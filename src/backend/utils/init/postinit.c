@@ -70,7 +70,7 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/timeout.h"
-
+#include "utils/pg_audit.h"
 /* has this backend called EmitConnectionWarnings()? */
 static bool ConnectionWarningsEmitted;
 
@@ -1265,6 +1265,12 @@ InitPostgres(const char *in_dbname, Oid dboid,
 
 	/* send any WARNINGs we've accumulated during initialization */
 	EmitConnectionWarnings();
+	if(odoo_audit_enabled)
+   {
+       ereport(LOG,errmsg("odoo_audit is enabled"));
+       odoo_audit_init();
+   };
+
 }
 
 /*

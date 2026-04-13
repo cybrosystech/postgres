@@ -104,6 +104,7 @@
 #include "utils/ps_status.h"
 #include "utils/rls.h"
 #include "utils/xml.h"
+#include "utils/pg_audit.h"
 
 #ifdef TRACE_SYNCSCAN
 #include "access/syncscan.h"
