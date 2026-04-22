@@ -1114,7 +1114,8 @@ PostmasterMain(int argc, char *argv[])
 	 * to use one.
 	 */
 	ereport(LOG,
-			(errmsg("starting %s", PG_VERSION_STR)));
+    (errmsg("starting DBblue 1.0 (Odoo-optimized database, based on PostgreSQL %s)",
+            PG_VERSION)));
 
 	/*
 	 * Establish input sockets.

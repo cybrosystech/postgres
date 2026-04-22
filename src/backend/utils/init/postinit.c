@@ -728,7 +728,7 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	char	   *fullpath;
 	char		dbname[NAMEDATALEN];
 	int			nfree = 0;
-
+	
 	elog(DEBUG3, "InitPostgres");
 
 	/*

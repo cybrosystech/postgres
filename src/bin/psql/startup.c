@@ -466,6 +466,7 @@ error:
 		pg_logging_config(PG_LOG_FLAG_TERSE);
 		connection_warnings(true);
 		if (!pset.quiet)
+			printf(_("Welcome to DBblue version 1.0 (A odoo specific Database)\n\n"));
 			printf(_("Type \"help\" for help.\n\n"));
 		initializeInput(options.no_readline ? 0 : 1);
 		successResult = MainLoop(stdin);
