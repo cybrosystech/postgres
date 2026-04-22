@@ -2302,7 +2302,7 @@
   short_desc => 'Allow the odoo specific dedicated audit log functionality',
   long_desc => 'Can be set to off for environments where global configuration changes should be made using a different method.',
   variable => 'odoo_audit_enabled',
-  boot_val => 'true',
+  boot_val => 'false',
 },
 { name => 'odoo_audit_tables', type => 'string', context => 'PGC_USERSET', group => 'CUSTOM_OPTIONS',
   short_desc => 'Specifies the table names for the audit purposes',
@@ -3465,7 +3465,7 @@
 { name => 'wal_compression', type => 'enum', context => 'PGC_SUSET', group => 'WAL_SETTINGS',
   short_desc => 'Compresses full-page writes written in WAL file with specified method.',
   variable => 'wal_compression',
-  boot_val => 'WAL_COMPRESSION_NONE',
+  boot_val => 'WAL_COMPRESSION_LZ4',
   options => 'wal_compression_options',
 },
 

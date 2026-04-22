@@ -26,7 +26,7 @@
 /* ----------------------------------------------------------------
 * GUC variable definitions
 * ---------------------------------------------------------------- */
-bool  odoo_audit_enabled = true;
+bool  odoo_audit_enabled = false;
 char *odoo_audit_tables  = NULL;
 
 

@@ -264,55 +264,102 @@ odoo_fillfactor_rebuild(void)
 
 
 
+// int
+// odoo_fillfactor_lookup(const char *tablename)
+// {
+//    char         normname[ODOO_FF_KEYLEN];
+//    OdooFFEntry *entry;
+
+
+//    if (!tablename)
+//        return -1;
+
+
+//    // rebuild if hash is NULL OR empty */
+//    if (!odoo_ff_htab || hash_get_num_entries(odoo_ff_htab) == 0)
+//    {
+//        ereport(LOG,
+//                (errmsg("lookup: rebuilding hash in PID %d (htab=%p)",
+//                        MyProcPid, (void *) odoo_ff_htab)));
+
+
+//        rebuild_hash_table(odoo_fillfactor_map);
+//    }
+
+
+//    // normalize_name(tablename, normname, sizeof(normname));
+//    memset(normname, 0, sizeof(normname));
+// normalize_name(tablename, normname, sizeof(normname));
+
+
+//    ereport(LOG, (errmsg("lookup: searching key = %s", normname)));
+
+
+//    entry = (OdooFFEntry *) hash_search(odoo_ff_htab, normname,
+//                                        HASH_FIND, NULL);
+
+
+//    if (!entry)
+//    {
+//        ereport(LOG, (errmsg("lookup: entry NOT FOUND")));
+//        return -1;
+//    }
+
+
+//    ereport(LOG,
+//            (errmsg("lookup: found fillfactor = %d", entry->fillfactor)));
+
+
+//    return entry->fillfactor;
+// }
+
+
+
 int
 odoo_fillfactor_lookup(const char *tablename)
 {
-   char         normname[ODOO_FF_KEYLEN];
-   OdooFFEntry *entry;
+    char         normname[ODOO_FF_KEYLEN];
+    OdooFFEntry *entry;
 
+    if (!tablename)
+        return -1;
 
-   if (!tablename)
-       return -1;
+    /* Rebuild if hash is NULL or empty */
+    if (!odoo_ff_htab || hash_get_num_entries(odoo_ff_htab) == 0)
+    {
+        ereport(LOG,
+                (errmsg("lookup: rebuilding hash in PID %d (htab=%p)",
+                        MyProcPid, (void *) odoo_ff_htab)));
+        rebuild_hash_table(odoo_fillfactor_map);
+    }
 
+    /*
+     * If the map is empty/unset, rebuild_hash_table() returns without
+     * creating the hash table. Bail out here instead of passing NULL
+     * into hash_search().
+     */
+    if (!odoo_ff_htab)
+        return -1;
 
-   // rebuild if hash is NULL OR empty */
-   if (!odoo_ff_htab || hash_get_num_entries(odoo_ff_htab) == 0)
-   {
-       ereport(LOG,
-               (errmsg("lookup: rebuilding hash in PID %d (htab=%p)",
-                       MyProcPid, (void *) odoo_ff_htab)));
+    memset(normname, 0, sizeof(normname));
+    normalize_name(tablename, normname, sizeof(normname));
 
+    ereport(LOG, (errmsg("lookup: searching key = %s", normname)));
 
-       rebuild_hash_table(odoo_fillfactor_map);
-   }
+    entry = (OdooFFEntry *) hash_search(odoo_ff_htab, normname,
+                                        HASH_FIND, NULL);
 
+    if (!entry)
+    {
+        ereport(LOG, (errmsg("lookup: entry NOT FOUND")));
+        return -1;
+    }
 
-   // normalize_name(tablename, normname, sizeof(normname));
-   memset(normname, 0, sizeof(normname));
-normalize_name(tablename, normname, sizeof(normname));
+    ereport(LOG,
+            (errmsg("lookup: found fillfactor = %d", entry->fillfactor)));
 
-
-   ereport(LOG, (errmsg("lookup: searching key = %s", normname)));
-
-
-   entry = (OdooFFEntry *) hash_search(odoo_ff_htab, normname,
-                                       HASH_FIND, NULL);
-
-
-   if (!entry)
-   {
-       ereport(LOG, (errmsg("lookup: entry NOT FOUND")));
-       return -1;
-   }
-
-
-   ereport(LOG,
-           (errmsg("lookup: found fillfactor = %d", entry->fillfactor)));
-
-
-   return entry->fillfactor;
+    return entry->fillfactor;
 }
-
 
 /*
 * odoo_fillfactor_assign_hook
