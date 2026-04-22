@@ -104,7 +104,11 @@
 #include "utils/ps_status.h"
 #include "utils/rls.h"
 #include "utils/xml.h"
+<<<<<<< HEAD
 #include "utils/pg_audit.h"
+=======
+#include "utils/pg_fillfactor.h"
+>>>>>>> feature/custom_fillfactor
 
 #ifdef TRACE_SYNCSCAN
 #include "access/syncscan.h"

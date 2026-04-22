@@ -33,7 +33,11 @@ OBJS = \
 	superuser.o \
 	timeout.o \
 	tzparser.o \
+<<<<<<< HEAD
 	pg_audit.o
+=======
+	pg_fillfactor.o
+>>>>>>> feature/custom_fillfactor
 
 # This location might depend on the installation directories. Therefore
 # we can't substitute it into pg_config.h.

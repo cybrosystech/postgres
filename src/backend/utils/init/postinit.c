@@ -70,7 +70,12 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/timeout.h"
+<<<<<<< HEAD
 #include "utils/pg_audit.h"
+=======
+#include "utils/pg_fillfactor.h"
+
+>>>>>>> feature/custom_fillfactor
 /* has this backend called EmitConnectionWarnings()? */
 static bool ConnectionWarningsEmitted;
 
@@ -1265,12 +1270,19 @@ InitPostgres(const char *in_dbname, Oid dboid,
 
 	/* send any WARNINGs we've accumulated during initialization */
 	EmitConnectionWarnings();
+<<<<<<< HEAD
 	if(odoo_audit_enabled)
    {
        ereport(LOG,errmsg("odoo_audit is enabled"));
        odoo_audit_init();
    };
 
+=======
+	if(odoo_fillfactor_map)
+	{
+		odoo_fillfactor_init(); 
+	}
+>>>>>>> feature/custom_fillfactor
 }
 
 /*
