@@ -117,6 +117,7 @@
 #include "storage/proc.h"
 #include "storage/shmem_internal.h"
 #include "tcop/backend_startup.h"
+#include "utils/pg_auto_index.h"
 #include "tcop/tcopprot.h"
 #include "utils/datetime.h"
 #include "utils/memutils.h"
@@ -923,6 +924,12 @@ PostmasterMain(int argc, char *argv[])
 	 * before any modules had a chance to take the background worker slots.
 	 */
 	ApplyLauncherRegister();
+
+	/*
+	 * Register the dbblue auto-index detector. Always registered; scanning
+	 * is gated by the dbblue_auto_index_enabled GUC at runtime.
+	 */
+	DbblueAutoIndexRegister();
 
 	/*
 	 * Register the shared memory needs of all core subsystems.

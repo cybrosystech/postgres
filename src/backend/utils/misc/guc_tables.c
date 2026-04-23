@@ -106,6 +106,7 @@
 #include "utils/xml.h"
 #include "utils/pg_audit.h"
 #include "utils/pg_fillfactor.h"
+#include "utils/pg_auto_index.h"
 
 #ifdef TRACE_SYNCSCAN
 #include "access/syncscan.h"

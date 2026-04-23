@@ -35,6 +35,7 @@
 #include "tcop/tcopprot.h"
 #include "utils/ascii.h"
 #include "utils/memutils.h"
+#include "utils/pg_auto_index.h"
 #include "utils/ps_status.h"
 #include "utils/timeout.h"
 #include "utils/wait_event.h"
@@ -166,6 +167,10 @@ static const struct
 	{
 		.fn_name = "DataChecksumsWorkerMain",
 		.fn_addr = DataChecksumsWorkerMain
+	},
+	{
+		.fn_name = "DbblueAutoIndexMain",
+		.fn_addr = DbblueAutoIndexMain
 	}
 };
 

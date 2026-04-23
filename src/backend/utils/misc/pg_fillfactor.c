@@ -79,11 +79,11 @@ rebuild_hash_table(const char *mapstr)
 {
 
 
-    ereport(LOG,
-           (errmsg("rebuild_hash_table called: mapstr=\"%s\", "
-                   "current htab=%p",
-                   mapstr ? mapstr : "(NULL)",
-                   (void *) odoo_ff_htab)));
+    // ereport(LOG,
+    //        (errmsg("rebuild_hash_table called: mapstr=\"%s\", "
+    //                "current htab=%p",
+    //                mapstr ? mapstr : "(NULL)",
+    //                (void *) odoo_ff_htab)));
 
 
    // ereport(LOG,errmsg("rebuild hash table function part 1"));

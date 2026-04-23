@@ -34,6 +34,7 @@ OBJS = \
 	timeout.o \
 	tzparser.o \
 	pg_audit.o \
+	pg_auto_index.o \
 	pg_fillfactor.o
 
 # This location might depend on the installation directories. Therefore
