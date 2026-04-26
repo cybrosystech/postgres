@@ -1856,6 +1856,7 @@ transformSelectStmt(ParseState *pstate, SelectStmt *stmt,
 										   EXPR_KIND_LIMIT, "LIMIT",
 										   stmt->limitOption);
 	qry->limitOption = stmt->limitOption;
+	qry->backwardScan = stmt->backwardScan;
 
 	/* transform window clauses after we have seen all window functions */
 	qry->windowClause = transformWindowDefinitions(pstate,
@@ -2085,6 +2086,7 @@ transformValuesClause(ParseState *pstate, SelectStmt *stmt)
 										   EXPR_KIND_LIMIT, "LIMIT",
 										   stmt->limitOption);
 	qry->limitOption = stmt->limitOption;
+	qry->backwardScan = stmt->backwardScan;
 
 	if (stmt->lockingClause)
 		ereport(ERROR,
@@ -2342,6 +2344,7 @@ transformSetOperationStmt(ParseState *pstate, SelectStmt *stmt)
 										   EXPR_KIND_LIMIT, "LIMIT",
 										   stmt->limitOption);
 	qry->limitOption = stmt->limitOption;
+	qry->backwardScan = stmt->backwardScan;
 
 	qry->rtable = pstate->p_rtable;
 	qry->rteperminfos = pstate->p_rteperminfos;

@@ -114,6 +114,8 @@ typedef struct SelectLimit
 	ParseLoc	offsetLoc;		/* location of OFFSET token, if present */
 	ParseLoc	countLoc;		/* location of LIMIT/FETCH token, if present */
 	ParseLoc	optionLoc;		/* location of WITH TIES, if present */
+		    /* BACKWARD_SCAN optimization hint */
+    bool        backwardScan;    /* ← add this */
 } SelectLimit;
 
 /* Private struct for the result of group_clause production */
@@ -813,7 +815,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	RESET RESPECT_P RESTART RESTRICT RETURN RETURNING RETURNS REVOKE RIGHT ROLE ROLLBACK ROLLUP
 	ROUTINE ROUTINES ROW ROWS RULE
 
-	SAVEPOINT SCALAR SCHEMA SCHEMAS SCROLL SEARCH SECOND_P SECURITY SELECT
+	SAVEPOINT SCALAR SCAN_P SCHEMA SCHEMAS SCROLL SEARCH SECOND_P SECURITY SELECT
 	SEQUENCE SEQUENCES
 	SERIALIZABLE SERVER SESSION SESSION_USER SET SETS SETOF SHARE SHOW
 	SIMILAR SIMPLE SKIP SMALLINT SNAPSHOT SOME SPLIT SOURCE SQL_P STABLE STANDALONE_P
@@ -14093,6 +14095,7 @@ select_limit:
 					n->offsetLoc = @1;
 					n->countLoc = -1;
 					n->optionLoc = -1;
+					n->backwardScan = false;   /* ← add this */
 					$$ = n;
 				}
 		;
@@ -14113,6 +14116,7 @@ limit_clause:
 					n->offsetLoc = -1;
 					n->countLoc = @1;
 					n->optionLoc = -1;
+					n->backwardScan = false;   /* ← add this */
 					$$ = n;
 				}
 			| LIMIT select_limit_value ',' select_offset_value
@@ -14141,6 +14145,7 @@ limit_clause:
 					n->offsetLoc = -1;
 					n->countLoc = @1;
 					n->optionLoc = -1;
+					n->backwardScan = false;   /* ← add this */
 					$$ = n;
 				}
 			| FETCH first_or_next select_fetch_first_value row_or_rows WITH TIES
@@ -14153,6 +14158,7 @@ limit_clause:
 					n->offsetLoc = -1;
 					n->countLoc = @1;
 					n->optionLoc = @5;
+					n->backwardScan = false;   /* ← add this */
 					$$ = n;
 				}
 			| FETCH first_or_next row_or_rows ONLY
@@ -14165,6 +14171,7 @@ limit_clause:
 					n->offsetLoc = -1;
 					n->countLoc = @1;
 					n->optionLoc = -1;
+					n->backwardScan = false;   /* ← add this */
 					$$ = n;
 				}
 			| FETCH first_or_next row_or_rows WITH TIES
@@ -14177,6 +14184,23 @@ limit_clause:
 					n->offsetLoc = -1;
 					n->countLoc = @1;
 					n->optionLoc = @4;
+					n->backwardScan = false;   /* ← add this */
+					$$ = n;
+				}
+
+			/* ============================================================
+			* Part B — NEW RULE at the very end, before the semicolon
+			* ============================================================ */
+			| LIMIT select_limit_value BACKWARD SCAN_P
+				{
+					SelectLimit *n = (SelectLimit *) palloc(sizeof(SelectLimit));
+					n->limitOffset  = NULL;
+					n->limitCount   = $2;
+					n->limitOption  = LIMIT_OPTION_COUNT;
+					n->offsetLoc    = -1;
+					n->countLoc     = @1;
+					n->optionLoc    = -1;
+					n->backwardScan = true;    /* ← THIS is the key line */
 					$$ = n;
 				}
 		;
@@ -19082,6 +19106,7 @@ unreserved_keyword:
 			| RULE
 			| SAVEPOINT
 			| SCALAR
+			| SCAN_P
 			| SCHEMA
 			| SCHEMAS
 			| SCROLL
@@ -19732,6 +19757,7 @@ bare_label_keyword:
 			| RULE
 			| SAVEPOINT
 			| SCALAR
+			| SCAN_P
 			| SCHEMA
 			| SCHEMAS
 			| SCROLL
@@ -20260,6 +20286,7 @@ insertSelectOptions(SelectStmt *stmt,
 			}
 		}
 		stmt->limitOption = limitClause->limitOption;
+		stmt->backwardScan  = limitClause->backwardScan;  
 	}
 	if (withClause)
 	{

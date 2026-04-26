@@ -3794,7 +3794,8 @@ create_limit_path(PlannerInfo *root, RelOptInfo *rel,
 				  Path *subpath,
 				  Node *limitOffset, Node *limitCount,
 				  LimitOption limitOption,
-				  int64 offset_est, int64 count_est)
+				  int64 offset_est, int64 count_est,
+				  bool scanBackward)
 {
 	LimitPath  *pathnode = makeNode(LimitPath);
 
@@ -3818,6 +3819,7 @@ create_limit_path(PlannerInfo *root, RelOptInfo *rel,
 	pathnode->limitCount = limitCount;
 	pathnode->limitOption = limitOption;
 
+	pathnode->scanBackward = scanBackward;     /* ← add this, caller sets true if needed */
 	/*
 	 * Adjust the output rows count and costs according to the offset/limit.
 	 */

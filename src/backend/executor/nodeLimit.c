@@ -25,8 +25,19 @@
 #include "executor/nodeLimit.h"
 #include "miscadmin.h"
 
+#include "access/genam.h"        /* index_beginscan, index_endscan */
+#include "access/relscan.h"      /* IndexScanDescData full definition */
+#include "access/tableam.h"      /* index_fetch_heap */
+#include "access/visibilitymap.h" /* VM_ALL_VISIBLE */
+#include "storage/bufmgr.h"      /* Buffer, ReleaseBuffer */
+#include "executor/nodeIndexscan.h"      /* IndexScanState */
+#include "executor/nodeIndexonlyscan.h"  /* IndexOnlyScanState */
+
 static void recompute_limits(LimitState *node);
 static int64 compute_tuples_needed(LimitState *node);
+static int64 index_count_live_tuples(LimitState *node, Snapshot snapshot);
+static TupleTableSlot *ExecBackwardScan(LimitState *node);
+static TupleTableSlot *ExecBackwardScanNext(LimitState *node);
 
 
 /* ----------------------------------------------------------------
@@ -46,6 +57,30 @@ ExecLimit(PlanState *pstate)
 	PlanState  *outerPlan;
 
 	CHECK_FOR_INTERRUPTS();
+
+
+
+
+   /*
+    * BACKWARD_SCAN fast path.
+    *
+    * If scanBackward is set, we take a completely separate
+    * execution path:
+    *
+    *   1. COUNT live rows (index-only, same snapshot)
+    *   2. compute flipOffset
+    *   3. collect rows into flipBuffer
+    *   4. reverse flipBuffer
+    *   5. return rows from flipBuffer one by one
+    *
+    * The existing forward logic below is completely untouched.
+    * We never mix the two paths.
+    */
+	if (node->scanBackward)
+		return ExecBackwardScan(node);    /* ← separate function */
+
+
+
 
 	/*
 	 * get information from the node
@@ -344,6 +379,275 @@ ExecLimit(PlanState *pstate)
 	return slot;
 }
 
+
+
+
+
+/*
+ * ExecBackwardScanNext
+ *
+ * Returns the next row from flipBuffer.
+ * flipBufCount tracks how many we have returned so far.
+ * When exhausted, returns an empty slot.
+ */
+static TupleTableSlot *
+ExecBackwardScanNext(LimitState *node)
+{
+    if (node->flipBufCount >= node->flipBufSize)
+    {
+        /*
+         * Buffer exhausted.
+         * Return NULL exactly like normal ExecLimit does
+         * at end of scan — that is what the parent expects.
+         */
+        return NULL;
+    }
+
+    return node->flipBuffer[node->flipBufCount++];
+}
+
+
+/*
+ * index_count_live_tuples
+ *
+ * Count live tuples using an index scan with the pinned snapshot.
+ * Handles both IndexScanState and IndexOnlyScanState as the child plan.
+ *
+ * For pages that are all-visible in the visibility map, we count
+ * without heap access. Otherwise we do a heap fetch to check MVCC.
+ */
+static int64
+index_count_live_tuples(LimitState *node, Snapshot snapshot)
+{
+    PlanState      *child = outerPlanState(node);
+    Relation        heapRel;
+    Relation        indexRel;
+    TupleTableSlot *heapSlot;
+    IndexScanDesc   scandesc;
+    int64           count = 0;
+    bool            gotTuple;
+    Buffer          vmbuffer = InvalidBuffer;
+    bool            need_free_slot = false;
+
+    /*
+     * The child can be either IndexScanState or IndexOnlyScanState.
+     * Extract the heap relation, index relation, and a tuple slot
+     * from whichever type we actually have.
+     */
+    if (IsA(child, IndexScanState))
+    {
+        IndexScanState *iss = (IndexScanState *) child;
+        heapRel  = iss->ss.ss_currentRelation;
+        indexRel = iss->iss_RelationDesc;
+        heapSlot = iss->ss.ss_ScanTupleSlot;
+    }
+    else if (IsA(child, IndexOnlyScanState))
+    {
+        IndexOnlyScanState *ioss = (IndexOnlyScanState *) child;
+        heapRel  = ioss->ss.ss_currentRelation;
+        indexRel = ioss->ioss_RelationDesc;
+
+        /*
+         * CRITICAL: IndexOnlyScan's ss_ScanTupleSlot has an index-shaped
+         * descriptor (e.g. just "id").  index_fetch_heap stores a full
+         * heap tuple, so we need a heap-shaped slot to avoid a crash.
+         */
+        heapSlot = MakeSingleTupleTableSlot(
+            RelationGetDescr(heapRel),
+            &TTSOpsBufferHeapTuple
+        );
+        need_free_slot = true;
+    }
+    else
+    {
+        /* Should not happen — planner checks ensured index scan */
+        elog(ERROR, "backward scan child is neither IndexScan nor IndexOnlyScan");
+        return 0;  /* keep compiler quiet */
+    }
+
+	scandesc = index_beginscan(
+		heapRel,        /* heap relation */
+		indexRel,       /* index relation */
+		snapshot,       /* pinned snapshot */
+		NULL,           /* IndexScanInstrumentation - NULL if not instrumenting */
+		0,              /* nkeys */
+		0,              /* norderbys */
+		0               /* flags */
+	);
+
+    scandesc->xs_want_itup = true;
+    index_rescan(scandesc, NULL, 0, NULL, 0);
+
+    for (;;)
+    {
+        ItemPointer tid;
+
+        CHECK_FOR_INTERRUPTS();
+
+        gotTuple = index_getnext_tid(scandesc, ForwardScanDirection);
+        if (!gotTuple)
+            break;
+
+        tid = &scandesc->xs_heaptid;
+
+        /*
+         * Check the visibility map: if the heap page is all-visible,
+         * every tuple on it is live — count without heap access.
+         * Otherwise, do a heap fetch to verify MVCC visibility.
+         * This is the same pattern used by IndexOnlyScan.
+         */
+        if (VM_ALL_VISIBLE(scandesc->heapRelation,
+                           ItemPointerGetBlockNumber(tid),
+                           &vmbuffer))
+        {
+            count++;
+        }
+        else
+        {
+            if (index_fetch_heap(scandesc, heapSlot))
+                count++;
+        }
+    }
+
+    /* Release VM buffer pin if we acquired one */
+    if (vmbuffer != InvalidBuffer)
+        ReleaseBuffer(vmbuffer);
+
+    index_endscan(scandesc);
+
+    /* Free the temporary slot if we created one for IndexOnlyScan */
+    if (need_free_slot)
+        ExecDropSingleTupleTableSlot(heapSlot);
+
+    return count;
+}
+
+
+
+static TupleTableSlot *
+ExecBackwardScan(LimitState *node)
+{
+    TupleTableSlot *slot;
+    TupleTableSlot *copy;
+    TupleTableSlot *tmp;
+    PlanState      *outerPlan;
+    int64           exact_live_count;
+    int64           flipOffset;
+    int64           rows_available;
+    int64           actual_count;
+    int64           skipped;
+    int64           collected;
+    int             left;
+    int             right;
+
+    /*
+     * If buffer already filled — just return next row.
+     */
+    if (node->flipBuffer != NULL)
+        return ExecBackwardScanNext(node);
+
+    /* Must compute offset/count before anything else */
+    if (node->lstate == LIMIT_INITIAL)
+        recompute_limits(node);
+
+    outerPlan = outerPlanState(node);
+
+    /* STEP A — Pin snapshot for consistent counting + fetching */
+    node->backwardScanSnapshot = RegisterSnapshot(GetTransactionSnapshot());
+    Assert(node->backwardScanSnapshot != InvalidSnapshot);
+
+    /*
+     * STEP B — Count live rows using pinned snapshot.
+     * index_count_live_tuples performs an index-only scan
+     * using the same snapshot as the fetch pass.
+     */
+    exact_live_count = index_count_live_tuples(
+        node,
+        node->backwardScanSnapshot
+    );
+
+    /* STEP C — Compute flip with actual available rows */
+    rows_available = exact_live_count - node->offset;
+
+    if (rows_available <= 0)
+    {
+        UnregisterSnapshot(node->backwardScanSnapshot);
+        node->backwardScanSnapshot = InvalidSnapshot;
+        node->flipBuffer   = (TupleTableSlot **) palloc(0);
+        node->flipBufSize  = 0;
+        node->flipBufCount = 0;
+        return NULL;
+    }
+
+    actual_count = (node->count < rows_available) ? node->count : rows_available;
+    flipOffset = exact_live_count - node->offset - actual_count;
+    if (flipOffset < 0)
+        flipOffset = 0;
+
+    node->flipOffset = flipOffset;
+    node->count = actual_count;
+
+    /* STEP D — Allocate buffer and collect rows */
+    node->flipBuffer = (TupleTableSlot **)
+        palloc(node->count * sizeof(TupleTableSlot *));
+    node->flipBufSize  = 0;
+    node->flipBufCount = 0;
+
+    /* Skip phase: advance past flipOffset rows */
+    skipped = 0;
+    while (skipped < node->flipOffset)
+    {
+        CHECK_FOR_INTERRUPTS();
+        slot = ExecProcNode(outerPlan);
+
+        if (slot == NULL || TupIsNull(slot))
+        {
+            UnregisterSnapshot(node->backwardScanSnapshot);
+            node->backwardScanSnapshot = InvalidSnapshot;
+            node->flipBuffer   = (TupleTableSlot **) palloc(0);
+            node->flipBufSize  = 0;
+            node->flipBufCount = 0;
+            return NULL;
+        }
+        skipped++;
+    }
+
+    /* Collect phase: gather up to actual_count rows */
+    collected = 0;
+    while (collected < node->count)
+    {
+        CHECK_FOR_INTERRUPTS();
+        slot = ExecProcNode(outerPlan);
+
+        if (TupIsNull(slot))
+            break;
+
+        copy = MakeSingleTupleTableSlot(
+            slot->tts_tupleDescriptor,
+            slot->tts_ops
+        );
+        ExecCopySlot(copy, slot);
+        node->flipBuffer[collected] = copy;
+        collected++;
+    }
+    node->flipBufSize = collected;
+
+    /* STEP E — Reverse buffer so rows come out in DESC order */
+    left  = 0;
+    right = (int) node->flipBufSize - 1;
+    while (left < right)
+    {
+        tmp = node->flipBuffer[left];
+        node->flipBuffer[left]  = node->flipBuffer[right];
+        node->flipBuffer[right] = tmp;
+        left++;
+        right--;
+    }
+
+    return ExecBackwardScanNext(node);
+}
+
+
 /*
  * Evaluate the limit/offset expressions --- done at startup or rescan.
  *
@@ -519,6 +823,16 @@ ExecInitLimit(Limit *node, EState *estate, int eflags)
 														node->uniqCollations,
 														&limitstate->ps);
 	}
+	   /*
+    * Copy backward scan flags from plan node into runtime state.
+    * Actual work happens in ExecLimit() at execution time.
+    */
+	limitstate->scanBackward  = node->scanBackward;
+	limitstate->needFlip      = node->needFlip;
+	limitstate->flipOffset    = 0;
+	limitstate->flipBuffer    = NULL;
+	limitstate->flipBufSize   = 0;
+	limitstate->flipBufCount  = 0;
 
 	return limitstate;
 }
@@ -533,14 +847,122 @@ ExecInitLimit(Limit *node, EState *estate, int eflags)
 void
 ExecEndLimit(LimitState *node)
 {
-	ExecEndNode(outerPlanState(node));
+    /* ============================================================
+     * Backward scan cleanup
+     *
+     * Free each copied slot individually first —
+     * they were allocated with MakeSingleTupleTableSlot
+     * so each one must be dropped with ExecDropSingleTupleTableSlot.
+     *
+     * Then free the buffer array itself.
+     * Then unpin the snapshot if still pinned.
+     * ============================================================
+     */
+    if (node->flipBuffer != NULL)
+    {
+        int i;
+
+        for (i = 0; i < node->flipBufSize; i++)
+        {
+            if (node->flipBuffer[i] != NULL)
+            {
+                ExecDropSingleTupleTableSlot(node->flipBuffer[i]);
+                node->flipBuffer[i] = NULL;
+            }
+        }
+
+        pfree(node->flipBuffer);
+        node->flipBuffer   = NULL;
+        node->flipBufSize  = 0;
+        node->flipBufCount = 0;
+    }
+
+    /*
+     * Unpin snapshot if still active.
+     * This can happen if query was cancelled mid-execution
+     * before ExecBackwardScan completed — we still must
+     * release the snapshot or VACUUM gets blocked forever.
+     */
+    if (node->scanBackward &&
+        node->backwardScanSnapshot != InvalidSnapshot)
+    {
+        UnregisterSnapshot(node->backwardScanSnapshot);
+        node->backwardScanSnapshot = InvalidSnapshot;
+    }
+
+    /*
+     * existing cleanup — untouched
+     */
+    ExecEndNode(outerPlanState(node));
 }
+
 
 
 void
 ExecReScanLimit(LimitState *node)
 {
 	PlanState  *outerPlan = outerPlanState(node);
+
+
+
+	/* ============================================================
+     * Backward scan rescan
+     *
+     * We must throw away the old buffer completely.
+     * Next call to ExecBackwardScan will rebuild it fresh
+     * with a new snapshot and new COUNT.
+     *
+     * This is correct because:
+     *   - parameters may have changed (different offset/count)
+     *   - underlying data may have changed
+     *   - snapshot must be fresh for the new execution
+     * ============================================================
+     */
+    if (node->flipBuffer != NULL)
+    {
+        int i;
+
+        /* free each copied slot */
+        for (i = 0; i < node->flipBufSize; i++)
+        {
+            if (node->flipBuffer[i] != NULL)
+            {
+                ExecDropSingleTupleTableSlot(node->flipBuffer[i]);
+                node->flipBuffer[i] = NULL;
+            }
+        }
+
+        pfree(node->flipBuffer);
+        node->flipBuffer   = NULL;
+        node->flipBufSize  = 0;
+        node->flipBufCount = 0;
+    }
+
+    /*
+     * Unpin old snapshot — new execution needs fresh snapshot.
+     * If we kept the old snapshot, COUNT and FETCH would see
+     * stale data from the previous execution.
+     */
+    if (node->scanBackward &&
+        node->backwardScanSnapshot != InvalidSnapshot)
+    {
+        UnregisterSnapshot(node->backwardScanSnapshot);
+        node->backwardScanSnapshot = InvalidSnapshot;
+    }
+
+    /*
+     * Reset flipOffset — will be recomputed on next execution.
+     */
+    node->flipOffset = 0;
+
+    /*
+     * existing rescan logic — untouched
+     */
+    if (node->ps.ps_ExprContext != NULL)
+        ReScanExprContext(node->ps.ps_ExprContext);
+
+    node->lstate = LIMIT_INITIAL;
+
 
 	/*
 	 * Recompute limit/offset in case parameters changed, and reset the state

@@ -1519,6 +1519,13 @@ typedef struct Limit
 
 	/* collations for equality comparisons */
 	Oid		   *uniqCollations pg_node_attr(array_size(uniqNumCols));
+
+
+
+	/* backward scan fields */
+	bool        scanBackward;   /* user requested BACKWARD_SCAN */
+	bool        needFlip;       /* executor must reverse output buffer */
+
 } Limit;
 
 
