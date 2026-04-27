@@ -26,8 +26,8 @@
 /* ----------------------------------------------------------------
 * GUC variable definitions
 * ---------------------------------------------------------------- */
-bool  odoo_audit_enabled = false;
-char *odoo_audit_tables  = NULL;
+bool  dbblue_audit_enabled = false;
+char *dbblue_audit_tables  = NULL;
 
 
 /* ----------------------------------------------------------------
@@ -39,11 +39,11 @@ static ExecutorFinish_hook_type prev_ExecutorFinish = NULL;
 /* ----------------------------------------------------------------
 * Forward declarations
 * ---------------------------------------------------------------- */
-static void odoo_audit_executor_finish(QueryDesc *queryDesc);
-static void odoo_audit_process_relation(ResultRelInfo *rri,
-                                       EState        *estate,
-                                       const char    *operation);
-static char *odoo_audit_tuple_to_json(HeapTuple tuple, TupleDesc tupdesc);
+static void dbblue_audit_executor_finish(QueryDesc *queryDesc);
+static void dbblue_audit_process_relation(ResultRelInfo *rri,
+                                          EState        *estate,
+                                          const char    *operation);
+static char *dbblue_audit_tuple_to_json(HeapTuple tuple, TupleDesc tupdesc);
 
 
 
@@ -70,7 +70,7 @@ static bool audit_table_checked = false;
 * once per backend session.
 * ---------------------------------------------------------------- */
 static void
-odoo_audit_ensure_log_table(void)
+dbblue_audit_ensure_log_table(void)
 {
    int spi_ret;
 
@@ -81,13 +81,13 @@ odoo_audit_ensure_log_table(void)
 
    if (SPI_connect() != SPI_OK_CONNECT)
    {
-       elog(WARNING, "odoo_audit: SPI_connect failed in ensure_log_table");
+       elog(WARNING, "dbblue_audit: SPI_connect failed in ensure_log_table");
        return;
-   }
+   }    
 
-
+   ereport(LOG,errmsg("dbblue_audit: ensuring audit log table exists"));
    spi_ret = SPI_execute(
-       "CREATE TABLE IF NOT EXISTS odoo_audit_log ("
+       "CREATE TABLE IF NOT EXISTS dbblue_audit_log ("
        "    id          BIGSERIAL    PRIMARY KEY,"
        "    rel_name    TEXT         NOT NULL,"
        "    dml_op      TEXT         NOT NULL,"
@@ -102,7 +102,7 @@ odoo_audit_ensure_log_table(void)
 
 
    if (spi_ret < 0)
-       elog(WARNING, "odoo_audit: failed to create odoo_audit_log table: %d",
+       elog(WARNING, "dbblue_audit: failed to create dbblue_audit_log table: %d",
             spi_ret);
    else
    {
@@ -113,33 +113,33 @@ odoo_audit_ensure_log_table(void)
         */
        CommandCounterIncrement();
        audit_table_checked = true;
-       elog(DEBUG1, "odoo_audit: odoo_audit_log table ensured");
+       elog(DEBUG1, "dbblue_audit: dbblue_audit_log table ensured");
    }
 
 
    SPI_finish();
 }
 /* ----------------------------------------------------------------
-* odoo_audit_table_is_tracked
+* dbblue_audit_table_is_tracked
 *
 * Returns true if table_name appears in the comma-separated
-* odoo_audit_tables GUC value.
+* dbblue_audit_tables GUC value.
 * ---------------------------------------------------------------- */
 bool
-odoo_audit_table_is_tracked(const char *table_name)
+dbblue_audit_table_is_tracked(const char *table_name)
 {
    char *rawlist;
    char *tok;
    char *saveptr;
 
 
-   if (!odoo_audit_enabled)
+   if (!dbblue_audit_enabled)
        return false;
-   if (odoo_audit_tables == NULL || odoo_audit_tables[0] == '\0')
+   if (dbblue_audit_tables == NULL || dbblue_audit_tables[0] == '\0')
        return false;
 
 
-   rawlist = pstrdup(odoo_audit_tables);
+   rawlist = pstrdup(dbblue_audit_tables);
 
 
    tok = strtok_r(rawlist, ",", &saveptr);
@@ -165,13 +165,13 @@ odoo_audit_table_is_tracked(const char *table_name)
 
 
 /* ----------------------------------------------------------------
-* odoo_audit_tuple_to_json
+* dbblue_audit_tuple_to_json
 *
 * Converts a HeapTuple to a JSON string using the row's TupleDesc.
 * Returns NULL if tuple is NULL.
 * ---------------------------------------------------------------- */
 static char *
-odoo_audit_tuple_to_json(HeapTuple tuple, TupleDesc tupdesc)
+dbblue_audit_tuple_to_json(HeapTuple tuple, TupleDesc tupdesc)
 {
    StringInfoData buf;
    int            i;
@@ -242,17 +242,17 @@ odoo_audit_tuple_to_json(HeapTuple tuple, TupleDesc tupdesc)
 
 
 /* ----------------------------------------------------------------
-* odoo_audit_write
+* dbblue_audit_write
 *
-* Inserts one row into odoo_audit_log using SPI.
+* Inserts one row into dbblue_audit_log using SPI.
 * Called once per audited row.
 * ---------------------------------------------------------------- */
 void
-odoo_audit_write(const char *table_name,
-                const char *operation,
-                HeapTuple   old_tuple,
-                HeapTuple   new_tuple,
-                TupleDesc   tupdesc)
+dbblue_audit_write(const char *table_name,
+                   const char *operation,
+                   HeapTuple   old_tuple,
+                   HeapTuple   new_tuple,
+                   TupleDesc   tupdesc)
 {
    char       *old_json  = NULL;
    char       *new_json  = NULL;
@@ -264,12 +264,12 @@ odoo_audit_write(const char *table_name,
 
 
    /* Auto-create the audit log table if it doesn't exist yet */
-   odoo_audit_ensure_log_table();
+   dbblue_audit_ensure_log_table();
 
 
    /* Build JSON for old/new rows */
-   old_json = odoo_audit_tuple_to_json(old_tuple, tupdesc);
-   new_json = odoo_audit_tuple_to_json(new_tuple, tupdesc);
+   old_json = dbblue_audit_tuple_to_json(old_tuple, tupdesc);
+   new_json = dbblue_audit_tuple_to_json(new_tuple, tupdesc);
 
 
    username  = GetUserNameFromId(GetUserId(), false);
@@ -283,14 +283,14 @@ odoo_audit_write(const char *table_name,
 
    if (SPI_connect() != SPI_OK_CONNECT)
    {
-       elog(WARNING, "odoo_audit: SPI_connect failed");
+       elog(WARNING, "dbblue_audit: SPI_connect failed");
        return;
    }
 
 
    initStringInfo(&sql);
    appendStringInfo(&sql,
-       "INSERT INTO odoo_audit_log "
+       "INSERT INTO dbblue_audit_log "
        "(rel_name, dml_op, old_data, new_data,"
        " changed_by, session_usr, client_addr, logged_at) "
        "VALUES (%s, %s, %s, %s, %s, %s, %s, now())",
@@ -306,29 +306,29 @@ odoo_audit_write(const char *table_name,
 
    spi_ret = SPI_execute(sql.data, false, 0);
    if (spi_ret < 0)
-       elog(WARNING, "odoo_audit: failed to insert audit row: %d", spi_ret);
+       elog(WARNING, "dbblue_audit: failed to insert audit row: %d", spi_ret);
 
 
    SPI_finish();
 }
 /* ----------------------------------------------------------------
-* odoo_audit_process_relation
+* dbblue_audit_process_relation
 *
 * After DML on one result relation, walk the es_tupleTable
 * transition slot to extract old/new tuples and call
-* odoo_audit_write() for each modified row.
+* dbblue_audit_write() for each modified row.
 * ---------------------------------------------------------------- */
 static void
-odoo_audit_process_relation(ResultRelInfo *rri,
-                            EState        *estate,
-                            const char    *operation)
+dbblue_audit_process_relation(ResultRelInfo *rri,
+                               EState        *estate,
+                               const char    *operation)
 {
    Relation    rel      = rri->ri_RelationDesc;
    const char *relname  = RelationGetRelationName(rel);
    TupleDesc   tupdesc  = RelationGetDescr(rel);
 
 
-   if (!odoo_audit_table_is_tracked(relname))
+   if (!dbblue_audit_table_is_tracked(relname))
        return;
 
 
@@ -352,7 +352,7 @@ odoo_audit_process_relation(ResultRelInfo *rri,
                            : ExecFetchSlotHeapTuple(new_slot, false, NULL);
 
 
-       odoo_audit_write(relname, operation, old_tup, new_tup, tupdesc);
+       dbblue_audit_write(relname, operation, old_tup, new_tup, tupdesc);
    }
 }
 
@@ -360,15 +360,15 @@ odoo_audit_process_relation(ResultRelInfo *rri,
 
 
 /* ----------------------------------------------------------------
-* odoo_audit_executor_finish  (ExecutorFinish hook)
+* dbblue_audit_executor_finish  (ExecutorFinish hook)
 *
 * Fires after all rows have been processed by the executor.
 * Walks every result relation to find UPDATE/DELETE targets.
 * ---------------------------------------------------------------- */
 static void
-odoo_audit_executor_finish(QueryDesc *queryDesc)
+dbblue_audit_executor_finish(QueryDesc *queryDesc)
 {
-   // ereport(LOG,(errmsg("odoo_audit: inside odoo_audit_executor_finish hook")));
+   ereport(LOG,(errmsg("dbblue_audit: inside dbblue_audit_executor_finish hook")));
    /* Chain to previous hook first */
    if (prev_ExecutorFinish)
        prev_ExecutorFinish(queryDesc);
@@ -376,9 +376,9 @@ odoo_audit_executor_finish(QueryDesc *queryDesc)
        standard_ExecutorFinish(queryDesc);
 
 
-   if (!odoo_audit_enabled)
+   if (!dbblue_audit_enabled)
        return;
-   if (odoo_audit_tables == NULL || odoo_audit_tables[0] == '\0')
+   if (dbblue_audit_tables == NULL || dbblue_audit_tables[0] == '\0')
        return;
 
 
@@ -405,21 +405,21 @@ odoo_audit_executor_finish(QueryDesc *queryDesc)
        foreach(lc, queryDesc->estate->es_opened_result_relations)
        {
            ResultRelInfo *rri = (ResultRelInfo *) lfirst(lc);
-           odoo_audit_process_relation(rri, queryDesc->estate, op);
+           dbblue_audit_process_relation(rri, queryDesc->estate, op);
        }
    }
 }
 
 
 /* ----------------------------------------------------------------
-* odoo_audit_init
+* dbblue_audit_init
 *
 * Called once from PostmasterMain / InitPostgres to install hooks.
 * ---------------------------------------------------------------- */
 void
-odoo_audit_init(void)
+dbblue_audit_init(void)
 {
-   // ereport(LOG, (errmsg("odoo_audit: inside pg_audit.c file")));
+   ereport(LOG, (errmsg("dbblue_audit: inside pg_audit.c file")));
    prev_ExecutorFinish  = ExecutorFinish_hook;
-   ExecutorFinish_hook  = odoo_audit_executor_finish;
+   ExecutorFinish_hook  = dbblue_audit_executor_finish;
 }

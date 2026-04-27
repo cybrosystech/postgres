@@ -3,7 +3,7 @@
  * pg_auto_index.c
  *    dbblue auto-index detector: a background worker that periodically
  *    scans the target database for unused and duplicate indexes and
- *    records its findings in a table named dbblue_index_recommendations.
+ *    records its findings in a table named dbblue_unused_index_recommendations.
  *
  *    Detection only. No index is ever dropped by this feature.( in future we are planning to implement this auto index management feature )
  *
@@ -58,7 +58,7 @@ dbblue_auto_index_ensure_table(void)
 	int ret;
 
 	ret = SPI_execute(
-		"CREATE TABLE IF NOT EXISTS dbblue_index_recommendations ("
+		"CREATE TABLE IF NOT EXISTS dbblue_unused_index_recommendations ("
 		"    id                  BIGSERIAL    PRIMARY KEY,"
 		"    finding_type        TEXT         NOT NULL,"
 		"    schema_name         TEXT         NOT NULL,"
@@ -89,7 +89,7 @@ dbblue_auto_index_truncate(void)
 {
 	int ret;
 
-	ret = SPI_execute("TRUNCATE dbblue_index_recommendations RESTART IDENTITY",
+	ret = SPI_execute("TRUNCATE dbblue_unused_index_recommendations RESTART IDENTITY",
 					  false, 0);
 	if (ret < 0)
 		elog(WARNING, "dbblue_auto_index: failed to truncate recommendations table: %d", ret);
@@ -127,7 +127,7 @@ dbblue_auto_index_detect_unused(void)
 
 	initStringInfo(&sql);
 	appendStringInfo(&sql,
-		"INSERT INTO dbblue_index_recommendations "
+		"INSERT INTO dbblue_unused_index_recommendations "
 		"    (finding_type, schema_name, table_name, index_name,"
 		"     index_size_bytes, index_scans, stats_reset_at,"
 		"     retention_days_used, reason) "
@@ -223,7 +223,7 @@ dbblue_auto_index_detect_duplicates(void)
 		"     AND a.pred      = b.pred"
 		"     AND a.exprs     = b.exprs"
 		") "
-		"INSERT INTO dbblue_index_recommendations "
+		"INSERT INTO dbblue_unused_index_recommendations "
 		"    (finding_type, schema_name, table_name, index_name,"
 		"     duplicate_of, index_size_bytes, reason) "
 		"SELECT 'duplicate',"
@@ -247,6 +247,61 @@ dbblue_auto_index_detect_duplicates(void)
 	else
 		elog(LOG, "dbblue_auto_index: flagged %lu duplicate index pair(s)",
 			 (unsigned long) SPI_processed);
+}
+
+
+/* ----------------------------------------------------------------
+ * Drop the recommendations table when the feature is disabled.
+ *
+ * Called from the worker loop whenever dbblue_auto_index_enabled is
+ * false. We probe pg_class first so that turning the feature off
+ * (or starting up with it off) is a silent no-op when the table is
+ * already absent — avoiding a NOTICE per wake-up.
+ *
+ * Note: this drops historical findings. That is the documented
+ * trade-off of tying table lifecycle to the GUC.
+ * ---------------------------------------------------------------- */
+static void
+dbblue_auto_index_drop_table(void)
+{
+	int ret;
+	bool exists;
+
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+	{
+		elog(WARNING, "dbblue_auto_index: SPI_connect failed (drop)");
+		PopActiveSnapshot();
+		AbortCurrentTransaction();
+		return;
+	}
+
+	ret = SPI_execute(
+		"SELECT 1 FROM pg_class c"
+		"  JOIN pg_namespace n ON n.oid = c.relnamespace"
+		" WHERE c.relname = 'dbblue_unused_index_recommendations'"
+		"   AND c.relkind = 'r'"
+		"   AND n.nspname NOT IN ('pg_catalog','information_schema','pg_toast')",
+		true, 1);
+
+	exists = (ret == SPI_OK_SELECT && SPI_processed > 0);
+
+	if (exists)
+	{
+		ret = SPI_execute(
+			"DROP TABLE dbblue_unused_index_recommendations CASCADE",
+			false, 0);
+		if (ret < 0)
+			elog(WARNING, "dbblue_auto_index: failed to drop recommendations table: %d", ret);
+		else
+			elog(LOG, "dbblue_auto_index: dropped recommendations table (feature disabled)");
+	}
+
+	SPI_finish();
+	PopActiveSnapshot();
+	CommitTransactionCommand();
 }
 
 
@@ -312,6 +367,8 @@ DbblueAutoIndexMain(Datum main_arg)
 	/* Run once immediately so users see output without waiting a full interval. */
 	if (dbblue_auto_index_enabled)
 		dbblue_auto_index_run_scan();
+	else
+		dbblue_auto_index_drop_table();
 
 	while (!ShutdownRequestPending)
 	{
@@ -343,6 +400,8 @@ DbblueAutoIndexMain(Datum main_arg)
 
 		if (dbblue_auto_index_enabled)
 			dbblue_auto_index_run_scan();
+		else
+			dbblue_auto_index_drop_table();
 	}
 
 	proc_exit(0);

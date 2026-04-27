@@ -1267,14 +1267,14 @@ InitPostgres(const char *in_dbname, Oid dboid,
 
 	/* send any WARNINGs we've accumulated during initialization */
 	EmitConnectionWarnings();
-	if(odoo_audit_enabled)
+	if(dbblue_audit_enabled)
    {
-       ereport(LOG,errmsg("odoo_audit is enabled"));
-       odoo_audit_init();
+       ereport(LOG,errmsg("dbblue_audit is enabled"));
+       dbblue_audit_init();
    };
-	if(odoo_fillfactor_map)
+	if(dbblue_fillfactor_map)
 	{
-		odoo_fillfactor_init(); 
+		dbblue_fillfactor_init(); 
 	}
 }
 
