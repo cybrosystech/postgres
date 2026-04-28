@@ -4,7 +4,8 @@ MODULE_big = pg_prewarm
 OBJS = \
 	$(WIN32RES) \
 	autoprewarm.o \
-	pg_prewarm.o
+	pg_prewarm.o \
+	db_blue_pinner.o
 
 EXTENSION = pg_prewarm
 DATA = pg_prewarm--1.1--1.2.sql pg_prewarm--1.1.sql pg_prewarm--1.0--1.1.sql
