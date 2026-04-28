@@ -329,9 +329,9 @@ dbblue_first_col_index_exists(Oid relid, AttrNumber attno)
 	pfree(q.data);
 	SPI_finish();
 
-	ereport(DEBUG1,
-			(errmsg("dbblue advisor[trace]: fcie(SPI): returning %d for relid=%u attno=%d",
-					(int) found, relid, attno)));
+	// ereport(DEBUG1,
+	// 		(errmsg("dbblue advisor[trace]: fcie(SPI): returning %d for relid=%u attno=%d",
+	// 				(int) found, relid, attno)));
 
 	return found;
 }
