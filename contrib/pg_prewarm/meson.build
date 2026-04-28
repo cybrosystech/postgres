@@ -2,6 +2,7 @@
 
 pg_prewarm_sources = files(
   'autoprewarm.c',
+  'db_blue_pinner.c',
   'pg_prewarm.c',
 )
 

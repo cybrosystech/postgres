@@ -134,5 +134,11 @@ BufferManagerShmemInit(void *arg)
 
 		proclist_init(&buf->lock_waiters);
 		ConditionVariableInit(BufferDescriptorGetIOCV(buf));
+
+		/* Odoo pinner: start out unpinned. */
+		buf->soft_pin_tier = SOFT_PIN_TIER_NONE;
 	}
+
+	/* Odoo pinner: shared-memory ring-buffer forced-relations table. */
+	InitRingBufferTable();
 }

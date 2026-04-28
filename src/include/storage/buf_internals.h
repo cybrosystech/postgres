@@ -356,7 +356,14 @@ typedef struct BufferDesc
 	 * buffer header spinlock.
 	 */
 	proclist_head lock_waiters;
+
+	/* Soft-pin tier (Odoo pinner). Non-atomic; benign races are tolerated. */
+	uint8		soft_pin_tier;
 } BufferDesc;
+
+#define SOFT_PIN_TIER_NONE	0	/* not pinned */
+#define SOFT_PIN_TIER_1		1	/* metadata: yield only on critical pressure */
+#define SOFT_PIN_TIER_2		2	/* OLTP: yield under normal pressure */
 
 /*
  * Concurrent access to buffer headers has proven to be more efficient if

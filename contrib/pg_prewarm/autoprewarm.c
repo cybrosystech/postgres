@@ -50,6 +50,9 @@
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
+#include "db_blue_pinner.h"
+
+
 #define AUTOPREWARM_FILE "autoprewarm.blocks"
 
 /* Metadata for each block we dump. */
@@ -158,6 +161,9 @@ _PG_init(void)
 	/* Register autoprewarm worker, if enabled. */
 	if (autoprewarm)
 		apw_start_leader_worker();
+		/* NEW  */
+    DBBluePinnerRegisterGUCs();
+    DBBluePinnerRegister();
 }
 
 /*
