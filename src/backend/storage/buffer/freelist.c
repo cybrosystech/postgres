@@ -283,6 +283,46 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint64 *buf_state, bool *from_r
 				continue;
 			}
 
+			/*
+			 * Odoo pinner: soft-pin check.
+			 *
+			 * If this buffer is soft-pinned, decide whether to skip it
+			 * based on tier and current pool pressure. We check this
+			 * before the usagecount branch so a soft-pinned buffer with
+			 * usagecount=0 is still protected (without this, it would be
+			 * the very next thing the clock-sweep evicts).
+			 *
+			 * A `break` here exits the inner CAS loop and lets the outer
+			 * loop pick the next buffer via ClockSweepTick(). soft_pin_tier
+			 * is a non-atomic uint8; benign races with the pinner are
+			 * tolerated (a missed clear gets re-stamped next pinner cycle).
+			 */
+			if (buf->soft_pin_tier != SOFT_PIN_TIER_NONE)
+			{
+				uint8		tier = buf->soft_pin_tier;
+
+				if (tier == SOFT_PIN_TIER_1)
+				{
+					if (!BufferPoolCriticalPressure())
+						break;
+					buf->soft_pin_tier = SOFT_PIN_TIER_NONE;
+					elog(LOG,
+						 "StrategyGetBuffer: releasing tier 1 pin on buf %d under critical pressure",
+						 buf->buf_id);
+				}
+				else if (tier == SOFT_PIN_TIER_2)
+				{
+					if (!BufferPoolUnderPressure())
+						break;
+					buf->soft_pin_tier = SOFT_PIN_TIER_NONE;
+				}
+				else
+				{
+					/* stale/invalid tier — clear it */
+					buf->soft_pin_tier = SOFT_PIN_TIER_NONE;
+				}
+			}
+
 			if (BUF_STATE_GET_USAGECOUNT(local_buf_state) != 0)
 			{
 				local_buf_state -= BUF_USAGECOUNT_ONE;
