@@ -79,6 +79,59 @@ int		dbblue_auto_index_suggestion_top_n_queries = 50;
 char   *dbblue_auto_index_suggestion_database = NULL;
 
 /*
+ * dbblue_check_advisor_enabled
+ *		GUC check_hook for dbblue_auto_index_suggestion_enabled.
+ *
+ * Fires synchronously in the backend that runs ALTER SYSTEM SET (or
+ * any other source that changes the GUC), so any ereport() the hook
+ * emits is delivered straight to the client (psql, the application,
+ * etc.) — not just to the server log.
+ *
+ * The hook does NOT block the value change.  It only complains when
+ * the operator is turning the feature ON while pg_stat_statements is
+ * not yet in shared_preload_libraries — a configuration that would
+ * cause every advisor tick to fail.  shared_preload_libraries is a
+ * PGC_POSTMASTER GUC and a backend cannot change it; the only fix is
+ * a server restart, so we surface the warning as early and as visibly
+ * as possible.
+ *
+ * Returning true unconditionally means the value is always accepted;
+ * the operator can turn the feature on without pg_stat_statements
+ * preloaded if they want (the worker will keep parking and warning
+ * each tick), and they can turn it off freely.
+ */
+bool
+dbblue_check_advisor_enabled(bool *newval, void **extra, GucSource source)
+{
+	const char *spl;
+
+	/* Only complain when the operator is turning the feature ON. */
+	if (!(*newval))
+		return true;
+
+	/*
+	 * Inspect the current shared_preload_libraries setting.  We pass
+	 * missing_ok=true defensively even though this GUC always exists.
+	 * restrict_privileged=false because we don't need superuser-only
+	 * values; SPL is readable by anyone.
+	 */
+	spl = GetConfigOption("shared_preload_libraries", true, false);
+
+	if (spl == NULL || *spl == '\0' ||
+		strstr(spl, "pg_stat_statements") == NULL)
+	{
+		printf(_("WARNING: dbblue_auto_index_suggestion_enabled is being set to on, but pg_stat_statements is not in shared_preload_libraries"));
+		ereport(NOTICE,
+				(errmsg("dbblue_auto_index_suggestion_enabled is being set to on, but pg_stat_statements is not in shared_preload_libraries"),
+				 errdetail("The advisor reads workload statistics from pg_stat_statements; without that library preloaded into shared memory, every advisor tick will fail and no index suggestions will be produced."),
+				 errhint("Run: ALTER SYSTEM SET shared_preload_libraries = 'pg_stat_statements';\n"
+						 "Then restart the server (a restart is required because shared_preload_libraries is a postmaster-only GUC).")));
+	}
+
+	return true;
+}
+
+/*
  * One candidate index, derived from a single query.
  *
  * Phase 3 only emits single-column candidates; Phase 5 extends this
@@ -133,7 +186,8 @@ static bool dbblue_hypopg_available = false;
 #define DBBLUE_MAX_QUERY_TEXT_LEN 16384
 
 static void dbblue_advisor_ensure_results_table(void);
-static void dbblue_advisor_detect_hypopg(void);
+static void dbblue_advisor_ensure_extensions(void);
+static bool dbblue_try_create_extension(const char *extname);
 static void dbblue_advisor_run_tick(void);
 static void dbblue_advisor_process_query(StatStatementsRow *row);
 static bool dbblue_query_should_skip(Query *query);
@@ -460,43 +514,135 @@ extract_var_walker(Node *node, CandidateWalkerCtx *ctx)
 }
 
 /*
- * dbblue_advisor_detect_hypopg
- *		Set dbblue_hypopg_available based on whether the hypopg extension
- *		is installed in our connected database.
+ * dbblue_try_create_extension
+ *		Run "CREATE EXTENSION IF NOT EXISTS <extname>" via SPI inside an
+ *		internal subtransaction, so a permission error or a missing
+ *		extension package warns rather than aborting the surrounding
+ *		ensure_extensions() transaction.
  *
- * Called once at worker startup.  If hypopg is missing, the advisor
- * still parses queries and lists candidates in the log but skips cost
- * evaluation and writes no rows.
+ * Caller must already be inside SPI_connect.  `extname` is spliced
+ * directly into SQL — only call with trusted constants.
+ *
+ * Returns true if the extension is installed in the connected
+ * database after the call (either it was already there, or we just
+ * created it).
+ */
+static bool
+dbblue_try_create_extension(const char *extname)
+{
+	StringInfoData sql;
+	MemoryContext oldcontext = CurrentMemoryContext;
+	ResourceOwner oldowner = CurrentResourceOwner;
+	bool		ok = false;
+
+	initStringInfo(&sql);
+	appendStringInfo(&sql, "CREATE EXTENSION IF NOT EXISTS %s", extname);
+
+	BeginInternalSubTransaction(NULL);
+
+	PG_TRY();
+	{
+		SPI_execute(sql.data, false, 0);
+
+		ReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(oldcontext);
+		CurrentResourceOwner = oldowner;
+		ok = true;
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		MemoryContextSwitchTo(oldcontext);
+		edata = CopyErrorData();
+		FlushErrorState();
+		RollbackAndReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(oldcontext);
+		CurrentResourceOwner = oldowner;
+
+		ereport(WARNING,
+				(errmsg("dbblue index advisor: could not CREATE EXTENSION %s in database \"%s\": %s",
+						extname,
+						dbblue_auto_index_suggestion_database,
+						edata->message)));
+		FreeErrorData(edata);
+	}
+	PG_END_TRY();
+
+	pfree(sql.data);
+	return ok;
+}
+
+/*
+ * dbblue_advisor_ensure_extensions
+ *		Install pg_stat_statements and hypopg in the connected database
+ *		(idempotent via CREATE EXTENSION IF NOT EXISTS), and update
+ *		dbblue_hypopg_available accordingly.
+ *
+ * Called only when the operator has the feature switched on (gated in
+ * the main loop), and only the first tick after each off→on transition.
+ *
+ * pg_stat_statements requires its shared library to be loaded via
+ * shared_preload_libraries; that is a postmaster-only GUC and a
+ * backend cannot change it.  We log a clear WARNING + errhint when we
+ * see it missing, then continue — CREATE EXTENSION pg_stat_statements
+ * still creates the SQL view, it just won't have any data to report.
  */
 static void
-dbblue_advisor_detect_hypopg(void)
+dbblue_advisor_ensure_extensions(void)
 {
-
 	int			ret;
+	bool		preloaded = false;
+	bool		psl_ok;
+	bool		hypo_ok;
 
 	StartTransactionCommand();
 	SPI_connect();
 	PushActiveSnapshot(GetTransactionSnapshot());
 	pgstat_report_activity(STATE_RUNNING,
-						   "dbblue index advisor: detecting hypopg");
+						   "dbblue index advisor: ensuring extensions");
 
-	ret = SPI_execute("SELECT 1 FROM pg_extension WHERE extname = 'hypopg'",
-					  true, 0);
-	dbblue_hypopg_available = (ret == SPI_OK_SELECT && SPI_processed > 0);
+	/* Step 1.  Verify pg_stat_statements is preloaded. */
+	ret = SPI_execute("SELECT 1 FROM pg_settings "
+					  "WHERE name = 'shared_preload_libraries' "
+					  "  AND setting LIKE '%pg_stat_statements%'",
+					  true, 1);
+	if (ret == SPI_OK_SELECT && SPI_processed > 0)
+		preloaded = true;
+
+	if (!preloaded)
+		ereport(WARNING,
+				(errmsg("dbblue index advisor: pg_stat_statements is not in shared_preload_libraries"),
+				 errdetail("The pg_stat_statements SQL view will be created but will report no query statistics until the library is preloaded."),
+				 errhint("Add 'pg_stat_statements' to shared_preload_libraries in postgresql.conf and restart the server.")));
+
+	/* Step 2.  Install (or confirm) both extensions. */
+	psl_ok = dbblue_try_create_extension("pg_stat_statements");
+	hypo_ok = dbblue_try_create_extension("hypopg");
 
 	SPI_finish();
 	PopActiveSnapshot();
 	CommitTransactionCommand();
 	pgstat_report_activity(STATE_IDLE, NULL);
 
-	if (dbblue_hypopg_available)
+	if (psl_ok)
 		ereport(LOG,
-				(errmsg("dbblue index advisor: hypopg extension detected; cost evaluation enabled")));
+				(errmsg("dbblue index advisor: pg_stat_statements extension is installed in database \"%s\"",
+						dbblue_auto_index_suggestion_database)));
+
+	if (hypo_ok)
+	{
+		dbblue_hypopg_available = true;
+		ereport(LOG,
+				(errmsg("dbblue index advisor: hypopg extension is installed; cost evaluation enabled")));
+	}
 	else
+	{
+		dbblue_hypopg_available = false;
 		ereport(WARNING,
-				(errmsg("dbblue index advisor: hypopg extension not installed in database \"%s\"; candidates will be logged but no rows will be written",
-						dbblue_auto_index_suggestion_database),
-				 errhint("Run CREATE EXTENSION hypopg in that database to enable cost-based suggestions.")));
+				(errmsg("dbblue index advisor: hypopg extension is unavailable; candidates will be logged but no rows will be written"),
+				 errhint("Install the hypopg package on the server, then re-enable dbblue_auto_index_suggestion_enabled.")));
+	}
 }
 
 /*
@@ -524,6 +670,7 @@ dbblue_advisor_get_plan_cost(const char *query_text)
 	appendStringInfo(&explain_sql,
 					 "EXPLAIN (FORMAT JSON, GENERIC_PLAN) %s",
 					 query_text);
+	ereport(LOG,errmsg("dbblue query for cost estimation: %s", explain_sql.data));
 
 	/*
 	 * NOTE: read_only must be false here.  EXPLAIN is rejected by SPI
@@ -1170,6 +1317,8 @@ dbblue_advisor_run_tick(void)
 void
 DbblueIndexAdvisorMain(Datum main_arg)
 {
+	bool		extensions_ensured = false;
+
 	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	BackgroundWorkerUnblockSignals();
@@ -1181,8 +1330,14 @@ DbblueIndexAdvisorMain(Datum main_arg)
 			(errmsg("dbblue index advisor started (database=\"%s\")",
 					dbblue_auto_index_suggestion_database)));
 
+	/*
+	 * The results table is needed regardless of the on/off flag (so the
+	 * DBA can still inspect past suggestions while the feature is paused),
+	 * so create it unconditionally at startup.  pg_stat_statements and
+	 * hypopg are only auto-installed once the operator switches the
+	 * feature on — see the loop body.
+	 */
 	dbblue_advisor_ensure_results_table();
-	dbblue_advisor_detect_hypopg();
 
 	while (!ShutdownRequestPending)
 	{
@@ -1196,7 +1351,25 @@ DbblueIndexAdvisorMain(Datum main_arg)
 		}
 
 		if (dbblue_auto_index_suggestion_enabled)
+		{
+			/*
+			 * First tick after each off→on transition: install (or
+			 * verify) pg_stat_statements and hypopg in the connected
+			 * database.  Cleared on flip-to-off below so a subsequent
+			 * re-enable picks up any extension drops the operator made
+			 * in the interim.
+			 */
+			if (!extensions_ensured)
+			{
+				dbblue_advisor_ensure_extensions();
+				extensions_ensured = true;
+			}
 			dbblue_advisor_run_tick();
+		}
+		else
+		{
+			extensions_ensured = false;
+		}
 
 		timeout_ms = (long) dbblue_auto_index_suggestion_interval * 1000L;
 		rc = WaitLatch(MyLatch,

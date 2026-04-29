@@ -636,6 +636,7 @@
   flags => 'GUC_NOT_IN_SAMPLE',
   variable => 'dbblue_auto_index_suggestion_enabled',
   boot_val => 'false',
+  check_hook => 'dbblue_check_advisor_enabled',
 },
 
 { name => 'dbblue_auto_index_suggestion_interval', type => 'int', context => 'PGC_SIGHUP', group => 'STATS_MONITORING',

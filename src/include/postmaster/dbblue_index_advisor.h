@@ -14,6 +14,7 @@
 #define DBBLUE_INDEX_ADVISOR_H
 
 #include "fmgr.h"
+#include "utils/guc.h"
 
 /* GUC-backed variables */
 extern PGDLLIMPORT bool dbblue_auto_index_suggestion_enabled;
@@ -26,5 +27,9 @@ extern PGDLLIMPORT char *dbblue_auto_index_suggestion_database;
 
 extern void DbblueIndexAdvisorRegister(void);
 extern void DbblueIndexAdvisorMain(Datum main_arg);
+
+/* GUC check_hook: validates dbblue_auto_index_suggestion_enabled. */
+extern bool dbblue_check_advisor_enabled(bool *newval, void **extra,
+										 GucSource source);
 
 #endif							/* DBBLUE_INDEX_ADVISOR_H */
