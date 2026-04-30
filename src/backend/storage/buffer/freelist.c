@@ -187,6 +187,16 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint64 *buf_state, bool *from_r
 	int			bgwprocno;
 	int			trycounter;
 
+	/*
+	 * Soft-pin pressure cache. Computed lazily on the first soft-pinned
+	 * buffer this clock sweep encounters, then reused. Without this cache
+	 * each encounter re-walks the buffer pool, turning the sweep into
+	 * O(N^2) under sustained pressure.
+	 */
+	bool		pressure_known = false;
+	bool		under_pressure = false;
+	bool		critical_pressure = false;
+
 	*from_ring = false;
 
 	/*
@@ -301,9 +311,21 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint64 *buf_state, bool *from_r
 			{
 				uint8		tier = buf->soft_pin_tier;
 
+				/*
+				 * Resolve pool pressure once per StrategyGetBuffer call.
+				 * Both flags come from a single ComputePoolPressure walk;
+				 * the cache holds for the rest of this sweep so subsequent
+				 * soft-pin encounters cost O(1) instead of O(N).
+				 */
+				if (!pressure_known)
+				{
+					ComputePoolPressure(&under_pressure, &critical_pressure);
+					pressure_known = true;
+				}
+
 				if (tier == SOFT_PIN_TIER_1)
 				{
-					if (!BufferPoolCriticalPressure())
+					if (!critical_pressure)
 						break;
 					buf->soft_pin_tier = SOFT_PIN_TIER_NONE;
 					elog(LOG,
@@ -312,7 +334,7 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint64 *buf_state, bool *from_r
 				}
 				else if (tier == SOFT_PIN_TIER_2)
 				{
-					if (!BufferPoolUnderPressure())
+					if (!under_pressure)
 						break;
 					buf->soft_pin_tier = SOFT_PIN_TIER_NONE;
 				}
