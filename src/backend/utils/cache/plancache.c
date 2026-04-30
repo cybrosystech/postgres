@@ -107,9 +107,12 @@ static int bucket_for_array_length(int len);
 static int64 compute_param_signature(CachedPlanSource *plansource,
 									 ParamListInfo boundParams);
 static ParamListInfo synthesize_bucket_params(CachedPlanSource *plansource,
+											  ParamListInfo boundParams,
 											  int64 signature);
 static CachedPlan *get_or_build_bucketed_gplan(CachedPlanSource *plansource,
-											   List *qlist, int64 signature,
+											   List *qlist,
+											   ParamListInfo boundParams,
+											   int64 signature,
 											   QueryEnvironment *queryEnv);
 
 /*
@@ -748,40 +751,74 @@ bucket_for_array_length(int len)
  * array parameters in boundParams.
  *
  * Returns -1 if bucketing is not applicable for this call (no array params,
- * boundParams uses paramFetch which we don't support yet, or the bound
- * parameter array is shorter than expected).
+ * boundParams shorter than expected, or paramFetch refuses to provide a value
+ * speculatively).
  *
  * The signature packs a 4-bit bucket index per array parameter, in the order
  * they appear in plansource->param_types.  Non-array parameters contribute
  * nothing.  We stop after 15 array parameters (60 bits).
+ *
+ * If boundParams has a paramFetch hook (PL/pgSQL via SPI, etc.), we call it
+ * with speculative=true to inspect the array length without triggering side
+ * effects.  If the hook returns an invalid value (ptype=InvalidOid), we fall
+ * back to the unbucketed path.
  */
 static int64
 compute_param_signature(CachedPlanSource *plansource, ParamListInfo boundParams)
 {
 	int64		sig = 0;
 	int			shift = 0;
+	bool		any_array = false;
 
-	if (!plansource->has_array_params || boundParams == NULL ||
-		boundParams->paramFetch != NULL)
+	if (boundParams == NULL || boundParams->numParams == 0)
 		return -1;
 
-	for (int i = 0; i < plansource->num_params; i++)
+	for (int i = 0; i < boundParams->numParams; i++)
 	{
-		Oid			ptype = plansource->param_types[i];
+		Oid			ptype = InvalidOid;
 		Oid			elemtype;
 		ParamExternData *prm;
+		ParamExternData prmwork;
 		int			arrlen;
 
-		if (!OidIsValid(ptype))
+		/*
+		 * Resolve param type and value.  For static params the type is in
+		 * plansource->param_types; for dynamic params (parserSetup hook,
+		 * used by PL/pgSQL via SPI) we must call paramFetch to learn the
+		 * type.  speculative=true so PL/pgSQL can refuse without raising
+		 * an error; in that case we fall back to the unbucketed path.
+		 */
+		if (boundParams->paramFetch != NULL)
+		{
+			prm = boundParams->paramFetch(boundParams, i + 1, true, &prmwork);
+			/*
+			 * PL/pgSQL marks variables NOT used in the current SQL with
+			 * ptype=InvalidOid via speculative.  Skip them; they don't
+			 * affect bucketing for THIS query.  Don't return -1 — that
+			 * would disable bucketing whenever the function has any
+			 * unused locals (which is almost always).
+			 */
+			if (prm == NULL || !OidIsValid(prm->ptype))
+				continue;
+			ptype = prm->ptype;
+		}
+		else
+		{
+			if (plansource->param_types != NULL && i < plansource->num_params)
+				ptype = plansource->param_types[i];
+			prm = &boundParams->params[i];
+			if (!OidIsValid(ptype))
+				ptype = prm->ptype;
+		}
+
+		/* Phase 1+2 scope: only int4[] and int8[] are bucketable */
+		if (ptype != INT4ARRAYOID && ptype != INT8ARRAYOID)
 			continue;
+
 		elemtype = get_element_type(ptype);
 		if (!OidIsValid(elemtype))
-			continue;			/* not an array type */
+			continue;
 
-		if (i >= boundParams->numParams)
-			return -1;
-
-		prm = &boundParams->params[i];
 		if (prm->isnull)
 		{
 			arrlen = 0;
@@ -795,9 +832,13 @@ compute_param_signature(CachedPlanSource *plansource, ParamListInfo boundParams)
 
 		sig |= ((int64) bucket_for_array_length(arrlen)) << shift;
 		shift += 4;
+		any_array = true;
 		if (shift >= 60)
 			break;
 	}
+
+	if (!any_array)
+		return -1;
 	return sig;
 }
 
@@ -810,16 +851,31 @@ compute_param_signature(CachedPlanSource *plansource, ParamListInfo boundParams)
  * PARAM_FLAG_CONST, so the planner uses them only as hints for selectivity
  * estimation; it will not fold them into the produced plan as constants.
  *
+ * For static-param sources (plansource->param_types is set), iterate by
+ * plansource->num_params and use those types.  For dynamic-param sources
+ * (PL/pgSQL via SPI, num_params=0 but boundParams has paramFetch), use
+ * boundParams->numParams and probe paramFetch for each type.
+ *
  * Caller is responsible for the memory context (we palloc in
  * CurrentMemoryContext).  Currently supports int4[] and int8[] element types
  * only; for other array types the slot is left as NULL.
  */
 static ParamListInfo
-synthesize_bucket_params(CachedPlanSource *plansource, int64 signature)
+synthesize_bucket_params(CachedPlanSource *plansource,
+						 ParamListInfo boundParams, int64 signature)
 {
-	int			n = plansource->num_params;
+	int			n;
+	bool		dynamic;
 	ParamListInfo plist;
 	int			shift = 0;
+
+	dynamic = (plansource->num_params == 0 && boundParams != NULL &&
+			   boundParams->paramFetch != NULL);
+
+	if (dynamic)
+		n = boundParams->numParams;
+	else
+		n = plansource->num_params;
 
 	if (n == 0)
 		return NULL;
@@ -836,9 +892,10 @@ synthesize_bucket_params(CachedPlanSource *plansource, int64 signature)
 
 	for (int i = 0; i < n; i++)
 	{
-		Oid			ptype = plansource->param_types[i];
-		Oid			elemtype = OidIsValid(ptype) ? get_element_type(ptype) : InvalidOid;
+		Oid			ptype = InvalidOid;
+		Oid			elemtype;
 		ParamExternData *prm = &plist->params[i];
+		ParamExternData prmwork;
 		int			bucket;
 		int			len;
 		Datum	   *elems;
@@ -847,15 +904,32 @@ synthesize_bucket_params(CachedPlanSource *plansource, int64 signature)
 		bool		elmbyval;
 		char		elmalign;
 
-		prm->ptype = ptype;
 		prm->pflags = 0;		/* deliberately NOT PARAM_FLAG_CONST */
 		prm->isnull = true;
 		prm->value = (Datum) 0;
 
+		if (dynamic)
+		{
+			ParamExternData *got = boundParams->paramFetch(boundParams, i + 1,
+														   true, &prmwork);
+			if (got == NULL || !OidIsValid(got->ptype))
+			{
+				prm->ptype = InvalidOid;
+				continue;
+			}
+			ptype = got->ptype;
+		}
+		else
+		{
+			ptype = plansource->param_types[i];
+		}
+		prm->ptype = ptype;
+
+		elemtype = OidIsValid(ptype) ? get_element_type(ptype) : InvalidOid;
 		if (!OidIsValid(elemtype))
 			continue;
 
-		/* Only int4 and int8 element arrays are supported in Phase 1 */
+		/* Only int4 and int8 element arrays are supported */
 		if (elemtype != INT4OID && elemtype != INT8OID)
 			continue;
 
@@ -896,7 +970,8 @@ synthesize_bucket_params(CachedPlanSource *plansource, int64 signature)
  */
 static CachedPlan *
 get_or_build_bucketed_gplan(CachedPlanSource *plansource, List *qlist,
-							int64 signature, QueryEnvironment *queryEnv)
+							ParamListInfo boundParams, int64 signature,
+							QueryEnvironment *queryEnv)
 {
 	int			free_slot = -1;
 	ParamListInfo synth;
@@ -936,7 +1011,7 @@ get_or_build_bucketed_gplan(CachedPlanSource *plansource, List *qlist,
 	}
 
 	/* Build a new plan with synthetic params for this bucket */
-	synth = synthesize_bucket_params(plansource, signature);
+	synth = synthesize_bucket_params(plansource, boundParams, signature);
 	plan = BuildCachedPlan(plansource, qlist, synth, queryEnv);
 
 	if (free_slot >= 0)
@@ -1656,15 +1731,21 @@ GetCachedPlan(CachedPlanSource *plansource, ParamListInfo boundParams,
 		 * If the query has array-typed parameters, look up (or build) a
 		 * generic plan tailored for the actual array size class, instead of
 		 * sharing a single generic plan across all sizes.
+		 *
+		 * has_array_params is a quick-path hint; for dynamic-param sources
+		 * (PL/pgSQL via SPI) num_params is 0 at CompleteCachedPlan time, so
+		 * we must also probe boundParams when the hint says no.
 		 */
-		if (plansource->has_array_params)
+		if (plansource->has_array_params ||
+			(boundParams != NULL && boundParams->paramFetch != NULL))
 			bucket_sig = compute_param_signature(plansource, boundParams);
 
 		if (bucket_sig >= 0)
 		{
 			/* Bucketed generic-plan path */
 			plan = get_or_build_bucketed_gplan(plansource, qlist,
-											   bucket_sig, queryEnv);
+											   boundParams, bucket_sig,
+											   queryEnv);
 		}
 		else if (CheckCachedPlan(plansource))
 		{
