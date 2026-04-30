@@ -9127,15 +9127,30 @@ const PgAioHandleCallbacks aio_local_buffer_readv_cb = {
  */
 
 /*
- * BufferPoolUnderPressure — true when fewer than 5% of buffers are
- * freely evictable (refcount==0 and not soft-pinned). Consulted by
- * the clock-sweep when it considers evicting a Tier 2 soft-pinned buffer.
+ * ComputePoolPressure — single-pass pool scan that resolves both the
+ * "under pressure" (<5% evictable) and "critical pressure" (<2% evictable)
+ * flags in one walk.
+ *
+ * Hot-path callers (StrategyGetBuffer) should compute this once per
+ * StrategyGetBuffer call and reuse the cached result for every soft-pin
+ * encounter. Calling separate per-tier helpers per encounter turns the
+ * clock sweep into O(N^2) under sustained pressure with many pinned
+ * buffers, which is the issue this function is designed to avoid.
+ *
+ * Counts buffers as "evictable" iff refcount==0 and soft_pin_tier==NONE.
+ * Reads soft_pin_tier non-atomically (a uint8); benign races with the
+ * pinner are tolerated — the threshold checks are coarse and a stale
+ * read by ±1 buffer cannot flip pressure state in any meaningful way.
+ *
+ * Early-exit: once free_count crosses the 5% threshold, both flags are
+ * known to be false and we return immediately without finishing the walk.
  */
-bool
-BufferPoolUnderPressure(void)
+void
+ComputePoolPressure(bool *under_pressure, bool *critical_pressure)
 {
 	int			free_count = 0;
-	int			threshold = NBuffers / 20;	/* 5% */
+	int			under_threshold = NBuffers / 20;	/* 5% */
+	int			critical_threshold = NBuffers / 50; /* 2% */
 	int			i;
 
 	for (i = 0; i < NBuffers; i++)
@@ -9146,42 +9161,51 @@ BufferPoolUnderPressure(void)
 		if (BUF_STATE_GET_REFCOUNT(buf_state) == 0 &&
 			buf->soft_pin_tier == SOFT_PIN_TIER_NONE)
 		{
-			free_count++;
-			if (free_count >= threshold)
-				return false;
+			if (++free_count >= under_threshold)
+			{
+				*under_pressure = false;
+				*critical_pressure = false;
+				return;
+			}
 		}
 	}
 
-	return true;
+	/* did not reach 5% — definitely under pressure */
+	*under_pressure = true;
+	*critical_pressure = (free_count < critical_threshold);
+}
+
+/*
+ * BufferPoolUnderPressure — true when fewer than 5% of buffers are
+ * freely evictable (refcount==0 and not soft-pinned). Thin wrapper over
+ * ComputePoolPressure for callers that only need one flag.
+ *
+ * Hot-path callers should use ComputePoolPressure directly so both
+ * flags come from a single walk.
+ */
+bool
+BufferPoolUnderPressure(void)
+{
+	bool		under;
+	bool		critical;
+
+	ComputePoolPressure(&under, &critical);
+	return under;
 }
 
 /*
  * BufferPoolCriticalPressure — true when fewer than 2% of buffers are
  * freely evictable. The last-resort threshold where even Tier 1
- * (metadata) soft pins must yield.
+ * (metadata) soft pins must yield. Thin wrapper over ComputePoolPressure.
  */
 bool
 BufferPoolCriticalPressure(void)
 {
-	int			free_count = 0;
-	int			threshold = NBuffers / 50;	/* 2% */
-	int			i;
+	bool		under;
+	bool		critical;
 
-	for (i = 0; i < NBuffers; i++)
-	{
-		BufferDesc *buf = GetBufferDescriptor(i);
-		uint64		buf_state = pg_atomic_read_u64(&buf->state);
-
-		if (BUF_STATE_GET_REFCOUNT(buf_state) == 0 &&
-			buf->soft_pin_tier == SOFT_PIN_TIER_NONE)
-		{
-			free_count++;
-			if (free_count >= threshold)
-				return false;
-		}
-	}
-
-	return true;
+	ComputePoolPressure(&under, &critical);
+	return critical;
 }
 
 /*
