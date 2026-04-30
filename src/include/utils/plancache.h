@@ -144,7 +144,22 @@ typedef struct CachedPlanSource
 	double		total_custom_cost;	/* total cost of custom plans so far */
 	int64		num_custom_plans;	/* # of custom plans included in total */
 	int64		num_generic_plans;	/* # of generic plans */
+	/*
+	 * Bucketed generic plans, one per array-size class.  Populated only when
+	 * the query has at least one array-typed parameter.  See plancache.c.
+	 */
+	bool		has_array_params;	/* any array-typed parameter? */
+	int			n_gplan_buckets;	/* # of populated bucket entries */
+	struct CachedPlanBucket *gplan_buckets; /* array of MAX_GPLAN_BUCKETS */
 } CachedPlanSource;
+
+#define MAX_GPLAN_BUCKETS 6
+
+typedef struct CachedPlanBucket
+{
+	int64		signature;		/* hash of per-array-param size buckets */
+	struct CachedPlan *plan;	/* refcounted plan, or NULL if slot unused */
+} CachedPlanBucket;
 
 /*
  * CachedPlan represents an execution plan derived from a CachedPlanSource.

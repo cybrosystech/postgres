@@ -58,6 +58,7 @@
 
 #include "access/transam.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_type_d.h"
 #include "executor/executor.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
@@ -67,7 +68,9 @@
 #include "storage/lmgr.h"
 #include "tcop/pquery.h"
 #include "tcop/utility.h"
+#include "utils/array.h"
 #include "utils/inval.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
 #include "utils/rls.h"
@@ -89,6 +92,8 @@ static dlist_head saved_plan_list = DLIST_STATIC_INIT(saved_plan_list);
 static dlist_head cached_expression_list = DLIST_STATIC_INIT(cached_expression_list);
 
 static void ReleaseGenericPlan(CachedPlanSource *plansource);
+static void ReleaseAllBucketedPlans(CachedPlanSource *plansource);
+static void MarkAllBucketedPlansInvalid(CachedPlanSource *plansource);
 static bool StmtPlanRequiresRevalidation(CachedPlanSource *plansource);
 static bool BuildingPlanRequiresSnapshot(CachedPlanSource *plansource);
 static List *RevalidateCachedQuery(CachedPlanSource *plansource,
@@ -98,6 +103,23 @@ static CachedPlan *BuildCachedPlan(CachedPlanSource *plansource, List *qlist,
 								   ParamListInfo boundParams, QueryEnvironment *queryEnv);
 static bool choose_custom_plan(CachedPlanSource *plansource,
 							   ParamListInfo boundParams);
+static int bucket_for_array_length(int len);
+static int64 compute_param_signature(CachedPlanSource *plansource,
+									 ParamListInfo boundParams);
+static ParamListInfo synthesize_bucket_params(CachedPlanSource *plansource,
+											  int64 signature);
+static CachedPlan *get_or_build_bucketed_gplan(CachedPlanSource *plansource,
+											   List *qlist, int64 signature,
+											   QueryEnvironment *queryEnv);
+
+/*
+ * Bucket midpoints used when synthesizing fake array values for planning.
+ * Index matches bucket_for_array_length(): 0=>1, 1=>5, 2=>50, 3=>500, 4=>5000,
+ * 5=>50000.  These are passed to the planner as hint values (without
+ * PARAM_FLAG_CONST) so it computes selectivity as if the real array had this
+ * many elements.
+ */
+static const int bucket_midpoint[MAX_GPLAN_BUCKETS] = {1, 5, 50, 500, 5000, 50000};
 static double cached_plan_cost(CachedPlan *plan, bool include_planner);
 static Query *QueryListGetPrimaryStmt(List *stmts);
 static void AcquireExecutorLocks(List *stmt_list, bool acquire);
@@ -483,6 +505,22 @@ CompleteCachedPlan(CachedPlanSource *plansource,
 	plansource->fixed_result = fixed_result;
 
 	/*
+	 * Detect whether any parameter is an array type we know how to bucket on.
+	 * For now, only int4[] and int8[] are bucketable (Phase 1).  Other array
+	 * types (text[], jsonb, etc.) fall back to the single-gplan path.
+	 */
+	plansource->has_array_params = false;
+	for (int i = 0; i < num_params; i++)
+	{
+		if (param_types[i] == INT4ARRAYOID ||
+			param_types[i] == INT8ARRAYOID)
+		{
+			plansource->has_array_params = true;
+			break;
+		}
+	}
+
+	/*
 	 * Also save the result tuple descriptor.  PlanCacheComputeResultDesc may
 	 * leak some cruft; normally we just accept that to save a copy step, but
 	 * in USE_VALGRIND mode be tidy by running it in the caller's context.
@@ -615,6 +653,10 @@ DropCachedPlan(CachedPlanSource *plansource)
 
 /*
  * ReleaseGenericPlan: release a CachedPlanSource's generic plan, if any.
+ *
+ * Also drops every per-bucket generic plan, since the bucketed plans are
+ * derived from the same query tree as the unbucketed gplan and become invalid
+ * for the same reasons.
  */
 static void
 ReleaseGenericPlan(CachedPlanSource *plansource)
@@ -628,6 +670,296 @@ ReleaseGenericPlan(CachedPlanSource *plansource)
 		plansource->gplan = NULL;
 		ReleaseCachedPlan(plan, NULL);
 	}
+	ReleaseAllBucketedPlans(plansource);
+}
+
+/*
+ * MarkAllBucketedPlansInvalid: mark every per-bucket cached plan invalid.
+ *
+ * Called from sinval-driven invalidation paths next to every existing
+ * "plansource->gplan->is_valid = false".  We can't release the plans here
+ * because they may be in use by an executing statement; the next
+ * GetCachedPlan call will notice is_valid=false, drop the entry, and rebuild.
+ */
+static void
+MarkAllBucketedPlansInvalid(CachedPlanSource *plansource)
+{
+	if (plansource->gplan_buckets == NULL)
+		return;
+	for (int i = 0; i < MAX_GPLAN_BUCKETS; i++)
+	{
+		CachedPlan *p = plansource->gplan_buckets[i].plan;
+
+		if (p != NULL)
+			p->is_valid = false;
+	}
+}
+
+/*
+ * ReleaseAllBucketedPlans: drop every cached per-bucket generic plan.
+ *
+ * Called from invalidation paths and when the plansource itself is dropped.
+ * Leaves the gplan_buckets array allocated; just clears the slots.
+ */
+static void
+ReleaseAllBucketedPlans(CachedPlanSource *plansource)
+{
+	if (plansource->gplan_buckets == NULL)
+		return;
+	for (int i = 0; i < MAX_GPLAN_BUCKETS; i++)
+	{
+		CachedPlan *plan = plansource->gplan_buckets[i].plan;
+
+		if (plan != NULL)
+		{
+			Assert(plan->magic == CACHEDPLAN_MAGIC);
+			plansource->gplan_buckets[i].plan = NULL;
+			plansource->gplan_buckets[i].signature = 0;
+			ReleaseCachedPlan(plan, NULL);
+		}
+	}
+	plansource->n_gplan_buckets = 0;
+}
+
+/*
+ * bucket_for_array_length: map an array element count to a bucket index.
+ *
+ * Logarithmic buckets: 0={1}, 1={2-10}, 2={11-100}, 3={101-1000},
+ * 4={1001-10000}, 5={10001+}.  See MAX_GPLAN_BUCKETS in plancache.h.
+ */
+static int
+bucket_for_array_length(int len)
+{
+	if (len <= 1)
+		return 0;
+	if (len <= 10)
+		return 1;
+	if (len <= 100)
+		return 2;
+	if (len <= 1000)
+		return 3;
+	if (len <= 10000)
+		return 4;
+	return MAX_GPLAN_BUCKETS - 1;
+}
+
+/*
+ * compute_param_signature: produce a signature hashing the size buckets of all
+ * array parameters in boundParams.
+ *
+ * Returns -1 if bucketing is not applicable for this call (no array params,
+ * boundParams uses paramFetch which we don't support yet, or the bound
+ * parameter array is shorter than expected).
+ *
+ * The signature packs a 4-bit bucket index per array parameter, in the order
+ * they appear in plansource->param_types.  Non-array parameters contribute
+ * nothing.  We stop after 15 array parameters (60 bits).
+ */
+static int64
+compute_param_signature(CachedPlanSource *plansource, ParamListInfo boundParams)
+{
+	int64		sig = 0;
+	int			shift = 0;
+
+	if (!plansource->has_array_params || boundParams == NULL ||
+		boundParams->paramFetch != NULL)
+		return -1;
+
+	for (int i = 0; i < plansource->num_params; i++)
+	{
+		Oid			ptype = plansource->param_types[i];
+		Oid			elemtype;
+		ParamExternData *prm;
+		int			arrlen;
+
+		if (!OidIsValid(ptype))
+			continue;
+		elemtype = get_element_type(ptype);
+		if (!OidIsValid(elemtype))
+			continue;			/* not an array type */
+
+		if (i >= boundParams->numParams)
+			return -1;
+
+		prm = &boundParams->params[i];
+		if (prm->isnull)
+		{
+			arrlen = 0;
+		}
+		else
+		{
+			ArrayType  *arr = DatumGetArrayTypeP(prm->value);
+
+			arrlen = ArrayGetNItems(ARR_NDIM(arr), ARR_DIMS(arr));
+		}
+
+		sig |= ((int64) bucket_for_array_length(arrlen)) << shift;
+		shift += 4;
+		if (shift >= 60)
+			break;
+	}
+	return sig;
+}
+
+/*
+ * synthesize_bucket_params: build a fake ParamListInfo for planning a
+ * bucket-specific generic plan.
+ *
+ * For each array parameter, we insert a fake array of bucket-midpoint size.
+ * For non-array parameters we leave isnull=true.  The values are NOT marked
+ * PARAM_FLAG_CONST, so the planner uses them only as hints for selectivity
+ * estimation; it will not fold them into the produced plan as constants.
+ *
+ * Caller is responsible for the memory context (we palloc in
+ * CurrentMemoryContext).  Currently supports int4[] and int8[] element types
+ * only; for other array types the slot is left as NULL.
+ */
+static ParamListInfo
+synthesize_bucket_params(CachedPlanSource *plansource, int64 signature)
+{
+	int			n = plansource->num_params;
+	ParamListInfo plist;
+	int			shift = 0;
+
+	if (n == 0)
+		return NULL;
+
+	plist = (ParamListInfo) palloc0(offsetof(ParamListInfoData, params) +
+									n * sizeof(ParamExternData));
+	plist->numParams = n;
+	plist->paramFetch = NULL;
+	plist->paramFetchArg = NULL;
+	plist->paramCompile = NULL;
+	plist->paramCompileArg = NULL;
+	plist->parserSetup = NULL;
+	plist->parserSetupArg = NULL;
+
+	for (int i = 0; i < n; i++)
+	{
+		Oid			ptype = plansource->param_types[i];
+		Oid			elemtype = OidIsValid(ptype) ? get_element_type(ptype) : InvalidOid;
+		ParamExternData *prm = &plist->params[i];
+		int			bucket;
+		int			len;
+		Datum	   *elems;
+		ArrayType  *arr;
+		int16		elmlen;
+		bool		elmbyval;
+		char		elmalign;
+
+		prm->ptype = ptype;
+		prm->pflags = 0;		/* deliberately NOT PARAM_FLAG_CONST */
+		prm->isnull = true;
+		prm->value = (Datum) 0;
+
+		if (!OidIsValid(elemtype))
+			continue;
+
+		/* Only int4 and int8 element arrays are supported in Phase 1 */
+		if (elemtype != INT4OID && elemtype != INT8OID)
+			continue;
+
+		bucket = (signature >> shift) & 0xF;
+		shift += 4;
+		if (bucket < 0 || bucket >= MAX_GPLAN_BUCKETS)
+			continue;
+		len = bucket_midpoint[bucket];
+
+		get_typlenbyvalalign(elemtype, &elmlen, &elmbyval, &elmalign);
+		elems = palloc(sizeof(Datum) * len);
+		for (int j = 0; j < len; j++)
+		{
+			if (elemtype == INT4OID)
+				elems[j] = Int32GetDatum(j + 1);
+			else
+				elems[j] = Int64GetDatum((int64) (j + 1));
+		}
+		arr = construct_array(elems, len, elemtype, elmlen, elmbyval, elmalign);
+		prm->isnull = false;
+		prm->value = PointerGetDatum(arr);
+	}
+
+	return plist;
+}
+
+/*
+ * get_or_build_bucketed_gplan: return a generic plan suitable for the given
+ * parameter signature, building one if no cached entry matches.
+ *
+ * The caller has already determined that we should use a generic plan (i.e.,
+ * choose_custom_plan returned false) and that plansource has array parameters.
+ * Returns a CachedPlan with refcount NOT yet incremented for the caller.
+ *
+ * If the bucket cache is full and no slot matches, we fall back to building a
+ * fresh plan with the synthetic params and don't cache it.  (Eviction policy
+ * is left to a later phase.)
+ */
+static CachedPlan *
+get_or_build_bucketed_gplan(CachedPlanSource *plansource, List *qlist,
+							int64 signature, QueryEnvironment *queryEnv)
+{
+	int			free_slot = -1;
+	ParamListInfo synth;
+	CachedPlan *plan;
+	MemoryContext oldcxt;
+
+	/* Allocate the bucket array on first use, in the source's context */
+	if (plansource->gplan_buckets == NULL)
+	{
+		oldcxt = MemoryContextSwitchTo(plansource->context);
+		plansource->gplan_buckets =
+			(CachedPlanBucket *) palloc0(sizeof(CachedPlanBucket) * MAX_GPLAN_BUCKETS);
+		MemoryContextSwitchTo(oldcxt);
+	}
+
+	/* Look for matching slot */
+	for (int i = 0; i < MAX_GPLAN_BUCKETS; i++)
+	{
+		CachedPlan *p = plansource->gplan_buckets[i].plan;
+
+		if (p != NULL && plansource->gplan_buckets[i].signature == signature)
+		{
+			if (p->is_valid)
+				return p;
+			/* invalidated entry: drop it and reuse the slot */
+			plansource->gplan_buckets[i].plan = NULL;
+			plansource->gplan_buckets[i].signature = 0;
+			ReleaseCachedPlan(p, NULL);
+			free_slot = i;
+			plansource->n_gplan_buckets--;
+			break;
+		}
+		else if (p == NULL && free_slot < 0)
+		{
+			free_slot = i;
+		}
+	}
+
+	/* Build a new plan with synthetic params for this bucket */
+	synth = synthesize_bucket_params(plansource, signature);
+	plan = BuildCachedPlan(plansource, qlist, synth, queryEnv);
+
+	if (free_slot >= 0)
+	{
+		/* Reparent into the source's long-lived context if appropriate */
+		if (plansource->is_saved)
+		{
+			MemoryContextSetParent(plan->context, CacheMemoryContext);
+			plan->is_saved = true;
+		}
+		else
+		{
+			MemoryContextSetParent(plan->context,
+								   MemoryContextGetParent(plansource->context));
+		}
+		plansource->gplan_buckets[free_slot].plan = plan;
+		plansource->gplan_buckets[free_slot].signature = signature;
+		plansource->n_gplan_buckets++;
+		plan->refcount++;		/* the bucket array holds a reference */
+	}
+	/* If no slot was free, plan is uncached; caller still gets a valid plan */
+
+	return plan;
 }
 
 /*
@@ -721,6 +1053,7 @@ RevalidateCachedQuery(CachedPlanSource *plansource,
 			plansource->is_valid = false;
 			if (plansource->gplan)
 				plansource->gplan->is_valid = false;
+			MarkAllBucketedPlansInvalid(plansource);
 		}
 	}
 
@@ -1317,7 +1650,23 @@ GetCachedPlan(CachedPlanSource *plansource, ParamListInfo boundParams,
 
 	if (!customplan)
 	{
-		if (CheckCachedPlan(plansource))
+		int64		bucket_sig = -1;
+
+		/*
+		 * If the query has array-typed parameters, look up (or build) a
+		 * generic plan tailored for the actual array size class, instead of
+		 * sharing a single generic plan across all sizes.
+		 */
+		if (plansource->has_array_params)
+			bucket_sig = compute_param_signature(plansource, boundParams);
+
+		if (bucket_sig >= 0)
+		{
+			/* Bucketed generic-plan path */
+			plan = get_or_build_bucketed_gplan(plansource, qlist,
+											   bucket_sig, queryEnv);
+		}
+		else if (CheckCachedPlan(plansource))
 		{
 			/* We want a generic plan, and we already have a valid one */
 			plan = plansource->gplan;
@@ -1736,6 +2085,8 @@ CopyCachedPlan(CachedPlanSource *plansource)
 	newsource->dependsOnRLS = plansource->dependsOnRLS;
 
 	newsource->gplan = NULL;
+	newsource->has_array_params = plansource->has_array_params;
+	/* gplan_buckets is already NULL from palloc0_object */
 
 	newsource->is_oneshot = false;
 	newsource->is_complete = true;
@@ -2152,6 +2503,7 @@ PlanCacheRelCallback(Datum arg, Oid relid)
 			plansource->is_valid = false;
 			if (plansource->gplan)
 				plansource->gplan->is_valid = false;
+			MarkAllBucketedPlansInvalid(plansource);
 		}
 
 		/*
@@ -2173,6 +2525,7 @@ PlanCacheRelCallback(Datum arg, Oid relid)
 				{
 					/* Invalidate the generic plan only */
 					plansource->gplan->is_valid = false;
+					MarkAllBucketedPlansInvalid(plansource);
 					break;		/* out of stmt_list scan */
 				}
 			}
@@ -2243,6 +2596,7 @@ PlanCacheObjectCallback(Datum arg, SysCacheIdentifier cacheid, uint32 hashvalue)
 				plansource->is_valid = false;
 				if (plansource->gplan)
 					plansource->gplan->is_valid = false;
+				MarkAllBucketedPlansInvalid(plansource);
 				break;
 			}
 		}
@@ -2271,6 +2625,7 @@ PlanCacheObjectCallback(Datum arg, SysCacheIdentifier cacheid, uint32 hashvalue)
 					{
 						/* Invalidate the generic plan only */
 						plansource->gplan->is_valid = false;
+						MarkAllBucketedPlansInvalid(plansource);
 						break;	/* out of invalItems scan */
 					}
 				}
@@ -2354,6 +2709,7 @@ ResetPlanCache(void)
 		plansource->is_valid = false;
 		if (plansource->gplan)
 			plansource->gplan->is_valid = false;
+		MarkAllBucketedPlansInvalid(plansource);
 	}
 
 	/* Likewise invalidate cached expressions */
