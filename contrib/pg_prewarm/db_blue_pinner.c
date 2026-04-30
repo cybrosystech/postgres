@@ -478,7 +478,7 @@ PinnerRunCycle(void)
                  e->table_name,
                  (long) (used_bytes   / (1024 * 1024)),
                  (long) (budget_bytes / (1024 * 1024)));
-            break;
+            continue;
         }
 
         /* Prewarm if cache ratio is below 80% */
@@ -795,6 +795,7 @@ GetRelCacheRatio(Oid relid)
         "    SELECT relfilenode, count(*) AS cached_blocks "
         "    FROM pg_buffercache "
         "    WHERE relfilenode = pg_relation_filenode($1) "
+        "      AND relforknumber = 0 "
         "    GROUP BY relfilenode "
         ") b ON b.relfilenode = pg_relation_filenode($1) "
         "WHERE c.oid = $1";
