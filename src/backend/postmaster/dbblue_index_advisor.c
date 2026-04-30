@@ -132,25 +132,94 @@ dbblue_check_advisor_enabled(bool *newval, void **extra, GucSource source)
 }
 
 /*
+ * One key column of a candidate index.  Order in the parent
+ * IndexCandidate's `cols` array is the order in which the column will
+ * appear in the generated CREATE INDEX statement (leading column first).
+ */
+typedef struct IndexColumn
+{
+	AttrNumber	attno;
+	char	   *attname;			/* palloc'd */
+} IndexColumn;
+
+/*
  * One candidate index, derived from a single query.
  *
- * Phase 3 only emits single-column candidates; Phase 5 extends this
- * struct (or its replacement) with a column array.
+ * `access_method` is "btree" by default; "hash" for hash variants.
+ * `partial_predicate` is NULL for non-partial indexes, otherwise the
+ * SQL fragment to splice into "CREATE INDEX ... WHERE <predicate>"
+ * (e.g. "active IS TRUE").
  */
 typedef struct IndexCandidate
 {
 	Oid			relid;
-	AttrNumber	attno;
 	char	   *qualified_relname;	/* schema.table, palloc'd */
-	char	   *attname;			/* column name, palloc'd */
+	int			n_cols;				/* >= 1 */
+	IndexColumn *cols;				/* palloc'd array of length n_cols */
+	char	   *access_method;		/* "btree" or "hash"; palloc'd */
+	char	   *partial_predicate;	/* NULL or "<col> IS TRUE/FALSE/NULL" */
 	char	   *ddl;				/* CREATE INDEX ... statement */
 } IndexCandidate;
 
-/* Walker context for extract_var_walker. */
+/*
+ * Phase 5.2: per-column role classification for one relation
+ * referenced by a query.
+ *
+ * Each column may play several roles in a single query (e.g., the
+ * same column referenced in WHERE and ORDER BY).  The classifier
+ * walks the parse tree and records a (relid, attno, role) tuple in
+ * the appropriate per-relid attno-list.  Lists are dedup'd so each
+ * (attno, role) pair appears at most once per relid.
+ *
+ * 5.2 only populates the inventory; the candidate generator still
+ * emits single-column DDL.  5.3 will consume rel_infos to emit
+ * composite, partial, INCLUDE, and hash variants.
+ */
+typedef enum DbblueColRole
+{
+	DBBLUE_ROLE_EQ,				/* col = / IN / ANY-array */
+	DBBLUE_ROLE_RANGE,			/* col <, <=, >, >= */
+	DBBLUE_ROLE_SORT,			/* ORDER BY col */
+	DBBLUE_ROLE_GROUP,			/* GROUP BY col */
+} DbblueColRole;
+
+/*
+ * Kinds of constant-comparison clauses we recognise as candidates
+ * for a partial-index predicate.  Order is important: the formatter
+ * indexes into a small string table.
+ */
+typedef enum DbbluePartialKind
+{
+	DBBLUE_PARTIAL_IS_TRUE = 0,
+	DBBLUE_PARTIAL_IS_NOT_TRUE,
+	DBBLUE_PARTIAL_IS_FALSE,
+	DBBLUE_PARTIAL_IS_NOT_FALSE,
+	DBBLUE_PARTIAL_IS_NULL,
+	DBBLUE_PARTIAL_IS_NOT_NULL,
+} DbbluePartialKind;
+
+typedef struct DbbluePartialClause
+{
+	AttrNumber			attno;
+	DbbluePartialKind	kind;
+} DbbluePartialClause;
+
+typedef struct DbblueRelInfo
+{
+	Oid			relid;
+	List	   *eq_attnos;		/* List of int (AttrNumber) */
+	List	   *range_attnos;
+	List	   *sort_attnos;
+	List	   *group_attnos;
+	List	   *partial_clauses;	/* List of DbbluePartialClause * */
+} DbblueRelInfo;
+
+/* Walker context for extract_var_walker and the predicate classifier. */
 typedef struct CandidateWalkerCtx
 {
 	Query	   *query;				/* root analysed query (for rtable) */
 	List	   *candidates;			/* List of IndexCandidate * */
+	List	   *rel_infos;			/* List of DbblueRelInfo * (one per relid) */
 } CandidateWalkerCtx;
 
 /*
@@ -193,9 +262,21 @@ static void dbblue_advisor_process_query(StatStatementsRow *row);
 static bool dbblue_query_should_skip(Query *query);
 static bool dbblue_relation_should_skip(Oid relid);
 static bool dbblue_first_col_index_exists(Oid relid, AttrNumber attno);
-static bool dbblue_candidate_already_listed(List *candidates,
-											Oid relid, AttrNumber attno);
+static bool dbblue_candidate_already_listed(List *candidates, Oid relid,
+											int key_cols,
+											const AttrNumber *key_attnos,
+											const char *access_method,
+											const char *partial_predicate);
 static bool extract_var_walker(Node *node, CandidateWalkerCtx *ctx);
+static DbblueRelInfo *dbblue_relinfo_for(CandidateWalkerCtx *ctx, Oid relid);
+static void dbblue_relinfo_add(DbblueRelInfo *ri, AttrNumber attno,
+							   DbblueColRole role);
+static bool dbblue_op_role(Oid opno, DbblueColRole *role);
+static void dbblue_classify_var(Node *arg, DbblueColRole role,
+								CandidateWalkerCtx *ctx);
+static void dbblue_classify_predicate(Node *clause, CandidateWalkerCtx *ctx);
+static void dbblue_classify_sortgroup(Query *query, CandidateWalkerCtx *ctx);
+static void dbblue_generate_composites(CandidateWalkerCtx *ctx);
 static double dbblue_advisor_get_plan_cost(const char *query_text);
 static void dbblue_advisor_reset_hypotheticals(void);
 static void dbblue_advisor_evaluate_candidates(StatStatementsRow *row,
@@ -220,6 +301,7 @@ static const char *const dbblue_create_results_table_sql =
 	"    index_columns        text[] NOT NULL,"
 	"    include_columns      text[],"
 	"    index_method         text NOT NULL DEFAULT 'btree',"
+	"    partial_predicate    text,"
 	"    queryid              bigint,"
 	"    sample_query         text,"
 	"    baseline_cost        double precision,"
@@ -230,13 +312,36 @@ static const char *const dbblue_create_results_table_sql =
 	"    ddl                  text NOT NULL,"
 	"    status               text NOT NULL DEFAULT 'new',"
 	"    created_at           timestamptz NOT NULL DEFAULT now(),"
-	"    last_seen_at         timestamptz NOT NULL DEFAULT now(),"
-	"    UNIQUE (relation_oid, index_columns)"
+	"    last_seen_at         timestamptz NOT NULL DEFAULT now()"
 	")";
 
 /*
+ * Schema migration applied unconditionally on each ensure call so
+ * fresh installs and upgrades converge on the same shape.  All steps
+ * are idempotent.
+ *
+ * 1. Add partial_predicate column if the table existed without it.
+ * 2. Drop any pre-Phase-5 unique constraint, then re-add one that
+ *    distinguishes partial / non-partial and btree / hash variants
+ *    (PG15+ NULLS NOT DISTINCT means NULL partial_predicate values
+ *    still collide with each other, so ON CONFLICT works correctly).
+ */
+static const char *const dbblue_migrate_results_table_sql =
+	"ALTER TABLE public.dbblue_index_suggestions "
+	"  ADD COLUMN IF NOT EXISTS partial_predicate text; "
+	"ALTER TABLE public.dbblue_index_suggestions "
+	"  DROP CONSTRAINT IF EXISTS dbblue_index_suggestions_relation_oid_index_columns_key; "
+	"ALTER TABLE public.dbblue_index_suggestions "
+	"  DROP CONSTRAINT IF EXISTS dbblue_index_suggestions_unique_key; "
+	"ALTER TABLE public.dbblue_index_suggestions "
+	"  ADD CONSTRAINT dbblue_index_suggestions_unique_key "
+	"    UNIQUE NULLS NOT DISTINCT "
+	"    (relation_oid, index_columns, index_method, partial_predicate); ";
+
+/*
  * dbblue_advisor_ensure_results_table
- *		Create public.dbblue_index_suggestions if it does not exist.
+ *		Create public.dbblue_index_suggestions if it does not exist,
+ *		and apply any schema migrations needed by newer phases.
  */
 static void
 dbblue_advisor_ensure_results_table(void)
@@ -254,6 +359,44 @@ dbblue_advisor_ensure_results_table(void)
 		ereport(WARNING,
 				(errmsg("dbblue index advisor: could not create dbblue_index_suggestions (SPI rc=%d)",
 						ret)));
+
+	/*
+	 * Apply schema migrations.  SPI_execute on a multi-statement
+	 * string runs them sequentially; each ALTER is itself
+	 * idempotent.  Wrap in a subtransaction so a partial failure
+	 * (e.g. UNIQUE NULLS NOT DISTINCT not supported on older
+	 * server) doesn't poison the parent transaction.
+	 */
+	{
+		MemoryContext oldcxt = CurrentMemoryContext;
+		ResourceOwner oldowner = CurrentResourceOwner;
+
+		BeginInternalSubTransaction(NULL);
+		PG_TRY();
+		{
+			SPI_execute(dbblue_migrate_results_table_sql, false, 0);
+			ReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(oldcxt);
+			CurrentResourceOwner = oldowner;
+		}
+		PG_CATCH();
+		{
+			ErrorData  *edata;
+
+			MemoryContextSwitchTo(oldcxt);
+			edata = CopyErrorData();
+			FlushErrorState();
+			RollbackAndReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(oldcxt);
+			CurrentResourceOwner = oldowner;
+
+			ereport(WARNING,
+					(errmsg("dbblue index advisor: schema migration failed: %s",
+							edata->message)));
+			FreeErrorData(edata);
+		}
+		PG_END_TRY();
+	}
 
 	SPI_finish();
 	PopActiveSnapshot();
@@ -301,17 +444,33 @@ dbblue_relation_should_skip(Oid relid)
 
 /*
  * dbblue_query_should_skip
- *		True if a Query is uninteresting for index suggestion: not a
- *		SELECT, or its rangetable contains no user relation we would
- *		ever index.
+ *		True if a Query is uninteresting for index suggestion.
+ *
+ * Accepted command types:
+ *   - CMD_SELECT — the obvious read path.
+ *   - CMD_UPDATE — the executor still has to *find* matching rows
+ *	   before modifying them; an index on the WHERE columns helps the
+ *	   read sub-plan exactly the same way it helps a SELECT.
+ *   - CMD_DELETE — same reasoning as UPDATE.
+ *
+ * Rejected:
+ *   - CMD_INSERT — INSERTs into a table aren't sped up by indexes on
+ *	   that table.  (INSERT ... SELECT has an embedded SELECT that
+ *	   could benefit, but pulling that out is Phase 6+ work.)
+ *   - CMD_UTILITY — ALTER, CREATE, BEGIN, SET, EXPLAIN, etc.
+ *   - CMD_MERGE / CMD_NOTHING / others — not yet supported.
+ *
+ * Also rejects queries whose rangetable has no user relation we would
+ * ever index (e.g. catalog-only or pg_temp queries).
  */
 static bool
 dbblue_query_should_skip(Query *query)
 {
-
 	ListCell   *lc;
 
-	if (query->commandType != CMD_SELECT)
+	if (query->commandType != CMD_SELECT &&
+		query->commandType != CMD_UPDATE &&
+		query->commandType != CMD_DELETE)
 		return true;
 
 	foreach(lc, query->rtable)
@@ -393,22 +552,674 @@ dbblue_first_col_index_exists(Oid relid, AttrNumber attno)
 /*
  * dbblue_candidate_already_listed
  *		Linear-scan dedup for in-memory candidates.  Candidate counts per
- *		query are small (a few dozen at most), so O(n) is fine.
+ *		query are small (a few dozen at most), so O(n×k) where k is
+ *		index width is fine.
+ *
+ * For Phase 5.1 the walker still emits single-column candidates, so
+ * `key_cols` is always 1 and `key_attnos` holds a single attno; the
+ * comparison degenerates to the original (relid, attno) check.  When
+ * Phase 5.3 lands and emits composites, this same loop already does
+ * the right thing because we compare the full ordered column list.
  */
 static bool
-dbblue_candidate_already_listed(List *candidates, Oid relid, AttrNumber attno)
+dbblue_candidate_already_listed(List *candidates, Oid relid,
+								int key_cols, const AttrNumber *key_attnos,
+								const char *access_method,
+								const char *partial_predicate)
 {
-
 	ListCell   *lc;
 
 	foreach(lc, candidates)
 	{
 		IndexCandidate *c = (IndexCandidate *) lfirst(lc);
+		int			i;
 
-		if (c->relid == relid && c->attno == attno)
-			return true;
+		if (c->relid != relid)
+			continue;
+		if (c->n_cols != key_cols)
+			continue;
+		for (i = 0; i < key_cols; i++)
+			if (c->cols[i].attno != key_attnos[i])
+				break;
+		if (i != key_cols)
+			continue;
+		/* access method and partial predicate must also match for dedup. */
+		if (strcmp(c->access_method, access_method) != 0)
+			continue;
+		if ((c->partial_predicate == NULL) != (partial_predicate == NULL))
+			continue;
+		if (c->partial_predicate != NULL &&
+			strcmp(c->partial_predicate, partial_predicate) != 0)
+			continue;
+		return true;			/* full match */
 	}
 	return false;
+}
+
+/*
+ * dbblue_relinfo_for
+ *		Get the per-relid DbblueRelInfo entry for `relid`, creating an
+ *		empty one if this is the first time we see this relation.
+ */
+static DbblueRelInfo *
+dbblue_relinfo_for(CandidateWalkerCtx *ctx, Oid relid)
+{
+	ListCell   *lc;
+	DbblueRelInfo *ri;
+
+	foreach(lc, ctx->rel_infos)
+	{
+		ri = (DbblueRelInfo *) lfirst(lc);
+		if (ri->relid == relid)
+			return ri;
+	}
+
+	ri = (DbblueRelInfo *) palloc0(sizeof(*ri));
+	ri->relid = relid;
+	ctx->rel_infos = lappend(ctx->rel_infos, ri);
+	return ri;
+}
+
+/*
+ * dbblue_relinfo_add
+ *		Append `attno` to the role list it belongs to, dedup'd.
+ */
+static void
+dbblue_relinfo_add(DbblueRelInfo *ri, AttrNumber attno, DbblueColRole role)
+{
+	List	  **listp;
+	ListCell   *lc;
+
+	switch (role)
+	{
+		case DBBLUE_ROLE_EQ:
+			listp = &ri->eq_attnos;
+			break;
+		case DBBLUE_ROLE_RANGE:
+			listp = &ri->range_attnos;
+			break;
+		case DBBLUE_ROLE_SORT:
+			listp = &ri->sort_attnos;
+			break;
+		case DBBLUE_ROLE_GROUP:
+			listp = &ri->group_attnos;
+			break;
+		default:
+			return;
+	}
+
+	foreach(lc, *listp)
+	{
+		if (lfirst_int(lc) == (int) attno)
+			return;
+	}
+	*listp = lappend_int(*listp, (int) attno);
+}
+
+/*
+ * dbblue_op_role
+ *		Heuristic operator → role classifier based on the operator's
+ *		name.  Covers the >99% case (`=`, `<`, `<=`, `>`, `>=`) without
+ *		needing a full pg_amop opfamily lookup.
+ *
+ * Returns true and sets *role on a recognised operator; returns false
+ * for anything else (custom types, geometric ops, etc.) — those
+ * predicates are silently dropped from the inventory in 5.2 and may
+ * be revisited in Phase 6.
+ */
+static bool
+dbblue_op_role(Oid opno, DbblueColRole *role)
+{
+	char	   *opname = get_opname(opno);
+	bool		got = false;
+
+	if (opname == NULL)
+		return false;
+
+	if (strcmp(opname, "=") == 0)
+	{
+		*role = DBBLUE_ROLE_EQ;
+		got = true;
+	}
+	else if (strcmp(opname, "<") == 0 || strcmp(opname, "<=") == 0 ||
+			 strcmp(opname, ">") == 0 || strcmp(opname, ">=") == 0)
+	{
+		*role = DBBLUE_ROLE_RANGE;
+		got = true;
+	}
+
+	pfree(opname);
+	return got;
+}
+
+/*
+ * dbblue_classify_var
+ *		If `arg` is a Var on a real, user-relation column, register it
+ *		under `role` in the per-relid info.  Same Var-acceptance checks
+ *		as extract_var_walker.
+ */
+static void
+dbblue_classify_var(Node *arg, DbblueColRole role, CandidateWalkerCtx *ctx)
+{
+	Var		   *v;
+	RangeTblEntry *rte;
+	DbblueRelInfo *ri;
+
+	if (arg == NULL || !IsA(arg, Var))
+		return;
+	v = (Var *) arg;
+
+	if (v->varlevelsup != 0)
+		return;
+	if (v->varno <= 0 ||
+		v->varno > list_length(ctx->query->rtable))
+		return;
+	rte = rt_fetch(v->varno, ctx->query->rtable);
+	if (rte->rtekind != RTE_RELATION)
+		return;
+	if (v->varattno <= 0)
+		return;
+	if (dbblue_relation_should_skip(rte->relid))
+		return;
+
+	ri = dbblue_relinfo_for(ctx, rte->relid);
+	dbblue_relinfo_add(ri, v->varattno, role);
+}
+
+/*
+ * dbblue_classify_predicate
+ *		Recursively classify a WHERE/HAVING predicate node.
+ *
+ * Handled: BoolExpr (AND/OR/NOT — recurses into args), OpExpr
+ * (=, <, <=, >, >= recognised), ScalarArrayOpExpr (`col IN (...)` /
+ * `col = ANY(arr)` recorded as equality).  Other nodes silently
+ * skipped — Phase 5.3 may extend to NullTest / FuncExpr.
+ */
+static void
+dbblue_classify_predicate(Node *clause, CandidateWalkerCtx *ctx)
+{
+	if (clause == NULL)
+		return;
+
+	if (IsA(clause, BoolExpr))
+	{
+		BoolExpr   *be = (BoolExpr *) clause;
+		ListCell   *lc;
+
+		foreach(lc, be->args)
+			dbblue_classify_predicate((Node *) lfirst(lc), ctx);
+		return;
+	}
+
+	if (IsA(clause, OpExpr))
+	{
+		OpExpr	   *op = (OpExpr *) clause;
+		DbblueColRole role;
+		ListCell   *lc;
+
+		if (!dbblue_op_role(op->opno, &role))
+			return;
+
+		foreach(lc, op->args)
+			dbblue_classify_var((Node *) lfirst(lc), role, ctx);
+		return;
+	}
+
+	if (IsA(clause, ScalarArrayOpExpr))
+	{
+		ScalarArrayOpExpr *sao = (ScalarArrayOpExpr *) clause;
+		DbblueColRole role;
+
+		if (!dbblue_op_role(sao->opno, &role))
+			return;
+		if (role != DBBLUE_ROLE_EQ)
+			return;
+
+		if (list_length(sao->args) >= 1)
+			dbblue_classify_var((Node *) linitial(sao->args),
+								DBBLUE_ROLE_EQ, ctx);
+		return;
+	}
+
+	/*
+	 * NullTest: `col IS NULL` / `col IS NOT NULL`.  We treat the column
+	 * as equality (it's a selective filter) AND record the clause as a
+	 * candidate partial-index predicate so the generator can emit a
+	 * partial variant.
+	 */
+	if (IsA(clause, NullTest))
+	{
+		NullTest   *nt = (NullTest *) clause;
+
+		ereport(DEBUG1,
+				(errmsg("dbblue advisor[trace]: classifier saw NullTest type=%d arg_tag=%d",
+						(int) nt->nulltesttype,
+						nt->arg ? (int) nodeTag(nt->arg) : -1)));
+
+		if (nt->arg != NULL && IsA(nt->arg, Var))
+		{
+			Var		   *v = (Var *) nt->arg;
+			RangeTblEntry *rte;
+
+			if (v->varlevelsup != 0 ||
+				v->varno <= 0 ||
+				v->varno > list_length(ctx->query->rtable))
+				return;
+			rte = rt_fetch(v->varno, ctx->query->rtable);
+			if (rte->rtekind != RTE_RELATION)
+				return;
+			if (v->varattno <= 0)
+				return;
+			if (dbblue_relation_should_skip(rte->relid))
+				return;
+
+			dbblue_classify_var((Node *) v, DBBLUE_ROLE_EQ, ctx);
+
+			/* Record the partial-index candidate clause. */
+			{
+				DbblueRelInfo *ri = dbblue_relinfo_for(ctx, rte->relid);
+				DbbluePartialClause *pc = palloc(sizeof(*pc));
+
+				pc->attno = v->varattno;
+				pc->kind = (nt->nulltesttype == IS_NULL)
+					? DBBLUE_PARTIAL_IS_NULL
+					: DBBLUE_PARTIAL_IS_NOT_NULL;
+				ri->partial_clauses = lappend(ri->partial_clauses, pc);
+			}
+		}
+		return;
+	}
+
+	/*
+	 * BooleanTest: `col IS TRUE` / `IS FALSE` / `IS NOT TRUE` /
+	 * `IS NOT FALSE`.  Treated the same way as NullTest — record a
+	 * partial clause and tag the column as equality.
+	 */
+	if (IsA(clause, BooleanTest))
+	{
+		BooleanTest *bt = (BooleanTest *) clause;
+		DbbluePartialKind kind;
+		bool		recognised = true;
+
+		ereport(DEBUG1,
+				(errmsg("dbblue advisor[trace]: classifier saw BooleanTest type=%d arg_tag=%d",
+						(int) bt->booltesttype,
+						bt->arg ? (int) nodeTag(bt->arg) : -1)));
+
+		switch (bt->booltesttype)
+		{
+			case IS_TRUE:
+				kind = DBBLUE_PARTIAL_IS_TRUE;
+				break;
+			case IS_NOT_TRUE:
+				kind = DBBLUE_PARTIAL_IS_NOT_TRUE;
+				break;
+			case IS_FALSE:
+				kind = DBBLUE_PARTIAL_IS_FALSE;
+				break;
+			case IS_NOT_FALSE:
+				kind = DBBLUE_PARTIAL_IS_NOT_FALSE;
+				break;
+			default:
+				recognised = false;
+				break;
+		}
+		if (!recognised)
+			return;
+
+		if (bt->arg != NULL && IsA(bt->arg, Var))
+		{
+			Var		   *v = (Var *) bt->arg;
+			RangeTblEntry *rte;
+
+			if (v->varlevelsup != 0 ||
+				v->varno <= 0 ||
+				v->varno > list_length(ctx->query->rtable))
+				return;
+			rte = rt_fetch(v->varno, ctx->query->rtable);
+			if (rte->rtekind != RTE_RELATION)
+				return;
+			if (v->varattno <= 0)
+				return;
+			if (dbblue_relation_should_skip(rte->relid))
+				return;
+
+			dbblue_classify_var((Node *) v, DBBLUE_ROLE_EQ, ctx);
+
+			{
+				DbblueRelInfo *ri = dbblue_relinfo_for(ctx, rte->relid);
+				DbbluePartialClause *pc = palloc(sizeof(*pc));
+
+				pc->attno = v->varattno;
+				pc->kind = kind;
+				ri->partial_clauses = lappend(ri->partial_clauses, pc);
+			}
+		}
+		return;
+	}
+
+	/* Other node types: not classified. */
+}
+
+/*
+ * dbblue_classify_sortgroup
+ *		Walk query->sortClause and query->groupClause to record each
+ *		referenced Var as SORT or GROUP, respectively.  Each clause
+ *		entry's tleSortGroupRef points back into query->targetList.
+ */
+static void
+dbblue_classify_sortgroup(Query *query, CandidateWalkerCtx *ctx)
+{
+	ListCell   *lc_clause;
+	ListCell   *lc_tle;
+
+	foreach(lc_clause, query->sortClause)
+	{
+		SortGroupClause *sgc = (SortGroupClause *) lfirst(lc_clause);
+
+		foreach(lc_tle, query->targetList)
+		{
+			TargetEntry *tle = (TargetEntry *) lfirst(lc_tle);
+
+			if (tle->ressortgroupref == sgc->tleSortGroupRef)
+			{
+				dbblue_classify_var((Node *) tle->expr,
+									DBBLUE_ROLE_SORT, ctx);
+				break;
+			}
+		}
+	}
+
+	foreach(lc_clause, query->groupClause)
+	{
+		SortGroupClause *sgc = (SortGroupClause *) lfirst(lc_clause);
+
+		foreach(lc_tle, query->targetList)
+		{
+			TargetEntry *tle = (TargetEntry *) lfirst(lc_tle);
+
+			if (tle->ressortgroupref == sgc->tleSortGroupRef)
+			{
+				dbblue_classify_var((Node *) tle->expr,
+									DBBLUE_ROLE_GROUP, ctx);
+				break;
+			}
+		}
+	}
+}
+
+/*
+ * dbblue_partial_predicate_text
+ *		Format a (relid, attno, kind) partial clause as the SQL fragment
+ *		that goes after WHERE in CREATE INDEX ... WHERE <pred>.
+ *		The result is palloc'd in CurrentMemoryContext.  Returns NULL
+ *		on lookup failure.
+ */
+static char *
+dbblue_partial_predicate_text(Oid relid, AttrNumber attno,
+							  DbbluePartialKind kind)
+{
+	static const char *const suffix[] = {
+		"IS TRUE",			/* DBBLUE_PARTIAL_IS_TRUE */
+		"IS NOT TRUE",		/* DBBLUE_PARTIAL_IS_NOT_TRUE */
+		"IS FALSE",			/* DBBLUE_PARTIAL_IS_FALSE */
+		"IS NOT FALSE",		/* DBBLUE_PARTIAL_IS_NOT_FALSE */
+		"IS NULL",			/* DBBLUE_PARTIAL_IS_NULL */
+		"IS NOT NULL",		/* DBBLUE_PARTIAL_IS_NOT_NULL */
+	};
+	char	   *attname = get_attname(relid, attno, false);
+
+	if (attname == NULL)
+		return NULL;
+	return psprintf("%s %s", quote_identifier(attname), suffix[kind]);
+}
+
+/*
+ * dbblue_emit_one_candidate
+ *		Helper used by the generator: take an ordered key list, an
+ *		access method ("btree" / "hash"), and an optional partial
+ *		predicate, and append the IndexCandidate to ctx->candidates.
+ *
+ *		Skips emission if the same (relid, cols, access_method,
+ *		partial_predicate) combination is already on the list.
+ */
+static void
+dbblue_emit_one_candidate(CandidateWalkerCtx *ctx, Oid relid,
+						  const char *qualified_relname,
+						  int n_keys, const AttrNumber *key_attnos,
+						  const char *access_method,
+						  const char *partial_predicate)
+{
+	IndexCandidate *cand;
+	StringInfoData ddl;
+	int			i;
+	bool		ok = true;
+
+	if (dbblue_candidate_already_listed(ctx->candidates, relid,
+										n_keys, key_attnos,
+										access_method, partial_predicate))
+		return;
+
+	cand = (IndexCandidate *) palloc0(sizeof(*cand));
+	cand->relid = relid;
+	cand->qualified_relname = pstrdup(qualified_relname);
+	cand->n_cols = n_keys;
+	cand->cols = (IndexColumn *) palloc(n_keys * sizeof(IndexColumn));
+	cand->access_method = pstrdup(access_method);
+	cand->partial_predicate = partial_predicate
+		? pstrdup(partial_predicate) : NULL;
+
+	initStringInfo(&ddl);
+	appendStringInfo(&ddl, "CREATE INDEX ON %s", cand->qualified_relname);
+	if (strcmp(access_method, "btree") != 0)
+		appendStringInfo(&ddl, " USING %s", access_method);
+	appendStringInfoString(&ddl, " (");
+	for (i = 0; i < n_keys; i++)
+	{
+		char	   *attname = get_attname(relid, key_attnos[i], false);
+
+		if (attname == NULL)
+		{
+			ok = false;
+			break;
+		}
+		cand->cols[i].attno = key_attnos[i];
+		cand->cols[i].attname = pstrdup(attname);
+		if (i > 0)
+			appendStringInfoString(&ddl, ", ");
+		appendStringInfoString(&ddl, quote_identifier(attname));
+	}
+	appendStringInfoString(&ddl, ")");
+	if (partial_predicate != NULL)
+		appendStringInfo(&ddl, " WHERE %s", partial_predicate);
+
+	if (!ok)
+	{
+		pfree(ddl.data);
+		pfree(cand->cols);
+		pfree(cand->access_method);
+		if (cand->partial_predicate)
+			pfree(cand->partial_predicate);
+		pfree(cand);
+		return;
+	}
+
+	cand->ddl = ddl.data;
+	ctx->candidates = lappend(ctx->candidates, cand);
+
+	ereport(DEBUG1,
+			(errmsg("dbblue advisor[trace]: emitted candidate: %s",
+					cand->ddl)));
+}
+
+/*
+ * dbblue_generate_composites
+ *		For each relid in ctx->rel_infos, build a single composite
+ *		candidate using the canonical column ordering:
+ *
+ *		    leading <- equality columns
+ *		    middle  <- range columns
+ *		    trailing<- sort columns
+ *
+ *		The result is capped at dbblue_auto_index_suggestion_max_index_columns
+ *		(default 3).  Length-1 composites are skipped because the
+ *		single-column candidates are already produced by extract_var_walker.
+ *
+ *		The composite goes through the same hypopg-evaluation pipeline
+ *		as a single-column candidate; the planner picks the cheapest.
+ *		Composites are intentionally NOT subjected to the leading-column
+ *		"already covered" filter — a (a, b) index can still help even
+ *		when (a) is independently indexed.
+ */
+static void
+dbblue_generate_composites(CandidateWalkerCtx *ctx)
+{
+	ListCell   *lc_ri;
+	int			max_cols = dbblue_auto_index_suggestion_max_index_columns;
+
+	if (max_cols < 2)
+		return;					/* user disabled composites */
+
+	foreach(lc_ri, ctx->rel_infos)
+	{
+		DbblueRelInfo *ri = (DbblueRelInfo *) lfirst(lc_ri);
+		List	   *ordered = NIL;
+		ListCell   *lc;
+		int			n_keys;
+		AttrNumber *key_attnos = NULL;
+		char	   *nspname;
+		char	   *relname;
+		char	   *qualified_relname;
+		int			i;
+
+		/*
+		 * Build the ordered attno list: equality cols → range cols →
+		 * sort cols.  Each role list is already dedup'd internally;
+		 * across-roles we dedup with list_member_int so a column
+		 * appearing in both eq and sort doesn't show up twice.
+		 */
+		foreach(lc, ri->eq_attnos)
+			ordered = lappend_int(ordered, lfirst_int(lc));
+		foreach(lc, ri->range_attnos)
+		{
+			int			a = lfirst_int(lc);
+
+			if (!list_member_int(ordered, a))
+				ordered = lappend_int(ordered, a);
+		}
+		foreach(lc, ri->sort_attnos)
+		{
+			int			a = lfirst_int(lc);
+
+			if (!list_member_int(ordered, a))
+				ordered = lappend_int(ordered, a);
+		}
+
+		/* Cap at the configured maximum. */
+		if (list_length(ordered) > max_cols)
+			ordered = list_truncate(ordered, max_cols);
+
+		/* Resolve schema-qualified relation name (used by all variants). */
+		nspname = get_namespace_name(get_rel_namespace(ri->relid));
+		relname = get_rel_name(ri->relid);
+		if (nspname == NULL || relname == NULL)
+		{
+			list_free(ordered);
+			continue;
+		}
+		qualified_relname = quote_qualified_identifier(nspname, relname);
+
+		n_keys = list_length(ordered);
+		if (n_keys >= 1)
+		{
+			key_attnos = (AttrNumber *) palloc(n_keys * sizeof(AttrNumber));
+			i = 0;
+			foreach(lc, ordered)
+				key_attnos[i++] = (AttrNumber) lfirst_int(lc);
+		}
+
+		/*
+		 * (1) Composite btree candidate (length >= 2).  Single-column
+		 * candidates are emitted by the walker, not here.
+		 */
+		if (n_keys >= 2)
+		{
+			dbblue_emit_one_candidate(ctx, ri->relid, qualified_relname,
+									  n_keys, key_attnos,
+									  "btree", NULL);
+
+			/*
+			 * (2) Partial-composite variants — same key list but with
+			 * each detected partial-clause appended as a WHERE.
+			 */
+			foreach(lc, ri->partial_clauses)
+			{
+				DbbluePartialClause *pc =
+					(DbbluePartialClause *) lfirst(lc);
+				char	   *predicate;
+
+				predicate = dbblue_partial_predicate_text(ri->relid,
+														  pc->attno,
+														  pc->kind);
+				if (predicate == NULL)
+					continue;
+				dbblue_emit_one_candidate(ctx, ri->relid, qualified_relname,
+										  n_keys, key_attnos,
+										  "btree", predicate);
+				pfree(predicate);
+			}
+		}
+
+		/*
+		 * (3) Partial single-column variants — for the *first* eq column
+		 * (most common shape), pair it with each partial clause.  This
+		 * adds candidates like CREATE INDEX ON tbl (id) WHERE active IS TRUE
+		 * even when no composite is generated.
+		 */
+		if (list_length(ri->eq_attnos) >= 1)
+		{
+			AttrNumber	first_eq = (AttrNumber) lfirst_int(list_head(ri->eq_attnos));
+
+			foreach(lc, ri->partial_clauses)
+			{
+				DbbluePartialClause *pc =
+					(DbbluePartialClause *) lfirst(lc);
+				char	   *predicate;
+
+				predicate = dbblue_partial_predicate_text(ri->relid,
+														  pc->attno,
+														  pc->kind);
+				if (predicate == NULL)
+					continue;
+				dbblue_emit_one_candidate(ctx, ri->relid, qualified_relname,
+										  1, &first_eq,
+										  "btree", predicate);
+				pfree(predicate);
+			}
+		}
+
+		/*
+		 * (4) Hash candidates.  Postgres only supports single-column
+		 * hash indexes, and hash is only competitive for columns used
+		 * exclusively in equality predicates (no range, no sort).
+		 */
+		foreach(lc, ri->eq_attnos)
+		{
+			AttrNumber	a = (AttrNumber) lfirst_int(lc);
+
+			if (list_member_int(ri->range_attnos, a))
+				continue;
+			if (list_member_int(ri->sort_attnos, a))
+				continue;
+			dbblue_emit_one_candidate(ctx, ri->relid, qualified_relname,
+									  1, &a,
+									  "hash", NULL);
+		}
+
+		if (key_attnos != NULL)
+			pfree(key_attnos);
+		list_free(ordered);
+	}
 }
 
 /*
@@ -457,7 +1268,9 @@ extract_var_walker(Node *node, CandidateWalkerCtx *ctx)
 		if (dbblue_relation_should_skip(relid))
 			return false;
 
-		if (dbblue_candidate_already_listed(ctx->candidates, relid, attno))
+		if (dbblue_candidate_already_listed(ctx->candidates, relid,
+											1, &attno,
+											"btree", NULL))
 			return false;
 
 		/*
@@ -488,15 +1301,24 @@ extract_var_walker(Node *node, CandidateWalkerCtx *ctx)
 				(errmsg("dbblue advisor[trace]: walker: relid=%u attno=%d nsp=%s rel=%s -> building candidate",
 						relid, attno, nspname, relname)));
 
+		/*
+		 * Build a single-column candidate using the Phase 5 multi-column
+		 * shape.  n_cols == 1 today; the same struct accommodates >1
+		 * once Phase 5.3's composite generator lands.
+		 */
 		cand = (IndexCandidate *) palloc0(sizeof(*cand));
 		cand->relid = relid;
-		cand->attno = attno;
 		cand->qualified_relname =
 			pstrdup(quote_qualified_identifier(nspname, relname));
-		cand->attname = pstrdup(get_attname(relid, attno, false));
+		cand->n_cols = 1;
+		cand->cols = (IndexColumn *) palloc(sizeof(IndexColumn));
+		cand->cols[0].attno = attno;
+		cand->cols[0].attname = pstrdup(get_attname(relid, attno, false));
+		cand->access_method = pstrdup("btree");
+		cand->partial_predicate = NULL;
 		cand->ddl = psprintf("CREATE INDEX ON %s (%s)",
 							 cand->qualified_relname,
-							 quote_identifier(cand->attname));
+							 quote_identifier(cand->cols[0].attname));
 		ctx->candidates = lappend(ctx->candidates, cand);
 
 		ereport(DEBUG1,
@@ -746,27 +1568,55 @@ dbblue_advisor_record_suggestion(StatStatementsRow *row,
 								 double hypothetical,
 								 double improvement_pct)
 {
-
 	StringInfoData sql;
+	StringInfoData cols_sql;
 	char	   *q_relname;
-	char	   *q_attname;
 	char	   *q_sample;
 	char	   *q_ddl;
+	char	   *q_method;
+	char	   *q_partial;
+	int			i;
 
 	q_relname = quote_literal_cstr(cand->qualified_relname);
-	q_attname = quote_literal_cstr(cand->attname);
 	q_sample = quote_literal_cstr(row->query_text);
 	q_ddl = quote_literal_cstr(cand->ddl);
+	q_method = quote_literal_cstr(cand->access_method
+								  ? cand->access_method : "btree");
+	q_partial = cand->partial_predicate
+		? quote_literal_cstr(cand->partial_predicate)
+		: pstrdup("NULL");
+
+	/*
+	 * Build the index_columns text[] literal: ARRAY['c1', 'c2', ...].
+	 * Each name is passed through quote_literal_cstr to neutralise any
+	 * weird identifiers (the column names are sourced from the catalog
+	 * so they should be safe, but we stay defensive on principle).
+	 */
+	initStringInfo(&cols_sql);
+	appendStringInfoString(&cols_sql, "ARRAY[");
+	for (i = 0; i < cand->n_cols; i++)
+	{
+		char	   *q_name = quote_literal_cstr(cand->cols[i].attname);
+
+		if (i > 0)
+			appendStringInfoString(&cols_sql, ", ");
+		appendStringInfoString(&cols_sql, q_name);
+		pfree(q_name);
+	}
+	appendStringInfoString(&cols_sql, "]::text[]");
 
 	initStringInfo(&sql);
 	appendStringInfo(&sql,
 					 "INSERT INTO public.dbblue_index_suggestions "
-					 "(relation_oid, relation_name, index_columns, queryid, "
+					 "(relation_oid, relation_name, index_columns, "
+					 " index_method, partial_predicate, queryid, "
 					 " sample_query, baseline_cost, hypothetical_cost, "
 					 " cost_improvement_pct, total_calls, total_exec_time_ms, ddl) "
-					 "VALUES (%u, %s, ARRAY[%s]::text[], %lld, "
+					 "VALUES (%u, %s, %s, %s, %s, %lld, "
 					 "        %s, %.6f, %.6f, %.4f, %lld, %.6f, %s) "
-					 "ON CONFLICT (relation_oid, index_columns) DO UPDATE SET "
+					 "ON CONFLICT (relation_oid, index_columns, "
+					 "             index_method, partial_predicate) "
+					 "DO UPDATE SET "
 					 "  last_seen_at = now(), "
 					 "  queryid = EXCLUDED.queryid, "
 					 "  sample_query = EXCLUDED.sample_query, "
@@ -775,7 +1625,8 @@ dbblue_advisor_record_suggestion(StatStatementsRow *row,
 					 "  cost_improvement_pct = EXCLUDED.cost_improvement_pct, "
 					 "  total_calls = EXCLUDED.total_calls, "
 					 "  total_exec_time_ms = EXCLUDED.total_exec_time_ms",
-					 cand->relid, q_relname, q_attname,
+					 cand->relid, q_relname, cols_sql.data,
+					 q_method, q_partial,
 					 (long long) row->queryid, q_sample,
 					 baseline, hypothetical, improvement_pct,
 					 (long long) row->calls, row->total_exec_time_ms, q_ddl);
@@ -783,10 +1634,12 @@ dbblue_advisor_record_suggestion(StatStatementsRow *row,
 	SPI_execute(sql.data, false, 0);
 
 	pfree(sql.data);
+	pfree(cols_sql.data);
 	pfree(q_relname);
-	pfree(q_attname);
 	pfree(q_sample);
 	pfree(q_ddl);
+	pfree(q_method);
+	pfree(q_partial);
 }
 
 /*
@@ -1010,8 +1863,9 @@ dbblue_advisor_process_query(StatStatementsRow *row)
 			if (dbblue_query_should_skip(query))
 			{
 				ereport(LOG,
-						(errmsg("dbblue index advisor: queryid=%lld skipped (non-SELECT or only catalog tables)",
-								(long long) row->queryid)));
+						(errmsg("dbblue index advisor: queryid=%lld skipped (cmdtype=%d not SELECT/UPDATE/DELETE, or only catalog tables)",
+								(long long) row->queryid,
+								(int) query->commandType)));
 			}
 			else
 			{
@@ -1053,6 +1907,53 @@ dbblue_advisor_process_query(StatStatementsRow *row)
 								list_length(ctx.candidates))));
 
 				/*
+				 * Phase 5.2: build the per-relid predicate inventory
+				 * (eq / range / sort / group attno lists).  Behavior
+				 * unchanged in 5.2 — the inventory is observable via
+				 * DEBUG1 below but isn't yet consumed by the candidate
+				 * generator.  Phase 5.3 will use it to emit composite
+				 * and partial DDL variants.
+				 */
+				if (query->jointree != NULL && query->jointree->quals != NULL)
+					dbblue_classify_predicate(query->jointree->quals, &ctx);
+				if (query->havingQual != NULL)
+					dbblue_classify_predicate(query->havingQual, &ctx);
+				dbblue_classify_sortgroup(query, &ctx);
+
+				{
+					ListCell   *lc_ri;
+
+					foreach(lc_ri, ctx.rel_infos)
+					{
+						DbblueRelInfo *ri = (DbblueRelInfo *) lfirst(lc_ri);
+
+						ereport(DEBUG1,
+								(errmsg("dbblue advisor[trace]: queryid=%lld relid=%u inventory eq=%d range=%d sort=%d group=%d partial=%d",
+										(long long) row->queryid, ri->relid,
+										list_length(ri->eq_attnos),
+										list_length(ri->range_attnos),
+										list_length(ri->sort_attnos),
+										list_length(ri->group_attnos),
+										list_length(ri->partial_clauses))));
+					}
+				}
+
+				/*
+				 * Phase 5.3: feed the predicate inventory into the
+				 * composite generator.  This appends one composite
+				 * candidate per relid that has >=2 distinct columns
+				 * across eq/range/sort.  Single-column candidates
+				 * already on the list are kept too — the planner +
+				 * threshold filter pick the winners.
+				 */
+				dbblue_generate_composites(&ctx);
+
+				ereport(DEBUG1,
+						(errmsg("dbblue advisor[trace]: post-composite queryid=%lld total candidates=%d",
+								(long long) row->queryid,
+								list_length(ctx.candidates))));
+
+				/*
 				 * Post-walker filter: drop candidates whose attno is
 				 * already the leading column of an existing index.  We
 				 * deferred this check out of the walker callback because
@@ -1073,7 +1974,22 @@ dbblue_advisor_process_query(StatStatementsRow *row)
 					{
 						IndexCandidate *c = (IndexCandidate *) lfirst(lc2);
 
-						if (dbblue_first_col_index_exists(c->relid, c->attno))
+						/*
+						 * Only filter "already covered" for length-1
+						 * plain-btree candidates with no partial
+						 * predicate.  Composites, partial indexes and
+						 * hash variants all express something the
+						 * existing single-column btree on the leading
+						 * column does NOT cover, so they must be
+						 * evaluated by hypopg even when the leading
+						 * column is independently indexed.
+						 */
+						if (c->n_cols == 1 &&
+							c->partial_predicate == NULL &&
+							c->access_method != NULL &&
+							strcmp(c->access_method, "btree") == 0 &&
+							dbblue_first_col_index_exists(c->relid,
+														  c->cols[0].attno))
 						{
 							ereport(DEBUG1,
 									(errmsg("dbblue advisor[trace]: queryid=%lld dropping candidate %s (already covered)",
