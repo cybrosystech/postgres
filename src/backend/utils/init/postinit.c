@@ -71,6 +71,8 @@
 #include "utils/syscache.h"
 #include "utils/timeout.h"
 #include "utils/pg_audit.h"
+#include "utils/pg_fillfactor.h"
+
 /* has this backend called EmitConnectionWarnings()? */
 static bool ConnectionWarningsEmitted;
 
@@ -1271,6 +1273,10 @@ InitPostgres(const char *in_dbname, Oid dboid,
        odoo_audit_init();
    };
 
+	if(odoo_fillfactor_map)
+	{
+		odoo_fillfactor_init(); 
+	}
 }
 
 /*

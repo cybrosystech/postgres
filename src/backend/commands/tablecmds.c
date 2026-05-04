@@ -975,7 +975,46 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 
 	/*
 	 * Parse and validate reloptions, if any.
-	 */
+	 */	
+   if (relkind == RELKIND_RELATION)
+   {
+       ereport(LOG,errmsg("DefineRelation: looking up fillfactor for table \"%s\"", stmt->relation->relname));
+       int ff = odoo_fillfactor_lookup(stmt->relation->relname);
+        ereport(LOG,
+                       (errmsg("odoo_fillfactor: injecting fillfactor=%d "
+                               "for table \"%s\"",
+                               ff, stmt->relation->relname)));
+       if (ff > 0)
+       {
+           bool found_existing = false;
+           ListCell *lc;
+
+
+           foreach(lc, stmt->options)
+           {
+               DefElem *opt = (DefElem *) lfirst(lc);
+               if (pg_strcasecmp(opt->defname, "fillfactor") == 0)
+               {
+                   found_existing = true;
+                   break;
+               }
+           }
+
+
+           if (!found_existing)
+           {
+               DefElem *ff_elem = makeDefElem("fillfactor",
+                                              (Node *) makeInteger(ff),
+                                              -1);
+               stmt->options = lappend(stmt->options, ff_elem);
+               ereport(LOG,
+                       (errmsg("odoo_fillfactor: injecting fillfactor=%d "
+                               "for table \"%s\"",
+                               ff, stmt->relation->relname)));
+           }
+       }
+   }
+
 	reloptions = transformRelOptions((Datum) 0, stmt->options, NULL, validnsps,
 									 true, false);
 
