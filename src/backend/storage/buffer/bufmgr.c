@@ -62,6 +62,7 @@
 #include "storage/proclist.h"
 #include "storage/procsignal.h"
 #include "storage/read_stream.h"
+#include "storage/shmem.h"
 #include "storage/smgr.h"
 #include "storage/standby.h"
 #include "utils/memdebug.h"
@@ -93,6 +94,149 @@
  * the buffers by doing lookups in BufMapping table.
  */
 #define BUF_DROP_FULL_SCAN_THRESHOLD		(uint64) (NBuffers / 32)
+
+/* ---------------------------------------------------------------------
+ * Odoo pinner: ring-buffer forced-relations table.
+ *
+ * A small fixed-size shared-memory registry of relfilenodes whose
+ * sequential reads must be funnelled through a 256KB ring buffer (the
+ * existing BAS_BULKREAD strategy). Lets the operator name large
+ * report tables that should never pollute shared_buffers.
+ * ---------------------------------------------------------------------
+ */
+#define MAX_RING_BUFFER_RELATIONS	64
+
+typedef struct RingBufferEntry
+{
+	Oid			relfileOid;
+	bool		active;
+} RingBufferEntry;
+
+typedef struct RingBufferTable
+{
+	LWLock		lock;
+	int			num_entries;
+	RingBufferEntry entries[MAX_RING_BUFFER_RELATIONS];
+} RingBufferTable;
+
+static RingBufferTable *RingBufferRelations = NULL;
+
+Size
+RingBufferShmemSize(void)
+{
+	return sizeof(RingBufferTable);
+}
+
+void
+InitRingBufferTable(void)
+{
+	bool		found;
+
+	RingBufferRelations = (RingBufferTable *)
+		ShmemInitStruct("RingBufferRelations",
+						sizeof(RingBufferTable),
+						&found);
+
+	if (!found)
+	{
+		MemSet(RingBufferRelations, 0, sizeof(RingBufferTable));
+		LWLockInitialize(&RingBufferRelations->lock,
+						 LWTRANCHE_RING_BUFFER_TABLE);
+	}
+}
+
+void
+RegisterRingBufferRelation(Oid relfileOid)
+{
+	int			i;
+
+	LWLockAcquire(&RingBufferRelations->lock, LW_EXCLUSIVE);
+
+	for (i = 0; i < MAX_RING_BUFFER_RELATIONS; i++)
+	{
+		if (RingBufferRelations->entries[i].active &&
+			RingBufferRelations->entries[i].relfileOid == relfileOid)
+		{
+			LWLockRelease(&RingBufferRelations->lock);
+			return;
+		}
+	}
+
+	for (i = 0; i < MAX_RING_BUFFER_RELATIONS; i++)
+	{
+		if (!RingBufferRelations->entries[i].active)
+		{
+			RingBufferRelations->entries[i].relfileOid = relfileOid;
+			RingBufferRelations->entries[i].active = true;
+			RingBufferRelations->num_entries++;
+
+			elog(DEBUG1,
+				 "bufmgr: registered relfileOid %u for ring buffer forcing",
+				 relfileOid);
+
+			LWLockRelease(&RingBufferRelations->lock);
+			return;
+		}
+	}
+
+	LWLockRelease(&RingBufferRelations->lock);
+
+	elog(WARNING,
+		 "RegisterRingBufferRelation: table full (%d entries), "
+		 "cannot add relfileOid %u. Increase MAX_RING_BUFFER_RELATIONS.",
+		 MAX_RING_BUFFER_RELATIONS, relfileOid);
+}
+
+void
+UnregisterRingBufferRelation(Oid relfileOid)
+{
+	int			i;
+
+	LWLockAcquire(&RingBufferRelations->lock, LW_EXCLUSIVE);
+
+	for (i = 0; i < MAX_RING_BUFFER_RELATIONS; i++)
+	{
+		if (RingBufferRelations->entries[i].active &&
+			RingBufferRelations->entries[i].relfileOid == relfileOid)
+		{
+			RingBufferRelations->entries[i].active = false;
+			RingBufferRelations->entries[i].relfileOid = InvalidOid;
+			RingBufferRelations->num_entries--;
+			break;
+		}
+	}
+
+	LWLockRelease(&RingBufferRelations->lock);
+}
+
+/*
+ * IsRingBufferForced — fast check on every read of a relation. Uses a
+ * shared lock so concurrent readers don't serialize.
+ */
+static bool
+IsRingBufferForced(Oid relfileOid)
+{
+	int			i;
+	bool		result = false;
+
+	if (RingBufferRelations->num_entries == 0)
+		return false;
+
+	LWLockAcquire(&RingBufferRelations->lock, LW_SHARED);
+
+	for (i = 0; i < MAX_RING_BUFFER_RELATIONS; i++)
+	{
+		if (RingBufferRelations->entries[i].active &&
+			RingBufferRelations->entries[i].relfileOid == relfileOid)
+		{
+			result = true;
+			break;
+		}
+	}
+
+	LWLockRelease(&RingBufferRelations->lock);
+	return result;
+}
 
 /*
  * This is separated out from PrivateRefCountEntry to allow for copying all
@@ -1354,6 +1498,26 @@ ReadBuffer_common(Relation rel, SMgrRelation smgr, char smgr_persistence,
 	operation.rel = rel;
 	operation.persistence = persistence;
 	operation.forknum = forkNum;
+
+	/*
+	 * Odoo pinner: substitute a BAS_BULKREAD ring-buffer strategy if this
+	 * relation is registered for forced ring-buffering and the caller
+	 * didn't already pick a strategy. Skipped for temp relations (which
+	 * use local buffers, not shared_buffers).
+	 */
+	if (strategy == NULL && persistence != RELPERSISTENCE_TEMP)
+	{
+		Oid			relfileOid = InvalidOid;
+
+		if (rel != NULL)
+			relfileOid = rel->rd_locator.relNumber;
+		else if (smgr != NULL)
+			relfileOid = smgr->smgr_rlocator.locator.relNumber;
+
+		if (OidIsValid(relfileOid) && IsRingBufferForced(relfileOid))
+			strategy = GetAccessStrategy(BAS_BULKREAD);
+	}
+
 	operation.strategy = strategy;
 	if (StartReadBuffer(&operation,
 						&buffer,
@@ -8956,3 +9120,170 @@ const PgAioHandleCallbacks aio_local_buffer_readv_cb = {
 	.complete_local = local_buffer_readv_complete,
 	.report = buffer_readv_report,
 };
+
+/* =====================================================================
+ * Odoo pinner: soft-pin and pool-pressure helpers
+ * =====================================================================
+ */
+
+/*
+ * ComputePoolPressure — single-pass pool scan that resolves both the
+ * "under pressure" (<5% evictable) and "critical pressure" (<2% evictable)
+ * flags in one walk.
+ *
+ * Hot-path callers (StrategyGetBuffer) should compute this once per
+ * StrategyGetBuffer call and reuse the cached result for every soft-pin
+ * encounter. Calling separate per-tier helpers per encounter turns the
+ * clock sweep into O(N^2) under sustained pressure with many pinned
+ * buffers, which is the issue this function is designed to avoid.
+ *
+ * Counts buffers as "evictable" iff refcount==0 and soft_pin_tier==NONE.
+ * Reads soft_pin_tier non-atomically (a uint8); benign races with the
+ * pinner are tolerated — the threshold checks are coarse and a stale
+ * read by ±1 buffer cannot flip pressure state in any meaningful way.
+ *
+ * Early-exit: once free_count crosses the 5% threshold, both flags are
+ * known to be false and we return immediately without finishing the walk.
+ */
+void
+ComputePoolPressure(bool *under_pressure, bool *critical_pressure)
+{
+	int			free_count = 0;
+	int			under_threshold = NBuffers / 20;	/* 5% */
+	int			critical_threshold = NBuffers / 50; /* 2% */
+	int			i;
+
+	for (i = 0; i < NBuffers; i++)
+	{
+		BufferDesc *buf = GetBufferDescriptor(i);
+		uint64		buf_state = pg_atomic_read_u64(&buf->state);
+
+		if (BUF_STATE_GET_REFCOUNT(buf_state) == 0 &&
+			buf->soft_pin_tier == SOFT_PIN_TIER_NONE)
+		{
+			if (++free_count >= under_threshold)
+			{
+				*under_pressure = false;
+				*critical_pressure = false;
+				return;
+			}
+		}
+	}
+
+	/* did not reach 5% — definitely under pressure */
+	*under_pressure = true;
+	*critical_pressure = (free_count < critical_threshold);
+}
+
+/*
+ * BufferPoolUnderPressure — true when fewer than 5% of buffers are
+ * freely evictable (refcount==0 and not soft-pinned). Thin wrapper over
+ * ComputePoolPressure for callers that only need one flag.
+ *
+ * Hot-path callers should use ComputePoolPressure directly so both
+ * flags come from a single walk.
+ */
+bool
+BufferPoolUnderPressure(void)
+{
+	bool		under;
+	bool		critical;
+
+	ComputePoolPressure(&under, &critical);
+	return under;
+}
+
+/*
+ * BufferPoolCriticalPressure — true when fewer than 2% of buffers are
+ * freely evictable. The last-resort threshold where even Tier 1
+ * (metadata) soft pins must yield. Thin wrapper over ComputePoolPressure.
+ */
+bool
+BufferPoolCriticalPressure(void)
+{
+	bool		under;
+	bool		critical;
+
+	ComputePoolPressure(&under, &critical);
+	return critical;
+}
+
+/*
+ * SoftPinRelationBuffers — walk shared_buffers and stamp soft_pin_tier
+ * on every resident buffer that belongs to the named relation. Called
+ * by the Odoo pinner after pg_prewarm has loaded the pages.
+ *
+ * Parameters:
+ *   relspcOid   - pg_class.reltablespace (caller substitutes
+ *                 MyDatabaseTableSpace if the relation is in the
+ *                 database default)
+ *   reldbOid    - the relation's database OID
+ *   relfileOid  - pg_class.relfilenode
+ *   tier        - SOFT_PIN_TIER_1 or SOFT_PIN_TIER_2
+ */
+void
+SoftPinRelationBuffers(Oid relspcOid, Oid reldbOid,
+					   Oid relfileOid, uint8 tier)
+{
+	int			i;
+	int			pinned = 0;
+
+	for (i = 0; i < NBuffers; i++)
+	{
+		BufferDesc *buf = GetBufferDescriptor(i);
+		uint64		buf_state;
+
+		if (buf->tag.relNumber != relfileOid)
+			continue;
+		if (buf->tag.dbOid != reldbOid)
+			continue;
+		if (buf->tag.spcOid != relspcOid &&
+			buf->tag.spcOid != DEFAULTTABLESPACE_OID)
+			continue;
+
+		buf_state = LockBufHdr(buf);
+
+		if (buf->tag.relNumber == relfileOid &&
+			buf->tag.dbOid == reldbOid &&
+			(buf_state & BM_VALID))
+		{
+			buf->soft_pin_tier = tier;
+			pinned++;
+		}
+
+		UnlockBufHdr(buf);
+	}
+
+	elog(DEBUG1,
+		 "SoftPinRelationBuffers: pinned %d buffers for relfileOid %u (tier %d)",
+		 pinned, relfileOid, tier);
+}
+
+/*
+ * ClearSoftPinForRelation — drop soft_pin_tier from every buffer of a
+ * relation. Called when the operator removes a table from
+ * odoo_pinner.pinned_tables.
+ */
+void
+ClearSoftPinForRelation(Oid relspcOid, Oid reldbOid, Oid relfileOid)
+{
+	int			i;
+
+	for (i = 0; i < NBuffers; i++)
+	{
+		BufferDesc *buf = GetBufferDescriptor(i);
+
+		if (buf->tag.relNumber != relfileOid)
+			continue;
+
+		(void) LockBufHdr(buf);
+
+		if (buf->tag.relNumber == relfileOid &&
+			buf->tag.dbOid == reldbOid)
+		{
+			buf->soft_pin_tier = SOFT_PIN_TIER_NONE;
+		}
+
+		UnlockBufHdr(buf);
+	}
+}

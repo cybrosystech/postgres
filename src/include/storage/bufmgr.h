@@ -384,6 +384,23 @@ extern int	GetAccessStrategyPinLimit(BufferAccessStrategy strategy);
 
 extern void FreeAccessStrategy(BufferAccessStrategy strategy);
 
+/* Odoo pinner: ring-buffer forced-relations table (shared memory) */
+extern Size RingBufferShmemSize(void);
+extern void InitRingBufferTable(void);
+extern void RegisterRingBufferRelation(Oid relfileOid);
+extern void UnregisterRingBufferRelation(Oid relfileOid);
+
+/* Odoo pinner: soft-pin a relation's resident buffers */
+extern void SoftPinRelationBuffers(Oid relspcOid, Oid reldbOid,
+								   Oid relfileOid, uint8 tier);
+extern void ClearSoftPinForRelation(Oid relspcOid, Oid reldbOid,
+									Oid relfileOid);
+
+/* Odoo pinner: pool-pressure helpers consulted by clock-sweep */
+extern void ComputePoolPressure(bool *under_pressure, bool *critical_pressure);
+extern bool BufferPoolUnderPressure(void);
+extern bool BufferPoolCriticalPressure(void);
+
 
 /* inline functions */
 
