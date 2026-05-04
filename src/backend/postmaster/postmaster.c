@@ -102,6 +102,7 @@
 #include "port/pg_getopt_ctx.h"
 #include "postmaster/autovacuum.h"
 #include "postmaster/bgworker_internals.h"
+#include "postmaster/dbblue_index_advisor.h"
 #include "postmaster/pgarch.h"
 #include "postmaster/postmaster.h"
 #include "postmaster/syslogger.h"
@@ -927,6 +928,13 @@ PostmasterMain(int argc, char *argv[])
 	ApplyLauncherRegister();
 	DbblueIndexAdvisorRegister();
 
+
+	/*
+	 * Register the dbblue index advisor as a built-in background worker.
+	 * Registered alongside the apply launcher so we claim a worker slot
+	 * before any preloaded library does.
+	 */
+	DbblueIndexAdvisorRegister();
 
 	/*
 	 * Register the shared memory needs of all core subsystems.
