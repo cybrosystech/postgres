@@ -3528,7 +3528,7 @@
 { name => 'wal_compression', type => 'enum', context => 'PGC_SUSET', group => 'WAL_SETTINGS',
   short_desc => 'Compresses full-page writes written in WAL file with specified method.',
   variable => 'wal_compression',
-  boot_val => 'WAL_COMPRESSION_NONE',
+  boot_val => 'WAL_COMPRESSION_LZ4',
   options => 'wal_compression_options',
 },
 
