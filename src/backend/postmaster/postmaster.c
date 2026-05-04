@@ -123,6 +123,7 @@
 #include "utils/pidfile.h"
 #include "utils/timestamp.h"
 #include "utils/varlena.h"
+#include "postmaster/dbblue_index_advisor.h"
 
 #ifdef EXEC_BACKEND
 #include "common/file_utils.h"
@@ -924,6 +925,8 @@ PostmasterMain(int argc, char *argv[])
 	 * before any modules had a chance to take the background worker slots.
 	 */
 	ApplyLauncherRegister();
+	DbblueIndexAdvisorRegister();
+
 
 	/*
 	 * Register the shared memory needs of all core subsystems.

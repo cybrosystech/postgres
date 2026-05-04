@@ -28,6 +28,7 @@ OBJS = \
 	startup.o \
 	syslogger.o \
 	walsummarizer.o \
-	walwriter.o
+	walwriter.o \
+	dbblue_index_advisor.o
 
 include $(top_srcdir)/src/backend/common.mk
