@@ -2808,6 +2808,18 @@ typedef struct LimitState
 	ExprState  *eqfunction;		/* tuple equality qual in case of WITH TIES
 								 * option */
 	TupleTableSlot *last_slot;	/* slot for evaluation of ties */
+
+
+
+	   /* backward scan runtime state */
+	bool        scanBackward;    /* copy from plan node */
+	bool        needFlip;        /* must reverse output */
+	int64       flipOffset;      /* computed flip position */
+	TupleTableSlot **flipBuffer; /* holds rows for reversal */
+	int         flipBufSize;     /* allocated slots */
+	int         flipBufCount;    /* filled slots */
+		/* OUR ADDITION — pinned snapshot for backward scan */ 
+	Snapshot   backwardScanSnapshot; /* ← add this */
 } LimitState;
 
 #endif							/* EXECNODES_H */

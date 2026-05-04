@@ -320,6 +320,9 @@ static GatherMerge *create_gather_merge_plan(PlannerInfo *root,
 											 GatherMergePath *best_path);
 
 
+static ScanDirection reverse_indexorderdir(ScanDirection dir);
+static bool plan_tree_contains_node(Plan *plan, NodeTag tag);
+static bool can_use_backward_scan(Plan *plan);
 /*
  * create_plan
  *	  Creates the access plan for a query by recursively processing the
@@ -2684,6 +2687,82 @@ create_modifytable_plan(PlannerInfo *root, ModifyTablePath *best_path)
 	return plan;
 }
 
+
+
+/*
+ * reverse_indexorderdir
+ */
+static ScanDirection
+reverse_indexorderdir(ScanDirection dir)
+{
+    if (dir == ForwardScanDirection)
+        return BackwardScanDirection;
+    if (dir == BackwardScanDirection)
+        return ForwardScanDirection;
+    return dir;
+}
+
+/*
+ * plan_tree_contains_node
+ */
+static bool
+plan_tree_contains_node(Plan *plan, NodeTag tag)
+{
+    if (plan == NULL)
+        return false;
+    if (nodeTag(plan) == tag)
+        return true;
+    if (plan_tree_contains_node(plan->lefttree, tag))
+        return true;
+    if (plan_tree_contains_node(plan->righttree, tag))
+        return true;
+    return false;
+}
+
+/*
+ * can_use_backward_scan
+ *
+ * Returns true if the plan shape supports our backward-scan optimisation
+ * (index-direction flip).  Returns false otherwise; the caller should
+ * silently fall back to vanilla PostgreSQL execution.
+ */
+static bool
+can_use_backward_scan(Plan *plan)
+{
+    if (plan == NULL)
+        return false;
+
+    /* Must be an index scan at the top */
+    if (!IsA(plan, IndexScan) &&
+        !IsA(plan, IndexOnlyScan))
+        return false;
+
+    /* No parallel scans */
+    if (plan->parallel_aware)
+        return false;
+
+    /* No Sort nodes in the tree (ORDER BY must use the index directly) */
+    if (plan_tree_contains_node(plan, T_Sort))
+        return false;
+
+    /* No joins */
+    if (plan_tree_contains_node(plan, T_MergeJoin) ||
+        plan_tree_contains_node(plan, T_HashJoin) ||
+        plan_tree_contains_node(plan, T_NestLoop))
+        return false;
+
+    /* No aggregation */
+    if (plan_tree_contains_node(plan, T_Agg))
+        return false;
+
+    return true;
+}
+
+
+
+
+
+
 /*
  * create_limit_plan
  *
@@ -2734,6 +2813,28 @@ create_limit_plan(PlannerInfo *root, LimitPath *best_path, int flags)
 					  numUniqkeys, uniqColIdx, uniqOperators, uniqCollations);
 
 	copy_generic_path_info(&plan->plan, (Path *) best_path);
+
+		/*
+	* BACKWARD_SCAN — copy flag from path to plan node.
+	* Safety check and index direction flip happen here.
+	*/
+	plan->scanBackward = false;
+	plan->needFlip     = false;
+
+	if (best_path->scanBackward && can_use_backward_scan(subplan))
+	{
+		plan->scanBackward = true;
+		plan->needFlip     = true;
+
+		if (IsA(subplan, IndexScan))
+			((IndexScan *) subplan)->indexorderdir =
+				reverse_indexorderdir(
+					((IndexScan *) subplan)->indexorderdir);
+		else if (IsA(subplan, IndexOnlyScan))
+			((IndexOnlyScan *) subplan)->indexorderdir =
+				reverse_indexorderdir(
+					((IndexOnlyScan *) subplan)->indexorderdir);
+	}
 
 	return plan;
 }

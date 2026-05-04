@@ -2739,6 +2739,8 @@ typedef struct LimitPath
 	Node	   *limitOffset;	/* OFFSET parameter, or NULL if none */
 	Node	   *limitCount;		/* COUNT parameter, or NULL if none */
 	LimitOption limitOption;	/* FETCH FIRST with ties or exact number */
+		    /* BACKWARD_SCAN optimization */
+    bool        scanBackward;   /* ← add this */
 } LimitPath;
 
 

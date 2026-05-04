@@ -2017,7 +2017,8 @@ grouping_planner(PlannerInfo *root, double tuple_fraction,
 											  parse->limitOffset,
 											  parse->limitCount,
 											  parse->limitOption,
-											  offset_est, count_est);
+											  offset_est, count_est,
+											  parse->backwardScan);
 		}
 
 		/*
@@ -5057,7 +5058,7 @@ create_partial_distinct_paths(PlannerInfo *root, RelOptInfo *input_rel,
 													   NULL,
 													   limitCount,
 													   LIMIT_OPTION_COUNT,
-													   0, 1));
+													   0, 1, false));
 				}
 				else
 				{
@@ -5251,7 +5252,7 @@ create_final_distinct_paths(PlannerInfo *root, RelOptInfo *input_rel,
 					add_path(distinct_rel, (Path *)
 							 create_limit_path(root, distinct_rel, sorted_path,
 											   NULL, limitCount,
-											   LIMIT_OPTION_COUNT, 0, 1));
+											   LIMIT_OPTION_COUNT, 0, 1, false));
 				}
 				else
 				{

@@ -234,6 +234,9 @@ typedef struct Query
 	Node	   *limitCount;		/* # of result tuples to return (int8 expr) */
 	LimitOption limitOption;	/* limit type */
 
+		/* BACKWARD_SCAN optimization hint */
+	bool        backwardScan;   /* user specified BACKWARD_SCAN */
+
 	List	   *rowMarks;		/* a list of RowMarkClause's */
 
 	Node	   *setOperations;	/* set-operation tree if this is top level of
@@ -2322,6 +2325,7 @@ typedef struct SelectStmt
 	Node	   *limitOffset;	/* # of result tuples to skip */
 	Node	   *limitCount;		/* # of result tuples to return */
 	LimitOption limitOption;	/* limit type */
+	bool        backwardScan;       /* ← add */
 	List	   *lockingClause;	/* FOR UPDATE (list of LockingClause's) */
 	WithClause *withClause;		/* WITH clause */
 
