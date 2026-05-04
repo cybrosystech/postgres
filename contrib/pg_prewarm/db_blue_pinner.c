@@ -175,6 +175,7 @@ static float4 GetRelCacheRatio(Oid relid);
 static int64 GetRelTotalSize(Oid relid);
 static int64 GetRelAccessCount(const char *table_name);
 static void  PrewarmRelationIntoBuffers(PinEntry *entry);
+static void  SoftPinRelationIndexes(PinEntry *entry);
 static uint8 ParseTierSuffix(char *table_name);
 static void  PinnerHandleSignals(void);
 
@@ -502,11 +503,21 @@ PinnerRunCycle(void)
                  e->table_name, e->cache_ratio * 100.0);
         }
 
-        /* Apply soft-pin flag to all cached buffers */
+        /* Apply soft-pin flag to all cached heap buffers */
         SoftPinRelationBuffers(e->relspcOid,
                                MyDatabaseId,
                                e->relfileOid,
                                e->tier);
+
+        /*
+         * Also pin each index's buffers. SoftPinRelationBuffers stamps
+         * by relfilenode, which is per-relation — index relfilenodes
+         * differ from the heap's, so without this call indexes remain
+         * evictable even when the heap is fully protected. Applies to
+         * both tiers: protecting the heap of a hot OLTP table without
+         * its indexes still costs idx_blks_read under pressure.
+         */
+        SoftPinRelationIndexes(e);
 
         used_bytes += e->table_size;
     }
@@ -903,6 +914,85 @@ PrewarmRelationIntoBuffers(PinEntry *entry)
                  "db_blue pinner: index prewarm failed for \"%s\"",
                  entry->table_name);
     }
+}
+
+/* =========================================================================
+ * SOFT-PIN INDEXES OF A RELATION
+ * =========================================================================
+ */
+
+/*
+ * SoftPinRelationIndexes — apply the relation's soft-pin tier to every
+ * resident buffer of every index defined on the table.
+ *
+ * The heap-only call to SoftPinRelationBuffers leaves index pages
+ * unprotected because each index has its own relfilenode. Under cache
+ * pressure that turns into idx_blks_read on tables whose heaps are
+ * fully soft-pinned — exactly the cost the pinner is supposed to
+ * eliminate. Applies to both tiers.
+ *
+ * Soft pins only stamp resident buffers, so for Tier 2 (where indexes
+ * are not prewarmed) this only protects index pages that have already
+ * been faulted in by query traffic. The next pinner cycle will pick up
+ * any newly-resident index pages.
+ *
+ * Must be called inside a transaction with an active SPI snapshot.
+ */
+static void
+SoftPinRelationIndexes(PinEntry *entry)
+{
+    int         ret;
+    uint64      i;
+    int         pinned_indexes = 0;
+    static const char *idx_query =
+        "SELECT c.relfilenode, c.reltablespace "
+        "FROM pg_index i "
+        "JOIN pg_class c ON c.oid = i.indexrelid "
+        "WHERE i.indrelid = $1";
+    Datum       args[1];
+    Oid         argtypes[1] = { OIDOID };
+
+    args[0] = ObjectIdGetDatum(entry->relid);
+
+    ret = SPI_execute_with_args(idx_query, 1, argtypes, args,
+                                NULL, true, 0);
+    if (ret != SPI_OK_SELECT)
+    {
+        elog(WARNING,
+             "db_blue pinner: index lookup failed for \"%s\"",
+             entry->table_name);
+        return;
+    }
+
+    for (i = 0; i < SPI_processed; i++)
+    {
+        bool        isnull;
+        Oid         idx_relfileOid;
+        Oid         idx_relspcOid;
+
+        idx_relfileOid = DatumGetObjectId(
+            SPI_getbinval(SPI_tuptable->vals[i],
+                          SPI_tuptable->tupdesc, 1, &isnull));
+        if (isnull || !OidIsValid(idx_relfileOid))
+            continue;
+
+        idx_relspcOid = DatumGetObjectId(
+            SPI_getbinval(SPI_tuptable->vals[i],
+                          SPI_tuptable->tupdesc, 2, &isnull));
+        if (isnull || !OidIsValid(idx_relspcOid))
+            idx_relspcOid = MyDatabaseTableSpace;
+
+        SoftPinRelationBuffers(idx_relspcOid,
+                               MyDatabaseId,
+                               idx_relfileOid,
+                               entry->tier);
+        pinned_indexes++;
+    }
+
+    if (pinned_indexes > 0)
+        elog(DEBUG1,
+             "db_blue pinner: soft-pinned %d indexes for \"%s\" (tier %d)",
+             pinned_indexes, entry->table_name, entry->tier);
 }
 
 /* =========================================================================
