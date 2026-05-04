@@ -106,6 +106,7 @@
 #include "utils/xml.h"
 #include "postmaster/dbblue_index_advisor.h"
 
+#include "utils/pg_audit.h"
 
 #ifdef TRACE_SYNCSCAN
 #include "access/syncscan.h"
