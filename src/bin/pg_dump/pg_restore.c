@@ -696,6 +696,18 @@ restore_one_database(const char *inputFileSpec, RestoreOptions *opts,
 	Archive    *AH;
 	int			n_errors;
 
+	/* If user didn't specify -j, use all available CPU cores */
+   if (numWorkers <= 1)
+   {
+       numWorkers = (int) sysconf(_SC_NPROCESSORS_ONLN);
+   }
+
+
+   pg_log_warning("restoring database \"%s\" to target server using %d parallel workers",
+                  opts->cparams.dbname,
+                  numWorkers);
+
+
 	AH = OpenArchive(inputFileSpec, opts->format);
 
 	SetArchiveOptions(AH, NULL, opts);
