@@ -275,7 +275,7 @@ dbblue_fillfactor_lookup(const char *tablename)
        return -1;
 
 
-   // rebuild if hash is NULL OR empty */
+   /* rebuild if hash is NULL OR empty */
    if (!dbblue_ff_htab || hash_get_num_entries(dbblue_ff_htab) == 0)
    {
        ereport(LOG,
@@ -286,10 +286,12 @@ dbblue_fillfactor_lookup(const char *tablename)
        rebuild_hash_table(dbblue_fillfactor_map);
    }
 
+   /* No map configured (e.g. during initdb / bootstrap) — nothing to look up */
+   if (!dbblue_ff_htab)
+       return -1;
 
-   // normalize_name(tablename, normname, sizeof(normname));
    memset(normname, 0, sizeof(normname));
-normalize_name(tablename, normname, sizeof(normname));
+   normalize_name(tablename, normname, sizeof(normname));
 
 
    ereport(LOG, (errmsg("lookup: searching key = %s", normname)));
