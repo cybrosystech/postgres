@@ -2592,9 +2592,17 @@ retry:
 	/*
 	 * Clear out the buffer's tag and flags.  We must do this to ensure that
 	 * linear scans of the buffer array don't think the buffer is valid.
+	 *
+	 * Also clear the Odoo-pinner soft-pin tier here. The tier was bound to
+	 * the relation we're invalidating; once the tag is gone, leaving the
+	 * tier set would leak protection onto whatever relation reuses this
+	 * buffer next, and would also cause the clock sweep to skip the now-
+	 * empty buffer until pressure forces a clear (effectively shrinking
+	 * the usable pool over time as DDL churns).
 	 */
 	oldFlags = buf_state & BUF_FLAG_MASK;
 	ClearBufferTag(&buf->tag);
+	buf->soft_pin_tier = SOFT_PIN_TIER_NONE;
 
 	UnlockBufHdrExt(buf, buf_state,
 					0,
@@ -2677,8 +2685,14 @@ InvalidateVictimBuffer(BufferDesc *buf_hdr)
 	 * doing anything with the buffer. But currently it's beneficial, as the
 	 * cheaper pre-check for several linear scans of shared buffers use the
 	 * tag (see e.g. FlushDatabaseBuffers()).
+	 *
+	 * Also clear the Odoo-pinner soft-pin tier — see the equivalent comment
+	 * in InvalidateBuffer. The buffer is about to be repurposed for a
+	 * different page; carrying the previous relation's tier forward would
+	 * leak protection onto the new occupant.
 	 */
 	ClearBufferTag(&buf_hdr->tag);
+	buf_hdr->soft_pin_tier = SOFT_PIN_TIER_NONE;
 	UnlockBufHdrExt(buf_hdr, buf_state,
 					0,
 					BUF_FLAG_MASK | BUF_USAGECOUNT_MASK,
