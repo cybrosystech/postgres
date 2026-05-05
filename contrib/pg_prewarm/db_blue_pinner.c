@@ -544,6 +544,19 @@ cycle_end:
  * PinnerSetupRingBuffers — parse ring_buffer_tables GUC and register
  * each table's relfilenode in the shared RingBufferRelations array.
  *
+ * Also soft-pins each table's *indexes* at Tier 2. Ring-buffer routing
+ * keeps the heap out of shared_buffers (route reads through a 256 KB
+ * private ring), but index pages are small and benefit from staying
+ * resident — without protection, concurrent pool pressure (e.g. archive
+ * scans) can evict report PK indexes and turn index-only scans into
+ * disk-bound queries. Pinning the indexes here gives ring_buffer_tables
+ * the contract users want: "don't pollute cache with this table's heap,
+ * but keep its indexes warm."
+ *
+ * Index pin sizes are not charged against max_pin_size_percent — they
+ * are typically small (a few MB per table) and disabling protection
+ * because the budget is consumed by heaps would defeat the purpose.
+ *
  * This runs inside a transaction so we can resolve table names to OIDs.
  */
 static void
@@ -568,9 +581,10 @@ PinnerSetupRingBuffers(void)
 
     foreach(lc, namelist)
     {
-        char   *table_name = (char *) lfirst(lc);
-        Oid     relid;
-        Oid     relfileOid;
+        char       *table_name = (char *) lfirst(lc);
+        Oid         relid;
+        Oid         relfileOid;
+        PinEntry    ring_entry;
 
         /* Trim whitespace */
         while (*table_name == ' ') table_name++;
@@ -594,6 +608,18 @@ PinnerSetupRingBuffers(void)
              "db_blue pinner: ring buffer forced for \"%s\" "
              "(relfileOid=%u)",
              table_name, relfileOid);
+
+        /*
+         * Soft-pin the indexes of this ring-buffered table. Builds a
+         * minimal PinEntry with just the fields SoftPinRelationIndexes
+         * needs: relid (for the SPI lookup), table_name (for log
+         * messages), and tier.
+         */
+        memset(&ring_entry, 0, sizeof(ring_entry));
+        ring_entry.relid = relid;
+        ring_entry.tier  = SOFT_PIN_TIER_2;
+        strlcpy(ring_entry.table_name, table_name, NAMEDATALEN);
+        SoftPinRelationIndexes(&ring_entry);
     }
 
     list_free(namelist);
