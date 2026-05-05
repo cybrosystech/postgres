@@ -847,18 +847,27 @@ compute_param_signature(CachedPlanSource *plansource, ParamListInfo boundParams)
  * bucket-specific generic plan.
  *
  * For each array parameter, we insert a fake array of bucket-midpoint size.
- * For non-array parameters we leave isnull=true.  The values are NOT marked
- * PARAM_FLAG_CONST, so the planner uses them only as hints for selectivity
- * estimation; it will not fold them into the produced plan as constants.
+ * For non-array parameters we PASS THROUGH the actual value from boundParams
+ * (when available) so the planner has selectivity info for them too.  In
+ * either case the value is NOT marked PARAM_FLAG_CONST: the planner uses it
+ * only as a hint for selectivity estimation, it will not fold it into the
+ * produced plan as a constant, and the cached plan remains reusable across
+ * future calls with different non-array param values.
+ *
+ * Without the value pass-through, mixed-param queries like
+ *   WHERE id = ANY($1) AND state = $2
+ * picked the wrong join order on the patched server (Phase 1/2 only synthesized
+ * the array; $2 was left isnull=true so the planner had no idea about its
+ * selectivity and put state's index scan first, killing performance).
  *
  * For static-param sources (plansource->param_types is set), iterate by
  * plansource->num_params and use those types.  For dynamic-param sources
  * (PL/pgSQL via SPI, num_params=0 but boundParams has paramFetch), use
- * boundParams->numParams and probe paramFetch for each type.
+ * boundParams->numParams and probe paramFetch for each type AND value.
  *
  * Caller is responsible for the memory context (we palloc in
  * CurrentMemoryContext).  Currently supports int4[] and int8[] element types
- * only; for other array types the slot is left as NULL.
+ * for bucketing; other types are passed through verbatim from boundParams.
  */
 static ParamListInfo
 synthesize_bucket_params(CachedPlanSource *plansource,
@@ -896,6 +905,7 @@ synthesize_bucket_params(CachedPlanSource *plansource,
 		Oid			elemtype;
 		ParamExternData *prm = &plist->params[i];
 		ParamExternData prmwork;
+		ParamExternData *src = NULL;
 		int			bucket;
 		int			len;
 		Datum	   *elems;
@@ -907,50 +917,67 @@ synthesize_bucket_params(CachedPlanSource *plansource,
 		prm->pflags = 0;		/* deliberately NOT PARAM_FLAG_CONST */
 		prm->isnull = true;
 		prm->value = (Datum) 0;
+		prm->ptype = InvalidOid;
 
+		/* Resolve src ParamExternData and ptype. */
 		if (dynamic)
 		{
-			ParamExternData *got = boundParams->paramFetch(boundParams, i + 1,
-														   true, &prmwork);
-			if (got == NULL || !OidIsValid(got->ptype))
-			{
-				prm->ptype = InvalidOid;
+			src = boundParams->paramFetch(boundParams, i + 1, true, &prmwork);
+			if (src == NULL || !OidIsValid(src->ptype))
 				continue;
-			}
-			ptype = got->ptype;
+			ptype = src->ptype;
 		}
 		else
 		{
 			ptype = plansource->param_types[i];
+			if (boundParams != NULL && i < boundParams->numParams)
+				src = &boundParams->params[i];
 		}
+		if (!OidIsValid(ptype))
+			continue;
 		prm->ptype = ptype;
 
-		elemtype = OidIsValid(ptype) ? get_element_type(ptype) : InvalidOid;
-		if (!OidIsValid(elemtype))
-			continue;
-
-		/* Only int4 and int8 element arrays are supported */
-		if (elemtype != INT4OID && elemtype != INT8OID)
-			continue;
-
-		bucket = (signature >> shift) & 0xF;
-		shift += 4;
-		if (bucket < 0 || bucket >= MAX_GPLAN_BUCKETS)
-			continue;
-		len = bucket_midpoint[bucket];
-
-		get_typlenbyvalalign(elemtype, &elmlen, &elmbyval, &elmalign);
-		elems = palloc(sizeof(Datum) * len);
-		for (int j = 0; j < len; j++)
+		/*
+		 * Bucketable array? Synthesize a fake array of bucket-midpoint size
+		 * so the planner gets the right cardinality hint.
+		 */
+		elemtype = get_element_type(ptype);
+		if (OidIsValid(elemtype) &&
+			(elemtype == INT4OID || elemtype == INT8OID))
 		{
-			if (elemtype == INT4OID)
-				elems[j] = Int32GetDatum(j + 1);
-			else
-				elems[j] = Int64GetDatum((int64) (j + 1));
+			bucket = (signature >> shift) & 0xF;
+			shift += 4;
+			if (bucket >= 0 && bucket < MAX_GPLAN_BUCKETS)
+			{
+				len = bucket_midpoint[bucket];
+				get_typlenbyvalalign(elemtype, &elmlen, &elmbyval, &elmalign);
+				elems = palloc(sizeof(Datum) * len);
+				for (int j = 0; j < len; j++)
+				{
+					if (elemtype == INT4OID)
+						elems[j] = Int32GetDatum(j + 1);
+					else
+						elems[j] = Int64GetDatum((int64) (j + 1));
+				}
+				arr = construct_array(elems, len, elemtype,
+									  elmlen, elmbyval, elmalign);
+				prm->isnull = false;
+				prm->value = PointerGetDatum(arr);
+			}
+			continue;
 		}
-		arr = construct_array(elems, len, elemtype, elmlen, elmbyval, elmalign);
-		prm->isnull = false;
-		prm->value = PointerGetDatum(arr);
+
+		/*
+		 * Non-array param: pass through the actual value from boundParams as
+		 * a planner hint.  Without this, the planner has no selectivity info
+		 * for $i in the bucket plan and may pick a wrong join order in
+		 * mixed-param queries (Phase 3 fix).
+		 */
+		if (src != NULL && OidIsValid(src->ptype))
+		{
+			prm->isnull = src->isnull;
+			prm->value = src->value;
+		}
 	}
 
 	return plist;
