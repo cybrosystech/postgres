@@ -1269,7 +1269,7 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	EmitConnectionWarnings();
 	if(dbblue_audit_enabled)
    {
-       ereport(LOG,errmsg("dbblue_audit is enabled"));
+    //    ereport(LOG,errmsg("dbblue_audit is enabled"));
        dbblue_audit_init();
    };
 
