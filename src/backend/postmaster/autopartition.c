@@ -187,6 +187,439 @@ AutoPartitionLauncherMain(Datum main_arg)
  * skips further processing this iteration), false if conversion was
  * skipped or failed.
  */
+/*
+ * Phase 3a-date: convert an unpartitioned heap to a date-partitioned
+ * table.  Sibling of convert_heap_to_partitioned() but with timestamp /
+ * interval arithmetic.
+ *
+ * Preconditions (the launcher logs a WARNING and skips otherwise):
+ *   * partition_column has type timestamp / timestamptz / date.
+ *   * The relation has a primary key that includes partition_column.
+ *     Composite PKs like (id, create_date) are fine and are the typical
+ *     shape.  PK validity is confirmed by the eventual CREATE TABLE
+ *     LIKE — if it fails the subtransaction rolls back cleanly.
+ *   * No FKs in/out and no user triggers.
+ *
+ * Initial partition spans [min(col), max(col) + interval).  No interval
+ * snapping — date_trunc only works for standard units, and supporting
+ * arbitrary intervals like '7 days' or '36 hours' generically is a
+ * follow-up.  The initial partition is one large bucket; subsequent
+ * partitions follow the user's interval cleanly.
+ */
+static bool
+convert_heap_to_partitioned_date(Oid reloid, const char *nsname,
+								 const char *relname, const char *partcol,
+								 const char *partinterval, int32 retention)
+{
+	StringInfoData buf;
+	int			ret;
+	bool		converted = false;
+	bool		has_fk_in,
+				has_fk_out,
+				has_trigger;
+	bool		col_ok;
+	bool		pk_ok;
+	int64		row_count = 0;
+	char	   *min_text = NULL;
+	char	   *max_text = NULL;
+	char	   *upper_text = NULL;
+	char	   *suffix = NULL;
+	MemoryContext savecxt;
+
+	if (partinterval == NULL || *partinterval == '\0')
+	{
+		ereport(WARNING,
+				(errmsg("auto-partition: %s.%s: range_date strategy needs auto_partition_interval",
+						nsname, relname)));
+		return false;
+	}
+
+	/* 1. Type check: partcol is timestamp/timestamptz/date. */
+	initStringInfo(&buf);
+	appendStringInfo(&buf,
+					 "SELECT EXISTS ("
+					 "  SELECT 1 FROM pg_attribute a "
+					 "  JOIN pg_type t ON t.oid = a.atttypid "
+					 "  WHERE a.attrelid = %u "
+					 "    AND a.attname = %s "
+					 "    AND t.typname IN ('timestamp','timestamptz','date'))",
+					 reloid, quote_literal_cstr(partcol));
+	ret = SPI_execute(buf.data, true, 0);
+	pfree(buf.data);
+	if (ret != SPI_OK_SELECT || SPI_processed == 0)
+	{
+		ereport(WARNING,
+				(errmsg("auto-partition: %s.%s: column-type check failed",
+						nsname, relname)));
+		return false;
+	}
+	{
+		bool		isnull;
+
+		col_ok = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
+											SPI_tuptable->tupdesc, 1, &isnull));
+	}
+	if (!col_ok)
+	{
+		ereport(WARNING,
+				(errmsg("auto-partition: %s.%s: column %s must be timestamp/timestamptz/date for range_date",
+						nsname, relname, partcol)));
+		return false;
+	}
+
+	/* 2. PK must include partition_column. */
+	initStringInfo(&buf);
+	appendStringInfo(&buf,
+					 "SELECT EXISTS ("
+					 "  SELECT 1 FROM pg_constraint con "
+					 "  JOIN pg_attribute a "
+					 "    ON a.attrelid = con.conrelid "
+					 "   AND a.attnum = ANY(con.conkey) "
+					 "  WHERE con.conrelid = %u "
+					 "    AND con.contype = 'p' "
+					 "    AND a.attname = %s)",
+					 reloid, quote_literal_cstr(partcol));
+	ret = SPI_execute(buf.data, true, 0);
+	pfree(buf.data);
+	if (ret != SPI_OK_SELECT || SPI_processed == 0)
+	{
+		ereport(WARNING,
+				(errmsg("auto-partition: %s.%s: PK check failed",
+						nsname, relname)));
+		return false;
+	}
+	{
+		bool		isnull;
+
+		pk_ok = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
+										   SPI_tuptable->tupdesc, 1, &isnull));
+	}
+	if (!pk_ok)
+	{
+		ereport(WARNING,
+				(errmsg("auto-partition: %s.%s: range_date conversion needs %s in the primary key",
+						nsname, relname, partcol)));
+		return false;
+	}
+
+	/* 3. FK / trigger checks (same as int variant). */
+	initStringInfo(&buf);
+	appendStringInfo(&buf,
+					 "SELECT "
+					 "  EXISTS(SELECT 1 FROM pg_constraint WHERE confrelid=%u AND contype='f') AS fk_in, "
+					 "  EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid=%u  AND contype='f') AS fk_out, "
+					 "  EXISTS(SELECT 1 FROM pg_trigger    WHERE tgrelid=%u   AND NOT tgisinternal) AS trig",
+					 reloid, reloid, reloid);
+	ret = SPI_execute(buf.data, true, 0);
+	pfree(buf.data);
+	if (ret != SPI_OK_SELECT || SPI_processed == 0)
+	{
+		ereport(WARNING,
+				(errmsg("auto-partition: %s.%s: FK/trigger check failed",
+						nsname, relname)));
+		return false;
+	}
+	{
+		bool		isnull;
+
+		has_fk_in = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
+											   SPI_tuptable->tupdesc, 1, &isnull));
+		has_fk_out = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
+											   SPI_tuptable->tupdesc, 2, &isnull));
+		has_trigger = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
+												 SPI_tuptable->tupdesc, 3, &isnull));
+	}
+	if (has_fk_in || has_fk_out || has_trigger)
+	{
+		ereport(WARNING,
+				(errmsg("auto-partition: %s.%s: skipping conversion — relation has %s%s%s",
+						nsname, relname,
+						has_fk_in ? "inbound FKs " : "",
+						has_fk_out ? "outbound FKs " : "",
+						has_trigger ? "user triggers" : "")));
+		return false;
+	}
+
+	/* 4. Compute initial partition bounds. */
+	initStringInfo(&buf);
+	appendStringInfo(&buf,
+					 "SELECT min(%s)::text, "
+					 "       (max(%s) + %s::interval)::text, "
+					 "       to_char(min(%s), 'YYYYMMDDHH24MISS'), "
+					 "       count(*)::bigint "
+					 "FROM %s.%s",
+					 quote_identifier(partcol),
+					 quote_identifier(partcol),
+					 quote_literal_cstr(partinterval),
+					 quote_identifier(partcol),
+					 quote_identifier(nsname),
+					 quote_identifier(relname));
+	ret = SPI_execute(buf.data, true, 0);
+	pfree(buf.data);
+	if (ret != SPI_OK_SELECT || SPI_processed == 0)
+	{
+		ereport(WARNING,
+				(errmsg("auto-partition: %s.%s: failed to compute initial bounds",
+						nsname, relname)));
+		return false;
+	}
+	{
+		bool		isnull;
+		char	   *s;
+
+		s = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+		savecxt = MemoryContextSwitchTo(TopTransactionContext);
+		min_text = s ? pstrdup(s) : NULL;
+		s = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2);
+		upper_text = s ? pstrdup(s) : NULL;
+		s = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3);
+		suffix = s ? pstrdup(s) : NULL;
+		MemoryContextSwitchTo(savecxt);
+		row_count = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
+												SPI_tuptable->tupdesc, 4, &isnull));
+		(void) max_text;		/* not currently used; kept for clarity */
+	}
+
+	if (row_count == 0)
+	{
+		/* Empty table: anchor on now() so the launcher has a starting bound. */
+		initStringInfo(&buf);
+		appendStringInfo(&buf,
+						 "SELECT now()::text, "
+						 "       (now() + %s::interval)::text, "
+						 "       to_char(now(), 'YYYYMMDDHH24MISS')",
+						 quote_literal_cstr(partinterval));
+		ret = SPI_execute(buf.data, true, 0);
+		pfree(buf.data);
+		if (ret == SPI_OK_SELECT && SPI_processed > 0)
+		{
+			char	   *s;
+
+			savecxt = MemoryContextSwitchTo(TopTransactionContext);
+			s = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+			min_text = s ? pstrdup(s) : NULL;
+			s = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2);
+			upper_text = s ? pstrdup(s) : NULL;
+			s = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3);
+			suffix = s ? pstrdup(s) : NULL;
+			MemoryContextSwitchTo(savecxt);
+		}
+	}
+
+	if (min_text == NULL || upper_text == NULL || suffix == NULL)
+	{
+		ereport(WARNING,
+				(errmsg("auto-partition: %s.%s: bound computation produced NULL",
+						nsname, relname)));
+		return false;
+	}
+
+	ereport(LOG,
+			(errmsg("auto-partition: converting %s.%s (rows=%lld, %s) -> partitioned [%s, %s)",
+					nsname, relname, (long long) row_count, partcol,
+					min_text, upper_text)));
+
+	/* 5. Conversion proper, in a subtransaction. */
+	BeginInternalSubTransaction("autopart_convert_date");
+	PG_TRY();
+	{
+		char		tmp_name[NAMEDATALEN];
+		char		init_name[NAMEDATALEN];
+		char		final_init_name[NAMEDATALEN];
+
+		snprintf(tmp_name, sizeof(tmp_name), "%s__autopart_new", relname);
+		snprintf(init_name, sizeof(init_name), "%s_initial", tmp_name);
+		snprintf(final_init_name, sizeof(final_init_name),
+				 "%s_p_%s", relname, suffix);
+
+		/* a. New partitioned parent. */
+		initStringInfo(&buf);
+		appendStringInfo(&buf,
+						 "CREATE TABLE %s.%s (LIKE %s.%s INCLUDING ALL) "
+						 "PARTITION BY RANGE (%s)",
+						 quote_identifier(nsname),
+						 quote_identifier(tmp_name),
+						 quote_identifier(nsname),
+						 quote_identifier(relname),
+						 quote_identifier(partcol));
+		SPI_exec(buf.data, 0);
+		pfree(buf.data);
+
+		/* b. Initial partition spanning the existing data. */
+		initStringInfo(&buf);
+		appendStringInfo(&buf,
+						 "CREATE TABLE %s.%s PARTITION OF %s.%s "
+						 "FOR VALUES FROM (%s) TO (%s)",
+						 quote_identifier(nsname),
+						 quote_identifier(init_name),
+						 quote_identifier(nsname),
+						 quote_identifier(tmp_name),
+						 quote_literal_cstr(min_text),
+						 quote_literal_cstr(upper_text));
+		SPI_exec(buf.data, 0);
+		pfree(buf.data);
+
+		/* c. Copy rows. */
+		if (row_count > 0)
+		{
+			initStringInfo(&buf);
+			appendStringInfo(&buf,
+							 "INSERT INTO %s.%s SELECT * FROM %s.%s",
+							 quote_identifier(nsname),
+							 quote_identifier(tmp_name),
+							 quote_identifier(nsname),
+							 quote_identifier(relname));
+			SPI_exec(buf.data, 0);
+			pfree(buf.data);
+		}
+
+		/*
+		 * d. Detach owned sequences before DROP, then re-attach to the
+		 *    swapped-in relation.  Same dance as the int variant —
+		 *    LIKE INCLUDING ALL copies DEFAULT clauses that reference
+		 *    sequences owned by the source.
+		 */
+		{
+			SPITupleTable *seqtab;
+			int			seq_ret;
+			int			seq_count;
+			char	  **seq_names = NULL;
+			char	  **seq_columns = NULL;
+
+			initStringInfo(&buf);
+			appendStringInfo(&buf,
+							 "SELECT s.relname, a.attname "
+							 "FROM pg_depend d "
+							 "JOIN pg_class s ON s.oid = d.objid AND s.relkind = 'S' "
+							 "JOIN pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid "
+							 "WHERE d.refobjid = %u "
+							 "  AND d.classid = 'pg_class'::regclass "
+							 "  AND d.refclassid = 'pg_class'::regclass "
+							 "  AND d.deptype = 'a'",
+							 reloid);
+			seq_ret = SPI_execute(buf.data, true, 0);
+			pfree(buf.data);
+
+			if (seq_ret == SPI_OK_SELECT && SPI_processed > 0)
+			{
+				MemoryContext oldcxt;
+
+				seq_count = (int) SPI_processed;
+				seqtab = SPI_tuptable;
+				oldcxt = MemoryContextSwitchTo(TopTransactionContext);
+				seq_names = palloc(sizeof(char *) * seq_count);
+				seq_columns = palloc(sizeof(char *) * seq_count);
+				for (int s = 0; s < seq_count; s++)
+				{
+					seq_names[s] = pstrdup(SPI_getvalue(seqtab->vals[s], seqtab->tupdesc, 1));
+					seq_columns[s] = pstrdup(SPI_getvalue(seqtab->vals[s], seqtab->tupdesc, 2));
+				}
+				MemoryContextSwitchTo(oldcxt);
+			}
+			else
+				seq_count = 0;
+
+			for (int s = 0; s < seq_count; s++)
+			{
+				initStringInfo(&buf);
+				appendStringInfo(&buf, "ALTER SEQUENCE %s.%s OWNED BY NONE",
+								 quote_identifier(nsname),
+								 quote_identifier(seq_names[s]));
+				SPI_exec(buf.data, 0);
+				pfree(buf.data);
+			}
+
+			/* The actual swap. */
+			initStringInfo(&buf);
+			appendStringInfo(&buf, "LOCK TABLE %s.%s IN ACCESS EXCLUSIVE MODE",
+							 quote_identifier(nsname),
+							 quote_identifier(relname));
+			SPI_exec(buf.data, 0);
+			pfree(buf.data);
+
+			initStringInfo(&buf);
+			appendStringInfo(&buf, "DROP TABLE %s.%s",
+							 quote_identifier(nsname),
+							 quote_identifier(relname));
+			SPI_exec(buf.data, 0);
+			pfree(buf.data);
+
+			initStringInfo(&buf);
+			appendStringInfo(&buf, "ALTER TABLE %s.%s RENAME TO %s",
+							 quote_identifier(nsname),
+							 quote_identifier(tmp_name),
+							 quote_identifier(relname));
+			SPI_exec(buf.data, 0);
+			pfree(buf.data);
+
+			initStringInfo(&buf);
+			appendStringInfo(&buf, "ALTER TABLE %s.%s RENAME TO %s",
+							 quote_identifier(nsname),
+							 quote_identifier(init_name),
+							 quote_identifier(final_init_name));
+			SPI_exec(buf.data, 0);
+			pfree(buf.data);
+
+			for (int s = 0; s < seq_count; s++)
+			{
+				initStringInfo(&buf);
+				appendStringInfo(&buf,
+								 "ALTER SEQUENCE %s.%s OWNED BY %s.%s.%s",
+								 quote_identifier(nsname),
+								 quote_identifier(seq_names[s]),
+								 quote_identifier(nsname),
+								 quote_identifier(relname),
+								 quote_identifier(seq_columns[s]));
+				SPI_exec(buf.data, 0);
+				pfree(buf.data);
+			}
+		}
+
+		/* e. Re-apply auto_partition reloptions. */
+		initStringInfo(&buf);
+		appendStringInfo(&buf,
+						 "ALTER TABLE %s.%s SET ("
+						 "auto_partition_strategy = %s, "
+						 "auto_partition_column = %s, "
+						 "auto_partition_interval = %s, "
+						 "auto_partition_retention = %d)",
+						 quote_identifier(nsname),
+						 quote_identifier(relname),
+						 quote_literal_cstr("range_date"),
+						 quote_literal_cstr(partcol),
+						 quote_literal_cstr(partinterval),
+						 retention);
+		SPI_exec(buf.data, 0);
+		pfree(buf.data);
+
+		ereport(LOG,
+				(errmsg("auto-partition: converted %s.%s, initial partition %s.%s",
+						nsname, relname, nsname, final_init_name)));
+		converted = true;
+
+		ReleaseCurrentSubTransaction();
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		MemoryContextSwitchTo(TopTransactionContext);
+		edata = CopyErrorData();
+		ereport(WARNING,
+				(errmsg("auto-partition: %s.%s: date conversion failed: %s",
+						nsname, relname, edata->message)));
+		FreeErrorData(edata);
+		FlushErrorState();
+		RollbackAndReleaseCurrentSubTransaction();
+		converted = false;
+	}
+	PG_END_TRY();
+
+	return converted;
+}
+
+/* ---------------------------------------------------------------- */
+
 static bool
 convert_heap_to_partitioned(Oid reloid, const char *nsname, const char *relname,
 							const char *partcol, const char *partinterval,
@@ -1377,13 +1810,13 @@ scan_configured_relations(void)
 			}
 			else if (r->strategy && strcmp(r->strategy, "range_date") == 0)
 			{
-				if (r->relkind == 'p')
+				if (r->relkind == 'r')
+					(void) convert_heap_to_partitioned_date(r->reloid, r->nsname, r->relname,
+															r->partcol, r->partinterval,
+															r->retention);
+				else if (r->relkind == 'p')
 					process_range_date_partition(r->reloid, r->nsname, r->relname,
 												 r->partcol, r->partinterval, r->retention);
-				else
-					ereport(DEBUG1,
-							(errmsg("auto-partition: %s.%s: range_date heap conversion not yet implemented",
-									r->nsname, r->relname)));
 			}
 			else if (r->strategy && strcmp(r->strategy, "list_int") == 0)
 				ereport(DEBUG1,
