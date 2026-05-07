@@ -591,16 +591,21 @@ convert_heap_to_partitioned(Oid reloid, const char *nsname, const char *relname,
  */
 static void
 process_range_int_partition(Oid reloid, const char *nsname, const char *relname,
-							const char *partinterval, int32 retention)
+							const char *partcol, const char *partinterval,
+							int32 retention)
 {
 	int64		interval_size;
 	int			ret;
 	int			partition_count = 0;
 	int64		max_upper;
+	int64		head_lower = 0;
+	char	   *head_relname = NULL;
 	bool		have_max_upper = false;
+	bool		create_next = true;
 	List	   *oldest_oids = NIL;	/* oids to detach + drop, in order */
 	StringInfoData buf;
 	char	   *endptr;
+	MemoryContext savecxt;
 
 	/* Parse the interval as a 64-bit row count. */
 	if (partinterval == NULL || *partinterval == '\0')
@@ -664,16 +669,35 @@ process_range_int_partition(Oid reloid, const char *nsname, const char *relname,
 	/*
 	 * Newest partition first.  Pull max_upper out of row 0 and remember
 	 * the oldest partitions (rows after retention threshold) as
-	 * detach/drop candidates.
+	 * detach/drop candidates.  Also save the head partition's name and
+	 * lower bound so we can probe its fill level before deciding to
+	 * create the next partition (the SPI tuptable is clobbered when we
+	 * issue another SPI query).
 	 */
 	{
 		bool		isnull;
+		char	   *namestr;
 
 		max_upper = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
 												SPI_tuptable->tupdesc,
 												4, &isnull));
 		if (!isnull)
 			have_max_upper = true;
+
+		head_lower = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
+												 SPI_tuptable->tupdesc,
+												 3, &isnull));
+		if (isnull)
+			have_max_upper = false;	/* malformed bound; bail on creation */
+
+		namestr = SPI_getvalue(SPI_tuptable->vals[0],
+							   SPI_tuptable->tupdesc, 2);
+		if (namestr != NULL)
+		{
+			savecxt = MemoryContextSwitchTo(TopTransactionContext);
+			head_relname = pstrdup(namestr);
+			MemoryContextSwitchTo(savecxt);
+		}
 	}
 
 	if (retention > 0 && partition_count > retention)
@@ -695,11 +719,82 @@ process_range_int_partition(Oid reloid, const char *nsname, const char *relname,
 	}
 
 	/*
+	 * Fill-check: probe the head partition for its largest partition-column
+	 * value and decide whether the next partition is actually needed.
+	 * Without this guard the launcher would create one partition every
+	 * iteration whether or not the current head is anywhere close to full,
+	 * burning through partitions on quiet tables and racing retention into
+	 * dropping useful data.
+	 *
+	 * The probe is a max(<partcol>) which the planner satisfies via an
+	 * index-only scan on the partition's PK (which we know exists because
+	 * partition_column IS the PK from Phase 3a's prereq check).  Cost is
+	 * effectively constant time.
+	 *
+	 * Threshold is hard-coded at 80%.  Move to a GUC if customers want
+	 * to tune.
+	 */
+	if (have_max_upper && head_relname != NULL)
+	{
+		int64		head_max = head_lower;
+		bool		head_empty = true;
+
+		initStringInfo(&buf);
+		appendStringInfo(&buf,
+						 "SELECT max(%s)::bigint FROM %s.%s",
+						 quote_identifier(partcol),
+						 quote_identifier(nsname),
+						 quote_identifier(head_relname));
+		ret = SPI_execute(buf.data, true, 0);
+		pfree(buf.data);
+
+		if (ret == SPI_OK_SELECT && SPI_processed > 0)
+		{
+			bool		isnull;
+			int64		v;
+
+			v = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
+											SPI_tuptable->tupdesc,
+											1, &isnull));
+			if (!isnull)
+			{
+				head_max = v;
+				head_empty = false;
+			}
+		}
+
+		if (head_empty)
+		{
+			ereport(DEBUG1,
+					(errmsg("auto-partition: %s.%s: head partition %s is empty, skipping create",
+							nsname, relname, head_relname)));
+			create_next = false;
+		}
+		else
+		{
+			int64		used = head_max - head_lower;
+			/*
+			 * Compare 5 * used >= 4 * interval to avoid float arithmetic,
+			 * i.e. the head is at least 80% full.
+			 */
+			if (used < 0 || (5 * used < 4 * interval_size))
+			{
+				ereport(DEBUG1,
+						(errmsg("auto-partition: %s.%s: head %s at %lld/%lld (%.0f%%), waiting",
+								nsname, relname, head_relname,
+								(long long) used, (long long) interval_size,
+								interval_size > 0 ? (100.0 * used / interval_size) : 0.0)));
+				create_next = false;
+			}
+		}
+	}
+
+	/*
 	 * Try to create the next partition.  Wrap in a subtransaction so a
 	 * failure (typically: partition already exists, or DDL conflict)
 	 * doesn't break this iteration of the scan loop.
 	 */
-	if (have_max_upper)
+	if (have_max_upper && create_next)
 	{
 		int64		lower_bound = max_upper;
 		int64		upper_bound = max_upper + interval_size;
@@ -922,7 +1017,7 @@ scan_configured_relations(void)
 												   retention);
 			else if (relkind == 'p')
 				process_range_int_partition(reloid, nsname, relname,
-											partinterval, retention);
+											partcol, partinterval, retention);
 		}
 		else if (strategy &&
 				 (strcmp(strategy, "range_date") == 0 ||
