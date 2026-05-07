@@ -7,6 +7,7 @@ backend_sources += files(
   'bgwriter.c',
   'checkpointer.c',
   'datachecksum_state.c',
+  'dbblue_auto_tuner.c',
   'fork_process.c',
   'interrupt.c',
   'launch_backend.c',

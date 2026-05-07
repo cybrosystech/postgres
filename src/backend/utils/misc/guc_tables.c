@@ -104,6 +104,7 @@
 #include "utils/ps_status.h"
 #include "utils/rls.h"
 #include "utils/xml.h"
+#include "postmaster/dbblue_auto_tuner.h"
 
 #ifdef TRACE_SYNCSCAN
 #include "access/syncscan.h"

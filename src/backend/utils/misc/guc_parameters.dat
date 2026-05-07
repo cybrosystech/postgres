@@ -624,6 +624,22 @@
   assign_hook => 'assign_datestyle',
 },
 
+{ name => 'dbblue_auto_tune', type => 'bool', context => 'PGC_SIGHUP', group => 'STATS_MONITORING',
+  short_desc => 'Enables the dbblue automatic configuration tuner.',
+  long_desc => 'When enabled, the dbblue auto tuner background worker inspects the server hardware (RAM, CPU count) and writes recommended values for the core memory and parallelism GUCs into public.dbblue_auto_tune_suggestions. The recommendations are only suggestions; the DBA must apply them manually.',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'dbblue_auto_tune',
+  boot_val => 'false',
+},
+
+{ name => 'dbblue_auto_tune_database', type => 'string', context => 'PGC_POSTMASTER', group => 'STATS_MONITORING',
+  short_desc => 'Database the dbblue auto tuner connects to.',
+  long_desc => 'The auto tuner background worker attaches to this database at server startup and writes its suggestions table there. Change requires a server restart.',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'dbblue_auto_tune_database',
+  boot_val => '"postgres"',
+},
+
 # This is PGC_SUSET to prevent hiding from log_lock_waits.
 { name => 'deadlock_timeout', type => 'int', context => 'PGC_SUSET', group => 'LOCK_MANAGEMENT',
   short_desc => 'Sets the time to wait on a lock before checking for deadlock.',
