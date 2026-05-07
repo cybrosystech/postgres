@@ -340,6 +340,25 @@ typedef enum StdRdOptIndexCleanup
 	STDRD_OPTION_VACUUM_INDEX_CLEANUP_ON,
 } StdRdOptIndexCleanup;
 
+/*
+ * StdRdOptions->auto_partition_strategy values.
+ *
+ * DBblue auto-partition: when set to anything other than OFF, the partition
+ * manager treats the relation as a candidate for automatic partition
+ * creation/rotation. The strategy decides how new partition bounds are
+ * computed; the column / interval / retention reloptions parameterize it.
+ *
+ * Phase 1 (this commit): reloptions are accepted and stored but no behavior
+ * is wired up yet. Cross-field validation lives in default_reloptions().
+ */
+typedef enum StdRdOptAutoPartition
+{
+	AUTO_PARTITION_OFF = 0,
+	AUTO_PARTITION_RANGE_INT,	/* RANGE on monotonic integer (e.g. id) */
+	AUTO_PARTITION_RANGE_DATE,	/* RANGE on date/timestamp column */
+	AUTO_PARTITION_LIST_INT,	/* LIST on integer (e.g. company_id) */
+} StdRdOptAutoPartition;
+
 typedef struct StdRdOptions
 {
 	int32		vl_len_;		/* varlena header (do not touch directly!) */
@@ -356,6 +375,12 @@ typedef struct StdRdOptions
 	 * to freeze. 0 if disabled, -1 if unspecified.
 	 */
 	double		vacuum_max_eager_freeze_failure_rate;
+
+	/* DBblue auto-partition reloptions (Phase 1: stored only, not yet acted on) */
+	StdRdOptAutoPartition auto_partition_strategy;
+	int			auto_partition_column;	/* offset to column-name string */
+	int			auto_partition_interval;	/* offset to interval string */
+	int			auto_partition_retention;	/* number of partitions to keep, 0 = unlimited */
 } StdRdOptions;
 
 #define HEAP_MIN_FILLFACTOR			10

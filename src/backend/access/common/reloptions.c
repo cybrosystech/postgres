@@ -413,6 +413,15 @@ static relopt_int intRelOpts[] =
 		},
 		-1, 0, 1024
 	},
+	{
+		{
+			"auto_partition_retention",
+			"DBblue auto-partition: number of partitions to retain (0 = unlimited)",
+			RELOPT_KIND_HEAP,
+			ShareUpdateExclusiveLock
+		},
+		0, 0, INT_MAX
+	},
 
 	/* list terminator */
 	{{NULL}}
@@ -548,6 +557,16 @@ static relopt_enum_elt_def viewCheckOptValues[] =
 	{(const char *) NULL}		/* list terminator */
 };
 
+/* values from StdRdOptAutoPartition (DBblue auto-partition) */
+static relopt_enum_elt_def autoPartitionStrategyValues[] =
+{
+	{"off", AUTO_PARTITION_OFF},
+	{"range_int", AUTO_PARTITION_RANGE_INT},
+	{"range_date", AUTO_PARTITION_RANGE_DATE},
+	{"list_int", AUTO_PARTITION_LIST_INT},
+	{(const char *) NULL}		/* list terminator */
+};
+
 static relopt_enum enumRelOpts[] =
 {
 	{
@@ -583,12 +602,49 @@ static relopt_enum enumRelOpts[] =
 		VIEW_OPTION_CHECK_OPTION_NOT_SET,
 		gettext_noop("Valid values are \"local\" and \"cascaded\".")
 	},
+	{
+		{
+			"auto_partition_strategy",
+			"DBblue auto-partition strategy for this relation",
+			RELOPT_KIND_HEAP,
+			ShareUpdateExclusiveLock
+		},
+		autoPartitionStrategyValues,
+		AUTO_PARTITION_OFF,
+		gettext_noop("Valid values are \"off\", \"range_int\", \"range_date\", and \"list_int\".")
+	},
 	/* list terminator */
 	{{NULL}}
 };
 
 static relopt_string stringRelOpts[] =
 {
+	{
+		{
+			"auto_partition_column",
+			"DBblue auto-partition: column name to partition by",
+			RELOPT_KIND_HEAP,
+			ShareUpdateExclusiveLock
+		},
+		0,			/* default_len */
+		true,		/* default_isnull */
+		NULL,		/* validate_cb (cross-field validation lives in default_reloptions) */
+		NULL,		/* fill_cb (default behavior — copy verbatim) */
+		""			/* default_val */
+	},
+	{
+		{
+			"auto_partition_interval",
+			"DBblue auto-partition: partition size (rows for range_int, interval for range_date)",
+			RELOPT_KIND_HEAP,
+			ShareUpdateExclusiveLock
+		},
+		0,
+		true,
+		NULL,
+		NULL,
+		""
+	},
 	/* list terminator */
 	{{NULL}}
 };
@@ -2025,12 +2081,63 @@ default_reloptions(Datum reloptions, bool validate, relopt_kind kind)
 		{"vacuum_truncate", RELOPT_TYPE_TERNARY,
 		offsetof(StdRdOptions, vacuum_truncate)},
 		{"vacuum_max_eager_freeze_failure_rate", RELOPT_TYPE_REAL,
-		offsetof(StdRdOptions, vacuum_max_eager_freeze_failure_rate)}
+		offsetof(StdRdOptions, vacuum_max_eager_freeze_failure_rate)},
+		{"auto_partition_strategy", RELOPT_TYPE_ENUM,
+		offsetof(StdRdOptions, auto_partition_strategy)},
+		{"auto_partition_column", RELOPT_TYPE_STRING,
+		offsetof(StdRdOptions, auto_partition_column)},
+		{"auto_partition_interval", RELOPT_TYPE_STRING,
+		offsetof(StdRdOptions, auto_partition_interval)},
+		{"auto_partition_retention", RELOPT_TYPE_INT,
+		offsetof(StdRdOptions, auto_partition_retention)}
 	};
 
-	return (bytea *) build_reloptions(reloptions, validate, kind,
-									  sizeof(StdRdOptions),
-									  tab, lengthof(tab));
+	{
+		StdRdOptions *rdopts;
+
+		rdopts = (StdRdOptions *) build_reloptions(reloptions, validate, kind,
+												   sizeof(StdRdOptions),
+												   tab, lengthof(tab));
+
+		/*
+		 * Cross-field validation for DBblue auto-partition reloptions.
+		 *
+		 * Phase 1 enforces the minimum: any strategy other than OFF requires a
+		 * column.  Full validation of column type and interval format happens
+		 * when the partition manager is wired up (Phase 2).
+		 */
+		if (validate && rdopts != NULL &&
+			rdopts->auto_partition_strategy != AUTO_PARTITION_OFF)
+		{
+			const char *col_name;
+
+			col_name = (rdopts->auto_partition_column == 0) ? NULL :
+				(const char *) rdopts + rdopts->auto_partition_column;
+
+			if (col_name == NULL || col_name[0] == '\0')
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("auto_partition_strategy requires auto_partition_column to be set")));
+
+			if (rdopts->auto_partition_strategy == AUTO_PARTITION_RANGE_INT ||
+				rdopts->auto_partition_strategy == AUTO_PARTITION_RANGE_DATE)
+			{
+				const char *iv;
+
+				iv = (rdopts->auto_partition_interval == 0) ? NULL :
+					(const char *) rdopts + rdopts->auto_partition_interval;
+
+				if (iv == NULL || iv[0] == '\0')
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							 errmsg("auto_partition_strategy '%s' requires auto_partition_interval",
+									rdopts->auto_partition_strategy == AUTO_PARTITION_RANGE_INT ?
+									"range_int" : "range_date")));
+			}
+		}
+
+		return (bytea *) rdopts;
+	}
 }
 
 /*
