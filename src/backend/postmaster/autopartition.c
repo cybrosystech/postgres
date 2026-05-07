@@ -83,10 +83,12 @@ static void scan_configured_relations(void);
 
 /*
  * Postmaster-time registration.  Called once from PostmasterMain() before
- * any backends are forked, alongside ApplyLauncherRegister().  This is
- * also where we define the launcher's GUCs — they must be created during
- * postmaster startup so that PGC_POSTMASTER variables can be set, and so
- * that regular backends see them at SHOW time.
+ * any backends are forked, alongside ApplyLauncherRegister().
+ *
+ * GUC definitions for the launcher live in guc_parameters.dat (so they
+ * are known to the GUC system before postgresql.conf /
+ * postgresql.auto.conf are parsed at startup) — see the auto_partition_*
+ * entries near the top of that file.
  *
  * Always registers a worker; the worker itself checks
  * `auto_partition_enabled` each loop iteration and idles when off.
@@ -95,25 +97,6 @@ void
 AutoPartitionLauncherRegister(void)
 {
 	BackgroundWorker bgw;
-
-	DefineCustomBoolVariable("auto_partition_enabled",
-							 "Whether the auto-partition launcher should perform work.",
-							 NULL,
-							 &auto_partition_enabled,
-							 true,
-							 PGC_SIGHUP,
-							 0,
-							 NULL, NULL, NULL);
-
-	DefineCustomIntVariable("auto_partition_naptime",
-							"Seconds between auto-partition launcher iterations.",
-							"Set to 0 to wait until signaled.",
-							&auto_partition_naptime,
-							60,
-							0, INT_MAX / 1000,
-							PGC_SIGHUP,
-							GUC_UNIT_S,
-							NULL, NULL, NULL);
 
 	memset(&bgw, 0, sizeof(bgw));
 	bgw.bgw_flags = BGWORKER_SHMEM_ACCESS |

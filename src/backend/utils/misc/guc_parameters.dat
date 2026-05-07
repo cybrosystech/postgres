@@ -122,6 +122,22 @@
   max => '600',
 },
 
+{ name => 'auto_partition_enabled', type => 'bool', context => 'PGC_SIGHUP', group => 'VACUUM_AUTOVACUUM',
+  short_desc => 'Whether the auto-partition launcher should perform work.',
+  variable => 'auto_partition_enabled',
+  boot_val => 'true',
+},
+
+{ name => 'auto_partition_naptime', type => 'int', context => 'PGC_SIGHUP', group => 'VACUUM_AUTOVACUUM',
+  short_desc => 'Seconds between auto-partition launcher iterations.',
+  long_desc => 'Set to 0 to wait until signaled.',
+  flags => 'GUC_UNIT_S',
+  variable => 'auto_partition_naptime',
+  boot_val => '60',
+  min => '0',
+  max => 'INT_MAX / 1000',
+},
+
 { name => 'autovacuum', type => 'bool', context => 'PGC_SIGHUP', group => 'VACUUM_AUTOVACUUM',
   short_desc => 'Starts the autovacuum subprocess.',
   variable => 'autovacuum_start_daemon',
