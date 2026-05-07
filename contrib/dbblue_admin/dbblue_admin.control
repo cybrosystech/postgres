@@ -1,0 +1,4 @@
+# dbblue_admin extension
+comment = 'DBblue: ops helpers for Odoo-tuned PostgreSQL'
+default_version = '1.0'
+relocatable = true

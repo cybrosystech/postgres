@@ -436,6 +436,52 @@ typedef struct StdRdOptions
 	((relation)->rd_options ? \
 	 ((StdRdOptions *) (relation)->rd_options)->parallel_workers : (defaultpw))
 
+/*
+ * DBblue auto-partition accessors.
+ *
+ * These read the reloption fields populated by default_reloptions().  All
+ * five are safe to call on any relation; they return AUTO_PARTITION_OFF /
+ * NULL / 0 when reloptions are absent, so callers don't need to null-check
+ * rd_options first.
+ *
+ * Note multiple eval of `relation` in every macro.  Don't pass a function
+ * call as the argument.
+ */
+#define RelationGetAutoPartitionStrategy(relation) \
+	((relation)->rd_options ? \
+	 ((StdRdOptions *) (relation)->rd_options)->auto_partition_strategy : \
+	 AUTO_PARTITION_OFF)
+
+/* TRUE iff strategy is anything other than OFF. */
+#define RelationHasAutoPartition(relation) \
+	(RelationGetAutoPartitionStrategy(relation) != AUTO_PARTITION_OFF)
+
+/*
+ * Returns the column-name string, or NULL if unset.  The returned pointer
+ * lives inside the relation's rd_options allocation, so it's valid for as
+ * long as the Relation is open.  Callers that need to retain the string
+ * past relation_close() must pstrdup() it.
+ */
+#define RelationGetAutoPartitionColumn(relation) \
+	(((relation)->rd_options && \
+	  ((StdRdOptions *) (relation)->rd_options)->auto_partition_column != 0) ? \
+	 (const char *) (relation)->rd_options + \
+	 ((StdRdOptions *) (relation)->rd_options)->auto_partition_column : \
+	 (const char *) NULL)
+
+/* As above, for the partition-size / interval string. */
+#define RelationGetAutoPartitionInterval(relation) \
+	(((relation)->rd_options && \
+	  ((StdRdOptions *) (relation)->rd_options)->auto_partition_interval != 0) ? \
+	 (const char *) (relation)->rd_options + \
+	 ((StdRdOptions *) (relation)->rd_options)->auto_partition_interval : \
+	 (const char *) NULL)
+
+/* Number of partitions to keep, 0 = unlimited. */
+#define RelationGetAutoPartitionRetention(relation) \
+	((relation)->rd_options ? \
+	 ((StdRdOptions *) (relation)->rd_options)->auto_partition_retention : 0)
+
 /* ViewOptions->check_option values */
 typedef enum ViewOptCheckOption
 {
