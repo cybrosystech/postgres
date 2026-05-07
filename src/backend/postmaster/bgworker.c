@@ -21,6 +21,7 @@
 #include "postmaster/bgworker_internals.h"
 #include "postmaster/datachecksum_state.h"
 #include "postmaster/postmaster.h"
+#include "postmaster/autopartition.h"
 #include "replication/logicallauncher.h"
 #include "replication/logicalworker.h"
 #include "storage/ipc.h"
@@ -134,6 +135,10 @@ static const struct
 	{
 		.fn_name = "ApplyLauncherMain",
 		.fn_addr = ApplyLauncherMain
+	},
+	{
+		.fn_name = "AutoPartitionLauncherMain",
+		.fn_addr = AutoPartitionLauncherMain
 	},
 	{
 		.fn_name = "ApplyWorkerMain",

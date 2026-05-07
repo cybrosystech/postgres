@@ -13,6 +13,7 @@ top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
 
 OBJS = \
+	autopartition.o \
 	autovacuum.o \
 	auxprocess.o \
 	bgworker.o \

@@ -106,6 +106,7 @@
 #include "postmaster/postmaster.h"
 #include "postmaster/syslogger.h"
 #include "postmaster/walsummarizer.h"
+#include "postmaster/autopartition.h"
 #include "replication/logicallauncher.h"
 #include "replication/slotsync.h"
 #include "replication/walsender.h"
@@ -924,6 +925,13 @@ PostmasterMain(int argc, char *argv[])
 	 * before any modules had a chance to take the background worker slots.
 	 */
 	ApplyLauncherRegister();
+
+	/*
+	 * Register the DBblue auto-partition launcher.  Same rationale as the
+	 * apply launcher — slot reservation must happen before extensions get
+	 * a chance to register their own bgworkers.
+	 */
+	AutoPartitionLauncherRegister();
 
 	/*
 	 * Register the shared memory needs of all core subsystems.
