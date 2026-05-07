@@ -635,10 +635,24 @@ convert_heap_to_partitioned(Oid reloid, const char *nsname, const char *relname,
 	int64		row_count = 0;
 	int64		lower_bound,
 				upper_bound;
-	bool		has_fk_in,
-				has_fk_out,
+	bool		has_fk_in PG_USED_FOR_ASSERTS_ONLY = false,
+				has_fk_out PG_USED_FOR_ASSERTS_ONLY = false,
 				has_trigger;
 	bool		pk_ok;
+
+	/*
+	 * Captured FK state, lives in TopTransactionContext so it survives
+	 * subtxn rollback if we have to retry.  All four arrays for inbound
+	 * are parallel; out_fk_* are parallel.
+	 */
+	int			out_fk_count = 0;
+	char	  **out_fk_names = NULL;
+	char	  **out_fk_defs = NULL;
+	int			in_fk_count = 0;
+	char	  **in_fk_names = NULL;
+	char	  **in_fk_defs = NULL;
+	char	  **in_fk_owners = NULL;
+	char	  **in_fk_owner_schemas = NULL;
 
 	/* Parse interval */
 	if (partinterval == NULL || *partinterval == '\0')
@@ -693,44 +707,37 @@ convert_heap_to_partitioned(Oid reloid, const char *nsname, const char *relname,
 		return false;
 	}
 
-	/* FK / trigger checks */
+	/* Trigger check: still refuse user triggers (Phase 3c+ TODO). */
 	initStringInfo(&buf);
 	appendStringInfo(&buf,
-					 "SELECT "
-					 "  EXISTS(SELECT 1 FROM pg_constraint WHERE confrelid=%u AND contype='f') AS fk_in, "
-					 "  EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid=%u  AND contype='f') AS fk_out, "
-					 "  EXISTS(SELECT 1 FROM pg_trigger    WHERE tgrelid=%u   AND NOT tgisinternal) AS trig",
-					 reloid, reloid, reloid);
+					 "SELECT EXISTS(SELECT 1 FROM pg_trigger "
+					 "              WHERE tgrelid=%u AND NOT tgisinternal)",
+					 reloid);
 	ret = SPI_execute(buf.data, true, 0);
 	pfree(buf.data);
 	if (ret != SPI_OK_SELECT || SPI_processed == 0)
 	{
 		ereport(WARNING,
-				(errmsg("auto-partition: %s.%s: FK/trigger check failed",
+				(errmsg("auto-partition: %s.%s: trigger check failed",
 						nsname, relname)));
 		return false;
 	}
 	{
 		bool		isnull;
 
-		has_fk_in = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
-											   SPI_tuptable->tupdesc, 1, &isnull));
-		has_fk_out = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
-											   SPI_tuptable->tupdesc, 2, &isnull));
 		has_trigger = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
-												 SPI_tuptable->tupdesc, 3, &isnull));
+												 SPI_tuptable->tupdesc, 1, &isnull));
 	}
-	if (has_fk_in || has_fk_out || has_trigger)
+	if (has_trigger)
 	{
 		ereport(WARNING,
-				(errmsg("auto-partition: %s.%s: skipping conversion — relation has %s%s%s",
-						nsname, relname,
-						has_fk_in ? "inbound FKs " : "",
-						has_fk_out ? "outbound FKs " : "",
-						has_trigger ? "user triggers" : ""),
-				 errhint("Drop FKs/triggers, let the launcher convert, then recreate.")));
+				(errmsg("auto-partition: %s.%s: skipping conversion — relation has user triggers",
+						nsname, relname),
+				 errhint("Drop triggers, let the launcher convert, then recreate.")));
 		return false;
 	}
+	(void) has_fk_in;			/* now captured + restored, not refused */
+	(void) has_fk_out;
 
 	/* Compute initial partition bounds */
 	initStringInfo(&buf);
@@ -786,6 +793,96 @@ convert_heap_to_partitioned(Oid reloid, const char *nsname, const char *relname,
 					(long long) lower_bound, (long long) upper_bound)));
 
 	/*
+	 * Capture FK definitions before the subtransaction, in
+	 * TopTransactionContext so the strings survive any subtxn rollback.
+	 *
+	 * Outbound FKs live on the source itself (con.conrelid = reloid).
+	 * Inbound FKs live on other tables and reference the source
+	 * (con.confrelid = reloid).  For each we save (a) the qualified
+	 * table on which the constraint sits, and (b) pg_get_constraintdef
+	 * which renders an ALTER-able definition like
+	 *    "FOREIGN KEY (author_id) REFERENCES public.res_partner(id) ..."
+	 *
+	 * After the swap the source name resolves to the new partitioned
+	 * relation, so re-adding the constraints with the same definitions
+	 * just works.
+	 */
+	{
+		MemoryContext oldcxt = MemoryContextSwitchTo(TopTransactionContext);
+
+		/* Outbound */
+		MemoryContextSwitchTo(oldcxt);
+
+		initStringInfo(&buf);
+		appendStringInfo(&buf,
+						 "SELECT con.conname, pg_get_constraintdef(con.oid) "
+						 "FROM pg_constraint con "
+						 "WHERE con.conrelid = %u AND con.contype = 'f' "
+						 "ORDER BY con.conname",
+						 reloid);
+		ret = SPI_execute(buf.data, true, 0);
+		pfree(buf.data);
+		if (ret == SPI_OK_SELECT && SPI_processed > 0)
+		{
+			MemoryContext c = MemoryContextSwitchTo(TopTransactionContext);
+
+			out_fk_count = (int) SPI_processed;
+			out_fk_names = palloc(sizeof(char *) * out_fk_count);
+			out_fk_defs = palloc(sizeof(char *) * out_fk_count);
+			for (int k = 0; k < out_fk_count; k++)
+			{
+				out_fk_names[k] = pstrdup(SPI_getvalue(SPI_tuptable->vals[k],
+													   SPI_tuptable->tupdesc, 1));
+				out_fk_defs[k] = pstrdup(SPI_getvalue(SPI_tuptable->vals[k],
+													  SPI_tuptable->tupdesc, 2));
+			}
+			MemoryContextSwitchTo(c);
+		}
+
+		/* Inbound */
+		initStringInfo(&buf);
+		appendStringInfo(&buf,
+						 "SELECT con.conname, "
+						 "       pg_get_constraintdef(con.oid), "
+						 "       n.nspname, c.relname "
+						 "FROM pg_constraint con "
+						 "JOIN pg_class c     ON c.oid = con.conrelid "
+						 "JOIN pg_namespace n ON n.oid = c.relnamespace "
+						 "WHERE con.confrelid = %u AND con.contype = 'f' "
+						 "ORDER BY con.conname",
+						 reloid);
+		ret = SPI_execute(buf.data, true, 0);
+		pfree(buf.data);
+		if (ret == SPI_OK_SELECT && SPI_processed > 0)
+		{
+			MemoryContext c = MemoryContextSwitchTo(TopTransactionContext);
+
+			in_fk_count = (int) SPI_processed;
+			in_fk_names = palloc(sizeof(char *) * in_fk_count);
+			in_fk_defs = palloc(sizeof(char *) * in_fk_count);
+			in_fk_owners = palloc(sizeof(char *) * in_fk_count);
+			in_fk_owner_schemas = palloc(sizeof(char *) * in_fk_count);
+			for (int k = 0; k < in_fk_count; k++)
+			{
+				in_fk_names[k] = pstrdup(SPI_getvalue(SPI_tuptable->vals[k],
+													  SPI_tuptable->tupdesc, 1));
+				in_fk_defs[k] = pstrdup(SPI_getvalue(SPI_tuptable->vals[k],
+													 SPI_tuptable->tupdesc, 2));
+				in_fk_owner_schemas[k] = pstrdup(SPI_getvalue(SPI_tuptable->vals[k],
+															  SPI_tuptable->tupdesc, 3));
+				in_fk_owners[k] = pstrdup(SPI_getvalue(SPI_tuptable->vals[k],
+													   SPI_tuptable->tupdesc, 4));
+			}
+			MemoryContextSwitchTo(c);
+		}
+	}
+
+	if (out_fk_count + in_fk_count > 0)
+		ereport(LOG,
+				(errmsg("auto-partition: %s.%s: capturing %d outbound + %d inbound FKs across conversion",
+						nsname, relname, out_fk_count, in_fk_count)));
+
+	/*
 	 * The actual conversion runs inside a subtransaction: any failure
 	 * leaves the source heap untouched and the launcher will retry next
 	 * iteration.
@@ -801,6 +898,37 @@ convert_heap_to_partitioned(Oid reloid, const char *nsname, const char *relname,
 		snprintf(init_name, sizeof(init_name), "%s_initial", tmp_name);
 		snprintf(final_init_name, sizeof(final_init_name),
 				 "%s_p_%lld", relname, (long long) lower_bound);
+
+		/*
+		 * 0. Drop FKs first.  Outbound ones go away with their owning
+		 * table (the soon-to-be-DROP'd source) anyway, but explicitly
+		 * dropping outbound FKs before the source DROP also frees us
+		 * from any LIKE-INCLUDING-ALL pickups.  Inbound FKs MUST be
+		 * dropped first because they'd otherwise block DROP TABLE on
+		 * the source.
+		 */
+		for (int k = 0; k < in_fk_count; k++)
+		{
+			initStringInfo(&buf);
+			appendStringInfo(&buf,
+							 "ALTER TABLE %s.%s DROP CONSTRAINT %s",
+							 quote_identifier(in_fk_owner_schemas[k]),
+							 quote_identifier(in_fk_owners[k]),
+							 quote_identifier(in_fk_names[k]));
+			SPI_exec(buf.data, 0);
+			pfree(buf.data);
+		}
+		for (int k = 0; k < out_fk_count; k++)
+		{
+			initStringInfo(&buf);
+			appendStringInfo(&buf,
+							 "ALTER TABLE %s.%s DROP CONSTRAINT %s",
+							 quote_identifier(nsname),
+							 quote_identifier(relname),
+							 quote_identifier(out_fk_names[k]));
+			SPI_exec(buf.data, 0);
+			pfree(buf.data);
+		}
 
 		/* 1. Create empty partitioned table mirroring the source. */
 		initStringInfo(&buf);
@@ -978,9 +1106,49 @@ convert_heap_to_partitioned(Oid reloid, const char *nsname, const char *relname,
 		SPI_exec(buf.data, 0);
 		pfree(buf.data);
 
+		/*
+		 * 6. Re-create FKs.  Outbound first (constraint owned by the
+		 *    swapped-in relation), then inbound (constraints on other
+		 *    tables that reference us).  pg_get_constraintdef rendered
+		 *    each definition with full schema-qualified targets, so the
+		 *    same string works against the new partitioned relation.
+		 *
+		 *    PG validates each constraint against existing data when it
+		 *    is added; for a freshly-copied table that's a full scan
+		 *    of every relevant tuple.  Phase 3d will switch to NOT
+		 *    VALID + later VALIDATE so the swap window stays small even
+		 *    on huge tables.
+		 */
+		for (int k = 0; k < out_fk_count; k++)
+		{
+			initStringInfo(&buf);
+			appendStringInfo(&buf,
+							 "ALTER TABLE %s.%s ADD CONSTRAINT %s %s",
+							 quote_identifier(nsname),
+							 quote_identifier(relname),
+							 quote_identifier(out_fk_names[k]),
+							 out_fk_defs[k]);
+			SPI_exec(buf.data, 0);
+			pfree(buf.data);
+		}
+		for (int k = 0; k < in_fk_count; k++)
+		{
+			initStringInfo(&buf);
+			appendStringInfo(&buf,
+							 "ALTER TABLE %s.%s ADD CONSTRAINT %s %s",
+							 quote_identifier(in_fk_owner_schemas[k]),
+							 quote_identifier(in_fk_owners[k]),
+							 quote_identifier(in_fk_names[k]),
+							 in_fk_defs[k]);
+			SPI_exec(buf.data, 0);
+			pfree(buf.data);
+		}
+
 		ereport(LOG,
-				(errmsg("auto-partition: converted %s.%s, initial partition %s.%s",
-						nsname, relname, nsname, final_init_name)));
+				(errmsg("auto-partition: converted %s.%s, initial partition %s.%s%s",
+						nsname, relname, nsname, final_init_name,
+						(out_fk_count + in_fk_count > 0)
+							? " (FKs preserved)" : "")));
 		converted = true;
 
 		ReleaseCurrentSubTransaction();
