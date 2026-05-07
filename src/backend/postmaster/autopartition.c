@@ -574,6 +574,343 @@ convert_heap_to_partitioned(Oid reloid, const char *nsname, const char *relname,
 /* ---------------------------------------------------------------- */
 
 /*
+ * Process a single range_date-partitioned relation.
+ *
+ * Mirrors process_range_int_partition() but with timestamp / interval
+ * arithmetic instead of int64 row counts.  Bounds in pg_class.relpartbound
+ * print as quoted ISO-8601 timestamps (e.g. 'FOR VALUES FROM (''2026-01-01
+ * 00:00:00+00'') TO (''2026-02-01 00:00:00+00'')'); we round-trip them
+ * through SPI so PG handles all timestamp parsing and interval math
+ * natively.
+ *
+ * Naming: child partitions are named <parent>_p_YYYYMMDDHH24MISS using
+ * the lower bound, which gives sortable, unique, fixed-width suffixes
+ * for any interval granularity (daily/monthly/yearly all fit).
+ */
+static void
+process_range_date_partition(Oid reloid, const char *nsname, const char *relname,
+							 const char *partcol, const char *partinterval,
+							 int32 retention)
+{
+	StringInfoData buf;
+	int			ret;
+	int			partition_count;
+	char	   *head_relname = NULL;
+	char	   *head_lower_text = NULL;
+	char	   *head_upper_text = NULL;
+	List	   *oldest_oids = NIL;
+	MemoryContext savecxt;
+
+	if (partinterval == NULL || *partinterval == '\0')
+	{
+		ereport(WARNING,
+				(errmsg("auto-partition: %s.%s: range_date strategy needs auto_partition_interval (e.g. '1 month')",
+						nsname, relname)));
+		return;
+	}
+
+	/*
+	 * List partitions, deparsed bounds parsed as text (we don't ::cast in
+	 * SQL so a malformed bound — e.g. MINVALUE/MAXVALUE — comes back as
+	 * NULL rather than failing the whole query).
+	 */
+	initStringInfo(&buf);
+	appendStringInfo(&buf,
+					 "SELECT child.oid::oid AS child_oid, "
+					 "       child.relname AS child_name, "
+					 "       (regexp_match(pg_get_expr(child.relpartbound, child.oid), "
+					 "                     'FROM \\(''([^'']+)''\\)'))[1] AS lower_text, "
+					 "       (regexp_match(pg_get_expr(child.relpartbound, child.oid), "
+					 "                     'TO \\(''([^'']+)''\\)'))[1] AS upper_text "
+					 "FROM pg_inherits i "
+					 "JOIN pg_class child ON child.oid = i.inhrelid "
+					 "WHERE i.inhparent = %u "
+					 "ORDER BY (regexp_match(pg_get_expr(child.relpartbound, child.oid), "
+					 "                       'TO \\(''([^'']+)''\\)'))[1]::timestamptz DESC NULLS LAST",
+					 reloid);
+	ret = SPI_execute(buf.data, true, 0);
+	pfree(buf.data);
+
+	if (ret != SPI_OK_SELECT)
+	{
+		ereport(WARNING,
+				(errmsg("auto-partition: %s.%s: failed to list date partitions (rc=%d)",
+						nsname, relname, ret)));
+		return;
+	}
+	partition_count = (int) SPI_processed;
+
+	if (partition_count == 0)
+	{
+		ereport(LOG,
+				(errmsg("auto-partition: %s.%s: no existing partitions, skipping (Phase 3 covers initial creation)",
+						nsname, relname)));
+		return;
+	}
+
+	/* Capture row 0 (newest) before SPI_tuptable gets clobbered. */
+	{
+		char	   *namestr;
+		char	   *lstr;
+		char	   *ustr;
+
+		namestr = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2);
+		lstr = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3);
+		ustr = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 4);
+
+		savecxt = MemoryContextSwitchTo(TopTransactionContext);
+		if (namestr)
+			head_relname = pstrdup(namestr);
+		if (lstr)
+			head_lower_text = pstrdup(lstr);
+		if (ustr)
+			head_upper_text = pstrdup(ustr);
+		MemoryContextSwitchTo(savecxt);
+	}
+
+	if (head_upper_text == NULL || head_relname == NULL)
+	{
+		ereport(WARNING,
+				(errmsg("auto-partition: %s.%s: head partition bounds unparseable, skipping",
+						nsname, relname)));
+		return;
+	}
+
+	/* Save oldest partition oids for retention enforcement. */
+	if (retention > 0 && partition_count > retention)
+	{
+		MemoryContext oldcxt = MemoryContextSwitchTo(TopTransactionContext);
+
+		for (int i = retention; i < partition_count; i++)
+		{
+			bool		isnull;
+			Oid			child_oid;
+
+			child_oid = DatumGetObjectId(SPI_getbinval(SPI_tuptable->vals[i],
+													   SPI_tuptable->tupdesc,
+													   1, &isnull));
+			if (!isnull)
+				oldest_oids = lappend_oid(oldest_oids, child_oid);
+		}
+		MemoryContextSwitchTo(oldcxt);
+	}
+
+	/*
+	 * Fill-check: probe head partition for max(<partcol>).  Empty head, or
+	 * head used < 80% of interval, means no new partition needed yet.
+	 *
+	 * For range_date the "used" / "interval" comparison happens entirely
+	 * in SQL since we can't do timestamp - timestamp math in C trivially.
+	 * The query returns a boolean: TRUE if 5 * (max - lower) >= 4 *
+	 * (upper - lower), i.e. the head is at least 80% full.
+	 */
+	{
+		bool		head_full = false;
+		bool		head_empty;
+
+		initStringInfo(&buf);
+		appendStringInfo(&buf,
+						 "SELECT max(%s) IS NULL AS empty, "
+						 "       CASE WHEN max(%s) IS NULL THEN false "
+						 "            ELSE 5 * EXTRACT(EPOCH FROM max(%s) - %s::timestamptz) "
+						 "                 >= 4 * EXTRACT(EPOCH FROM %s::timestamptz - %s::timestamptz) "
+						 "       END AS at_threshold "
+						 "FROM %s.%s",
+						 quote_identifier(partcol),
+						 quote_identifier(partcol),
+						 quote_identifier(partcol),
+						 quote_literal_cstr(head_lower_text),
+						 quote_literal_cstr(head_upper_text),
+						 quote_literal_cstr(head_lower_text),
+						 quote_identifier(nsname),
+						 quote_identifier(head_relname));
+		ret = SPI_execute(buf.data, true, 0);
+		pfree(buf.data);
+
+		if (ret != SPI_OK_SELECT || SPI_processed == 0)
+		{
+			ereport(WARNING,
+					(errmsg("auto-partition: %s.%s: fill-check failed",
+							nsname, relname)));
+			return;
+		}
+		{
+			bool		isnull;
+
+			head_empty = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
+													SPI_tuptable->tupdesc,
+													1, &isnull));
+			head_full = !head_empty &&
+				DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
+										   SPI_tuptable->tupdesc,
+										   2, &isnull));
+		}
+
+		if (head_empty)
+		{
+			ereport(DEBUG1,
+					(errmsg("auto-partition: %s.%s: head partition %s is empty, skipping create",
+							nsname, relname, head_relname)));
+		}
+		else if (!head_full)
+		{
+			ereport(DEBUG1,
+					(errmsg("auto-partition: %s.%s: head %s not yet at 80%%, waiting",
+							nsname, relname, head_relname)));
+		}
+
+		/*
+		 * Create next partition only if head is past 80%.
+		 *
+		 * Compute next bounds via SQL ($latest_upper, $latest_upper +
+		 * INTERVAL '...') and a partition-name suffix from the lower bound.
+		 * We render the new lower/upper as text so the resulting CREATE
+		 * TABLE can use them as quoted literals in FOR VALUES.
+		 */
+		if (head_full)
+		{
+			char	   *new_lower_text = NULL;
+			char	   *new_upper_text = NULL;
+			char	   *suffix = NULL;
+
+			initStringInfo(&buf);
+			appendStringInfo(&buf,
+							 "SELECT (%s::timestamptz)::text AS lo, "
+							 "       (%s::timestamptz + %s::interval)::text AS hi, "
+							 "       to_char(%s::timestamptz, 'YYYYMMDDHH24MISS') AS sfx",
+							 quote_literal_cstr(head_upper_text),
+							 quote_literal_cstr(head_upper_text),
+							 quote_literal_cstr(partinterval),
+							 quote_literal_cstr(head_upper_text));
+			ret = SPI_execute(buf.data, true, 0);
+			pfree(buf.data);
+
+			if (ret == SPI_OK_SELECT && SPI_processed > 0)
+			{
+				char	   *lo,
+						   *hi,
+						   *sfx;
+
+				lo = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+				hi = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2);
+				sfx = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3);
+
+				savecxt = MemoryContextSwitchTo(TopTransactionContext);
+				new_lower_text = lo ? pstrdup(lo) : NULL;
+				new_upper_text = hi ? pstrdup(hi) : NULL;
+				suffix = sfx ? pstrdup(sfx) : NULL;
+				MemoryContextSwitchTo(savecxt);
+			}
+
+			if (new_lower_text && new_upper_text && suffix)
+			{
+				char		child_name[NAMEDATALEN];
+
+				snprintf(child_name, sizeof(child_name),
+						 "%s_p_%s", relname, suffix);
+
+				BeginInternalSubTransaction("autopart_create_date");
+				PG_TRY();
+				{
+					initStringInfo(&buf);
+					appendStringInfo(&buf,
+									 "CREATE TABLE IF NOT EXISTS %s.%s "
+									 "PARTITION OF %s.%s "
+									 "FOR VALUES FROM (%s) TO (%s)",
+									 quote_identifier(nsname),
+									 quote_identifier(child_name),
+									 quote_identifier(nsname),
+									 quote_identifier(relname),
+									 quote_literal_cstr(new_lower_text),
+									 quote_literal_cstr(new_upper_text));
+					ret = SPI_exec(buf.data, 0);
+					pfree(buf.data);
+
+					if (ret == SPI_OK_UTILITY)
+						ereport(LOG,
+								(errmsg("auto-partition: created %s.%s for [%s, %s) on %s.%s",
+										nsname, child_name,
+										new_lower_text, new_upper_text,
+										nsname, relname)));
+
+					ReleaseCurrentSubTransaction();
+				}
+				PG_CATCH();
+				{
+					ErrorData  *edata;
+
+					MemoryContextSwitchTo(TopTransactionContext);
+					edata = CopyErrorData();
+					ereport(WARNING,
+							(errmsg("auto-partition: %s.%s: create-partition failed: %s",
+									nsname, relname, edata->message)));
+					FreeErrorData(edata);
+					FlushErrorState();
+					RollbackAndReleaseCurrentSubTransaction();
+				}
+				PG_END_TRY();
+			}
+		}
+	}
+
+	/* Retention: detach + drop oldest beyond `retention`. */
+	if (oldest_oids != NIL)
+	{
+		ListCell   *lc;
+
+		foreach(lc, oldest_oids)
+		{
+			Oid			old_oid = lfirst_oid(lc);
+
+			BeginInternalSubTransaction("autopart_detach_date");
+			PG_TRY();
+			{
+				char	   *qual;
+
+				qual = quote_qualified_identifier(get_namespace_name(get_rel_namespace(old_oid)),
+												  get_rel_name(old_oid));
+
+				initStringInfo(&buf);
+				appendStringInfo(&buf,
+								 "ALTER TABLE %s.%s DETACH PARTITION %s",
+								 quote_identifier(nsname),
+								 quote_identifier(relname),
+								 qual);
+				SPI_exec(buf.data, 0);
+				pfree(buf.data);
+
+				initStringInfo(&buf);
+				appendStringInfo(&buf, "DROP TABLE %s", qual);
+				SPI_exec(buf.data, 0);
+				pfree(buf.data);
+
+				ereport(LOG,
+						(errmsg("auto-partition: detached + dropped %s (retention=%d)",
+								qual, retention)));
+
+				ReleaseCurrentSubTransaction();
+			}
+			PG_CATCH();
+			{
+				ErrorData  *edata;
+
+				MemoryContextSwitchTo(TopTransactionContext);
+				edata = CopyErrorData();
+				ereport(WARNING,
+						(errmsg("auto-partition: %s.%s: retention drop failed for oid %u: %s",
+								nsname, relname, old_oid, edata->message)));
+				FreeErrorData(edata);
+				FlushErrorState();
+				RollbackAndReleaseCurrentSubTransaction();
+			}
+			PG_END_TRY();
+		}
+	}
+}
+
+/* ---------------------------------------------------------------- */
+
+/*
  * Process a single range_int-partitioned relation.
  *
  * Steps:
@@ -958,73 +1295,101 @@ scan_configured_relations(void)
 		goto done;
 	}
 
-	for (i = 0; i < SPI_processed; i++)
+	/*
+	 * The per-relation processors below run further SPI queries which
+	 * clobber SPI_tuptable, so we can't keep referencing the outer scan's
+	 * tuples across iterations.  Snapshot every row's values into local
+	 * pstrdup'd memory in TopTransactionContext first, then dispatch.
+	 */
 	{
-		HeapTuple	row = SPI_tuptable->vals[i];
-		TupleDesc	td = SPI_tuptable->tupdesc;
-		bool		isnull;
-		Oid			reloid;
-		char	   *nsname;
-		char	   *relname;
-		char		relkind;
-		char	   *strategy;
-		char	   *partcol;
-		char	   *partinterval;
-		int32		retention = 0;
-
-		reloid = DatumGetObjectId(SPI_getbinval(row, td, 1, &isnull));
-		nsname = SPI_getvalue(row, td, 2);
-		relname = SPI_getvalue(row, td, 3);
-		relkind = DatumGetChar(SPI_getbinval(row, td, 4, &isnull));
-		strategy = SPI_getvalue(row, td, 5);
-		partcol = SPI_getvalue(row, td, 6);
-		partinterval = SPI_getvalue(row, td, 7);
-		(void) SPI_getbinval(row, td, 8, &isnull);
-		if (!isnull)
-			retention = DatumGetInt32(SPI_getbinval(row, td, 8, &isnull));
-
-		ereport(DEBUG1,
-				(errmsg("auto-partition: %s.%s (oid=%u, relkind=%c) "
-						"strategy=%s column=%s interval=%s retention=%d",
-						nsname ? nsname : "?",
-						relname ? relname : "?",
-						reloid,
-						relkind,
-						strategy ? strategy : "?",
-						partcol ? partcol : "(none)",
-						partinterval ? partinterval : "(none)",
-						retention)));
-
-		/*
-		 * Dispatch by strategy + relkind.
-		 *
-		 * relkind='r' (regular heap) + range_int: try to convert the
-		 *   heap to partitioned (Phase 3a — brief lock during swap).
-		 *   On success the relation will be relkind='p' next iteration
-		 *   and ordinary rotation takes over.
-		 *
-		 * relkind='p' + range_int: ordinary rotation (create next
-		 *   partition, enforce retention).
-		 *
-		 * range_date / list_int strategies are not yet implemented for
-		 * either path; logged at DEBUG.
-		 */
-		if (strategy && strcmp(strategy, "range_int") == 0)
+		typedef struct ScanRow
 		{
-			if (relkind == 'r')
-				(void) convert_heap_to_partitioned(reloid, nsname, relname,
-												   partcol, partinterval,
-												   retention);
-			else if (relkind == 'p')
-				process_range_int_partition(reloid, nsname, relname,
-											partcol, partinterval, retention);
+			Oid			reloid;
+			char	   *nsname;
+			char	   *relname;
+			char		relkind;
+			char	   *strategy;
+			char	   *partcol;
+			char	   *partinterval;
+			int32		retention;
+		} ScanRow;
+
+		ScanRow    *rows;
+		int			nrows = (int) SPI_processed;
+		MemoryContext oldcxt = MemoryContextSwitchTo(TopTransactionContext);
+
+		rows = palloc0(sizeof(ScanRow) * nrows);
+		for (i = 0; i < (uint64) nrows; i++)
+		{
+			HeapTuple	row = SPI_tuptable->vals[i];
+			TupleDesc	td = SPI_tuptable->tupdesc;
+			bool		isnull;
+			char	   *s;
+
+			rows[i].reloid = DatumGetObjectId(SPI_getbinval(row, td, 1, &isnull));
+			s = SPI_getvalue(row, td, 2); rows[i].nsname = s ? pstrdup(s) : NULL;
+			s = SPI_getvalue(row, td, 3); rows[i].relname = s ? pstrdup(s) : NULL;
+			rows[i].relkind = DatumGetChar(SPI_getbinval(row, td, 4, &isnull));
+			s = SPI_getvalue(row, td, 5); rows[i].strategy = s ? pstrdup(s) : NULL;
+			s = SPI_getvalue(row, td, 6); rows[i].partcol = s ? pstrdup(s) : NULL;
+			s = SPI_getvalue(row, td, 7); rows[i].partinterval = s ? pstrdup(s) : NULL;
+			(void) SPI_getbinval(row, td, 8, &isnull);
+			if (!isnull)
+				rows[i].retention = DatumGetInt32(SPI_getbinval(row, td, 8, &isnull));
 		}
-		else if (strategy &&
-				 (strcmp(strategy, "range_date") == 0 ||
-				  strcmp(strategy, "list_int") == 0))
+		MemoryContextSwitchTo(oldcxt);
+
+		for (i = 0; i < (uint64) nrows; i++)
+		{
+			ScanRow    *r = &rows[i];
+
 			ereport(DEBUG1,
-					(errmsg("auto-partition: %s.%s: strategy '%s' not yet implemented",
-							nsname, relname, strategy)));
+					(errmsg("auto-partition: %s.%s (oid=%u, relkind=%c) "
+							"strategy=%s column=%s interval=%s retention=%d",
+							r->nsname ? r->nsname : "?",
+							r->relname ? r->relname : "?",
+							r->reloid, r->relkind,
+							r->strategy ? r->strategy : "?",
+							r->partcol ? r->partcol : "(none)",
+							r->partinterval ? r->partinterval : "(none)",
+							r->retention)));
+
+			/*
+			 * Dispatch by strategy + relkind.
+			 *
+			 * relkind='r' (regular heap) + range_int: try to convert the
+			 *   heap to partitioned (Phase 3a — brief lock during swap).
+			 *
+			 * relkind='p' + range_int / range_date: rotation.
+			 *
+			 * list_int and heap-conversion-for-range_date are not yet
+			 * implemented; logged at DEBUG.
+			 */
+			if (r->strategy && strcmp(r->strategy, "range_int") == 0)
+			{
+				if (r->relkind == 'r')
+					(void) convert_heap_to_partitioned(r->reloid, r->nsname, r->relname,
+													   r->partcol, r->partinterval,
+													   r->retention);
+				else if (r->relkind == 'p')
+					process_range_int_partition(r->reloid, r->nsname, r->relname,
+												r->partcol, r->partinterval, r->retention);
+			}
+			else if (r->strategy && strcmp(r->strategy, "range_date") == 0)
+			{
+				if (r->relkind == 'p')
+					process_range_date_partition(r->reloid, r->nsname, r->relname,
+												 r->partcol, r->partinterval, r->retention);
+				else
+					ereport(DEBUG1,
+							(errmsg("auto-partition: %s.%s: range_date heap conversion not yet implemented",
+									r->nsname, r->relname)));
+			}
+			else if (r->strategy && strcmp(r->strategy, "list_int") == 0)
+				ereport(DEBUG1,
+						(errmsg("auto-partition: %s.%s: list_int not yet implemented",
+								r->nsname, r->relname)));
+		}
 	}
 
 done:
