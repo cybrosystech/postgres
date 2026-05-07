@@ -5,7 +5,14 @@ DATA = dbblue_admin--1.0.sql
 PGFILEDESC = "dbblue_admin - ops helpers for DBblue"
 
 ifdef USE_PGXS
-PG_CONFIG = pg_config
+# Out-of-tree (PGXS) builds.  PG_CONFIG defaults to whatever 'pg_config'
+# resolves to via PATH — which on hosts with a system PostgreSQL package
+# installed will be the wrong server.  Override explicitly when packaging
+# against a specific build:
+#
+#   make USE_PGXS=1 PG_CONFIG=/path/to/dbblue/bin/pg_config install
+#
+PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 else
