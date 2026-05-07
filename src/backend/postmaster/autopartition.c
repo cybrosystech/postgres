@@ -1107,23 +1107,27 @@ convert_heap_to_partitioned(Oid reloid, const char *nsname, const char *relname,
 		pfree(buf.data);
 
 		/*
-		 * 6. Re-create FKs.  Outbound first (constraint owned by the
-		 *    swapped-in relation), then inbound (constraints on other
-		 *    tables that reference us).  pg_get_constraintdef rendered
-		 *    each definition with full schema-qualified targets, so the
-		 *    same string works against the new partitioned relation.
+		 * 6. Re-create FKs as NOT VALID inside the swap window.
 		 *
-		 *    PG validates each constraint against existing data when it
-		 *    is added; for a freshly-copied table that's a full scan
-		 *    of every relevant tuple.  Phase 3d will switch to NOT
-		 *    VALID + later VALIDATE so the swap window stays small even
-		 *    on huge tables.
+		 *    A plain ADD CONSTRAINT validates the constraint against
+		 *    every tuple under ACCESS EXCLUSIVE lock — a full scan that
+		 *    can lock a populated table for minutes.  ADD CONSTRAINT
+		 *    ... NOT VALID is metadata-only: PG will enforce the
+		 *    constraint on future writes immediately, but skip the
+		 *    initial validation scan.  We then run VALIDATE CONSTRAINT
+		 *    *after* the swap subtransaction commits, where it takes
+		 *    only ShareUpdateExclusiveLock and lets concurrent writers
+		 *    keep going.
+		 *
+		 *    pg_get_constraintdef rendered each definition with full
+		 *    schema-qualified targets, so the same string works
+		 *    against the new partitioned relation.
 		 */
 		for (int k = 0; k < out_fk_count; k++)
 		{
 			initStringInfo(&buf);
 			appendStringInfo(&buf,
-							 "ALTER TABLE %s.%s ADD CONSTRAINT %s %s",
+							 "ALTER TABLE %s.%s ADD CONSTRAINT %s %s NOT VALID",
 							 quote_identifier(nsname),
 							 quote_identifier(relname),
 							 quote_identifier(out_fk_names[k]),
@@ -1135,7 +1139,7 @@ convert_heap_to_partitioned(Oid reloid, const char *nsname, const char *relname,
 		{
 			initStringInfo(&buf);
 			appendStringInfo(&buf,
-							 "ALTER TABLE %s.%s ADD CONSTRAINT %s %s",
+							 "ALTER TABLE %s.%s ADD CONSTRAINT %s %s NOT VALID",
 							 quote_identifier(in_fk_owner_schemas[k]),
 							 quote_identifier(in_fk_owners[k]),
 							 quote_identifier(in_fk_names[k]),
@@ -1168,6 +1172,87 @@ convert_heap_to_partitioned(Oid reloid, const char *nsname, const char *relname,
 		converted = false;
 	}
 	PG_END_TRY();
+
+	/*
+	 * Post-swap: VALIDATE each FK we re-added as NOT VALID.  Each runs
+	 * in its own subtransaction so a single orphan-row failure leaves
+	 * the constraint NOT VALID (correctly enforced on writes; its
+	 * pre-existing data is uncertified) without affecting the others.
+	 *
+	 * VALIDATE CONSTRAINT takes ShareUpdateExclusiveLock — concurrent
+	 * SELECT and DML on the relation continue normally during the
+	 * validation scan.  This is the production-grade swap pattern:
+	 * the brief ACCESS EXCLUSIVE window from step 4 above is constant
+	 * time relative to table size, and the long-tail validation
+	 * happens out of band.
+	 */
+	if (converted && (out_fk_count + in_fk_count > 0))
+	{
+		for (int k = 0; k < out_fk_count; k++)
+		{
+			BeginInternalSubTransaction("autopart_validate_fk");
+			PG_TRY();
+			{
+				initStringInfo(&buf);
+				appendStringInfo(&buf,
+								 "ALTER TABLE %s.%s VALIDATE CONSTRAINT %s",
+								 quote_identifier(nsname),
+								 quote_identifier(relname),
+								 quote_identifier(out_fk_names[k]));
+				SPI_exec(buf.data, 0);
+				pfree(buf.data);
+				ReleaseCurrentSubTransaction();
+			}
+			PG_CATCH();
+			{
+				ErrorData  *edata;
+
+				MemoryContextSwitchTo(TopTransactionContext);
+				edata = CopyErrorData();
+				ereport(WARNING,
+						(errmsg("auto-partition: %s.%s: VALIDATE %s failed: %s",
+								nsname, relname, out_fk_names[k], edata->message)));
+				FreeErrorData(edata);
+				FlushErrorState();
+				RollbackAndReleaseCurrentSubTransaction();
+			}
+			PG_END_TRY();
+		}
+		for (int k = 0; k < in_fk_count; k++)
+		{
+			BeginInternalSubTransaction("autopart_validate_fk_in");
+			PG_TRY();
+			{
+				initStringInfo(&buf);
+				appendStringInfo(&buf,
+								 "ALTER TABLE %s.%s VALIDATE CONSTRAINT %s",
+								 quote_identifier(in_fk_owner_schemas[k]),
+								 quote_identifier(in_fk_owners[k]),
+								 quote_identifier(in_fk_names[k]));
+				SPI_exec(buf.data, 0);
+				pfree(buf.data);
+				ReleaseCurrentSubTransaction();
+			}
+			PG_CATCH();
+			{
+				ErrorData  *edata;
+
+				MemoryContextSwitchTo(TopTransactionContext);
+				edata = CopyErrorData();
+				ereport(WARNING,
+						(errmsg("auto-partition: %s.%s: VALIDATE %s failed: %s",
+								in_fk_owners[k], in_fk_names[k],
+								in_fk_names[k], edata->message)));
+				FreeErrorData(edata);
+				FlushErrorState();
+				RollbackAndReleaseCurrentSubTransaction();
+			}
+			PG_END_TRY();
+		}
+		ereport(LOG,
+				(errmsg("auto-partition: %s.%s: validated %d FK constraint(s) post-swap",
+						nsname, relname, out_fk_count + in_fk_count)));
+	}
 
 	return converted;
 }
