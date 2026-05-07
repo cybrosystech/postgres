@@ -978,12 +978,12 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	 */	
    if (relkind == RELKIND_RELATION)
    {
-       ereport(LOG,errmsg("DefineRelation: looking up fillfactor for table \"%s\"", stmt->relation->relname));
+    //    ereport(LOG,errmsg("DefineRelation: looking up fillfactor for table \"%s\"", stmt->relation->relname));
        int ff = dbblue_fillfactor_lookup(stmt->relation->relname);
-        ereport(LOG,
-                       (errmsg("dbblue_fillfactor: injecting fillfactor=%d "
-                               "for table \"%s\"",
-                               ff, stmt->relation->relname)));
+        // ereport(LOG,
+        //                (errmsg("dbblue_fillfactor: injecting fillfactor=%d "
+        //                        "for table \"%s\"",
+        //                        ff, stmt->relation->relname)));
        if (ff > 0)
        {
            bool found_existing = false;

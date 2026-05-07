@@ -79,7 +79,7 @@
   long_desc => 'An empty string means use "archive_library".',
   variable => 'XLogArchiveCommand',
   boot_val => '""',
-  show_hook => 'show_archive_command',
+  show_hook => 'show_archive_command',  
 },
 
 { name => 'archive_library', type => 'string', context => 'PGC_SIGHUP', group => 'WAL_ARCHIVING',

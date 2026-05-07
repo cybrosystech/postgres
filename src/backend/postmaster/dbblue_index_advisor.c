@@ -2242,9 +2242,9 @@ DbblueIndexAdvisorMain(Datum main_arg)
 	BackgroundWorkerInitializeConnection(dbblue_auto_index_suggestion_database,
 										 NULL, 0);
 
-	ereport(LOG,
-			(errmsg("dbblue index advisor started (database=\"%s\")",
-					dbblue_auto_index_suggestion_database)));
+	// ereport(LOG,
+	// 		(errmsg("dbblue index advisor started (database=\"%s\")",
+	// 				dbblue_auto_index_suggestion_database)));
 
 	/*
 	 * The results table is needed regardless of the on/off flag (so the
