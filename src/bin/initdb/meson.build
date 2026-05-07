@@ -1,6 +1,7 @@
 # Copyright (c) 2022-2026, PostgreSQL Global Development Group
 
 initdb_sources = files(
+  'auto_tune.c',
   'findtimezone.c',
   'initdb.c'
 )

@@ -32,6 +32,7 @@ endif
 
 OBJS = \
 	$(WIN32RES) \
+	auto_tune.o \
 	findtimezone.o \
 	initdb.o \
 	localtime.o
