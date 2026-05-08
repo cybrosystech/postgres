@@ -4,9 +4,10 @@
  *	  Hardware detection and tuning formulas for initdb's auto-tune feature.
  *
  * Detection covers Linux/macOS (POSIX sysconf) and Windows
- * (GlobalMemoryStatusEx / GetSystemInfo).  Formulas follow the well-known
- * PGTune profile, parameterised by workload.  Memory values are produced
- * in kilobytes so initdb can format them with a "kB"/"MB"/"GB" suffix.
+ * (GlobalMemoryStatusEx / GetSystemInfo).  Formulas are tuned for Odoo
+ * workloads: many concurrent short transactions from the ORM, with the
+ * occasional heavier report.  Memory values are produced in kilobytes so
+ * initdb can format them with a "kB"/"MB"/"GB" suffix.
  *
  * src/bin/initdb/auto_tune.c
  *
@@ -17,7 +18,6 @@
 #include <limits.h>
 #include <string.h>
 #include <unistd.h>
-#include "utils/elog.h"
 
 #ifdef WIN32
 #include <windows.h>
@@ -27,45 +27,6 @@
 
 #define KB_PER_MB			1024
 #define KB_PER_GB			(1024 * 1024)
-
-bool
-auto_tune_parse_workload(const char *name, WorkloadProfile *out)
-{
-	if (name == NULL || *name == '\0')
-		return false;
-
-	if (pg_strcasecmp(name, "mixed") == 0)
-	{
-		ereport(LOG,errmsg("workload : mixed"));
-		*out = WORKLOAD_MIXED;
-	}
-	else if (pg_strcasecmp(name, "oltp") == 0)
-	{
-		ereport(LOG,errmsg("workload : oltp"));
-		*out = WORKLOAD_OLTP;
-	}
-	else if (pg_strcasecmp(name, "olap") == 0 ||
-			 pg_strcasecmp(name, "dw") == 0 ||
-			 pg_strcasecmp(name, "warehouse") == 0)
-	{
-		ereport(LOG,errmsg("workload : olap"));
-		*out = WORKLOAD_OLAP;
-	}	
-	else if (pg_strcasecmp(name, "web") == 0)
-	{
-		ereport(LOG,errmsg("workload : web"));
-		*out = WORKLOAD_WEB;
-	}
-	else if (pg_strcasecmp(name, "desktop") == 0)
-	{
-		ereport(LOG,errmsg("workload : desktop"));
-		*out = WORKLOAD_DESKTOP;
-	}
-	else
-		return false;
-
-	return true;
-}
 
 /*
  * Detect total physical RAM.  Returns 0 on failure.
@@ -86,9 +47,7 @@ detect_total_ram(void)
 	long		page_size = sysconf(_SC_PAGE_SIZE);
 
 	if (pages > 0 && page_size > 0)
-		
 		return (uint64) pages * (uint64) page_size;
-		ereport(LOG,errmsg("total ram : %d",pages * page_size));
 #endif
 	return 0;
 #endif
@@ -110,7 +69,7 @@ detect_cpu_count(void)
 #else
 #ifdef _SC_NPROCESSORS_ONLN
 	long		n = sysconf(_SC_NPROCESSORS_ONLN);
-	ereport(LOG,errmsg("cpu count : %d",n));
+
 	if (n > 0)
 		return (int) n;
 #endif
@@ -162,7 +121,6 @@ detect_ssd(void)
 static int
 clamp_int(int v, int lo, int hi)
 {
-	ereport(LOG,errmsg("clamp : %d : %d : %d",v,lo,hi));
 	if (v < lo)
 		return lo;
 	if (v > hi)
@@ -181,7 +139,7 @@ round_down_8kb(int kb)
 }
 
 AutoTuneSettings
-auto_tune_compute(WorkloadProfile workload, int max_connections)
+auto_tune_compute(int max_connections)
 {
 	AutoTuneSettings s;
 	uint64		ram_bytes;
@@ -189,12 +147,9 @@ auto_tune_compute(WorkloadProfile workload, int max_connections)
 	bool		ssd;
 	int			ram_kb;
 	int			shared_kb;
-	int			work_mem_base_kb;
 	int			parallel_per_gather;
 
 	memset(&s, 0, sizeof(s));
-	s.workload = workload;
-	s.wal_buffers_kb = -1;		/* let the server auto-derive */
 
 	ram_bytes = detect_total_ram();
 	cpus = detect_cpu_count();
@@ -221,95 +176,64 @@ auto_tune_compute(WorkloadProfile workload, int max_connections)
 		ram_kb = (int) (ram_bytes / 1024);
 
 	/*
-	 * shared_buffers: 25% of RAM for server workloads, 6.25% for desktop.
-	 * No upper cap — the server's own limits will reject anything truly
-	 * unreasonable, and initdb re-probes the value before committing to it.
+	 * shared_buffers: 25% of RAM is the long-standing rule of thumb and
+	 * works well for Odoo, whose hot tables (res_partner, sale_order, ...)
+	 * benefit from staying resident.  Floor at the upstream default so a
+	 * tiny VM is never tuned *down*.
 	 */
-	if (workload == WORKLOAD_DESKTOP)
-		shared_kb = ram_kb / 16;
-	else
-		shared_kb = ram_kb / 4;
-
-	/* Floor at 128 MB (the upstream default) so we never tune *down* a
-	 * tiny VM into uselessness. */
+	shared_kb = ram_kb / 4;
 	if (shared_kb < 128 * KB_PER_MB)
 		shared_kb = 128 * KB_PER_MB;
 	s.shared_buffers_kb = round_down_8kb(shared_kb);
 
-	/* effective_cache_size: planner hint about OS + PG cache combined. */
-	if (workload == WORKLOAD_DESKTOP)
-		s.effective_cache_size_kb = ram_kb / 4;
-	else
-		s.effective_cache_size_kb = (int) ((int64) ram_kb * 3 / 4);
-
-	/* maintenance_work_mem: bigger for analytics, capped to avoid waste. */
-	{
-		int			mwm_kb;
-		int			cap_kb;
-
-		if (workload == WORKLOAD_OLAP)
-		{
-			mwm_kb = ram_kb / 8;
-			cap_kb = 4 * KB_PER_GB;
-		}
-		else
-		{
-			mwm_kb = ram_kb / 16;
-			cap_kb = 2 * KB_PER_GB;
-		}
-		s.maintenance_work_mem_kb = clamp_int(mwm_kb, 64, cap_kb);
-	}
+	/* Planner hint: combined OS + PG cache. */
+	s.effective_cache_size_kb = (int) ((int64) ram_kb * 3 / 4);
 
 	/*
-	 * Parallelism: leave room for non-parallel workers and the leader.
-	 * On a 1-CPU host we still allow per_gather = 1 (a single parallel
-	 * worker beats serial for big sequential scans).
+	 * maintenance_work_mem: governs VACUUM, CREATE INDEX, ALTER TABLE.
+	 * Odoo's module updates create/rebuild many indexes, so be generous.
+	 * RAM/16 capped at 2 GB matches PGTune.
+	 */
+	s.maintenance_work_mem_kb = clamp_int(ram_kb / 16, 64, 2 * KB_PER_GB);
+
+	/*
+	 * Parallelism.  Odoo rarely benefits from very wide parallel workers
+	 * on a single query (most queries are short OLTP), but reports do —
+	 * so we allow up to CPU/2 per gather, capped at 4 to keep one big
+	 * report from starving everyone else.
 	 */
 	s.max_worker_processes = clamp_int(cpus, 8, 1024);
 	s.max_parallel_workers = clamp_int(cpus, 8, 1024);
 	parallel_per_gather = cpus / 2;
 	if (parallel_per_gather < 2)
 		parallel_per_gather = (cpus >= 2) ? 2 : 1;
+	if (parallel_per_gather > 4)
+		parallel_per_gather = 4;
 	s.max_parallel_workers_per_gather = parallel_per_gather;
-	s.max_parallel_maintenance_workers = clamp_int(cpus / 2, 2, 16);
+	s.max_parallel_maintenance_workers = clamp_int(cpus / 2, 2, 4);
 
 	/*
-	 * work_mem: divide the RAM not reserved for shared_buffers among the
-	 * concurrent operations a server might run (max_connections * per-conn
-	 * factor * parallel workers).  Then scale by workload — analytical
-	 * workloads run fewer-but-bigger sorts, web workloads run many small
-	 * ones.  PGTune uses similar multipliers.
+	 * work_mem: per-operation sort/hash budget.  Odoo's ORM emits joins
+	 * with multiple ORDER BY / GROUP BY clauses, so it benefits from a
+	 * roomier work_mem than the upstream 4 MB.  We compute the maximum
+	 * each operation could safely take if every connection ran in
+	 * parallel, then keep the full value (no /2 mixed-workload haircut)
+	 * because Odoo's typical concurrency is well below max_connections.
 	 */
 	{
 		int			divisor;
 		int			work_mem_kb;
 
+		/*
+		 * Use parallel_per_gather as the parallel factor in the divisor —
+		 * the budget is shared across the leader and its workers.
+		 */
 		divisor = max_connections * 3 * parallel_per_gather;
 		if (divisor < 1)
 			divisor = 1;
-		work_mem_base_kb = (ram_kb - s.shared_buffers_kb) / divisor;
-		if (work_mem_base_kb < 64)
-			work_mem_base_kb = 64;	/* minimum supported by the GUC */
-
-		switch (workload)
-		{
-			case WORKLOAD_WEB:
-			case WORKLOAD_OLTP:
-				work_mem_kb = work_mem_base_kb;
-				break;
-			case WORKLOAD_MIXED:
-			case WORKLOAD_OLAP:
-				work_mem_kb = work_mem_base_kb / 2;
-				break;
-			case WORKLOAD_DESKTOP:
-				work_mem_kb = work_mem_base_kb / 6;
-				break;
-			default:
-				work_mem_kb = work_mem_base_kb / 2;
-				break;
-		}
-		if (work_mem_kb < 64)
-			work_mem_kb = 64;
+		work_mem_kb = (ram_kb - s.shared_buffers_kb) / divisor;
+		if (work_mem_kb < 4 * KB_PER_MB)
+			work_mem_kb = 4 * KB_PER_MB;	/* never below upstream default */
 		s.work_mem_kb = work_mem_kb;
 	}
 
@@ -320,34 +244,20 @@ auto_tune_compute(WorkloadProfile workload, int max_connections)
 	/* Smooth checkpoints over the full interval. */
 	s.checkpoint_completion_target = 0.9;
 
-	/* WAL sizing follows workload write intensity. */
-	switch (workload)
-	{
-		case WORKLOAD_WEB:
-			s.min_wal_size_mb = 1024;
-			s.max_wal_size_mb = 4096;
-			break;
-		case WORKLOAD_OLTP:
-			s.min_wal_size_mb = 2048;
-			s.max_wal_size_mb = 8192;
-			break;
-		case WORKLOAD_OLAP:
-			s.min_wal_size_mb = 4096;
-			s.max_wal_size_mb = 16384;
-			break;
-		case WORKLOAD_DESKTOP:
-			s.min_wal_size_mb = 100;
-			s.max_wal_size_mb = 2048;
-			break;
-		case WORKLOAD_MIXED:
-		default:
-			s.min_wal_size_mb = 1024;
-			s.max_wal_size_mb = 4096;
-			break;
-	}
+	/*
+	 * WAL sizing: Odoo writes constantly (every business action is a
+	 * transaction) so size for sustained throughput without forcing
+	 * frequent checkpoints.
+	 */
+	s.min_wal_size_mb = 2048;
+	s.max_wal_size_mb = 8192;
 
-	/* More histogram buckets help analytical query plans. */
-	s.default_statistics_target = (workload == WORKLOAD_OLAP) ? 500 : 100;
+	/*
+	 * Odoo joins many tables (res_partner, res_users, account_move_line, ...)
+	 * with selective filters where better histograms pay off.  Bump from
+	 * the upstream default of 100.
+	 */
+	s.default_statistics_target = 200;
 
 	s.valid = true;
 	return s;

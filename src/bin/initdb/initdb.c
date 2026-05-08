@@ -209,11 +209,9 @@ static const char *default_timezone = NULL;
 /*
  * Auto-tune state.  In the dbblue distribution, auto-tune is on by default
  * so a fresh cluster comes up with sensible values for the host instead of
- * the upstream-conservative ones.  Use --no-auto-tune to opt out, or
- * --workload=NAME to pick a profile other than "mixed".
+ * the upstream-conservative ones.  Use --no-auto-tune to opt out.
  */
 static bool auto_tune_enabled = true;
-static WorkloadProfile auto_tune_workload = WORKLOAD_MIXED;
 static AutoTuneSettings auto_tune_settings;
 
 /*
@@ -1321,12 +1319,11 @@ apply_auto_tune(void)
 {
 	AutoTuneSettings s;
 	int			desired_buffers;
-	const char *workload_label;
 
 	if (!auto_tune_enabled)
 		return;
 
-	s = auto_tune_compute(auto_tune_workload, n_connections);
+	s = auto_tune_compute(n_connections);
 	if (!s.valid)
 	{
 		printf(_("auto-tune: could not detect host specs, using upstream defaults\n"));
@@ -1334,31 +1331,10 @@ apply_auto_tune(void)
 		return;
 	}
 
-	switch (s.workload)
-	{
-		case WORKLOAD_OLTP:
-			workload_label = "oltp";
-			break;
-		case WORKLOAD_OLAP:
-			workload_label = "olap";
-			break;
-		case WORKLOAD_WEB:
-			workload_label = "web";
-			break;
-		case WORKLOAD_DESKTOP:
-			workload_label = "desktop";
-			break;
-		case WORKLOAD_MIXED:
-		default:
-			workload_label = "mixed";
-			break;
-	}
-
-	printf(_("auto-tune: detected %lu MB RAM, %d CPU(s), storage=%s, workload=%s\n"),
+	printf(_("auto-tune: detected %lu MB RAM, %d CPU(s), storage=%s\n"),
 		   (unsigned long) (s.total_ram_bytes / (1024 * 1024)),
 		   s.cpu_count,
-		   s.ssd_storage ? "ssd" : "hdd",
-		   workload_label);
+		   s.ssd_storage ? "ssd" : "hdd");
 
 	/*
 	 * Convert kB → 8 kB pages (BLCKSZ).  Use int64 because shared_buffers
@@ -2763,8 +2739,6 @@ usage(const char *progname)
 	printf(_("  -d, --debug               generate lots of debugging output\n"));
 	printf(_("      --discard-caches      set debug_discard_caches=1\n"));
 	printf(_("      --no-auto-tune        skip auto-tuning postgresql.conf for the host\n"));
-	printf(_("      --workload=PROFILE    auto-tune profile: mixed (default), oltp, olap,\n"
-			 "                            web, or desktop\n"));
 	printf(_("  -L DIRECTORY              where to find the input files\n"));
 	printf(_("  -n, --no-clean            do not clean up after errors\n"));
 	printf(_("  -N, --no-sync             do not wait for changes to be written safely to disk\n"));
@@ -3418,7 +3392,6 @@ main(int argc, char *argv[])
 		{"no-data-checksums", no_argument, NULL, 20},
 		{"no-sync-data-files", no_argument, NULL, 21},
 		{"no-auto-tune", no_argument, NULL, 22},
-		{"workload", required_argument, NULL, 23},
 		{NULL, 0, NULL, 0}
 	};
 
@@ -3618,11 +3591,6 @@ main(int argc, char *argv[])
 				break;
 			case 22:
 				auto_tune_enabled = false;
-				break;
-			case 23:
-				if (!auto_tune_parse_workload(optarg, &auto_tune_workload))
-					pg_fatal("invalid workload \"%s\"; valid values are: mixed, oltp, olap, web, desktop",
-							 optarg);
 				break;
 			default:
 				/* getopt_long already emitted a complaint */
