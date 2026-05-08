@@ -1992,6 +1992,232 @@ process_range_int_partition(Oid reloid, const char *nsname, const char *relname,
 /* ---------------------------------------------------------------- */
 
 /*
+ * Process a single list_int-partitioned relation.
+ *
+ * Unlike the range_* strategies, list partitioning has no notion of
+ * "next" — partitions are explicit value sets, not range boundaries.
+ * The launcher's job for list_int is to drain the DEFAULT partition:
+ * any new partition_column value that's accumulated rows there gets
+ * promoted to its own explicit partition.
+ *
+ * Concrete steps:
+ *
+ *   1. Find the DEFAULT partition (pg_get_expr(relpartbound) = 'DEFAULT').
+ *      If absent, the user opted out of auto-rotation — log + return.
+ *
+ *   2. SELECT DISTINCT partition_column FROM <default> for non-null
+ *      values.
+ *
+ *   3. For each value, in its own subtransaction:
+ *        a. CREATE TABLE <parent>_p_<N> (LIKE <parent> INCLUDING ALL)
+ *        b. INSERT INTO <parent>_p_<N> SELECT * FROM <default> WHERE col=N
+ *        c. DELETE FROM <default> WHERE col=N
+ *        d. ALTER TABLE <parent> ATTACH PARTITION <parent>_p_<N>
+ *           FOR VALUES IN (N)
+ *
+ *      A failure on any one value rolls back just that subtxn — other
+ *      values continue to be promoted normally.
+ *
+ * Retention is intentionally a no-op for list_int: in Odoo's main use
+ * case (multi-tenant company_id partitioning), companies don't expire,
+ * and "drop the oldest by oid" doesn't carry the same meaning as it
+ * does for range partitions.  Operators who need it can drop unwanted
+ * partitions manually.
+ */
+static void
+process_list_int_partition(Oid reloid, const char *nsname, const char *relname,
+						   const char *partcol, int32 retention)
+{
+	StringInfoData buf;
+	int			ret;
+	Oid			default_oid;
+	char	   *default_relname = NULL;
+	int			value_count;
+	int64	   *new_values = NULL;
+	MemoryContext savecxt;
+	int			promoted = 0;
+
+	(void) retention;			/* not used for list_int */
+
+	/* 1. Find the DEFAULT partition for this parent. */
+	initStringInfo(&buf);
+	appendStringInfo(&buf,
+					 "SELECT child.oid, child.relname "
+					 "FROM pg_inherits i "
+					 "JOIN pg_class child ON child.oid = i.inhrelid "
+					 "WHERE i.inhparent = %u "
+					 "  AND pg_get_expr(child.relpartbound, child.oid) = 'DEFAULT'",
+					 reloid);
+	ret = SPI_execute(buf.data, true, 0);
+	pfree(buf.data);
+	if (ret != SPI_OK_SELECT)
+	{
+		ereport(WARNING,
+				(errmsg("auto-partition: %s.%s: failed to look up DEFAULT partition",
+						nsname, relname)));
+		return;
+	}
+	if (SPI_processed == 0)
+	{
+		ereport(DEBUG1,
+				(errmsg("auto-partition: %s.%s: no DEFAULT partition, list_int rotation no-op",
+						nsname, relname)));
+		return;
+	}
+	{
+		bool		isnull;
+		char	   *s;
+
+		default_oid = DatumGetObjectId(SPI_getbinval(SPI_tuptable->vals[0],
+													 SPI_tuptable->tupdesc,
+													 1, &isnull));
+		s = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2);
+		savecxt = MemoryContextSwitchTo(TopTransactionContext);
+		default_relname = s ? pstrdup(s) : NULL;
+		MemoryContextSwitchTo(savecxt);
+		(void) default_oid;
+	}
+
+	if (default_relname == NULL)
+		return;
+
+	/* 2. Distinct values currently sitting in DEFAULT. */
+	initStringInfo(&buf);
+	appendStringInfo(&buf,
+					 "SELECT DISTINCT %s::bigint AS v "
+					 "FROM %s.%s "
+					 "WHERE %s IS NOT NULL "
+					 "ORDER BY v",
+					 quote_identifier(partcol),
+					 quote_identifier(nsname),
+					 quote_identifier(default_relname),
+					 quote_identifier(partcol));
+	ret = SPI_execute(buf.data, true, 0);
+	pfree(buf.data);
+	if (ret != SPI_OK_SELECT)
+	{
+		ereport(WARNING,
+				(errmsg("auto-partition: %s.%s: failed to scan DEFAULT for new values",
+						nsname, relname)));
+		return;
+	}
+
+	value_count = (int) SPI_processed;
+	if (value_count == 0)
+	{
+		ereport(DEBUG1,
+				(errmsg("auto-partition: %s.%s: DEFAULT partition is empty, nothing to promote",
+						nsname, relname)));
+		return;
+	}
+
+	{
+		MemoryContext c = MemoryContextSwitchTo(TopTransactionContext);
+
+		new_values = palloc(sizeof(int64) * value_count);
+		for (int k = 0; k < value_count; k++)
+		{
+			bool		isnull;
+
+			new_values[k] = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[k],
+														SPI_tuptable->tupdesc,
+														1, &isnull));
+		}
+		MemoryContextSwitchTo(c);
+	}
+
+	/* 3. Promote each value into its own explicit partition. */
+	for (int k = 0; k < value_count; k++)
+	{
+		int64		v = new_values[k];
+		char		child_name[NAMEDATALEN];
+
+		snprintf(child_name, sizeof(child_name),
+				 "%s_p_%lld", relname, (long long) v);
+
+		BeginInternalSubTransaction("autopart_list_promote");
+		PG_TRY();
+		{
+			/* a. New empty partition table cloned from parent's shape. */
+			initStringInfo(&buf);
+			appendStringInfo(&buf,
+							 "CREATE TABLE %s.%s (LIKE %s.%s INCLUDING ALL)",
+							 quote_identifier(nsname),
+							 quote_identifier(child_name),
+							 quote_identifier(nsname),
+							 quote_identifier(relname));
+			SPI_exec(buf.data, 0);
+			pfree(buf.data);
+
+			/* b. Move rows from DEFAULT into the standalone table. */
+			initStringInfo(&buf);
+			appendStringInfo(&buf,
+							 "INSERT INTO %s.%s SELECT * FROM %s.%s WHERE %s = %lld",
+							 quote_identifier(nsname),
+							 quote_identifier(child_name),
+							 quote_identifier(nsname),
+							 quote_identifier(default_relname),
+							 quote_identifier(partcol),
+							 (long long) v);
+			SPI_exec(buf.data, 0);
+			pfree(buf.data);
+
+			/* c. Remove the moved rows from DEFAULT. */
+			initStringInfo(&buf);
+			appendStringInfo(&buf,
+							 "DELETE FROM %s.%s WHERE %s = %lld",
+							 quote_identifier(nsname),
+							 quote_identifier(default_relname),
+							 quote_identifier(partcol),
+							 (long long) v);
+			SPI_exec(buf.data, 0);
+			pfree(buf.data);
+
+			/* d. Attach as a real partition. */
+			initStringInfo(&buf);
+			appendStringInfo(&buf,
+							 "ALTER TABLE %s.%s ATTACH PARTITION %s.%s "
+							 "FOR VALUES IN (%lld)",
+							 quote_identifier(nsname),
+							 quote_identifier(relname),
+							 quote_identifier(nsname),
+							 quote_identifier(child_name),
+							 (long long) v);
+			SPI_exec(buf.data, 0);
+			pfree(buf.data);
+
+			ereport(LOG,
+					(errmsg("auto-partition: promoted %s.%s = %lld to partition %s.%s",
+							nsname, default_relname, (long long) v,
+							nsname, child_name)));
+			promoted++;
+			ReleaseCurrentSubTransaction();
+		}
+		PG_CATCH();
+		{
+			ErrorData  *edata;
+
+			MemoryContextSwitchTo(TopTransactionContext);
+			edata = CopyErrorData();
+			ereport(WARNING,
+					(errmsg("auto-partition: %s.%s: promoting value %lld failed: %s",
+							nsname, relname, (long long) v, edata->message)));
+			FreeErrorData(edata);
+			FlushErrorState();
+			RollbackAndReleaseCurrentSubTransaction();
+		}
+		PG_END_TRY();
+	}
+
+	if (promoted > 0)
+		ereport(LOG,
+				(errmsg("auto-partition: %s.%s: promoted %d/%d distinct values out of DEFAULT",
+						nsname, relname, promoted, value_count)));
+}
+
+/* ---------------------------------------------------------------- */
+
+/*
  * One scan iteration: open a transaction, find every relation with a
  * non-OFF auto_partition_strategy reloption, dispatch by strategy, then
  * commit.
@@ -2136,9 +2362,15 @@ scan_configured_relations(void)
 												 r->partcol, r->partinterval, r->retention);
 			}
 			else if (r->strategy && strcmp(r->strategy, "list_int") == 0)
-				ereport(DEBUG1,
-						(errmsg("auto-partition: %s.%s: list_int not yet implemented",
-								r->nsname, r->relname)));
+			{
+				if (r->relkind == 'p')
+					process_list_int_partition(r->reloid, r->nsname, r->relname,
+											   r->partcol, r->retention);
+				else
+					ereport(DEBUG1,
+							(errmsg("auto-partition: %s.%s: list_int heap conversion not yet implemented",
+									r->nsname, r->relname)));
+			}
 		}
 	}
 
