@@ -81,11 +81,11 @@ ALTER TABLE mail_message SET (
 
 ### Coverage matrix
 
-| Strategy | Heap → partitioned | FKs preserved | Rotation | Retention | Fill-gate |
-|---|---|---|---|---|---|
-| `range_int`  | ✅ | ✅ both directions | ✅ | ✅ | ✅ 80% |
-| `range_date` | ✅ | ❌ refused (composite-PK FK shape) | ✅ | ✅ | ✅ 80% |
-| `list_int`   | ❌ TODO | — | ❌ TODO | n/a | n/a |
+| Strategy | Heap → partitioned | FKs preserved | Triggers preserved | Rotation | Retention | Fill-gate |
+|---|---|---|---|---|---|---|
+| `range_int`  | ✅ | ✅ both directions | ✅ | ✅ | ✅ | ✅ 80% |
+| `range_date` | ✅ | ❌ refused (composite-PK FK shape) | ❌ refused (same reason) | ✅ | ✅ | ✅ 80% |
+| `list_int`   | ❌ TODO | — | — | ❌ TODO | n/a | n/a |
 
 ### What survives across conversion (range_int)
 
@@ -93,6 +93,11 @@ ALTER TABLE mail_message SET (
 - The PRIMARY KEY constraint
 - The owned sequence backing `bigserial` / `serial` (detached + re-attached)
 - All foreign key constraints in both directions, with their original names
+  (re-added as `NOT VALID`, validated post-swap under ShareUpdateExclusiveLock)
+- All user triggers on the source — captured via `pg_get_triggerdef`,
+  recreated post-swap on the partitioned parent (PG auto-propagates to
+  partitions).  Includes the BEFORE/AFTER ROW triggers Odoo's
+  `tracking=True` modules generate.
 - All `DEFAULT` clauses, generated columns, comments, statistics targets
 - The auto-partition reloptions themselves (re-applied post-swap)
 
@@ -116,24 +121,17 @@ ALTER TABLE mail_message SET (
 
 In rough priority order:
 
-### Trigger-aware conversion (range_int)
-**Currently:** any heap with a user trigger is refused with a WARNING.
-**Need:** capture `pg_get_triggerdef` for each user trigger, drop them
-before the swap, recreate them on the partitioned parent (and let PG
-propagate to partitions automatically — works for AFTER triggers; BEFORE
-ROW triggers on partitioned tables have constraints).
-**Estimated:** ~150 lines, similar shape to FK capture.
-
-### range_date FK handling
+### range_date FK + trigger handling
 **Currently:** `convert_heap_to_partitioned_date()` still refuses FKs
-because date-partitioning typically requires a composite PK
-`(id, partition_column)`, and existing FKs that reference just `id`
-won't match the new unique constraint shape.
+and triggers because date-partitioning typically requires a composite
+PK `(id, partition_column)`, and existing FKs that reference just
+`id` won't match the new unique constraint shape.
 **Need:** either (a) require application cooperation (caller must
 update referencing FKs to include the partition column), or (b)
 generate a separate non-partition-key UNIQUE INDEX on `id` to keep
 FKs working unchanged.  Option (b) is preferable but requires careful
-analysis of write hot-path overhead.
+analysis of write hot-path overhead.  Once FKs work, lifting the
+trigger refusal is mechanical.
 **Estimated:** ~300 lines plus design discussion.
 
 ### `list_int` strategy
@@ -290,6 +288,7 @@ ALTER TABLE stock_move_line SET (
 ## Commit history (`feature/auto-partition`)
 
 ```
+dfe0759f833  Phase 3d-trig — trigger-aware conversion
 c4f7c710ea7  re-add FKs as NOT VALID, validate after swap
 e3cb7d1107c  Phase 3c — FK-aware heap conversion (range_int)
 e02514e2c47  Phase 3a-date — heap conversion for range_date
