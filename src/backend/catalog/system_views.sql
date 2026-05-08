@@ -795,6 +795,49 @@ CREATE VIEW pg_stat_xact_user_tables AS
     WHERE schemaname NOT IN ('pg_catalog', 'information_schema') AND
           schemaname !~ '^pg_toast';
 
+-- DBblue auto-partition: per-(parent, partition) state for relations
+-- whose auto_partition_strategy reloption is set.  Joins pg_inherits +
+-- pg_class to expose the partition tree alongside the parent's
+-- configuration.  Useful for ops dashboards: "what does the launcher
+-- think the partition state of this table is?"
+--
+-- rank_from_head = 1 is the newest partition (highest oid, which for
+-- launcher-created partitions matches the highest upper bound).  The
+-- launcher's fill-check probes the rank=1 row each iteration.
+CREATE VIEW pg_stat_auto_partition AS
+    SELECT
+        parent_ns.nspname AS schemaname,
+        parent.relname    AS parent_table,
+        opts.config->>'auto_partition_strategy' AS strategy,
+        opts.config->>'auto_partition_column'   AS partition_column,
+        opts.config->>'auto_partition_interval' AS partition_interval,
+        NULLIF(opts.config->>'auto_partition_retention', '')::int AS retention,
+        partition_ns.nspname AS partition_schema,
+        partition.relname    AS partition_name,
+        pg_get_expr(partition.relpartbound, partition.oid) AS bound,
+        (partition.relpages::bigint) * 8 AS partition_size_kb,
+        partition.reltuples::bigint      AS est_rows,
+        row_number() OVER (PARTITION BY parent.oid ORDER BY partition.oid DESC)
+            AS rank_from_head,
+        count(*) OVER (PARTITION BY parent.oid)
+            AS total_partitions
+    FROM pg_inherits i
+    JOIN pg_class parent      ON parent.oid    = i.inhparent
+    JOIN pg_class partition   ON partition.oid = i.inhrelid
+    JOIN pg_namespace parent_ns    ON parent_ns.oid    = parent.relnamespace
+    JOIN pg_namespace partition_ns ON partition_ns.oid = partition.relnamespace
+    LEFT JOIN LATERAL (
+        SELECT jsonb_object_agg(split_part(o, '=', 1),
+                                substring(o from position('=' in o) + 1))
+                 AS config
+        FROM unnest(parent.reloptions) o
+        WHERE o LIKE 'auto_partition%'
+    ) opts ON TRUE
+    WHERE parent.relkind = 'p'
+      AND opts.config IS NOT NULL
+      AND opts.config ? 'auto_partition_strategy'
+      AND opts.config->>'auto_partition_strategy' <> 'off';
+
 CREATE VIEW pg_stat_autovacuum_scores AS
     SELECT
         s.oid AS relid,
