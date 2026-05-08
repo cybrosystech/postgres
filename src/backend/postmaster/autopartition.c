@@ -636,8 +636,7 @@ convert_heap_to_partitioned(Oid reloid, const char *nsname, const char *relname,
 	int64		lower_bound,
 				upper_bound;
 	bool		has_fk_in PG_USED_FOR_ASSERTS_ONLY = false,
-				has_fk_out PG_USED_FOR_ASSERTS_ONLY = false,
-				has_trigger;
+				has_fk_out PG_USED_FOR_ASSERTS_ONLY = false;
 	bool		pk_ok;
 
 	/*
@@ -653,6 +652,16 @@ convert_heap_to_partitioned(Oid reloid, const char *nsname, const char *relname,
 	char	  **in_fk_defs = NULL;
 	char	  **in_fk_owners = NULL;
 	char	  **in_fk_owner_schemas = NULL;
+
+	/*
+	 * Captured user trigger definitions.  pg_get_triggerdef returns a
+	 * full CREATE TRIGGER statement we can replay verbatim after the
+	 * swap; the trigger will be installed on the new partitioned parent
+	 * and PG auto-propagates it to existing and future partitions.
+	 */
+	int			trig_count = 0;
+	char	  **trig_names = NULL;
+	char	  **trig_defs = NULL;
 
 	/* Parse interval */
 	if (partinterval == NULL || *partinterval == '\0')
@@ -707,36 +716,8 @@ convert_heap_to_partitioned(Oid reloid, const char *nsname, const char *relname,
 		return false;
 	}
 
-	/* Trigger check: still refuse user triggers (Phase 3c+ TODO). */
-	initStringInfo(&buf);
-	appendStringInfo(&buf,
-					 "SELECT EXISTS(SELECT 1 FROM pg_trigger "
-					 "              WHERE tgrelid=%u AND NOT tgisinternal)",
-					 reloid);
-	ret = SPI_execute(buf.data, true, 0);
-	pfree(buf.data);
-	if (ret != SPI_OK_SELECT || SPI_processed == 0)
-	{
-		ereport(WARNING,
-				(errmsg("auto-partition: %s.%s: trigger check failed",
-						nsname, relname)));
-		return false;
-	}
-	{
-		bool		isnull;
-
-		has_trigger = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
-												 SPI_tuptable->tupdesc, 1, &isnull));
-	}
-	if (has_trigger)
-	{
-		ereport(WARNING,
-				(errmsg("auto-partition: %s.%s: skipping conversion — relation has user triggers",
-						nsname, relname),
-				 errhint("Drop triggers, let the launcher convert, then recreate.")));
-		return false;
-	}
-	(void) has_fk_in;			/* now captured + restored, not refused */
+	/* Triggers are now captured + restored (Phase 3d), not refused. */
+	(void) has_fk_in;
 	(void) has_fk_out;
 
 	/* Compute initial partition bounds */
@@ -877,10 +858,48 @@ convert_heap_to_partitioned(Oid reloid, const char *nsname, const char *relname,
 		}
 	}
 
-	if (out_fk_count + in_fk_count > 0)
+	/*
+	 * Capture user triggers via pg_get_triggerdef.  Skip internal
+	 * triggers (those auto-created for FK enforcement, etc.) — those
+	 * are managed implicitly when the FK constraints are re-added.
+	 *
+	 * Each captured definition is a complete CREATE TRIGGER statement
+	 * that mentions the source table by name, so we just replay it
+	 * after the rename.
+	 */
+	{
+		initStringInfo(&buf);
+		appendStringInfo(&buf,
+						 "SELECT tgname, pg_get_triggerdef(oid) "
+						 "FROM pg_trigger "
+						 "WHERE tgrelid = %u AND NOT tgisinternal "
+						 "ORDER BY tgname",
+						 reloid);
+		ret = SPI_execute(buf.data, true, 0);
+		pfree(buf.data);
+		if (ret == SPI_OK_SELECT && SPI_processed > 0)
+		{
+			MemoryContext c = MemoryContextSwitchTo(TopTransactionContext);
+
+			trig_count = (int) SPI_processed;
+			trig_names = palloc(sizeof(char *) * trig_count);
+			trig_defs = palloc(sizeof(char *) * trig_count);
+			for (int k = 0; k < trig_count; k++)
+			{
+				trig_names[k] = pstrdup(SPI_getvalue(SPI_tuptable->vals[k],
+													 SPI_tuptable->tupdesc, 1));
+				trig_defs[k] = pstrdup(SPI_getvalue(SPI_tuptable->vals[k],
+													SPI_tuptable->tupdesc, 2));
+			}
+			MemoryContextSwitchTo(c);
+		}
+	}
+
+	if (out_fk_count + in_fk_count + trig_count > 0)
 		ereport(LOG,
-				(errmsg("auto-partition: %s.%s: capturing %d outbound + %d inbound FKs across conversion",
-						nsname, relname, out_fk_count, in_fk_count)));
+				(errmsg("auto-partition: %s.%s: capturing %d outbound + %d inbound FKs and %d trigger(s) across conversion",
+						nsname, relname,
+						out_fk_count, in_fk_count, trig_count)));
 
 	/*
 	 * The actual conversion runs inside a subtransaction: any failure
@@ -1252,6 +1271,51 @@ convert_heap_to_partitioned(Oid reloid, const char *nsname, const char *relname,
 		ereport(LOG,
 				(errmsg("auto-partition: %s.%s: validated %d FK constraint(s) post-swap",
 						nsname, relname, out_fk_count + in_fk_count)));
+	}
+
+	/*
+	 * Post-swap trigger recreation.  Same pattern as the FK VALIDATE
+	 * loop — sequential subtransactions so a single bad trigger leaves
+	 * the conversion in place with a WARNING in the log instead of
+	 * rolling back everything.
+	 *
+	 * pg_get_triggerdef returned a full CREATE TRIGGER statement that
+	 * references the original table name; the swapped-in relation
+	 * carries the same name, so the same DDL works against the new
+	 * partitioned parent.  PG auto-propagates the trigger to existing
+	 * and future partitions.
+	 */
+	if (converted && trig_count > 0)
+	{
+		int			recreated = 0;
+
+		for (int k = 0; k < trig_count; k++)
+		{
+			BeginInternalSubTransaction("autopart_recreate_trig");
+			PG_TRY();
+			{
+				SPI_exec(trig_defs[k], 0);
+				recreated++;
+				ReleaseCurrentSubTransaction();
+			}
+			PG_CATCH();
+			{
+				ErrorData  *edata;
+
+				MemoryContextSwitchTo(TopTransactionContext);
+				edata = CopyErrorData();
+				ereport(WARNING,
+						(errmsg("auto-partition: %s.%s: recreating trigger %s failed: %s",
+								nsname, relname, trig_names[k], edata->message)));
+				FreeErrorData(edata);
+				FlushErrorState();
+				RollbackAndReleaseCurrentSubTransaction();
+			}
+			PG_END_TRY();
+		}
+		ereport(LOG,
+				(errmsg("auto-partition: %s.%s: recreated %d/%d trigger(s) post-swap",
+						nsname, relname, recreated, trig_count)));
 	}
 
 	return converted;
