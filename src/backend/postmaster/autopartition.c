@@ -1992,6 +1992,433 @@ process_range_int_partition(Oid reloid, const char *nsname, const char *relname,
 /* ---------------------------------------------------------------- */
 
 /*
+ * Phase: convert an unpartitioned heap to LIST-partitioned, one
+ * partition per distinct value of partition_column plus a DEFAULT
+ * partition for future arrivals.
+ *
+ * Targeted at multi-tenant Odoo schemas (partition by company_id).
+ *
+ * Preconditions, refused with WARNING + skip:
+ *   * relkind = 'r' (regular heap)
+ *   * partition_column is part of the primary key.  PG requires the
+ *     partition column to be in any unique constraint, so a typical
+ *     id-only PK won't work — the application has to pre-migrate to
+ *     a composite (id, partition_column) PK.
+ *   * No FKs in/out.  Same composite-PK shape mismatch as range_date:
+ *     existing FKs that reference just `id` won't match the new
+ *     composite unique constraint.
+ *   * No user triggers.  Lifting this is mechanical once FKs work.
+ *
+ * Conversion sequence (subtransaction-wrapped):
+ *   1. SELECT DISTINCT <partition_column> FROM source.
+ *   2. CREATE __new (LIKE INCLUDING ALL) PARTITION BY LIST (col).
+ *   3. CREATE one partition per distinct value: PARTITION OF __new
+ *      FOR VALUES IN (v).
+ *   4. CREATE __new DEFAULT partition.
+ *   5. INSERT INTO __new SELECT * FROM source — partition routing
+ *      sends each row to the correct partition by value.
+ *   6. Sequence dance, atomic swap, sequence re-attach (same as
+ *      range_int conversion).
+ *   7. Re-apply auto_partition reloptions.
+ */
+static bool
+convert_heap_to_partitioned_list(Oid reloid, const char *nsname,
+								 const char *relname, const char *partcol,
+								 int32 retention)
+{
+	StringInfoData buf;
+	int			ret;
+	bool		converted = false;
+	bool		col_in_pk;
+	bool		has_fk_in,
+				has_fk_out,
+				has_trigger;
+	int			value_count;
+	int64	   *values = NULL;
+	int64		row_count = 0;
+	MemoryContext savecxt;
+
+	/* 1. partition_column must be part of the PK. */
+	initStringInfo(&buf);
+	appendStringInfo(&buf,
+					 "SELECT EXISTS ("
+					 "  SELECT 1 FROM pg_constraint con "
+					 "  JOIN pg_attribute a "
+					 "    ON a.attrelid = con.conrelid "
+					 "   AND a.attnum = ANY(con.conkey) "
+					 "  WHERE con.conrelid = %u "
+					 "    AND con.contype = 'p' "
+					 "    AND a.attname = %s)",
+					 reloid, quote_literal_cstr(partcol));
+	ret = SPI_execute(buf.data, true, 0);
+	pfree(buf.data);
+	if (ret != SPI_OK_SELECT || SPI_processed == 0)
+	{
+		ereport(WARNING,
+				(errmsg("auto-partition: %s.%s: PK check failed",
+						nsname, relname)));
+		return false;
+	}
+	{
+		bool		isnull;
+
+		col_in_pk = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
+											   SPI_tuptable->tupdesc, 1, &isnull));
+	}
+	if (!col_in_pk)
+	{
+		ereport(WARNING,
+				(errmsg("auto-partition: %s.%s: list_int conversion needs %s in the primary key",
+						nsname, relname, partcol)));
+		return false;
+	}
+
+	/* 2. Refuse FKs and triggers — same shape problem as range_date. */
+	initStringInfo(&buf);
+	appendStringInfo(&buf,
+					 "SELECT "
+					 "  EXISTS(SELECT 1 FROM pg_constraint WHERE confrelid=%u AND contype='f'), "
+					 "  EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid=%u  AND contype='f'), "
+					 "  EXISTS(SELECT 1 FROM pg_trigger    WHERE tgrelid=%u   AND NOT tgisinternal)",
+					 reloid, reloid, reloid);
+	ret = SPI_execute(buf.data, true, 0);
+	pfree(buf.data);
+	if (ret != SPI_OK_SELECT || SPI_processed == 0)
+	{
+		ereport(WARNING,
+				(errmsg("auto-partition: %s.%s: FK/trigger check failed",
+						nsname, relname)));
+		return false;
+	}
+	{
+		bool		isnull;
+
+		has_fk_in = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
+											   SPI_tuptable->tupdesc, 1, &isnull));
+		has_fk_out = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
+											   SPI_tuptable->tupdesc, 2, &isnull));
+		has_trigger = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
+												 SPI_tuptable->tupdesc, 3, &isnull));
+	}
+	if (has_fk_in || has_fk_out || has_trigger)
+	{
+		ereport(WARNING,
+				(errmsg("auto-partition: %s.%s: list_int conversion currently refuses FKs/triggers — drop them, let the launcher convert, then recreate",
+						nsname, relname)));
+		return false;
+	}
+
+	/* 3. SELECT DISTINCT to discover initial partition values. */
+	initStringInfo(&buf);
+	appendStringInfo(&buf,
+					 "SELECT DISTINCT %s::bigint AS v "
+					 "FROM %s.%s WHERE %s IS NOT NULL ORDER BY v",
+					 quote_identifier(partcol),
+					 quote_identifier(nsname),
+					 quote_identifier(relname),
+					 quote_identifier(partcol));
+	ret = SPI_execute(buf.data, true, 0);
+	pfree(buf.data);
+	if (ret != SPI_OK_SELECT)
+	{
+		ereport(WARNING,
+				(errmsg("auto-partition: %s.%s: failed to discover distinct values",
+						nsname, relname)));
+		return false;
+	}
+	value_count = (int) SPI_processed;
+
+	if (value_count == 0)
+	{
+		/*
+		 * Empty source.  Build only the parent + DEFAULT — no value
+		 * partitions yet.  The launcher's rotation pass will promote
+		 * values out of DEFAULT once data starts landing.
+		 */
+		ereport(LOG,
+				(errmsg("auto-partition: converting %s.%s (empty heap) -> partitioned with DEFAULT only",
+						nsname, relname)));
+	}
+	else
+	{
+		MemoryContext c = MemoryContextSwitchTo(TopTransactionContext);
+
+		values = palloc(sizeof(int64) * value_count);
+		for (int k = 0; k < value_count; k++)
+		{
+			bool		isnull;
+
+			values[k] = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[k],
+													SPI_tuptable->tupdesc,
+													1, &isnull));
+		}
+		MemoryContextSwitchTo(c);
+	}
+
+	/* Row count for the log line (separate query — DISTINCT didn't return it). */
+	initStringInfo(&buf);
+	appendStringInfo(&buf, "SELECT count(*)::bigint FROM %s.%s",
+					 quote_identifier(nsname), quote_identifier(relname));
+	ret = SPI_execute(buf.data, true, 0);
+	pfree(buf.data);
+	if (ret == SPI_OK_SELECT && SPI_processed > 0)
+	{
+		bool		isnull;
+
+		row_count = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
+												SPI_tuptable->tupdesc, 1, &isnull));
+	}
+
+	ereport(LOG,
+			(errmsg("auto-partition: converting %s.%s (rows=%lld, %d distinct %s values) -> LIST partitioned",
+					nsname, relname, (long long) row_count, value_count, partcol)));
+
+	/* 4. Conversion proper. */
+	(void) savecxt;
+	BeginInternalSubTransaction("autopart_convert_list");
+	PG_TRY();
+	{
+		char		tmp_name[NAMEDATALEN];
+		char		default_name[NAMEDATALEN];
+
+		snprintf(tmp_name, sizeof(tmp_name), "%s__autopart_new", relname);
+		snprintf(default_name, sizeof(default_name), "%s_default", relname);
+
+		/* a. Parent partitioned table. */
+		initStringInfo(&buf);
+		appendStringInfo(&buf,
+						 "CREATE TABLE %s.%s (LIKE %s.%s INCLUDING ALL) "
+						 "PARTITION BY LIST (%s)",
+						 quote_identifier(nsname),
+						 quote_identifier(tmp_name),
+						 quote_identifier(nsname),
+						 quote_identifier(relname),
+						 quote_identifier(partcol));
+		SPI_exec(buf.data, 0);
+		pfree(buf.data);
+
+		/* b. One partition per distinct value. */
+		for (int k = 0; k < value_count; k++)
+		{
+			char		child_name[NAMEDATALEN];
+
+			snprintf(child_name, sizeof(child_name),
+					 "%s__autopart_new_p_%lld",
+					 relname, (long long) values[k]);
+
+			initStringInfo(&buf);
+			appendStringInfo(&buf,
+							 "CREATE TABLE %s.%s PARTITION OF %s.%s "
+							 "FOR VALUES IN (%lld)",
+							 quote_identifier(nsname),
+							 quote_identifier(child_name),
+							 quote_identifier(nsname),
+							 quote_identifier(tmp_name),
+							 (long long) values[k]);
+			SPI_exec(buf.data, 0);
+			pfree(buf.data);
+		}
+
+		/* c. DEFAULT partition for future arrivals. */
+		{
+			char		default_initial[NAMEDATALEN];
+
+			snprintf(default_initial, sizeof(default_initial),
+					 "%s__autopart_new_default", relname);
+			initStringInfo(&buf);
+			appendStringInfo(&buf,
+							 "CREATE TABLE %s.%s PARTITION OF %s.%s DEFAULT",
+							 quote_identifier(nsname),
+							 quote_identifier(default_initial),
+							 quote_identifier(nsname),
+							 quote_identifier(tmp_name));
+			SPI_exec(buf.data, 0);
+			pfree(buf.data);
+		}
+
+		/* d. Copy rows.  Partition routing handles the dispatch. */
+		if (row_count > 0)
+		{
+			initStringInfo(&buf);
+			appendStringInfo(&buf,
+							 "INSERT INTO %s.%s SELECT * FROM %s.%s",
+							 quote_identifier(nsname),
+							 quote_identifier(tmp_name),
+							 quote_identifier(nsname),
+							 quote_identifier(relname));
+			SPI_exec(buf.data, 0);
+			pfree(buf.data);
+		}
+
+		/* e. Sequence detach + swap + reattach.  Same as range_int. */
+		{
+			SPITupleTable *seqtab;
+			int			seq_ret;
+			int			seq_count;
+			char	  **seq_names = NULL;
+			char	  **seq_columns = NULL;
+
+			initStringInfo(&buf);
+			appendStringInfo(&buf,
+							 "SELECT s.relname, a.attname "
+							 "FROM pg_depend d "
+							 "JOIN pg_class s ON s.oid = d.objid AND s.relkind = 'S' "
+							 "JOIN pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid "
+							 "WHERE d.refobjid = %u "
+							 "  AND d.classid = 'pg_class'::regclass "
+							 "  AND d.refclassid = 'pg_class'::regclass "
+							 "  AND d.deptype = 'a'",
+							 reloid);
+			seq_ret = SPI_execute(buf.data, true, 0);
+			pfree(buf.data);
+
+			if (seq_ret == SPI_OK_SELECT && SPI_processed > 0)
+			{
+				MemoryContext oldcxt;
+
+				seq_count = (int) SPI_processed;
+				seqtab = SPI_tuptable;
+				oldcxt = MemoryContextSwitchTo(TopTransactionContext);
+				seq_names = palloc(sizeof(char *) * seq_count);
+				seq_columns = palloc(sizeof(char *) * seq_count);
+				for (int s = 0; s < seq_count; s++)
+				{
+					seq_names[s] = pstrdup(SPI_getvalue(seqtab->vals[s], seqtab->tupdesc, 1));
+					seq_columns[s] = pstrdup(SPI_getvalue(seqtab->vals[s], seqtab->tupdesc, 2));
+				}
+				MemoryContextSwitchTo(oldcxt);
+			}
+			else
+				seq_count = 0;
+
+			for (int s = 0; s < seq_count; s++)
+			{
+				initStringInfo(&buf);
+				appendStringInfo(&buf, "ALTER SEQUENCE %s.%s OWNED BY NONE",
+								 quote_identifier(nsname),
+								 quote_identifier(seq_names[s]));
+				SPI_exec(buf.data, 0);
+				pfree(buf.data);
+			}
+
+			initStringInfo(&buf);
+			appendStringInfo(&buf, "LOCK TABLE %s.%s IN ACCESS EXCLUSIVE MODE",
+							 quote_identifier(nsname),
+							 quote_identifier(relname));
+			SPI_exec(buf.data, 0);
+			pfree(buf.data);
+
+			initStringInfo(&buf);
+			appendStringInfo(&buf, "DROP TABLE %s.%s",
+							 quote_identifier(nsname),
+							 quote_identifier(relname));
+			SPI_exec(buf.data, 0);
+			pfree(buf.data);
+
+			initStringInfo(&buf);
+			appendStringInfo(&buf, "ALTER TABLE %s.%s RENAME TO %s",
+							 quote_identifier(nsname),
+							 quote_identifier(tmp_name),
+							 quote_identifier(relname));
+			SPI_exec(buf.data, 0);
+			pfree(buf.data);
+
+			/* Rename the per-value partitions to clean names. */
+			for (int k = 0; k < value_count; k++)
+			{
+				char		old[NAMEDATALEN];
+				char		new[NAMEDATALEN];
+
+				snprintf(old, sizeof(old),
+						 "%s__autopart_new_p_%lld",
+						 relname, (long long) values[k]);
+				snprintf(new, sizeof(new),
+						 "%s_p_%lld",
+						 relname, (long long) values[k]);
+
+				initStringInfo(&buf);
+				appendStringInfo(&buf,
+								 "ALTER TABLE %s.%s RENAME TO %s",
+								 quote_identifier(nsname),
+								 quote_identifier(old),
+								 quote_identifier(new));
+				SPI_exec(buf.data, 0);
+				pfree(buf.data);
+			}
+			/* Rename the DEFAULT partition. */
+			{
+				char		old[NAMEDATALEN];
+
+				snprintf(old, sizeof(old), "%s__autopart_new_default", relname);
+				initStringInfo(&buf);
+				appendStringInfo(&buf,
+								 "ALTER TABLE %s.%s RENAME TO %s",
+								 quote_identifier(nsname),
+								 quote_identifier(old),
+								 quote_identifier(default_name));
+				SPI_exec(buf.data, 0);
+				pfree(buf.data);
+			}
+
+			for (int s = 0; s < seq_count; s++)
+			{
+				initStringInfo(&buf);
+				appendStringInfo(&buf,
+								 "ALTER SEQUENCE %s.%s OWNED BY %s.%s.%s",
+								 quote_identifier(nsname),
+								 quote_identifier(seq_names[s]),
+								 quote_identifier(nsname),
+								 quote_identifier(relname),
+								 quote_identifier(seq_columns[s]));
+				SPI_exec(buf.data, 0);
+				pfree(buf.data);
+			}
+		}
+
+		/* f. Re-apply reloptions. */
+		initStringInfo(&buf);
+		appendStringInfo(&buf,
+						 "ALTER TABLE %s.%s SET ("
+						 "auto_partition_strategy = %s, "
+						 "auto_partition_column = %s, "
+						 "auto_partition_retention = %d)",
+						 quote_identifier(nsname),
+						 quote_identifier(relname),
+						 quote_literal_cstr("list_int"),
+						 quote_literal_cstr(partcol),
+						 retention);
+		SPI_exec(buf.data, 0);
+		pfree(buf.data);
+
+		ereport(LOG,
+				(errmsg("auto-partition: converted %s.%s -> LIST partitioned with %d explicit partition(s) + DEFAULT",
+						nsname, relname, value_count)));
+		converted = true;
+
+		ReleaseCurrentSubTransaction();
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		MemoryContextSwitchTo(TopTransactionContext);
+		edata = CopyErrorData();
+		ereport(WARNING,
+				(errmsg("auto-partition: %s.%s: list_int conversion failed: %s",
+						nsname, relname, edata->message)));
+		FreeErrorData(edata);
+		FlushErrorState();
+		RollbackAndReleaseCurrentSubTransaction();
+		converted = false;
+	}
+	PG_END_TRY();
+
+	return converted;
+}
+
+/* ---------------------------------------------------------------- */
+
+/*
  * Process a single list_int-partitioned relation.
  *
  * Unlike the range_* strategies, list partitioning has no notion of
@@ -2363,13 +2790,12 @@ scan_configured_relations(void)
 			}
 			else if (r->strategy && strcmp(r->strategy, "list_int") == 0)
 			{
-				if (r->relkind == 'p')
+				if (r->relkind == 'r')
+					(void) convert_heap_to_partitioned_list(r->reloid, r->nsname, r->relname,
+															r->partcol, r->retention);
+				else if (r->relkind == 'p')
 					process_list_int_partition(r->reloid, r->nsname, r->relname,
 											   r->partcol, r->retention);
-				else
-					ereport(DEBUG1,
-							(errmsg("auto-partition: %s.%s: list_int heap conversion not yet implemented",
-									r->nsname, r->relname)));
 			}
 		}
 	}
