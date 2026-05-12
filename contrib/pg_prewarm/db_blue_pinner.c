@@ -156,6 +156,30 @@ typedef struct PinEntry
 /* Max tables we will process in one cycle */
 #define MAX_PIN_ENTRIES     256
 
+/*
+ * Max ring-buffer-routed tables we will track between cycles. Matches the
+ * shmem registry size in bufmgr.c (MAX_RING_BUFFER_RELATIONS).
+ */
+#define MAX_RING_BUFFER_TRACKED  64
+
+/*
+ * Previous cycle's registered ring-buffer relfilenodes. Used to compute
+ * the set we need to unregister at the start of the next cycle.
+ *
+ * Without this tracking, RegisterRingBufferRelation accumulates entries
+ * across DDL events (TRUNCATE, VACUUM FULL, CLUSTER, DROP+recreate)
+ * because the relfilenode changes but the old entry is never removed.
+ * Over time the 64-entry shmem registry fills with dead entries and new
+ * tables fail to register.
+ *
+ * Lives in the bgworker's process memory; lost on worker restart, in
+ * which case we just over-write the shmem registry with the fresh set
+ * on the next cycle (any pre-restart dead entries are functionally
+ * harmless until they get unregistered or the postmaster restarts).
+ */
+static Oid  prev_ring_buffer_oids[MAX_RING_BUFFER_TRACKED];
+static int  prev_ring_buffer_count = 0;
+
 /* =========================================================================
  * FORWARD DECLARATIONS
  * =========================================================================
@@ -221,12 +245,12 @@ DBBluePinnerRegisterGUCs(void)
     DefineCustomStringVariable(
         "db_blue.pinned_tables",
         "Tables to keep resident in shared_buffers (comma-separated)",
-        "Use 'tablename:tier1' for metadata tables that must never be evicted.",
+        "Use 'tablename:tier1' for metadata tables that must never be evicted. "
+        "Empty by default — enable only when the hot working set is ~3x or more "
+        "of shared_buffers. Benchmarks show 3-7% throughput regression in "
+        "deployments where the working set already fits comfortably.",
         &DBBluePinner_pinned_tables,
-        /* default — sensible Odoo metadata + OLTP tables */
-        "res_users:tier1,res_company:tier1,res_currency:tier1,"
-        "res_partner,product_template,product_product,"
-        "account_move,sale_order,stock_quant",
+        "",         /* off by default — opt-in feature */
         PGC_SIGHUP,
         0,
         NULL, NULL, NULL
@@ -237,11 +261,11 @@ DBBluePinnerRegisterGUCs(void)
         "Tables whose scans must never pollute shared_buffers",
         "All sequential reads for these tables are routed through a "
         "private ring buffer, preventing large reports from evicting "
-        "hot OLTP data.",
+        "hot OLTP data. PostgreSQL's BAS_BULKREAD strategy already handles "
+        "this automatically for tables larger than shared_buffers/4; this "
+        "GUC is only needed for smaller report-shaped tables.",
         &DBBluePinner_ring_buffer_tables,
-        /* default — known large Odoo report tables */
-        "account_move_line,stock_move,mail_message,mail_mail,"
-        "account_analytic_line,stock_move_line",
+        "",         /* off by default — opt-in feature */
         PGC_SIGHUP,
         0,
         NULL, NULL, NULL
@@ -249,10 +273,10 @@ DBBluePinnerRegisterGUCs(void)
 
     DefineCustomIntVariable(
         "db_blue.pin_check_interval",
-        "Seconds between pinner maintenance cycles (0 = startup only)",
+        "Seconds between pinner maintenance cycles (0 = worker exits after one cycle)",
         NULL,
         &DBBluePinner_check_interval,
-        300,    /* default: 5 minutes */
+        0,      /* default: 0 = effectively disabled */
         0,      /* min: disabled */
         3600,   /* max: 1 hour */
         PGC_SIGHUP,
@@ -533,6 +557,28 @@ cycle_end:
     elog(DEBUG1,
          "db_blue pinner: cycle complete, %ldMB pinned",
          (long) (used_bytes / (1024 * 1024)));
+
+    /*
+     * Sanity warning: if the pinned set is small relative to the pool
+     * (< 1/4 of shared_buffers), the protection mechanism is unlikely to
+     * earn its overhead. Benchmarks show 3-7% throughput regression in
+     * deployments where the working set already fits comfortably and the
+     * pinner is therefore pinning a small fraction of the pool. Surface
+     * this once per cycle so operators can see it.
+     */
+    {
+        int64   pool_bytes = (int64) NBuffers * BLCKSZ;
+
+        if (used_bytes > 0 && used_bytes < pool_bytes / 4)
+            elog(LOG,
+                 "db_blue pinner: pinned set is %ldMB of %ldMB pool "
+                 "(%.1f%%) — the feature provides little benefit when the "
+                 "working set fits comfortably in shared_buffers; consider "
+                 "disabling db_blue.pinned_tables for higher throughput",
+                 (long) (used_bytes  / (1024 * 1024)),
+                 (long) (pool_bytes  / (1024 * 1024)),
+                 100.0 * used_bytes / pool_bytes);
+    }
 }
 
 /* =========================================================================
@@ -565,6 +611,24 @@ PinnerSetupRingBuffers(void)
     List       *namelist;
     ListCell   *lc;
     char       *rawstring;
+    Oid         new_oids[MAX_RING_BUFFER_TRACKED];
+    int         new_count = 0;
+    int         i;
+
+    /*
+     * Step 1: unregister everything we registered last cycle. This is the
+     * fix for the leak — DDL operations (TRUNCATE, VACUUM FULL, CLUSTER,
+     * DROP+recreate) change a table's relfilenode, leaving the old one as
+     * a dead entry in the shmem registry. Without this cleanup, the
+     * 64-slot registry fills with stale entries over time and new tables
+     * fail to register.
+     *
+     * Tables that survived will get re-registered in step 2 (with their
+     * current relfilenode, which may have changed since last cycle).
+     */
+    for (i = 0; i < prev_ring_buffer_count; i++)
+        UnregisterRingBufferRelation(prev_ring_buffer_oids[i]);
+    prev_ring_buffer_count = 0;
 
     if (DBBluePinner_ring_buffer_tables == NULL ||
         strlen(DBBluePinner_ring_buffer_tables) == 0)
@@ -579,6 +643,10 @@ PinnerSetupRingBuffers(void)
         return;
     }
 
+    /*
+     * Step 2: walk the desired set, register each, remember relfileOids
+     * for next cycle's cleanup pass.
+     */
     foreach(lc, namelist)
     {
         char       *table_name = (char *) lfirst(lc);
@@ -604,6 +672,10 @@ PinnerSetupRingBuffers(void)
 
         RegisterRingBufferRelation(relfileOid);
 
+        /* Remember for next cycle's cleanup pass */
+        if (new_count < MAX_RING_BUFFER_TRACKED)
+            new_oids[new_count++] = relfileOid;
+
         elog(DEBUG1,
              "db_blue pinner: ring buffer forced for \"%s\" "
              "(relfileOid=%u)",
@@ -621,6 +693,10 @@ PinnerSetupRingBuffers(void)
         strlcpy(ring_entry.table_name, table_name, NAMEDATALEN);
         SoftPinRelationIndexes(&ring_entry);
     }
+
+    /* Remember the new set for next cycle's cleanup pass */
+    memcpy(prev_ring_buffer_oids, new_oids, new_count * sizeof(Oid));
+    prev_ring_buffer_count = new_count;
 
     list_free(namelist);
 }
