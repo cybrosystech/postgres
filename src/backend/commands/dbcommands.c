@@ -998,6 +998,23 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 	 * made to the source until we finish copying it, so we can be sure it
 	 * won't change underneath us.
 	 */
+	/*
+	 * If the user supplied no TEMPLATE and no encoding/locale/provider
+	 * options, default the new database to the builtin C.UTF-8 locale with
+	 * UTF8 encoding.  Use template0 as the source so the encoding/locale
+	 * compatibility checks below are bypassed regardless of template1's
+	 * settings.
+	 */
+	if (templateEl == NULL && encodingEl == NULL &&
+		localeEl == NULL && builtinlocaleEl == NULL && iculocaleEl == NULL &&
+		collateEl == NULL && ctypeEl == NULL && locproviderEl == NULL)
+	{
+		dbtemplate = "template0";
+		encoding = PG_UTF8;
+		dblocprovider = COLLPROVIDER_BUILTIN;
+		dblocale = "C.UTF-8";
+	}
+
 	if (!dbtemplate)
 		dbtemplate = "template1";	/* Default template database name */
 
