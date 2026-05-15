@@ -162,6 +162,15 @@ static relopt_bool boolRelOpts[] =
 		},
 		true
 	},
+	{
+		{
+			"appendoptimized",
+			"Marks this relation as using append-optimized row storage",
+			RELOPT_KIND_HEAP,
+			AccessExclusiveLock
+		},
+		false
+	},
 	/* list terminator */
 	{{NULL}}
 };
@@ -413,6 +422,15 @@ static relopt_int intRelOpts[] =
 		},
 		-1, 0, 1024
 	},
+	{
+		{
+			"compresslevel",
+			"Compression level for append-optimized storage (0 = off)",
+			RELOPT_KIND_HEAP,
+			AccessExclusiveLock
+		},
+		0, 0, 19
+	},
 
 	/* list terminator */
 	{{NULL}}
@@ -587,8 +605,64 @@ static relopt_enum enumRelOpts[] =
 	{{NULL}}
 };
 
+static void
+validate_ao_orientation(const char *val)
+{
+	if (val == NULL)
+		return;
+	if (strcmp(val, "row") == 0)
+		return;
+	ereport(ERROR,
+			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+			 errmsg("invalid value for orientation: \"%s\"", val),
+			 errhint("Phase 1 of append-optimized storage supports only \"row\" orientation.")));
+}
+
+static void
+validate_ao_compresstype(const char *val)
+{
+	if (val == NULL)
+		return;
+	if (strcmp(val, "none") == 0 ||
+		strcmp(val, "zstd") == 0 ||
+		strcmp(val, "zlib") == 0 ||
+		strcmp(val, "lz4") == 0 ||
+		strcmp(val, "rle_type") == 0)
+		return;
+	ereport(ERROR,
+			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+			 errmsg("invalid value for compresstype: \"%s\"", val),
+			 errhint("Valid values are \"none\", \"zstd\", \"zlib\", \"lz4\", \"rle_type\".")));
+}
+
 static relopt_string stringRelOpts[] =
 {
+	{
+		{
+			"orientation",
+			"Row or column orientation for append-optimized storage",
+			RELOPT_KIND_HEAP,
+			AccessExclusiveLock
+		},
+		3,						/* default_len ("row") */
+		false,					/* default_isnull */
+		validate_ao_orientation,
+		NULL,					/* fill_cb */
+		"row"					/* default_val */
+	},
+	{
+		{
+			"compresstype",
+			"Compression algorithm for append-optimized storage",
+			RELOPT_KIND_HEAP,
+			AccessExclusiveLock
+		},
+		4,						/* default_len ("none") */
+		false,					/* default_isnull */
+		validate_ao_compresstype,
+		NULL,					/* fill_cb */
+		"none"					/* default_val */
+	},
 	/* list terminator */
 	{{NULL}}
 };
@@ -2025,7 +2099,15 @@ default_reloptions(Datum reloptions, bool validate, relopt_kind kind)
 		{"vacuum_truncate", RELOPT_TYPE_TERNARY,
 		offsetof(StdRdOptions, vacuum_truncate)},
 		{"vacuum_max_eager_freeze_failure_rate", RELOPT_TYPE_REAL,
-		offsetof(StdRdOptions, vacuum_max_eager_freeze_failure_rate)}
+		offsetof(StdRdOptions, vacuum_max_eager_freeze_failure_rate)},
+		{"appendoptimized", RELOPT_TYPE_BOOL,
+		offsetof(StdRdOptions, appendoptimized)},
+		{"compresslevel", RELOPT_TYPE_INT,
+		offsetof(StdRdOptions, compresslevel)},
+		{"orientation", RELOPT_TYPE_STRING,
+		offsetof(StdRdOptions, orientation_offset)},
+		{"compresstype", RELOPT_TYPE_STRING,
+		offsetof(StdRdOptions, compresstype_offset)}
 	};
 
 	return (bytea *) build_reloptions(reloptions, validate, kind,

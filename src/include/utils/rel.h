@@ -356,6 +356,15 @@ typedef struct StdRdOptions
 	 * to freeze. 0 if disabled, -1 if unspecified.
 	 */
 	double		vacuum_max_eager_freeze_failure_rate;
+
+	/*
+	 * Append-optimized row storage options (Phase 1: parsed and stored but
+	 * not acted on by the storage engine yet).
+	 */
+	bool		appendoptimized;	/* marks relation as append-optimized */
+	int			compresslevel;		/* compression level (0..19) */
+	int			orientation_offset;	/* string offset for orientation */
+	int			compresstype_offset; /* string offset for compresstype */
 } StdRdOptions;
 
 #define HEAP_MIN_FILLFACTOR			10

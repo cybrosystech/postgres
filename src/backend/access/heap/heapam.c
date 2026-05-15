@@ -1442,11 +1442,15 @@ heap_getnext(TableScanDesc sscan, ScanDirection direction)
 	 * downgrade this to an assert. The reason for checking the AM routine,
 	 * rather than the AM oid, is that this allows to write regression tests
 	 * that create another AM reusing the heap handler.
+	 *
+	 * appendoptimized reuses the heap storage layout, so its routine is
+	 * also accepted here.
 	 */
-	if (unlikely(sscan->rs_rd->rd_tableam != GetHeapamTableAmRoutine()))
+	if (unlikely(sscan->rs_rd->rd_tableam != GetHeapamTableAmRoutine() &&
+				 sscan->rs_rd->rd_tableam != GetAppendoptimizedTableAmRoutine()))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg_internal("only heap AM is supported")));
+				 errmsg_internal("only heap AM and append optimised AO is supported")));
 
 	/* Note: no locking manipulations needed */
 

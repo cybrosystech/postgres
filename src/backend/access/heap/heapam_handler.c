@@ -2712,3 +2712,103 @@ heap_tableam_handler(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_POINTER(&heapam_methods);
 }
+
+/* ------------------------------------------------------------------------
+ * Append-optimized row table access method (Phase 3).
+ *
+ * Reuses the heap storage layout but forces an append-only insert path:
+ * the FSM is bypassed and tuples are always added to the last page
+ * (extending the relation when the last page is full). Page free-space
+ * is also reduced to zero (effective fillfactor = 100) because AO tables
+ * have no use for HOT-update headroom.
+ *
+ * UPDATE/DELETE still use heap's MVCC semantics for now — visibility
+ * bitmap and compaction-style VACUUM are deferred to later phases.
+ * ------------------------------------------------------------------------
+ */
+static void
+ao_tuple_insert(Relation relation, TupleTableSlot *slot, CommandId cid,
+				uint32 options, BulkInsertState bistate)
+{
+	heapam_tuple_insert(relation, slot, cid,
+						options | HEAP_INSERT_SKIP_FSM, bistate);
+}
+
+static void
+ao_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
+				CommandId cid, uint32 options, BulkInsertState bistate)
+{
+	heap_multi_insert(relation, slots, ntuples, cid,
+					  options | HEAP_INSERT_SKIP_FSM, bistate);
+}
+
+static const TableAmRoutine appendoptimized_methods = {
+	.type = T_TableAmRoutine,
+
+	.slot_callbacks = heapam_slot_callbacks,
+
+	.scan_begin = heap_beginscan,
+	.scan_end = heap_endscan,
+	.scan_rescan = heap_rescan,
+	.scan_getnextslot = heap_getnextslot,
+
+	.scan_set_tidrange = heap_set_tidrange,
+	.scan_getnextslot_tidrange = heap_getnextslot_tidrange,
+
+	.parallelscan_estimate = table_block_parallelscan_estimate,
+	.parallelscan_initialize = table_block_parallelscan_initialize,
+	.parallelscan_reinitialize = table_block_parallelscan_reinitialize,
+
+	.index_fetch_begin = heapam_index_fetch_begin,
+	.index_fetch_reset = heapam_index_fetch_reset,
+	.index_fetch_end = heapam_index_fetch_end,
+	.index_fetch_tuple = heapam_index_fetch_tuple,
+
+	/* Append-only insert path */
+	.tuple_insert = ao_tuple_insert,
+	.tuple_insert_speculative = heapam_tuple_insert_speculative,
+	.tuple_complete_speculative = heapam_tuple_complete_speculative,
+	.multi_insert = ao_multi_insert,
+	.tuple_delete = heapam_tuple_delete,
+	.tuple_update = heapam_tuple_update,
+	.tuple_lock = heapam_tuple_lock,
+
+	.tuple_fetch_row_version = heapam_fetch_row_version,
+	.tuple_get_latest_tid = heap_get_latest_tid,
+	.tuple_tid_valid = heapam_tuple_tid_valid,
+	.tuple_satisfies_snapshot = heapam_tuple_satisfies_snapshot,
+	.index_delete_tuples = heap_index_delete_tuples,
+
+	.relation_set_new_filelocator = heapam_relation_set_new_filelocator,
+	.relation_nontransactional_truncate = heapam_relation_nontransactional_truncate,
+	.relation_copy_data = heapam_relation_copy_data,
+	.relation_copy_for_cluster = heapam_relation_copy_for_cluster,
+	.relation_vacuum = heap_vacuum_rel,
+	.scan_analyze_next_block = heapam_scan_analyze_next_block,
+	.scan_analyze_next_tuple = heapam_scan_analyze_next_tuple,
+	.index_build_range_scan = heapam_index_build_range_scan,
+	.index_validate_scan = heapam_index_validate_scan,
+
+	.relation_size = table_block_relation_size,
+	.relation_needs_toast_table = heapam_relation_needs_toast_table,
+	.relation_toast_am = heapam_relation_toast_am,
+	.relation_fetch_toast_slice = heap_fetch_toast_slice,
+
+	.relation_estimate_size = heapam_estimate_rel_size,
+
+	.scan_bitmap_next_tuple = heapam_scan_bitmap_next_tuple,
+	.scan_sample_next_block = heapam_scan_sample_next_block,
+	.scan_sample_next_tuple = heapam_scan_sample_next_tuple
+};
+
+const TableAmRoutine *
+GetAppendoptimizedTableAmRoutine(void)
+{
+	return &appendoptimized_methods;
+}
+
+Datum
+appendoptimized_tableam_handler(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_POINTER(&appendoptimized_methods);
+}

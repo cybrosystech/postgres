@@ -1074,6 +1074,37 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	TupleDescFinalize(descriptor);
 
 	/*
+	 * If WITH (appendoptimized = true) was given and no USING clause was
+	 * specified, route the table to the "appendoptimized" access method.
+	 * This is the Phase 1 hook for Greenplum-compatible AO syntax.
+	 */
+	if (stmt->options != NIL &&
+		(RELKIND_HAS_TABLE_AM(relkind) || relkind == RELKIND_PARTITIONED_TABLE))
+	{
+		ListCell   *cell;
+
+		foreach(cell, stmt->options)
+		{
+			DefElem    *def = (DefElem *) lfirst(cell);
+
+			if (def->defnamespace == NULL &&
+				strcmp(def->defname, "appendoptimized") == 0 &&
+				defGetBoolean(def))
+			{
+				if (stmt->accessMethod != NULL &&
+					strcmp(stmt->accessMethod, "appendoptimized") != 0)
+					ereport(ERROR,
+							(errcode(ERRCODE_SYNTAX_ERROR),
+							 errmsg("cannot combine USING %s with WITH (appendoptimized = true)",
+									stmt->accessMethod)));
+				if (stmt->accessMethod == NULL)
+					stmt->accessMethod = pstrdup("appendoptimized");
+				break;
+			}
+		}
+	}
+
+	/*
 	 * For relations with table AM and partitioned tables, select access
 	 * method to use: an explicitly indicated one, or (in the case of a
 	 * partitioned table) the parent's, if it has one.

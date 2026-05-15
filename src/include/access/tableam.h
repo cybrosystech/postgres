@@ -2139,5 +2139,6 @@ extern const TableAmRoutine *GetTableAmRoutine(Oid amhandler);
  */
 
 extern const TableAmRoutine *GetHeapamTableAmRoutine(void);
+extern const TableAmRoutine *GetAppendoptimizedTableAmRoutine(void);
 
 #endif							/* TABLEAM_H */
