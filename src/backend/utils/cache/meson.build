@@ -3,6 +3,7 @@
 backend_sources += files(
   'attoptcache.c',
   'catcache.c',
+  'dbblue_predfingerprint.c',
   'evtcache.c',
   'funccache.c',
   'inval.c',
