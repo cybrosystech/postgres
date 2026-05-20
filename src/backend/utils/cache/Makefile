@@ -15,6 +15,7 @@ include $(top_builddir)/src/Makefile.global
 OBJS = \
 	attoptcache.o \
 	catcache.o \
+	dbblue_countcache.o \
 	dbblue_predfingerprint.o \
 	evtcache.o \
 	funccache.o \
