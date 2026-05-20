@@ -47,6 +47,7 @@
 #include "utils/lsyscache.h"
 #include "parser/scanner.h"
 #include "parser/scansup.h"
+#include "varatt.h"				/* DBblue: VARDATA_ANY / VARSIZE_ANY_EXHDR */
 
 #define JUMBLE_SIZE				1024	/* query serialization buffer size */
 
@@ -162,6 +163,34 @@ JumbleQuery(Query *query)
 }
 
 /*
+ * JumbleExpr
+ *		Fingerprint a non-Query node tree (typically a predicate subtree such
+ *		as Query->jointree->quals) and return the resulting 64-bit hash.
+ *		When include_consts is true, Const values participate in the hash;
+ *		otherwise the behavior matches the standard normalized form.
+ *
+ * Unlike JumbleQuery, this does not touch any queryId field and the caller
+ * is free to discard the JumbleState.
+ */
+int64
+JumbleExpr(Node *expr, bool include_consts)
+{
+	JumbleState *jstate;
+	int64		hash;
+
+	jstate = InitJumble();
+	jstate->include_consts = include_consts;
+
+	hash = DoJumble(jstate, expr);
+
+	pfree(jstate->jumble);
+	pfree(jstate->clocations);
+	pfree(jstate);
+
+	return hash;
+}
+
+/*
  * Enables query identifier computation.
  *
  * Third-party plugins can use this function to inform core that they require
@@ -195,6 +224,7 @@ InitJumble(void)
 	jstate->highest_extern_param_id = 0;
 	jstate->pending_nulls = 0;
 	jstate->has_squashed_lists = false;
+	jstate->include_consts = false;
 #ifdef USE_ASSERT_CHECKING
 	jstate->total_jumble_len = 0;
 #endif
@@ -370,6 +400,60 @@ AppendJumble64(JumbleState *jstate, const unsigned char *value)
 }
 
 /*
+ * AppendConstValueIfAny
+ *		DBblue helper: when jstate->include_consts is set, fold the bytes of a
+ *		Const's value into the jumble buffer so two otherwise-identical
+ *		predicate trees with different literal values produce different
+ *		hashes.  Used by the COUNT cache fingerprint path.
+ *
+ * Pass-by-value Datums are hashed by their raw 8 bytes (sufficient even for
+ * narrower types since unused upper bytes are zero-padded by the Datum
+ * conventions).  Pass-by-ref values of known length use the type's typlen;
+ * varlena values use VARDATA_ANY/VARSIZE_ANY_EXHDR so TOAST-detoasted and
+ * inline forms hash identically.  NULL constants append a single null tag.
+ */
+static void
+AppendConstValueIfAny(JumbleState *jstate, Const *c)
+{
+	if (!jstate->include_consts)
+		return;
+
+	if (c->constisnull)
+	{
+		AppendJumbleNull(jstate);
+		return;
+	}
+
+	/* type tag is already folded in by _jumbleConst via JUMBLE_FIELD(consttype) */
+	if (c->constbyval)
+	{
+		AppendJumble64(jstate, (const unsigned char *) &c->constvalue);
+	}
+	else if (c->constlen > 0)
+	{
+		AppendJumble(jstate,
+					 (const unsigned char *) DatumGetPointer(c->constvalue),
+					 (Size) c->constlen);
+	}
+	else if (c->constlen == -1)
+	{
+		/* varlena: hash the unwrapped payload */
+		struct varlena *v = (struct varlena *) DatumGetPointer(c->constvalue);
+		Size		sz = VARSIZE_ANY_EXHDR(v);
+
+		AppendJumble(jstate, (const unsigned char *) VARDATA_ANY(v), sz);
+	}
+	else if (c->constlen == -2)
+	{
+		/* cstring */
+		const char *s = DatumGetCString(c->constvalue);
+
+		AppendJumble(jstate, (const unsigned char *) s, strlen(s) + 1);
+	}
+	/* other negative typlens: nothing to hash beyond the type tag */
+}
+
+/*
  * FlushPendingNulls
  *		Incorporate the pending_nulls value into the jumble buffer.
  *
@@ -531,8 +615,21 @@ IsSquashableConstantList(List *elements)
 	_jumbleNode(jstate, (Node *) expr->item)
 #define JUMBLE_ELEMENTS(list, node) \
 	_jumbleElements(jstate, (List *) expr->list, node)
+/*
+ * JUMBLE_LOCATION records the source-text position of a constant (for
+ * pg_stat_statements normalization).  When jstate->include_consts is set,
+ * DBblue additionally folds the Const's value bytes into the jumble buffer
+ * so the resulting hash distinguishes literal values.  The nodeTag guard
+ * limits that side-effect to T_Const callers; the four utility-statement
+ * call sites (FetchStmt, TransactionStmt, DeallocateStmt, VariableSetStmt)
+ * fall through unchanged.
+ */
 #define JUMBLE_LOCATION(location) \
-	RecordConstLocation(jstate, false, expr->location, -1)
+do { \
+	RecordConstLocation(jstate, false, expr->location, -1); \
+	if (jstate->include_consts && nodeTag((Node *) (expr)) == T_Const) \
+		AppendConstValueIfAny(jstate, (Const *) (expr)); \
+} while (0)
 #define JUMBLE_FIELD(item) \
 do { \
 	if (sizeof(expr->item) == 8) \
