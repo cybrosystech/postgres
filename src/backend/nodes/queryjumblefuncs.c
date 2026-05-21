@@ -437,11 +437,12 @@ AppendConstValueIfAny(JumbleState *jstate, Const *c)
 	}
 	else if (c->constlen == -1)
 	{
-		/* varlena: hash the unwrapped payload */
+		/* varlena: hash the unwrapped payload (empty strings have sz==0; skip) */
 		struct varlena *v = (struct varlena *) DatumGetPointer(c->constvalue);
 		Size		sz = VARSIZE_ANY_EXHDR(v);
 
-		AppendJumble(jstate, (const unsigned char *) VARDATA_ANY(v), sz);
+		if (sz > 0)
+			AppendJumble(jstate, (const unsigned char *) VARDATA_ANY(v), sz);
 	}
 	else if (c->constlen == -2)
 	{
