@@ -71,6 +71,7 @@ double		cursor_tuple_fraction = DEFAULT_CURSOR_TUPLE_FRACTION;
 int			debug_parallel_query = DEBUG_PARALLEL_OFF;
 bool		parallel_leader_participation = true;
 bool		enable_distinct_reordering = true;
+bool		dbblue_offset_flip = true;	/* enable offset-flip planner rewrite */
 
 /* Hook for plugins to get control in planner() */
 planner_hook_type planner_hook = NULL;
@@ -600,8 +601,9 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 				dbblue_fp = fp;
 				dbblue_reloid = rte->relid;
 
-				/* Try the offset-flip only when sort + const OFFSET/LIMIT present */
-				if (parse->sortClause != NIL &&
+				/* Try the offset-flip only when GUC enabled + sort + const OFFSET/LIMIT */
+				if (dbblue_offset_flip &&
+					parse->sortClause != NIL &&
 					parse->limitOffset != NULL &&
 					parse->limitCount != NULL)
 				{

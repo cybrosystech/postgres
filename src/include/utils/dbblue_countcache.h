@@ -51,6 +51,9 @@ typedef struct CountCacheEntry
 	int			hits;
 } CountCacheEntry;
 
+/* GUC: enable/disable COUNT caching (and the offset-flip that feeds on it). */
+extern PGDLLIMPORT bool dbblue_count_cache;
+
 /*
  * Lookup the entry for (reloid, fingerprint).  Returns NULL on miss, on
  * snapshot-staleness, or when the cache is disabled / uninitialized.

@@ -45,6 +45,8 @@
 
 #define DBBLUE_COUNTCACHE_DEFAULT_SIZE	16
 
+bool		dbblue_count_cache = true;	/* enable COUNT result caching */
+
 static HTAB *countcache = NULL;
 static int	countcache_count = 0;
 static int	countcache_max_entries = DBBLUE_COUNTCACHE_DEFAULT_SIZE;
@@ -126,6 +128,8 @@ dbblue_countcache_lookup(Oid reloid, int64 fingerprint)
 	bool		found;
 	TransactionId xmin_now;
 
+	if (!dbblue_count_cache)
+		return NULL;
 	if (countcache == NULL)
 		return NULL;
 	if (!OidIsValid(reloid) || fingerprint == INT64CONST(0))
@@ -165,6 +169,8 @@ dbblue_countcache_insert(Oid reloid, int64 fingerprint, int64 count)
 	bool		found;
 	TransactionId xmin_now;
 
+	if (!dbblue_count_cache)
+		return;
 	if (!OidIsValid(reloid) || fingerprint == INT64CONST(0))
 		return;
 

@@ -62,6 +62,7 @@
 #include "optimizer/paths.h"
 #include "optimizer/planmain.h"
 #include "parser/parse_expr.h"
+#include "utils/dbblue_countcache.h"
 #include "parser/parser.h"
 #include "pgstat.h"
 #include "postmaster/autovacuum.h"

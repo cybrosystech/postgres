@@ -623,6 +623,20 @@
   assign_hook => 'assign_datestyle',
 },
 
+{ name => 'dbblue_count_cache', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
+  short_desc => 'Enables the DBblue session-local COUNT(*) result cache.',
+  flags => 'GUC_EXPLAIN',
+  variable => 'dbblue_count_cache',
+  boot_val => 'true',
+},
+
+{ name => 'dbblue_offset_flip', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
+  short_desc => 'Enables the DBblue OFFSET-flip planner rewrite (requires dbblue_count_cache).',
+  flags => 'GUC_EXPLAIN',
+  variable => 'dbblue_offset_flip',
+  boot_val => 'true',
+},
+
 # This is PGC_SUSET to prevent hiding from log_lock_waits.
 { name => 'deadlock_timeout', type => 'int', context => 'PGC_SUSET', group => 'LOCK_MANAGEMENT',
   short_desc => 'Sets the time to wait on a lock before checking for deadlock.',
