@@ -22,6 +22,7 @@ SUBDIRS	    = \
 	sequence \
 	table \
 	tablesample \
-	transam
+	transam \
+	zheap_stub
 
 include $(top_srcdir)/src/backend/common.mk
