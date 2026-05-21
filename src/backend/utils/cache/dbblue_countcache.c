@@ -120,13 +120,22 @@ current_snapshot_xmin(void)
 	return snap->xmin;
 }
 
+/*
+ * TTL for cache entries.  Odoo's search_count and web_search_read are
+ * separate HTTP requests and therefore separate transactions, so requiring
+ * the exact same snapshot_xmin would guarantee a miss on every single
+ * Odoo page navigation.  30 seconds comfortably covers any request cycle
+ * while preventing reuse of genuinely stale counts from earlier sessions.
+ * DDL-driven staleness is already handled by the relcache callback.
+ */
+#define DBBLUE_COUNTCACHE_TTL_USEC	(30 * USECS_PER_SEC)
+
 const CountCacheEntry *
 dbblue_countcache_lookup(Oid reloid, int64 fingerprint)
 {
 	CountCacheKey key;
 	CountCacheEntry *entry;
 	bool		found;
-	TransactionId xmin_now;
 
 	if (!dbblue_count_cache)
 		return NULL;
@@ -144,14 +153,15 @@ dbblue_countcache_lookup(Oid reloid, int64 fingerprint)
 	if (!found)
 		return NULL;
 
-	xmin_now = current_snapshot_xmin();
-	if (!TransactionIdIsValid(xmin_now) ||
-		!TransactionIdEquals(entry->snapshot_xmin, xmin_now))
+	/*
+	 * TTL check: reject entries older than DBBLUE_COUNTCACHE_TTL_USEC.
+	 * We use wall-clock age rather than snapshot_xmin equality so that
+	 * the cached count from Odoo's search_count request is still usable
+	 * in the immediately following web_search_read request (a separate
+	 * transaction on the same backend, typically < 5 seconds later).
+	 */
+	if (GetCurrentTimestamp() - entry->captured_at > DBBLUE_COUNTCACHE_TTL_USEC)
 	{
-		/*
-		 * Stale by snapshot horizon.  Drop the entry so we don't have
-		 * to re-check it on every subsequent lookup.
-		 */
 		(void) hash_search(countcache, &key, HASH_REMOVE, NULL);
 		countcache_count--;
 		return NULL;
