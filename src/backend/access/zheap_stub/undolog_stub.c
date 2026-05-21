@@ -1,18 +1,20 @@
 /*-------------------------------------------------------------------------
  *
  * undolog_stub.c
- *	  Stub implementation of the undo-log rmgr redo callback.
+ *	  Stub implementations for undo-log helpers that have not yet been
+ *	  ported from PG12 to PG19.
  *
- * The real implementation lives in src/backend/access/undo/undolog.c
- * (staged from the PG12 zheap tree) but is not yet ported to PG19.
- * Until that port lands, undolog_redo must exist as a symbol so that
- * src/include/access/rmgrlist.h links successfully.  This stub PANICs
- * if it ever fires — that would mean someone wired in an undo writer
- * before porting recovery, which is a development error.
+ * Until src/backend/storage/smgr/undofile.c is ported, the undo log
+ * code in src/backend/access/undo/undolog.c calls a small number of
+ * undofile helpers that do not yet exist as compiled symbols.  We
+ * provide weak stubs here so the binary links.  Because the stub zheap
+ * AM never actually writes undo segments, these stubs are never reached
+ * in practice; if they do fire it indicates someone wired in undo I/O
+ * before porting undofile.c, and PANIC is the correct response.
  *
- * The companion undolog_desc / undolog_identify functions live in
- * src/backend/access/rmgrdesc/undologdesc.c because that directory is
- * linked into pg_waldump and other frontend tools that inspect WAL.
+ * Note: the rmgr redo / desc / identify callbacks for RM_UNDOLOG_ID are
+ * now defined by the real undolog.c (port phase 1.2) and by
+ * rmgrdesc/undologdesc.c, so they are no longer stubbed here.
  *
  * Portions Copyright (c) 2026, dbblue / Cybrosys Technologies.
  *
@@ -23,12 +25,12 @@
  */
 #include "postgres.h"
 
-#include "access/undolog_rmgr.h"
-#include "access/xlogreader.h"
+#include "storage/block.h"
+#include "storage/undofile.h"
 
 void
-undolog_redo(XLogReaderState *record)
+undofile_forget_sync(UndoLogNumber logno, BlockNumber segno, Oid tablespace)
 {
-	elog(PANIC, "undolog_redo: undo log subsystem is not yet ported to PG19; "
-		 "a WAL record for RM_UNDOLOG_ID should not exist in this build");
+	elog(PANIC, "undofile_forget_sync: undofile.c not yet ported to PG19; "
+		 "this should be unreachable until the undo SMGR is wired in");
 }

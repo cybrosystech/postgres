@@ -24,7 +24,7 @@ extern void undofile_close(SMgrRelation reln, ForkNumber forknum);
 extern void undofile_create(SMgrRelation reln, ForkNumber forknum,
 							bool isRedo);
 extern bool undofile_exists(SMgrRelation reln, ForkNumber forknum);
-extern void undofile_unlink(RelFileNodeBackend rnode, ForkNumber forknum,
+extern void undofile_unlink(RelFileLocatorBackend rlocator, ForkNumber forknum,
 							bool isRedo);
 extern void undofile_extend(SMgrRelation reln, ForkNumber forknum,
 							BlockNumber blocknum, char *buffer,

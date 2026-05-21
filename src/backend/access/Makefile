@@ -23,6 +23,7 @@ SUBDIRS	    = \
 	table \
 	tablesample \
 	transam \
+	undo \
 	zheap_stub
 
 include $(top_srcdir)/src/backend/common.mk

@@ -80,7 +80,7 @@ typedef enum
 typedef uint64 UndoLogOffset;
 
 /* printf-family format string for UndoRecPtr. */
-#define UndoRecPtrFormat "%016" INT64_MODIFIER "X"
+#define UndoRecPtrFormat "%016" PRIX64
 
 /* printf-family format string for UndoLogOffset. */
 #define UndoLogOffsetFormat UINT64_FORMAT
@@ -180,13 +180,13 @@ typedef int UndoLogNumber;
 /* Find out which tablespace the given undo log location is backed by. */
 extern Oid	UndoRecPtrGetTablespace(UndoRecPtr insertion_point);
 
-/* Populate a RelFileNode from an UndoRecPtr. */
-#define UndoRecPtrAssignRelFileNode(rfn, urp)			\
+/* Populate a RelFileLocator from an UndoRecPtr. */
+#define UndoRecPtrAssignRelFileLocator(rfl, urp)		\
 	do													\
 	{													\
-		(rfn).spcNode = UndoRecPtrGetTablespace(urp);	\
-		(rfn).dbNode = UndoLogDatabaseOid;				\
-		(rfn).relNode = UndoRecPtrGetRelNode(urp);		\
+		(rfl).spcOid = UndoRecPtrGetTablespace(urp);	\
+		(rfl).dbOid = UndoLogDatabaseOid;				\
+		(rfl).relNumber = UndoRecPtrGetRelNode(urp);	\
 	} while (false);
 
 /*

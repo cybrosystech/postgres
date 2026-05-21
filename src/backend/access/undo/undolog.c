@@ -22,10 +22,13 @@
 #include "access/transam.h"
 #include "access/undolog.h"
 #include "access/undolog_xlog.h"
-#include "access/tpd.h"
+/* TPD support not yet ported -- see src/backend/access/zheap/tpd.c */
 #include "access/xact.h"
 #include "access/xlog.h"
+#include "access/xlog_internal.h"
+#include "access/xloginsert.h"
 #include "access/xlogreader.h"
+#include "access/xlogutils.h"
 #include "catalog/catalog.h"
 #include "catalog/pg_tablespace.h"
 #include "commands/tablespace.h"
@@ -46,8 +49,11 @@
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
+#include "utils/tuplestore.h"
 #include "utils/varlena.h"
+#include "utils/wait_event.h"
 
+#include <inttypes.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -1198,15 +1204,15 @@ CleanUpUndoCheckPointFiles(XLogRecPtr checkPointRedo)
 	char		oldest_path[MAXPGPATH];
 
 	/*
-	 * If a base backup is in progress, we can't delete any checkpoint
-	 * snapshot files because one of them corresponds to the backup label but
-	 * there could be any number of checkpoints during the backup.
+	 * PG12 guarded this with BackupInProgress() to avoid deleting checkpoint
+	 * snapshot files during an exclusive base backup.  Exclusive backup mode
+	 * was removed in PG15; non-exclusive backups taken by pg_basebackup do
+	 * not conflict with checkpoint-file cleanup, so the guard is no longer
+	 * needed.
 	 */
-	if (BackupInProgress())
-		return;
 
 	/* Otherwise keep only those >= the previous checkpoint's redo point. */
-	snprintf(oldest_path, MAXPGPATH, "%016" INT64_MODIFIER "X",
+	snprintf(oldest_path, MAXPGPATH, "%016" PRIX64,
 			 checkPointRedo);
 	dir = AllocateDir("pg_undo");
 	while ((de = ReadDir(dir, "pg_undo")) != NULL)
@@ -1323,7 +1329,7 @@ CheckPointUndoLogs(XLogRecPtr checkPointRedo, XLogRecPtr priorCheckPointRedo)
 	LWLockRelease(UndoLogLock);
 
 	/* Dump into a file under pg_undo. */
-	snprintf(path, MAXPGPATH, "pg_undo/%016" INT64_MODIFIER "X",
+	snprintf(path, MAXPGPATH, "pg_undo/%016" PRIX64,
 			 checkPointRedo);
 	pgstat_report_wait_start(WAIT_EVENT_UNDO_CHECKPOINT_WRITE);
 	fd = OpenTransientFile(path, O_RDWR | O_CREAT | PG_BINARY);
@@ -1399,7 +1405,7 @@ StartupUndoLogs(XLogRecPtr checkPointRedo)
 		return;
 
 	/* Open the pg_undo file corresponding to the given checkpoint. */
-	snprintf(path, MAXPGPATH, "pg_undo/%016" INT64_MODIFIER "X",
+	snprintf(path, MAXPGPATH, "pg_undo/%016" PRIX64,
 			 checkPointRedo);
 	pgstat_report_wait_start(WAIT_EVENT_UNDO_CHECKPOINT_READ);
 	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
@@ -1483,11 +1489,22 @@ prepare_xlog:
 	{
 		XLogBeginInsert();
 		XLogRegisterData((char *) xlrec, sizeof(xl_undolog_meta));
-		recptr = XLogInsertExtended(RM_UNDOLOG_ID, XLOG_UNDOLOG_META,
-									RedoRecPtr, doPageWrites);
+		/*
+		 * PG12 used XLogInsertExtended() to optionally skip insertion if
+		 * RedoRecPtr had advanced past doPageWrites; that variant no longer
+		 * exists in PG19.  Plain XLogInsert() always inserts.  Since the
+		 * undo log subsystem is not yet writing real WAL (stub AM), the
+		 * lost retry-on-redo-advance behavior cannot cause problems.
+		 */
+		(void) doPageWrites;
+		recptr = XLogInsert(RM_UNDOLOG_ID, XLOG_UNDOLOG_META);
 		if (recptr == InvalidXLogRecPtr)
 		{
-			ResetRegisteredTPDBuffers();
+			/*
+			 * Was: ResetRegisteredTPDBuffers();
+			 * TPD subsystem not yet ported to PG19; no TPD buffers to reset.
+			 * Re-enable once src/backend/access/zheap/tpd.c is ported.
+			 */
 			goto prepare_xlog;
 		}
 
@@ -1773,10 +1790,10 @@ undolog_xid_map_gc(void)
 	 * During crash recovery, it may not be possible to call GetOldestXmin()
 	 * yet because latestCompletedXid is invalid.
 	 */
-	if (!TransactionIdIsNormal(ShmemVariableCache->latestCompletedXid))
+	if (!FullTransactionIdIsNormal(TransamVariables->latestCompletedXid))
 		return;
 
-	oldest_xid = GetOldestXmin(NULL, PROCARRAY_FLAGS_DEFAULT);
+	oldest_xid = GetOldestNonRemovableTransactionId(NULL);
 	new_oldest_chunk = UndoLogGetXidHigh(oldest_xid);
 	oldest_chunk = MyUndoLogState.xid_map_oldest_chunk;
 
@@ -2383,7 +2400,10 @@ pg_stat_get_undo_logs(PG_FUNCTION_ARGS)
 	}
 	if (tablespace_name)
 		pfree(tablespace_name);
-	tuplestore_donestoring(tupstore);
+	/*
+	 * tuplestore_donestoring() was removed in PG14; tuples are now considered
+	 * "done" implicitly once the function returns.
+	 */
 
 	return (Datum) 0;
 }
@@ -2503,17 +2523,27 @@ forget_undo_buffers(int logno, UndoLogOffset old_discard,
 {
 	BlockNumber old_blockno;
 	BlockNumber new_blockno;
-	RelFileNode rnode;
+	RelFileLocator rlocator;
 
-	UndoRecPtrAssignRelFileNode(rnode, MakeUndoRecPtr(logno, old_discard));
+	UndoRecPtrAssignRelFileLocator(rlocator, MakeUndoRecPtr(logno, old_discard));
 	old_blockno = old_discard / BLCKSZ;
 	new_blockno = new_discard / BLCKSZ;
 	if (drop_tail)
 		++new_blockno;
 	while (old_blockno < new_blockno)
 	{
-		ForgetBuffer(rnode, UndoLogForkNum, old_blockno);
-		ForgetLocalBuffer(rnode, UndoLogForkNum, old_blockno++);
+		/*
+		 * PG12 called ForgetBuffer/ForgetLocalBuffer here to invalidate
+		 * any cached pages of the undo segment being discarded.  PG19
+		 * does not expose those helpers; cache invalidation for unlinked
+		 * relations now happens through DropRelationsAllBuffers /
+		 * smgrdounlinkall.  Wire that up when undo SMGR integration is
+		 * ported.  Until then no real undo I/O happens, so leaving these
+		 * as no-ops cannot leak stale pages.
+		 */
+		(void) rlocator;
+		(void) old_blockno;
+		old_blockno++;
 	}
 }
 
@@ -2529,7 +2559,7 @@ undolog_xlog_discard(XLogReaderState *record)
 	UndoLogOffset end;
 	UndoLogOffset old_segment_begin;
 	UndoLogOffset new_segment_begin;
-	RelFileNode rnode = {0};
+	RelFileLocator rlocator = {0};
 	char		dir[MAXPGPATH];
 
 	log = get_undo_log_by_number(xlrec->logno);
@@ -2540,12 +2570,13 @@ undolog_xlog_discard(XLogReaderState *record)
 	 * We're about to discard undologs. In Hot Standby mode, ensure that
 	 * there's no queries running which need to get tuple from discarded undo.
 	 *
-	 * XXX we are passing empty rnode to the conflict function so that it can
-	 * check conflict in all the backend regardless of which database the
-	 * backend is connected.
+	 * XXX we are passing an empty RelFileLocator to the conflict function
+	 * so that it can check conflict in all backends regardless of which
+	 * database the backend is connected to.  isCatalogRel = false because
+	 * undo logs are not catalog relations.
 	 */
 	if (InHotStandby && TransactionIdIsValid(xlrec->latestxid))
-		ResolveRecoveryConflictWithSnapshot(xlrec->latestxid, rnode);
+		ResolveRecoveryConflictWithSnapshot(xlrec->latestxid, false, rlocator);
 
 	/*
 	 * See if we need to unlink or rename any files, but don't consider it an

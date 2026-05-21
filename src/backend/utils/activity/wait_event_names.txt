@@ -266,6 +266,9 @@ TIMELINE_HISTORY_WRITE	"Waiting for a write of a newly created timeline history 
 TWOPHASE_FILE_READ	"Waiting for a read of a two phase state file."
 TWOPHASE_FILE_SYNC	"Waiting for a two phase state file to reach durable storage."
 TWOPHASE_FILE_WRITE	"Waiting for a write of a two phase state file."
+UNDO_CHECKPOINT_READ	"Waiting for a read of an undo log metadata checkpoint file."
+UNDO_CHECKPOINT_SYNC	"Waiting for an undo log metadata checkpoint file to reach durable storage."
+UNDO_CHECKPOINT_WRITE	"Waiting for a write of an undo log metadata checkpoint file."
 VERSION_FILE_SYNC	"Waiting for the version file to reach durable storage while creating a database."
 VERSION_FILE_WRITE	"Waiting for the version file to be written while creating a database."
 WALSENDER_TIMELINE_HISTORY_READ	"Waiting for a read from a timeline history file during a walsender timeline command."
@@ -370,6 +373,7 @@ WaitLSN	"Waiting to read or update shared Wait-for-LSN state."
 LogicalDecodingControl	"Waiting to read or update logical decoding status information."
 DataChecksumsWorker	"Waiting for data checksums worker."
 AioWorkerControl	"Waiting to update AIO worker information."
+UndoLog	"Waiting to read or update undo log shared metadata."
 
 #
 # END OF PREDEFINED LWLOCKS (DO NOT CHANGE THIS LINE)
@@ -417,7 +421,7 @@ XactSLRU	"Waiting to access the transaction status SLRU cache."
 ParallelVacuumDSA	"Waiting for parallel vacuum dynamic shared memory allocation."
 AioUringCompletion	"Waiting for another process to complete IO via io_uring."
 ShmemIndex	"Waiting to find or allocate space in shared memory."
-UndoLog	"Waiting to read or update undo log shared metadata."
+UndoLogBank	"Waiting to read or update per-bank undo log shared metadata."
 UndoDiscard	"Waiting to advance the discard pointer of an undo log."
 DiscardUpdate	"Waiting to update the discard pointer of an undo log."
 
