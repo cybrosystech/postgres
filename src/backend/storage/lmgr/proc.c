@@ -242,6 +242,7 @@ ProcGlobalShmemInit(void *arg)
 	ProcGlobal->startupBufferPinWaitBufId = -1;
 	ProcGlobal->walwriterProc = INVALID_PROC_NUMBER;
 	ProcGlobal->checkpointerProc = INVALID_PROC_NUMBER;
+	ProcGlobal->oldestXidWithEpochHavingUndo = FirstNormalFullTransactionId;
 	pg_atomic_init_u32(&ProcGlobal->procArrayGroupFirst, INVALID_PROC_NUMBER);
 	pg_atomic_init_u32(&ProcGlobal->clogGroupFirst, INVALID_PROC_NUMBER);
 

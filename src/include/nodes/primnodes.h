@@ -60,6 +60,7 @@ typedef enum OnCommitAction
 	ONCOMMIT_PRESERVE_ROWS,		/* ON COMMIT PRESERVE ROWS (do nothing) */
 	ONCOMMIT_DELETE_ROWS,		/* ON COMMIT DELETE ROWS */
 	ONCOMMIT_DROP,				/* ON COMMIT DROP */
+	ONCOMMIT_TEMP_DISCARD,		/* discard temp-relation undo at commit (zheap) */
 } OnCommitAction;
 
 /*

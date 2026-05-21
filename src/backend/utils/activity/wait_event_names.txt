@@ -417,6 +417,9 @@ XactSLRU	"Waiting to access the transaction status SLRU cache."
 ParallelVacuumDSA	"Waiting for parallel vacuum dynamic shared memory allocation."
 AioUringCompletion	"Waiting for another process to complete IO via io_uring."
 ShmemIndex	"Waiting to find or allocate space in shared memory."
+UndoLog	"Waiting to read or update undo log shared metadata."
+UndoDiscard	"Waiting to advance the discard pointer of an undo log."
+DiscardUpdate	"Waiting to update the discard pointer of an undo log."
 
 # No "ABI_compatibility" region here as WaitEventLWLock has its own C code.
 

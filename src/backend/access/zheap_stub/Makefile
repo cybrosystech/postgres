@@ -13,6 +13,7 @@ top_builddir = ../../../..
 include $(top_builddir)/src/Makefile.global
 
 OBJS = \
+	undolog_stub.o \
 	zheap_handler.o
 
 include $(top_srcdir)/src/backend/common.mk

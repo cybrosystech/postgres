@@ -498,6 +498,19 @@ typedef struct PROC_HDR
 	int			spins_per_delay;
 	/* Buffer id of the buffer that Startup process waits for pin on, or -1 */
 	int			startupBufferPinWaitBufId;
+
+	/*
+	 * Oldest FullTransactionId (xid + epoch) for which the undo log subsystem
+	 * still holds undo records.  Used by zheap to decide when a transaction
+	 * slot's xid becomes "all-visible without consulting undo".  Maintained
+	 * by the undo discard worker.  Initialized to FirstNormalFullTransactionId
+	 * at startup and only advances forward.
+	 *
+	 * Stays at its initial value until the undo log subsystem (staged in
+	 * src/backend/access/undo/) is ported and starts emitting WAL.  Until
+	 * then, no zheap data is being written, so the stale value is harmless.
+	 */
+	FullTransactionId oldestXidWithEpochHavingUndo;
 } PROC_HDR;
 
 extern PGDLLIMPORT PROC_HDR *ProcGlobal;
