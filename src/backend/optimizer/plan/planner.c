@@ -646,6 +646,13 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 														   Int64GetDatum(new_off),
 														   false, true);
 									dbblue_did_flip = true;
+								ereport(DEBUG1,
+										(errmsg("dbblue offset-flip: rel=%s N=%lld K=%lld L=%lld new_off=%lld",
+												get_rel_name(dbblue_reloid),
+												(long long) N,
+												(long long) K,
+												(long long) L,
+												(long long) new_off)));
 								}
 							}
 						}

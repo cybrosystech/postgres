@@ -40,6 +40,7 @@
 #include "utils/dbblue_countcache.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
@@ -494,6 +495,12 @@ dbblue_count_serve_if_cached(QueryDesc *queryDesc)
 								  pstmt->dbblue_pred_fingerprint);
 	if (ce == NULL)
 		return false;
+
+	ereport(DEBUG1,
+			(errmsg("dbblue count-serve: rel=%s count=%lld hits=%d",
+					get_rel_name(pstmt->dbblue_pred_reloid),
+					(long long) ce->count,
+					ce->hits)));
 
 	/*
 	 * Inject a virtual tuple containing the cached count.  queryDesc->dest
