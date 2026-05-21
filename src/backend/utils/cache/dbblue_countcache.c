@@ -32,6 +32,7 @@
 #include "access/xact.h"
 #include "catalog/pg_type_d.h"
 #include "executor/execdesc.h"
+#include "executor/executor.h"
 #include "miscadmin.h"
 #include "nodes/execnodes.h"
 #include "nodes/plannodes.h"
@@ -439,4 +440,77 @@ countcache_relcache_callback(Datum arg, Oid relid)
 			countcache_count--;
 		}
 	}
+}
+
+/* ------------------------------------------------------------------ */
+/*	COUNT result serving: skip the table scan when cache is fresh     */
+/* ------------------------------------------------------------------ */
+
+/*
+ * dbblue_count_serve_if_cached
+ *
+ * Called from standard_ExecutorRun after rStartup but before ExecutePlan.
+ * When the current query is an Agg-rooted COUNT and the cache has a fresh
+ * hit, inject the cached count into queryDesc->dest (which at this point is
+ * the CountCaptureDest wrapper) and return true so the caller skips the
+ * real table scan.
+ *
+ * The injected tuple goes through the capture wrapper's receiveSlot, which
+ * re-inserts the count into the cache (refreshing its TTL) and then
+ * forwards it to the real DestReceiver so the client sees a normal result.
+ *
+ * Returns false if no cached value is available or the query shape doesn't
+ * qualify.
+ */
+bool
+dbblue_count_serve_if_cached(QueryDesc *queryDesc)
+{
+	PlannedStmt *pstmt;
+	const CountCacheEntry *ce;
+	TupleTableSlot *slot;
+	Datum		values[1];
+	bool		isnull[1];
+
+	if (queryDesc == NULL)
+		return false;
+
+	pstmt = queryDesc->plannedstmt;
+	if (pstmt == NULL || pstmt->dbblue_pred_fingerprint == INT64CONST(0))
+		return false;
+	if (!OidIsValid(pstmt->dbblue_pred_reloid))
+		return false;
+
+	/* Must be an Agg-rooted plan (COUNT shape) */
+	if (pstmt->planTree == NULL || !IsA(pstmt->planTree, Agg))
+		return false;
+
+	/* TupleDesc must be single INT8 column — same guard as ccd_rStartup */
+	if (queryDesc->tupDesc == NULL ||
+		queryDesc->tupDesc->natts != 1 ||
+		TupleDescAttr(queryDesc->tupDesc, 0)->atttypid != INT8OID)
+		return false;
+
+	ce = dbblue_countcache_lookup(pstmt->dbblue_pred_reloid,
+								  pstmt->dbblue_pred_fingerprint);
+	if (ce == NULL)
+		return false;
+
+	/*
+	 * Inject a virtual tuple containing the cached count.  queryDesc->dest
+	 * is the CountCaptureDest wrapper at this point; its receiveSlot will
+	 * capture the value (refreshing the TTL) and forward to the real dest.
+	 */
+	slot = MakeSingleTupleTableSlot(queryDesc->tupDesc, &TTSOpsVirtual);
+	values[0] = Int64GetDatum(ce->count);
+	isnull[0] = false;
+	ExecClearTuple(slot);
+	slot->tts_values = values;
+	slot->tts_isnull = isnull;
+	ExecStoreVirtualTuple(slot);
+
+	queryDesc->dest->receiveSlot(slot, queryDesc->dest);
+
+	ExecDropSingleTupleTableSlot(slot);
+
+	return true;
 }

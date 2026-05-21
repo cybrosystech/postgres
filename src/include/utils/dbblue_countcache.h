@@ -92,4 +92,13 @@ struct QueryDesc;				/* forward decl to keep this header light */
 extern bool dbblue_count_capture_install(struct QueryDesc *queryDesc);
 extern void dbblue_count_capture_finalize(struct QueryDesc *queryDesc);
 
+/*
+ * Serve-side counterpart to capture: if the current query is a bare
+ * COUNT(*) and the cache has a fresh hit, inject the cached count into
+ * queryDesc->dest and return true (caller should skip ExecutePlan).
+ * Must be called after rStartup, before ExecutePlan, and only when the
+ * capture wrapper is already installed (i.e. dbblue_capture_installed).
+ */
+extern bool dbblue_count_serve_if_cached(struct QueryDesc *queryDesc);
+
 #endif							/* DBBLUE_COUNTCACHE_H */

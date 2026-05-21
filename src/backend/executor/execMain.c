@@ -372,6 +372,15 @@ standard_ExecutorRun(QueryDesc *queryDesc,
 		dest->rStartup(dest, operation, queryDesc->tupDesc);
 
 	/*
+	 * DBblue: if this is a cached COUNT and the wrapper is installed,
+	 * inject the cached value and skip the full table scan.
+	 */
+	if (dbblue_capture_installed &&
+		!ScanDirectionIsNoMovement(direction) &&
+		dbblue_count_serve_if_cached(queryDesc))
+		goto dbblue_skip_execute;
+
+	/*
 	 * Run plan, unless direction is NoMovement.
 	 *
 	 * Note: pquery.c selects NoMovement if a prior call already reached
@@ -391,6 +400,7 @@ standard_ExecutorRun(QueryDesc *queryDesc,
 					direction,
 					dest);
 
+dbblue_skip_execute:
 	/*
 	 * Update es_total_processed to keep track of the number of tuples
 	 * processed across multiple ExecutorRun() calls.
