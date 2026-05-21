@@ -60,6 +60,7 @@
 #include "rewrite/rewriteManip.h"
 #include "utils/acl.h"
 #include "utils/backend_status.h"
+#include "utils/dbblue_countcache.h"
 #include "utils/dbblue_predfingerprint.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -330,6 +331,53 @@ planner(Query *parse, const char *query_string, int cursorOptions,
 	return result;
 }
 
+/*
+ * dbblue_extract_offset_int64 -- read INT4 or INT8 Const as int64.
+ * Returns -1 (caller treats as "unusable") on NULL or unknown type.
+ */
+static int64
+dbblue_extract_offset_int64(Node *node)
+{
+	Const	   *c;
+
+	if (node == NULL || !IsA(node, Const))
+		return -1;
+	c = (Const *) node;
+	if (c->constisnull)
+		return -1;
+	if (c->consttype == INT8OID)
+		return DatumGetInt64(c->constvalue);
+	if (c->consttype == INT4OID)
+		return (int64) DatumGetInt32(c->constvalue);
+	return -1;
+}
+
+/*
+ * dbblue_flip_sortclauses -- return a copy of sortcls with every
+ * sort operator replaced by its commutator and nulls_first toggled.
+ * This converts ORDER BY col ASC NULLS LAST to DESC NULLS FIRST, etc.
+ */
+static List *
+dbblue_flip_sortclauses(List *sortcls)
+{
+	List	   *result = NIL;
+	ListCell   *lc;
+
+	foreach(lc, sortcls)
+	{
+		SortGroupClause *sgc = copyObject(lfirst(lc));
+		Oid			rev = get_commutator(sgc->sortop);
+
+		if (!OidIsValid(rev))
+			return NIL;			/* can't flip; signal caller to abort */
+		sgc->sortop = rev;
+		sgc->reverse_sort = !sgc->reverse_sort;
+		sgc->nulls_first = !sgc->nulls_first;
+		result = lappend(result, sgc);
+	}
+	return result;
+}
+
 PlannedStmt *
 standard_planner(Query *parse, const char *query_string, int cursorOptions,
 				 ParamListInfo boundParams, ExplainState *es)
@@ -344,6 +392,11 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 	ListCell   *lp,
 			   *lr,
 			   *lc;
+	/* DBblue Phase 4: offset-flip state */
+	int64		dbblue_fp = INT64CONST(0);
+	Oid			dbblue_reloid = InvalidOid;
+	List	   *dbblue_orig_sortclause = NIL;
+	bool		dbblue_did_flip = false;
 
 	/*
 	 * Set up global state for this planner invocation.  This data is needed
@@ -516,6 +569,90 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 		(*planner_setup_hook) (glob, parse, query_string, cursorOptions,
 							   &tuple_fraction, es);
 
+	/*
+	 * DBblue Phase 4: offset-flip pre-planning rewrite.
+	 *
+	 * When Odoo's paginated SELECT has a large OFFSET K on a table whose
+	 * total row count N is already cached from the leading COUNT query in
+	 * the same request, and K > N/2, rewriting to OFFSET (N-K-L) with
+	 * flipped sort directions lets the planner use the "cheap end" of the
+	 * index.  We wrap the resulting plan with an outer Sort to restore the
+	 * original order for the small result set (≤ L rows).
+	 *
+	 * This block also computes dbblue_fp / dbblue_reloid for all
+	 * single-table SELECTs with non-trivial quals so that the PlannedStmt
+	 * is stamped for the COUNT-capture path even when no flip fires.
+	 */
+	if (parse->commandType == CMD_SELECT &&
+		list_length(parse->rtable) == 1 &&
+		parse->jointree != NULL &&
+		parse->jointree->quals != NULL)
+	{
+		RangeTblEntry *rte = linitial_node(RangeTblEntry, parse->rtable);
+
+		if (rte->rtekind == RTE_RELATION && OidIsValid(rte->relid))
+		{
+			int64		fp = dbblue_predicate_fingerprint(rte->relid,
+														  parse->jointree->quals);
+
+			if (fp != INT64CONST(0))
+			{
+				dbblue_fp = fp;
+				dbblue_reloid = rte->relid;
+
+				/* Try the offset-flip only when sort + const OFFSET/LIMIT present */
+				if (parse->sortClause != NIL &&
+					parse->limitOffset != NULL &&
+					parse->limitCount != NULL)
+				{
+					/*
+					 * OFFSET/LIMIT are typically an int4 literal wrapped in
+					 * an int4→int8 cast at this point (eval_const_expressions
+					 * runs later inside subquery_planner).  Fold now so that
+					 * dbblue_extract_offset_int64 sees a plain Const.
+					 */
+					Node	   *folded_off =
+						eval_const_expressions(NULL, parse->limitOffset);
+					Node	   *folded_lim =
+						eval_const_expressions(NULL, parse->limitCount);
+					int64		K = dbblue_extract_offset_int64(folded_off);
+					int64		L = dbblue_extract_offset_int64(folded_lim);
+
+					if (K > 0 && L > 0)
+					{
+						const CountCacheEntry *ce =
+							dbblue_countcache_lookup(dbblue_reloid, dbblue_fp);
+
+						if (ce != NULL)
+						{
+							int64		N = ce->count;
+							int64		new_off = N - K - L;
+
+							if (K > N / 2 && new_off >= 0)
+							{
+								List	   *flipped =
+									dbblue_flip_sortclauses(parse->sortClause);
+
+								if (flipped != NIL)
+								{
+									dbblue_orig_sortclause = parse->sortClause;
+									parse->sortClause = flipped;
+									parse->limitOffset =
+										(Node *) makeConst(INT8OID, -1,
+														   InvalidOid,
+														   sizeof(int64),
+														   Int64GetDatum(new_off),
+														   false, true);
+									dbblue_did_flip = true;
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
 	/* primary planning entry point (may recurse for subqueries) */
 	root = subquery_planner(glob, parse, NULL, NULL, NULL, false,
 							tuple_fraction, NULL);
@@ -525,6 +662,16 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 	best_path = get_cheapest_fractional_path(final_rel, tuple_fraction);
 
 	top_plan = create_plan(root, best_path);
+
+	/*
+	 * DBblue Phase 4: if we flipped the sort direction to reach the cheap
+	 * end of the index, wrap with an outer Sort that restores the original
+	 * order.  At this point top_plan delivers at most LIMIT rows, so the
+	 * Sort is essentially free.
+	 */
+	if (dbblue_did_flip)
+		top_plan = (Plan *) make_sort_from_sortclauses(dbblue_orig_sortclause,
+													   top_plan);
 
 	/*
 	 * If creating a plan for a scrollable cursor, make sure it can run
@@ -708,37 +855,9 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 			result->jitFlags |= PGJIT_DEFORM;
 	}
 
-	/*
-	 * DBblue COUNT-cache routing: stamp the PlannedStmt with a
-	 * value-sensitive predicate fingerprint when the parse tree is a
-	 * SELECT against a single base relation with a non-trivial WHERE.
-	 * The executor uses this as the cache key on capture (the leading
-	 * COUNT) and the planner reuses it on lookup (the paginated SELECT
-	 * that follows in the same request).  Fingerprint of zero means
-	 * "not a candidate" and is the default.
-	 */
-	result->dbblue_pred_fingerprint = INT64CONST(0);
-	result->dbblue_pred_reloid = InvalidOid;
-
-	if (parse->commandType == CMD_SELECT &&
-		list_length(parse->rtable) == 1 &&
-		parse->jointree != NULL &&
-		parse->jointree->quals != NULL)
-	{
-		RangeTblEntry *rte = (RangeTblEntry *) linitial(parse->rtable);
-
-		if (rte->rtekind == RTE_RELATION && OidIsValid(rte->relid))
-		{
-			int64		fp = dbblue_predicate_fingerprint(rte->relid,
-														  parse->jointree->quals);
-
-			if (fp != INT64CONST(0))
-			{
-				result->dbblue_pred_fingerprint = fp;
-				result->dbblue_pred_reloid = rte->relid;
-			}
-		}
-	}
+	/* DBblue: stamp fingerprint computed above (or zero if non-candidate). */
+	result->dbblue_pred_fingerprint = dbblue_fp;
+	result->dbblue_pred_reloid = dbblue_reloid;
 
 	/* Allow plugins to take control before we discard "glob" */
 	if (planner_shutdown_hook)

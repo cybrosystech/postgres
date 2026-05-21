@@ -98,10 +98,20 @@ current_snapshot_xmin(void)
 {
 	Snapshot	snap;
 
-	if (!ActiveSnapshotSet())
+	/*
+	 * Prefer the active snapshot (available during executor run).  Fall back
+	 * to the transaction snapshot for callers that run during planning, where
+	 * no active snapshot has been pushed yet.  In READ COMMITTED mode both
+	 * call GetSnapshotData() and will have the same xmin within the tiny
+	 * window of a single Odoo request.
+	 */
+	if (ActiveSnapshotSet())
+		snap = GetActiveSnapshot();
+	else if (IsTransactionState())
+		snap = GetTransactionSnapshot();
+	else
 		return InvalidTransactionId;
 
-	snap = GetActiveSnapshot();
 	if (snap == NULL)
 		return InvalidTransactionId;
 
