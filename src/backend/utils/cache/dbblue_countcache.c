@@ -30,7 +30,12 @@
 #include "postgres.h"
 
 #include "access/xact.h"
+#include "catalog/pg_type_d.h"
+#include "executor/execdesc.h"
 #include "miscadmin.h"
+#include "nodes/execnodes.h"
+#include "nodes/plannodes.h"
+#include "tcop/dest.h"
 #include "utils/dbblue_countcache.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
@@ -225,6 +230,158 @@ evict_oldest(void)
 		(void) hash_search(countcache, &doomed_key, HASH_REMOVE, NULL);
 		countcache_count--;
 	}
+}
+
+/* ------------------------------------------------------------------ */
+/*	COUNT result capture: DestReceiver wrapper installed at run start */
+/* ------------------------------------------------------------------ */
+
+typedef struct CountCaptureDest
+{
+	DestReceiver pub;			/* must be first */
+	DestReceiver *wrapped;		/* original dest we forward to */
+	Oid			reloid;
+	int64		fingerprint;
+
+	int			tuples_seen;	/* receiveSlot calls during this run */
+	bool		shape_ok;		/* TupleDesc is single int8 attr */
+	int64		captured_count;	/* first row's first attribute */
+} CountCaptureDest;
+
+static bool
+ccd_receiveSlot(TupleTableSlot *slot, DestReceiver *self)
+{
+	CountCaptureDest *ccd = (CountCaptureDest *) self;
+	bool		isnull;
+
+	/*
+	 * Capture the count value from the first row only.  Subsequent
+	 * receives bump the counter so rShutdown can decide not to insert
+	 * when the result was not exactly one row.  Either way we forward
+	 * the tuple unmodified to the real receiver so the client sees
+	 * normal behavior.
+	 */
+	if (ccd->tuples_seen == 0 && ccd->shape_ok)
+	{
+		Datum		d = slot_getattr(slot, 1, &isnull);
+
+		if (!isnull)
+			ccd->captured_count = DatumGetInt64(d);
+		else
+			ccd->shape_ok = false;	/* NULL count is uncacheable */
+	}
+	ccd->tuples_seen++;
+
+	return ccd->wrapped->receiveSlot(slot, ccd->wrapped);
+}
+
+static void
+ccd_rStartup(DestReceiver *self, int operation, TupleDesc typeinfo)
+{
+	CountCaptureDest *ccd = (CountCaptureDest *) self;
+
+	/*
+	 * Validate the result shape here, where we can see the TupleDesc.
+	 * A bona fide COUNT(*) returns exactly one BIGINT column; anything
+	 * else (multi-column aggregates like (sum, avg), other types) is
+	 * not cacheable and we just become a transparent pass-through.
+	 */
+	ccd->shape_ok = (typeinfo->natts == 1 &&
+					 TupleDescAttr(typeinfo, 0)->atttypid == INT8OID);
+
+	ccd->wrapped->rStartup(ccd->wrapped, operation, typeinfo);
+}
+
+static void
+ccd_rShutdown(DestReceiver *self)
+{
+	CountCaptureDest *ccd = (CountCaptureDest *) self;
+
+	ccd->wrapped->rShutdown(ccd->wrapped);
+
+	/*
+	 * Insert only when we observed exactly one BIGINT row.  More tuples
+	 * means the plan wasn't a single COUNT; zero tuples means an error
+	 * path or aborted scan and we have nothing to record.
+	 */
+	if (ccd->shape_ok && ccd->tuples_seen == 1 && ccd->captured_count >= 0)
+		dbblue_countcache_insert(ccd->reloid, ccd->fingerprint,
+								 ccd->captured_count);
+}
+
+static void
+ccd_rDestroy(DestReceiver *self)
+{
+	/*
+	 * No-op.  The wrapper does not own the wrapped DestReceiver's
+	 * lifetime, so we must not forward rDestroy.  Storage for the
+	 * wrapper itself is released by dbblue_count_capture_finalize.
+	 * If finalize was somehow skipped, the leak is bounded by the
+	 * executor memory context and harmless.
+	 */
+	(void) self;
+}
+
+bool
+dbblue_count_capture_install(QueryDesc *queryDesc)
+{
+	PlannedStmt *pstmt;
+	CountCaptureDest *ccd;
+
+	if (queryDesc == NULL)
+		return false;
+
+	pstmt = queryDesc->plannedstmt;
+	if (pstmt == NULL || pstmt->dbblue_pred_fingerprint == INT64CONST(0))
+		return false;
+	if (!OidIsValid(pstmt->dbblue_pred_reloid))
+		return false;
+
+	/*
+	 * Cheap shape gate: only Agg-rooted plans are candidates.  This
+	 * keeps the wrapper off normal SELECT id, ... FROM ... paths.  The
+	 * TupleDesc check in ccd_rStartup is the final guard that rejects
+	 * non-COUNT aggregates (SUM, MAX, etc.).
+	 */
+	if (pstmt->planTree == NULL || !IsA(pstmt->planTree, Agg))
+		return false;
+
+	ccd = (CountCaptureDest *) palloc0(sizeof(CountCaptureDest));
+	ccd->pub.receiveSlot = ccd_receiveSlot;
+	ccd->pub.rStartup = ccd_rStartup;
+	ccd->pub.rShutdown = ccd_rShutdown;
+	ccd->pub.rDestroy = ccd_rDestroy;
+	ccd->pub.mydest = queryDesc->dest->mydest;
+	ccd->wrapped = queryDesc->dest;
+	ccd->reloid = pstmt->dbblue_pred_reloid;
+	ccd->fingerprint = pstmt->dbblue_pred_fingerprint;
+	ccd->tuples_seen = 0;
+	ccd->shape_ok = false;		/* set true in rStartup if natts/type ok */
+	ccd->captured_count = 0;
+
+	queryDesc->dest = (DestReceiver *) ccd;
+	return true;
+}
+
+void
+dbblue_count_capture_finalize(QueryDesc *queryDesc)
+{
+	CountCaptureDest *ccd;
+
+	if (queryDesc == NULL || queryDesc->dest == NULL)
+		return;
+
+	/*
+	 * Cheap identity check: the install path is the only thing that
+	 * installs ccd_receiveSlot, so it doubles as a "is our wrapper"
+	 * tag.  If it isn't ours, leave dest alone.
+	 */
+	if (queryDesc->dest->receiveSlot != ccd_receiveSlot)
+		return;
+
+	ccd = (CountCaptureDest *) queryDesc->dest;
+	queryDesc->dest = ccd->wrapped;
+	pfree(ccd);
 }
 
 /*

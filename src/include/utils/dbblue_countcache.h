@@ -74,4 +74,19 @@ extern void dbblue_countcache_insert(Oid reloid, int64 fingerprint,
 /* Current populated size, exposed for observability / tests. */
 extern int dbblue_countcache_current_size(void);
 
+/*
+ * Capture-side hook called by standard_ExecutorRun.  When the planned
+ * statement looks like a single-aggregate COUNT(*) shape and carries a
+ * non-zero predicate fingerprint, this wraps queryDesc->dest with an
+ * interceptor that records the resulting count.  Returns true when a
+ * wrapper was installed; the caller must pass the same QueryDesc to
+ * dbblue_count_capture_finalize() afterwards to insert and unwrap.
+ *
+ * Safe to call on any QueryDesc; non-matching queries return false and
+ * leave queryDesc->dest untouched.
+ */
+struct QueryDesc;				/* forward decl to keep this header light */
+extern bool dbblue_count_capture_install(struct QueryDesc *queryDesc);
+extern void dbblue_count_capture_finalize(struct QueryDesc *queryDesc);
+
 #endif							/* DBBLUE_COUNTCACHE_H */

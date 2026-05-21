@@ -60,6 +60,7 @@
 #include "rewrite/rewriteManip.h"
 #include "utils/acl.h"
 #include "utils/backend_status.h"
+#include "utils/dbblue_predfingerprint.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/selfuncs.h"
@@ -705,6 +706,38 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 			result->jitFlags |= PGJIT_EXPR;
 		if (jit_tuple_deforming)
 			result->jitFlags |= PGJIT_DEFORM;
+	}
+
+	/*
+	 * DBblue COUNT-cache routing: stamp the PlannedStmt with a
+	 * value-sensitive predicate fingerprint when the parse tree is a
+	 * SELECT against a single base relation with a non-trivial WHERE.
+	 * The executor uses this as the cache key on capture (the leading
+	 * COUNT) and the planner reuses it on lookup (the paginated SELECT
+	 * that follows in the same request).  Fingerprint of zero means
+	 * "not a candidate" and is the default.
+	 */
+	result->dbblue_pred_fingerprint = INT64CONST(0);
+	result->dbblue_pred_reloid = InvalidOid;
+
+	if (parse->commandType == CMD_SELECT &&
+		list_length(parse->rtable) == 1 &&
+		parse->jointree != NULL &&
+		parse->jointree->quals != NULL)
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) linitial(parse->rtable);
+
+		if (rte->rtekind == RTE_RELATION && OidIsValid(rte->relid))
+		{
+			int64		fp = dbblue_predicate_fingerprint(rte->relid,
+														  parse->jointree->quals);
+
+			if (fp != INT64CONST(0))
+			{
+				result->dbblue_pred_fingerprint = fp;
+				result->dbblue_pred_reloid = rte->relid;
+			}
+		}
 	}
 
 	/* Allow plugins to take control before we discard "glob" */
