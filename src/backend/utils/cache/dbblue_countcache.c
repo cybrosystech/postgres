@@ -126,11 +126,11 @@ current_snapshot_xmin(void)
  * TTL for cache entries.  Odoo's search_count and web_search_read are
  * separate HTTP requests and therefore separate transactions, so requiring
  * the exact same snapshot_xmin would guarantee a miss on every single
- * Odoo page navigation.  30 seconds comfortably covers any request cycle
- * while preventing reuse of genuinely stale counts from earlier sessions.
+ * Odoo page navigation.  5 minutes covers typical user browsing pace while
+ * preventing reuse of genuinely stale counts from earlier sessions.
  * DDL-driven staleness is already handled by the relcache callback.
  */
-#define DBBLUE_COUNTCACHE_TTL_USEC	(30 * USECS_PER_SEC)
+#define DBBLUE_COUNTCACHE_TTL_USEC	(5 * 60 * USECS_PER_SEC)
 
 const CountCacheEntry *
 dbblue_countcache_lookup(Oid reloid, int64 fingerprint)

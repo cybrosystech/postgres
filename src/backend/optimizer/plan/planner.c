@@ -630,29 +630,47 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 							int64		N = ce->count;
 							int64		new_off = N - K - L;
 
-							if (K > N / 2 && new_off >= 0)
+							/*
+							 * Flip when K is past the midpoint and there are
+							 * rows left to return (K < N).  When new_off < 0
+							 * we are on the last partial page: use OFFSET 0
+							 * with LIMIT clamped to the actual remaining rows
+							 * (N - K) so the reversed scan fetches exactly
+							 * the right tuples.
+							 */
+							if (K > N / 2 && K < N)
 							{
 								List	   *flipped =
 									dbblue_flip_sortclauses(parse->sortClause);
 
 								if (flipped != NIL)
 								{
+									int64		actual_off = (new_off >= 0) ? new_off : INT64CONST(0);
+									int64		actual_lim = (new_off >= 0) ? L : (N - K);
+
 									dbblue_orig_sortclause = parse->sortClause;
 									parse->sortClause = flipped;
 									parse->limitOffset =
 										(Node *) makeConst(INT8OID, -1,
 														   InvalidOid,
 														   sizeof(int64),
-														   Int64GetDatum(new_off),
+														   Int64GetDatum(actual_off),
 														   false, true);
+									if (new_off < 0)
+										parse->limitCount =
+											(Node *) makeConst(INT8OID, -1,
+															   InvalidOid,
+															   sizeof(int64),
+															   Int64GetDatum(actual_lim),
+															   false, true);
 									dbblue_did_flip = true;
-								ereport(DEBUG1,
-										(errmsg("dbblue offset-flip: rel=%s N=%lld K=%lld L=%lld new_off=%lld",
-												get_rel_name(dbblue_reloid),
-												(long long) N,
-												(long long) K,
-												(long long) L,
-												(long long) new_off)));
+									ereport(DEBUG1,
+											(errmsg("dbblue offset-flip: rel=%s N=%lld K=%lld L=%lld new_off=%lld",
+													get_rel_name(dbblue_reloid),
+													(long long) N,
+													(long long) K,
+													(long long) L,
+													(long long) actual_off)));
 								}
 							}
 						}
