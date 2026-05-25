@@ -13,12 +13,15 @@
  *	               is set and exceeded, DETACH + DROP the oldest
  *	               partitions until the count is at retention.
  *
- *	  range_date : not yet implemented (logged-only).
- *	  list_int   : not yet implemented (logged-only).
+ *	  range_date : heap conversion + rotation + retention (FK/trigger
+ *	               support coming in Phase B).
+ *	  list_int   : heap conversion (one partition per distinct value) +
+ *	               DEFAULT-partition rotation (FK/trigger support coming
+ *	               in Phase C).
  *
- *	Heap relations (relkind='r') are logged but not modified — converting
- *	an unpartitioned table to partitioned is the online-migration job
- *	(Phase 3).
+ *	Heap relations (relkind='r') are converted automatically; the
+ *	conversion runs while writers proceed and takes ACCESS EXCLUSIVE
+ *	only for the brief rename swap.
  *
  *	Registration happens at postmaster startup (see postmaster.c calling
  *	AutoPartitionLauncherRegister()), so the worker is built into the
@@ -160,6 +163,593 @@ AutoPartitionLauncherMain(Datum main_arg)
 }
 
 /* ---------------------------------------------------------------- */
+/* Shared helper types and functions used by all conversion paths    */
+/* ---------------------------------------------------------------- */
+
+/*
+ * Descriptor for a set of FK constraints.
+ * owner_schemas/owners are non-NULL only for inbound FK lists.
+ */
+typedef struct ApFkList
+{
+	int			count;
+	char	  **names;
+	char	  **defs;			/* pg_get_constraintdef output */
+	char	  **owner_schemas;	/* inbound only: schema of referencing table */
+	char	  **owners;			/* inbound only: name of referencing table */
+} ApFkList;
+
+typedef struct ApTrigList
+{
+	int			count;
+	char	  **names;
+	char	  **defs;			/* full CREATE TRIGGER DDL */
+} ApTrigList;
+
+typedef struct ApSeqList
+{
+	int			count;
+	char	  **names;			/* sequence relnames */
+	char	  **columns;		/* column names they are owned by */
+} ApSeqList;
+
+/*
+ * ap_check_pk_includes_col — verify the PK includes partcol.
+ *
+ * require_single=true  → PK must be exactly one column equal to partcol
+ *                        (range_int constraint).
+ * require_single=false → partcol merely needs to appear in the PK
+ *                        (composite PKs fine; range_date / list_int).
+ */
+static bool
+ap_check_pk_includes_col(Oid reloid, const char *nsname, const char *relname,
+						 const char *partcol, bool require_single)
+{
+	StringInfoData buf;
+	int			ret;
+	bool		ok;
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf,
+					 "SELECT EXISTS ("
+					 "  SELECT 1 FROM pg_constraint con "
+					 "  JOIN pg_attribute a "
+					 "    ON a.attrelid = con.conrelid "
+					 "   AND a.attnum = ANY(con.conkey) "
+					 "  WHERE con.conrelid = %u "
+					 "    AND con.contype = 'p' "
+					 "%s"
+					 "    AND a.attname = %s)",
+					 reloid,
+					 require_single ? "    AND array_length(con.conkey,1) = 1\n" : "",
+					 quote_literal_cstr(partcol));
+	ret = SPI_execute(buf.data, true, 0);
+	pfree(buf.data);
+	if (ret != SPI_OK_SELECT || SPI_processed == 0)
+	{
+		ereport(WARNING,
+				(errmsg("auto-partition: %s.%s: PK check failed (SPI rc=%d)",
+						nsname, relname, ret)));
+		return false;
+	}
+	{
+		bool		isnull;
+
+		ok = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
+										SPI_tuptable->tupdesc, 1, &isnull));
+	}
+	if (!ok)
+	{
+		if (require_single)
+			ereport(WARNING,
+					(errmsg("auto-partition: %s.%s: PK must be a single column equal to partition_column %s",
+							nsname, relname, partcol)));
+		else
+			ereport(WARNING,
+					(errmsg("auto-partition: %s.%s: partition_column %s must be part of the primary key",
+							nsname, relname, partcol)));
+	}
+	return ok;
+}
+
+/*
+ * ap_check_fk_trigger_presence — detect FK and trigger presence without
+ * capturing definitions.  Returns false on SPI error.
+ */
+static bool
+ap_check_fk_trigger_presence(Oid reloid, const char *nsname, const char *relname,
+							 bool *has_fk_in, bool *has_fk_out, bool *has_trigger)
+{
+	StringInfoData buf;
+	int			ret;
+
+	*has_fk_in = *has_fk_out = *has_trigger = false;
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf,
+					 "SELECT "
+					 "  EXISTS(SELECT 1 FROM pg_constraint WHERE confrelid=%u AND contype='f'), "
+					 "  EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid=%u  AND contype='f'), "
+					 "  EXISTS(SELECT 1 FROM pg_trigger    WHERE tgrelid=%u   AND NOT tgisinternal)",
+					 reloid, reloid, reloid);
+	ret = SPI_execute(buf.data, true, 0);
+	pfree(buf.data);
+	if (ret != SPI_OK_SELECT || SPI_processed == 0)
+	{
+		ereport(WARNING,
+				(errmsg("auto-partition: %s.%s: FK/trigger presence check failed",
+						nsname, relname)));
+		return false;
+	}
+	{
+		bool		isnull;
+
+		*has_fk_in = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
+											   SPI_tuptable->tupdesc, 1, &isnull));
+		*has_fk_out = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
+											    SPI_tuptable->tupdesc, 2, &isnull));
+		*has_trigger = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
+												  SPI_tuptable->tupdesc, 3, &isnull));
+	}
+	return true;
+}
+
+/*
+ * ap_capture_fks — populate out_fks (constraints on the source table) and
+ * in_fks (constraints on other tables that reference the source).
+ * All strings are pstrdup'd into TopTransactionContext.
+ */
+static void
+ap_capture_fks(Oid reloid, ApFkList *out_fks, ApFkList *in_fks)
+{
+	StringInfoData buf;
+	int			ret;
+
+	memset(out_fks, 0, sizeof(*out_fks));
+	memset(in_fks, 0, sizeof(*in_fks));
+
+	/* Outbound FKs */
+	initStringInfo(&buf);
+	appendStringInfo(&buf,
+					 "SELECT con.conname, pg_get_constraintdef(con.oid) "
+					 "FROM pg_constraint con "
+					 "WHERE con.conrelid = %u AND con.contype = 'f' "
+					 "ORDER BY con.conname",
+					 reloid);
+	ret = SPI_execute(buf.data, true, 0);
+	pfree(buf.data);
+	if (ret == SPI_OK_SELECT && SPI_processed > 0)
+	{
+		MemoryContext c = MemoryContextSwitchTo(TopTransactionContext);
+		int			k;
+
+		out_fks->count = (int) SPI_processed;
+		out_fks->names = palloc(sizeof(char *) * out_fks->count);
+		out_fks->defs = palloc(sizeof(char *) * out_fks->count);
+		for (k = 0; k < out_fks->count; k++)
+		{
+			out_fks->names[k] = pstrdup(SPI_getvalue(SPI_tuptable->vals[k],
+													  SPI_tuptable->tupdesc, 1));
+			out_fks->defs[k] = pstrdup(SPI_getvalue(SPI_tuptable->vals[k],
+													 SPI_tuptable->tupdesc, 2));
+		}
+		MemoryContextSwitchTo(c);
+	}
+
+	/* Inbound FKs */
+	initStringInfo(&buf);
+	appendStringInfo(&buf,
+					 "SELECT con.conname, "
+					 "       pg_get_constraintdef(con.oid), "
+					 "       n.nspname, c.relname "
+					 "FROM pg_constraint con "
+					 "JOIN pg_class c     ON c.oid = con.conrelid "
+					 "JOIN pg_namespace n ON n.oid = c.relnamespace "
+					 "WHERE con.confrelid = %u AND con.contype = 'f' "
+					 "ORDER BY con.conname",
+					 reloid);
+	ret = SPI_execute(buf.data, true, 0);
+	pfree(buf.data);
+	if (ret == SPI_OK_SELECT && SPI_processed > 0)
+	{
+		MemoryContext c = MemoryContextSwitchTo(TopTransactionContext);
+		int			k;
+
+		in_fks->count = (int) SPI_processed;
+		in_fks->names = palloc(sizeof(char *) * in_fks->count);
+		in_fks->defs = palloc(sizeof(char *) * in_fks->count);
+		in_fks->owner_schemas = palloc(sizeof(char *) * in_fks->count);
+		in_fks->owners = palloc(sizeof(char *) * in_fks->count);
+		for (k = 0; k < in_fks->count; k++)
+		{
+			in_fks->names[k] = pstrdup(SPI_getvalue(SPI_tuptable->vals[k],
+													 SPI_tuptable->tupdesc, 1));
+			in_fks->defs[k] = pstrdup(SPI_getvalue(SPI_tuptable->vals[k],
+													SPI_tuptable->tupdesc, 2));
+			in_fks->owner_schemas[k] = pstrdup(SPI_getvalue(SPI_tuptable->vals[k],
+															 SPI_tuptable->tupdesc, 3));
+			in_fks->owners[k] = pstrdup(SPI_getvalue(SPI_tuptable->vals[k],
+													  SPI_tuptable->tupdesc, 4));
+		}
+		MemoryContextSwitchTo(c);
+	}
+}
+
+/*
+ * ap_capture_triggers — record all user-visible trigger definitions via
+ * pg_get_triggerdef.  Internal triggers (FK enforcement) are excluded.
+ */
+static void
+ap_capture_triggers(Oid reloid, ApTrigList *trigs)
+{
+	StringInfoData buf;
+	int			ret;
+
+	memset(trigs, 0, sizeof(*trigs));
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf,
+					 "SELECT tgname, pg_get_triggerdef(oid) "
+					 "FROM pg_trigger "
+					 "WHERE tgrelid = %u AND NOT tgisinternal "
+					 "ORDER BY tgname",
+					 reloid);
+	ret = SPI_execute(buf.data, true, 0);
+	pfree(buf.data);
+	if (ret == SPI_OK_SELECT && SPI_processed > 0)
+	{
+		MemoryContext c = MemoryContextSwitchTo(TopTransactionContext);
+		int			k;
+
+		trigs->count = (int) SPI_processed;
+		trigs->names = palloc(sizeof(char *) * trigs->count);
+		trigs->defs = palloc(sizeof(char *) * trigs->count);
+		for (k = 0; k < trigs->count; k++)
+		{
+			trigs->names[k] = pstrdup(SPI_getvalue(SPI_tuptable->vals[k],
+												   SPI_tuptable->tupdesc, 1));
+			trigs->defs[k] = pstrdup(SPI_getvalue(SPI_tuptable->vals[k],
+												  SPI_tuptable->tupdesc, 2));
+		}
+		MemoryContextSwitchTo(c);
+	}
+}
+
+/*
+ * ap_capture_seqs — find sequences owned by the source table via the
+ * OWNED BY dependency written by bigserial/serial defaults.
+ */
+static void
+ap_capture_seqs(Oid reloid, ApSeqList *seqs)
+{
+	StringInfoData buf;
+	int			ret;
+
+	memset(seqs, 0, sizeof(*seqs));
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf,
+					 "SELECT s.relname, a.attname "
+					 "FROM pg_depend d "
+					 "JOIN pg_class s ON s.oid = d.objid AND s.relkind = 'S' "
+					 "JOIN pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid "
+					 "WHERE d.refobjid = %u "
+					 "  AND d.classid = 'pg_class'::regclass "
+					 "  AND d.refclassid = 'pg_class'::regclass "
+					 "  AND d.deptype = 'a'",
+					 reloid);
+	ret = SPI_execute(buf.data, true, 0);
+	pfree(buf.data);
+	if (ret == SPI_OK_SELECT && SPI_processed > 0)
+	{
+		MemoryContext c = MemoryContextSwitchTo(TopTransactionContext);
+		int			k;
+		SPITupleTable *tt = SPI_tuptable;
+
+		seqs->count = (int) SPI_processed;
+		seqs->names = palloc(sizeof(char *) * seqs->count);
+		seqs->columns = palloc(sizeof(char *) * seqs->count);
+		for (k = 0; k < seqs->count; k++)
+		{
+			seqs->names[k] = pstrdup(SPI_getvalue(tt->vals[k], tt->tupdesc, 1));
+			seqs->columns[k] = pstrdup(SPI_getvalue(tt->vals[k], tt->tupdesc, 2));
+		}
+		MemoryContextSwitchTo(c);
+	}
+}
+
+/* ap_detach_seqs — OWNED BY NONE on every sequence in the list. */
+static void
+ap_detach_seqs(const char *nsname, const ApSeqList *seqs)
+{
+	StringInfoData buf;
+	int			k;
+
+	for (k = 0; k < seqs->count; k++)
+	{
+		initStringInfo(&buf);
+		appendStringInfo(&buf, "ALTER SEQUENCE %s.%s OWNED BY NONE",
+						 quote_identifier(nsname),
+						 quote_identifier(seqs->names[k]));
+		SPI_exec(buf.data, 0);
+		pfree(buf.data);
+	}
+}
+
+/* ap_reattach_seqs — OWNED BY <relname>.<col> on every sequence. */
+static void
+ap_reattach_seqs(const char *nsname, const char *relname, const ApSeqList *seqs)
+{
+	StringInfoData buf;
+	int			k;
+
+	for (k = 0; k < seqs->count; k++)
+	{
+		initStringInfo(&buf);
+		appendStringInfo(&buf,
+						 "ALTER SEQUENCE %s.%s OWNED BY %s.%s.%s",
+						 quote_identifier(nsname),
+						 quote_identifier(seqs->names[k]),
+						 quote_identifier(nsname),
+						 quote_identifier(relname),
+						 quote_identifier(seqs->columns[k]));
+		SPI_exec(buf.data, 0);
+		pfree(buf.data);
+	}
+}
+
+/*
+ * ap_atomic_swap — the brief ACCESS EXCLUSIVE window.
+ *
+ * Locks the source, drops it, and renames tmp_name to relname.
+ * Sequences must be detached before calling this.
+ * Partition renaming after the swap is the caller's responsibility.
+ */
+static void
+ap_atomic_swap(const char *nsname, const char *relname, const char *tmp_name)
+{
+	StringInfoData buf;
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf, "LOCK TABLE %s.%s IN ACCESS EXCLUSIVE MODE",
+					 quote_identifier(nsname), quote_identifier(relname));
+	SPI_exec(buf.data, 0);
+	pfree(buf.data);
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf, "DROP TABLE %s.%s",
+					 quote_identifier(nsname), quote_identifier(relname));
+	SPI_exec(buf.data, 0);
+	pfree(buf.data);
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf, "ALTER TABLE %s.%s RENAME TO %s",
+					 quote_identifier(nsname),
+					 quote_identifier(tmp_name),
+					 quote_identifier(relname));
+	SPI_exec(buf.data, 0);
+	pfree(buf.data);
+}
+
+/* ap_drop_fks — drop inbound then outbound FKs before the swap. */
+static void
+ap_drop_fks(const char *nsname, const char *relname,
+			const ApFkList *out_fks, const ApFkList *in_fks)
+{
+	StringInfoData buf;
+	int			k;
+
+	for (k = 0; k < in_fks->count; k++)
+	{
+		initStringInfo(&buf);
+		appendStringInfo(&buf,
+						 "ALTER TABLE %s.%s DROP CONSTRAINT %s",
+						 quote_identifier(in_fks->owner_schemas[k]),
+						 quote_identifier(in_fks->owners[k]),
+						 quote_identifier(in_fks->names[k]));
+		SPI_exec(buf.data, 0);
+		pfree(buf.data);
+	}
+	for (k = 0; k < out_fks->count; k++)
+	{
+		initStringInfo(&buf);
+		appendStringInfo(&buf,
+						 "ALTER TABLE %s.%s DROP CONSTRAINT %s",
+						 quote_identifier(nsname),
+						 quote_identifier(relname),
+						 quote_identifier(out_fks->names[k]));
+		SPI_exec(buf.data, 0);
+		pfree(buf.data);
+	}
+}
+
+/*
+ * ap_add_fks_not_valid — ADD CONSTRAINT ... NOT VALID for each FK.
+ * Called inside the swap subtransaction after the rename.
+ */
+static void
+ap_add_fks_not_valid(const char *nsname, const char *relname,
+					 const ApFkList *out_fks, const ApFkList *in_fks)
+{
+	StringInfoData buf;
+	int			k;
+
+	for (k = 0; k < out_fks->count; k++)
+	{
+		initStringInfo(&buf);
+		appendStringInfo(&buf,
+						 "ALTER TABLE %s.%s ADD CONSTRAINT %s %s NOT VALID",
+						 quote_identifier(nsname),
+						 quote_identifier(relname),
+						 quote_identifier(out_fks->names[k]),
+						 out_fks->defs[k]);
+		SPI_exec(buf.data, 0);
+		pfree(buf.data);
+	}
+	for (k = 0; k < in_fks->count; k++)
+	{
+		initStringInfo(&buf);
+		appendStringInfo(&buf,
+						 "ALTER TABLE %s.%s ADD CONSTRAINT %s %s NOT VALID",
+						 quote_identifier(in_fks->owner_schemas[k]),
+						 quote_identifier(in_fks->owners[k]),
+						 quote_identifier(in_fks->names[k]),
+						 in_fks->defs[k]);
+		SPI_exec(buf.data, 0);
+		pfree(buf.data);
+	}
+}
+
+/*
+ * ap_validate_fks — post-swap VALIDATE CONSTRAINT loop.
+ * One subtransaction per FK so a single orphan row leaves the rest validated.
+ */
+static void
+ap_validate_fks(const char *nsname, const char *relname,
+				const ApFkList *out_fks, const ApFkList *in_fks)
+{
+	StringInfoData buf;
+	int			k;
+
+	for (k = 0; k < out_fks->count; k++)
+	{
+		BeginInternalSubTransaction("autopart_validate_fk");
+		PG_TRY();
+		{
+			initStringInfo(&buf);
+			appendStringInfo(&buf,
+							 "ALTER TABLE %s.%s VALIDATE CONSTRAINT %s",
+							 quote_identifier(nsname),
+							 quote_identifier(relname),
+							 quote_identifier(out_fks->names[k]));
+			SPI_exec(buf.data, 0);
+			pfree(buf.data);
+			ReleaseCurrentSubTransaction();
+		}
+		PG_CATCH();
+		{
+			ErrorData  *edata;
+
+			MemoryContextSwitchTo(TopTransactionContext);
+			edata = CopyErrorData();
+			ereport(WARNING,
+					(errmsg("auto-partition: %s.%s: VALIDATE %s failed: %s",
+							nsname, relname, out_fks->names[k], edata->message)));
+			FreeErrorData(edata);
+			FlushErrorState();
+			RollbackAndReleaseCurrentSubTransaction();
+		}
+		PG_END_TRY();
+	}
+	for (k = 0; k < in_fks->count; k++)
+	{
+		BeginInternalSubTransaction("autopart_validate_fk_in");
+		PG_TRY();
+		{
+			initStringInfo(&buf);
+			appendStringInfo(&buf,
+							 "ALTER TABLE %s.%s VALIDATE CONSTRAINT %s",
+							 quote_identifier(in_fks->owner_schemas[k]),
+							 quote_identifier(in_fks->owners[k]),
+							 quote_identifier(in_fks->names[k]));
+			SPI_exec(buf.data, 0);
+			pfree(buf.data);
+			ReleaseCurrentSubTransaction();
+		}
+		PG_CATCH();
+		{
+			ErrorData  *edata;
+
+			MemoryContextSwitchTo(TopTransactionContext);
+			edata = CopyErrorData();
+			ereport(WARNING,
+					(errmsg("auto-partition: %s.%s: VALIDATE %s failed: %s",
+							in_fks->owners[k], in_fks->names[k],
+							in_fks->names[k], edata->message)));
+			FreeErrorData(edata);
+			FlushErrorState();
+			RollbackAndReleaseCurrentSubTransaction();
+		}
+		PG_END_TRY();
+	}
+
+	if (out_fks->count + in_fks->count > 0)
+		ereport(LOG,
+				(errmsg("auto-partition: %s.%s: validated %d FK constraint(s) post-swap",
+						nsname, relname, out_fks->count + in_fks->count)));
+}
+
+/*
+ * ap_recreate_triggers — replay trigger DDL post-swap, one subtransaction
+ * per trigger so a single failure doesn't abort the rest.
+ */
+static void
+ap_recreate_triggers(const char *nsname, const char *relname,
+					 const ApTrigList *trigs)
+{
+	int			k;
+	int			recreated = 0;
+
+	for (k = 0; k < trigs->count; k++)
+	{
+		BeginInternalSubTransaction("autopart_recreate_trig");
+		PG_TRY();
+		{
+			SPI_exec(trigs->defs[k], 0);
+			recreated++;
+			ReleaseCurrentSubTransaction();
+		}
+		PG_CATCH();
+		{
+			ErrorData  *edata;
+
+			MemoryContextSwitchTo(TopTransactionContext);
+			edata = CopyErrorData();
+			ereport(WARNING,
+					(errmsg("auto-partition: %s.%s: recreating trigger %s failed: %s",
+							nsname, relname, trigs->names[k], edata->message)));
+			FreeErrorData(edata);
+			FlushErrorState();
+			RollbackAndReleaseCurrentSubTransaction();
+		}
+		PG_END_TRY();
+	}
+	if (trigs->count > 0)
+		ereport(LOG,
+				(errmsg("auto-partition: %s.%s: recreated %d/%d trigger(s) post-swap",
+						nsname, relname, recreated, trigs->count)));
+}
+
+/*
+ * ap_restore_reloptions — re-apply auto_partition_* reloptions after swap.
+ * partinterval may be NULL (list_int has no interval).
+ */
+static void
+ap_restore_reloptions(const char *nsname, const char *relname,
+					  const char *strategy, const char *partcol,
+					  const char *partinterval, int32 retention)
+{
+	StringInfoData buf;
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf,
+					 "ALTER TABLE %s.%s SET ("
+					 "auto_partition_strategy = %s, "
+					 "auto_partition_column = %s, ",
+					 quote_identifier(nsname),
+					 quote_identifier(relname),
+					 quote_literal_cstr(strategy),
+					 quote_literal_cstr(partcol));
+	if (partinterval != NULL)
+		appendStringInfo(&buf,
+						 "auto_partition_interval = %s, ",
+						 quote_literal_cstr(partinterval));
+	appendStringInfo(&buf, "auto_partition_retention = %d)", retention);
+	SPI_exec(buf.data, 0);
+	pfree(buf.data);
+}
+
+/* ---------------------------------------------------------------- */
 
 /*
  * Phase 3a: convert an unpartitioned heap into a partitioned table with
@@ -214,17 +804,16 @@ convert_heap_to_partitioned_date(Oid reloid, const char *nsname,
 	StringInfoData buf;
 	int			ret;
 	bool		converted = false;
-	bool		has_fk_in,
-				has_fk_out,
-				has_trigger;
 	bool		col_ok;
-	bool		pk_ok;
 	int64		row_count = 0;
 	char	   *min_text = NULL;
-	char	   *max_text = NULL;
 	char	   *upper_text = NULL;
 	char	   *suffix = NULL;
 	MemoryContext savecxt;
+	ApFkList	out_fks,
+				in_fks;
+	ApTrigList	trigs;
+	ApSeqList	seqs;
 
 	if (partinterval == NULL || *partinterval == '\0')
 	{
@@ -234,7 +823,7 @@ convert_heap_to_partitioned_date(Oid reloid, const char *nsname,
 		return false;
 	}
 
-	/* 1. Type check: partcol is timestamp/timestamptz/date. */
+	/* 1. partcol must be a timestamp/timestamptz/date column. */
 	initStringInfo(&buf);
 	appendStringInfo(&buf,
 					 "SELECT EXISTS ("
@@ -267,80 +856,11 @@ convert_heap_to_partitioned_date(Oid reloid, const char *nsname,
 		return false;
 	}
 
-	/* 2. PK must include partition_column. */
-	initStringInfo(&buf);
-	appendStringInfo(&buf,
-					 "SELECT EXISTS ("
-					 "  SELECT 1 FROM pg_constraint con "
-					 "  JOIN pg_attribute a "
-					 "    ON a.attrelid = con.conrelid "
-					 "   AND a.attnum = ANY(con.conkey) "
-					 "  WHERE con.conrelid = %u "
-					 "    AND con.contype = 'p' "
-					 "    AND a.attname = %s)",
-					 reloid, quote_literal_cstr(partcol));
-	ret = SPI_execute(buf.data, true, 0);
-	pfree(buf.data);
-	if (ret != SPI_OK_SELECT || SPI_processed == 0)
-	{
-		ereport(WARNING,
-				(errmsg("auto-partition: %s.%s: PK check failed",
-						nsname, relname)));
+	/* 2. PK must include partcol (composite PK is fine). */
+	if (!ap_check_pk_includes_col(reloid, nsname, relname, partcol, false))
 		return false;
-	}
-	{
-		bool		isnull;
 
-		pk_ok = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
-										   SPI_tuptable->tupdesc, 1, &isnull));
-	}
-	if (!pk_ok)
-	{
-		ereport(WARNING,
-				(errmsg("auto-partition: %s.%s: range_date conversion needs %s in the primary key",
-						nsname, relname, partcol)));
-		return false;
-	}
-
-	/* 3. FK / trigger checks (same as int variant). */
-	initStringInfo(&buf);
-	appendStringInfo(&buf,
-					 "SELECT "
-					 "  EXISTS(SELECT 1 FROM pg_constraint WHERE confrelid=%u AND contype='f') AS fk_in, "
-					 "  EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid=%u  AND contype='f') AS fk_out, "
-					 "  EXISTS(SELECT 1 FROM pg_trigger    WHERE tgrelid=%u   AND NOT tgisinternal) AS trig",
-					 reloid, reloid, reloid);
-	ret = SPI_execute(buf.data, true, 0);
-	pfree(buf.data);
-	if (ret != SPI_OK_SELECT || SPI_processed == 0)
-	{
-		ereport(WARNING,
-				(errmsg("auto-partition: %s.%s: FK/trigger check failed",
-						nsname, relname)));
-		return false;
-	}
-	{
-		bool		isnull;
-
-		has_fk_in = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
-											   SPI_tuptable->tupdesc, 1, &isnull));
-		has_fk_out = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
-											   SPI_tuptable->tupdesc, 2, &isnull));
-		has_trigger = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
-												 SPI_tuptable->tupdesc, 3, &isnull));
-	}
-	if (has_fk_in || has_fk_out || has_trigger)
-	{
-		ereport(WARNING,
-				(errmsg("auto-partition: %s.%s: skipping conversion — relation has %s%s%s",
-						nsname, relname,
-						has_fk_in ? "inbound FKs " : "",
-						has_fk_out ? "outbound FKs " : "",
-						has_trigger ? "user triggers" : "")));
-		return false;
-	}
-
-	/* 4. Compute initial partition bounds. */
+	/* 3. Compute initial partition bounds. */
 	initStringInfo(&buf);
 	appendStringInfo(&buf,
 					 "SELECT min(%s)::text, "
@@ -377,7 +897,6 @@ convert_heap_to_partitioned_date(Oid reloid, const char *nsname,
 		MemoryContextSwitchTo(savecxt);
 		row_count = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
 												SPI_tuptable->tupdesc, 4, &isnull));
-		(void) max_text;		/* not currently used; kept for clarity */
 	}
 
 	if (row_count == 0)
@@ -419,6 +938,15 @@ convert_heap_to_partitioned_date(Oid reloid, const char *nsname,
 					nsname, relname, (long long) row_count, partcol,
 					min_text, upper_text)));
 
+	/* 4. Capture FKs and triggers before the subtransaction. */
+	ap_capture_fks(reloid, &out_fks, &in_fks);
+	ap_capture_triggers(reloid, &trigs);
+
+	if (out_fks.count + in_fks.count + trigs.count > 0)
+		ereport(LOG,
+				(errmsg("auto-partition: %s.%s: capturing %d outbound + %d inbound FKs and %d trigger(s)",
+						nsname, relname, out_fks.count, in_fks.count, trigs.count)));
+
 	/* 5. Conversion proper, in a subtransaction. */
 	BeginInternalSubTransaction("autopart_convert_date");
 	PG_TRY();
@@ -432,7 +960,10 @@ convert_heap_to_partitioned_date(Oid reloid, const char *nsname,
 		snprintf(final_init_name, sizeof(final_init_name),
 				 "%s_p_%s", relname, suffix);
 
-		/* a. New partitioned parent. */
+		/* a. Drop FKs. */
+		ap_drop_fks(nsname, relname, &out_fks, &in_fks);
+
+		/* b. New partitioned parent. */
 		initStringInfo(&buf);
 		appendStringInfo(&buf,
 						 "CREATE TABLE %s.%s (LIKE %s.%s INCLUDING ALL) "
@@ -445,7 +976,7 @@ convert_heap_to_partitioned_date(Oid reloid, const char *nsname,
 		SPI_exec(buf.data, 0);
 		pfree(buf.data);
 
-		/* b. Initial partition spanning the existing data. */
+		/* c. Initial partition spanning the existing data. */
 		initStringInfo(&buf);
 		appendStringInfo(&buf,
 						 "CREATE TABLE %s.%s PARTITION OF %s.%s "
@@ -459,7 +990,7 @@ convert_heap_to_partitioned_date(Oid reloid, const char *nsname,
 		SPI_exec(buf.data, 0);
 		pfree(buf.data);
 
-		/* c. Copy rows. */
+		/* d. Copy rows. */
 		if (row_count > 0)
 		{
 			initStringInfo(&buf);
@@ -473,128 +1004,32 @@ convert_heap_to_partitioned_date(Oid reloid, const char *nsname,
 			pfree(buf.data);
 		}
 
-		/*
-		 * d. Detach owned sequences before DROP, then re-attach to the
-		 *    swapped-in relation.  Same dance as the int variant —
-		 *    LIKE INCLUDING ALL copies DEFAULT clauses that reference
-		 *    sequences owned by the source.
-		 */
-		{
-			SPITupleTable *seqtab;
-			int			seq_ret;
-			int			seq_count;
-			char	  **seq_names = NULL;
-			char	  **seq_columns = NULL;
+		/* e. Atomic swap + sequence dance. */
+		ap_capture_seqs(reloid, &seqs);
+		ap_detach_seqs(nsname, &seqs);
+		ap_atomic_swap(nsname, relname, tmp_name);
 
-			initStringInfo(&buf);
-			appendStringInfo(&buf,
-							 "SELECT s.relname, a.attname "
-							 "FROM pg_depend d "
-							 "JOIN pg_class s ON s.oid = d.objid AND s.relkind = 'S' "
-							 "JOIN pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid "
-							 "WHERE d.refobjid = %u "
-							 "  AND d.classid = 'pg_class'::regclass "
-							 "  AND d.refclassid = 'pg_class'::regclass "
-							 "  AND d.deptype = 'a'",
-							 reloid);
-			seq_ret = SPI_execute(buf.data, true, 0);
-			pfree(buf.data);
-
-			if (seq_ret == SPI_OK_SELECT && SPI_processed > 0)
-			{
-				MemoryContext oldcxt;
-
-				seq_count = (int) SPI_processed;
-				seqtab = SPI_tuptable;
-				oldcxt = MemoryContextSwitchTo(TopTransactionContext);
-				seq_names = palloc(sizeof(char *) * seq_count);
-				seq_columns = palloc(sizeof(char *) * seq_count);
-				for (int s = 0; s < seq_count; s++)
-				{
-					seq_names[s] = pstrdup(SPI_getvalue(seqtab->vals[s], seqtab->tupdesc, 1));
-					seq_columns[s] = pstrdup(SPI_getvalue(seqtab->vals[s], seqtab->tupdesc, 2));
-				}
-				MemoryContextSwitchTo(oldcxt);
-			}
-			else
-				seq_count = 0;
-
-			for (int s = 0; s < seq_count; s++)
-			{
-				initStringInfo(&buf);
-				appendStringInfo(&buf, "ALTER SEQUENCE %s.%s OWNED BY NONE",
-								 quote_identifier(nsname),
-								 quote_identifier(seq_names[s]));
-				SPI_exec(buf.data, 0);
-				pfree(buf.data);
-			}
-
-			/* The actual swap. */
-			initStringInfo(&buf);
-			appendStringInfo(&buf, "LOCK TABLE %s.%s IN ACCESS EXCLUSIVE MODE",
-							 quote_identifier(nsname),
-							 quote_identifier(relname));
-			SPI_exec(buf.data, 0);
-			pfree(buf.data);
-
-			initStringInfo(&buf);
-			appendStringInfo(&buf, "DROP TABLE %s.%s",
-							 quote_identifier(nsname),
-							 quote_identifier(relname));
-			SPI_exec(buf.data, 0);
-			pfree(buf.data);
-
-			initStringInfo(&buf);
-			appendStringInfo(&buf, "ALTER TABLE %s.%s RENAME TO %s",
-							 quote_identifier(nsname),
-							 quote_identifier(tmp_name),
-							 quote_identifier(relname));
-			SPI_exec(buf.data, 0);
-			pfree(buf.data);
-
-			initStringInfo(&buf);
-			appendStringInfo(&buf, "ALTER TABLE %s.%s RENAME TO %s",
-							 quote_identifier(nsname),
-							 quote_identifier(init_name),
-							 quote_identifier(final_init_name));
-			SPI_exec(buf.data, 0);
-			pfree(buf.data);
-
-			for (int s = 0; s < seq_count; s++)
-			{
-				initStringInfo(&buf);
-				appendStringInfo(&buf,
-								 "ALTER SEQUENCE %s.%s OWNED BY %s.%s.%s",
-								 quote_identifier(nsname),
-								 quote_identifier(seq_names[s]),
-								 quote_identifier(nsname),
-								 quote_identifier(relname),
-								 quote_identifier(seq_columns[s]));
-				SPI_exec(buf.data, 0);
-				pfree(buf.data);
-			}
-		}
-
-		/* e. Re-apply auto_partition reloptions. */
 		initStringInfo(&buf);
-		appendStringInfo(&buf,
-						 "ALTER TABLE %s.%s SET ("
-						 "auto_partition_strategy = %s, "
-						 "auto_partition_column = %s, "
-						 "auto_partition_interval = %s, "
-						 "auto_partition_retention = %d)",
+		appendStringInfo(&buf, "ALTER TABLE %s.%s RENAME TO %s",
 						 quote_identifier(nsname),
-						 quote_identifier(relname),
-						 quote_literal_cstr("range_date"),
-						 quote_literal_cstr(partcol),
-						 quote_literal_cstr(partinterval),
-						 retention);
+						 quote_identifier(init_name),
+						 quote_identifier(final_init_name));
 		SPI_exec(buf.data, 0);
 		pfree(buf.data);
 
+		ap_reattach_seqs(nsname, relname, &seqs);
+
+		/* f. Re-apply reloptions. */
+		ap_restore_reloptions(nsname, relname, "range_date",
+							  partcol, partinterval, retention);
+
+		/* g. Re-add FKs as NOT VALID. */
+		ap_add_fks_not_valid(nsname, relname, &out_fks, &in_fks);
+
 		ereport(LOG,
-				(errmsg("auto-partition: converted %s.%s, initial partition %s.%s",
-						nsname, relname, nsname, final_init_name)));
+				(errmsg("auto-partition: converted %s.%s, initial partition %s.%s%s",
+						nsname, relname, nsname, final_init_name,
+						(out_fks.count + in_fks.count > 0) ? " (FKs preserved)" : "")));
 		converted = true;
 
 		ReleaseCurrentSubTransaction();
@@ -614,6 +1049,12 @@ convert_heap_to_partitioned_date(Oid reloid, const char *nsname,
 		converted = false;
 	}
 	PG_END_TRY();
+
+	if (converted)
+	{
+		ap_validate_fks(nsname, relname, &out_fks, &in_fks);
+		ap_recreate_triggers(nsname, relname, &trigs);
+	}
 
 	return converted;
 }
@@ -635,33 +1076,10 @@ convert_heap_to_partitioned(Oid reloid, const char *nsname, const char *relname,
 	int64		row_count = 0;
 	int64		lower_bound,
 				upper_bound;
-	bool		has_fk_in PG_USED_FOR_ASSERTS_ONLY = false,
-				has_fk_out PG_USED_FOR_ASSERTS_ONLY = false;
-	bool		pk_ok;
-
-	/*
-	 * Captured FK state, lives in TopTransactionContext so it survives
-	 * subtxn rollback if we have to retry.  All four arrays for inbound
-	 * are parallel; out_fk_* are parallel.
-	 */
-	int			out_fk_count = 0;
-	char	  **out_fk_names = NULL;
-	char	  **out_fk_defs = NULL;
-	int			in_fk_count = 0;
-	char	  **in_fk_names = NULL;
-	char	  **in_fk_defs = NULL;
-	char	  **in_fk_owners = NULL;
-	char	  **in_fk_owner_schemas = NULL;
-
-	/*
-	 * Captured user trigger definitions.  pg_get_triggerdef returns a
-	 * full CREATE TRIGGER statement we can replay verbatim after the
-	 * swap; the trigger will be installed on the new partitioned parent
-	 * and PG auto-propagates it to existing and future partitions.
-	 */
-	int			trig_count = 0;
-	char	  **trig_names = NULL;
-	char	  **trig_defs = NULL;
+	ApFkList	out_fks,
+				in_fks;
+	ApTrigList	trigs;
+	ApSeqList	seqs;
 
 	/* Parse interval */
 	if (partinterval == NULL || *partinterval == '\0')
@@ -676,51 +1094,11 @@ convert_heap_to_partitioned(Oid reloid, const char *nsname, const char *relname,
 		return false;
 	}
 
-	/*
-	 * Validate prereqs: PK is a single column matching partcol; no FKs
-	 * in/out; no user triggers.  All checks via separate SPI queries
-	 * because mixing them in one query gets ugly.
-	 */
-	initStringInfo(&buf);
-	appendStringInfo(&buf,
-					 "SELECT EXISTS ( "
-					 "  SELECT 1 FROM pg_constraint con "
-					 "  JOIN pg_attribute a "
-					 "    ON a.attrelid = con.conrelid "
-					 "   AND a.attnum = ANY(con.conkey) "
-					 "  WHERE con.conrelid = %u "
-					 "    AND con.contype = 'p' "
-					 "    AND array_length(con.conkey,1) = 1 "
-					 "    AND a.attname = %s)",
-					 reloid, quote_literal_cstr(partcol));
-	ret = SPI_execute(buf.data, true, 0);
-	pfree(buf.data);
-	if (ret != SPI_OK_SELECT || SPI_processed == 0)
-	{
-		ereport(WARNING,
-				(errmsg("auto-partition: %s.%s: conversion check failed",
-						nsname, relname)));
+	/* PK must be a single column equal to partcol. */
+	if (!ap_check_pk_includes_col(reloid, nsname, relname, partcol, true))
 		return false;
-	}
-	{
-		bool		isnull;
 
-		pk_ok = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
-										   SPI_tuptable->tupdesc, 1, &isnull));
-	}
-	if (!pk_ok)
-	{
-		ereport(WARNING,
-				(errmsg("auto-partition: %s.%s: cannot convert (PK must be single column equal to partition_column %s)",
-						nsname, relname, partcol)));
-		return false;
-	}
-
-	/* Triggers are now captured + restored (Phase 3d), not refused. */
-	(void) has_fk_in;
-	(void) has_fk_out;
-
-	/* Compute initial partition bounds */
+	/* Compute initial partition bounds. */
 	initStringInfo(&buf);
 	appendStringInfo(&buf,
 					 "SELECT min(%s), max(%s), count(*)::bigint FROM %s.%s",
@@ -773,139 +1151,15 @@ convert_heap_to_partitioned(Oid reloid, const char *nsname, const char *relname,
 					(long long) min_val, (long long) max_val,
 					(long long) lower_bound, (long long) upper_bound)));
 
-	/*
-	 * Capture FK definitions before the subtransaction, in
-	 * TopTransactionContext so the strings survive any subtxn rollback.
-	 *
-	 * Outbound FKs live on the source itself (con.conrelid = reloid).
-	 * Inbound FKs live on other tables and reference the source
-	 * (con.confrelid = reloid).  For each we save (a) the qualified
-	 * table on which the constraint sits, and (b) pg_get_constraintdef
-	 * which renders an ALTER-able definition like
-	 *    "FOREIGN KEY (author_id) REFERENCES public.res_partner(id) ..."
-	 *
-	 * After the swap the source name resolves to the new partitioned
-	 * relation, so re-adding the constraints with the same definitions
-	 * just works.
-	 */
-	{
-		MemoryContext oldcxt = MemoryContextSwitchTo(TopTransactionContext);
+	/* Capture FKs and triggers before the subtransaction. */
+	ap_capture_fks(reloid, &out_fks, &in_fks);
+	ap_capture_triggers(reloid, &trigs);
 
-		/* Outbound */
-		MemoryContextSwitchTo(oldcxt);
-
-		initStringInfo(&buf);
-		appendStringInfo(&buf,
-						 "SELECT con.conname, pg_get_constraintdef(con.oid) "
-						 "FROM pg_constraint con "
-						 "WHERE con.conrelid = %u AND con.contype = 'f' "
-						 "ORDER BY con.conname",
-						 reloid);
-		ret = SPI_execute(buf.data, true, 0);
-		pfree(buf.data);
-		if (ret == SPI_OK_SELECT && SPI_processed > 0)
-		{
-			MemoryContext c = MemoryContextSwitchTo(TopTransactionContext);
-
-			out_fk_count = (int) SPI_processed;
-			out_fk_names = palloc(sizeof(char *) * out_fk_count);
-			out_fk_defs = palloc(sizeof(char *) * out_fk_count);
-			for (int k = 0; k < out_fk_count; k++)
-			{
-				out_fk_names[k] = pstrdup(SPI_getvalue(SPI_tuptable->vals[k],
-													   SPI_tuptable->tupdesc, 1));
-				out_fk_defs[k] = pstrdup(SPI_getvalue(SPI_tuptable->vals[k],
-													  SPI_tuptable->tupdesc, 2));
-			}
-			MemoryContextSwitchTo(c);
-		}
-
-		/* Inbound */
-		initStringInfo(&buf);
-		appendStringInfo(&buf,
-						 "SELECT con.conname, "
-						 "       pg_get_constraintdef(con.oid), "
-						 "       n.nspname, c.relname "
-						 "FROM pg_constraint con "
-						 "JOIN pg_class c     ON c.oid = con.conrelid "
-						 "JOIN pg_namespace n ON n.oid = c.relnamespace "
-						 "WHERE con.confrelid = %u AND con.contype = 'f' "
-						 "ORDER BY con.conname",
-						 reloid);
-		ret = SPI_execute(buf.data, true, 0);
-		pfree(buf.data);
-		if (ret == SPI_OK_SELECT && SPI_processed > 0)
-		{
-			MemoryContext c = MemoryContextSwitchTo(TopTransactionContext);
-
-			in_fk_count = (int) SPI_processed;
-			in_fk_names = palloc(sizeof(char *) * in_fk_count);
-			in_fk_defs = palloc(sizeof(char *) * in_fk_count);
-			in_fk_owners = palloc(sizeof(char *) * in_fk_count);
-			in_fk_owner_schemas = palloc(sizeof(char *) * in_fk_count);
-			for (int k = 0; k < in_fk_count; k++)
-			{
-				in_fk_names[k] = pstrdup(SPI_getvalue(SPI_tuptable->vals[k],
-													  SPI_tuptable->tupdesc, 1));
-				in_fk_defs[k] = pstrdup(SPI_getvalue(SPI_tuptable->vals[k],
-													 SPI_tuptable->tupdesc, 2));
-				in_fk_owner_schemas[k] = pstrdup(SPI_getvalue(SPI_tuptable->vals[k],
-															  SPI_tuptable->tupdesc, 3));
-				in_fk_owners[k] = pstrdup(SPI_getvalue(SPI_tuptable->vals[k],
-													   SPI_tuptable->tupdesc, 4));
-			}
-			MemoryContextSwitchTo(c);
-		}
-	}
-
-	/*
-	 * Capture user triggers via pg_get_triggerdef.  Skip internal
-	 * triggers (those auto-created for FK enforcement, etc.) — those
-	 * are managed implicitly when the FK constraints are re-added.
-	 *
-	 * Each captured definition is a complete CREATE TRIGGER statement
-	 * that mentions the source table by name, so we just replay it
-	 * after the rename.
-	 */
-	{
-		initStringInfo(&buf);
-		appendStringInfo(&buf,
-						 "SELECT tgname, pg_get_triggerdef(oid) "
-						 "FROM pg_trigger "
-						 "WHERE tgrelid = %u AND NOT tgisinternal "
-						 "ORDER BY tgname",
-						 reloid);
-		ret = SPI_execute(buf.data, true, 0);
-		pfree(buf.data);
-		if (ret == SPI_OK_SELECT && SPI_processed > 0)
-		{
-			MemoryContext c = MemoryContextSwitchTo(TopTransactionContext);
-
-			trig_count = (int) SPI_processed;
-			trig_names = palloc(sizeof(char *) * trig_count);
-			trig_defs = palloc(sizeof(char *) * trig_count);
-			for (int k = 0; k < trig_count; k++)
-			{
-				trig_names[k] = pstrdup(SPI_getvalue(SPI_tuptable->vals[k],
-													 SPI_tuptable->tupdesc, 1));
-				trig_defs[k] = pstrdup(SPI_getvalue(SPI_tuptable->vals[k],
-													SPI_tuptable->tupdesc, 2));
-			}
-			MemoryContextSwitchTo(c);
-		}
-	}
-
-	if (out_fk_count + in_fk_count + trig_count > 0)
+	if (out_fks.count + in_fks.count + trigs.count > 0)
 		ereport(LOG,
-				(errmsg("auto-partition: %s.%s: capturing %d outbound + %d inbound FKs and %d trigger(s) across conversion",
-						nsname, relname,
-						out_fk_count, in_fk_count, trig_count)));
+				(errmsg("auto-partition: %s.%s: capturing %d outbound + %d inbound FKs and %d trigger(s)",
+						nsname, relname, out_fks.count, in_fks.count, trigs.count)));
 
-	/*
-	 * The actual conversion runs inside a subtransaction: any failure
-	 * leaves the source heap untouched and the launcher will retry next
-	 * iteration.
-	 */
 	BeginInternalSubTransaction("autopart_convert");
 	PG_TRY();
 	{
@@ -918,36 +1172,8 @@ convert_heap_to_partitioned(Oid reloid, const char *nsname, const char *relname,
 		snprintf(final_init_name, sizeof(final_init_name),
 				 "%s_p_%lld", relname, (long long) lower_bound);
 
-		/*
-		 * 0. Drop FKs first.  Outbound ones go away with their owning
-		 * table (the soon-to-be-DROP'd source) anyway, but explicitly
-		 * dropping outbound FKs before the source DROP also frees us
-		 * from any LIKE-INCLUDING-ALL pickups.  Inbound FKs MUST be
-		 * dropped first because they'd otherwise block DROP TABLE on
-		 * the source.
-		 */
-		for (int k = 0; k < in_fk_count; k++)
-		{
-			initStringInfo(&buf);
-			appendStringInfo(&buf,
-							 "ALTER TABLE %s.%s DROP CONSTRAINT %s",
-							 quote_identifier(in_fk_owner_schemas[k]),
-							 quote_identifier(in_fk_owners[k]),
-							 quote_identifier(in_fk_names[k]));
-			SPI_exec(buf.data, 0);
-			pfree(buf.data);
-		}
-		for (int k = 0; k < out_fk_count; k++)
-		{
-			initStringInfo(&buf);
-			appendStringInfo(&buf,
-							 "ALTER TABLE %s.%s DROP CONSTRAINT %s",
-							 quote_identifier(nsname),
-							 quote_identifier(relname),
-							 quote_identifier(out_fk_names[k]));
-			SPI_exec(buf.data, 0);
-			pfree(buf.data);
-		}
+		/* 0. Drop FKs (inbound first, then outbound). */
+		ap_drop_fks(nsname, relname, &out_fks, &in_fks);
 
 		/* 1. Create empty partitioned table mirroring the source. */
 		initStringInfo(&buf);
@@ -976,7 +1202,7 @@ convert_heap_to_partitioned(Oid reloid, const char *nsname, const char *relname,
 		SPI_exec(buf.data, 0);
 		pfree(buf.data);
 
-		/* 3. Copy existing rows.  Single statement, single transaction. */
+		/* 3. Copy existing rows. */
 		if (row_count > 0)
 		{
 			initStringInfo(&buf);
@@ -990,188 +1216,37 @@ convert_heap_to_partitioned(Oid reloid, const char *nsname, const char *relname,
 			pfree(buf.data);
 		}
 
-		/* 4. Atomic swap (brief ACCESS EXCLUSIVE on source).
-		 *
-		 *    Tricky bit: CREATE TABLE LIKE INCLUDING ALL copies the
-		 *    DEFAULT clause for each column, including DEFAULT
-		 *    nextval('<seq>') from bigserial/serial columns.  The new
-		 *    table's column then depends on a sequence owned by the
-		 *    old table, so DROP TABLE on the source fails with
-		 *    "other objects depend on it".
-		 *
-		 *    We unhook the sequences (OWNED BY NONE) before the DROP,
-		 *    then re-own them to the swapped-in relation's column
-		 *    after the rename so the new table cleans up properly on
-		 *    eventual DROP.
-		 */
-		{
-			SPITupleTable *seqtab;
-			int			seq_ret;
-			int			seq_count;
-			char	  **seq_names = NULL;
-			char	  **seq_columns = NULL;
-
-			initStringInfo(&buf);
-			appendStringInfo(&buf,
-							 "SELECT s.relname, a.attname "
-							 "FROM pg_depend d "
-							 "JOIN pg_class s ON s.oid = d.objid AND s.relkind = 'S' "
-							 "JOIN pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid "
-							 "WHERE d.refobjid = %u "
-							 "  AND d.classid = 'pg_class'::regclass "
-							 "  AND d.refclassid = 'pg_class'::regclass "
-							 "  AND d.deptype = 'a'",
-							 reloid);
-			seq_ret = SPI_execute(buf.data, true, 0);
-			pfree(buf.data);
-
-			if (seq_ret == SPI_OK_SELECT && SPI_processed > 0)
-			{
-				MemoryContext oldcxt;
-
-				seq_count = (int) SPI_processed;
-				seqtab = SPI_tuptable;
-				oldcxt = MemoryContextSwitchTo(TopTransactionContext);
-				seq_names = palloc(sizeof(char *) * seq_count);
-				seq_columns = palloc(sizeof(char *) * seq_count);
-				for (int s = 0; s < seq_count; s++)
-				{
-					seq_names[s] = pstrdup(SPI_getvalue(seqtab->vals[s], seqtab->tupdesc, 1));
-					seq_columns[s] = pstrdup(SPI_getvalue(seqtab->vals[s], seqtab->tupdesc, 2));
-				}
-				MemoryContextSwitchTo(oldcxt);
-			}
-			else
-				seq_count = 0;
-
-			/* Detach all owned sequences from the source. */
-			for (int s = 0; s < seq_count; s++)
-			{
-				initStringInfo(&buf);
-				appendStringInfo(&buf, "ALTER SEQUENCE %s.%s OWNED BY NONE",
-								 quote_identifier(nsname),
-								 quote_identifier(seq_names[s]));
-				SPI_exec(buf.data, 0);
-				pfree(buf.data);
-			}
-
-			/* Now the actual swap. */
-			initStringInfo(&buf);
-			appendStringInfo(&buf, "LOCK TABLE %s.%s IN ACCESS EXCLUSIVE MODE",
-							 quote_identifier(nsname),
-							 quote_identifier(relname));
-			SPI_exec(buf.data, 0);
-			pfree(buf.data);
-
-			initStringInfo(&buf);
-			appendStringInfo(&buf, "DROP TABLE %s.%s",
-							 quote_identifier(nsname),
-							 quote_identifier(relname));
-			SPI_exec(buf.data, 0);
-			pfree(buf.data);
-
-			initStringInfo(&buf);
-			appendStringInfo(&buf, "ALTER TABLE %s.%s RENAME TO %s",
-							 quote_identifier(nsname),
-							 quote_identifier(tmp_name),
-							 quote_identifier(relname));
-			SPI_exec(buf.data, 0);
-			pfree(buf.data);
-
-			initStringInfo(&buf);
-			appendStringInfo(&buf, "ALTER TABLE %s.%s RENAME TO %s",
-							 quote_identifier(nsname),
-							 quote_identifier(init_name),
-							 quote_identifier(final_init_name));
-			SPI_exec(buf.data, 0);
-			pfree(buf.data);
-
-			/* Re-attach sequences to the new (now correctly-named) table. */
-			for (int s = 0; s < seq_count; s++)
-			{
-				initStringInfo(&buf);
-				appendStringInfo(&buf,
-								 "ALTER SEQUENCE %s.%s OWNED BY %s.%s.%s",
-								 quote_identifier(nsname),
-								 quote_identifier(seq_names[s]),
-								 quote_identifier(nsname),
-								 quote_identifier(relname),
-								 quote_identifier(seq_columns[s]));
-				SPI_exec(buf.data, 0);
-				pfree(buf.data);
-			}
-		}
-
 		/*
-		 * 5. Re-apply the auto_partition reloptions on the swapped-in
-		 *    relation.  CREATE TABLE LIKE INCLUDING ALL did NOT copy
-		 *    reloptions (and shouldn't have — they referenced the old
-		 *    heap); we set them now so the launcher sees the new
-		 *    partitioned table on the next iteration.
+		 * 4. Atomic swap.  Detach owned sequences before DROP so
+		 *    "other objects depend on it" doesn't fire, then re-attach
+		 *    after the rename so the new partitioned table owns them.
 		 */
+		ap_capture_seqs(reloid, &seqs);
+		ap_detach_seqs(nsname, &seqs);
+		ap_atomic_swap(nsname, relname, tmp_name);
+
+		/* Rename the initial partition to its final name. */
 		initStringInfo(&buf);
-		appendStringInfo(&buf,
-						 "ALTER TABLE %s.%s SET ("
-						 "auto_partition_strategy = %s, "
-						 "auto_partition_column = %s, "
-						 "auto_partition_interval = %s, "
-						 "auto_partition_retention = %d)",
+		appendStringInfo(&buf, "ALTER TABLE %s.%s RENAME TO %s",
 						 quote_identifier(nsname),
-						 quote_identifier(relname),
-						 quote_literal_cstr("range_int"),
-						 quote_literal_cstr(partcol),
-						 quote_literal_cstr(partinterval),
-						 retention);
+						 quote_identifier(init_name),
+						 quote_identifier(final_init_name));
 		SPI_exec(buf.data, 0);
 		pfree(buf.data);
 
-		/*
-		 * 6. Re-create FKs as NOT VALID inside the swap window.
-		 *
-		 *    A plain ADD CONSTRAINT validates the constraint against
-		 *    every tuple under ACCESS EXCLUSIVE lock — a full scan that
-		 *    can lock a populated table for minutes.  ADD CONSTRAINT
-		 *    ... NOT VALID is metadata-only: PG will enforce the
-		 *    constraint on future writes immediately, but skip the
-		 *    initial validation scan.  We then run VALIDATE CONSTRAINT
-		 *    *after* the swap subtransaction commits, where it takes
-		 *    only ShareUpdateExclusiveLock and lets concurrent writers
-		 *    keep going.
-		 *
-		 *    pg_get_constraintdef rendered each definition with full
-		 *    schema-qualified targets, so the same string works
-		 *    against the new partitioned relation.
-		 */
-		for (int k = 0; k < out_fk_count; k++)
-		{
-			initStringInfo(&buf);
-			appendStringInfo(&buf,
-							 "ALTER TABLE %s.%s ADD CONSTRAINT %s %s NOT VALID",
-							 quote_identifier(nsname),
-							 quote_identifier(relname),
-							 quote_identifier(out_fk_names[k]),
-							 out_fk_defs[k]);
-			SPI_exec(buf.data, 0);
-			pfree(buf.data);
-		}
-		for (int k = 0; k < in_fk_count; k++)
-		{
-			initStringInfo(&buf);
-			appendStringInfo(&buf,
-							 "ALTER TABLE %s.%s ADD CONSTRAINT %s %s NOT VALID",
-							 quote_identifier(in_fk_owner_schemas[k]),
-							 quote_identifier(in_fk_owners[k]),
-							 quote_identifier(in_fk_names[k]),
-							 in_fk_defs[k]);
-			SPI_exec(buf.data, 0);
-			pfree(buf.data);
-		}
+		ap_reattach_seqs(nsname, relname, &seqs);
+
+		/* 5. Re-apply reloptions. */
+		ap_restore_reloptions(nsname, relname, "range_int",
+							  partcol, partinterval, retention);
+
+		/* 6. Re-add FKs as NOT VALID (validation happens post-swap). */
+		ap_add_fks_not_valid(nsname, relname, &out_fks, &in_fks);
 
 		ereport(LOG,
 				(errmsg("auto-partition: converted %s.%s, initial partition %s.%s%s",
 						nsname, relname, nsname, final_init_name,
-						(out_fk_count + in_fk_count > 0)
-							? " (FKs preserved)" : "")));
+						(out_fks.count + in_fks.count > 0) ? " (FKs preserved)" : "")));
 		converted = true;
 
 		ReleaseCurrentSubTransaction();
@@ -1192,130 +1267,10 @@ convert_heap_to_partitioned(Oid reloid, const char *nsname, const char *relname,
 	}
 	PG_END_TRY();
 
-	/*
-	 * Post-swap: VALIDATE each FK we re-added as NOT VALID.  Each runs
-	 * in its own subtransaction so a single orphan-row failure leaves
-	 * the constraint NOT VALID (correctly enforced on writes; its
-	 * pre-existing data is uncertified) without affecting the others.
-	 *
-	 * VALIDATE CONSTRAINT takes ShareUpdateExclusiveLock — concurrent
-	 * SELECT and DML on the relation continue normally during the
-	 * validation scan.  This is the production-grade swap pattern:
-	 * the brief ACCESS EXCLUSIVE window from step 4 above is constant
-	 * time relative to table size, and the long-tail validation
-	 * happens out of band.
-	 */
-	if (converted && (out_fk_count + in_fk_count > 0))
+	if (converted)
 	{
-		for (int k = 0; k < out_fk_count; k++)
-		{
-			BeginInternalSubTransaction("autopart_validate_fk");
-			PG_TRY();
-			{
-				initStringInfo(&buf);
-				appendStringInfo(&buf,
-								 "ALTER TABLE %s.%s VALIDATE CONSTRAINT %s",
-								 quote_identifier(nsname),
-								 quote_identifier(relname),
-								 quote_identifier(out_fk_names[k]));
-				SPI_exec(buf.data, 0);
-				pfree(buf.data);
-				ReleaseCurrentSubTransaction();
-			}
-			PG_CATCH();
-			{
-				ErrorData  *edata;
-
-				MemoryContextSwitchTo(TopTransactionContext);
-				edata = CopyErrorData();
-				ereport(WARNING,
-						(errmsg("auto-partition: %s.%s: VALIDATE %s failed: %s",
-								nsname, relname, out_fk_names[k], edata->message)));
-				FreeErrorData(edata);
-				FlushErrorState();
-				RollbackAndReleaseCurrentSubTransaction();
-			}
-			PG_END_TRY();
-		}
-		for (int k = 0; k < in_fk_count; k++)
-		{
-			BeginInternalSubTransaction("autopart_validate_fk_in");
-			PG_TRY();
-			{
-				initStringInfo(&buf);
-				appendStringInfo(&buf,
-								 "ALTER TABLE %s.%s VALIDATE CONSTRAINT %s",
-								 quote_identifier(in_fk_owner_schemas[k]),
-								 quote_identifier(in_fk_owners[k]),
-								 quote_identifier(in_fk_names[k]));
-				SPI_exec(buf.data, 0);
-				pfree(buf.data);
-				ReleaseCurrentSubTransaction();
-			}
-			PG_CATCH();
-			{
-				ErrorData  *edata;
-
-				MemoryContextSwitchTo(TopTransactionContext);
-				edata = CopyErrorData();
-				ereport(WARNING,
-						(errmsg("auto-partition: %s.%s: VALIDATE %s failed: %s",
-								in_fk_owners[k], in_fk_names[k],
-								in_fk_names[k], edata->message)));
-				FreeErrorData(edata);
-				FlushErrorState();
-				RollbackAndReleaseCurrentSubTransaction();
-			}
-			PG_END_TRY();
-		}
-		ereport(LOG,
-				(errmsg("auto-partition: %s.%s: validated %d FK constraint(s) post-swap",
-						nsname, relname, out_fk_count + in_fk_count)));
-	}
-
-	/*
-	 * Post-swap trigger recreation.  Same pattern as the FK VALIDATE
-	 * loop — sequential subtransactions so a single bad trigger leaves
-	 * the conversion in place with a WARNING in the log instead of
-	 * rolling back everything.
-	 *
-	 * pg_get_triggerdef returned a full CREATE TRIGGER statement that
-	 * references the original table name; the swapped-in relation
-	 * carries the same name, so the same DDL works against the new
-	 * partitioned parent.  PG auto-propagates the trigger to existing
-	 * and future partitions.
-	 */
-	if (converted && trig_count > 0)
-	{
-		int			recreated = 0;
-
-		for (int k = 0; k < trig_count; k++)
-		{
-			BeginInternalSubTransaction("autopart_recreate_trig");
-			PG_TRY();
-			{
-				SPI_exec(trig_defs[k], 0);
-				recreated++;
-				ReleaseCurrentSubTransaction();
-			}
-			PG_CATCH();
-			{
-				ErrorData  *edata;
-
-				MemoryContextSwitchTo(TopTransactionContext);
-				edata = CopyErrorData();
-				ereport(WARNING,
-						(errmsg("auto-partition: %s.%s: recreating trigger %s failed: %s",
-								nsname, relname, trig_names[k], edata->message)));
-				FreeErrorData(edata);
-				FlushErrorState();
-				RollbackAndReleaseCurrentSubTransaction();
-			}
-			PG_END_TRY();
-		}
-		ereport(LOG,
-				(errmsg("auto-partition: %s.%s: recreated %d/%d trigger(s) post-swap",
-						nsname, relname, recreated, trig_count)));
+		ap_validate_fks(nsname, relname, &out_fks, &in_fks);
+		ap_recreate_triggers(nsname, relname, &trigs);
 	}
 
 	return converted;
@@ -2029,77 +1984,22 @@ convert_heap_to_partitioned_list(Oid reloid, const char *nsname,
 	StringInfoData buf;
 	int			ret;
 	bool		converted = false;
-	bool		col_in_pk;
 	bool		has_fk_in,
 				has_fk_out,
 				has_trigger;
 	int			value_count;
 	int64	   *values = NULL;
 	int64		row_count = 0;
-	MemoryContext savecxt;
+	ApSeqList	seqs;
 
-	/* 1. partition_column must be part of the PK. */
-	initStringInfo(&buf);
-	appendStringInfo(&buf,
-					 "SELECT EXISTS ("
-					 "  SELECT 1 FROM pg_constraint con "
-					 "  JOIN pg_attribute a "
-					 "    ON a.attrelid = con.conrelid "
-					 "   AND a.attnum = ANY(con.conkey) "
-					 "  WHERE con.conrelid = %u "
-					 "    AND con.contype = 'p' "
-					 "    AND a.attname = %s)",
-					 reloid, quote_literal_cstr(partcol));
-	ret = SPI_execute(buf.data, true, 0);
-	pfree(buf.data);
-	if (ret != SPI_OK_SELECT || SPI_processed == 0)
-	{
-		ereport(WARNING,
-				(errmsg("auto-partition: %s.%s: PK check failed",
-						nsname, relname)));
+	/* 1. partcol must be part of the PK. */
+	if (!ap_check_pk_includes_col(reloid, nsname, relname, partcol, false))
 		return false;
-	}
-	{
-		bool		isnull;
 
-		col_in_pk = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
-											   SPI_tuptable->tupdesc, 1, &isnull));
-	}
-	if (!col_in_pk)
-	{
-		ereport(WARNING,
-				(errmsg("auto-partition: %s.%s: list_int conversion needs %s in the primary key",
-						nsname, relname, partcol)));
+	/* 2. Refuse FKs and triggers until Phase C adds support. */
+	if (!ap_check_fk_trigger_presence(reloid, nsname, relname,
+									  &has_fk_in, &has_fk_out, &has_trigger))
 		return false;
-	}
-
-	/* 2. Refuse FKs and triggers — same shape problem as range_date. */
-	initStringInfo(&buf);
-	appendStringInfo(&buf,
-					 "SELECT "
-					 "  EXISTS(SELECT 1 FROM pg_constraint WHERE confrelid=%u AND contype='f'), "
-					 "  EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid=%u  AND contype='f'), "
-					 "  EXISTS(SELECT 1 FROM pg_trigger    WHERE tgrelid=%u   AND NOT tgisinternal)",
-					 reloid, reloid, reloid);
-	ret = SPI_execute(buf.data, true, 0);
-	pfree(buf.data);
-	if (ret != SPI_OK_SELECT || SPI_processed == 0)
-	{
-		ereport(WARNING,
-				(errmsg("auto-partition: %s.%s: FK/trigger check failed",
-						nsname, relname)));
-		return false;
-	}
-	{
-		bool		isnull;
-
-		has_fk_in = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
-											   SPI_tuptable->tupdesc, 1, &isnull));
-		has_fk_out = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
-											   SPI_tuptable->tupdesc, 2, &isnull));
-		has_trigger = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
-												 SPI_tuptable->tupdesc, 3, &isnull));
-	}
 	if (has_fk_in || has_fk_out || has_trigger)
 	{
 		ereport(WARNING,
@@ -2130,11 +2030,6 @@ convert_heap_to_partitioned_list(Oid reloid, const char *nsname,
 
 	if (value_count == 0)
 	{
-		/*
-		 * Empty source.  Build only the parent + DEFAULT — no value
-		 * partitions yet.  The launcher's rotation pass will promote
-		 * values out of DEFAULT once data starts landing.
-		 */
 		ereport(LOG,
 				(errmsg("auto-partition: converting %s.%s (empty heap) -> partitioned with DEFAULT only",
 						nsname, relname)));
@@ -2142,9 +2037,10 @@ convert_heap_to_partitioned_list(Oid reloid, const char *nsname,
 	else
 	{
 		MemoryContext c = MemoryContextSwitchTo(TopTransactionContext);
+		int			k;
 
 		values = palloc(sizeof(int64) * value_count);
-		for (int k = 0; k < value_count; k++)
+		for (k = 0; k < value_count; k++)
 		{
 			bool		isnull;
 
@@ -2155,7 +2051,7 @@ convert_heap_to_partitioned_list(Oid reloid, const char *nsname,
 		MemoryContextSwitchTo(c);
 	}
 
-	/* Row count for the log line (separate query — DISTINCT didn't return it). */
+	/* Row count for the log line. */
 	initStringInfo(&buf);
 	appendStringInfo(&buf, "SELECT count(*)::bigint FROM %s.%s",
 					 quote_identifier(nsname), quote_identifier(relname));
@@ -2174,12 +2070,12 @@ convert_heap_to_partitioned_list(Oid reloid, const char *nsname,
 					nsname, relname, (long long) row_count, value_count, partcol)));
 
 	/* 4. Conversion proper. */
-	(void) savecxt;
 	BeginInternalSubTransaction("autopart_convert_list");
 	PG_TRY();
 	{
 		char		tmp_name[NAMEDATALEN];
 		char		default_name[NAMEDATALEN];
+		int			k;
 
 		snprintf(tmp_name, sizeof(tmp_name), "%s__autopart_new", relname);
 		snprintf(default_name, sizeof(default_name), "%s_default", relname);
@@ -2198,7 +2094,7 @@ convert_heap_to_partitioned_list(Oid reloid, const char *nsname,
 		pfree(buf.data);
 
 		/* b. One partition per distinct value. */
-		for (int k = 0; k < value_count; k++)
+		for (k = 0; k < value_count; k++)
 		{
 			char		child_name[NAMEDATALEN];
 
@@ -2250,145 +2146,50 @@ convert_heap_to_partitioned_list(Oid reloid, const char *nsname,
 			pfree(buf.data);
 		}
 
-		/* e. Sequence detach + swap + reattach.  Same as range_int. */
+		/* e. Atomic swap + sequence dance. */
+		ap_capture_seqs(reloid, &seqs);
+		ap_detach_seqs(nsname, &seqs);
+		ap_atomic_swap(nsname, relname, tmp_name);
+
+		/* Rename the per-value partitions to clean names. */
+		for (k = 0; k < value_count; k++)
 		{
-			SPITupleTable *seqtab;
-			int			seq_ret;
-			int			seq_count;
-			char	  **seq_names = NULL;
-			char	  **seq_columns = NULL;
+			char		old_name[NAMEDATALEN];
+			char		new_name[NAMEDATALEN];
 
-			initStringInfo(&buf);
-			appendStringInfo(&buf,
-							 "SELECT s.relname, a.attname "
-							 "FROM pg_depend d "
-							 "JOIN pg_class s ON s.oid = d.objid AND s.relkind = 'S' "
-							 "JOIN pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid "
-							 "WHERE d.refobjid = %u "
-							 "  AND d.classid = 'pg_class'::regclass "
-							 "  AND d.refclassid = 'pg_class'::regclass "
-							 "  AND d.deptype = 'a'",
-							 reloid);
-			seq_ret = SPI_execute(buf.data, true, 0);
-			pfree(buf.data);
-
-			if (seq_ret == SPI_OK_SELECT && SPI_processed > 0)
-			{
-				MemoryContext oldcxt;
-
-				seq_count = (int) SPI_processed;
-				seqtab = SPI_tuptable;
-				oldcxt = MemoryContextSwitchTo(TopTransactionContext);
-				seq_names = palloc(sizeof(char *) * seq_count);
-				seq_columns = palloc(sizeof(char *) * seq_count);
-				for (int s = 0; s < seq_count; s++)
-				{
-					seq_names[s] = pstrdup(SPI_getvalue(seqtab->vals[s], seqtab->tupdesc, 1));
-					seq_columns[s] = pstrdup(SPI_getvalue(seqtab->vals[s], seqtab->tupdesc, 2));
-				}
-				MemoryContextSwitchTo(oldcxt);
-			}
-			else
-				seq_count = 0;
-
-			for (int s = 0; s < seq_count; s++)
-			{
-				initStringInfo(&buf);
-				appendStringInfo(&buf, "ALTER SEQUENCE %s.%s OWNED BY NONE",
-								 quote_identifier(nsname),
-								 quote_identifier(seq_names[s]));
-				SPI_exec(buf.data, 0);
-				pfree(buf.data);
-			}
-
-			initStringInfo(&buf);
-			appendStringInfo(&buf, "LOCK TABLE %s.%s IN ACCESS EXCLUSIVE MODE",
-							 quote_identifier(nsname),
-							 quote_identifier(relname));
-			SPI_exec(buf.data, 0);
-			pfree(buf.data);
-
-			initStringInfo(&buf);
-			appendStringInfo(&buf, "DROP TABLE %s.%s",
-							 quote_identifier(nsname),
-							 quote_identifier(relname));
-			SPI_exec(buf.data, 0);
-			pfree(buf.data);
+			snprintf(old_name, sizeof(old_name),
+					 "%s__autopart_new_p_%lld", relname, (long long) values[k]);
+			snprintf(new_name, sizeof(new_name),
+					 "%s_p_%lld", relname, (long long) values[k]);
 
 			initStringInfo(&buf);
 			appendStringInfo(&buf, "ALTER TABLE %s.%s RENAME TO %s",
 							 quote_identifier(nsname),
-							 quote_identifier(tmp_name),
-							 quote_identifier(relname));
+							 quote_identifier(old_name),
+							 quote_identifier(new_name));
 			SPI_exec(buf.data, 0);
 			pfree(buf.data);
-
-			/* Rename the per-value partitions to clean names. */
-			for (int k = 0; k < value_count; k++)
-			{
-				char		old[NAMEDATALEN];
-				char		new[NAMEDATALEN];
-
-				snprintf(old, sizeof(old),
-						 "%s__autopart_new_p_%lld",
-						 relname, (long long) values[k]);
-				snprintf(new, sizeof(new),
-						 "%s_p_%lld",
-						 relname, (long long) values[k]);
-
-				initStringInfo(&buf);
-				appendStringInfo(&buf,
-								 "ALTER TABLE %s.%s RENAME TO %s",
-								 quote_identifier(nsname),
-								 quote_identifier(old),
-								 quote_identifier(new));
-				SPI_exec(buf.data, 0);
-				pfree(buf.data);
-			}
-			/* Rename the DEFAULT partition. */
-			{
-				char		old[NAMEDATALEN];
-
-				snprintf(old, sizeof(old), "%s__autopart_new_default", relname);
-				initStringInfo(&buf);
-				appendStringInfo(&buf,
-								 "ALTER TABLE %s.%s RENAME TO %s",
-								 quote_identifier(nsname),
-								 quote_identifier(old),
-								 quote_identifier(default_name));
-				SPI_exec(buf.data, 0);
-				pfree(buf.data);
-			}
-
-			for (int s = 0; s < seq_count; s++)
-			{
-				initStringInfo(&buf);
-				appendStringInfo(&buf,
-								 "ALTER SEQUENCE %s.%s OWNED BY %s.%s.%s",
-								 quote_identifier(nsname),
-								 quote_identifier(seq_names[s]),
-								 quote_identifier(nsname),
-								 quote_identifier(relname),
-								 quote_identifier(seq_columns[s]));
-				SPI_exec(buf.data, 0);
-				pfree(buf.data);
-			}
 		}
 
-		/* f. Re-apply reloptions. */
-		initStringInfo(&buf);
-		appendStringInfo(&buf,
-						 "ALTER TABLE %s.%s SET ("
-						 "auto_partition_strategy = %s, "
-						 "auto_partition_column = %s, "
-						 "auto_partition_retention = %d)",
-						 quote_identifier(nsname),
-						 quote_identifier(relname),
-						 quote_literal_cstr("list_int"),
-						 quote_literal_cstr(partcol),
-						 retention);
-		SPI_exec(buf.data, 0);
-		pfree(buf.data);
+		/* Rename the DEFAULT partition. */
+		{
+			char		old_name[NAMEDATALEN];
+
+			snprintf(old_name, sizeof(old_name), "%s__autopart_new_default", relname);
+			initStringInfo(&buf);
+			appendStringInfo(&buf, "ALTER TABLE %s.%s RENAME TO %s",
+							 quote_identifier(nsname),
+							 quote_identifier(old_name),
+							 quote_identifier(default_name));
+			SPI_exec(buf.data, 0);
+			pfree(buf.data);
+		}
+
+		ap_reattach_seqs(nsname, relname, &seqs);
+
+		/* f. Re-apply reloptions (no partinterval for list_int). */
+		ap_restore_reloptions(nsname, relname, "list_int",
+							  partcol, NULL, retention);
 
 		ereport(LOG,
 				(errmsg("auto-partition: converted %s.%s -> LIST partitioned with %d explicit partition(s) + DEFAULT",
