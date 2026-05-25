@@ -13,11 +13,10 @@
  *	               is set and exceeded, DETACH + DROP the oldest
  *	               partitions until the count is at retention.
  *
- *	  range_date : heap conversion + rotation + retention (FK/trigger
- *	               support coming in Phase B).
+ *	  range_date : heap conversion + rotation + retention + FK/trigger
+ *	               preservation.
  *	  list_int   : heap conversion (one partition per distinct value) +
- *	               DEFAULT-partition rotation (FK/trigger support coming
- *	               in Phase C).
+ *	               DEFAULT-partition rotation + FK/trigger preservation.
  *
  *	Heap relations (relkind='r') are converted automatically; the
  *	conversion runs while writers proceed and takes ACCESS EXCLUSIVE
@@ -250,48 +249,6 @@ ap_check_pk_includes_col(Oid reloid, const char *nsname, const char *relname,
 							nsname, relname, partcol)));
 	}
 	return ok;
-}
-
-/*
- * ap_check_fk_trigger_presence — detect FK and trigger presence without
- * capturing definitions.  Returns false on SPI error.
- */
-static bool
-ap_check_fk_trigger_presence(Oid reloid, const char *nsname, const char *relname,
-							 bool *has_fk_in, bool *has_fk_out, bool *has_trigger)
-{
-	StringInfoData buf;
-	int			ret;
-
-	*has_fk_in = *has_fk_out = *has_trigger = false;
-
-	initStringInfo(&buf);
-	appendStringInfo(&buf,
-					 "SELECT "
-					 "  EXISTS(SELECT 1 FROM pg_constraint WHERE confrelid=%u AND contype='f'), "
-					 "  EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid=%u  AND contype='f'), "
-					 "  EXISTS(SELECT 1 FROM pg_trigger    WHERE tgrelid=%u   AND NOT tgisinternal)",
-					 reloid, reloid, reloid);
-	ret = SPI_execute(buf.data, true, 0);
-	pfree(buf.data);
-	if (ret != SPI_OK_SELECT || SPI_processed == 0)
-	{
-		ereport(WARNING,
-				(errmsg("auto-partition: %s.%s: FK/trigger presence check failed",
-						nsname, relname)));
-		return false;
-	}
-	{
-		bool		isnull;
-
-		*has_fk_in = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
-											   SPI_tuptable->tupdesc, 1, &isnull));
-		*has_fk_out = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
-											    SPI_tuptable->tupdesc, 2, &isnull));
-		*has_trigger = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
-												  SPI_tuptable->tupdesc, 3, &isnull));
-	}
-	return true;
 }
 
 /*
@@ -1984,9 +1941,9 @@ convert_heap_to_partitioned_list(Oid reloid, const char *nsname,
 	StringInfoData buf;
 	int			ret;
 	bool		converted = false;
-	bool		has_fk_in,
-				has_fk_out,
-				has_trigger;
+	ApFkList	out_fks,
+				in_fks;
+	ApTrigList	trigs;
 	int			value_count;
 	int64	   *values = NULL;
 	int64		row_count = 0;
@@ -1996,17 +1953,14 @@ convert_heap_to_partitioned_list(Oid reloid, const char *nsname,
 	if (!ap_check_pk_includes_col(reloid, nsname, relname, partcol, false))
 		return false;
 
-	/* 2. Refuse FKs and triggers until Phase C adds support. */
-	if (!ap_check_fk_trigger_presence(reloid, nsname, relname,
-									  &has_fk_in, &has_fk_out, &has_trigger))
-		return false;
-	if (has_fk_in || has_fk_out || has_trigger)
-	{
-		ereport(WARNING,
-				(errmsg("auto-partition: %s.%s: list_int conversion currently refuses FKs/triggers — drop them, let the launcher convert, then recreate",
-						nsname, relname)));
-		return false;
-	}
+	/* 2. Capture FKs and triggers before the subtransaction. */
+	ap_capture_fks(reloid, &out_fks, &in_fks);
+	ap_capture_triggers(reloid, &trigs);
+
+	if (out_fks.count + in_fks.count + trigs.count > 0)
+		ereport(LOG,
+				(errmsg("auto-partition: %s.%s: capturing %d outbound + %d inbound FKs and %d trigger(s)",
+						nsname, relname, out_fks.count, in_fks.count, trigs.count)));
 
 	/* 3. SELECT DISTINCT to discover initial partition values. */
 	initStringInfo(&buf);
@@ -2080,7 +2034,10 @@ convert_heap_to_partitioned_list(Oid reloid, const char *nsname,
 		snprintf(tmp_name, sizeof(tmp_name), "%s__autopart_new", relname);
 		snprintf(default_name, sizeof(default_name), "%s_default", relname);
 
-		/* a. Parent partitioned table. */
+		/* a. Drop FKs. */
+		ap_drop_fks(nsname, relname, &out_fks, &in_fks);
+
+		/* b. Parent partitioned table. */
 		initStringInfo(&buf);
 		appendStringInfo(&buf,
 						 "CREATE TABLE %s.%s (LIKE %s.%s INCLUDING ALL) "
@@ -2093,7 +2050,7 @@ convert_heap_to_partitioned_list(Oid reloid, const char *nsname,
 		SPI_exec(buf.data, 0);
 		pfree(buf.data);
 
-		/* b. One partition per distinct value. */
+		/* c. One partition per distinct value. */
 		for (k = 0; k < value_count; k++)
 		{
 			char		child_name[NAMEDATALEN];
@@ -2115,7 +2072,7 @@ convert_heap_to_partitioned_list(Oid reloid, const char *nsname,
 			pfree(buf.data);
 		}
 
-		/* c. DEFAULT partition for future arrivals. */
+		/* d. DEFAULT partition for future arrivals. */
 		{
 			char		default_initial[NAMEDATALEN];
 
@@ -2132,7 +2089,7 @@ convert_heap_to_partitioned_list(Oid reloid, const char *nsname,
 			pfree(buf.data);
 		}
 
-		/* d. Copy rows.  Partition routing handles the dispatch. */
+		/* e. Copy rows.  Partition routing handles the dispatch. */
 		if (row_count > 0)
 		{
 			initStringInfo(&buf);
@@ -2146,7 +2103,7 @@ convert_heap_to_partitioned_list(Oid reloid, const char *nsname,
 			pfree(buf.data);
 		}
 
-		/* e. Atomic swap + sequence dance. */
+		/* f. Atomic swap + sequence dance. */
 		ap_capture_seqs(reloid, &seqs);
 		ap_detach_seqs(nsname, &seqs);
 		ap_atomic_swap(nsname, relname, tmp_name);
@@ -2187,13 +2144,17 @@ convert_heap_to_partitioned_list(Oid reloid, const char *nsname,
 
 		ap_reattach_seqs(nsname, relname, &seqs);
 
-		/* f. Re-apply reloptions (no partinterval for list_int). */
+		/* g. Re-apply reloptions (no partinterval for list_int). */
 		ap_restore_reloptions(nsname, relname, "list_int",
 							  partcol, NULL, retention);
 
+		/* h. Re-add FKs as NOT VALID. */
+		ap_add_fks_not_valid(nsname, relname, &out_fks, &in_fks);
+
 		ereport(LOG,
-				(errmsg("auto-partition: converted %s.%s -> LIST partitioned with %d explicit partition(s) + DEFAULT",
-						nsname, relname, value_count)));
+				(errmsg("auto-partition: converted %s.%s -> LIST partitioned with %d explicit partition(s) + DEFAULT%s",
+						nsname, relname, value_count,
+						(out_fks.count + in_fks.count > 0) ? " (FKs preserved)" : "")));
 		converted = true;
 
 		ReleaseCurrentSubTransaction();
@@ -2213,6 +2174,12 @@ convert_heap_to_partitioned_list(Oid reloid, const char *nsname,
 		converted = false;
 	}
 	PG_END_TRY();
+
+	if (converted)
+	{
+		ap_validate_fks(nsname, relname, &out_fks, &in_fks);
+		ap_recreate_triggers(nsname, relname, &trigs);
+	}
 
 	return converted;
 }
