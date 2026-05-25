@@ -48,6 +48,7 @@
 #define DBBLUE_COUNTCACHE_DEFAULT_SIZE	16
 
 bool		dbblue_count_cache = true;	/* enable COUNT result caching */
+int			dbblue_countcache_ttl = 300;	/* cache TTL in seconds (GUC) */
 
 static HTAB *countcache = NULL;
 static int	countcache_count = 0;
@@ -123,14 +124,12 @@ current_snapshot_xmin(void)
 }
 
 /*
- * TTL for cache entries.  Odoo's search_count and web_search_read are
- * separate HTTP requests and therefore separate transactions, so requiring
- * the exact same snapshot_xmin would guarantee a miss on every single
- * Odoo page navigation.  5 minutes covers typical user browsing pace while
- * preventing reuse of genuinely stale counts from earlier sessions.
- * DDL-driven staleness is already handled by the relcache callback.
+ * TTL for cache entries.  Driven by the dbblue_count_cache_ttl GUC (seconds).
+ * Odoo's search_count and web_search_read are separate HTTP requests so the
+ * TTL must cover the round-trip between them; 300 s (5 min) suits typical
+ * browsing pace.  DDL-driven staleness is handled by the relcache callback.
  */
-#define DBBLUE_COUNTCACHE_TTL_USEC	(5 * 60 * USECS_PER_SEC)
+#define DBBLUE_COUNTCACHE_TTL_USEC	((int64) dbblue_countcache_ttl * USECS_PER_SEC)
 
 const CountCacheEntry *
 dbblue_countcache_lookup(Oid reloid, int64 fingerprint)

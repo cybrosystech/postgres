@@ -54,6 +54,9 @@ typedef struct CountCacheEntry
 /* GUC: enable/disable COUNT caching (and the offset-flip that feeds on it). */
 extern PGDLLIMPORT bool dbblue_count_cache;
 
+/* GUC: how long (seconds) a cache entry stays valid; default 300 (5 min). */
+extern PGDLLIMPORT int dbblue_countcache_ttl;
+
 /*
  * Lookup the entry for (reloid, fingerprint).  Returns NULL on miss, on
  * snapshot-staleness, or when the cache is disabled / uninitialized.
