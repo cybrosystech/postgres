@@ -252,6 +252,90 @@ ap_check_pk_includes_col(Oid reloid, const char *nsname, const char *relname,
 }
 
 /*
+ * ap_pk_has_col — silently test whether the PK of reloid includes partcol.
+ */
+static bool
+ap_pk_has_col(Oid reloid, const char *partcol)
+{
+	StringInfoData buf;
+	int			ret;
+	bool		ok = false;
+	bool		isnull;
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf,
+					 "SELECT EXISTS ("
+					 "  SELECT 1 FROM pg_constraint con "
+					 "  JOIN pg_attribute a "
+					 "    ON a.attrelid = con.conrelid "
+					 "   AND a.attnum = ANY(con.conkey) "
+					 "  WHERE con.conrelid = %u "
+					 "    AND con.contype = 'p' "
+					 "    AND a.attname = %s)",
+					 reloid, quote_literal_cstr(partcol));
+	ret = SPI_execute(buf.data, true, 0);
+	pfree(buf.data);
+	if (ret == SPI_OK_SELECT && SPI_processed > 0)
+		ok = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
+										SPI_tuptable->tupdesc, 1, &isnull));
+	return ok;
+}
+
+/*
+ * ap_get_pk_info — fetch the PK constraint name and ordered column list.
+ *
+ * conname_out receives the constraint name (e.g. "sale_mppt_pkey").
+ * cols_out receives a comma-separated, already-quoted list of PK columns
+ * (e.g. '"id"' or '"id", "company_id"') ready for use in ALTER TABLE.
+ * Both are pstrdup'd into the caller's current memory context.
+ * Returns false if no PK exists.
+ */
+static bool
+ap_get_pk_info(Oid reloid, const char *nsname, const char *relname,
+			   char **conname_out, char **cols_out)
+{
+	StringInfoData buf;
+	int			ret;
+	MemoryContext savecxt;
+	char	   *s;
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf,
+					 "SELECT con.conname, "
+					 "       string_agg(quote_ident(a.attname), ', ' "
+					 "                  ORDER BY array_position(con.conkey, a.attnum)) "
+					 "FROM pg_constraint con "
+					 "JOIN pg_attribute a ON a.attrelid = con.conrelid "
+					 "                    AND a.attnum = ANY(con.conkey) "
+					 "WHERE con.conrelid = %u AND con.contype = 'p' "
+					 "GROUP BY con.conname",
+					 reloid);
+	ret = SPI_execute(buf.data, true, 0);
+	pfree(buf.data);
+	if (ret != SPI_OK_SELECT || SPI_processed == 0)
+	{
+		ereport(WARNING,
+				(errmsg("auto-partition: %s.%s: no primary key — cannot auto-rebuild PK for partitioning",
+						nsname, relname)));
+		return false;
+	}
+	savecxt = MemoryContextSwitchTo(TopTransactionContext);
+	s = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+	*conname_out = s ? pstrdup(s) : NULL;
+	s = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2);
+	*cols_out = s ? pstrdup(s) : NULL;
+	MemoryContextSwitchTo(savecxt);
+	if (*conname_out == NULL || *cols_out == NULL)
+	{
+		ereport(WARNING,
+				(errmsg("auto-partition: %s.%s: failed to read PK metadata",
+						nsname, relname)));
+		return false;
+	}
+	return true;
+}
+
+/*
  * ap_capture_fks — populate out_fks (constraints on the source table) and
  * in_fks (constraints on other tables that reference the source).
  * All strings are pstrdup'd into TopTransactionContext.
@@ -757,6 +841,39 @@ ap_restore_reloptions(const char *nsname, const char *relname,
  * follow-up.  The initial partition is one large bucket; subsequent
  * partitions follow the user's interval cleanly.
  */
+
+/*
+ * ap_rename_pk_index — rename PK index from <old_tblname>_pkey to
+ * <new_tblname>_pkey.
+ *
+ * LIKE INCLUDING ALL names the PK index after the table it was copied from.
+ * After renaming tables (atomic swap + partition rename), the PK index still
+ * carries the old name.  Called once for the partitioned parent (tmp→relname)
+ * and once for the initial partition (init_name→final_init_name).
+ */
+static void
+ap_rename_pk_index(const char *nsname,
+				   const char *old_tblname, const char *new_tblname)
+{
+	char		old_idx[NAMEDATALEN];
+	char		new_idx[NAMEDATALEN];
+	StringInfoData buf;
+
+	snprintf(old_idx, sizeof(old_idx), "%s_pkey", old_tblname);
+	snprintf(new_idx, sizeof(new_idx), "%s_pkey", new_tblname);
+
+	if (strcmp(old_idx, new_idx) == 0)
+		return;
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf, "ALTER INDEX IF EXISTS %s.%s RENAME TO %s",
+					 quote_identifier(nsname),
+					 quote_identifier(old_idx),
+					 quote_identifier(new_idx));
+	SPI_exec(buf.data, 0);
+	pfree(buf.data);
+}
+
 static bool
 convert_heap_to_partitioned_date(Oid reloid, const char *nsname,
 								 const char *relname, const char *partcol,
@@ -775,6 +892,9 @@ convert_heap_to_partitioned_date(Oid reloid, const char *nsname,
 				in_fks;
 	ApTrigList	trigs;
 	ApSeqList	seqs;
+	bool		need_pk_rebuild = false;
+	char	   *pk_conname = NULL;
+	char	   *pk_cols = NULL;
 
 	if (partinterval == NULL || *partinterval == '\0')
 	{
@@ -817,9 +937,16 @@ convert_heap_to_partitioned_date(Oid reloid, const char *nsname,
 		return false;
 	}
 
-	/* 2. PK must include partcol (composite PK is fine). */
-	if (!ap_check_pk_includes_col(reloid, nsname, relname, partcol, false))
-		return false;
+	/* 2. Detect whether PK already includes partcol; auto-rebuild if not. */
+	if (!ap_pk_has_col(reloid, partcol))
+	{
+		if (!ap_get_pk_info(reloid, nsname, relname, &pk_conname, &pk_cols))
+			return false;
+		need_pk_rebuild = true;
+		ereport(LOG,
+				(errmsg("auto-partition: %s.%s: PK will be rebuilt to (%s, %s) for range partitioning",
+						nsname, relname, pk_cols, partcol)));
+	}
 
 	/* 3. Compute initial partition bounds. */
 	initStringInfo(&buf);
@@ -940,6 +1067,27 @@ convert_heap_to_partitioned_date(Oid reloid, const char *nsname,
 		/* a. Drop FKs. */
 		ap_drop_fks(nsname, relname, &out_fks, &in_fks);
 
+		/* a2. Rebuild PK to include partcol if it was missing. */
+		if (need_pk_rebuild)
+		{
+			initStringInfo(&buf);
+			appendStringInfo(&buf, "ALTER TABLE %s.%s DROP CONSTRAINT %s",
+							 quote_identifier(nsname),
+							 quote_identifier(relname),
+							 quote_identifier(pk_conname));
+			SPI_exec(buf.data, 0);
+			pfree(buf.data);
+
+			initStringInfo(&buf);
+			appendStringInfo(&buf, "ALTER TABLE %s.%s ADD PRIMARY KEY (%s, %s)",
+							 quote_identifier(nsname),
+							 quote_identifier(relname),
+							 pk_cols,
+							 quote_identifier(partcol));
+			SPI_exec(buf.data, 0);
+			pfree(buf.data);
+		}
+
 		/* b. New partitioned parent. */
 		initStringInfo(&buf);
 		appendStringInfo(&buf,
@@ -985,6 +1133,7 @@ convert_heap_to_partitioned_date(Oid reloid, const char *nsname,
 		ap_capture_seqs(reloid, &seqs);
 		ap_detach_seqs(nsname, &seqs);
 		ap_atomic_swap(nsname, relname, tmp_name);
+		ap_rename_pk_index(nsname, tmp_name, relname);
 
 		initStringInfo(&buf);
 		appendStringInfo(&buf, "ALTER TABLE %s.%s RENAME TO %s",
@@ -993,6 +1142,8 @@ convert_heap_to_partitioned_date(Oid reloid, const char *nsname,
 						 quote_identifier(final_init_name));
 		SPI_exec(buf.data, 0);
 		pfree(buf.data);
+
+		ap_rename_pk_index(nsname, init_name, final_init_name);
 
 		ap_reattach_seqs(nsname, relname, &seqs);
 
@@ -1201,6 +1352,7 @@ convert_heap_to_partitioned(Oid reloid, const char *nsname, const char *relname,
 		ap_capture_seqs(reloid, &seqs);
 		ap_detach_seqs(nsname, &seqs);
 		ap_atomic_swap(nsname, relname, tmp_name);
+		ap_rename_pk_index(nsname, tmp_name, relname);
 
 		/* Rename the initial partition to its final name. */
 		initStringInfo(&buf);
@@ -1210,6 +1362,8 @@ convert_heap_to_partitioned(Oid reloid, const char *nsname, const char *relname,
 						 quote_identifier(final_init_name));
 		SPI_exec(buf.data, 0);
 		pfree(buf.data);
+
+		ap_rename_pk_index(nsname, init_name, final_init_name);
 
 		ap_reattach_seqs(nsname, relname, &seqs);
 
@@ -1967,10 +2121,20 @@ convert_heap_to_partitioned_list(Oid reloid, const char *nsname,
 	int64	   *values = NULL;
 	int64		row_count = 0;
 	ApSeqList	seqs;
+	bool		need_pk_rebuild = false;
+	char	   *pk_conname = NULL;
+	char	   *pk_cols = NULL;
 
-	/* 1. partcol must be part of the PK. */
-	if (!ap_check_pk_includes_col(reloid, nsname, relname, partcol, false))
-		return false;
+	/* 1. Detect whether PK already includes partcol; auto-rebuild if not. */
+	if (!ap_pk_has_col(reloid, partcol))
+	{
+		if (!ap_get_pk_info(reloid, nsname, relname, &pk_conname, &pk_cols))
+			return false;
+		need_pk_rebuild = true;
+		ereport(LOG,
+				(errmsg("auto-partition: %s.%s: PK will be rebuilt to (%s, %s) for list partitioning",
+						nsname, relname, pk_cols, partcol)));
+	}
 
 	/* 2. Capture FKs and triggers before the subtransaction. */
 	ap_capture_fks(reloid, &out_fks, &in_fks);
@@ -2070,6 +2234,27 @@ convert_heap_to_partitioned_list(Oid reloid, const char *nsname,
 
 		/* a. Drop FKs. */
 		ap_drop_fks(nsname, relname, &out_fks, &in_fks);
+
+		/* a2. Rebuild PK to include partcol if it was missing. */
+		if (need_pk_rebuild)
+		{
+			initStringInfo(&buf);
+			appendStringInfo(&buf, "ALTER TABLE %s.%s DROP CONSTRAINT %s",
+							 quote_identifier(nsname),
+							 quote_identifier(relname),
+							 quote_identifier(pk_conname));
+			SPI_exec(buf.data, 0);
+			pfree(buf.data);
+
+			initStringInfo(&buf);
+			appendStringInfo(&buf, "ALTER TABLE %s.%s ADD PRIMARY KEY (%s, %s)",
+							 quote_identifier(nsname),
+							 quote_identifier(relname),
+							 pk_cols,
+							 quote_identifier(partcol));
+			SPI_exec(buf.data, 0);
+			pfree(buf.data);
+		}
 
 		/* b. Parent partitioned table. */
 		initStringInfo(&buf);
