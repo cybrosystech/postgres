@@ -684,7 +684,8 @@ ap_recreate_triggers(const char *nsname, const char *relname,
 static void
 ap_restore_reloptions(const char *nsname, const char *relname,
 					  const char *strategy, const char *partcol,
-					  const char *partinterval, int32 retention)
+					  const char *partinterval, int32 retention,
+					  int32 fill_factor)
 {
 	StringInfoData buf;
 
@@ -701,7 +702,10 @@ ap_restore_reloptions(const char *nsname, const char *relname,
 		appendStringInfo(&buf,
 						 "auto_partition_interval = %s, ",
 						 quote_literal_cstr(partinterval));
-	appendStringInfo(&buf, "auto_partition_retention = %d)", retention);
+	appendStringInfo(&buf, "auto_partition_retention = %d", retention);
+	if (fill_factor != 80)
+		appendStringInfo(&buf, ", auto_partition_fill_factor = %d", fill_factor);
+	appendStringInfoChar(&buf, ')');
 	SPI_exec(buf.data, 0);
 	pfree(buf.data);
 }
@@ -994,7 +998,7 @@ convert_heap_to_partitioned_date(Oid reloid, const char *nsname,
 
 		/* f. Re-apply reloptions. */
 		ap_restore_reloptions(nsname, relname, "range_date",
-							  partcol, partinterval, retention);
+							  partcol, partinterval, retention, 80);
 
 		/* g. Re-add FKs as NOT VALID. */
 		ap_add_fks_not_valid(nsname, relname, &out_fks, &in_fks);
@@ -1211,7 +1215,7 @@ convert_heap_to_partitioned(Oid reloid, const char *nsname, const char *relname,
 
 		/* 5. Re-apply reloptions. */
 		ap_restore_reloptions(nsname, relname, "range_int",
-							  partcol, partinterval, retention);
+							  partcol, partinterval, retention, 80);
 
 		/* 6. Re-add FKs as NOT VALID (validation happens post-swap). */
 		ap_add_fks_not_valid(nsname, relname, &out_fks, &in_fks);
@@ -1268,7 +1272,7 @@ convert_heap_to_partitioned(Oid reloid, const char *nsname, const char *relname,
 static void
 process_range_date_partition(Oid reloid, const char *nsname, const char *relname,
 							 const char *partcol, const char *partinterval,
-							 int32 retention)
+							 int32 retention, int32 fill_factor)
 {
 	StringInfoData buf;
 	int			ret;
@@ -1390,12 +1394,13 @@ process_range_date_partition(Oid reloid, const char *nsname, const char *relname
 		appendStringInfo(&buf,
 						 "SELECT max(%s) IS NULL AS empty, "
 						 "       CASE WHEN max(%s) IS NULL THEN false "
-						 "            ELSE 5 * EXTRACT(EPOCH FROM max(%s) - %s::timestamptz) "
-						 "                 >= 4 * EXTRACT(EPOCH FROM %s::timestamptz - %s::timestamptz) "
+						 "            ELSE %d * EXTRACT(EPOCH FROM max(%s) - %s::timestamptz) "
+						 "                 >= 100 * EXTRACT(EPOCH FROM %s::timestamptz - %s::timestamptz) "
 						 "       END AS at_threshold "
 						 "FROM %s.%s",
 						 quote_identifier(partcol),
 						 quote_identifier(partcol),
+						 fill_factor,
 						 quote_identifier(partcol),
 						 quote_literal_cstr(head_lower_text),
 						 quote_literal_cstr(head_upper_text),
@@ -1433,8 +1438,8 @@ process_range_date_partition(Oid reloid, const char *nsname, const char *relname
 		else if (!head_full)
 		{
 			ereport(DEBUG1,
-					(errmsg("auto-partition: %s.%s: head %s not yet at 80%%, waiting",
-							nsname, relname, head_relname)));
+					(errmsg("auto-partition: %s.%s: head %s not yet at %d%%, waiting",
+							nsname, relname, head_relname, fill_factor)));
 		}
 
 		/*
@@ -1607,7 +1612,7 @@ process_range_date_partition(Oid reloid, const char *nsname, const char *relname
 static void
 process_range_int_partition(Oid reloid, const char *nsname, const char *relname,
 							const char *partcol, const char *partinterval,
-							int32 retention)
+							int32 retention, int32 fill_factor)
 {
 	int64		interval_size;
 	int			ret;
@@ -1746,8 +1751,8 @@ process_range_int_partition(Oid reloid, const char *nsname, const char *relname,
 	 * partition_column IS the PK from Phase 3a's prereq check).  Cost is
 	 * effectively constant time.
 	 *
-	 * Threshold is hard-coded at 80%.  Move to a GUC if customers want
-	 * to tune.
+	 * Threshold is controlled by the auto_partition_fill_factor reloption
+	 * (default 80).
 	 */
 	if (have_max_upper && head_relname != NULL)
 	{
@@ -1788,17 +1793,15 @@ process_range_int_partition(Oid reloid, const char *nsname, const char *relname,
 		else
 		{
 			int64		used = head_max - head_lower;
-			/*
-			 * Compare 5 * used >= 4 * interval to avoid float arithmetic,
-			 * i.e. the head is at least 80% full.
-			 */
-			if (used < 0 || (5 * used < 4 * interval_size))
+
+			if (used < 0 || ((int64) fill_factor * used < (int64) 100 * interval_size))
 			{
 				ereport(DEBUG1,
-						(errmsg("auto-partition: %s.%s: head %s at %lld/%lld (%.0f%%), waiting",
+						(errmsg("auto-partition: %s.%s: head %s at %lld/%lld (%.0f%% of %d%% threshold), waiting",
 								nsname, relname, head_relname,
 								(long long) used, (long long) interval_size,
-								interval_size > 0 ? (100.0 * used / interval_size) : 0.0)));
+								interval_size > 0 ? (100.0 * used / interval_size) : 0.0,
+								fill_factor)));
 				create_next = false;
 			}
 		}
@@ -2177,7 +2180,7 @@ convert_heap_to_partitioned_list(Oid reloid, const char *nsname,
 
 		/* g. Re-apply reloptions (no partinterval for list_int). */
 		ap_restore_reloptions(nsname, relname, "list_int",
-							  partcol, NULL, retention);
+							  partcol, NULL, retention, 80);
 
 		/* h. Re-add FKs as NOT VALID. */
 		ap_add_fks_not_valid(nsname, relname, &out_fks, &in_fks);
@@ -2468,7 +2471,8 @@ scan_configured_relations(void)
 					  "       opts.config->>'auto_partition_strategy' AS strategy, "
 					  "       opts.config->>'auto_partition_column' AS partition_column, "
 					  "       opts.config->>'auto_partition_interval' AS partition_interval, "
-					  "       NULLIF(opts.config->>'auto_partition_retention','')::int AS retention "
+					  "       NULLIF(opts.config->>'auto_partition_retention','')::int AS retention, "
+					  "       NULLIF(opts.config->>'auto_partition_fill_factor','')::int AS fill_factor "
 					  "FROM pg_class c "
 					  "JOIN pg_namespace n ON n.oid = c.relnamespace "
 					  "LEFT JOIN LATERAL ( "
@@ -2514,6 +2518,7 @@ scan_configured_relations(void)
 			char	   *partcol;
 			char	   *partinterval;
 			int32		retention;
+			int32		fill_factor;	/* 1-100, default 80 */
 		} ScanRow;
 
 		ScanRow    *rows;
@@ -2538,6 +2543,21 @@ scan_configured_relations(void)
 			(void) SPI_getbinval(row, td, 8, &isnull);
 			if (!isnull)
 				rows[i].retention = DatumGetInt32(SPI_getbinval(row, td, 8, &isnull));
+			rows[i].fill_factor = 80;	/* default */
+			(void) SPI_getbinval(row, td, 9, &isnull);
+			if (!isnull)
+			{
+				int32	ff = DatumGetInt32(SPI_getbinval(row, td, 9, &isnull));
+
+				if (ff >= 1 && ff <= 100)
+					rows[i].fill_factor = ff;
+				else
+					ereport(WARNING,
+							(errmsg("auto-partition: %s.%s: fill_factor %d out of range [1,100], using 80",
+									rows[i].nsname ? rows[i].nsname : "?",
+									rows[i].relname ? rows[i].relname : "?",
+									ff)));
+			}
 		}
 		MemoryContextSwitchTo(oldcxt);
 
@@ -2575,7 +2595,8 @@ scan_configured_relations(void)
 													   r->retention);
 				else if (r->relkind == 'p')
 					process_range_int_partition(r->reloid, r->nsname, r->relname,
-												r->partcol, r->partinterval, r->retention);
+												r->partcol, r->partinterval, r->retention,
+												r->fill_factor);
 			}
 			else if (r->strategy && strcmp(r->strategy, "range_date") == 0)
 			{
@@ -2585,7 +2606,8 @@ scan_configured_relations(void)
 															r->retention);
 				else if (r->relkind == 'p')
 					process_range_date_partition(r->reloid, r->nsname, r->relname,
-												 r->partcol, r->partinterval, r->retention);
+												 r->partcol, r->partinterval, r->retention,
+												 r->fill_factor);
 			}
 			else if (r->strategy && strcmp(r->strategy, "list_int") == 0)
 			{
