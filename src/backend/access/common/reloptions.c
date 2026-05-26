@@ -422,6 +422,15 @@ static relopt_int intRelOpts[] =
 		},
 		0, 0, INT_MAX
 	},
+	{
+		{
+			"auto_partition_fill_factor",
+			"DBblue auto-partition: partition fill threshold before rotating (1-100, default 80)",
+			RELOPT_KIND_HEAP | RELOPT_KIND_PARTITIONED,
+			ShareUpdateExclusiveLock
+		},
+		80, 1, 100
+	},
 
 	/* list terminator */
 	{{NULL}}
@@ -2089,7 +2098,9 @@ default_reloptions(Datum reloptions, bool validate, relopt_kind kind)
 		{"auto_partition_interval", RELOPT_TYPE_STRING,
 		offsetof(StdRdOptions, auto_partition_interval)},
 		{"auto_partition_retention", RELOPT_TYPE_INT,
-		offsetof(StdRdOptions, auto_partition_retention)}
+		offsetof(StdRdOptions, auto_partition_retention)},
+		{"auto_partition_fill_factor", RELOPT_TYPE_INT,
+		offsetof(StdRdOptions, auto_partition_fill_factor)}
 	};
 
 	{
@@ -2252,7 +2263,9 @@ partitioned_table_reloptions(Datum reloptions, bool validate)
 		{"auto_partition_interval", RELOPT_TYPE_STRING,
 		offsetof(StdRdOptions, auto_partition_interval)},
 		{"auto_partition_retention", RELOPT_TYPE_INT,
-		offsetof(StdRdOptions, auto_partition_retention)}
+		offsetof(StdRdOptions, auto_partition_retention)},
+		{"auto_partition_fill_factor", RELOPT_TYPE_INT,
+		offsetof(StdRdOptions, auto_partition_fill_factor)}
 	};
 	StdRdOptions *rdopts;
 

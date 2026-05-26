@@ -376,11 +376,12 @@ typedef struct StdRdOptions
 	 */
 	double		vacuum_max_eager_freeze_failure_rate;
 
-	/* DBblue auto-partition reloptions (Phase 1: stored only, not yet acted on) */
+	/* DBblue auto-partition reloptions */
 	StdRdOptAutoPartition auto_partition_strategy;
 	int			auto_partition_column;	/* offset to column-name string */
 	int			auto_partition_interval;	/* offset to interval string */
 	int			auto_partition_retention;	/* number of partitions to keep, 0 = unlimited */
+	int			auto_partition_fill_factor;	/* rotation threshold 1-100, default 80 */
 } StdRdOptions;
 
 #define HEAP_MIN_FILLFACTOR			10
