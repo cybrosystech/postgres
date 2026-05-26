@@ -899,10 +899,26 @@ convert_heap_to_partitioned_date(Oid reloid, const char *nsname,
 	ap_capture_fks(reloid, &out_fks, &in_fks);
 	ap_capture_triggers(reloid, &trigs);
 
-	if (out_fks.count + in_fks.count + trigs.count > 0)
+	/*
+	 * range_date conversion changes the PK from (id) to (id, partcol).
+	 * PostgreSQL then forbids UNIQUE(id) on a partitioned table, so any
+	 * inbound FK that references only id cannot be recreated after the swap.
+	 * Refuse now and tell the DBA to drop those FKs first.
+	 */
+	if (in_fks.count > 0)
+	{
+		ereport(WARNING,
+				(errmsg("auto-partition: %s.%s: %d inbound FK(s) reference this table — "
+						"drop them before converting (range_date requires a composite PK "
+						"that makes UNIQUE(id) impossible on a partitioned table)",
+						nsname, relname, in_fks.count)));
+		return false;
+	}
+
+	if (out_fks.count + trigs.count > 0)
 		ereport(LOG,
-				(errmsg("auto-partition: %s.%s: capturing %d outbound + %d inbound FKs and %d trigger(s)",
-						nsname, relname, out_fks.count, in_fks.count, trigs.count)));
+				(errmsg("auto-partition: %s.%s: preserving %d outbound FK(s) and %d trigger(s) across swap",
+						nsname, relname, out_fks.count, trigs.count)));
 
 	/* 5. Conversion proper, in a subtransaction. */
 	BeginInternalSubTransaction("autopart_convert_date");
@@ -1957,10 +1973,25 @@ convert_heap_to_partitioned_list(Oid reloid, const char *nsname,
 	ap_capture_fks(reloid, &out_fks, &in_fks);
 	ap_capture_triggers(reloid, &trigs);
 
-	if (out_fks.count + in_fks.count + trigs.count > 0)
+	/*
+	 * list_int conversion changes the PK from (id) to (id, partcol).
+	 * Same restriction as range_date: inbound FKs referencing only id
+	 * cannot be recreated after the swap.
+	 */
+	if (in_fks.count > 0)
+	{
+		ereport(WARNING,
+				(errmsg("auto-partition: %s.%s: %d inbound FK(s) reference this table — "
+						"drop them before converting (list_int requires a composite PK "
+						"that makes UNIQUE(id) impossible on a partitioned table)",
+						nsname, relname, in_fks.count)));
+		return false;
+	}
+
+	if (out_fks.count + trigs.count > 0)
 		ereport(LOG,
-				(errmsg("auto-partition: %s.%s: capturing %d outbound + %d inbound FKs and %d trigger(s)",
-						nsname, relname, out_fks.count, in_fks.count, trigs.count)));
+				(errmsg("auto-partition: %s.%s: preserving %d outbound FK(s) and %d trigger(s) across swap",
+						nsname, relname, out_fks.count, trigs.count)));
 
 	/* 3. SELECT DISTINCT to discover initial partition values. */
 	initStringInfo(&buf);
