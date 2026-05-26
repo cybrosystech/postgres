@@ -72,12 +72,7 @@
  */
 bool		auto_partition_enabled = true;
 int			auto_partition_naptime = 60;	/* seconds */
-
-/*
- * Phase 2 connects to a single hardcoded database.  Multi-DB scanning
- * (one worker per database, via dynamic registration) is a follow-up.
- */
-#define AUTO_PARTITION_DEFAULT_DB "postgres"
+char	   *auto_partition_database = NULL;	/* set by GUC, default "postgres" */
 
 static void scan_configured_relations(void);
 
@@ -128,11 +123,16 @@ AutoPartitionLauncherMain(Datum main_arg)
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	BackgroundWorkerUnblockSignals();
 
-	BackgroundWorkerInitializeConnection(AUTO_PARTITION_DEFAULT_DB, NULL, 0);
+	BackgroundWorkerInitializeConnection(
+		(auto_partition_database && auto_partition_database[0] != '\0')
+		? auto_partition_database : "postgres",
+		NULL, 0);
 
 	ereport(LOG,
 			(errmsg("auto-partition launcher started: database=\"%s\", naptime=%ds",
-					AUTO_PARTITION_DEFAULT_DB, auto_partition_naptime)));
+					(auto_partition_database && auto_partition_database[0] != '\0')
+					? auto_partition_database : "postgres",
+					auto_partition_naptime)));
 
 	while (!ShutdownRequestPending)
 	{

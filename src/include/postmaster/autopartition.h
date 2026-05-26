@@ -17,6 +17,7 @@
 /* GUC variables (defined in autopartition.c) */
 extern PGDLLIMPORT bool auto_partition_enabled;
 extern PGDLLIMPORT int	auto_partition_naptime;
+extern PGDLLIMPORT char *auto_partition_database;
 
 /*
  * Postmaster-time registration: called once during postmaster startup, just

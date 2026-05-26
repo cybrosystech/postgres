@@ -122,6 +122,13 @@
   max => '600',
 },
 
+{ name => 'auto_partition_database', type => 'string', context => 'PGC_SIGHUP', group => 'VACUUM_AUTOVACUUM',
+  short_desc => 'Database the auto-partition launcher connects to.',
+  long_desc => 'Defaults to "postgres". Reload with SIGHUP to switch databases without a server restart.',
+  variable => 'auto_partition_database',
+  boot_val => '"postgres"',
+},
+
 { name => 'auto_partition_enabled', type => 'bool', context => 'PGC_SIGHUP', group => 'VACUUM_AUTOVACUUM',
   short_desc => 'Whether the auto-partition launcher should perform work.',
   variable => 'auto_partition_enabled',
