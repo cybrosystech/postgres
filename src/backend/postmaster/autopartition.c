@@ -1394,19 +1394,19 @@ process_range_date_partition(Oid reloid, const char *nsname, const char *relname
 		appendStringInfo(&buf,
 						 "SELECT max(%s) IS NULL AS empty, "
 						 "       CASE WHEN max(%s) IS NULL THEN false "
-						 "            ELSE %d * EXTRACT(EPOCH FROM max(%s) - %s::timestamptz) "
-						 "                 >= 100 * EXTRACT(EPOCH FROM %s::timestamptz - %s::timestamptz) "
+						 "            ELSE 100 * EXTRACT(EPOCH FROM max(%s) - %s::timestamptz) "
+						 "                 >= %d * EXTRACT(EPOCH FROM %s::timestamptz - %s::timestamptz) "
 						 "       END AS at_threshold "
 						 "FROM %s.%s",
-						 quote_identifier(partcol),
-						 quote_identifier(partcol),
-						 fill_factor,
-						 quote_identifier(partcol),
-						 quote_literal_cstr(head_lower_text),
-						 quote_literal_cstr(head_upper_text),
-						 quote_literal_cstr(head_lower_text),
-						 quote_identifier(nsname),
-						 quote_identifier(head_relname));
+						 quote_identifier(partcol),		/* 1: IS NULL check */
+						 quote_identifier(partcol),		/* 2: CASE WHEN */
+						 quote_identifier(partcol),		/* 3: max(partcol) */
+						 quote_literal_cstr(head_lower_text),	/* 4: - lower */
+						 fill_factor,					/* 5: %d threshold */
+						 quote_literal_cstr(head_upper_text),	/* 6: upper */
+						 quote_literal_cstr(head_lower_text),	/* 7: - lower */
+						 quote_identifier(nsname),		/* 8: schema */
+						 quote_identifier(head_relname)); /* 9: partition */
 		ret = SPI_execute(buf.data, true, 0);
 		pfree(buf.data);
 
@@ -1794,7 +1794,7 @@ process_range_int_partition(Oid reloid, const char *nsname, const char *relname,
 		{
 			int64		used = head_max - head_lower;
 
-			if (used < 0 || ((int64) fill_factor * used < (int64) 100 * interval_size))
+			if (used < 0 || ((int64) 100 * used < (int64) fill_factor * interval_size))
 			{
 				ereport(DEBUG1,
 						(errmsg("auto-partition: %s.%s: head %s at %lld/%lld (%.0f%% of %d%% threshold), waiting",
