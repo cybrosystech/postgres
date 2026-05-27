@@ -114,6 +114,11 @@
 #include "utils/usercontext.h"
 
 /*
+ * GUC variable to auto-create btree indexes on foreign key columns
+ */
+bool		dbblue_fk_auto_index = true;
+
+/*
  * ON COMMIT action list
  */
 typedef struct OnCommitItem
@@ -10695,6 +10700,126 @@ ATAddForeignKeyConstraint(List **wqueue, AlteredTableInfo *tab, Relation rel,
 							  fkdelsetcols,
 							  false,
 							  with_period);
+
+	/*
+	 * Auto-create a btree index on the referencing (FK) columns if
+	 * dbblue_fk_auto_index is set and the table is a plain relation.
+	 * Check first to see if an index already exists on these columns.
+	 */
+	if (dbblue_fk_auto_index &&
+		rel->rd_rel->relkind == RELKIND_RELATION)
+	{
+		bool		index_exists = false;
+		List	   *indexList = RelationGetIndexList(rel);
+		ListCell   *cell;
+
+		/*
+		 * Check if there's already an index covering these FK columns
+		 */
+		foreach(cell, indexList)
+		{
+			Oid			indexOid_check = lfirst_oid(cell);
+			Relation	indexRel = index_open(indexOid_check, AccessShareLock);
+			Form_pg_index indexForm = indexRel->rd_index;
+			int			nkeys = indexForm->indnkeyatts;
+
+			/*
+			 * Check if this index has the same number of key attributes as our FK
+			 * and if they match in order
+			 */
+			if (nkeys == numfks)
+			{
+				bool		match = true;
+				int			fk_j;
+
+				for (fk_j = 0; fk_j < numfks; fk_j++)
+				{
+					if (indexForm->indkey.values[fk_j] != fkattnum[fk_j])
+					{
+						match = false;
+						break;
+					}
+				}
+
+				if (match)
+				{
+					index_exists = true;
+					index_close(indexRel, AccessShareLock);
+					break;
+				}
+			}
+
+			index_close(indexRel, AccessShareLock);
+		}
+
+		/*
+		 * If no matching index exists, create one now
+		 */
+		if (!index_exists)
+		{
+			List	   *indexParams = NIL;
+			IndexStmt  *istmt;
+			int			fk_i;
+
+			for (fk_i = 0; fk_i < numfks; fk_i++)
+			{
+				IndexElem  *iparam = makeNode(IndexElem);
+
+				iparam->name = get_attname(RelationGetRelid(rel), fkattnum[fk_i], false);
+				iparam->expr = NULL;
+				iparam->indexcolname = NULL;
+				iparam->collation = NIL;
+				iparam->opclass = NIL;
+				iparam->opclassopts = NIL;
+				iparam->ordering = SORTBY_DEFAULT;
+				iparam->nulls_ordering = SORTBY_NULLS_DEFAULT;
+				iparam->location = -1;
+				indexParams = lappend(indexParams, iparam);
+			}
+
+			istmt = makeNode(IndexStmt);
+			istmt->idxname = NULL;	/* auto-generate name */
+			istmt->relation = makeRangeVar(
+				get_namespace_name(RelationGetNamespace(rel)),
+				pstrdup(RelationGetRelationName(rel)), -1);
+			istmt->accessMethod = "btree";
+			istmt->tableSpace = NULL;
+			istmt->indexParams = indexParams;
+			istmt->indexIncludingParams = NIL;
+			istmt->options = NIL;
+			istmt->whereClause = NULL;
+			istmt->excludeOpNames = NIL;
+			istmt->idxcomment = NULL;
+			istmt->indexOid = InvalidOid;
+			istmt->oldNumber = InvalidRelFileNumber;
+			istmt->oldCreateSubid = InvalidSubTransactionId;
+			istmt->oldFirstRelfilelocatorSubid = InvalidSubTransactionId;
+			istmt->unique = false;
+			istmt->nulls_not_distinct = false;
+			istmt->primary = false;
+			istmt->isconstraint = false;
+			istmt->iswithoutoverlaps = false;
+			istmt->deferrable = false;
+			istmt->initdeferred = false;
+			istmt->transformed = true;	/* skip transformIndexStmt */
+			istmt->concurrent = false;
+			istmt->if_not_exists = false;	/* we already checked above */
+			istmt->reset_default_tblspc = false;
+
+			DefineIndex(NULL,
+						RelationGetRelid(rel),
+						istmt,
+						InvalidOid,		/* no predefined OID */
+						InvalidOid,		/* no parent index */
+						InvalidOid,		/* no parent constraint */
+						-1,				/* total_parts unknown */
+						true,			/* is_alter_table */
+						false,			/* check_rights */
+						false,			/* check_not_in_use */
+						false,			/* skip_build */
+						false);			/* quiet */
+		}
+	}
 
 	/* Next process the action triggers at the referenced side and recurse */
 	addFkRecurseReferenced(fkconstraint, rel, pkrel,

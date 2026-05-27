@@ -108,4 +108,6 @@ extern void RangeVarCallbackOwnsRelation(const RangeVar *relation,
 extern bool PartConstraintImpliedByRelConstraint(Relation scanrel,
 												 List *partConstraint);
 
+extern PGDLLIMPORT bool dbblue_fk_auto_index;
+
 #endif							/* TABLECMDS_H */
