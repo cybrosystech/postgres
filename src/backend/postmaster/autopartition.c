@@ -540,9 +540,51 @@ ap_reattach_seqs(const char *nsname, const char *relname, const ApSeqList *seqs)
 }
 
 /*
+ * ap_match_owner — set tblname's owner to match reloid's owner.
+ *
+ * The background worker creates tables as the superuser, but the original
+ * table may be owned by a different role.  ALTER SEQUENCE ... OWNED BY checks
+ * that sequence and table share the same owner, so the new partitioned table
+ * must have the same owner as the original before we call ap_reattach_seqs.
+ */
+static void
+ap_match_owner(const char *nsname, const char *tblname, Oid reloid)
+{
+	StringInfoData buf;
+	int			ret;
+	char	   *owner;
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf,
+					 "SELECT r.rolname FROM pg_class c "
+					 "JOIN pg_roles r ON r.oid = c.relowner "
+					 "WHERE c.oid = %u",
+					 reloid);
+	ret = SPI_execute(buf.data, true, 1);
+	pfree(buf.data);
+	if (ret != SPI_OK_SELECT || SPI_processed == 0)
+		return;
+
+	owner = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+	if (owner == NULL)
+		return;
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf, "ALTER TABLE %s.%s OWNER TO %s",
+					 quote_identifier(nsname),
+					 quote_identifier(tblname),
+					 quote_identifier(owner));
+	SPI_exec(buf.data, 0);
+	pfree(buf.data);
+}
+
+/*
  * ap_atomic_swap — the brief ACCESS EXCLUSIVE window.
  *
- * Locks the source, drops it, and renames tmp_name to relname.
+ * RENAME old → old_ap, RENAME tmp → relname, DROP old_ap CASCADE.
+ * Using RENAME before DROP avoids "cannot drop … other objects depend on it"
+ * errors caused by rules, views, or FK constraints that trail the old table.
+ * CASCADE on the final drop removes any such leftovers cleanly.
  * Sequences must be detached before calling this.
  * Partition renaming after the swap is the caller's responsibility.
  */
@@ -550,6 +592,20 @@ static void
 ap_atomic_swap(const char *nsname, const char *relname, const char *tmp_name)
 {
 	StringInfoData buf;
+	char		old_name[NAMEDATALEN];
+	int			rlen = strlen(relname);
+
+	/* Build a safe "old" name that fits in NAMEDATALEN. */
+	if (rlen > NAMEDATALEN - 8)
+		rlen = NAMEDATALEN - 8;
+	snprintf(old_name, sizeof(old_name), "%.*s_ap_old", rlen, relname);
+
+	/* Drop any leftover from a previous aborted run. */
+	initStringInfo(&buf);
+	appendStringInfo(&buf, "DROP TABLE IF EXISTS %s.%s CASCADE",
+					 quote_identifier(nsname), quote_identifier(old_name));
+	SPI_exec(buf.data, 0);
+	pfree(buf.data);
 
 	initStringInfo(&buf);
 	appendStringInfo(&buf, "LOCK TABLE %s.%s IN ACCESS EXCLUSIVE MODE",
@@ -557,17 +613,28 @@ ap_atomic_swap(const char *nsname, const char *relname, const char *tmp_name)
 	SPI_exec(buf.data, 0);
 	pfree(buf.data);
 
+	/* Step 1: push old table aside. */
 	initStringInfo(&buf);
-	appendStringInfo(&buf, "DROP TABLE %s.%s",
-					 quote_identifier(nsname), quote_identifier(relname));
+	appendStringInfo(&buf, "ALTER TABLE %s.%s RENAME TO %s",
+					 quote_identifier(nsname),
+					 quote_identifier(relname),
+					 quote_identifier(old_name));
 	SPI_exec(buf.data, 0);
 	pfree(buf.data);
 
+	/* Step 2: bring new partitioned table into service. */
 	initStringInfo(&buf);
 	appendStringInfo(&buf, "ALTER TABLE %s.%s RENAME TO %s",
 					 quote_identifier(nsname),
 					 quote_identifier(tmp_name),
 					 quote_identifier(relname));
+	SPI_exec(buf.data, 0);
+	pfree(buf.data);
+
+	/* Step 3: drop the now-orphaned old table, taking its dependents with it. */
+	initStringInfo(&buf);
+	appendStringInfo(&buf, "DROP TABLE %s.%s CASCADE",
+					 quote_identifier(nsname), quote_identifier(old_name));
 	SPI_exec(buf.data, 0);
 	pfree(buf.data);
 }
@@ -584,7 +651,7 @@ ap_drop_fks(const char *nsname, const char *relname,
 	{
 		initStringInfo(&buf);
 		appendStringInfo(&buf,
-						 "ALTER TABLE %s.%s DROP CONSTRAINT %s",
+						 "ALTER TABLE %s.%s DROP CONSTRAINT IF EXISTS %s",
 						 quote_identifier(in_fks->owner_schemas[k]),
 						 quote_identifier(in_fks->owners[k]),
 						 quote_identifier(in_fks->names[k]));
@@ -595,7 +662,7 @@ ap_drop_fks(const char *nsname, const char *relname,
 	{
 		initStringInfo(&buf);
 		appendStringInfo(&buf,
-						 "ALTER TABLE %s.%s DROP CONSTRAINT %s",
+						 "ALTER TABLE %s.%s DROP CONSTRAINT IF EXISTS %s",
 						 quote_identifier(nsname),
 						 quote_identifier(relname),
 						 quote_identifier(out_fks->names[k]));
@@ -629,6 +696,14 @@ ap_add_fks_not_valid(const char *nsname, const char *relname,
 	}
 	for (k = 0; k < in_fks->count; k++)
 	{
+		/*
+		 * Self-referential FKs appear in both out_fks and in_fks.  The
+		 * out_fks loop already added them; skip the duplicate here.
+		 */
+		if (strcmp(in_fks->owner_schemas[k], nsname) == 0 &&
+			strcmp(in_fks->owners[k], relname) == 0)
+			continue;
+
 		initStringInfo(&buf);
 		appendStringInfo(&buf,
 						 "ALTER TABLE %s.%s ADD CONSTRAINT %s %s NOT VALID",
@@ -684,6 +759,11 @@ ap_validate_fks(const char *nsname, const char *relname,
 	}
 	for (k = 0; k < in_fks->count; k++)
 	{
+		/* Self-referential FKs were already validated in the out_fks loop. */
+		if (strcmp(in_fks->owner_schemas[k], nsname) == 0 &&
+			strcmp(in_fks->owners[k], relname) == 0)
+			continue;
+
 		BeginInternalSubTransaction("autopart_validate_fk_in");
 		PG_TRY();
 		{
@@ -705,7 +785,7 @@ ap_validate_fks(const char *nsname, const char *relname,
 			edata = CopyErrorData();
 			ereport(WARNING,
 					(errmsg("auto-partition: %s.%s: VALIDATE %s failed: %s",
-							in_fks->owners[k], in_fks->names[k],
+							in_fks->owner_schemas[k], in_fks->owners[k],
 							in_fks->names[k], edata->message)));
 			FreeErrorData(edata);
 			FlushErrorState();
@@ -885,8 +965,10 @@ convert_heap_to_partitioned_date(Oid reloid, const char *nsname,
 	bool		col_ok;
 	int64		row_count = 0;
 	char	   *min_text = NULL;
+	char	   *max_text = NULL;
 	char	   *upper_text = NULL;
 	char	   *suffix = NULL;
+	char	   *inferred_align = NULL;	/* derived from interval: year/month/day/hour */
 	MemoryContext savecxt;
 	ApFkList	out_fks,
 				in_fks;
@@ -895,6 +977,11 @@ convert_heap_to_partitioned_date(Oid reloid, const char *nsname,
 	bool		need_pk_rebuild = false;
 	char	   *pk_conname = NULL;
 	char	   *pk_cols = NULL;
+	/* multi-partition boundary arrays */
+	int			nparts = 0;
+	char	  **part_lowers = NULL;
+	char	  **part_uppers = NULL;
+	char	  **part_suffixes = NULL;
 
 	if (partinterval == NULL || *partinterval == '\0')
 	{
@@ -948,18 +1035,84 @@ convert_heap_to_partitioned_date(Oid reloid, const char *nsname,
 						nsname, relname, pk_cols, partcol)));
 	}
 
-	/* 3. Compute initial partition bounds. */
+	/*
+	 * 2b. Check for unique indexes (including unique constraints backed by
+	 * indexes) that don't include partcol.  PostgreSQL requires every unique
+	 * index on a partitioned table to include all partition key columns.
+	 * LIKE INCLUDING ALL copies all indexes, so a pre-existing unique index
+	 * on (module, name) without the partition key would make the CREATE TABLE
+	 * fail with a cryptic error.  Detect it here and tell the user clearly.
+	 */
+	{
+		StringInfoData ub;
+		int			uret;
+
+		initStringInfo(&ub);
+		appendStringInfo(&ub,
+						 "SELECT ci.relname "
+						 "FROM pg_index i "
+						 "JOIN pg_class ci ON ci.oid = i.indexrelid "
+						 "WHERE i.indrelid = %u "
+						 "  AND i.indisunique = true "
+						 "  AND i.indisprimary = false "
+						 "  AND NOT EXISTS ("
+						 "    SELECT 1 FROM pg_attribute a "
+						 "    WHERE a.attrelid = i.indrelid "
+						 "      AND a.attname = %s "
+						 "      AND a.attnum = ANY(i.indkey::int2[]))",
+						 reloid, quote_literal_cstr(partcol));
+		uret = SPI_execute(ub.data, true, 0);
+		pfree(ub.data);
+		if (uret == SPI_OK_SELECT && SPI_processed > 0)
+		{
+			uint64		u;
+
+			for (u = 0; u < SPI_processed; u++)
+			{
+				char *iname = SPI_getvalue(SPI_tuptable->vals[u],
+										   SPI_tuptable->tupdesc, 1);
+				ereport(WARNING,
+						(errmsg("auto-partition: %s.%s: unique index \"%s\" does not include "
+								"partition column %s — drop it before converting "
+								"(all unique indexes on a partitioned table must include "
+								"all partition key columns)",
+								nsname, relname, iname ? iname : "?", partcol)));
+			}
+			return false;
+		}
+	}
+
+	/*
+	 * 3. Compute initial partition bounds and infer alignment granularity
+	 * from the interval.  The CASE derives the date_trunc field we'll use:
+	 *   year  component present  → 'year'
+	 *   month component present  → 'month'
+	 *   day   component >= 1     → 'day'
+	 *   otherwise (hours/mins)   → 'hour'
+	 * This drives the multi-partition aligned initial load below.
+	 */
 	initStringInfo(&buf);
 	appendStringInfo(&buf,
 					 "SELECT min(%s)::text, "
+					 "       max(%s)::text, "
 					 "       (max(%s) + %s::interval)::text, "
 					 "       to_char(min(%s), 'YYYYMMDDHH24MISS'), "
-					 "       count(*)::bigint "
+					 "       count(*)::bigint, "
+					 "       CASE "
+					 "         WHEN EXTRACT(year  FROM %s::interval) <> 0 THEN 'year' "
+					 "         WHEN EXTRACT(month FROM %s::interval) <> 0 THEN 'month' "
+					 "         WHEN EXTRACT(day   FROM %s::interval) >= 1 THEN 'day' "
+					 "         ELSE 'hour' "
+					 "       END "
 					 "FROM %s.%s",
+					 quote_identifier(partcol),
 					 quote_identifier(partcol),
 					 quote_identifier(partcol),
 					 quote_literal_cstr(partinterval),
 					 quote_identifier(partcol),
+					 quote_literal_cstr(partinterval),
+					 quote_literal_cstr(partinterval),
+					 quote_literal_cstr(partinterval),
 					 quote_identifier(nsname),
 					 quote_identifier(relname));
 	ret = SPI_execute(buf.data, true, 0);
@@ -979,12 +1132,16 @@ convert_heap_to_partitioned_date(Oid reloid, const char *nsname,
 		savecxt = MemoryContextSwitchTo(TopTransactionContext);
 		min_text = s ? pstrdup(s) : NULL;
 		s = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2);
-		upper_text = s ? pstrdup(s) : NULL;
+		max_text = s ? pstrdup(s) : NULL;
 		s = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3);
+		upper_text = s ? pstrdup(s) : NULL;
+		s = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 4);
 		suffix = s ? pstrdup(s) : NULL;
+		s = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 6);
+		inferred_align = s ? pstrdup(s) : NULL;
 		MemoryContextSwitchTo(savecxt);
 		row_count = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
-												SPI_tuptable->tupdesc, 4, &isnull));
+												SPI_tuptable->tupdesc, 5, &isnull));
 	}
 
 	if (row_count == 0)
@@ -1021,10 +1178,88 @@ convert_heap_to_partitioned_date(Oid reloid, const char *nsname,
 		return false;
 	}
 
+	/*
+	 * 3b. For non-empty tables, generate calendar-aligned partition boundaries
+	 * using a recursive CTE.  The alignment granularity was derived from the
+	 * interval in step 3 (inferred_align = year/month/day/hour).
+	 *
+	 * Empty tables fall through to the single-partition path anchored at now().
+	 */
+	if (row_count > 0 && inferred_align != NULL)
+	{
+		initStringInfo(&buf);
+		appendStringInfo(&buf,
+						 "WITH RECURSIVE b(lo, hi) AS ("
+						 "  SELECT date_trunc(%s, %s::timestamptz),"
+						 "         date_trunc(%s, %s::timestamptz) + %s::interval"
+						 "  UNION ALL"
+						 "  SELECT hi, hi + %s::interval"
+						 "  FROM b"
+						 "  WHERE lo <= %s::timestamptz"
+						 ")"
+						 "SELECT lo::text, hi::text, to_char(lo, 'YYYYMMDDHH24MISS')"
+						 " FROM b ORDER BY lo",
+						 quote_literal_cstr(inferred_align),
+						 quote_literal_cstr(min_text),
+						 quote_literal_cstr(inferred_align),
+						 quote_literal_cstr(min_text),
+						 quote_literal_cstr(partinterval),
+						 quote_literal_cstr(partinterval),
+						 quote_literal_cstr(max_text));
+		ret = SPI_execute(buf.data, true, 0);
+		pfree(buf.data);
+
+		if (ret == SPI_OK_SELECT && SPI_processed > 0)
+		{
+			int			np = (int) SPI_processed;
+			int			p;
+
+			savecxt = MemoryContextSwitchTo(TopTransactionContext);
+			part_lowers   = palloc(sizeof(char *) * np);
+			part_uppers   = palloc(sizeof(char *) * np);
+			part_suffixes = palloc(sizeof(char *) * np);
+
+			for (p = 0; p < np; p++)
+			{
+				char *s;
+
+				s = SPI_getvalue(SPI_tuptable->vals[p], SPI_tuptable->tupdesc, 1);
+				part_lowers[p]   = s ? pstrdup(s) : NULL;
+				s = SPI_getvalue(SPI_tuptable->vals[p], SPI_tuptable->tupdesc, 2);
+				part_uppers[p]   = s ? pstrdup(s) : NULL;
+				s = SPI_getvalue(SPI_tuptable->vals[p], SPI_tuptable->tupdesc, 3);
+				part_suffixes[p] = s ? pstrdup(s) : NULL;
+			}
+			MemoryContextSwitchTo(savecxt);
+			nparts = np;
+		}
+		else
+			ereport(WARNING,
+					(errmsg("auto-partition: %s.%s: boundary CTE failed, falling back to single partition",
+							nsname, relname)));
+	}
+
+	if (nparts == 0)
+	{
+		/* Empty table or CTE failure: one partition anchored at min (or now()). */
+		savecxt = MemoryContextSwitchTo(TopTransactionContext);
+		part_lowers   = palloc(sizeof(char *));
+		part_uppers   = palloc(sizeof(char *));
+		part_suffixes = palloc(sizeof(char *));
+		part_lowers[0]   = min_text;
+		part_uppers[0]   = upper_text;
+		part_suffixes[0] = suffix;
+		MemoryContextSwitchTo(savecxt);
+		nparts = 1;
+	}
+
 	ereport(LOG,
-			(errmsg("auto-partition: converting %s.%s (rows=%lld, %s) -> partitioned [%s, %s)",
+			(errmsg("auto-partition: converting %s.%s (rows=%lld, %s) -> partitioned "
+					"[%s, %s) in %d partition(s) (align=%s)",
 					nsname, relname, (long long) row_count, partcol,
-					min_text, upper_text)));
+					part_lowers[0], part_uppers[nparts - 1],
+					nparts,
+					inferred_align ? inferred_align : "none")));
 
 	/* 4. Capture FKs and triggers before the subtransaction. */
 	ap_capture_fks(reloid, &out_fks, &in_fks);
@@ -1056,13 +1291,9 @@ convert_heap_to_partitioned_date(Oid reloid, const char *nsname,
 	PG_TRY();
 	{
 		char		tmp_name[NAMEDATALEN];
-		char		init_name[NAMEDATALEN];
-		char		final_init_name[NAMEDATALEN];
+		int			p;
 
 		snprintf(tmp_name, sizeof(tmp_name), "%s__autopart_new", relname);
-		snprintf(init_name, sizeof(init_name), "%s_initial", tmp_name);
-		snprintf(final_init_name, sizeof(final_init_name),
-				 "%s_p_%s", relname, suffix);
 
 		/* a. Drop FKs. */
 		ap_drop_fks(nsname, relname, &out_fks, &in_fks);
@@ -1100,20 +1331,37 @@ convert_heap_to_partitioned_date(Oid reloid, const char *nsname,
 						 quote_identifier(partcol));
 		SPI_exec(buf.data, 0);
 		pfree(buf.data);
+		ap_match_owner(nsname, tmp_name, reloid);
 
-		/* c. Initial partition spanning the existing data. */
-		initStringInfo(&buf);
-		appendStringInfo(&buf,
-						 "CREATE TABLE %s.%s PARTITION OF %s.%s "
-						 "FOR VALUES FROM (%s) TO (%s)",
-						 quote_identifier(nsname),
-						 quote_identifier(init_name),
-						 quote_identifier(nsname),
-						 quote_identifier(tmp_name),
-						 quote_literal_cstr(min_text),
-						 quote_literal_cstr(upper_text));
-		SPI_exec(buf.data, 0);
-		pfree(buf.data);
+		/*
+		 * c. Create partition(s) with their final names directly.
+		 * For aligned initial loads, nparts > 1 and each partition covers
+		 * exactly one calendar period.  For the unaligned path, nparts == 1
+		 * and the single partition covers [min, max+interval).
+		 *
+		 * Because we name the partitions relname_p_<suffix> directly (not a
+		 * temp name), no rename is needed after the atomic swap.
+		 */
+		for (p = 0; p < nparts; p++)
+		{
+			char	part_name[NAMEDATALEN];
+
+			snprintf(part_name, sizeof(part_name), "%s_p_%s",
+					 relname, part_suffixes[p]);
+
+			initStringInfo(&buf);
+			appendStringInfo(&buf,
+							 "CREATE TABLE %s.%s PARTITION OF %s.%s "
+							 "FOR VALUES FROM (%s) TO (%s)",
+							 quote_identifier(nsname),
+							 quote_identifier(part_name),
+							 quote_identifier(nsname),
+							 quote_identifier(tmp_name),
+							 quote_literal_cstr(part_lowers[p]),
+							 quote_literal_cstr(part_uppers[p]));
+			SPI_exec(buf.data, 0);
+			pfree(buf.data);
+		}
 
 		/* d. Copy rows. */
 		if (row_count > 0)
@@ -1133,17 +1381,8 @@ convert_heap_to_partitioned_date(Oid reloid, const char *nsname,
 		ap_capture_seqs(reloid, &seqs);
 		ap_detach_seqs(nsname, &seqs);
 		ap_atomic_swap(nsname, relname, tmp_name);
+		/* Rename the parent PK index from tmp_name_pkey -> relname_pkey. */
 		ap_rename_pk_index(nsname, tmp_name, relname);
-
-		initStringInfo(&buf);
-		appendStringInfo(&buf, "ALTER TABLE %s.%s RENAME TO %s",
-						 quote_identifier(nsname),
-						 quote_identifier(init_name),
-						 quote_identifier(final_init_name));
-		SPI_exec(buf.data, 0);
-		pfree(buf.data);
-
-		ap_rename_pk_index(nsname, init_name, final_init_name);
 
 		ap_reattach_seqs(nsname, relname, &seqs);
 
@@ -1154,10 +1393,18 @@ convert_heap_to_partitioned_date(Oid reloid, const char *nsname,
 		/* g. Re-add FKs as NOT VALID. */
 		ap_add_fks_not_valid(nsname, relname, &out_fks, &in_fks);
 
-		ereport(LOG,
-				(errmsg("auto-partition: converted %s.%s, initial partition %s.%s%s",
-						nsname, relname, nsname, final_init_name,
-						(out_fks.count + in_fks.count > 0) ? " (FKs preserved)" : "")));
+		{
+			char first_part[NAMEDATALEN];
+
+			snprintf(first_part, sizeof(first_part), "%s_p_%s",
+					 relname, part_suffixes[0]);
+			ereport(LOG,
+					(errmsg("auto-partition: converted %s.%s, %d initial partition(s) "
+							"starting at %s.%s%s",
+							nsname, relname, nparts,
+							nsname, first_part,
+							(out_fks.count + in_fks.count > 0) ? " (FKs preserved)" : "")));
+		}
 		converted = true;
 
 		ReleaseCurrentSubTransaction();
@@ -1226,6 +1473,47 @@ convert_heap_to_partitioned(Oid reloid, const char *nsname, const char *relname,
 	if (!ap_check_pk_includes_col(reloid, nsname, relname, partcol, true))
 		return false;
 
+	/* Reject non-PK unique indexes that don't include the partition column. */
+	{
+		StringInfoData ub;
+		int			uret;
+
+		initStringInfo(&ub);
+		appendStringInfo(&ub,
+						 "SELECT ci.relname "
+						 "FROM pg_index i "
+						 "JOIN pg_class ci ON ci.oid = i.indexrelid "
+						 "WHERE i.indrelid = %u "
+						 "  AND i.indisunique = true "
+						 "  AND i.indisprimary = false "
+						 "  AND NOT EXISTS ("
+						 "    SELECT 1 FROM pg_attribute a "
+						 "    WHERE a.attrelid = i.indrelid "
+						 "      AND a.attname = %s "
+						 "      AND a.attnum = ANY(i.indkey::int2[]))",
+						 reloid, quote_literal_cstr(partcol));
+		uret = SPI_execute(ub.data, true, 0);
+		pfree(ub.data);
+		if (uret == SPI_OK_SELECT && SPI_processed > 0)
+		{
+			uint64		u;
+
+			for (u = 0; u < SPI_processed; u++)
+			{
+				char	   *iname = SPI_getvalue(SPI_tuptable->vals[u],
+												 SPI_tuptable->tupdesc, 1);
+
+				ereport(WARNING,
+						(errmsg("auto-partition: %s.%s: unique index \"%s\" does not include "
+								"partition column %s — drop it before converting "
+								"(all unique indexes on a partitioned table must include "
+								"all partition key columns)",
+								nsname, relname, iname ? iname : "?", partcol)));
+			}
+			return false;
+		}
+	}
+
 	/* Compute initial partition bounds. */
 	initStringInfo(&buf);
 	appendStringInfo(&buf,
@@ -1292,13 +1580,12 @@ convert_heap_to_partitioned(Oid reloid, const char *nsname, const char *relname,
 	PG_TRY();
 	{
 		char		tmp_name[NAMEDATALEN];
-		char		init_name[NAMEDATALEN];
-		char		final_init_name[NAMEDATALEN];
+		char		first_part[NAMEDATALEN];
+		int			nparts = 0;
+		int64		lo;
 
 		snprintf(tmp_name, sizeof(tmp_name), "%s__autopart_new", relname);
-		snprintf(init_name, sizeof(init_name), "%s_initial", tmp_name);
-		snprintf(final_init_name, sizeof(final_init_name),
-				 "%s_p_%lld", relname, (long long) lower_bound);
+		first_part[0] = '\0';
 
 		/* 0. Drop FKs (inbound first, then outbound). */
 		ap_drop_fks(nsname, relname, &out_fks, &in_fks);
@@ -1315,20 +1602,36 @@ convert_heap_to_partitioned(Oid reloid, const char *nsname, const char *relname,
 						 quote_identifier(partcol));
 		SPI_exec(buf.data, 0);
 		pfree(buf.data);
+		ap_match_owner(nsname, tmp_name, reloid);
 
-		/* 2. Initial partition covering the existing data range. */
-		initStringInfo(&buf);
-		appendStringInfo(&buf,
-						 "CREATE TABLE %s.%s PARTITION OF %s.%s "
-						 "FOR VALUES FROM (%lld) TO (%lld)",
-						 quote_identifier(nsname),
-						 quote_identifier(init_name),
-						 quote_identifier(nsname),
-						 quote_identifier(tmp_name),
-						 (long long) lower_bound,
-						 (long long) upper_bound);
-		SPI_exec(buf.data, 0);
-		pfree(buf.data);
+		/*
+		 * 2. Create one partition per interval spanning [lower_bound, upper_bound).
+		 * Partitions are named <relname>_p_<lo> with their final names so no
+		 * post-swap rename is needed.
+		 */
+		for (lo = lower_bound; lo < upper_bound; lo += interval_int)
+		{
+			int64		hi = lo + interval_int;
+			char		part_name[NAMEDATALEN];
+
+			snprintf(part_name, sizeof(part_name),
+					 "%s_p_%lld", relname, (long long) lo);
+			if (nparts == 0)
+				strlcpy(first_part, part_name, sizeof(first_part));
+
+			initStringInfo(&buf);
+			appendStringInfo(&buf,
+							 "CREATE TABLE %s.%s PARTITION OF %s.%s "
+							 "FOR VALUES FROM (%lld) TO (%lld)",
+							 quote_identifier(nsname),
+							 quote_identifier(part_name),
+							 quote_identifier(nsname),
+							 quote_identifier(tmp_name),
+							 (long long) lo, (long long) hi);
+			SPI_exec(buf.data, 0);
+			pfree(buf.data);
+			nparts++;
+		}
 
 		/* 3. Copy existing rows. */
 		if (row_count > 0)
@@ -1354,17 +1657,6 @@ convert_heap_to_partitioned(Oid reloid, const char *nsname, const char *relname,
 		ap_atomic_swap(nsname, relname, tmp_name);
 		ap_rename_pk_index(nsname, tmp_name, relname);
 
-		/* Rename the initial partition to its final name. */
-		initStringInfo(&buf);
-		appendStringInfo(&buf, "ALTER TABLE %s.%s RENAME TO %s",
-						 quote_identifier(nsname),
-						 quote_identifier(init_name),
-						 quote_identifier(final_init_name));
-		SPI_exec(buf.data, 0);
-		pfree(buf.data);
-
-		ap_rename_pk_index(nsname, init_name, final_init_name);
-
 		ap_reattach_seqs(nsname, relname, &seqs);
 
 		/* 5. Re-apply reloptions. */
@@ -1375,8 +1667,12 @@ convert_heap_to_partitioned(Oid reloid, const char *nsname, const char *relname,
 		ap_add_fks_not_valid(nsname, relname, &out_fks, &in_fks);
 
 		ereport(LOG,
-				(errmsg("auto-partition: converted %s.%s, initial partition %s.%s%s",
-						nsname, relname, nsname, final_init_name,
+				(errmsg("auto-partition: converted %s.%s (rows=%lld, %s=[%lld..%lld]) "
+						"-> %d partition(s) starting %s.%s%s",
+						nsname, relname,
+						(long long) row_count, partcol,
+						(long long) min_val, (long long) max_val,
+						nparts, nsname, first_part,
 						(out_fks.count + in_fks.count > 0) ? " (FKs preserved)" : "")));
 		converted = true;
 
@@ -2136,6 +2432,84 @@ convert_heap_to_partitioned_list(Oid reloid, const char *nsname,
 						nsname, relname, pk_cols, partcol)));
 	}
 
+	/*
+	 * 1b. If we need to rebuild the PK to include partcol, that PK rebuild
+	 * requires partcol to be NOT NULL (PKs cannot contain NULLs).  Check
+	 * now to give a clear error instead of failing mid-subtransaction.
+	 */
+	if (need_pk_rebuild)
+	{
+		StringInfoData nb;
+		int			nret;
+		int64		null_count = 0;
+
+		initStringInfo(&nb);
+		appendStringInfo(&nb,
+						 "SELECT count(*) FROM %s.%s WHERE %s IS NULL",
+						 quote_identifier(nsname),
+						 quote_identifier(relname),
+						 quote_identifier(partcol));
+		nret = SPI_execute(nb.data, true, 0);
+		pfree(nb.data);
+		if (nret == SPI_OK_SELECT && SPI_processed > 0)
+		{
+			bool		isnull;
+
+			null_count = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
+													  SPI_tuptable->tupdesc,
+													  1, &isnull));
+		}
+		if (null_count > 0)
+		{
+			ereport(WARNING,
+					(errmsg("auto-partition: %s.%s: partition column %s has %lld NULL row(s) — "
+							"set NOT NULL before converting (PRIMARY KEY requires non-null values)",
+							nsname, relname, partcol, (long long) null_count)));
+			return false;
+		}
+	}
+
+	/* Reject non-PK unique indexes that don't include the partition column. */
+	{
+		StringInfoData ub;
+		int			uret;
+
+		initStringInfo(&ub);
+		appendStringInfo(&ub,
+						 "SELECT ci.relname "
+						 "FROM pg_index i "
+						 "JOIN pg_class ci ON ci.oid = i.indexrelid "
+						 "WHERE i.indrelid = %u "
+						 "  AND i.indisunique = true "
+						 "  AND i.indisprimary = false "
+						 "  AND NOT EXISTS ("
+						 "    SELECT 1 FROM pg_attribute a "
+						 "    WHERE a.attrelid = i.indrelid "
+						 "      AND a.attname = %s "
+						 "      AND a.attnum = ANY(i.indkey::int2[]))",
+						 reloid, quote_literal_cstr(partcol));
+		uret = SPI_execute(ub.data, true, 0);
+		pfree(ub.data);
+		if (uret == SPI_OK_SELECT && SPI_processed > 0)
+		{
+			uint64		u;
+
+			for (u = 0; u < SPI_processed; u++)
+			{
+				char	   *iname = SPI_getvalue(SPI_tuptable->vals[u],
+												 SPI_tuptable->tupdesc, 1);
+
+				ereport(WARNING,
+						(errmsg("auto-partition: %s.%s: unique index \"%s\" does not include "
+								"partition column %s — drop it before converting "
+								"(all unique indexes on a partitioned table must include "
+								"all partition key columns)",
+								nsname, relname, iname ? iname : "?", partcol)));
+			}
+			return false;
+		}
+	}
+
 	/* 2. Capture FKs and triggers before the subtransaction. */
 	ap_capture_fks(reloid, &out_fks, &in_fks);
 	ap_capture_triggers(reloid, &trigs);
@@ -2268,15 +2642,15 @@ convert_heap_to_partitioned_list(Oid reloid, const char *nsname,
 						 quote_identifier(partcol));
 		SPI_exec(buf.data, 0);
 		pfree(buf.data);
+		ap_match_owner(nsname, tmp_name, reloid);
 
-		/* c. One partition per distinct value. */
+		/* c. One partition per distinct value — use final names directly. */
 		for (k = 0; k < value_count; k++)
 		{
 			char		child_name[NAMEDATALEN];
 
 			snprintf(child_name, sizeof(child_name),
-					 "%s__autopart_new_p_%lld",
-					 relname, (long long) values[k]);
+					 "%s_p_%lld", relname, (long long) values[k]);
 
 			initStringInfo(&buf);
 			appendStringInfo(&buf,
@@ -2291,22 +2665,16 @@ convert_heap_to_partitioned_list(Oid reloid, const char *nsname,
 			pfree(buf.data);
 		}
 
-		/* d. DEFAULT partition for future arrivals. */
-		{
-			char		default_initial[NAMEDATALEN];
-
-			snprintf(default_initial, sizeof(default_initial),
-					 "%s__autopart_new_default", relname);
-			initStringInfo(&buf);
-			appendStringInfo(&buf,
-							 "CREATE TABLE %s.%s PARTITION OF %s.%s DEFAULT",
-							 quote_identifier(nsname),
-							 quote_identifier(default_initial),
-							 quote_identifier(nsname),
-							 quote_identifier(tmp_name));
-			SPI_exec(buf.data, 0);
-			pfree(buf.data);
-		}
+		/* d. DEFAULT partition for future arrivals — also named directly. */
+		initStringInfo(&buf);
+		appendStringInfo(&buf,
+						 "CREATE TABLE %s.%s PARTITION OF %s.%s DEFAULT",
+						 quote_identifier(nsname),
+						 quote_identifier(default_name),
+						 quote_identifier(nsname),
+						 quote_identifier(tmp_name));
+		SPI_exec(buf.data, 0);
+		pfree(buf.data);
 
 		/* e. Copy rows.  Partition routing handles the dispatch. */
 		if (row_count > 0)
@@ -2326,40 +2694,7 @@ convert_heap_to_partitioned_list(Oid reloid, const char *nsname,
 		ap_capture_seqs(reloid, &seqs);
 		ap_detach_seqs(nsname, &seqs);
 		ap_atomic_swap(nsname, relname, tmp_name);
-
-		/* Rename the per-value partitions to clean names. */
-		for (k = 0; k < value_count; k++)
-		{
-			char		old_name[NAMEDATALEN];
-			char		new_name[NAMEDATALEN];
-
-			snprintf(old_name, sizeof(old_name),
-					 "%s__autopart_new_p_%lld", relname, (long long) values[k]);
-			snprintf(new_name, sizeof(new_name),
-					 "%s_p_%lld", relname, (long long) values[k]);
-
-			initStringInfo(&buf);
-			appendStringInfo(&buf, "ALTER TABLE %s.%s RENAME TO %s",
-							 quote_identifier(nsname),
-							 quote_identifier(old_name),
-							 quote_identifier(new_name));
-			SPI_exec(buf.data, 0);
-			pfree(buf.data);
-		}
-
-		/* Rename the DEFAULT partition. */
-		{
-			char		old_name[NAMEDATALEN];
-
-			snprintf(old_name, sizeof(old_name), "%s__autopart_new_default", relname);
-			initStringInfo(&buf);
-			appendStringInfo(&buf, "ALTER TABLE %s.%s RENAME TO %s",
-							 quote_identifier(nsname),
-							 quote_identifier(old_name),
-							 quote_identifier(default_name));
-			SPI_exec(buf.data, 0);
-			pfree(buf.data);
-		}
+		ap_rename_pk_index(nsname, tmp_name, relname);
 
 		ap_reattach_seqs(nsname, relname, &seqs);
 
