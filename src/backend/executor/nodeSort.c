@@ -19,6 +19,7 @@
 #include "executor/execdebug.h"
 #include "executor/nodeSort.h"
 #include "miscadmin.h"
+#include "utils/rel.h"
 #include "utils/tuplesort.h"
 
 
@@ -46,6 +47,29 @@
  *		  -- the outer child is prepared to return the first tuple.
  * ----------------------------------------------------------------
  */
+/*
+ * get_outer_scan_relation
+ *		Return the Relation being scanned by the direct outer child, or NULL.
+ *		Phase 1: handles Sort → SeqScan / IndexScan common case.
+ */
+static Relation
+get_outer_scan_relation(PlanState *ps)
+{
+	if (ps == NULL)
+		return NULL;
+	switch (nodeTag(ps))
+	{
+		case T_SeqScanState:
+		case T_IndexScanState:
+		case T_IndexOnlyScanState:
+		case T_BitmapHeapScanState:
+		case T_TidScanState:
+			return ((ScanState *) ps)->ss_currentRelation;
+		default:
+			return NULL;
+	}
+}
+
 static TupleTableSlot *
 ExecSort(PlanState *pstate)
 {
@@ -102,24 +126,42 @@ ExecSort(PlanState *pstate)
 		if (node->bounded)
 			tuplesortopts |= TUPLESORT_ALLOWBOUNDED;
 
-		if (node->datumSort)
-			tuplesortstate = tuplesort_begin_datum(TupleDescAttr(tupDesc, 0)->atttypid,
-												   plannode->sortOperators[0],
-												   plannode->collations[0],
-												   plannode->nullsFirst[0],
-												   work_mem,
-												   NULL,
-												   tuplesortopts);
-		else
-			tuplesortstate = tuplesort_begin_heap(tupDesc,
-												  plannode->numCols,
-												  plannode->sortColIdx,
-												  plannode->sortOperators,
-												  plannode->collations,
-												  plannode->nullsFirst,
-												  work_mem,
-												  NULL,
-												  tuplesortopts);
+		/*
+		 * DBblue: scale work_mem by the relation's work_mem_factor reloption
+		 * when the direct outer child is a plain table scan.
+		 */
+		{
+			int			effective_work_mem = work_mem;
+			Relation	outerRel = get_outer_scan_relation(outerNode);
+
+			if (outerRel != NULL)
+			{
+				double		factor = RelationGetWorkMemFactor(outerRel, 1.0);
+
+				if (factor != 1.0)
+					effective_work_mem =
+						(int) Min((int64) work_mem * factor, (int64) INT_MAX);
+			}
+
+			if (node->datumSort)
+				tuplesortstate = tuplesort_begin_datum(TupleDescAttr(tupDesc, 0)->atttypid,
+													   plannode->sortOperators[0],
+													   plannode->collations[0],
+													   plannode->nullsFirst[0],
+													   effective_work_mem,
+													   NULL,
+													   tuplesortopts);
+			else
+				tuplesortstate = tuplesort_begin_heap(tupDesc,
+													  plannode->numCols,
+													  plannode->sortColIdx,
+													  plannode->sortOperators,
+													  plannode->collations,
+													  plannode->nullsFirst,
+													  effective_work_mem,
+													  NULL,
+													  tuplesortopts);
+		}
 		if (node->bounded)
 			tuplesort_set_bound(tuplesortstate, node->bound);
 		node->tuplesortstate = tuplesortstate;

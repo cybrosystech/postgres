@@ -468,6 +468,16 @@ static relopt_real realRelOpts[] =
 
 	{
 		{
+			"work_mem_factor",
+			"Multiplier on work_mem for hash aggregation and sort operations on this relation.",
+			RELOPT_KIND_HEAP,
+			ShareUpdateExclusiveLock
+		},
+		1.0, 0.1, 1000.0
+	},
+
+	{
+		{
 			"seq_page_cost",
 			"Sets the planner's estimate of the cost of a sequentially fetched disk page.",
 			RELOPT_KIND_TABLESPACE,
@@ -2025,7 +2035,9 @@ default_reloptions(Datum reloptions, bool validate, relopt_kind kind)
 		{"vacuum_truncate", RELOPT_TYPE_TERNARY,
 		offsetof(StdRdOptions, vacuum_truncate)},
 		{"vacuum_max_eager_freeze_failure_rate", RELOPT_TYPE_REAL,
-		offsetof(StdRdOptions, vacuum_max_eager_freeze_failure_rate)}
+		offsetof(StdRdOptions, vacuum_max_eager_freeze_failure_rate)},
+		{"work_mem_factor", RELOPT_TYPE_REAL,
+		offsetof(StdRdOptions, work_mem_factor)}
 	};
 
 	return (bytea *) build_reloptions(reloptions, validate, kind,

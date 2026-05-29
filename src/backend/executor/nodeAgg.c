@@ -268,6 +268,7 @@
 #include "port/pg_bitutils.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/rel.h"
 #include "utils/datum.h"
 #include "utils/expandeddatum.h"
 #include "utils/injection_point.h"
@@ -3277,6 +3278,30 @@ hashagg_reset_spill_state(AggState *aggstate)
  *
  * -----------------
  */
+/*
+ * get_outer_scan_relation
+ *		If the direct outer child of a plan node is a table scan, return its
+ *		Relation.  Returns NULL for any other plan shape (joins, subqueries, …).
+ *		Phase 1: covers the Agg → SeqScan / IndexScan common case.
+ */
+static Relation
+get_outer_scan_relation(PlanState *ps)
+{
+	if (ps == NULL)
+		return NULL;
+	switch (nodeTag(ps))
+	{
+		case T_SeqScanState:
+		case T_IndexScanState:
+		case T_IndexOnlyScanState:
+		case T_BitmapHeapScanState:
+		case T_TidScanState:
+			return ((ScanState *) ps)->ss_currentRelation;
+		default:
+			return NULL;
+	}
+}
+
 AggState *
 ExecInitAgg(Agg *node, EState *estate, int eflags)
 {
@@ -3712,6 +3737,29 @@ ExecInitAgg(Agg *node, EState *estate, int eflags)
 							&aggstate->hash_mem_limit,
 							&aggstate->hash_ngroups_limit,
 							&aggstate->hash_planned_partitions);
+
+		/*
+		 * DBblue: scale the hash memory budget by the relation's
+		 * work_mem_factor reloption when the direct outer child is a plain
+		 * table scan (Phase 1 — Agg → SeqScan / IndexScan pattern).
+		 */
+		{
+			Relation	outerRel = get_outer_scan_relation(outerPlanState(aggstate));
+
+			if (outerRel != NULL)
+			{
+				double		factor = RelationGetWorkMemFactor(outerRel, 1.0);
+
+				if (factor != 1.0)
+				{
+					aggstate->hash_mem_limit =
+						(Size) (aggstate->hash_mem_limit * factor);
+					aggstate->hash_ngroups_limit =
+						(uint64) (aggstate->hash_ngroups_limit * factor);
+				}
+			}
+		}
+
 		find_hash_columns(aggstate);
 
 		/* Skip massive memory allocation if we are just doing EXPLAIN */

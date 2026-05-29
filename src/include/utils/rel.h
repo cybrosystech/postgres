@@ -356,6 +356,9 @@ typedef struct StdRdOptions
 	 * to freeze. 0 if disabled, -1 if unspecified.
 	 */
 	double		vacuum_max_eager_freeze_failure_rate;
+
+	/* DBblue: per-relation work_mem multiplier */
+	double		work_mem_factor;	/* scale factor for Agg/Sort memory budget; 1.0 = use work_mem as-is */
 } StdRdOptions;
 
 #define HEAP_MIN_FILLFACTOR			10
@@ -410,6 +413,16 @@ typedef struct StdRdOptions
 #define RelationGetParallelWorkers(relation, defaultpw) \
 	((relation)->rd_options ? \
 	 ((StdRdOptions *) (relation)->rd_options)->parallel_workers : (defaultpw))
+
+/*
+ * RelationGetWorkMemFactor
+ *		Returns the per-relation work_mem multiplier reloption.
+ *		1.0 means use work_mem unchanged; 4.0 means give this relation 4×.
+ *		Note multiple eval of argument!
+ */
+#define RelationGetWorkMemFactor(relation, defaultfactor) \
+	((relation)->rd_options ? \
+	 ((StdRdOptions *) (relation)->rd_options)->work_mem_factor : (defaultfactor))
 
 /* ViewOptions->check_option values */
 typedef enum ViewOptCheckOption
