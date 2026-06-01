@@ -15,6 +15,9 @@
  * Commit path (xact callback):
  *   For every relid in the local list, look it up in the shmem array and, if
  *   found, set dirty = true.  Relids absent from the array are ignored.
+ *   The callback fires on COMMIT and PREPARE (flush dirty flags) and on
+ *   ABORT (discard without flushing).  PRE_COMMIT and other intermediate
+ *   events are ignored so that xact_noted_rels survives to actual commit.
  *
  * REFRESH path:
  *   1. Collect source relids from the matview rewrite rule.
@@ -131,6 +134,11 @@ matview_shmem_mark_dirty(Oid relid)
 
 /* ----------
  * matview_dirty_xact_callback
+ *
+ * On commit (or prepare), flush xact_noted_rels to shmem.
+ * On abort, discard without flushing.
+ * Intermediate events (PRE_COMMIT etc.) are intentionally ignored so that
+ * xact_noted_rels survives to the actual COMMIT event.
  * ----------
  */
 static void
@@ -138,13 +146,18 @@ matview_dirty_xact_callback(XactEvent event, void *arg)
 {
 	int			i;
 
-	if (event == XACT_EVENT_COMMIT || event == XACT_EVENT_PARALLEL_COMMIT)
+	if (event == XACT_EVENT_COMMIT || event == XACT_EVENT_PARALLEL_COMMIT ||
+		event == XACT_EVENT_PREPARE)
 	{
 		for (i = 0; i < xact_noted_nrels; i++)
 			matview_shmem_mark_dirty(xact_noted_rels[i]);
+		xact_noted_nrels = 0;
 	}
-	/* always reset local list — even on abort */
-	xact_noted_nrels = 0;
+	else if (event == XACT_EVENT_ABORT || event == XACT_EVENT_PARALLEL_ABORT)
+	{
+		/* rolled back — discard without dirtying shmem */
+		xact_noted_nrels = 0;
+	}
 }
 
 /* ----------
