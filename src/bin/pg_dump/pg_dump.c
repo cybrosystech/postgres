@@ -18119,6 +18119,9 @@ dumpTableSchema(Archive *fout, const TableInfo *tbinfo)
 					case 'l':
 						cmname = "lz4";
 						break;
+					case 'z':
+						cmname = "zstd";
+						break;
 					default:
 						cmname = NULL;
 						break;

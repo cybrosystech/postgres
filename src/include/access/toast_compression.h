@@ -38,7 +38,8 @@ typedef enum ToastCompressionId
 {
 	TOAST_PGLZ_COMPRESSION_ID = 0,
 	TOAST_LZ4_COMPRESSION_ID = 1,
-	TOAST_INVALID_COMPRESSION_ID = 2,
+	TOAST_ZSTD_COMPRESSION_ID = 2,
+	TOAST_INVALID_COMPRESSION_ID = 3,
 } ToastCompressionId;
 
 /*
@@ -48,15 +49,19 @@ typedef enum ToastCompressionId
  */
 #define TOAST_PGLZ_COMPRESSION			'p'
 #define TOAST_LZ4_COMPRESSION			'l'
+#define TOAST_ZSTD_COMPRESSION			'z'
 #define InvalidCompressionMethod		'\0'
 
 #define CompressionMethodIsValid(cm)  ((cm) != InvalidCompressionMethod)
 
 /*
- * Choose an appropriate default toast compression method.  If lz4 is
- * compiled-in, use it, otherwise use pglz.
+ * Choose an appropriate default toast compression method.  Prefer zstd if
+ * compiled-in (best ratio for Odoo's HTML/XML/JSON workloads); fall back to
+ * lz4, then pglz.
  */
-#ifdef USE_LZ4
+#if defined(USE_ZSTD)
+#define DEFAULT_TOAST_COMPRESSION	TOAST_ZSTD_COMPRESSION
+#elif defined(USE_LZ4)
 #define DEFAULT_TOAST_COMPRESSION	TOAST_LZ4_COMPRESSION
 #else
 #define DEFAULT_TOAST_COMPRESSION	TOAST_PGLZ_COMPRESSION
@@ -73,6 +78,12 @@ extern varlena *lz4_compress_datum(const varlena *value);
 extern varlena *lz4_decompress_datum(const varlena *value);
 extern varlena *lz4_decompress_datum_slice(const varlena *value,
 										   int32 slicelength);
+
+/* zstd compression/decompression routines */
+extern varlena *zstd_compress_datum(const varlena *value);
+extern varlena *zstd_decompress_datum(const varlena *value);
+extern varlena *zstd_decompress_datum_slice(const varlena *value,
+											int32 slicelength);
 
 /* other stuff */
 extern ToastCompressionId toast_get_compression_id(varlena *attr);
