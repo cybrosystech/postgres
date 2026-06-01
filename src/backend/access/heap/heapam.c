@@ -33,6 +33,7 @@
 
 #include "access/heapam.h"
 #include "access/heaptoast.h"
+#include "commands/matview_dirty.h"
 #include "access/hio.h"
 #include "access/multixact.h"
 #include "access/subtrans.h"
@@ -2181,6 +2182,9 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 	/* Note: speculative insertions are counted too, even if aborted later */
 	pgstat_count_heap_insert(relation, 1);
 
+	/* DBblue: record write for matview dirty tracking */
+	MatviewDirtyNote(RelationGetRelid(relation));
+
 	/*
 	 * If heaptup is a private copy, release it.  Don't forget to copy t_self
 	 * back to the caller's image, too.
@@ -2644,6 +2648,9 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 		slots[i]->tts_tid = heaptuples[i]->t_self;
 
 	pgstat_count_heap_insert(relation, ntuples);
+
+	/* DBblue: record write for matview dirty tracking */
+	MatviewDirtyNote(RelationGetRelid(relation));
 }
 
 /*
@@ -3134,6 +3141,9 @@ l1:
 		UnlockTupleTuplock(relation, &(tp.t_self), LockTupleExclusive);
 
 	pgstat_count_heap_delete(relation);
+
+	/* DBblue: record write for matview dirty tracking */
+	MatviewDirtyNote(RelationGetRelid(relation));
 
 	if (old_key_tuple != NULL && old_key_copied)
 		heap_freetuple(old_key_tuple);
@@ -4139,6 +4149,9 @@ l2:
 		UnlockTupleTuplock(relation, &(oldtup.t_self), *lockmode);
 
 	pgstat_count_heap_update(relation, use_hot_update, newbuf != buffer);
+
+	/* DBblue: record write for matview dirty tracking */
+	MatviewDirtyNote(RelationGetRelid(relation));
 
 	/*
 	 * If heaptup is a private copy, release it.  Don't forget to copy t_self

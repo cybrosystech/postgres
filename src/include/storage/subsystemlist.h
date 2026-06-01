@@ -88,3 +88,6 @@ PG_SHMEM_SUBSYSTEM(DataChecksumsShmemCallbacks)
 
 /* AIO subsystem. This delegates to the method-specific callbacks */
 PG_SHMEM_SUBSYSTEM(AioShmemCallbacks)
+
+/* DBblue: matview dirty-flag tracking for auto_skip_unchanged */
+PG_SHMEM_SUBSYSTEM(MatviewDirtyShmemCallbacks)

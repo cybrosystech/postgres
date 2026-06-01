@@ -25,6 +25,7 @@
 #include "catalog/pg_am.h"
 #include "catalog/pg_opclass.h"
 #include "commands/matview.h"
+#include "commands/matview_dirty.h"
 #include "commands/repack.h"
 #include "commands/tablecmds.h"
 #include "commands/tablespace.h"
@@ -178,6 +179,7 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 	int			save_sec_context;
 	int			save_nestlevel;
 	ObjectAddress address;
+	List	   *auto_skip_source_relids = NIL;
 
 	matviewRel = table_open(matviewOid, NoLock);
 	relowner = matviewRel->rd_rel->relowner;
@@ -282,6 +284,48 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 	dataQuery = linitial_node(Query, actions);
 
 	/*
+	 * DBblue: auto_skip_unchanged — if every source table is clean (no
+	 * committed writes since the last successful refresh), skip entirely.
+	 */
+	if (!is_create && !skipData && RelationGetAutoSkipUnchanged(matviewRel))
+	{
+		ListCell   *lc;
+		bool		all_clean = true;
+
+		foreach(lc, dataQuery->rtable)
+		{
+			RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+
+			if (rte->rtekind == RTE_RELATION)
+			{
+				MatviewDirtyRegister(rte->relid);
+				auto_skip_source_relids =
+					lappend_oid(auto_skip_source_relids, rte->relid);
+			}
+		}
+
+		foreach(lc, auto_skip_source_relids)
+		{
+			if (!MatviewDirtyIsClean(lfirst_oid(lc)))
+			{
+				all_clean = false;
+				break;
+			}
+		}
+
+		if (all_clean)
+		{
+			table_close(matviewRel, NoLock);
+			AtEOXact_GUC(false, save_nestlevel);
+			SetUserIdAndSecContext(save_userid, save_sec_context);
+			ObjectAddressSet(address, RelationRelationId, matviewOid);
+			if (qc)
+				SetQueryCompletion(qc, CMDTAG_REFRESH_MATERIALIZED_VIEW, 0);
+			return address;
+		}
+	}
+
+	/*
 	 * Check for active uses of the relation in the current transaction, such
 	 * as open scans.
 	 *
@@ -361,6 +405,19 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 		pgstat_count_truncate(matviewRel);
 		if (!skipData)
 			pgstat_count_heap_insert(matviewRel, processed);
+	}
+
+	/*
+	 * DBblue: refresh completed — mark every watched source table clean so
+	 * the next REFRESH with auto_skip_unchanged can be skipped if there are
+	 * no further writes.
+	 */
+	if (auto_skip_source_relids != NIL)
+	{
+		ListCell   *lc;
+
+		foreach(lc, auto_skip_source_relids)
+			MatviewDirtyMarkClean(lfirst_oid(lc));
 	}
 
 	table_close(matviewRel, NoLock);
