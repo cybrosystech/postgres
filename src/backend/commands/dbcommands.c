@@ -1004,15 +1004,23 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 	 * UTF8 encoding.  Use template0 as the source so the encoding/locale
 	 * compatibility checks below are bypassed regardless of template1's
 	 * settings.
+	 *
+	 * Only do this if template0 actually exists (to avoid issues during
+	 * initdb when template0 is being created).
 	 */
 	if (templateEl == NULL && encodingEl == NULL &&
 		localeEl == NULL && builtinlocaleEl == NULL && iculocaleEl == NULL &&
 		collateEl == NULL && ctypeEl == NULL && locproviderEl == NULL)
 	{
-		dbtemplate = "template0";
-		encoding = PG_UTF8;
-		dblocprovider = COLLPROVIDER_BUILTIN;
-		dblocale = "C.UTF-8";
+		/* Check if template0 exists before trying to use it */
+		Oid template0_oid = get_database_oid("template0", true);
+		if (OidIsValid(template0_oid))
+		{
+			dbtemplate = "template0";
+			encoding = PG_UTF8;
+			dblocprovider = COLLPROVIDER_BUILTIN;
+			dblocale = "C.UTF-8";
+		}
 	}
 
 	if (!dbtemplate)
