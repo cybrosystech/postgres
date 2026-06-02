@@ -286,6 +286,9 @@ dbblue_fillfactor_lookup(const char *tablename)
        rebuild_hash_table(dbblue_fillfactor_map);
    }
 
+   // If hash table is still NULL (no fillfactor map configured), return -1
+   if (!dbblue_ff_htab)
+       return -1;
 
    // normalize_name(tablename, normname, sizeof(normname));
    memset(normname, 0, sizeof(normname));
