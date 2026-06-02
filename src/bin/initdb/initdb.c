@@ -50,6 +50,7 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <netdb.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -81,6 +82,8 @@
 #include "getopt_long.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
+
+#include "auto_tune.h"
 
 
 /* Ideally this would be in a .h file, but it hardly seems worth the trouble */
@@ -204,6 +207,14 @@ static const char *dynamic_shared_memory_type = NULL;
 static const char *default_timezone = NULL;
 
 /*
+ * Auto-tune state.  In the dbblue distribution, auto-tune is on by default
+ * so a fresh cluster comes up with sensible values for the host instead of
+ * the upstream-conservative ones.  Use --no-auto-tune to opt out.
+ */
+static bool auto_tune_enabled = true;
+static AutoTuneSettings auto_tune_settings;
+
+/*
  * Warning messages for authentication methods
  */
 #define AUTHTRUST_WARNING \
@@ -278,7 +289,9 @@ static void set_null_conf(void);
 static void test_config_settings(void);
 static bool test_specific_config_settings(int test_conns, int test_av_slots,
 										  int test_buffs);
+static void apply_auto_tune(void);
 static void setup_config(void);
+static char *format_kb(int kb);
 static void bootstrap_template1(void);
 static void setup_auth(FILE *cmdfd);
 static void get_su_pwd(void);
@@ -1276,6 +1289,98 @@ test_specific_config_settings(int test_conns, int test_av_slots, int test_buffs)
 }
 
 /*
+ * Format a kilobyte count as a string suitable for postgresql.conf:
+ * MB or GB if the value is an exact multiple, otherwise kB.  Returned
+ * buffer is palloc'd by psprintf.
+ */
+static char *
+format_kb(int kb)
+{
+	if (kb % (1024 * 1024) == 0)
+		return psprintf("%dGB", kb / (1024 * 1024));
+	if (kb % 1024 == 0)
+		return psprintf("%dMB", kb / 1024);
+	return psprintf("%dkB", kb);
+}
+
+/*
+ * Compute auto-tuned settings for the current host and store them in
+ * auto_tune_settings.  If the requested shared_buffers exceeds what the
+ * kernel will tolerate, fall back to the value already chosen by
+ * test_config_settings().  Run after test_config_settings() so we know
+ * n_connections and the kernel-feasible n_buffers.
+ *
+ * Other tuned values (work_mem, effective_cache_size, etc.) are per-process
+ * limits, so no probing is needed; setup_config() will write them straight
+ * into postgresql.conf.
+ */
+static void
+apply_auto_tune(void)
+{
+	AutoTuneSettings s;
+	int			desired_buffers;
+
+	if (!auto_tune_enabled)
+		return;
+
+	s = auto_tune_compute(n_connections);
+	if (!s.valid)
+	{
+		printf(_("auto-tune: could not detect host specs, using upstream defaults\n"));
+		auto_tune_settings.valid = false;
+		return;
+	}
+
+	printf(_("auto-tune: detected %lu MB RAM, %d CPU(s), storage=%s\n"),
+		   (unsigned long) (s.total_ram_bytes / (1024 * 1024)),
+		   s.cpu_count,
+		   s.ssd_storage ? "ssd" : "hdd");
+
+	/*
+	 * Convert kB → 8 kB pages (BLCKSZ).  Use int64 because shared_buffers
+	 * on a multi-GB host can exceed INT_MAX kilobytes-times-1024.  Cap
+	 * the result to a safe int range; n_buffers in initdb is int.
+	 */
+	{
+		int64		buf64 = ((int64) s.shared_buffers_kb * 1024) / BLCKSZ;
+
+		if (buf64 > INT_MAX)
+			buf64 = INT_MAX;
+		desired_buffers = (int) buf64;
+	}
+
+	/*
+	 * Probe shared_buffers if we want more than test_config_settings already
+	 * confirmed.  If the kernel rejects it, keep the smaller probed value.
+	 */
+	if (desired_buffers > n_buffers)
+	{
+		printf(_("auto-tune: probing \"shared_buffers\" = %s ... "),
+			   format_kb(s.shared_buffers_kb));
+		fflush(stdout);
+		if (test_specific_config_settings(n_connections, n_av_slots,
+										  desired_buffers))
+		{
+			n_buffers = desired_buffers;
+			printf("ok\n");
+		}
+		else
+		{
+			s.shared_buffers_kb = n_buffers * (BLCKSZ / 1024);
+			printf(_("rejected by kernel, keeping %s\n"),
+				   format_kb(s.shared_buffers_kb));
+		}
+	}
+	else
+	{
+		/* The probed value already covers what we want. */
+		n_buffers = desired_buffers;
+	}
+
+	auto_tune_settings = s;
+}
+
+/*
  * Calculate the default wal_size with a "pretty" unit.
  */
 static char *
@@ -1444,6 +1549,65 @@ setup_config(void)
 	conflines = replace_guc_value(conflines, "default_toast_compression",
 								  "lz4", true);
 #endif
+
+	/*
+	 * Apply auto-tuned values, if enabled and detection succeeded.  These
+	 * are written before user -c overrides so the user can still tweak
+	 * any individual setting.  shared_buffers and max_connections were
+	 * already handled above (their values flow through n_buffers and
+	 * n_connections, which apply_auto_tune may have updated).
+	 */
+	if (auto_tune_enabled && auto_tune_settings.valid)
+	{
+		const AutoTuneSettings *t = &auto_tune_settings;
+
+		conflines = replace_guc_value(conflines, "effective_cache_size",
+									  format_kb(t->effective_cache_size_kb), false);
+		conflines = replace_guc_value(conflines, "work_mem",
+									  format_kb(t->work_mem_kb), false);
+		conflines = replace_guc_value(conflines, "maintenance_work_mem",
+									  format_kb(t->maintenance_work_mem_kb), false);
+
+		snprintf(repltok, sizeof(repltok), "%d", t->max_worker_processes);
+		conflines = replace_guc_value(conflines, "max_worker_processes",
+									  repltok, false);
+		snprintf(repltok, sizeof(repltok), "%d", t->max_parallel_workers);
+		conflines = replace_guc_value(conflines, "max_parallel_workers",
+									  repltok, false);
+		snprintf(repltok, sizeof(repltok), "%d", t->max_parallel_workers_per_gather);
+		conflines = replace_guc_value(conflines, "max_parallel_workers_per_gather",
+									  repltok, false);
+		snprintf(repltok, sizeof(repltok), "%d", t->max_parallel_maintenance_workers);
+		conflines = replace_guc_value(conflines, "max_parallel_maintenance_workers",
+									  repltok, false);
+
+		snprintf(repltok, sizeof(repltok), "%.2f", t->random_page_cost);
+		conflines = replace_guc_value(conflines, "random_page_cost",
+									  repltok, false);
+		snprintf(repltok, sizeof(repltok), "%d", t->effective_io_concurrency);
+		conflines = replace_guc_value(conflines, "effective_io_concurrency",
+									  repltok, false);
+
+		snprintf(repltok, sizeof(repltok), "%.2f", t->checkpoint_completion_target);
+		conflines = replace_guc_value(conflines, "checkpoint_completion_target",
+									  repltok, false);
+
+		/*
+		 * Override the WAL sizes computed above by setup_config's earlier
+		 * defaults.  Auto-tune values are workload-driven and supersede
+		 * the segment-count-based defaults.
+		 */
+		snprintf(repltok, sizeof(repltok), "%dMB", t->min_wal_size_mb);
+		conflines = replace_guc_value(conflines, "min_wal_size",
+									  repltok, false);
+		snprintf(repltok, sizeof(repltok), "%dMB", t->max_wal_size_mb);
+		conflines = replace_guc_value(conflines, "max_wal_size",
+									  repltok, false);
+
+		snprintf(repltok, sizeof(repltok), "%d", t->default_statistics_target);
+		conflines = replace_guc_value(conflines, "default_statistics_target",
+									  repltok, false);
+	}
 
 	/*
 	 * Now replace anything that's overridden via -c switches.
@@ -2574,6 +2738,7 @@ usage(const char *progname)
 	printf(_("  -c, --set NAME=VALUE      override default setting for server parameter\n"));
 	printf(_("  -d, --debug               generate lots of debugging output\n"));
 	printf(_("      --discard-caches      set debug_discard_caches=1\n"));
+	printf(_("      --no-auto-tune        skip auto-tuning postgresql.conf for the host\n"));
 	printf(_("  -L DIRECTORY              where to find the input files\n"));
 	printf(_("  -n, --no-clean            do not clean up after errors\n"));
 	printf(_("  -N, --no-sync             do not wait for changes to be written safely to disk\n"));
@@ -3115,6 +3280,9 @@ initialize_data_directory(void)
 	set_null_conf();
 	test_config_settings();
 
+	/* Apply auto-tune on top of the kernel-tested baseline */
+	apply_auto_tune();
+
 	/* Now create all the text config files */
 	setup_config();
 
@@ -3223,6 +3391,7 @@ main(int argc, char *argv[])
 		{"sync-method", required_argument, NULL, 19},
 		{"no-data-checksums", no_argument, NULL, 20},
 		{"no-sync-data-files", no_argument, NULL, 21},
+		{"no-auto-tune", no_argument, NULL, 22},
 		{NULL, 0, NULL, 0}
 	};
 
@@ -3419,6 +3588,9 @@ main(int argc, char *argv[])
 				break;
 			case 21:
 				sync_data_files = false;
+				break;
+			case 22:
+				auto_tune_enabled = false;
 				break;
 			default:
 				/* getopt_long already emitted a complaint */

@@ -302,6 +302,9 @@ WalReceiverMain(const void *startup_data, size_t startup_data_len)
 	if (sender_host)
 		pfree(sender_host);
 
+	/* Initialize buffers for processing messages */
+	initStringInfo(&reply_message);
+
 	first_stream = true;
 	for (;;)
 	{
@@ -325,6 +328,7 @@ WalReceiverMain(const void *startup_data, size_t startup_data_len)
 					 errdetail("The primary's identifier is %s, the standby's identifier is %s.",
 							   primary_sysid, standby_sysid)));
 		}
+		pfree(primary_sysid);
 
 		/*
 		 * Confirm that the current timeline of the primary is the same or
@@ -405,9 +409,8 @@ WalReceiverMain(const void *startup_data, size_t startup_data_len)
 				walrcv->walRcvState = WALRCV_STREAMING;
 			SpinLockRelease(&walrcv->mutex);
 
-			/* Initialize LogstreamResult and buffers for processing messages */
+			/* Initialize LogstreamResult for processing messages */
 			LogstreamResult.Write = LogstreamResult.Flush = GetXLogReplayRecPtr(NULL);
-			initStringInfo(&reply_message);
 
 			/* Initialize nap wakeup times. */
 			now = GetCurrentTimestamp();
@@ -975,15 +978,13 @@ XLogWalRcvWrite(char *buf, Size nbytes, XLogRecPtr recptr, TimeLineID tli)
 	}
 
 	/* Update shared-memory status */
-	pg_atomic_write_u64(&WalRcv->writtenUpto, LogstreamResult.Write);
+	pg_atomic_write_membarrier_u64(&WalRcv->writtenUpto, LogstreamResult.Write);
 
 	/*
-	 * If we wrote an LSN that someone was waiting for, notify the waiters.
+	 * Wake up processes waiting for standby write LSN to reach current write
+	 * position.
 	 */
-	if (waitLSNState &&
-		(LogstreamResult.Write >=
-		 pg_atomic_read_u64(&waitLSNState->minWaitedLSN[WAIT_LSN_TYPE_STANDBY_WRITE])))
-		WaitLSNWakeup(WAIT_LSN_TYPE_STANDBY_WRITE, LogstreamResult.Write);
+	WaitLSNWakeup(WAIT_LSN_TYPE_STANDBY_WRITE, LogstreamResult.Write);
 
 	/*
 	 * Close the current segment if it's fully written up in the last cycle of
@@ -1025,13 +1026,10 @@ XLogWalRcvFlush(bool dying, TimeLineID tli)
 		SpinLockRelease(&walrcv->mutex);
 
 		/*
-		 * If we flushed an LSN that someone was waiting for, notify the
-		 * waiters.
+		 * Wake up processes waiting for standby flush LSN to reach current
+		 * flush position.
 		 */
-		if (waitLSNState &&
-			(LogstreamResult.Flush >=
-			 pg_atomic_read_u64(&waitLSNState->minWaitedLSN[WAIT_LSN_TYPE_STANDBY_FLUSH])))
-			WaitLSNWakeup(WAIT_LSN_TYPE_STANDBY_FLUSH, LogstreamResult.Flush);
+		WaitLSNWakeup(WAIT_LSN_TYPE_STANDBY_FLUSH, LogstreamResult.Flush);
 
 		/* Signal the startup process and walsender that new WAL has arrived */
 		WakeupRecovery();

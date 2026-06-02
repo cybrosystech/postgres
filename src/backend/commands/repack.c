@@ -62,6 +62,7 @@
 #include "miscadmin.h"
 #include "optimizer/optimizer.h"
 #include "pgstat.h"
+#include "replication/logicalrelation.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
 #include "storage/predicate.h"
@@ -919,14 +920,12 @@ check_concurrent_repack_requirements(Relation rel, Oid *ident_idx_p)
 
 	/*
 	 * Obtain the replica identity index -- either one that has been set
-	 * explicitly, or the primary key.  If none of these cases apply, the
-	 * table cannot be repacked concurrently.  It might be possible to have
-	 * repack work with a FULL replica identity; however that requires more
-	 * work and is not implemented yet.
+	 * explicitly, or a non-deferrable primary key.  If none of these cases
+	 * apply, the table cannot be repacked concurrently.  It might be possible
+	 * to have repack work with a FULL replica identity; however that requires
+	 * more work and is not implemented yet.
 	 */
-	ident_idx = RelationGetReplicaIndex(rel);
-	if (!OidIsValid(ident_idx) && OidIsValid(rel->rd_pkindex))
-		ident_idx = rel->rd_pkindex;
+	ident_idx = GetRelationIdentityOrPK(rel);
 	if (!OidIsValid(ident_idx))
 		ereport(ERROR,
 				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -2107,6 +2106,8 @@ get_tables_to_repack(RepackCommand cmd, bool usingindex, MemoryContext permcxt)
 		{
 			RelToCluster *rtc;
 			Form_pg_index index;
+			HeapTuple	classtup;
+			Form_pg_class classForm;
 			MemoryContext oldcxt;
 
 			index = (Form_pg_index) GETSTRUCT(tuple);
@@ -2121,11 +2122,24 @@ get_tables_to_repack(RepackCommand cmd, bool usingindex, MemoryContext permcxt)
 				continue;
 
 			/* Verify that the table still exists; skip if not */
-			if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(index->indrelid)))
+			classtup = SearchSysCache1(RELOID, ObjectIdGetDatum(index->indrelid));
+			if (!HeapTupleIsValid(classtup))
 			{
 				UnlockRelationOid(index->indrelid, AccessShareLock);
 				continue;
 			}
+			classForm = (Form_pg_class) GETSTRUCT(classtup);
+
+			/* Skip temp relations belonging to other sessions */
+			if (classForm->relpersistence == RELPERSISTENCE_TEMP &&
+				!isTempOrTempToastNamespace(classForm->relnamespace))
+			{
+				ReleaseSysCache(classtup);
+				UnlockRelationOid(index->indrelid, AccessShareLock);
+				continue;
+			}
+
+			ReleaseSysCache(classtup);
 
 			/* noisily skip rels which the user can't process */
 			if (!repack_is_permitted_for_relation(cmd, index->indrelid,
@@ -2176,6 +2190,14 @@ get_tables_to_repack(RepackCommand cmd, bool usingindex, MemoryContext permcxt)
 			/* Can only process plain tables and matviews */
 			if (class->relkind != RELKIND_RELATION &&
 				class->relkind != RELKIND_MATVIEW)
+			{
+				UnlockRelationOid(class->oid, AccessShareLock);
+				continue;
+			}
+
+			/* Skip temp relations belonging to other sessions */
+			if (class->relpersistence == RELPERSISTENCE_TEMP &&
+				!isTempOrTempToastNamespace(class->relnamespace))
 			{
 				UnlockRelationOid(class->oid, AccessShareLock);
 				continue;
@@ -2727,7 +2749,7 @@ restore_tuple(BufFile *file, Relation relation, TupleTableSlot *slot)
 			varlensz = VARSIZE_ANY(&chunk_header);
 
 			value = palloc(varlensz);
-			SET_VARSIZE(value, VARSIZE_ANY(&chunk_header));
+			memcpy(value, &chunk_header, VARHDRSZ);
 			BufFileReadExact(file, (char *) value + VARHDRSZ, varlensz - VARHDRSZ);
 
 			slot->tts_values[i] = PointerGetDatum(value);
@@ -3018,7 +3040,7 @@ rebuild_relation_finish_concurrent(Relation NewHeap, Relation OldHeap,
 		{
 			int			pos = foreach_current_index(ind_old);
 
-			if (unlikely(list_length(ind_oids_new) < pos))
+			if (list_length(ind_oids_new) <= pos)
 				elog(ERROR, "list of new indexes too short");
 			ident_idx_new = list_nth_oid(ind_oids_new, pos);
 			break;
