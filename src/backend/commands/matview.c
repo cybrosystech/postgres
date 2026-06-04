@@ -66,8 +66,6 @@ static void refresh_by_match_merge(Oid matviewOid, Oid tempOid, Oid relowner,
 								   int save_sec_context);
 static void refresh_by_heap_swap(Oid matviewOid, Oid OIDNewHeap, char relpersistence);
 static bool is_usable_unique_index(Relation indexRel);
-static void OpenMatViewIncrementalMaintenance(void);
-static void CloseMatViewIncrementalMaintenance(void);
 
 /*
  * SetMatViewPopulatedState
@@ -1012,13 +1010,13 @@ MatViewIncrementalMaintenanceIsEnabled(void)
 	return matview_maintenance_depth > 0;
 }
 
-static void
+void
 OpenMatViewIncrementalMaintenance(void)
 {
 	matview_maintenance_depth++;
 }
 
-static void
+void
 CloseMatViewIncrementalMaintenance(void)
 {
 	matview_maintenance_depth--;

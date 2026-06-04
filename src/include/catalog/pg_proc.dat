@@ -12769,4 +12769,9 @@
   proname => 'hashoid8extended', prorettype => 'int8',
   proargtypes => 'oid8 int8', prosrc => 'hashoid8extended' },
 
+# DBblue: incremental refresh trigger for materialized views
+{ oid => '8335', descr => 'DBblue incremental refresh: apply delta to materialized view',
+  proname => 'matview_delta_apply', provolatile => 'v', prorettype => 'trigger',
+  proargtypes => '', prosrc => 'matview_delta_apply' },
+
 ]

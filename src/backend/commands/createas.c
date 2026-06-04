@@ -26,12 +26,15 @@
 
 #include "access/heapam.h"
 #include "access/reloptions.h"
+#include "access/table.h"
 #include "access/tableam.h"
 #include "access/xact.h"
 #include "catalog/namespace.h"
 #include "catalog/toasting.h"
 #include "commands/createas.h"
+#include "commands/defrem.h"
 #include "commands/matview.h"
+#include "commands/matview_incr.h"
 #include "commands/prepare.h"
 #include "commands/tablecmds.h"
 #include "commands/view.h"
@@ -277,6 +280,44 @@ ExecCreateTableAs(ParseState *pstate, CreateTableAsStmt *stmt,
 		into->skipData = true;
 	}
 
+	/*
+	 * DBblue: if incremental_refresh is requested, validate eligibility and
+	 * inject COUNT(*) AS __mv_count__ into both the schema query and the
+	 * stored view-definition query.  Do this before create_ctas_nodata so
+	 * that the column is created as part of the matview schema and populated
+	 * naturally by the initial REFRESH — no ALTER TABLE needed afterward.
+	 */
+	if (is_matview && do_refresh)
+	{
+		Query	   *vq = castNode(Query, into->viewQuery);
+		ListCell   *lc;
+		bool		want_incr = false;
+
+		foreach(lc, into->options)
+		{
+			DefElem    *opt = lfirst_node(DefElem, lc);
+
+			if (strcmp(opt->defname, "incremental_refresh") == 0)
+			{
+				want_incr = defGetBoolean(opt);
+				break;
+			}
+		}
+
+		if (want_incr)
+		{
+			const char *reason;
+
+			if (!MatviewIncrIsEligible(vq, &reason))
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("cannot use incremental_refresh: %s", reason)));
+
+			MatviewIncrAddCountTarget(query);
+			MatviewIncrAddCountTarget(vq);
+		}
+	}
+
 	if (into->skipData)
 	{
 		/*
@@ -295,6 +336,22 @@ ExecCreateTableAs(ParseState *pstate, CreateTableAsStmt *stmt,
 		if (do_refresh)
 			RefreshMatViewByOid(address.objectId, true, false, false,
 								pstate->p_sourcetext, qc);
+
+		/*
+		 * DBblue: if incremental_refresh is enabled, set up the delta
+		 * triggers, unique index, and catalog rows now that the matview
+		 * is fully populated.
+		 */
+		if (is_matview && do_refresh)
+		{
+			Relation	mvrel = table_open(address.objectId, AccessShareLock);
+			bool		incr = RelationGetIncrementalRefresh(mvrel);
+
+			table_close(mvrel, AccessShareLock);
+			if (incr)
+				MatviewIncrSetup(address.objectId,
+								 castNode(Query, into->viewQuery));
+		}
 
 	}
 	else

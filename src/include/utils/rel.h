@@ -359,6 +359,9 @@ typedef struct StdRdOptions
 
 	/* DBblue: skip REFRESH when no source table has been written since last refresh */
 	bool		auto_skip_unchanged;
+
+	/* DBblue: maintain matview incrementally on source table writes */
+	bool		incremental_refresh;
 } StdRdOptions;
 
 #define HEAP_MIN_FILLFACTOR			10
@@ -421,6 +424,14 @@ typedef struct StdRdOptions
 #define RelationGetAutoSkipUnchanged(relation) \
 	((relation)->rd_options ? \
 	 ((StdRdOptions *) (relation)->rd_options)->auto_skip_unchanged : false)
+
+/*
+ * RelationGetIncrementalRefresh
+ *		Returns true if the matview should be maintained incrementally.
+ */
+#define RelationGetIncrementalRefresh(relation) \
+	((relation)->rd_options ? \
+	 ((StdRdOptions *) (relation)->rd_options)->incremental_refresh : false)
 
 /* ViewOptions->check_option values */
 typedef enum ViewOptCheckOption

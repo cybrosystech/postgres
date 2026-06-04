@@ -5007,7 +5007,8 @@ ATPrepCmd(List **wqueue, Relation rel, AlterTableCmd *cmd,
 		case AT_AddColumn:		/* ADD COLUMN */
 			ATSimplePermissions(cmd->subtype, rel,
 								ATT_TABLE | ATT_PARTITIONED_TABLE |
-								ATT_COMPOSITE_TYPE | ATT_FOREIGN_TABLE);
+								ATT_COMPOSITE_TYPE | ATT_FOREIGN_TABLE |
+								ATT_MATVIEW);	/* DBblue: incremental refresh adds __mv_count__ */
 			ATPrepAddColumn(wqueue, rel, recurse, recursing, false, cmd,
 							lockmode, context);
 			/* Recursion occurs during execution phase */
