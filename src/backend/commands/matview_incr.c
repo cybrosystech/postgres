@@ -108,6 +108,20 @@ typedef struct IncrPlanEntry
 static HTAB *incr_plan_cache = NULL;
 
 /*
+ * Per-AVG-column metadata collected from the view's query tree.
+ * Used by SQL builders to emit correct hidden-column maintenance.
+ */
+typedef struct AvgColInfo
+{
+	char   *avg_col;		/* visible output column name */
+	char   *sum_col;		/* __mv_avgsum_<avg_col> hidden column */
+	char   *cnt_col;		/* __mv_avgcnt_<avg_col> hidden column */
+	Oid		avg_rettype;	/* return type of the AVG (numeric, float8, …) */
+	Node   *arg_expr;		/* AVG argument expression (Var) — for Phase 2 deparse */
+	char   *arg_col;		/* simple column name for Phase 1 (may be NULL) */
+} AvgColInfo;
+
+/*
  * Fixed aliases used in Phase 2 delta SQL.
  * The transition table (__mv_newtable/__mv_oldtable) gets alias _d_;
  * the other (non-changing) source table gets alias _j_.
@@ -119,6 +133,9 @@ static HTAB *incr_plan_cache = NULL;
  * Forward declarations
  * ----------
  */
+static bool incr_is_hidden_col(const char *resname);
+static Oid	incr_find_sum_agg(Oid avg_fnoid, Oid *rettype_out);
+static void incr_collect_avg_info(Query *viewQuery, List **avgInfoList);
 static Oid	incr_get_source_table(Query *viewQuery);
 static void incr_get_join_info(Query *viewQuery,
 							   int *tbl1_varno, Oid *tbl1_oid,
@@ -278,11 +295,12 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 			Aggref	   *agg = (Aggref *) te->expr;
 			char	   *fname = get_func_name(agg->aggfnoid);
 
-			if (strcmp(fname, "sum") == 0 || strcmp(fname, "count") == 0)
+			if (strcmp(fname, "sum") == 0 || strcmp(fname, "count") == 0 ||
+				strcmp(fname, "avg") == 0)
 				continue;
 
-			*reason = psprintf("aggregate \"%s\" not supported in Phase 1 "
-							   "(supported: SUM, COUNT)", fname);
+			*reason = psprintf("aggregate \"%s\" not supported "
+							   "(supported: SUM, COUNT, AVG)", fname);
 			return false;
 		}
 		*reason = "only column references and SUM/COUNT aggregates are allowed";
@@ -426,16 +444,88 @@ MatviewIncrTeardown(Oid mvrelid)
 
 /*
  * MatviewIncrAddCountTarget
- * Append "COUNT(*) AS __mv_count__" to the query's target list.
- * Called before matview creation so the hidden tracking column is populated
- * naturally by the initial SELECT — no ALTER TABLE needed afterward.
+ * Append hidden maintenance columns to the query's target list.
+ *
+ * For every AVG(x) column in the query:
+ *   SUM(x) AS __mv_avgsum_colname__   — running sum for that AVG
+ *   COUNT(x) AS __mv_avgcnt_colname__ — running non-null count for that AVG
+ *
+ * Finally, always append:
+ *   COUNT(*) AS __mv_count__           — source-row count per group
+ *
+ * Called before matview creation so these columns are part of the initial
+ * schema and populated naturally by the first SELECT — no ALTER TABLE needed.
  */
 void
 MatviewIncrAddCountTarget(Query *q)
 {
+	List	   *orig_tl = list_copy(q->targetList);
+	ListCell   *lc;
+	int			next_resno = list_length(q->targetList) + 1;
 	Aggref	   *aggref;
 	TargetEntry *te;
 
+	/* Inject SUM(x) / COUNT(x) pairs for each AVG column */
+	foreach(lc, orig_tl)
+	{
+		TargetEntry *orig_te = lfirst_node(TargetEntry, lc);
+		Aggref	   *avg_agg;
+		Oid			sum_fnoid,
+					sum_rettype;
+		Aggref	   *sum_agg,
+				   *cnt_agg;
+
+		if (orig_te->resjunk || !IsA(orig_te->expr, Aggref))
+			continue;
+		avg_agg = (Aggref *) orig_te->expr;
+		if (strcmp(get_func_name(avg_agg->aggfnoid), "avg") != 0)
+			continue;
+
+		sum_fnoid = incr_find_sum_agg(avg_agg->aggfnoid, &sum_rettype);
+
+		/* SUM(x) hidden column */
+		sum_agg = copyObject(avg_agg);
+		sum_agg->aggfnoid = sum_fnoid;
+		sum_agg->aggtype = sum_rettype;
+		sum_agg->aggtranstype = InvalidOid;
+		sum_agg->aggno = -1;
+		sum_agg->aggtransno = -1;
+		te = makeTargetEntry((Expr *) sum_agg, next_resno++,
+							 psprintf("%s%s", MATVIEW_INCR_AVGSUM_PREFIX,
+									  orig_te->resname),
+							 false);
+		q->targetList = lappend(q->targetList, te);
+
+		/* COUNT(x) hidden column — count("any") OID = 2147 */
+		cnt_agg = makeNode(Aggref);
+		cnt_agg->aggfnoid = 2147;
+		cnt_agg->aggtype = INT8OID;
+		cnt_agg->aggcollid = InvalidOid;
+		cnt_agg->inputcollid = InvalidOid;
+		cnt_agg->aggtranstype = InvalidOid;
+		cnt_agg->aggargtypes = avg_agg->aggargtypes;
+		cnt_agg->aggdirectargs = NIL;
+		cnt_agg->args = copyObject(avg_agg->args);
+		cnt_agg->aggorder = NIL;
+		cnt_agg->aggdistinct = NIL;
+		cnt_agg->aggfilter = NULL;
+		cnt_agg->aggstar = false;
+		cnt_agg->aggvariadic = false;
+		cnt_agg->aggkind = AGGKIND_NORMAL;
+		cnt_agg->aggpresorted = false;
+		cnt_agg->agglevelsup = 0;
+		cnt_agg->aggsplit = AGGSPLIT_SIMPLE;
+		cnt_agg->aggno = -1;
+		cnt_agg->aggtransno = -1;
+		cnt_agg->location = -1;
+		te = makeTargetEntry((Expr *) cnt_agg, next_resno++,
+							 psprintf("%s%s", MATVIEW_INCR_AVGCNT_PREFIX,
+									  orig_te->resname),
+							 false);
+		q->targetList = lappend(q->targetList, te);
+	}
+
+	/* Always append COUNT(*) AS __mv_count__ */
 	aggref = makeNode(Aggref);
 	aggref->aggfnoid = 2803;		/* count(*) — stable catalog OID */
 	aggref->aggtype = INT8OID;
@@ -457,12 +547,9 @@ MatviewIncrAddCountTarget(Query *q)
 	aggref->aggno = -1;
 	aggref->aggtransno = -1;
 	aggref->location = -1;
-
-	te = makeTargetEntry((Expr *) aggref,
-						 list_length(q->targetList) + 1,
+	te = makeTargetEntry((Expr *) aggref, next_resno,
 						 pstrdup(MATVIEW_INCR_COUNT_COL),
 						 false);
-
 	q->targetList = lappend(q->targetList, te);
 }
 
@@ -470,6 +557,116 @@ MatviewIncrAddCountTarget(Query *q)
  * Internal helpers — query introspection
  * ============================================================
  */
+
+/* True for columns that are hidden maintenance state, not user-visible output */
+static bool
+incr_is_hidden_col(const char *resname)
+{
+	if (resname == NULL)
+		return false;
+	if (strcmp(resname, MATVIEW_INCR_COUNT_COL) == 0)
+		return true;
+	if (strncmp(resname, MATVIEW_INCR_AVGSUM_PREFIX,
+				strlen(MATVIEW_INCR_AVGSUM_PREFIX)) == 0)
+		return true;
+	if (strncmp(resname, MATVIEW_INCR_AVGCNT_PREFIX,
+				strlen(MATVIEW_INCR_AVGCNT_PREFIX)) == 0)
+		return true;
+	return false;
+}
+
+/*
+ * incr_find_sum_agg
+ * Return the SUM aggregate OID (and its return type) that corresponds to the
+ * given AVG aggregate OID.  Covers all built-in numeric and interval types.
+ */
+static Oid
+incr_find_sum_agg(Oid avg_fnoid, Oid *rettype_out)
+{
+	static const struct
+	{
+		Oid		avg;
+		Oid		sum;
+		Oid		ret;
+	}			map[] = {
+		{2100, 2107, NUMERICOID},	/* avg/sum(int8) */
+		{2101, 2108, INT8OID},		/* avg/sum(int4) */
+		{2102, 2109, INT8OID},		/* avg/sum(int2) */
+		{2103, 2114, NUMERICOID},	/* avg/sum(numeric) */
+		{2104, 2110, FLOAT4OID},	/* avg/sum(float4) */
+		{2105, 2111, FLOAT8OID},	/* avg/sum(float8) */
+		{2106, 2113, INTERVALOID},	/* avg/sum(interval) */
+	};
+
+	for (int i = 0; i < lengthof(map); i++)
+	{
+		if (map[i].avg == avg_fnoid)
+		{
+			*rettype_out = map[i].ret;
+			return map[i].sum;
+		}
+	}
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("incremental_refresh: AVG aggregate OID %u not supported "
+					"(numeric, integer, float, and interval types only)",
+					avg_fnoid)));
+	return InvalidOid;
+}
+
+/*
+ * incr_collect_avg_info
+ * Build a list of AvgColInfo for every AVG() column in the target list.
+ * arg_col is the plain column name (for Phase 1 single-table SQL builders);
+ * arg_expr is the raw Var node (for Phase 2 builders that call incr_deparse_expr).
+ */
+static void
+incr_collect_avg_info(Query *viewQuery, List **avgInfoList)
+{
+	ListCell   *lc;
+
+	*avgInfoList = NIL;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+		Aggref	   *agg;
+		AvgColInfo *info;
+
+		if (te->resjunk || !IsA(te->expr, Aggref))
+			continue;
+		agg = (Aggref *) te->expr;
+		if (strcmp(get_func_name(agg->aggfnoid), "avg") != 0)
+			continue;
+
+		info = palloc(sizeof(AvgColInfo));
+		info->avg_col = pstrdup(te->resname);
+		info->sum_col = psprintf("%s%s", MATVIEW_INCR_AVGSUM_PREFIX, te->resname);
+		info->cnt_col = psprintf("%s%s", MATVIEW_INCR_AVGCNT_PREFIX, te->resname);
+		info->avg_rettype = agg->aggtype;
+		info->arg_expr = NULL;
+		info->arg_col = NULL;
+
+		if (agg->args != NIL)
+		{
+			TargetEntry *arg_te = linitial_node(TargetEntry, agg->args);
+			Node	   *argnode = (Node *) arg_te->expr;
+
+			info->arg_expr = argnode;
+
+			/* For Phase 1: resolve the arg Var to a plain column name */
+			if (IsA(argnode, Var))
+			{
+				Var		   *v = (Var *) argnode;
+				RangeTblEntry *rte = rt_fetch(v->varno, viewQuery->rtable);
+
+				if (rte->rtekind == RTE_RELATION)
+					info->arg_col = get_attname(rte->relid, v->varattno, false);
+			}
+		}
+
+		*avgInfoList = lappend(*avgInfoList, info);
+	}
+}
 
 static Oid
 incr_get_source_table(Query *viewQuery)
@@ -530,12 +727,16 @@ incr_collect_agg_info(Query *viewQuery,
 		if (te->resjunk || !IsA(te->expr, Aggref))
 			continue;
 
-		/* __mv_count__ is handled explicitly by the SQL builders — skip it here */
-		if (te->resname && strcmp(te->resname, MATVIEW_INCR_COUNT_COL) == 0)
+		/* Hidden maintenance columns and AVG are handled separately */
+		if (incr_is_hidden_col(te->resname))
 			continue;
 
 		agg = (Aggref *) te->expr;
 		fname = get_func_name(agg->aggfnoid);
+
+		/* AVG is handled by incr_collect_avg_info, not here */
+		if (strcmp(fname, "avg") == 0)
+			continue;
 
 		if (agg->args != NIL)
 		{
@@ -584,20 +785,23 @@ incr_build_ins_sql(Oid mvrelid, Query *viewQuery)
 	List	   *aggColNames = NIL,
 			   *aggFuncNames = NIL,
 			   *aggArgColNames = NIL;
+	List	   *avgInfoList = NIL;
 	ListCell   *gcl,
 			   *acl,
 			   *fcl,
-			   *arcl;
+			   *arcl,
+			   *lc;
 	const char *mvname = mv_qname(mvrelid);
 	const char *cntcol = quote_identifier(MATVIEW_INCR_COUNT_COL);
 	bool		first;
 
 	incr_collect_group_cols(viewQuery, &groupColNames);
 	incr_collect_agg_info(viewQuery, &aggColNames, &aggFuncNames, &aggArgColNames);
+	incr_collect_avg_info(viewQuery, &avgInfoList);
 
 	initStringInfo(&buf);
 
-	/* INSERT INTO mv (group_cols, agg_cols, __mv_count__) */
+	/* INSERT INTO mv (group_cols, agg_cols, avg_cols, hidden_avg_cols, __mv_count__) */
 	appendStringInfo(&buf, "INSERT INTO %s (", mvname);
 	first = true;
 	foreach(gcl, groupColNames)
@@ -607,12 +811,19 @@ incr_build_ins_sql(Oid mvrelid, Query *viewQuery)
 		first = false;
 	}
 	foreach(acl, aggColNames)
-	{
 		appendStringInfo(&buf, ",%s", quote_identifier(strVal(lfirst(acl))));
+	foreach(lc, avgInfoList)
+	{
+		AvgColInfo *ai = lfirst(lc);
+
+		appendStringInfo(&buf, ",%s,%s,%s",
+						 quote_identifier(ai->avg_col),
+						 quote_identifier(ai->sum_col),
+						 quote_identifier(ai->cnt_col));
 	}
 	appendStringInfo(&buf, ",%s) ", cntcol);
 
-	/* SELECT group_cols, agg_exprs, COUNT(*) FROM __mv_newtable GROUP BY group_cols */
+	/* SELECT group_cols, agg_exprs, avg+hidden exprs, COUNT(*) FROM __mv_newtable GROUP BY ... */
 	appendStringInfoString(&buf, "SELECT ");
 	first = true;
 	foreach(gcl, groupColNames)
@@ -621,7 +832,6 @@ incr_build_ins_sql(Oid mvrelid, Query *viewQuery)
 		appendStringInfoString(&buf, quote_identifier(strVal(lfirst(gcl))));
 		first = false;
 	}
-
 	forthree(acl, aggColNames, fcl, aggFuncNames, arcl, aggArgColNames)
 	{
 		const char *fname = strVal(lfirst(fcl));
@@ -633,6 +843,13 @@ incr_build_ins_sql(Oid mvrelid, Query *viewQuery)
 			appendStringInfo(&buf, ",%s(%s)",
 							 fname,
 							 quote_identifier(strVal((String *) argnode)));
+	}
+	foreach(lc, avgInfoList)
+	{
+		AvgColInfo *ai = lfirst(lc);
+		const char *argq = ai->arg_col ? quote_identifier(ai->arg_col) : "NULL";
+
+		appendStringInfo(&buf, ",AVG(%s),SUM(%s),COUNT(%s)", argq, argq, argq);
 	}
 	appendStringInfo(&buf, ",COUNT(*) FROM %s GROUP BY ", MATVIEW_INCR_NEWTABLE);
 	first = true;
@@ -654,6 +871,7 @@ incr_build_ins_sql(Oid mvrelid, Query *viewQuery)
 	}
 	appendStringInfoString(&buf, ") DO UPDATE SET ");
 
+	/* Regular SUM/COUNT aggregates: simple addition */
 	first = true;
 	foreach(acl, aggColNames)
 	{
@@ -663,6 +881,29 @@ incr_build_ins_sql(Oid mvrelid, Query *viewQuery)
 		appendStringInfo(&buf, "%s=%s.%s+EXCLUDED.%s", colq, mvname, colq, colq);
 		first = false;
 	}
+
+	/* AVG aggregates: update hidden sum/cnt, then recompute visible avg */
+	foreach(lc, avgInfoList)
+	{
+		AvgColInfo *ai = lfirst(lc);
+		const char *avg_q = quote_identifier(ai->avg_col);
+		const char *sum_q = quote_identifier(ai->sum_col);
+		const char *cnt_q = quote_identifier(ai->cnt_col);
+		const char *type_name = format_type_be(ai->avg_rettype);
+
+		if (!first) appendStringInfoChar(&buf, ',');
+		appendStringInfo(&buf,
+						 "%s=%s.%s+EXCLUDED.%s"
+						 ",%s=%s.%s+EXCLUDED.%s"
+						 ",%s=((%s.%s+EXCLUDED.%s)::%s/NULLIF(%s.%s+EXCLUDED.%s,0))",
+						 sum_q, mvname, sum_q, sum_q,
+						 cnt_q, mvname, cnt_q, cnt_q,
+						 avg_q,
+						 mvname, sum_q, sum_q, type_name,
+						 mvname, cnt_q, cnt_q);
+		first = false;
+	}
+
 	if (!first) appendStringInfoChar(&buf, ',');
 	appendStringInfo(&buf, "%s=%s.%s+EXCLUDED.%s", cntcol, mvname, cntcol, cntcol);
 
@@ -690,20 +931,23 @@ incr_build_del_sql(Oid mvrelid, Query *viewQuery)
 	List	   *aggColNames = NIL,
 			   *aggFuncNames = NIL,
 			   *aggArgColNames = NIL;
+	List	   *avgInfoList = NIL;
 	ListCell   *gcl,
 			   *acl,
 			   *fcl,
-			   *arcl;
+			   *arcl,
+			   *lc;
 	const char *mvname = mv_qname(mvrelid);
 	const char *cntcol = quote_identifier(MATVIEW_INCR_COUNT_COL);
 	bool		first;
 
 	incr_collect_group_cols(viewQuery, &groupColNames);
 	incr_collect_agg_info(viewQuery, &aggColNames, &aggFuncNames, &aggArgColNames);
+	incr_collect_avg_info(viewQuery, &avgInfoList);
 
 	initStringInfo(&buf);
 
-	/* WITH d AS (SELECT group_cols, agg_exprs, COUNT(*) FROM __mv_oldtable GROUP BY ...) */
+	/* WITH d AS (SELECT group_cols, agg_exprs, hidden avg cols, COUNT(*) FROM __mv_oldtable ...) */
 	appendStringInfoString(&buf, "WITH d AS (SELECT ");
 	first = true;
 	foreach(gcl, groupColNames)
@@ -726,6 +970,16 @@ incr_build_del_sql(Oid mvrelid, Query *viewQuery)
 							 quote_identifier(strVal((String *) argnode)),
 							 colq);
 	}
+	/* Hidden AVG support cols in CTE */
+	foreach(lc, avgInfoList)
+	{
+		AvgColInfo *ai = lfirst(lc);
+		const char *argq = ai->arg_col ? quote_identifier(ai->arg_col) : "NULL";
+
+		appendStringInfo(&buf, ",SUM(%s) AS %s,COUNT(%s) AS %s",
+						 argq, quote_identifier(ai->sum_col),
+						 argq, quote_identifier(ai->cnt_col));
+	}
 	appendStringInfo(&buf, ",COUNT(*) AS %s FROM %s GROUP BY ",
 					 cntcol, MATVIEW_INCR_OLDTABLE);
 	first = true;
@@ -737,7 +991,7 @@ incr_build_del_sql(Oid mvrelid, Query *viewQuery)
 	}
 	appendStringInfoString(&buf, ") ");
 
-	/* UPDATE mv SET agg = mv.agg - d.agg, __mv_count__ = mv.__mv_count__ - d.__mv_count__ */
+	/* UPDATE mv SET agg=mv.agg-d.agg, hidden_avg, avg_recompute, __mv_count__ */
 	appendStringInfo(&buf, "UPDATE %s SET ", mvname);
 	first = true;
 	foreach(acl, aggColNames)
@@ -746,6 +1000,26 @@ incr_build_del_sql(Oid mvrelid, Query *viewQuery)
 
 		if (!first) appendStringInfoChar(&buf, ',');
 		appendStringInfo(&buf, "%s=%s.%s-d.%s", colq, mvname, colq, colq);
+		first = false;
+	}
+	foreach(lc, avgInfoList)
+	{
+		AvgColInfo *ai = lfirst(lc);
+		const char *avg_q = quote_identifier(ai->avg_col);
+		const char *sum_q = quote_identifier(ai->sum_col);
+		const char *cnt_q = quote_identifier(ai->cnt_col);
+		const char *type_name = format_type_be(ai->avg_rettype);
+
+		if (!first) appendStringInfoChar(&buf, ',');
+		appendStringInfo(&buf,
+						 "%s=%s.%s-d.%s"
+						 ",%s=%s.%s-d.%s"
+						 ",%s=((%s.%s-d.%s)::%s/NULLIF(%s.%s-d.%s,0))",
+						 sum_q, mvname, sum_q, sum_q,
+						 cnt_q, mvname, cnt_q, cnt_q,
+						 avg_q,
+						 mvname, sum_q, sum_q, type_name,
+						 mvname, cnt_q, cnt_q);
 		first = false;
 	}
 	if (!first) appendStringInfoChar(&buf, ',');
@@ -1076,15 +1350,56 @@ incr_build_ins_sql_join(Oid mvrelid, Query *viewQuery,
 	foreach(lc, viewQuery->targetList)
 	{
 		TargetEntry *te = lfirst_node(TargetEntry, lc);
-		const char *colq;
 
 		if (te->resjunk || IsA(te->expr, Var))
 			continue;
-		colq = quote_identifier(te->resname);
-		if (!first)
-			appendStringInfoChar(&buf, ',');
-		appendStringInfo(&buf, "%s=%s.%s+EXCLUDED.%s", colq, mvname, colq, colq);
-		first = false;
+		/* hidden avgsum/avgcnt cols are emitted as part of the avg triple below */
+		if (strncmp(te->resname, MATVIEW_INCR_AVGSUM_PREFIX,
+					sizeof(MATVIEW_INCR_AVGSUM_PREFIX) - 1) == 0 ||
+			strncmp(te->resname, MATVIEW_INCR_AVGCNT_PREFIX,
+					sizeof(MATVIEW_INCR_AVGCNT_PREFIX) - 1) == 0)
+			continue;
+
+		if (IsA(te->expr, Aggref))
+		{
+			Aggref	   *agg = (Aggref *) te->expr;
+			char	   *fname = get_func_name(agg->aggfnoid);
+
+			if (strcmp(fname, "avg") == 0)
+			{
+				char	   *sum_col = psprintf("%s%s",
+											  MATVIEW_INCR_AVGSUM_PREFIX,
+											  te->resname);
+				char	   *cnt_col = psprintf("%s%s",
+											  MATVIEW_INCR_AVGCNT_PREFIX,
+											  te->resname);
+				const char *avg_q = quote_identifier(te->resname);
+				const char *sum_q = quote_identifier(sum_col);
+				const char *cnt_q = quote_identifier(cnt_col);
+				const char *type_name = format_type_be(agg->aggtype);
+
+				if (!first) appendStringInfoChar(&buf, ',');
+				appendStringInfo(&buf,
+								 "%s=%s.%s+EXCLUDED.%s"
+								 ",%s=%s.%s+EXCLUDED.%s"
+								 ",%s=((%s.%s+EXCLUDED.%s)::%s/NULLIF(%s.%s+EXCLUDED.%s,0))",
+								 sum_q, mvname, sum_q, sum_q,
+								 cnt_q, mvname, cnt_q, cnt_q,
+								 avg_q,
+								 mvname, sum_q, sum_q, type_name,
+								 mvname, cnt_q, cnt_q);
+				first = false;
+				continue;
+			}
+		}
+
+		{
+			const char *colq = quote_identifier(te->resname);
+
+			if (!first) appendStringInfoChar(&buf, ',');
+			appendStringInfo(&buf, "%s=%s.%s+EXCLUDED.%s", colq, mvname, colq, colq);
+			first = false;
+		}
 	}
 
 	return buf.data;
@@ -1137,6 +1452,10 @@ incr_build_del_sql_join(Oid mvrelid, Query *viewQuery,
 		TargetEntry *te = lfirst_node(TargetEntry, lc);
 
 		if (te->resjunk)
+			continue;
+		/* skip visible avg col — recomputed in UPDATE SET from hidden sum/cnt */
+		if (IsA(te->expr, Aggref) &&
+			strcmp(get_func_name(((Aggref *) te->expr)->aggfnoid), "avg") == 0)
 			continue;
 		if (!first)
 			appendStringInfoChar(&buf, ',');
@@ -1208,15 +1527,56 @@ incr_build_del_sql_join(Oid mvrelid, Query *viewQuery,
 	foreach(lc, viewQuery->targetList)
 	{
 		TargetEntry *te = lfirst_node(TargetEntry, lc);
-		const char *colq;
 
 		if (te->resjunk || IsA(te->expr, Var))
 			continue;
-		colq = quote_identifier(te->resname);
-		if (!first)
-			appendStringInfoChar(&buf, ',');
-		appendStringInfo(&buf, "%s=%s.%s-d.%s", colq, mvname, colq, colq);
-		first = false;
+		/* hidden avgsum/avgcnt cols are emitted as part of the avg triple below */
+		if (strncmp(te->resname, MATVIEW_INCR_AVGSUM_PREFIX,
+					sizeof(MATVIEW_INCR_AVGSUM_PREFIX) - 1) == 0 ||
+			strncmp(te->resname, MATVIEW_INCR_AVGCNT_PREFIX,
+					sizeof(MATVIEW_INCR_AVGCNT_PREFIX) - 1) == 0)
+			continue;
+
+		if (IsA(te->expr, Aggref))
+		{
+			Aggref	   *agg = (Aggref *) te->expr;
+			char	   *fname = get_func_name(agg->aggfnoid);
+
+			if (strcmp(fname, "avg") == 0)
+			{
+				char	   *sum_col = psprintf("%s%s",
+											  MATVIEW_INCR_AVGSUM_PREFIX,
+											  te->resname);
+				char	   *cnt_col = psprintf("%s%s",
+											  MATVIEW_INCR_AVGCNT_PREFIX,
+											  te->resname);
+				const char *avg_q = quote_identifier(te->resname);
+				const char *sum_q = quote_identifier(sum_col);
+				const char *cnt_q = quote_identifier(cnt_col);
+				const char *type_name = format_type_be(agg->aggtype);
+
+				if (!first) appendStringInfoChar(&buf, ',');
+				appendStringInfo(&buf,
+								 "%s=%s.%s-d.%s"
+								 ",%s=%s.%s-d.%s"
+								 ",%s=((%s.%s-d.%s)::%s/NULLIF(%s.%s-d.%s,0))",
+								 sum_q, mvname, sum_q, sum_q,
+								 cnt_q, mvname, cnt_q, cnt_q,
+								 avg_q,
+								 mvname, sum_q, sum_q, type_name,
+								 mvname, cnt_q, cnt_q);
+				first = false;
+				continue;
+			}
+		}
+
+		{
+			const char *colq = quote_identifier(te->resname);
+
+			if (!first) appendStringInfoChar(&buf, ',');
+			appendStringInfo(&buf, "%s=%s.%s-d.%s", colq, mvname, colq, colq);
+			first = false;
+		}
 	}
 
 	/* FROM d WHERE mv.g = d.g */

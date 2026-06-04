@@ -15,11 +15,18 @@
 #include "utils/relcache.h"
 
 /*
- * Name of the hidden row-count column added to every incrementally-refreshed
- * matview.  It tracks how many source rows contribute to each group so the
- * group row can be deleted when the count drops to zero.
+ * Hidden column names / prefixes used by the incremental refresh engine.
+ *
+ * __mv_count__          — source-row count per group (group is deleted when 0)
+ * __mv_avgsum_<col>__   — running SUM for an AVG output column named <col>
+ * __mv_avgcnt_<col>__   — running COUNT(x) for the same AVG column
+ *
+ * The avg / avgsum / avgcnt triple lets us maintain AVG incrementally:
+ *   visible_avg = running_sum / running_cnt   (recomputed after each delta)
  */
-#define MATVIEW_INCR_COUNT_COL	"__mv_count__"
+#define MATVIEW_INCR_COUNT_COL		"__mv_count__"
+#define MATVIEW_INCR_AVGSUM_PREFIX	"__mv_avgsum_"
+#define MATVIEW_INCR_AVGCNT_PREFIX	"__mv_avgcnt_"
 
 /*
  * Transition-table aliases used in the internal triggers.
