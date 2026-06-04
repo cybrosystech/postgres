@@ -78,6 +78,7 @@
 #include "commands/policy.h"
 #include "commands/publicationcmds.h"
 #include "commands/seclabel.h"
+#include "commands/matview_incr.h"
 #include "commands/sequence.h"
 #include "commands/trigger.h"
 #include "commands/typecmds.h"
@@ -1447,6 +1448,10 @@ doDeletion(const ObjectAddress *object, int flags)
 				 */
 				if (relKind == RELKIND_SEQUENCE)
 					DeleteSequenceTuple(object->objectId);
+
+				/* DBblue: clean up incremental refresh catalog rows */
+				if (relKind == RELKIND_MATVIEW)
+					MatviewIncrTeardown(object->objectId);
 				break;
 			}
 
