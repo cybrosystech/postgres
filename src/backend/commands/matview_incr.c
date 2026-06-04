@@ -6,7 +6,15 @@
  * Phase 1 scope
  * -------------
  * Single source table, GROUP BY with SUM and/or COUNT(*) only.
- * AVG, HAVING, subqueries, JOINs → Phase 2/3.
+ *
+ * Phase 2 scope
+ * -------------
+ * Two source tables connected by an INNER JOIN, GROUP BY with SUM and/or
+ * COUNT(*).  Delta SQL is stored per source table: when T1 changes the
+ * trigger joins __mv_newtable/__mv_oldtable with the current state of T2,
+ * and vice versa.
+ *
+ * AVG, HAVING, LEFT/OUTER JOINs, subqueries → Phase 3.
  *
  * Lifecycle
  * ---------
@@ -47,6 +55,7 @@
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_aggregate.h"
+#include "catalog/pg_operator.h"
 #include "catalog/pg_dbblue_matview.h"
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_type.h"
@@ -86,6 +95,7 @@
 typedef struct IncrPlanKey
 {
 	Oid			mvrelid;
+	Oid			srctable;	/* needed for Phase 2: same mv has plans per source table */
 	int			plan_type;
 } IncrPlanKey;
 
@@ -97,11 +107,25 @@ typedef struct IncrPlanEntry
 
 static HTAB *incr_plan_cache = NULL;
 
+/*
+ * Fixed aliases used in Phase 2 delta SQL.
+ * The transition table (__mv_newtable/__mv_oldtable) gets alias _d_;
+ * the other (non-changing) source table gets alias _j_.
+ */
+#define INCR_DELTA_ALIAS	"_d_"
+#define INCR_JOIN_ALIAS		"_j_"
+
 /* ----------
  * Forward declarations
  * ----------
  */
 static Oid	incr_get_source_table(Query *viewQuery);
+static void incr_get_join_info(Query *viewQuery,
+							   int *tbl1_varno, Oid *tbl1_oid,
+							   int *tbl2_varno, Oid *tbl2_oid,
+							   Node **join_quals);
+static void incr_deparse_expr(Node *expr, List *rtable,
+							  int delta_varno, StringInfo buf);
 static void incr_collect_group_cols(Query *viewQuery, List **groupColNames);
 static void incr_collect_agg_info(Query *viewQuery,
 								  List **aggColNames,
@@ -110,6 +134,12 @@ static void incr_collect_agg_info(Query *viewQuery,
 static char *incr_build_ins_sql(Oid mvrelid, Query *viewQuery);
 static char *incr_build_del_sql(Oid mvrelid, Query *viewQuery);
 static char *incr_build_cln_sql(Oid mvrelid);
+static char *incr_build_ins_sql_join(Oid mvrelid, Query *viewQuery,
+									 int delta_varno, Oid other_oid,
+									 Node *join_quals);
+static char *incr_build_del_sql_join(Oid mvrelid, Query *viewQuery,
+									 int delta_varno, Oid other_oid,
+									 Node *join_quals);
 static void incr_store_catalog(Oid mvrelid, Oid srctable,
 							   const char *ins_sql,
 							   const char *del_sql,
@@ -120,8 +150,8 @@ static void incr_create_trigger(Oid mvrelid, Oid srctable,
 								const char *newtable,
 								const char *oldtable);
 static void incr_init_plan_cache(void);
-static SPIPlanPtr incr_get_plan(Oid mvrelid, int plan_type);
-static void incr_cache_plan(Oid mvrelid, int plan_type, SPIPlanPtr plan);
+static SPIPlanPtr incr_get_plan(Oid mvrelid, Oid srctable, int plan_type);
+static void incr_cache_plan(Oid mvrelid, Oid srctable, int plan_type, SPIPlanPtr plan);
 static char *incr_fetch_sql(Oid mvrelid, Oid srctable, int plan_type);
 
 /* ----------
@@ -143,7 +173,7 @@ mv_qname(Oid relid)
 
 /*
  * MatviewIncrIsEligible
- * Returns true if the query can be maintained incrementally (Phase 1).
+ * Returns true if the query can be maintained incrementally (Phase 1 or 2).
  * Sets *reason on failure.
  */
 bool
@@ -159,7 +189,7 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 	}
 	if (viewQuery->havingQual != NULL)
 	{
-		*reason = "HAVING is not supported in Phase 1";
+		*reason = "HAVING is not supported";
 		return false;
 	}
 	if (viewQuery->setOperations != NULL)
@@ -169,35 +199,68 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 	}
 	if (viewQuery->hasSubLinks)
 	{
-		*reason = "subqueries are not supported in Phase 1";
+		*reason = "subqueries are not supported";
 		return false;
 	}
 	if (viewQuery->distinctClause != NIL)
 	{
-		*reason = "DISTINCT is not supported in Phase 1";
+		*reason = "DISTINCT is not supported";
 		return false;
 	}
 
-	/* Count base relations — exactly one allowed in Phase 1 */
+	/* Count base relations: 1 = Phase 1 (single table), 2 = Phase 2 (INNER JOIN) */
 	foreach(lc, viewQuery->rtable)
 	{
 		RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
 
-		/* PG19 adds RTE_GROUP for GROUP BY and RTE_RESULT for empty FROM — skip both */
-		if (rte->rtekind == RTE_GROUP || rte->rtekind == RTE_RESULT)
+		/* PG19 RTE_GROUP, RTE_RESULT, and explicit-JOIN's RTE_JOIN are bookkeeping — skip */
+		if (rte->rtekind == RTE_GROUP || rte->rtekind == RTE_RESULT ||
+			rte->rtekind == RTE_JOIN)
 			continue;
 
 		if (rte->rtekind == RTE_RELATION)
 			nbasetables++;
 		else
 		{
-			*reason = "only simple table references are supported in Phase 1";
+			*reason = "only plain table references are supported (no functions, VALUES, etc.)";
 			return false;
 		}
 	}
-	if (nbasetables != 1)
+
+	if (nbasetables == 1)
 	{
-		*reason = "exactly one source table required in Phase 1; JOINs supported in Phase 2";
+		/* Phase 1: nothing extra to check */
+	}
+	else if (nbasetables == 2)
+	{
+		/* Phase 2: require an INNER JOIN condition */
+		bool		has_join = false;
+
+		if (IsA(viewQuery->jointree, FromExpr))
+		{
+			FromExpr   *fe = (FromExpr *) viewQuery->jointree;
+
+			if (fe->quals != NULL)
+				has_join = true;	/* implicit join: FROM T1, T2 WHERE ... */
+			else if (fe->fromlist != NIL && IsA(linitial(fe->fromlist), JoinExpr))
+			{
+				JoinExpr   *je = (JoinExpr *) linitial(fe->fromlist);
+
+				if (je->jointype == JOIN_INNER && je->quals != NULL)
+					has_join = true;
+			}
+		}
+
+		if (!has_join)
+		{
+			*reason = "two source tables require an INNER JOIN condition (Phase 2);"
+				" LEFT/OUTER JOINs are Phase 3";
+			return false;
+		}
+	}
+	else
+	{
+		*reason = "more than two source tables not supported; Phase 2 maximum is two tables";
 		return false;
 	}
 
@@ -230,41 +293,12 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 }
 
 /*
- * MatviewIncrSetup
- * Called from ExecCreateTableAs after the matview is created and populated.
- * __mv_count__ is already present and populated — injected by
- * MatviewIncrAddCountTarget() before matview creation.
+ * incr_install_triggers — install the three AFTER STATEMENT triggers (INSERT,
+ * DELETE, UPDATE) on srctable that drive matview mvrelid.
  */
-void
-MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
+static void
+incr_install_triggers(Oid mvrelid, Oid srctable)
 {
-	const char *reason;
-	Oid			srctable;
-	List	   *groupColNames = NIL;
-	char	   *ins_sql,
-			   *del_sql,
-			   *cln_sql;
-
-	if (!MatviewIncrIsEligible(viewQuery, &reason))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("cannot use incremental_refresh: %s", reason)));
-
-	srctable = incr_get_source_table(viewQuery);
-
-	/* Step 1: generate delta SQL */
-	ins_sql = incr_build_ins_sql(mvrelid, viewQuery);
-	del_sql = incr_build_del_sql(mvrelid, viewQuery);
-	cln_sql = incr_build_cln_sql(mvrelid);
-
-	/* Step 2: persist in pg_dbblue_matview */
-	incr_store_catalog(mvrelid, srctable, ins_sql, del_sql, cln_sql);
-
-	/* Step 3: unique index on GROUP BY columns */
-	incr_collect_group_cols(viewQuery, &groupColNames);
-	incr_create_unique_index(mvrelid, groupColNames);
-
-	/* Step 4: internal triggers */
 	incr_create_trigger(mvrelid, srctable,
 						TRIGGER_TYPE_INSERT,
 						MATVIEW_INCR_NEWTABLE, NULL);
@@ -274,10 +308,93 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 	incr_create_trigger(mvrelid, srctable,
 						TRIGGER_TYPE_UPDATE,
 						MATVIEW_INCR_NEWTABLE, MATVIEW_INCR_OLDTABLE);
+}
+
+/*
+ * MatviewIncrSetup
+ * Called from ExecCreateTableAs after the matview is created and populated.
+ * __mv_count__ is already present and populated — injected by
+ * MatviewIncrAddCountTarget() before matview creation.
+ *
+ * Phase 1 (1 source table): 3 triggers on that table.
+ * Phase 2 (2-table INNER JOIN): separate delta SQL per source table,
+ *   6 triggers total (3 per table).
+ */
+void
+MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
+{
+	const char *reason;
+	List	   *groupColNames = NIL;
+	char	   *ins_sql,
+			   *del_sql,
+			   *cln_sql;
+	int			nbasetables = 0;
+	ListCell   *lc;
+
+	if (!MatviewIncrIsEligible(viewQuery, &reason))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot use incremental_refresh: %s", reason)));
+
+	/* Count base tables to determine phase */
+	foreach(lc, viewQuery->rtable)
+	{
+		RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+
+		if (rte->rtekind == RTE_RELATION)
+			nbasetables++;
+	}
+
+	/* Step 1: unique index on GROUP BY columns (same for all phases) */
+	incr_collect_group_cols(viewQuery, &groupColNames);
+	incr_create_unique_index(mvrelid, groupColNames);
+
+	cln_sql = incr_build_cln_sql(mvrelid);
+
+	if (nbasetables == 1)
+	{
+		/* ---- Phase 1: single source table ---- */
+		Oid			srctable = incr_get_source_table(viewQuery);
+
+		ins_sql = incr_build_ins_sql(mvrelid, viewQuery);
+		del_sql = incr_build_del_sql(mvrelid, viewQuery);
+		incr_store_catalog(mvrelid, srctable, ins_sql, del_sql, cln_sql);
+		incr_install_triggers(mvrelid, srctable);
+	}
+	else
+	{
+		/* ---- Phase 2: two-table INNER JOIN ---- */
+		int			tbl1_varno,
+					tbl2_varno;
+		Oid			tbl1_oid,
+					tbl2_oid;
+		Node	   *join_quals;
+
+		incr_get_join_info(viewQuery,
+						   &tbl1_varno, &tbl1_oid,
+						   &tbl2_varno, &tbl2_oid,
+						   &join_quals);
+
+		/* Delta SQL when T1 rows change — join transition table with current T2 */
+		ins_sql = incr_build_ins_sql_join(mvrelid, viewQuery,
+										  tbl1_varno, tbl2_oid, join_quals);
+		del_sql = incr_build_del_sql_join(mvrelid, viewQuery,
+										  tbl1_varno, tbl2_oid, join_quals);
+		incr_store_catalog(mvrelid, tbl1_oid, ins_sql, del_sql, cln_sql);
+		incr_install_triggers(mvrelid, tbl1_oid);
+
+		/* Delta SQL when T2 rows change — join transition table with current T1 */
+		ins_sql = incr_build_ins_sql_join(mvrelid, viewQuery,
+										  tbl2_varno, tbl1_oid, join_quals);
+		del_sql = incr_build_del_sql_join(mvrelid, viewQuery,
+										  tbl2_varno, tbl1_oid, join_quals);
+		incr_store_catalog(mvrelid, tbl2_oid, ins_sql, del_sql, cln_sql);
+		incr_install_triggers(mvrelid, tbl2_oid);
+	}
 
 	ereport(DEBUG1,
-			(errmsg("DBblue: incremental refresh set up for matview %s",
-					get_rel_name(mvrelid))));
+			(errmsg("DBblue: incremental refresh (Phase %d) set up for matview %s",
+					nbasetables, get_rel_name(mvrelid))));
 }
 
 /*
@@ -658,6 +775,467 @@ incr_build_cln_sql(Oid mvrelid)
 }
 
 /* ============================================================
+ * Phase 2 helpers
+ * ============================================================
+ */
+
+/*
+ * incr_get_join_info
+ * Walk the rtable to find the two RTE_RELATION entries and extract the
+ * INNER JOIN qualification from either a JoinExpr or FromExpr->quals.
+ */
+static void
+incr_get_join_info(Query *viewQuery,
+				   int *tbl1_varno, Oid *tbl1_oid,
+				   int *tbl2_varno, Oid *tbl2_oid,
+				   Node **join_quals)
+{
+	ListCell   *lc;
+	int			varno = 0;
+
+	*tbl1_varno = *tbl2_varno = 0;
+	*tbl1_oid = *tbl2_oid = InvalidOid;
+	*join_quals = NULL;
+
+	foreach(lc, viewQuery->rtable)
+	{
+		RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+
+		varno++;
+		if (rte->rtekind != RTE_RELATION)
+			continue;
+
+		if (*tbl1_varno == 0)
+		{
+			*tbl1_varno = varno;
+			*tbl1_oid = rte->relid;
+		}
+		else
+		{
+			*tbl2_varno = varno;
+			*tbl2_oid = rte->relid;
+		}
+	}
+
+	if (IsA(viewQuery->jointree, FromExpr))
+	{
+		FromExpr   *fe = (FromExpr *) viewQuery->jointree;
+
+		if (fe->quals != NULL)
+			*join_quals = fe->quals;	/* implicit: FROM T1, T2 WHERE ... */
+		else if (fe->fromlist != NIL &&
+				 IsA(linitial(fe->fromlist), JoinExpr))
+		{
+			JoinExpr   *je = (JoinExpr *) linitial(fe->fromlist);
+
+			*join_quals = je->quals;	/* explicit: FROM T1 JOIN T2 ON ... */
+		}
+	}
+
+	if (*join_quals == NULL)
+		elog(ERROR, "incr_get_join_info: no join condition found");
+}
+
+/*
+ * incr_deparse_expr
+ * Render a query-tree Node to SQL, substituting aliases:
+ *   Var(varno == delta_varno)  →  _d_."colname"
+ *   Var(other varno)           →  _j_."colname"
+ * Handles Var, OpExpr (binary operators), and BoolExpr (AND/OR/NOT).
+ *
+ * PG17+ wraps GROUP BY columns in an RTE_GROUP entry; explicit JOINs add an
+ * RTE_JOIN.  Both have relid=0, so we follow the indirection chain until we
+ * reach an RTE_RELATION.
+ */
+static void
+incr_deparse_expr(Node *expr, List *rtable, int delta_varno, StringInfo buf)
+{
+	if (expr == NULL)
+		return;
+
+	if (IsA(expr, Var))
+	{
+		Var		   *v = (Var *) expr;
+		RangeTblEntry *rte;
+		const char *colname;
+		const char *alias;
+
+		/* Chase RTE_JOIN/RTE_GROUP indirection until we find the base table */
+		for (;;)
+		{
+			rte = rt_fetch(v->varno, rtable);
+			if (rte->rtekind == RTE_RELATION)
+				break;
+			if (rte->rtekind == RTE_JOIN)
+			{
+				/* joinaliasvars maps output col position → underlying Var */
+				Node *av = list_nth(rte->joinaliasvars, v->varattno - 1);
+				if (!IsA(av, Var))
+					elog(ERROR, "incr_deparse_expr: non-Var in joinaliasvars");
+				v = (Var *) av;
+			}
+			else if (rte->rtekind == RTE_GROUP)
+			{
+				/* groupexprs maps output position → grouping expression */
+				Node *ge = list_nth(rte->groupexprs, v->varattno - 1);
+				if (!IsA(ge, Var))
+					elog(ERROR, "incr_deparse_expr: non-Var in groupexprs");
+				v = (Var *) ge;
+			}
+			else
+				elog(ERROR,
+					 "incr_deparse_expr: unexpected RTE kind %d at varno %d",
+					 (int) rte->rtekind, v->varno);
+		}
+
+		colname = get_attname(rte->relid, v->varattno, false);
+		alias = (v->varno == delta_varno) ? INCR_DELTA_ALIAS : INCR_JOIN_ALIAS;
+		appendStringInfo(buf, "%s.%s", alias, quote_identifier(colname));
+	}
+	else if (IsA(expr, OpExpr))
+	{
+		OpExpr	   *op = (OpExpr *) expr;
+		HeapTuple	tup;
+		Form_pg_operator opform;
+		char	   *opname;
+
+		tup = SearchSysCache1(OPEROID, ObjectIdGetDatum(op->opno));
+		if (!HeapTupleIsValid(tup))
+			elog(ERROR, "incr_deparse_expr: operator %u not found", op->opno);
+		opform = (Form_pg_operator) GETSTRUCT(tup);
+		opname = pstrdup(NameStr(opform->oprname));
+		ReleaseSysCache(tup);
+
+		appendStringInfoChar(buf, '(');
+		incr_deparse_expr(linitial(op->args), rtable, delta_varno, buf);
+		appendStringInfo(buf, " %s ", opname);
+		incr_deparse_expr(lsecond(op->args), rtable, delta_varno, buf);
+		appendStringInfoChar(buf, ')');
+	}
+	else if (IsA(expr, BoolExpr))
+	{
+		BoolExpr   *boolexpr = (BoolExpr *) expr;
+		const char *opstr;
+		ListCell   *lc;
+		bool		first = true;
+
+		opstr = (boolexpr->boolop == AND_EXPR) ? " AND " :
+				(boolexpr->boolop == OR_EXPR)  ? " OR "  : " NOT ";
+
+		appendStringInfoChar(buf, '(');
+		foreach(lc, boolexpr->args)
+		{
+			if (!first)
+				appendStringInfoString(buf, opstr);
+			incr_deparse_expr(lfirst(lc), rtable, delta_varno, buf);
+			first = false;
+		}
+		appendStringInfoChar(buf, ')');
+	}
+	else
+		elog(ERROR,
+			 "incr_deparse_expr: unsupported expression type %d in join condition",
+			 (int) nodeTag(expr));
+}
+
+/*
+ * incr_build_ins_sql_join — Phase 2 INSERT delta
+ *
+ * When rows in the delta-side table change, join the transition table with the
+ * current state of the other table:
+ *
+ *   INSERT INTO mv (g1, agg_col, __mv_count__)
+ *   SELECT _d_.g1, SUM(_j_.agg_arg), COUNT(*)
+ *   FROM __mv_newtable _d_ JOIN schema.other _j_ ON (join_cond)
+ *   GROUP BY _d_.g1
+ *   ON CONFLICT (g1) DO UPDATE SET
+ *     agg_col      = mv.agg_col      + EXCLUDED.agg_col,
+ *     __mv_count__ = mv.__mv_count__ + EXCLUDED.__mv_count__
+ */
+static char *
+incr_build_ins_sql_join(Oid mvrelid, Query *viewQuery,
+						int delta_varno, Oid other_oid,
+						Node *join_quals)
+{
+	StringInfoData buf;
+	StringInfoData jbuf;
+	List	   *groupColNames = NIL;
+	ListCell   *lc,
+			   *gcl;
+	const char *mvname = mv_qname(mvrelid);
+	const char *other_qname = mv_qname(other_oid);
+	bool		first;
+
+	incr_collect_group_cols(viewQuery, &groupColNames);
+	initStringInfo(&buf);
+	initStringInfo(&jbuf);
+
+	incr_deparse_expr(join_quals, viewQuery->rtable, delta_varno, &jbuf);
+
+	/* INSERT INTO mv (output_cols) */
+	appendStringInfo(&buf, "INSERT INTO %s (", mvname);
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+		if (te->resjunk)
+			continue;
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		appendStringInfoString(&buf, quote_identifier(te->resname));
+		first = false;
+	}
+	appendStringInfoString(&buf, ") SELECT ");
+
+	/* SELECT: group cols as _d_.col/_j_.col, aggs with aliased args */
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+		if (te->resjunk)
+			continue;
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		first = false;
+
+		if (strcmp(te->resname, MATVIEW_INCR_COUNT_COL) == 0)
+		{
+			appendStringInfoString(&buf, "COUNT(*)");
+		}
+		else if (IsA(te->expr, Var))
+		{
+			StringInfoData ebuf;
+
+			initStringInfo(&ebuf);
+			incr_deparse_expr((Node *) te->expr, viewQuery->rtable,
+							  delta_varno, &ebuf);
+			appendStringInfoString(&buf, ebuf.data);
+		}
+		else if (IsA(te->expr, Aggref))
+		{
+			Aggref	   *agg = (Aggref *) te->expr;
+			char	   *fname = get_func_name(agg->aggfnoid);
+
+			if (strcmp(fname, "count") == 0 && agg->aggstar)
+				appendStringInfoString(&buf, "COUNT(*)");
+			else if (agg->args != NIL)
+			{
+				TargetEntry *arg_te = linitial_node(TargetEntry, agg->args);
+				StringInfoData ebuf;
+
+				initStringInfo(&ebuf);
+				incr_deparse_expr((Node *) arg_te->expr, viewQuery->rtable,
+								  delta_varno, &ebuf);
+				appendStringInfo(&buf, "%s(%s)", fname, ebuf.data);
+			}
+			else
+				appendStringInfo(&buf, "%s(*)", fname);
+		}
+	}
+
+	/* FROM __mv_newtable _d_ JOIN other _j_ ON (condition) */
+	appendStringInfo(&buf, " FROM %s %s JOIN %s %s ON (%s)",
+					 MATVIEW_INCR_NEWTABLE, INCR_DELTA_ALIAS,
+					 other_qname, INCR_JOIN_ALIAS,
+					 jbuf.data);
+
+	/* GROUP BY _d_.g1, ... */
+	appendStringInfoString(&buf, " GROUP BY ");
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+		StringInfoData ebuf;
+
+		if (te->resjunk || !IsA(te->expr, Var))
+			continue;
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		first = false;
+		initStringInfo(&ebuf);
+		incr_deparse_expr((Node *) te->expr, viewQuery->rtable,
+						  delta_varno, &ebuf);
+		appendStringInfoString(&buf, ebuf.data);
+	}
+
+	/* ON CONFLICT (group_cols) DO UPDATE SET agg = mv.agg + EXCLUDED.agg */
+	appendStringInfoString(&buf, " ON CONFLICT (");
+	first = true;
+	foreach(gcl, groupColNames)
+	{
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		appendStringInfoString(&buf, quote_identifier(strVal(lfirst(gcl))));
+		first = false;
+	}
+	appendStringInfoString(&buf, ") DO UPDATE SET ");
+
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+		const char *colq;
+
+		if (te->resjunk || IsA(te->expr, Var))
+			continue;
+		colq = quote_identifier(te->resname);
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		appendStringInfo(&buf, "%s=%s.%s+EXCLUDED.%s", colq, mvname, colq, colq);
+		first = false;
+	}
+
+	return buf.data;
+}
+
+/*
+ * incr_build_del_sql_join — Phase 2 DELETE delta
+ *
+ * When rows in the delta-side table are removed, join the old transition
+ * table with the current state of the other table and subtract:
+ *
+ *   WITH d AS (
+ *     SELECT _d_.g1 AS g1, SUM(_j_.agg_arg) AS agg_col,
+ *            COUNT(*) AS __mv_count__
+ *     FROM __mv_oldtable _d_ JOIN schema.other _j_ ON (join_cond)
+ *     GROUP BY _d_.g1
+ *   )
+ *   UPDATE mv SET
+ *     agg_col      = mv.agg_col      - d.agg_col,
+ *     __mv_count__ = mv.__mv_count__ - d.__mv_count__
+ *   FROM d
+ *   WHERE mv.g1 = d.g1
+ */
+static char *
+incr_build_del_sql_join(Oid mvrelid, Query *viewQuery,
+						int delta_varno, Oid other_oid,
+						Node *join_quals)
+{
+	StringInfoData buf;
+	StringInfoData jbuf;
+	List	   *groupColNames = NIL;
+	ListCell   *lc,
+			   *gcl;
+	const char *mvname = mv_qname(mvrelid);
+	const char *other_qname = mv_qname(other_oid);
+	const char *cntcol = quote_identifier(MATVIEW_INCR_COUNT_COL);
+	bool		first;
+
+	incr_collect_group_cols(viewQuery, &groupColNames);
+	initStringInfo(&buf);
+	initStringInfo(&jbuf);
+
+	incr_deparse_expr(join_quals, viewQuery->rtable, delta_varno, &jbuf);
+
+	/* WITH d AS (SELECT ...) */
+	appendStringInfoString(&buf, "WITH d AS (SELECT ");
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+		if (te->resjunk)
+			continue;
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		first = false;
+
+		if (strcmp(te->resname, MATVIEW_INCR_COUNT_COL) == 0)
+		{
+			appendStringInfo(&buf, "COUNT(*) AS %s", cntcol);
+		}
+		else if (IsA(te->expr, Var))
+		{
+			StringInfoData ebuf;
+
+			initStringInfo(&ebuf);
+			incr_deparse_expr((Node *) te->expr, viewQuery->rtable,
+							  delta_varno, &ebuf);
+			appendStringInfo(&buf, "%s AS %s",
+							 ebuf.data, quote_identifier(te->resname));
+		}
+		else if (IsA(te->expr, Aggref))
+		{
+			Aggref	   *agg = (Aggref *) te->expr;
+			char	   *fname = get_func_name(agg->aggfnoid);
+			const char *colq = quote_identifier(te->resname);
+
+			if (strcmp(fname, "count") == 0 && agg->aggstar)
+				appendStringInfo(&buf, "COUNT(*) AS %s", colq);
+			else if (agg->args != NIL)
+			{
+				TargetEntry *arg_te = linitial_node(TargetEntry, agg->args);
+				StringInfoData ebuf;
+
+				initStringInfo(&ebuf);
+				incr_deparse_expr((Node *) arg_te->expr, viewQuery->rtable,
+								  delta_varno, &ebuf);
+				appendStringInfo(&buf, "%s(%s) AS %s", fname, ebuf.data, colq);
+			}
+			else
+				appendStringInfo(&buf, "%s(*) AS %s", fname, colq);
+		}
+	}
+
+	/* FROM __mv_oldtable _d_ JOIN other _j_ ON (cond) GROUP BY ... ) */
+	appendStringInfo(&buf, " FROM %s %s JOIN %s %s ON (%s) GROUP BY ",
+					 MATVIEW_INCR_OLDTABLE, INCR_DELTA_ALIAS,
+					 other_qname, INCR_JOIN_ALIAS,
+					 jbuf.data);
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+		StringInfoData ebuf;
+
+		if (te->resjunk || !IsA(te->expr, Var))
+			continue;
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		first = false;
+		initStringInfo(&ebuf);
+		incr_deparse_expr((Node *) te->expr, viewQuery->rtable,
+						  delta_varno, &ebuf);
+		appendStringInfoString(&buf, ebuf.data);
+	}
+	appendStringInfoString(&buf, ") ");
+
+	/* UPDATE mv SET agg = mv.agg - d.agg ... */
+	appendStringInfo(&buf, "UPDATE %s SET ", mvname);
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+		const char *colq;
+
+		if (te->resjunk || IsA(te->expr, Var))
+			continue;
+		colq = quote_identifier(te->resname);
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		appendStringInfo(&buf, "%s=%s.%s-d.%s", colq, mvname, colq, colq);
+		first = false;
+	}
+
+	/* FROM d WHERE mv.g = d.g */
+	appendStringInfo(&buf, " FROM d WHERE ");
+	first = true;
+	foreach(gcl, groupColNames)
+	{
+		const char *colq = quote_identifier(strVal(lfirst(gcl)));
+
+		if (!first)
+			appendStringInfoString(&buf, " AND ");
+		appendStringInfo(&buf, "%s.%s=d.%s", mvname, colq, colq);
+		first = false;
+	}
+
+	return buf.data;
+}
+
+/* ============================================================
  * Catalog helpers
  * ============================================================
  */
@@ -813,9 +1391,9 @@ incr_init_plan_cache(void)
 }
 
 static SPIPlanPtr
-incr_get_plan(Oid mvrelid, int plan_type)
+incr_get_plan(Oid mvrelid, Oid srctable, int plan_type)
 {
-	IncrPlanKey key = {mvrelid, plan_type};
+	IncrPlanKey key = {mvrelid, srctable, plan_type};
 	IncrPlanEntry *entry;
 
 	if (incr_plan_cache == NULL)
@@ -833,9 +1411,9 @@ incr_get_plan(Oid mvrelid, int plan_type)
 }
 
 static void
-incr_cache_plan(Oid mvrelid, int plan_type, SPIPlanPtr plan)
+incr_cache_plan(Oid mvrelid, Oid srctable, int plan_type, SPIPlanPtr plan)
 {
-	IncrPlanKey key = {mvrelid, plan_type};
+	IncrPlanKey key = {mvrelid, srctable, plan_type};
 	IncrPlanEntry *entry;
 	bool		found;
 
@@ -931,7 +1509,7 @@ matview_delta_apply(PG_FUNCTION_ARGS)
 	/* ----- insert delta (INSERT or UPDATE new-side) ----- */
 	if (is_insert || is_update)
 	{
-		SPIPlanPtr	plan = incr_get_plan(mvrelid, INCR_PLAN_INS);
+		SPIPlanPtr	plan = incr_get_plan(mvrelid, srctable, INCR_PLAN_INS);
 
 		if (plan == NULL)
 		{
@@ -945,7 +1523,7 @@ matview_delta_apply(PG_FUNCTION_ARGS)
 				elog(ERROR, "matview_delta_apply: SPI_prepare (insert) failed: %s",
 					 SPI_result_code_string(SPI_result));
 			SPI_keepplan(plan);
-			incr_cache_plan(mvrelid, INCR_PLAN_INS, plan);
+			incr_cache_plan(mvrelid, srctable, INCR_PLAN_INS, plan);
 		}
 
 		ret = SPI_execute_plan(plan, NULL, NULL, false, 0);
@@ -957,7 +1535,7 @@ matview_delta_apply(PG_FUNCTION_ARGS)
 	/* ----- delete delta (DELETE or UPDATE old-side) ----- */
 	if (is_delete || is_update)
 	{
-		SPIPlanPtr	plan = incr_get_plan(mvrelid, INCR_PLAN_DEL);
+		SPIPlanPtr	plan = incr_get_plan(mvrelid, srctable, INCR_PLAN_DEL);
 
 		if (plan == NULL)
 		{
@@ -971,7 +1549,7 @@ matview_delta_apply(PG_FUNCTION_ARGS)
 				elog(ERROR, "matview_delta_apply: SPI_prepare (delete) failed: %s",
 					 SPI_result_code_string(SPI_result));
 			SPI_keepplan(plan);
-			incr_cache_plan(mvrelid, INCR_PLAN_DEL, plan);
+			incr_cache_plan(mvrelid, srctable, INCR_PLAN_DEL, plan);
 		}
 
 		ret = SPI_execute_plan(plan, NULL, NULL, false, 0);
@@ -981,7 +1559,7 @@ matview_delta_apply(PG_FUNCTION_ARGS)
 
 		/* Cleanup: remove group rows whose count dropped to zero */
 		{
-			SPIPlanPtr	cplan = incr_get_plan(mvrelid, INCR_PLAN_CLN);
+			SPIPlanPtr	cplan = incr_get_plan(mvrelid, srctable, INCR_PLAN_CLN);
 
 			if (cplan == NULL)
 			{
@@ -995,7 +1573,7 @@ matview_delta_apply(PG_FUNCTION_ARGS)
 					elog(ERROR, "matview_delta_apply: SPI_prepare (cleanup) failed: %s",
 						 SPI_result_code_string(SPI_result));
 				SPI_keepplan(cplan);
-				incr_cache_plan(mvrelid, INCR_PLAN_CLN, cplan);
+				incr_cache_plan(mvrelid, srctable, INCR_PLAN_CLN, cplan);
 			}
 
 			ret = SPI_execute_plan(cplan, NULL, NULL, false, 0);
