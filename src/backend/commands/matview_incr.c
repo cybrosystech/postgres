@@ -56,6 +56,7 @@
 #include "catalog/indexing.h"
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_operator.h"
+#include "catalog/pg_proc.h"
 #include "catalog/pg_dbblue_matview.h"
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_type.h"
@@ -172,6 +173,10 @@ static void incr_store_catalog(Oid mvrelid, Oid srctable,
 							   const char *having_sql);
 static void incr_create_unique_index(Oid mvrelid, List *groupColNames);
 static bool incr_validate_having(Node *expr, Query *viewQuery);
+static bool incr_validate_where_qual(Node *qual);
+static Node *incr_get_where_qual(Query *viewQuery);
+static void incr_deparse_where_qual(Node *qual, List *rtable, int delta_varno,
+									StringInfo buf);
 static const char *incr_resolve_var_colname(Var *v, List *rtable);
 static void incr_deparse_having_cond(Node *expr, Query *viewQuery, StringInfo buf);
 static char *incr_build_hav_sql(Oid mvrelid, Query *viewQuery);
@@ -279,15 +284,15 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 		{
 			FromExpr   *fe = (FromExpr *) viewQuery->jointree;
 
-			if (fe->quals != NULL)
-				has_join = true;	/* implicit join: FROM T1, T2 WHERE ... */
-			else if (fe->fromlist != NIL && IsA(linitial(fe->fromlist), JoinExpr))
+			if (fe->fromlist != NIL && IsA(linitial(fe->fromlist), JoinExpr))
 			{
 				JoinExpr   *je = (JoinExpr *) linitial(fe->fromlist);
 
 				if (je->jointype == JOIN_INNER && je->quals != NULL)
 					has_join = true;
 			}
+			else if (fe->quals != NULL)
+				has_join = true;	/* implicit join: FROM T1, T2 WHERE join_cond */
 		}
 
 		if (!has_join)
@@ -329,6 +334,19 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 		}
 		*reason = "only column references and SUM/COUNT aggregates are allowed";
 		return false;
+	}
+
+	/* Validate WHERE clause if present (Phase 5) */
+	{
+		Node	   *where_qual = incr_get_where_qual(viewQuery);
+
+		if (where_qual != NULL && !incr_validate_where_qual(where_qual))
+		{
+			*reason = "WHERE clause uses unsupported expressions; "
+				"only column references, constants, comparisons, "
+				"boolean operators, and IN lists are allowed";
+			return false;
+		}
 	}
 
 	return true;
@@ -791,6 +809,288 @@ incr_collect_avg_info(Query *viewQuery, List **avgInfoList)
 
 /*
  * incr_resolve_var_colname
+ * incr_get_where_qual
+ * Return the WHERE qual for single-table or explicit-JOIN queries.
+ * For implicit joins (FROM t1, t2 WHERE ...) the quals already serve as the
+ * ON clause in delta SQL, so we return NULL to avoid double-filtering.
+ */
+static Node *
+incr_get_where_qual(Query *viewQuery)
+{
+	FromExpr   *fe;
+
+	if (!IsA(viewQuery->jointree, FromExpr))
+		return NULL;
+
+	fe = (FromExpr *) viewQuery->jointree;
+
+	/*
+	 * Implicit join: fromlist has 2+ entries.  fe->quals is the join
+	 * condition, already emitted as ON clause in delta SQL — not a WHERE.
+	 */
+	if (list_length(fe->fromlist) > 1)
+		return NULL;
+
+	return fe->quals;				/* single table or explicit JOIN */
+}
+
+/*
+ * incr_validate_where_qual
+ * Return true if qual only uses expressions safe for WHERE maintenance:
+ * Var, Const, OpExpr, BoolExpr, FuncExpr (stable/immutable), NullTest,
+ * ScalarArrayOpExpr (col IN/NOT IN list), ArrayExpr.
+ * Aggregates and sublinks are not permitted in WHERE.
+ */
+static bool
+incr_validate_where_qual(Node *qual)
+{
+	ListCell   *lc;
+
+	if (qual == NULL)
+		return true;
+
+	if (IsA(qual, Var) || IsA(qual, Const))
+		return true;
+
+	if (IsA(qual, NullTest))
+		return incr_validate_where_qual((Node *) ((NullTest *) qual)->arg);
+
+	if (IsA(qual, OpExpr))
+	{
+		OpExpr	   *op = (OpExpr *) qual;
+
+		foreach(lc, op->args)
+			if (!incr_validate_where_qual(lfirst(lc)))
+				return false;
+		return true;
+	}
+
+	if (IsA(qual, BoolExpr))
+	{
+		BoolExpr   *be = (BoolExpr *) qual;
+
+		foreach(lc, be->args)
+			if (!incr_validate_where_qual(lfirst(lc)))
+				return false;
+		return true;
+	}
+
+	if (IsA(qual, FuncExpr))
+	{
+		FuncExpr   *fe = (FuncExpr *) qual;
+
+		if (fe->funcretset || func_volatile(fe->funcid) == PROVOLATILE_VOLATILE)
+			return false;
+		foreach(lc, fe->args)
+			if (!incr_validate_where_qual(lfirst(lc)))
+				return false;
+		return true;
+	}
+
+	if (IsA(qual, ScalarArrayOpExpr))
+	{
+		ScalarArrayOpExpr *sao = (ScalarArrayOpExpr *) qual;
+
+		foreach(lc, sao->args)
+			if (!incr_validate_where_qual(lfirst(lc)))
+				return false;
+		return true;
+	}
+
+	if (IsA(qual, ArrayExpr))
+	{
+		ArrayExpr  *ae = (ArrayExpr *) qual;
+
+		foreach(lc, ae->elements)
+			if (!incr_validate_where_qual(lfirst(lc)))
+				return false;
+		return true;
+	}
+
+	return false;
+}
+
+/*
+ * incr_deparse_where_qual
+ * Render a WHERE qual to SQL.
+ *   delta_varno < 0  → Phase 1: Var emitted as bare column name
+ *   delta_varno >= 1 → Phase 2: Var gets _d_ / _j_ table alias
+ */
+static void
+incr_deparse_where_qual(Node *qual, List *rtable, int delta_varno, StringInfo buf)
+{
+	ListCell   *lc;
+
+	if (qual == NULL)
+		return;
+
+	if (IsA(qual, Var))
+	{
+		Var		   *v = (Var *) qual;
+
+		if (delta_varno < 0)
+		{
+			/* Phase 1: bare column name — the transition table has no alias */
+			appendStringInfoString(buf,
+								   quote_identifier(incr_resolve_var_colname(v, rtable)));
+		}
+		else
+		{
+			/* Phase 2: use incr_deparse_expr for _d_ / _j_ aliasing */
+			incr_deparse_expr(qual, rtable, delta_varno, buf);
+		}
+		return;
+	}
+
+	if (IsA(qual, Const))
+	{
+		Const	   *c = (Const *) qual;
+
+		if (c->constisnull)
+			appendStringInfoString(buf, "NULL");
+		else
+		{
+			Oid			outfunc;
+			bool		typIsVarlena;
+			char	   *val;
+
+			getTypeOutputInfo(c->consttype, &outfunc, &typIsVarlena);
+			val = OidOutputFunctionCall(outfunc, c->constvalue);
+			appendStringInfo(buf, "'%s'::%s", val, format_type_be(c->consttype));
+		}
+		return;
+	}
+
+	if (IsA(qual, NullTest))
+	{
+		NullTest   *nt = (NullTest *) qual;
+		StringInfoData abuf;
+
+		initStringInfo(&abuf);
+		incr_deparse_where_qual((Node *) nt->arg, rtable, delta_varno, &abuf);
+		appendStringInfo(buf, "(%s IS %sNULL)", abuf.data,
+						 nt->nulltesttype == IS_NOT_NULL ? "NOT " : "");
+		return;
+	}
+
+	if (IsA(qual, OpExpr))
+	{
+		OpExpr	   *op = (OpExpr *) qual;
+		HeapTuple	tup;
+		Form_pg_operator opform;
+		char	   *opname;
+
+		tup = SearchSysCache1(OPEROID, ObjectIdGetDatum(op->opno));
+		if (!HeapTupleIsValid(tup))
+			elog(ERROR, "incr_deparse_where_qual: operator %u not found", op->opno);
+		opform = (Form_pg_operator) GETSTRUCT(tup);
+		opname = pstrdup(NameStr(opform->oprname));
+		ReleaseSysCache(tup);
+
+		appendStringInfoChar(buf, '(');
+		incr_deparse_where_qual(linitial(op->args), rtable, delta_varno, buf);
+		appendStringInfo(buf, " %s ", opname);
+		if (list_length(op->args) > 1)
+			incr_deparse_where_qual(lsecond(op->args), rtable, delta_varno, buf);
+		appendStringInfoChar(buf, ')');
+		return;
+	}
+
+	if (IsA(qual, BoolExpr))
+	{
+		BoolExpr   *be = (BoolExpr *) qual;
+		const char *opstr = (be->boolop == AND_EXPR) ? " AND " :
+			(be->boolop == OR_EXPR) ? " OR " : "NOT ";
+		bool		first = true;
+
+		appendStringInfoChar(buf, '(');
+		foreach(lc, be->args)
+		{
+			if (!first)
+				appendStringInfoString(buf, opstr);
+			if (be->boolop == NOT_EXPR)
+				appendStringInfoString(buf, opstr);
+			incr_deparse_where_qual(lfirst(lc), rtable, delta_varno, buf);
+			first = false;
+		}
+		appendStringInfoChar(buf, ')');
+		return;
+	}
+
+	if (IsA(qual, FuncExpr))
+	{
+		FuncExpr   *fe = (FuncExpr *) qual;
+
+		/* Implicit cast: single-arg function — emit (arg)::returntype */
+		if (list_length(fe->args) == 1)
+		{
+			appendStringInfoChar(buf, '(');
+			incr_deparse_where_qual(linitial(fe->args), rtable, delta_varno, buf);
+			appendStringInfo(buf, ")::%s", format_type_be(fe->funcresulttype));
+		}
+		else
+		{
+			char	   *fname = get_func_name(fe->funcid);
+			bool		first = true;
+
+			appendStringInfo(buf, "%s(", fname);
+			foreach(lc, fe->args)
+			{
+				if (!first)
+					appendStringInfoChar(buf, ',');
+				incr_deparse_where_qual(lfirst(lc), rtable, delta_varno, buf);
+				first = false;
+			}
+			appendStringInfoChar(buf, ')');
+		}
+		return;
+	}
+
+	if (IsA(qual, ArrayExpr))
+	{
+		ArrayExpr  *ae = (ArrayExpr *) qual;
+		bool		first = true;
+
+		appendStringInfoString(buf, "ARRAY[");
+		foreach(lc, ae->elements)
+		{
+			if (!first)
+				appendStringInfoChar(buf, ',');
+			incr_deparse_where_qual(lfirst(lc), rtable, delta_varno, buf);
+			first = false;
+		}
+		appendStringInfoChar(buf, ']');
+		return;
+	}
+
+	if (IsA(qual, ScalarArrayOpExpr))
+	{
+		ScalarArrayOpExpr *sao = (ScalarArrayOpExpr *) qual;
+		HeapTuple	tup;
+		Form_pg_operator opform;
+		char	   *opname;
+
+		tup = SearchSysCache1(OPEROID, ObjectIdGetDatum(sao->opno));
+		if (!HeapTupleIsValid(tup))
+			elog(ERROR, "incr_deparse_where_qual: operator %u not found", sao->opno);
+		opform = (Form_pg_operator) GETSTRUCT(tup);
+		opname = pstrdup(NameStr(opform->oprname));
+		ReleaseSysCache(tup);
+
+		appendStringInfoChar(buf, '(');
+		incr_deparse_where_qual(linitial(sao->args), rtable, delta_varno, buf);
+		appendStringInfo(buf, " %s %s(", opname, sao->useOr ? "ANY" : "ALL");
+		incr_deparse_where_qual(lsecond(sao->args), rtable, delta_varno, buf);
+		appendStringInfoString(buf, "))");
+		return;
+	}
+
+	elog(ERROR,
+		 "incr_deparse_where_qual: unsupported expression type %d",
+		 (int) nodeTag(qual));
+}
+
+/*
  * Chase RTE_GROUP / RTE_JOIN indirection and return the base-table column
  * name for a Var node.  Shared by incr_deparse_expr and incr_deparse_having_cond.
  */
@@ -1321,7 +1621,20 @@ incr_build_ins_sql(Oid mvrelid, Query *viewQuery)
 	}
 	if (viewQuery->havingQual != NULL)
 		appendStringInfoString(&buf, ",true");
-	appendStringInfo(&buf, ",COUNT(*) FROM %s GROUP BY ", MATVIEW_INCR_NEWTABLE);
+	appendStringInfo(&buf, ",COUNT(*) FROM %s", MATVIEW_INCR_NEWTABLE);
+	{
+		Node	   *wq = incr_get_where_qual(viewQuery);
+
+		if (wq != NULL)
+		{
+			StringInfoData wbuf;
+
+			initStringInfo(&wbuf);
+			incr_deparse_where_qual(wq, viewQuery->rtable, -1, &wbuf);
+			appendStringInfo(&buf, " WHERE %s", wbuf.data);
+		}
+	}
+	appendStringInfoString(&buf, " GROUP BY ");
 	first = true;
 	foreach(gcl, groupColNames)
 	{
@@ -1475,7 +1788,20 @@ incr_build_backfill_sql(Oid mvrelid, Query *viewQuery, Oid srctable)
 		appendStringInfo(&buf, ",AVG(%s),SUM(%s),COUNT(%s)", argq, argq, argq);
 	}
 	/* __mv_having_ok__ = false for all backfill rows; DO NOTHING leaves passing rows alone */
-	appendStringInfo(&buf, ",false,COUNT(*) FROM %s GROUP BY ", srctable_name);
+	appendStringInfo(&buf, ",false,COUNT(*) FROM %s", srctable_name);
+	{
+		Node	   *wq = incr_get_where_qual(viewQuery);
+
+		if (wq != NULL)
+		{
+			StringInfoData wbuf;
+
+			initStringInfo(&wbuf);
+			incr_deparse_where_qual(wq, viewQuery->rtable, -1, &wbuf);
+			appendStringInfo(&buf, " WHERE %s", wbuf.data);
+		}
+	}
+	appendStringInfoString(&buf, " GROUP BY ");
 	first = true;
 	foreach(gcl, groupColNames)
 	{
@@ -1568,8 +1894,20 @@ incr_build_del_sql(Oid mvrelid, Query *viewQuery)
 						 argq, quote_identifier(ai->sum_col),
 						 argq, quote_identifier(ai->cnt_col));
 	}
-	appendStringInfo(&buf, ",COUNT(*) AS %s FROM %s GROUP BY ",
-					 cntcol, MATVIEW_INCR_OLDTABLE);
+	appendStringInfo(&buf, ",COUNT(*) AS %s FROM %s", cntcol, MATVIEW_INCR_OLDTABLE);
+	{
+		Node	   *wq = incr_get_where_qual(viewQuery);
+
+		if (wq != NULL)
+		{
+			StringInfoData wbuf;
+
+			initStringInfo(&wbuf);
+			incr_deparse_where_qual(wq, viewQuery->rtable, -1, &wbuf);
+			appendStringInfo(&buf, " WHERE %s", wbuf.data);
+		}
+	}
+	appendStringInfoString(&buf, " GROUP BY ");
 	first = true;
 	foreach(gcl, groupColNames)
 	{
@@ -1683,15 +2021,16 @@ incr_get_join_info(Query *viewQuery,
 	{
 		FromExpr   *fe = (FromExpr *) viewQuery->jointree;
 
-		if (fe->quals != NULL)
-			*join_quals = fe->quals;	/* implicit: FROM T1, T2 WHERE ... */
-		else if (fe->fromlist != NIL &&
-				 IsA(linitial(fe->fromlist), JoinExpr))
+		if (fe->fromlist != NIL &&
+			IsA(linitial(fe->fromlist), JoinExpr))
 		{
 			JoinExpr   *je = (JoinExpr *) linitial(fe->fromlist);
 
 			*join_quals = je->quals;	/* explicit: FROM T1 JOIN T2 ON ... */
+			/* fe->quals is the WHERE clause — handled separately */
 		}
+		else if (fe->quals != NULL)
+			*join_quals = fe->quals;	/* implicit: FROM T1, T2 WHERE join_cond */
 	}
 
 	if (*join_quals == NULL)
@@ -1902,11 +2241,23 @@ incr_build_ins_sql_join(Oid mvrelid, Query *viewQuery,
 		}
 	}
 
-	/* FROM __mv_newtable _d_ JOIN other _j_ ON (condition) */
+	/* FROM __mv_newtable _d_ JOIN other _j_ ON (condition) [WHERE ...] */
 	appendStringInfo(&buf, " FROM %s %s JOIN %s %s ON (%s)",
 					 MATVIEW_INCR_NEWTABLE, INCR_DELTA_ALIAS,
 					 other_qname, INCR_JOIN_ALIAS,
 					 jbuf.data);
+	{
+		Node	   *wq = incr_get_where_qual(viewQuery);
+
+		if (wq != NULL)
+		{
+			StringInfoData wbuf;
+
+			initStringInfo(&wbuf);
+			incr_deparse_where_qual(wq, viewQuery->rtable, delta_varno, &wbuf);
+			appendStringInfo(&buf, " WHERE %s", wbuf.data);
+		}
+	}
 
 	/* GROUP BY _d_.g1, ... */
 	appendStringInfoString(&buf, " GROUP BY ");
@@ -2098,11 +2449,23 @@ incr_build_backfill_sql_join(Oid mvrelid, Query *viewQuery,
 		}
 	}
 
-	/* FROM actual_delta_table _d_ JOIN other _j_ ON (cond) */
+	/* FROM actual_delta_table _d_ JOIN other _j_ ON (cond) [WHERE ...] */
 	appendStringInfo(&buf, " FROM %s %s JOIN %s %s ON (%s)",
 					 delta_qname, INCR_DELTA_ALIAS,
 					 other_qname, INCR_JOIN_ALIAS,
 					 jbuf.data);
+	{
+		Node	   *wq = incr_get_where_qual(viewQuery);
+
+		if (wq != NULL)
+		{
+			StringInfoData wbuf;
+
+			initStringInfo(&wbuf);
+			incr_deparse_where_qual(wq, viewQuery->rtable, delta_varno, &wbuf);
+			appendStringInfo(&buf, " WHERE %s", wbuf.data);
+		}
+	}
 
 	/* GROUP BY */
 	appendStringInfoString(&buf, " GROUP BY ");
@@ -2233,11 +2596,24 @@ incr_build_del_sql_join(Oid mvrelid, Query *viewQuery,
 		}
 	}
 
-	/* FROM __mv_oldtable _d_ JOIN other _j_ ON (cond) GROUP BY ... ) */
-	appendStringInfo(&buf, " FROM %s %s JOIN %s %s ON (%s) GROUP BY ",
+	/* FROM __mv_oldtable _d_ JOIN other _j_ ON (cond) [WHERE ...] GROUP BY ... ) */
+	appendStringInfo(&buf, " FROM %s %s JOIN %s %s ON (%s)",
 					 MATVIEW_INCR_OLDTABLE, INCR_DELTA_ALIAS,
 					 other_qname, INCR_JOIN_ALIAS,
 					 jbuf.data);
+	{
+		Node	   *wq = incr_get_where_qual(viewQuery);
+
+		if (wq != NULL)
+		{
+			StringInfoData wbuf;
+
+			initStringInfo(&wbuf);
+			incr_deparse_where_qual(wq, viewQuery->rtable, delta_varno, &wbuf);
+			appendStringInfo(&buf, " WHERE %s", wbuf.data);
+		}
+	}
+	appendStringInfoString(&buf, " GROUP BY ");
 	first = true;
 	foreach(lc, viewQuery->targetList)
 	{
