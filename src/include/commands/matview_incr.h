@@ -29,6 +29,16 @@
 #define MATVIEW_INCR_AVGCNT_PREFIX	"__mv_avgcnt_"
 
 /*
+ * Hidden boolean column that tracks whether each group currently satisfies
+ * the HAVING condition.  Set to true on INSERT (new groups always start
+ * passing), then recomputed after every delta by the hav_sql step.
+ * Groups with __mv_having_ok__ = false are kept alive so their running
+ * totals survive until they pass HAVING again; a VIEW over the base table
+ * exposes only the passing rows to the user.
+ */
+#define MATVIEW_INCR_HAVING_COL		"__mv_having_ok__"
+
+/*
  * Transition-table aliases used in the internal triggers.
  * Must match the names embedded in the stored delta SQL.
  */

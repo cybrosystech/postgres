@@ -62,6 +62,7 @@
 #include "commands/defrem.h"
 #include "commands/matview.h"
 #include "commands/matview_incr.h"
+#include "commands/tablecmds.h"
 #include "commands/trigger.h"
 #include "executor/spi.h"
 #include "lib/stringinfo.h"
@@ -81,16 +82,18 @@
 /* ----------
  * Process-local plan cache.
  *
- * Three plans per matview:
+ * Four plans per matview:
  *   INCR_PLAN_INS — apply __mv_newtable delta to matview (INSERT ON CONFLICT)
  *   INCR_PLAN_DEL — subtract __mv_oldtable delta from matview (UPDATE)
  *   INCR_PLAN_CLN — remove zero-count groups (DELETE WHERE __mv_count__ <= 0)
+ *   INCR_PLAN_HAV — recompute __mv_having_ok__ for all active groups (HAVING)
  * ----------
  */
 #define INCR_PLAN_INS	0
 #define INCR_PLAN_DEL	1
 #define INCR_PLAN_CLN	2
-#define INCR_NUM_PLANS	3
+#define INCR_PLAN_HAV	3
+#define INCR_NUM_PLANS	4
 
 typedef struct IncrPlanKey
 {
@@ -149,19 +152,33 @@ static void incr_collect_agg_info(Query *viewQuery,
 								  List **aggFuncNames,
 								  List **aggArgColNames);
 static char *incr_build_ins_sql(Oid mvrelid, Query *viewQuery);
+static char *incr_build_backfill_sql(Oid mvrelid, Query *viewQuery,
+									 Oid srctable);
 static char *incr_build_del_sql(Oid mvrelid, Query *viewQuery);
 static char *incr_build_cln_sql(Oid mvrelid);
 static char *incr_build_ins_sql_join(Oid mvrelid, Query *viewQuery,
 									 int delta_varno, Oid other_oid,
 									 Node *join_quals);
+static char *incr_build_backfill_sql_join(Oid mvrelid, Query *viewQuery,
+										  int delta_varno, Oid delta_oid,
+										  Oid other_oid, Node *join_quals);
 static char *incr_build_del_sql_join(Oid mvrelid, Query *viewQuery,
 									 int delta_varno, Oid other_oid,
 									 Node *join_quals);
 static void incr_store_catalog(Oid mvrelid, Oid srctable,
 							   const char *ins_sql,
 							   const char *del_sql,
-							   const char *cln_sql);
+							   const char *cln_sql,
+							   const char *having_sql);
 static void incr_create_unique_index(Oid mvrelid, List *groupColNames);
+static bool incr_validate_having(Node *expr, Query *viewQuery);
+static const char *incr_resolve_var_colname(Var *v, List *rtable);
+static void incr_deparse_having_cond(Node *expr, Query *viewQuery, StringInfo buf);
+static char *incr_build_hav_sql(Oid mvrelid, Query *viewQuery);
+static void incr_create_having_view(Oid mvrelid,
+									const char *origschema,
+									const char *origname,
+									Query *viewQuery);
 static void incr_create_trigger(Oid mvrelid, Oid srctable,
 								int16 tgtype_event,
 								const char *newtable,
@@ -206,8 +223,13 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 	}
 	if (viewQuery->havingQual != NULL)
 	{
-		*reason = "HAVING is not supported";
-		return false;
+		if (!incr_validate_having(viewQuery->havingQual, viewQuery))
+		{
+			*reason = "HAVING uses unsupported expressions; "
+				"only maintained aggregates (COUNT/SUM/AVG), "
+				"group columns, constants, and comparison/boolean operators allowed";
+			return false;
+		}
 	}
 	if (viewQuery->setOperations != NULL)
 	{
@@ -281,12 +303,14 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 		return false;
 	}
 
-	/* Only Var (group col) or Aggref (SUM/COUNT) in target list */
+	/* Only Var (group col) or Aggref (SUM/COUNT/AVG) in target list */
 	foreach(lc, viewQuery->targetList)
 	{
 		TargetEntry *te = lfirst_node(TargetEntry, lc);
 
 		if (te->resjunk)
+			continue;
+		if (incr_is_hidden_col(te->resname))	/* skip hidden maintenance columns */
 			continue;
 		if (IsA(te->expr, Var))
 			continue;
@@ -345,8 +369,12 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 	List	   *groupColNames = NIL;
 	char	   *ins_sql,
 			   *del_sql,
-			   *cln_sql;
+			   *cln_sql,
+			   *hav_sql;
 	int			nbasetables = 0;
+	bool		hasHaving;
+	char	   *origschema = NULL;
+	char	   *origname = NULL;
 	ListCell   *lc;
 
 	if (!MatviewIncrIsEligible(viewQuery, &reason))
@@ -363,11 +391,33 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 			nbasetables++;
 	}
 
+	hasHaving = (viewQuery->havingQual != NULL);
+
 	/* Step 1: unique index on GROUP BY columns (same for all phases) */
 	incr_collect_group_cols(viewQuery, &groupColNames);
 	incr_create_unique_index(mvrelid, groupColNames);
 
+	/*
+	 * Step 2 (HAVING only): rename the internal matview to
+	 * _dbblue_<mvrelid>_base so we can create a user-facing VIEW with the
+	 * original name that filters on __mv_having_ok__.
+	 *
+	 * After this rename mv_qname(mvrelid) returns the base table name, so
+	 * all subsequent SQL builders reference the base table automatically.
+	 */
+	if (hasHaving)
+	{
+		origschema = pstrdup(get_namespace_name(get_rel_namespace(mvrelid)));
+		origname   = pstrdup(get_rel_name(mvrelid));
+		RenameRelationInternal(mvrelid,
+							   psprintf("_dbblue_%u_base", mvrelid),
+							   false, false);
+		/* Flush relcache so mv_qname() sees the new name immediately */
+		CommandCounterIncrement();
+	}
+
 	cln_sql = incr_build_cln_sql(mvrelid);
+	hav_sql = hasHaving ? incr_build_hav_sql(mvrelid, viewQuery) : NULL;
 
 	if (nbasetables == 1)
 	{
@@ -376,7 +426,28 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 
 		ins_sql = incr_build_ins_sql(mvrelid, viewQuery);
 		del_sql = incr_build_del_sql(mvrelid, viewQuery);
-		incr_store_catalog(mvrelid, srctable, ins_sql, del_sql, cln_sql);
+		incr_store_catalog(mvrelid, srctable, ins_sql, del_sql, cln_sql, hav_sql);
+
+		/*
+		 * HAVING backfill: the initial CREATE MATERIALIZED VIEW only inserted
+		 * HAVING-passing groups.  Insert all remaining groups (with
+		 * __mv_having_ok__ = false) so their running totals are tracked from
+		 * the start.  ON CONFLICT DO NOTHING leaves passing groups intact.
+		 */
+		if (hasHaving)
+		{
+			char	   *backfill_sql = incr_build_backfill_sql(mvrelid, viewQuery, srctable);
+			int			spi_ret;
+
+			OpenMatViewIncrementalMaintenance();
+			SPI_connect();
+			spi_ret = SPI_execute(backfill_sql, false, 0);
+			SPI_finish();
+			CloseMatViewIncrementalMaintenance();
+			if (spi_ret < 0)
+				elog(ERROR, "DBblue: HAVING backfill failed (code %d)", spi_ret);
+		}
+
 		incr_install_triggers(mvrelid, srctable);
 	}
 	else
@@ -398,7 +469,7 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 										  tbl1_varno, tbl2_oid, join_quals);
 		del_sql = incr_build_del_sql_join(mvrelid, viewQuery,
 										  tbl1_varno, tbl2_oid, join_quals);
-		incr_store_catalog(mvrelid, tbl1_oid, ins_sql, del_sql, cln_sql);
+		incr_store_catalog(mvrelid, tbl1_oid, ins_sql, del_sql, cln_sql, hav_sql);
 		incr_install_triggers(mvrelid, tbl1_oid);
 
 		/* Delta SQL when T2 rows change — join transition table with current T1 */
@@ -406,13 +477,41 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 										  tbl2_varno, tbl1_oid, join_quals);
 		del_sql = incr_build_del_sql_join(mvrelid, viewQuery,
 										  tbl2_varno, tbl1_oid, join_quals);
-		incr_store_catalog(mvrelid, tbl2_oid, ins_sql, del_sql, cln_sql);
+		incr_store_catalog(mvrelid, tbl2_oid, ins_sql, del_sql, cln_sql, hav_sql);
 		incr_install_triggers(mvrelid, tbl2_oid);
+
+		/*
+		 * HAVING backfill for JOIN: seed all groups (not just HAVING-passing
+		 * ones) so groups that initially fail HAVING are tracked from the start.
+		 * We join the real tables instead of transition tables.  DO NOTHING
+		 * leaves the already-passing groups intact.
+		 */
+		if (hasHaving)
+		{
+			char	   *backfill_sql = incr_build_backfill_sql_join(
+				mvrelid, viewQuery,
+				tbl1_varno, tbl1_oid, tbl2_oid, join_quals);
+			int			spi_ret;
+
+			OpenMatViewIncrementalMaintenance();
+			SPI_connect();
+			spi_ret = SPI_execute(backfill_sql, false, 0);
+			SPI_finish();
+			CloseMatViewIncrementalMaintenance();
+			if (spi_ret < 0)
+				elog(ERROR, "DBblue: HAVING backfill (JOIN) failed (code %d)", spi_ret);
+		}
 	}
 
+	/* Step 3 (HAVING only): create the user-facing VIEW over the base table */
+	if (hasHaving)
+		incr_create_having_view(mvrelid, origschema, origname, viewQuery);
+
 	ereport(DEBUG1,
-			(errmsg("DBblue: incremental refresh (Phase %d) set up for matview %s",
-					nbasetables, get_rel_name(mvrelid))));
+			(errmsg("DBblue: incremental refresh (Phase %d%s) set up for matview %s",
+					nbasetables,
+					hasHaving ? " + HAVING" : "",
+					hasHaving ? origname : get_rel_name(mvrelid))));
 }
 
 /*
@@ -525,6 +624,21 @@ MatviewIncrAddCountTarget(Query *q)
 		q->targetList = lappend(q->targetList, te);
 	}
 
+	/*
+	 * If HAVING present, inject __mv_having_ok__ = true.  All rows in the
+	 * initial population pass HAVING (PostgreSQL applies it during CREATE),
+	 * so true is correct.  The hav_sql step recomputes it after every delta.
+	 */
+	if (q->havingQual != NULL)
+	{
+		Const	   *c = makeConst(BOOLOID, -1, InvalidOid, sizeof(bool),
+								  BoolGetDatum(true), false, true);
+		te = makeTargetEntry((Expr *) c, next_resno++,
+							 pstrdup(MATVIEW_INCR_HAVING_COL),
+							 false);
+		q->targetList = lappend(q->targetList, te);
+	}
+
 	/* Always append COUNT(*) AS __mv_count__ */
 	aggref = makeNode(Aggref);
 	aggref->aggfnoid = 2803;		/* count(*) — stable catalog OID */
@@ -565,6 +679,8 @@ incr_is_hidden_col(const char *resname)
 	if (resname == NULL)
 		return false;
 	if (strcmp(resname, MATVIEW_INCR_COUNT_COL) == 0)
+		return true;
+	if (strcmp(resname, MATVIEW_INCR_HAVING_COL) == 0)
 		return true;
 	if (strncmp(resname, MATVIEW_INCR_AVGSUM_PREFIX,
 				strlen(MATVIEW_INCR_AVGSUM_PREFIX)) == 0)
@@ -666,6 +782,356 @@ incr_collect_avg_info(Query *viewQuery, List **avgInfoList)
 
 		*avgInfoList = lappend(*avgInfoList, info);
 	}
+}
+
+/* ============================================================
+ * HAVING helpers — Phase 4
+ * ============================================================
+ */
+
+/*
+ * incr_resolve_var_colname
+ * Chase RTE_GROUP / RTE_JOIN indirection and return the base-table column
+ * name for a Var node.  Shared by incr_deparse_expr and incr_deparse_having_cond.
+ */
+static const char *
+incr_resolve_var_colname(Var *v, List *rtable)
+{
+	RangeTblEntry *rte;
+
+	for (;;)
+	{
+		rte = rt_fetch(v->varno, rtable);
+		if (rte->rtekind == RTE_RELATION)
+			break;
+		if (rte->rtekind == RTE_JOIN)
+		{
+			Node	   *av = list_nth(rte->joinaliasvars, v->varattno - 1);
+
+			if (!IsA(av, Var))
+				elog(ERROR, "incr_resolve_var_colname: non-Var in joinaliasvars");
+			v = (Var *) av;
+		}
+		else if (rte->rtekind == RTE_GROUP)
+		{
+			Node	   *ge = list_nth(rte->groupexprs, v->varattno - 1);
+
+			if (!IsA(ge, Var))
+				elog(ERROR, "incr_resolve_var_colname: non-Var in groupexprs");
+			v = (Var *) ge;
+		}
+		else
+			elog(ERROR, "incr_resolve_var_colname: unexpected RTE kind %d",
+				 (int) rte->rtekind);
+	}
+	return get_attname(rte->relid, v->varattno, false);
+}
+
+/*
+ * incr_validate_having
+ * Return true if expr uses only maintained aggregates (COUNT/SUM/AVG),
+ * group-by Vars, constants, comparisons, and boolean operators.
+ * Used by MatviewIncrIsEligible to gate Phase 4 eligibility.
+ */
+static bool
+incr_validate_having(Node *expr, Query *viewQuery)
+{
+	if (expr == NULL)
+		return true;
+
+	if (IsA(expr, Aggref))
+	{
+		Aggref	   *agg = (Aggref *) expr;
+		char	   *fname = get_func_name(agg->aggfnoid);
+		ListCell   *lc;
+
+		/* COUNT(*) — always maintained via __mv_count__ */
+		if (strcmp(fname, "count") == 0 && agg->aggstar)
+			return true;
+
+		/* Other aggregates must match a SELECT target */
+		foreach(lc, viewQuery->targetList)
+		{
+			TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+			if (!IsA(te->expr, Aggref))
+				continue;
+			if (((Aggref *) te->expr)->aggfnoid == agg->aggfnoid)
+				return true;	/* same function — good enough for eligibility */
+		}
+		return false;
+	}
+	else if (IsA(expr, Var))
+		return true;
+	else if (IsA(expr, Const))
+		return true;
+	else if (IsA(expr, OpExpr))
+	{
+		OpExpr	   *op = (OpExpr *) expr;
+		ListCell   *lc;
+
+		foreach(lc, op->args)
+		{
+			if (!incr_validate_having(lfirst(lc), viewQuery))
+				return false;
+		}
+		return true;
+	}
+	else if (IsA(expr, BoolExpr))
+	{
+		BoolExpr   *be = (BoolExpr *) expr;
+		ListCell   *lc;
+
+		foreach(lc, be->args)
+		{
+			if (!incr_validate_having(lfirst(lc), viewQuery))
+				return false;
+		}
+		return true;
+	}
+	else if (IsA(expr, NullTest))
+		return true;			/* IS NULL / IS NOT NULL on group cols is fine */
+	else if (IsA(expr, FuncExpr))
+	{
+		/* Allow implicit type-coercion functions (e.g. int4 → numeric) */
+		FuncExpr   *fe = (FuncExpr *) expr;
+		ListCell   *lc;
+
+		if (!fe->funcretset)
+		{
+			foreach(lc, fe->args)
+			{
+				if (!incr_validate_having(lfirst(lc), viewQuery))
+					return false;
+			}
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * incr_deparse_having_cond
+ * Render the HAVING expression as SQL using matview column names.
+ * Aggregates are mapped to the corresponding output column name or
+ * the hidden __mv_count__ column.
+ */
+static void
+incr_deparse_having_cond(Node *expr, Query *viewQuery, StringInfo buf)
+{
+	if (expr == NULL)
+		return;
+
+	if (IsA(expr, Aggref))
+	{
+		Aggref	   *hagg = (Aggref *) expr;
+		char	   *fname = get_func_name(hagg->aggfnoid);
+		ListCell   *lc;
+
+		if (strcmp(fname, "count") == 0 && hagg->aggstar)
+		{
+			appendStringInfoString(buf, quote_identifier(MATVIEW_INCR_COUNT_COL));
+			return;
+		}
+
+		/* Find matching SELECT aggregate by function OID */
+		foreach(lc, viewQuery->targetList)
+		{
+			TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+			if (!IsA(te->expr, Aggref))
+				continue;
+			if (((Aggref *) te->expr)->aggfnoid == hagg->aggfnoid)
+			{
+				appendStringInfoString(buf, quote_identifier(te->resname));
+				return;
+			}
+		}
+		elog(ERROR, "incr_deparse_having_cond: aggregate %s not found in SELECT list",
+			 fname);
+	}
+	else if (IsA(expr, Var))
+	{
+		/* Group column — resolve to base column name, then find the output resname */
+		Var		   *v = (Var *) expr;
+		const char *colname = incr_resolve_var_colname(v, viewQuery->rtable);
+		ListCell   *lc;
+
+		foreach(lc, viewQuery->targetList)
+		{
+			TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+			if (!IsA(te->expr, Var))
+				continue;
+			if (strcmp(incr_resolve_var_colname((Var *) te->expr,
+												viewQuery->rtable),
+					   colname) == 0)
+			{
+				appendStringInfoString(buf, quote_identifier(te->resname));
+				return;
+			}
+		}
+		appendStringInfoString(buf, quote_identifier(colname));
+	}
+	else if (IsA(expr, Const))
+	{
+		Const	   *c = (Const *) expr;
+
+		if (c->constisnull)
+		{
+			appendStringInfoString(buf, "NULL");
+		}
+		else
+		{
+			Oid			outfunc;
+			bool		typIsVarlena;
+			char	   *val;
+
+			getTypeOutputInfo(c->consttype, &outfunc, &typIsVarlena);
+			val = OidOutputFunctionCall(outfunc, c->constvalue);
+			appendStringInfo(buf, "'%s'::%s", val, format_type_be(c->consttype));
+		}
+	}
+	else if (IsA(expr, OpExpr))
+	{
+		OpExpr	   *op = (OpExpr *) expr;
+		HeapTuple	tup;
+		Form_pg_operator opform;
+		char	   *opname;
+
+		tup = SearchSysCache1(OPEROID, ObjectIdGetDatum(op->opno));
+		if (!HeapTupleIsValid(tup))
+			elog(ERROR, "incr_deparse_having_cond: operator %u not found", op->opno);
+		opform = (Form_pg_operator) GETSTRUCT(tup);
+		opname = pstrdup(NameStr(opform->oprname));
+		ReleaseSysCache(tup);
+
+		appendStringInfoChar(buf, '(');
+		incr_deparse_having_cond(linitial(op->args), viewQuery, buf);
+		appendStringInfo(buf, " %s ", opname);
+		if (list_length(op->args) > 1)
+			incr_deparse_having_cond(lsecond(op->args), viewQuery, buf);
+		appendStringInfoChar(buf, ')');
+	}
+	else if (IsA(expr, BoolExpr))
+	{
+		BoolExpr   *be = (BoolExpr *) expr;
+		const char *opstr = (be->boolop == AND_EXPR) ? " AND " :
+			(be->boolop == OR_EXPR) ? " OR " : "NOT ";
+		ListCell   *lc;
+		bool		first = true;
+
+		appendStringInfoChar(buf, '(');
+		foreach(lc, be->args)
+		{
+			if (!first)
+				appendStringInfoString(buf, opstr);
+			if (be->boolop == NOT_EXPR)
+				appendStringInfoString(buf, opstr);
+			incr_deparse_having_cond(lfirst(lc), viewQuery, buf);
+			first = false;
+		}
+		appendStringInfoChar(buf, ')');
+	}
+	else if (IsA(expr, FuncExpr))
+	{
+		/* Implicit type-coercion function — emit as arg::returntype */
+		FuncExpr   *fe = (FuncExpr *) expr;
+
+		if (list_length(fe->args) == 1)
+		{
+			appendStringInfoChar(buf, '(');
+			incr_deparse_having_cond(linitial(fe->args), viewQuery, buf);
+			appendStringInfo(buf, ")::%s", format_type_be(fe->funcresulttype));
+		}
+		else
+			elog(ERROR,
+				 "incr_deparse_having_cond: unsupported FuncExpr with %d args",
+				 list_length(fe->args));
+	}
+	else
+		elog(ERROR,
+			 "incr_deparse_having_cond: unsupported expression type %d",
+			 (int) nodeTag(expr));
+}
+
+/*
+ * incr_build_hav_sql
+ * Builds the HAVING maintenance step SQL:
+ *   UPDATE <base_table> SET __mv_having_ok__ = (<having_cond>)
+ *   WHERE __mv_count__ > 0
+ *
+ * Runs after every delta to recompute visibility for all live groups.
+ * The base table name is derived from mv_qname(mvrelid), which at this
+ * point already reflects the renamed _dbblue_<mvrelid>_base table.
+ */
+static char *
+incr_build_hav_sql(Oid mvrelid, Query *viewQuery)
+{
+	StringInfoData buf;
+	StringInfoData cond;
+
+	initStringInfo(&buf);
+	initStringInfo(&cond);
+
+	incr_deparse_having_cond(viewQuery->havingQual, viewQuery, &cond);
+
+	appendStringInfo(&buf,
+					 "UPDATE %s SET %s=(%s) WHERE %s>0",
+					 mv_qname(mvrelid),
+					 quote_identifier(MATVIEW_INCR_HAVING_COL),
+					 cond.data,
+					 quote_identifier(MATVIEW_INCR_COUNT_COL));
+
+	return buf.data;
+}
+
+/*
+ * incr_create_having_view
+ * Create a non-materialized VIEW in <origschema>.<origname> that selects
+ * only the user-visible (non-hidden) columns from the renamed base table
+ * filtered by __mv_having_ok__.
+ */
+static void
+incr_create_having_view(Oid mvrelid,
+						const char *origschema,
+						const char *origname,
+						Query *viewQuery)
+{
+	StringInfoData buf;
+	ListCell   *lc;
+	bool		first = true;
+	int			ret;
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf, "CREATE VIEW %s AS SELECT ",
+					 quote_qualified_identifier(origschema, origname));
+
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+		if (te->resjunk || incr_is_hidden_col(te->resname))
+			continue;
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		appendStringInfoString(&buf, quote_identifier(te->resname));
+		first = false;
+	}
+
+	appendStringInfo(&buf, " FROM %s WHERE %s",
+					 mv_qname(mvrelid),
+					 quote_identifier(MATVIEW_INCR_HAVING_COL));
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "incr_create_having_view: SPI_connect failed");
+
+	ret = SPI_exec(buf.data, 0);
+	SPI_finish();
+
+	if (ret < 0)
+		elog(ERROR, "incr_create_having_view: CREATE VIEW failed: %s",
+			 SPI_result_code_string(ret));
 }
 
 static Oid
@@ -821,6 +1287,8 @@ incr_build_ins_sql(Oid mvrelid, Query *viewQuery)
 						 quote_identifier(ai->sum_col),
 						 quote_identifier(ai->cnt_col));
 	}
+	if (viewQuery->havingQual != NULL)
+		appendStringInfo(&buf, ",%s", quote_identifier(MATVIEW_INCR_HAVING_COL));
 	appendStringInfo(&buf, ",%s) ", cntcol);
 
 	/* SELECT group_cols, agg_exprs, avg+hidden exprs, COUNT(*) FROM __mv_newtable GROUP BY ... */
@@ -851,6 +1319,8 @@ incr_build_ins_sql(Oid mvrelid, Query *viewQuery)
 
 		appendStringInfo(&buf, ",AVG(%s),SUM(%s),COUNT(%s)", argq, argq, argq);
 	}
+	if (viewQuery->havingQual != NULL)
+		appendStringInfoString(&buf, ",true");
 	appendStringInfo(&buf, ",COUNT(*) FROM %s GROUP BY ", MATVIEW_INCR_NEWTABLE);
 	first = true;
 	foreach(gcl, groupColNames)
@@ -906,6 +1376,124 @@ incr_build_ins_sql(Oid mvrelid, Query *viewQuery)
 
 	if (!first) appendStringInfoChar(&buf, ',');
 	appendStringInfo(&buf, "%s=%s.%s+EXCLUDED.%s", cntcol, mvname, cntcol, cntcol);
+
+	return buf.data;
+}
+
+/*
+ * incr_build_backfill_sql — one-time setup for HAVING matviews
+ *
+ * Inserts all groups (not just HAVING-passing ones) into the base table so
+ * that groups which initially fail HAVING are still tracked.  Groups already
+ * present (they passed HAVING during initial population) are left untouched
+ * via ON CONFLICT DO NOTHING.
+ *
+ *   INSERT INTO base (g1, ..., agg_cols, ..., __mv_having_ok__, __mv_count__)
+ *   SELECT g1, ..., agg_exprs, ..., false, COUNT(*)
+ *   FROM <srctable>
+ *   GROUP BY g1, ...
+ *   ON CONFLICT (g1, ...) DO NOTHING
+ */
+static char *
+incr_build_backfill_sql(Oid mvrelid, Query *viewQuery, Oid srctable)
+{
+	StringInfoData buf;
+	List	   *groupColNames = NIL;
+	List	   *aggColNames = NIL,
+			   *aggFuncNames = NIL,
+			   *aggArgColNames = NIL;
+	List	   *avgInfoList = NIL;
+	ListCell   *gcl,
+			   *acl,
+			   *fcl,
+			   *arcl,
+			   *lc;
+	const char *mvname = mv_qname(mvrelid);
+	const char *cntcol = quote_identifier(MATVIEW_INCR_COUNT_COL);
+	const char *srctable_name;
+	bool		first;
+
+	incr_collect_group_cols(viewQuery, &groupColNames);
+	incr_collect_agg_info(viewQuery, &aggColNames, &aggFuncNames, &aggArgColNames);
+	incr_collect_avg_info(viewQuery, &avgInfoList);
+
+	srctable_name = quote_qualified_identifier(
+		get_namespace_name(get_rel_namespace(srctable)),
+		get_rel_name(srctable));
+
+	initStringInfo(&buf);
+
+	/* INSERT INTO base (group_cols, agg_cols, ..., __mv_having_ok__, __mv_count__) */
+	appendStringInfo(&buf, "INSERT INTO %s (", mvname);
+	first = true;
+	foreach(gcl, groupColNames)
+	{
+		if (!first) appendStringInfoChar(&buf, ',');
+		appendStringInfoString(&buf, quote_identifier(strVal(lfirst(gcl))));
+		first = false;
+	}
+	foreach(acl, aggColNames)
+		appendStringInfo(&buf, ",%s", quote_identifier(strVal(lfirst(acl))));
+	foreach(lc, avgInfoList)
+	{
+		AvgColInfo *ai = lfirst(lc);
+
+		appendStringInfo(&buf, ",%s,%s,%s",
+						 quote_identifier(ai->avg_col),
+						 quote_identifier(ai->sum_col),
+						 quote_identifier(ai->cnt_col));
+	}
+	appendStringInfo(&buf, ",%s,%s) ",
+					 quote_identifier(MATVIEW_INCR_HAVING_COL), cntcol);
+
+	/* SELECT group_cols, agg_exprs, ..., false, COUNT(*) FROM srctable GROUP BY ... */
+	appendStringInfoString(&buf, "SELECT ");
+	first = true;
+	foreach(gcl, groupColNames)
+	{
+		if (!first) appendStringInfoChar(&buf, ',');
+		appendStringInfoString(&buf, quote_identifier(strVal(lfirst(gcl))));
+		first = false;
+	}
+	forthree(acl, aggColNames, fcl, aggFuncNames, arcl, aggArgColNames)
+	{
+		const char *fname = strVal(lfirst(fcl));
+		Node	   *argnode = lfirst(arcl);
+
+		if (strcmp(fname, "count") == 0 && argnode == NULL)
+			appendStringInfoString(&buf, ",COUNT(*)");
+		else
+			appendStringInfo(&buf, ",%s(%s)",
+							 fname,
+							 quote_identifier(strVal((String *) argnode)));
+	}
+	foreach(lc, avgInfoList)
+	{
+		AvgColInfo *ai = lfirst(lc);
+		const char *argq = ai->arg_col ? quote_identifier(ai->arg_col) : "NULL";
+
+		appendStringInfo(&buf, ",AVG(%s),SUM(%s),COUNT(%s)", argq, argq, argq);
+	}
+	/* __mv_having_ok__ = false for all backfill rows; DO NOTHING leaves passing rows alone */
+	appendStringInfo(&buf, ",false,COUNT(*) FROM %s GROUP BY ", srctable_name);
+	first = true;
+	foreach(gcl, groupColNames)
+	{
+		if (!first) appendStringInfoChar(&buf, ',');
+		appendStringInfoString(&buf, quote_identifier(strVal(lfirst(gcl))));
+		first = false;
+	}
+
+	/* ON CONFLICT DO NOTHING — don't overwrite already-passing groups */
+	appendStringInfoString(&buf, " ON CONFLICT (");
+	first = true;
+	foreach(gcl, groupColNames)
+	{
+		if (!first) appendStringInfoChar(&buf, ',');
+		appendStringInfoString(&buf, quote_identifier(strVal(lfirst(gcl))));
+		first = false;
+	}
+	appendStringInfoString(&buf, ") DO NOTHING");
 
 	return buf.data;
 }
@@ -1278,6 +1866,11 @@ incr_build_ins_sql_join(Oid mvrelid, Query *viewQuery,
 		{
 			appendStringInfoString(&buf, "COUNT(*)");
 		}
+		else if (strcmp(te->resname, MATVIEW_INCR_HAVING_COL) == 0)
+		{
+			/* new groups start as passing; hav_sql corrects after delta */
+			appendStringInfoString(&buf, "true");
+		}
 		else if (IsA(te->expr, Var))
 		{
 			StringInfoData ebuf;
@@ -1353,11 +1946,12 @@ incr_build_ins_sql_join(Oid mvrelid, Query *viewQuery,
 
 		if (te->resjunk || IsA(te->expr, Var))
 			continue;
-		/* hidden avgsum/avgcnt cols are emitted as part of the avg triple below */
+		/* hidden avgsum/avgcnt and having cols handled separately — skip generic path */
 		if (strncmp(te->resname, MATVIEW_INCR_AVGSUM_PREFIX,
 					sizeof(MATVIEW_INCR_AVGSUM_PREFIX) - 1) == 0 ||
 			strncmp(te->resname, MATVIEW_INCR_AVGCNT_PREFIX,
-					sizeof(MATVIEW_INCR_AVGCNT_PREFIX) - 1) == 0)
+					sizeof(MATVIEW_INCR_AVGCNT_PREFIX) - 1) == 0 ||
+			strcmp(te->resname, MATVIEW_INCR_HAVING_COL) == 0)
 			continue;
 
 		if (IsA(te->expr, Aggref))
@@ -1401,6 +1995,145 @@ incr_build_ins_sql_join(Oid mvrelid, Query *viewQuery,
 			first = false;
 		}
 	}
+
+	return buf.data;
+}
+
+/*
+ * incr_build_backfill_sql_join — one-time setup for Phase 2 HAVING matviews
+ *
+ * Same idea as incr_build_backfill_sql but for a two-table JOIN:
+ * replaces __mv_newtable with the actual delta table so all groups are
+ * seeded before triggers are installed.
+ *
+ *   INSERT INTO base (group_cols, agg_cols, ..., __mv_having_ok__, __mv_count__)
+ *   SELECT _d_.g1, agg_exprs, ..., false, COUNT(*)
+ *   FROM delta_table _d_ JOIN other_table _j_ ON (join_cond)
+ *   GROUP BY _d_.g1, ...
+ *   ON CONFLICT (group_cols) DO NOTHING
+ */
+static char *
+incr_build_backfill_sql_join(Oid mvrelid, Query *viewQuery,
+							 int delta_varno, Oid delta_oid,
+							 Oid other_oid, Node *join_quals)
+{
+	StringInfoData buf;
+	StringInfoData jbuf;
+	List	   *groupColNames = NIL;
+	ListCell   *lc,
+			   *gcl;
+	const char *mvname = mv_qname(mvrelid);
+	const char *delta_qname = quote_qualified_identifier(
+		get_namespace_name(get_rel_namespace(delta_oid)),
+		get_rel_name(delta_oid));
+	const char *other_qname = mv_qname(other_oid);
+	bool		first;
+
+	incr_collect_group_cols(viewQuery, &groupColNames);
+	initStringInfo(&buf);
+	initStringInfo(&jbuf);
+
+	incr_deparse_expr(join_quals, viewQuery->rtable, delta_varno, &jbuf);
+
+	/* INSERT INTO base (output_cols) */
+	appendStringInfo(&buf, "INSERT INTO %s (", mvname);
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+		if (te->resjunk)
+			continue;
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		appendStringInfoString(&buf, quote_identifier(te->resname));
+		first = false;
+	}
+	appendStringInfoString(&buf, ") SELECT ");
+
+	/* SELECT: same structure as ins_sql_join but __mv_having_ok__ = false */
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+		if (te->resjunk)
+			continue;
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		first = false;
+
+		if (strcmp(te->resname, MATVIEW_INCR_COUNT_COL) == 0)
+			appendStringInfoString(&buf, "COUNT(*)");
+		else if (strcmp(te->resname, MATVIEW_INCR_HAVING_COL) == 0)
+			appendStringInfoString(&buf, "false");	/* DO NOTHING leaves t=true intact */
+		else if (IsA(te->expr, Var))
+		{
+			StringInfoData ebuf;
+
+			initStringInfo(&ebuf);
+			incr_deparse_expr((Node *) te->expr, viewQuery->rtable,
+							  delta_varno, &ebuf);
+			appendStringInfoString(&buf, ebuf.data);
+		}
+		else if (IsA(te->expr, Aggref))
+		{
+			Aggref	   *agg = (Aggref *) te->expr;
+			char	   *fname = get_func_name(agg->aggfnoid);
+
+			if (strcmp(fname, "count") == 0 && agg->aggstar)
+				appendStringInfoString(&buf, "COUNT(*)");
+			else if (agg->args != NIL)
+			{
+				TargetEntry *arg_te = linitial_node(TargetEntry, agg->args);
+				StringInfoData ebuf;
+
+				initStringInfo(&ebuf);
+				incr_deparse_expr((Node *) arg_te->expr, viewQuery->rtable,
+								  delta_varno, &ebuf);
+				appendStringInfo(&buf, "%s(%s)", fname, ebuf.data);
+			}
+			else
+				appendStringInfo(&buf, "%s(*)", fname);
+		}
+	}
+
+	/* FROM actual_delta_table _d_ JOIN other _j_ ON (cond) */
+	appendStringInfo(&buf, " FROM %s %s JOIN %s %s ON (%s)",
+					 delta_qname, INCR_DELTA_ALIAS,
+					 other_qname, INCR_JOIN_ALIAS,
+					 jbuf.data);
+
+	/* GROUP BY */
+	appendStringInfoString(&buf, " GROUP BY ");
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+		StringInfoData ebuf;
+
+		if (te->resjunk || !IsA(te->expr, Var))
+			continue;
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		first = false;
+		initStringInfo(&ebuf);
+		incr_deparse_expr((Node *) te->expr, viewQuery->rtable,
+						  delta_varno, &ebuf);
+		appendStringInfoString(&buf, ebuf.data);
+	}
+
+	/* ON CONFLICT DO NOTHING — passing groups already in base */
+	appendStringInfoString(&buf, " ON CONFLICT (");
+	first = true;
+	foreach(gcl, groupColNames)
+	{
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		appendStringInfoString(&buf, quote_identifier(strVal(lfirst(gcl))));
+		first = false;
+	}
+	appendStringInfoString(&buf, ") DO NOTHING");
 
 	return buf.data;
 }
@@ -1453,7 +2186,9 @@ incr_build_del_sql_join(Oid mvrelid, Query *viewQuery,
 
 		if (te->resjunk)
 			continue;
-		/* skip visible avg col — recomputed in UPDATE SET from hidden sum/cnt */
+		/* skip avg visible col (recomputed from hidden sum/cnt) and having col */
+		if (strcmp(te->resname, MATVIEW_INCR_HAVING_COL) == 0)
+			continue;
 		if (IsA(te->expr, Aggref) &&
 			strcmp(get_func_name(((Aggref *) te->expr)->aggfnoid), "avg") == 0)
 			continue;
@@ -1530,11 +2265,12 @@ incr_build_del_sql_join(Oid mvrelid, Query *viewQuery,
 
 		if (te->resjunk || IsA(te->expr, Var))
 			continue;
-		/* hidden avgsum/avgcnt cols are emitted as part of the avg triple below */
+		/* hidden avgsum/avgcnt and having cols handled separately — skip generic path */
 		if (strncmp(te->resname, MATVIEW_INCR_AVGSUM_PREFIX,
 					sizeof(MATVIEW_INCR_AVGSUM_PREFIX) - 1) == 0 ||
 			strncmp(te->resname, MATVIEW_INCR_AVGCNT_PREFIX,
-					sizeof(MATVIEW_INCR_AVGCNT_PREFIX) - 1) == 0)
+					sizeof(MATVIEW_INCR_AVGCNT_PREFIX) - 1) == 0 ||
+			strcmp(te->resname, MATVIEW_INCR_HAVING_COL) == 0)
 			continue;
 
 		if (IsA(te->expr, Aggref))
@@ -1604,7 +2340,8 @@ static void
 incr_store_catalog(Oid mvrelid, Oid srctable,
 				   const char *ins_sql,
 				   const char *del_sql,
-				   const char *cln_sql)
+				   const char *cln_sql,
+				   const char *having_sql)
 {
 	Relation	catalog;
 	HeapTuple	tup;
@@ -1617,6 +2354,13 @@ incr_store_catalog(Oid mvrelid, Oid srctable,
 	values[Anum_pg_dbblue_matview_ins_sql - 1] = CStringGetTextDatum(ins_sql);
 	values[Anum_pg_dbblue_matview_del_sql - 1] = CStringGetTextDatum(del_sql);
 	values[Anum_pg_dbblue_matview_cln_sql - 1] = CStringGetTextDatum(cln_sql);
+	if (having_sql)
+		values[Anum_pg_dbblue_matview_having_sql - 1] = CStringGetTextDatum(having_sql);
+	else
+	{
+		values[Anum_pg_dbblue_matview_having_sql - 1] = (Datum) 0;
+		nulls[Anum_pg_dbblue_matview_having_sql - 1] = true;
+	}
 
 	catalog = table_open(DbblueMatviewRelationId, RowExclusiveLock);
 	tup = heap_form_tuple(RelationGetDescr(catalog), values, nulls);
@@ -1797,7 +2541,8 @@ incr_fetch_sql(Oid mvrelid, Oid srctable, int plan_type)
 
 	attnum = (plan_type == INCR_PLAN_INS) ? Anum_pg_dbblue_matview_ins_sql :
 			 (plan_type == INCR_PLAN_DEL) ? Anum_pg_dbblue_matview_del_sql :
-											Anum_pg_dbblue_matview_cln_sql;
+			 (plan_type == INCR_PLAN_CLN) ? Anum_pg_dbblue_matview_cln_sql :
+											Anum_pg_dbblue_matview_having_sql;
 
 	catalog = table_open(DbblueMatviewRelationId, AccessShareLock);
 	ScanKeyInit(&keys[0], Anum_pg_dbblue_matview_mvrelid,
@@ -1939,6 +2684,32 @@ matview_delta_apply(PG_FUNCTION_ARGS)
 			ret = SPI_execute_plan(cplan, NULL, NULL, false, 0);
 			if (ret < 0)
 				elog(ERROR, "matview_delta_apply: cleanup failed: %s",
+					 SPI_result_code_string(ret));
+		}
+	}
+
+	/* ----- HAVING step: recompute __mv_having_ok__ for all active groups ----- */
+	{
+		char	   *sql = incr_fetch_sql(mvrelid, srctable, INCR_PLAN_HAV);
+
+		if (sql)					/* NULL = no HAVING clause on this matview */
+		{
+			SPIPlanPtr	hplan = incr_get_plan(mvrelid, srctable, INCR_PLAN_HAV);
+
+			if (hplan == NULL)
+			{
+				hplan = SPI_prepare(sql, 0, NULL);
+				if (!hplan)
+					elog(ERROR,
+						 "matview_delta_apply: SPI_prepare (having) failed: %s",
+						 SPI_result_code_string(SPI_result));
+				SPI_keepplan(hplan);
+				incr_cache_plan(mvrelid, srctable, INCR_PLAN_HAV, hplan);
+			}
+
+			ret = SPI_execute_plan(hplan, NULL, NULL, false, 0);
+			if (ret < 0)
+				elog(ERROR, "matview_delta_apply: having step failed: %s",
 					 SPI_result_code_string(ret));
 		}
 	}
