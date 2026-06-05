@@ -121,8 +121,7 @@ typedef struct AvgColInfo
 	char   *sum_col;		/* __mv_avgsum_<avg_col> hidden column */
 	char   *cnt_col;		/* __mv_avgcnt_<avg_col> hidden column */
 	Oid		avg_rettype;	/* return type of the AVG (numeric, float8, …) */
-	Node   *arg_expr;		/* AVG argument expression (Var) — for Phase 2 deparse */
-	char   *arg_col;		/* simple column name for Phase 1 (may be NULL) */
+	Node   *arg_expr;		/* AVG argument expression — deparsed by incr_deparse_where_qual */
 } AvgColInfo;
 
 /*
@@ -326,7 +325,23 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 
 			if (strcmp(fname, "sum") == 0 || strcmp(fname, "count") == 0 ||
 				strcmp(fname, "avg") == 0)
+			{
+				/* Validate aggregate argument expressions (Phase 6) */
+				if (agg->args != NIL)
+				{
+					TargetEntry *arg_te = linitial_node(TargetEntry, agg->args);
+
+					if (!incr_validate_where_qual((Node *) arg_te->expr))
+					{
+						*reason = psprintf("argument of aggregate \"%s\" uses "
+										   "unsupported expressions; only column "
+										   "references, constants, and arithmetic "
+										   "operators are allowed", fname);
+						return false;
+					}
+				}
 				continue;
+			}
 
 			*reason = psprintf("aggregate \"%s\" not supported "
 							   "(supported: SUM, COUNT, AVG)", fname);
@@ -778,24 +793,12 @@ incr_collect_avg_info(Query *viewQuery, List **avgInfoList)
 		info->cnt_col = psprintf("%s%s", MATVIEW_INCR_AVGCNT_PREFIX, te->resname);
 		info->avg_rettype = agg->aggtype;
 		info->arg_expr = NULL;
-		info->arg_col = NULL;
 
 		if (agg->args != NIL)
 		{
 			TargetEntry *arg_te = linitial_node(TargetEntry, agg->args);
-			Node	   *argnode = (Node *) arg_te->expr;
 
-			info->arg_expr = argnode;
-
-			/* For Phase 1: resolve the arg Var to a plain column name */
-			if (IsA(argnode, Var))
-			{
-				Var		   *v = (Var *) argnode;
-				RangeTblEntry *rte = rt_fetch(v->varno, viewQuery->rtable);
-
-				if (rte->rtekind == RTE_RELATION)
-					info->arg_col = get_attname(rte->relid, v->varattno, false);
-			}
+			info->arg_expr = (Node *) arg_te->expr;
 		}
 
 		*avgInfoList = lappend(*avgInfoList, info);
@@ -1468,8 +1471,8 @@ incr_collect_group_cols(Query *viewQuery, List **groupColNames)
 }
 
 /*
- * Collect aggregate column info: output name, function name, arg column name.
- * For COUNT(*), argColName is NULL.
+ * Collect aggregate column info: output name, function name, arg expression.
+ * For COUNT(*), the arg node is NULL.
  */
 static void
 incr_collect_agg_info(Query *viewQuery,
@@ -1487,8 +1490,8 @@ incr_collect_agg_info(Query *viewQuery,
 	{
 		TargetEntry *te = lfirst_node(TargetEntry, lc);
 		Aggref	   *agg;
-		char	   *fname,
-				   *argcol = NULL;
+		char	   *fname;
+		Node	   *arg_node = NULL;
 
 		if (te->resjunk || !IsA(te->expr, Aggref))
 			continue;
@@ -1508,21 +1511,12 @@ incr_collect_agg_info(Query *viewQuery,
 		{
 			TargetEntry *arg_te = linitial_node(TargetEntry, agg->args);
 
-			if (IsA(arg_te->expr, Var))
-			{
-				Var		   *v = (Var *) arg_te->expr;
-				RangeTblEntry *rte = rt_fetch(v->varno, viewQuery->rtable);
-
-				argcol = get_attname(rte->relid, v->varattno, false);
-			}
+			arg_node = (Node *) arg_te->expr;
 		}
 
 		*aggColNames = lappend(*aggColNames, makeString(pstrdup(te->resname)));
 		*aggFuncNames = lappend(*aggFuncNames, makeString(pstrdup(fname)));
-				/* NULL pointer signals COUNT(*) — no argument column */
-		*aggArgColNames = lappend(*aggArgColNames,
-								  argcol ? (Node *) makeString(pstrdup(argcol))
-										 : NULL);
+		*aggArgColNames = lappend(*aggArgColNames, arg_node); /* NULL = COUNT(*) */
 	}
 }
 
@@ -1608,16 +1602,26 @@ incr_build_ins_sql(Oid mvrelid, Query *viewQuery)
 		if (strcmp(fname, "count") == 0 && argnode == NULL)
 			appendStringInfoString(&buf, ",COUNT(*)");
 		else
-			appendStringInfo(&buf, ",%s(%s)",
-							 fname,
-							 quote_identifier(strVal((String *) argnode)));
+		{
+			StringInfoData abuf;
+
+			initStringInfo(&abuf);
+			incr_deparse_where_qual(argnode, viewQuery->rtable, -1, &abuf);
+			appendStringInfo(&buf, ",%s(%s)", fname, abuf.data);
+		}
 	}
 	foreach(lc, avgInfoList)
 	{
 		AvgColInfo *ai = lfirst(lc);
-		const char *argq = ai->arg_col ? quote_identifier(ai->arg_col) : "NULL";
+		StringInfoData abuf;
 
-		appendStringInfo(&buf, ",AVG(%s),SUM(%s),COUNT(%s)", argq, argq, argq);
+		initStringInfo(&abuf);
+		if (ai->arg_expr)
+			incr_deparse_where_qual(ai->arg_expr, viewQuery->rtable, -1, &abuf);
+		else
+			appendStringInfoString(&abuf, "NULL");
+		appendStringInfo(&buf, ",AVG(%s),SUM(%s),COUNT(%s)",
+						 abuf.data, abuf.data, abuf.data);
 	}
 	if (viewQuery->havingQual != NULL)
 		appendStringInfoString(&buf, ",true");
@@ -1776,16 +1780,26 @@ incr_build_backfill_sql(Oid mvrelid, Query *viewQuery, Oid srctable)
 		if (strcmp(fname, "count") == 0 && argnode == NULL)
 			appendStringInfoString(&buf, ",COUNT(*)");
 		else
-			appendStringInfo(&buf, ",%s(%s)",
-							 fname,
-							 quote_identifier(strVal((String *) argnode)));
+		{
+			StringInfoData abuf;
+
+			initStringInfo(&abuf);
+			incr_deparse_where_qual(argnode, viewQuery->rtable, -1, &abuf);
+			appendStringInfo(&buf, ",%s(%s)", fname, abuf.data);
+		}
 	}
 	foreach(lc, avgInfoList)
 	{
 		AvgColInfo *ai = lfirst(lc);
-		const char *argq = ai->arg_col ? quote_identifier(ai->arg_col) : "NULL";
+		StringInfoData abuf;
 
-		appendStringInfo(&buf, ",AVG(%s),SUM(%s),COUNT(%s)", argq, argq, argq);
+		initStringInfo(&abuf);
+		if (ai->arg_expr)
+			incr_deparse_where_qual(ai->arg_expr, viewQuery->rtable, -1, &abuf);
+		else
+			appendStringInfoString(&abuf, "NULL");
+		appendStringInfo(&buf, ",AVG(%s),SUM(%s),COUNT(%s)",
+						 abuf.data, abuf.data, abuf.data);
 	}
 	/* __mv_having_ok__ = false for all backfill rows; DO NOTHING leaves passing rows alone */
 	appendStringInfo(&buf, ",false,COUNT(*) FROM %s", srctable_name);
@@ -1879,20 +1893,28 @@ incr_build_del_sql(Oid mvrelid, Query *viewQuery)
 		if (strcmp(fname, "count") == 0 && argnode == NULL)
 			appendStringInfo(&buf, ",COUNT(*) AS %s", colq);
 		else
-			appendStringInfo(&buf, ",%s(%s) AS %s",
-							 fname,
-							 quote_identifier(strVal((String *) argnode)),
-							 colq);
+		{
+			StringInfoData abuf;
+
+			initStringInfo(&abuf);
+			incr_deparse_where_qual(argnode, viewQuery->rtable, -1, &abuf);
+			appendStringInfo(&buf, ",%s(%s) AS %s", fname, abuf.data, colq);
+		}
 	}
 	/* Hidden AVG support cols in CTE */
 	foreach(lc, avgInfoList)
 	{
 		AvgColInfo *ai = lfirst(lc);
-		const char *argq = ai->arg_col ? quote_identifier(ai->arg_col) : "NULL";
+		StringInfoData abuf;
 
+		initStringInfo(&abuf);
+		if (ai->arg_expr)
+			incr_deparse_where_qual(ai->arg_expr, viewQuery->rtable, -1, &abuf);
+		else
+			appendStringInfoString(&abuf, "NULL");
 		appendStringInfo(&buf, ",SUM(%s) AS %s,COUNT(%s) AS %s",
-						 argq, quote_identifier(ai->sum_col),
-						 argq, quote_identifier(ai->cnt_col));
+						 abuf.data, quote_identifier(ai->sum_col),
+						 abuf.data, quote_identifier(ai->cnt_col));
 	}
 	appendStringInfo(&buf, ",COUNT(*) AS %s FROM %s", cntcol, MATVIEW_INCR_OLDTABLE);
 	{
@@ -2232,8 +2254,8 @@ incr_build_ins_sql_join(Oid mvrelid, Query *viewQuery,
 				StringInfoData ebuf;
 
 				initStringInfo(&ebuf);
-				incr_deparse_expr((Node *) arg_te->expr, viewQuery->rtable,
-								  delta_varno, &ebuf);
+				incr_deparse_where_qual((Node *) arg_te->expr, viewQuery->rtable,
+										delta_varno, &ebuf);
 				appendStringInfo(&buf, "%s(%s)", fname, ebuf.data);
 			}
 			else
@@ -2440,8 +2462,8 @@ incr_build_backfill_sql_join(Oid mvrelid, Query *viewQuery,
 				StringInfoData ebuf;
 
 				initStringInfo(&ebuf);
-				incr_deparse_expr((Node *) arg_te->expr, viewQuery->rtable,
-								  delta_varno, &ebuf);
+				incr_deparse_where_qual((Node *) arg_te->expr, viewQuery->rtable,
+										delta_varno, &ebuf);
 				appendStringInfo(&buf, "%s(%s)", fname, ebuf.data);
 			}
 			else
@@ -2587,8 +2609,8 @@ incr_build_del_sql_join(Oid mvrelid, Query *viewQuery,
 				StringInfoData ebuf;
 
 				initStringInfo(&ebuf);
-				incr_deparse_expr((Node *) arg_te->expr, viewQuery->rtable,
-								  delta_varno, &ebuf);
+				incr_deparse_where_qual((Node *) arg_te->expr, viewQuery->rtable,
+										delta_varno, &ebuf);
 				appendStringInfo(&buf, "%s(%s) AS %s", fname, ebuf.data, colq);
 			}
 			else
