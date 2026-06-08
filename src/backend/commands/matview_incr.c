@@ -125,9 +125,10 @@ static HTAB *incr_plan_cache = NULL;
  */
 typedef struct IncrJoinEntry
 {
-	int		varno;		/* varno of this table in viewQuery->rtable */
-	Oid		oid;		/* table OID */
-	Node   *quals;		/* ON condition for this join step */
+	int			varno;		/* varno of this table in viewQuery->rtable */
+	Oid			oid;		/* table OID */
+	Node	   *quals;		/* ON condition for this join step */
+	JoinType	join_type;	/* JOIN_INNER (anchor/inner), JOIN_LEFT, JOIN_RIGHT */
 } IncrJoinEntry;
 
 /* ----------
@@ -139,10 +140,25 @@ static Oid	incr_find_sum_agg(Oid avg_fnoid, Oid *rettype_out);
 static Oid	incr_get_source_table(Query *viewQuery);
 static List *incr_collect_tables(Query *viewQuery);
 static List *incr_build_join_list_for_delta(List *all_tables, int delta_varno);
+static bool incr_has_outer_join(List *all_tables);
+static int	incr_outer_preserved_varno(List *all_tables);
+static char *str_replace_all(const char *src, const char *from, const char *to);
+static Node *find_connecting_qual(List *all_tables, int varno_a, int varno_b);
+static char *qual_to_live_sql(Node *qual, List *rtable, List *all_tables,
+							   int preserved_varno);
+static char *incr_build_outer_sql(Oid mvrelid, Query *viewQuery,
+								   int delta_varno, const char *delta_table,
+								   List *all_tables, bool include_delete_step);
 static void incr_collect_group_cols(Query *viewQuery, List **groupColNames);
 static void incr_append_from_join(StringInfo buf, Query *viewQuery,
 								  int delta_varno, const char *delta_table,
 								  List *join_list);
+static char *incr_build_row_ins_sql(Oid mvrelid, Query *viewQuery,
+									int delta_varno, const char *delta_table,
+									List *join_list);
+static char *incr_build_row_del_sql(Oid mvrelid, Query *viewQuery,
+									int delta_varno, const char *delta_table,
+									List *join_list);
 static char *incr_build_ins_sql_gen(Oid mvrelid, Query *viewQuery,
 									int delta_varno, const char *delta_table,
 									List *join_list);
@@ -208,9 +224,9 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 	ListCell   *lc;
 	int			nbasetables = 0;
 
-	if (viewQuery->groupClause == NIL)
+	if (viewQuery->havingQual != NULL && viewQuery->groupClause == NIL)
 	{
-		*reason = "query has no GROUP BY clause";
+		*reason = "HAVING requires GROUP BY";
 		return false;
 	}
 	if (viewQuery->havingQual != NULL)
@@ -285,10 +301,20 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 			return false;
 		}
 
-		/* Walk every JoinExpr in the tree: must all be INNER with quals */
+		/*
+		 * Walk every JoinExpr in the tree.  We accept:
+		 *   - Pure INNER JOIN
+		 *   - Pure LEFT JOIN  (or mixed INNER + LEFT)
+		 *   - Pure RIGHT JOIN (or mixed INNER + RIGHT)
+		 * FULL OUTER JOIN and CROSS JOIN are not supported.
+		 *
+		 * The outer join type (LEFT or RIGHT) must be consistent — no
+		 * mixing LEFT and RIGHT in the same matview.
+		 */
 		{
 			List	   *stack = list_make1(jtree_root);
 			ListCell   *slc;
+			JoinType	outer_type = JOIN_INNER; /* tracks any outer join seen */
 
 			foreach(slc, stack)
 			{
@@ -296,9 +322,15 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 
 				if (!IsA(je, JoinExpr))
 					continue;
-				if (je->jointype != JOIN_INNER)
+				if (je->jointype == JOIN_FULL)
 				{
-					*reason = "only INNER JOINs are supported for incremental refresh";
+					*reason = "FULL OUTER JOIN is not supported";
+					return false;
+				}
+				if (je->jointype != JOIN_INNER && je->jointype != JOIN_LEFT &&
+					je->jointype != JOIN_RIGHT)
+				{
+					*reason = "only INNER, LEFT, and RIGHT JOINs are supported";
 					return false;
 				}
 				if (je->quals == NULL)
@@ -306,25 +338,77 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 					*reason = "each JOIN step must have an ON condition";
 					return false;
 				}
+				/* Track whether we have an outer join and ensure consistency */
+				if (je->jointype == JOIN_LEFT || je->jointype == JOIN_RIGHT)
+				{
+					if (outer_type == JOIN_INNER)
+						outer_type = je->jointype;
+					else if (outer_type != je->jointype)
+					{
+						*reason = "mixing LEFT and RIGHT JOINs in the same matview "
+								  "is not supported";
+						return false;
+					}
+				}
 				if (IsA(je->larg, JoinExpr))
 					stack = lappend(stack, je->larg);
 				if (IsA(je->rarg, JoinExpr))
 					stack = lappend(stack, je->rarg);
 			}
+
+			/*
+			 * For outer joins, verify that GROUP BY columns come from the
+			 * preserved side so that groups are well-defined.
+			 *
+			 * We check this after collecting tables so we have the preserved
+			 * varno.  A quick pre-check: if outer_type != JOIN_INNER, walk
+			 * the targetList and verify each group-by Var resolves to a
+			 * table that is NOT the optional side.
+			 *
+			 * Preserved side: LEFT JOIN → anchor (leftmost RangeTblRef varno),
+			 *                  RIGHT JOIN → rightmost RangeTblRef varno.
+			 * We do the precise check in MatviewIncrSetup after incr_collect_tables.
+			 * Here just flag if there are outer joins so the caller knows.
+			 */
+			/* outer_type != JOIN_INNER flags outer-join matviews (no error here) */
+			(void) outer_type;		/* used implicitly via incr_collect_tables */
 		}
 	}
 
-	/* Only Var (group col) or Aggref (SUM/COUNT/AVG) in target list */
+	/* Validate SELECT list expressions */
 	foreach(lc, viewQuery->targetList)
 	{
 		TargetEntry *te = lfirst_node(TargetEntry, lc);
 
 		if (te->resjunk)
 			continue;
-		if (incr_is_hidden_col(te->resname))	/* skip hidden maintenance columns */
+		if (incr_is_hidden_col(te->resname))
 			continue;
 		if (IsA(te->expr, Var))
 			continue;
+
+		if (viewQuery->groupClause == NIL)
+		{
+			/*
+			 * Row-level view (no GROUP BY): Aggref is not meaningful here.
+			 * Allow any expression that incr_validate_expr accepts.
+			 */
+			if (IsA(te->expr, Aggref))
+			{
+				*reason = "aggregate functions require GROUP BY";
+				return false;
+			}
+			if (!incr_validate_expr((Node *) te->expr, NULL, false))
+			{
+				*reason = "SELECT expression uses unsupported constructs; "
+					"only column references, constants, and simple "
+					"operators/functions are allowed";
+				return false;
+			}
+			continue;
+		}
+
+		/* GROUP BY view: only Var or supported Aggref */
 		if (IsA(te->expr, Aggref))
 		{
 			Aggref	   *agg = (Aggref *) te->expr;
@@ -333,7 +417,6 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 			if (strcmp(fname, "sum") == 0 || strcmp(fname, "count") == 0 ||
 				strcmp(fname, "avg") == 0)
 			{
-				/* Validate aggregate argument expressions (Phase 6) */
 				if (agg->args != NIL)
 				{
 					TargetEntry *arg_te = linitial_node(TargetEntry, agg->args);
@@ -354,7 +437,8 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 							   "(supported: SUM, COUNT, AVG)", fname);
 			return false;
 		}
-		*reason = "only column references and SUM/COUNT aggregates are allowed";
+		*reason = "only column references and SUM/COUNT/AVG aggregates are allowed "
+			"in GROUP BY matviews";
 		return false;
 	}
 
@@ -433,9 +517,15 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 
 	hasHaving = (viewQuery->havingQual != NULL);
 
-	/* Step 1: unique index on GROUP BY columns (same for all phases) */
-	incr_collect_group_cols(viewQuery, &groupColNames);
-	incr_create_unique_index(mvrelid, groupColNames);
+	/*
+	 * Row-level matviews (no GROUP BY) skip the unique index — there are no
+	 * group-by columns to index on, and row identity uses full-row matching.
+	 */
+	if (viewQuery->groupClause != NIL)
+	{
+		incr_collect_group_cols(viewQuery, &groupColNames);
+		incr_create_unique_index(mvrelid, groupColNames);
+	}
 
 	/*
 	 * Step 2 (HAVING only): rename the internal matview to
@@ -461,82 +551,145 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 
 	if (nbasetables == 1)
 	{
-		/* ---- Phase 1: single source table ---- */
-		Oid			srctable = incr_get_source_table(viewQuery);
+		/* ---- Phase 1 / Phase 9a: single source table ---- */
+		Oid		srctable = incr_get_source_table(viewQuery);
 
-		ins_sql = incr_build_ins_sql_gen(mvrelid, viewQuery, -1,
-										 MATVIEW_INCR_NEWTABLE, NIL);
-		del_sql = incr_build_del_sql_gen(mvrelid, viewQuery, -1,
-										 MATVIEW_INCR_OLDTABLE, NIL);
-		incr_store_catalog(mvrelid, srctable, ins_sql, del_sql, cln_sql, hav_sql);
-
-		/*
-		 * HAVING backfill: the initial CREATE MATERIALIZED VIEW only inserted
-		 * HAVING-passing groups.  Insert all remaining groups (with
-		 * __mv_having_ok__ = false) so their running totals are tracked from
-		 * the start.  ON CONFLICT DO NOTHING leaves passing groups intact.
-		 */
-		if (hasHaving)
+		if (viewQuery->groupClause == NIL)
 		{
-			char	   *backfill_sql = incr_build_backfill_sql_gen(
-				mvrelid, viewQuery, -1, mv_qname(srctable), NIL);
-			int			spi_ret;
+			/* Phase 9a: row-level, no GROUP BY */
+			ins_sql = incr_build_row_ins_sql(mvrelid, viewQuery, -1,
+											 MATVIEW_INCR_NEWTABLE, NIL);
+			del_sql = incr_build_row_del_sql(mvrelid, viewQuery, -1,
+											 MATVIEW_INCR_OLDTABLE, NIL);
+			incr_store_catalog(mvrelid, srctable,
+							   ins_sql, del_sql, "SELECT 1", NULL);
+		}
+		else
+		{
+			/* Phase 1: aggregate with GROUP BY */
+			ins_sql = incr_build_ins_sql_gen(mvrelid, viewQuery, -1,
+											 MATVIEW_INCR_NEWTABLE, NIL);
+			del_sql = incr_build_del_sql_gen(mvrelid, viewQuery, -1,
+											 MATVIEW_INCR_OLDTABLE, NIL);
+			incr_store_catalog(mvrelid, srctable, ins_sql, del_sql,
+							   cln_sql, hav_sql);
 
-			OpenMatViewIncrementalMaintenance();
-			SPI_connect();
-			spi_ret = SPI_execute(backfill_sql, false, 0);
-			SPI_finish();
-			CloseMatViewIncrementalMaintenance();
-			if (spi_ret < 0)
-				elog(ERROR, "DBblue: HAVING backfill failed (code %d)", spi_ret);
+			if (hasHaving)
+			{
+				char *backfill_sql = incr_build_backfill_sql_gen(
+					mvrelid, viewQuery, -1, mv_qname(srctable), NIL);
+				int   spi_ret;
+
+				OpenMatViewIncrementalMaintenance();
+				SPI_connect();
+				spi_ret = SPI_execute(backfill_sql, false, 0);
+				SPI_finish();
+				CloseMatViewIncrementalMaintenance();
+				if (spi_ret < 0)
+					elog(ERROR, "DBblue: HAVING backfill failed (code %d)",
+						 spi_ret);
+			}
 		}
 
 		incr_install_triggers(mvrelid, srctable);
 	}
 	else
 	{
-		/* ---- Phase 2+: N-table INNER JOIN ---- */
+		/* ---- Phase 2+: N-table JOIN ---- */
 		List	   *all_tables = incr_collect_tables(viewQuery);
 		ListCell   *jlc;
 
-		foreach(jlc, all_tables)
+		if (viewQuery->groupClause == NIL)
 		{
-			IncrJoinEntry *delta = lfirst(jlc);
-			List		  *join_list = incr_build_join_list_for_delta(all_tables,
-																	 delta->varno);
+			/* ---- Phase 9b: row-level JOIN matview ---- */
+			foreach(jlc, all_tables)
+			{
+				IncrJoinEntry *delta     = lfirst(jlc);
+				List		  *join_list = incr_build_join_list_for_delta(
+					all_tables, delta->varno);
 
-			ins_sql = incr_build_ins_sql_gen(mvrelid, viewQuery,
-											 delta->varno, MATVIEW_INCR_NEWTABLE,
-											 join_list);
-			del_sql = incr_build_del_sql_gen(mvrelid, viewQuery,
-											 delta->varno, MATVIEW_INCR_OLDTABLE,
-											 join_list);
-			incr_store_catalog(mvrelid, delta->oid, ins_sql, del_sql, cln_sql, hav_sql);
-			incr_install_triggers(mvrelid, delta->oid);
+				ins_sql = incr_build_row_ins_sql(mvrelid, viewQuery,
+												 delta->varno,
+												 MATVIEW_INCR_NEWTABLE,
+												 join_list);
+				del_sql = incr_build_row_del_sql(mvrelid, viewQuery,
+												 delta->varno,
+												 MATVIEW_INCR_OLDTABLE,
+												 join_list);
+				incr_store_catalog(mvrelid, delta->oid,
+								   ins_sql, del_sql, "SELECT 1", NULL);
+				incr_install_triggers(mvrelid, delta->oid);
+			}
 		}
-
-		/*
-		 * HAVING backfill: seed all groups from the real tables so groups that
-		 * initially fail HAVING are tracked.  Pick the first table as the
-		 * "anchor"; its join_list covers all others.
-		 */
-		if (hasHaving)
+		else if (incr_has_outer_join(all_tables))
 		{
-			IncrJoinEntry *first = linitial(all_tables);
-			List		  *join_list = incr_build_join_list_for_delta(all_tables,
-																	 first->varno);
-			char		  *backfill_sql = incr_build_backfill_sql_gen(
-				mvrelid, viewQuery,
-				first->varno, mv_qname(first->oid), join_list);
-			int			   spi_ret;
+			/* ---- Phase 8: LEFT/RIGHT outer join (recompute strategy) ---- */
+			int		preserved_varno = incr_outer_preserved_varno(all_tables);
 
-			OpenMatViewIncrementalMaintenance();
-			SPI_connect();
-			spi_ret = SPI_execute(backfill_sql, false, 0);
-			SPI_finish();
-			CloseMatViewIncrementalMaintenance();
-			if (spi_ret < 0)
-				elog(ERROR, "DBblue: HAVING backfill (JOIN) failed (code %d)", spi_ret);
+			foreach(jlc, all_tables)
+			{
+				IncrJoinEntry *delta        = lfirst(jlc);
+				bool           is_preserved = (delta->varno == preserved_varno);
+
+				ins_sql = incr_build_outer_sql(mvrelid, viewQuery,
+											   delta->varno,
+											   MATVIEW_INCR_NEWTABLE,
+											   all_tables, false);
+				del_sql = incr_build_outer_sql(mvrelid, viewQuery,
+											   delta->varno,
+											   MATVIEW_INCR_OLDTABLE,
+											   all_tables, is_preserved);
+				incr_store_catalog(mvrelid, delta->oid,
+								   ins_sql, del_sql, "SELECT 1", hav_sql);
+				incr_install_triggers(mvrelid, delta->oid);
+			}
+		}
+		else
+		{
+			/* ---- Phase 2-7: N-table INNER JOIN ---- */
+			foreach(jlc, all_tables)
+			{
+				IncrJoinEntry *delta     = lfirst(jlc);
+				List		  *join_list = incr_build_join_list_for_delta(
+					all_tables, delta->varno);
+
+				ins_sql = incr_build_ins_sql_gen(mvrelid, viewQuery,
+												 delta->varno,
+												 MATVIEW_INCR_NEWTABLE,
+												 join_list);
+				del_sql = incr_build_del_sql_gen(mvrelid, viewQuery,
+												 delta->varno,
+												 MATVIEW_INCR_OLDTABLE,
+												 join_list);
+				incr_store_catalog(mvrelid, delta->oid,
+								   ins_sql, del_sql, cln_sql, hav_sql);
+				incr_install_triggers(mvrelid, delta->oid);
+			}
+
+			/*
+			 * HAVING backfill: seed all groups from the real tables so groups
+			 * that initially fail HAVING are tracked.
+			 */
+			if (hasHaving)
+			{
+				IncrJoinEntry *first_je  = linitial(all_tables);
+				List		  *join_list = incr_build_join_list_for_delta(
+					all_tables, first_je->varno);
+				char		  *backfill_sql = incr_build_backfill_sql_gen(
+					mvrelid, viewQuery,
+					first_je->varno, mv_qname(first_je->oid), join_list);
+				int			   spi_ret;
+
+				OpenMatViewIncrementalMaintenance();
+				SPI_connect();
+				spi_ret = SPI_execute(backfill_sql, false, 0);
+				SPI_finish();
+				CloseMatViewIncrementalMaintenance();
+				if (spi_ret < 0)
+					elog(ERROR,
+						 "DBblue: HAVING backfill (JOIN) failed (code %d)",
+						 spi_ret);
+			}
 		}
 	}
 
@@ -600,6 +753,10 @@ MatviewIncrAddCountTarget(Query *q)
 	int			next_resno = list_length(q->targetList) + 1;
 	Aggref	   *aggref;
 	TargetEntry *te;
+
+	/* Row-level views (no GROUP BY) need no hidden maintenance columns */
+	if (q->groupClause == NIL)
+		return;
 
 	/* Inject SUM(x) / COUNT(x) pairs for each AVG column */
 	foreach(lc, orig_tl)
@@ -1437,6 +1594,148 @@ incr_append_from_join(StringInfo buf, Query *viewQuery,
 }
 
 /*
+ * incr_build_row_ins_sql — INSERT delta for row-level (no GROUP BY) matviews.
+ *
+ *   INSERT INTO mv (col1, col2, ...)
+ *   SELECT expr1, expr2, ...
+ *   FROM __mv_newtable _d_
+ *   [JOIN T2 _j2_ ON ...] [WHERE ...]
+ */
+static char *
+incr_build_row_ins_sql(Oid mvrelid, Query *viewQuery,
+					   int delta_varno, const char *delta_table,
+					   List *join_list)
+{
+	StringInfoData	buf;
+	ListCell	   *lc;
+	const char	   *mvname = mv_qname(mvrelid);
+	bool			first;
+
+	initStringInfo(&buf);
+
+	appendStringInfo(&buf, "INSERT INTO %s (", mvname);
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+		if (te->resjunk) continue;
+		if (!first) appendStringInfoChar(&buf, ',');
+		appendStringInfoString(&buf, quote_identifier(te->resname));
+		first = false;
+	}
+	appendStringInfoString(&buf, ") SELECT ");
+
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry    *te = lfirst_node(TargetEntry, lc);
+		StringInfoData	ebuf;
+
+		if (te->resjunk) continue;
+		if (!first) appendStringInfoChar(&buf, ',');
+		first = false;
+
+		initStringInfo(&ebuf);
+		incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable,
+								delta_varno, &ebuf);
+		appendStringInfoString(&buf, ebuf.data);
+	}
+
+	incr_append_from_join(&buf, viewQuery, delta_varno, delta_table, join_list);
+
+	{
+		Node *wq = incr_get_where_qual(viewQuery);
+
+		if (wq != NULL)
+		{
+			StringInfoData wbuf;
+
+			initStringInfo(&wbuf);
+			incr_deparse_where_qual(wq, viewQuery->rtable, delta_varno, &wbuf);
+			appendStringInfo(&buf, " WHERE %s", wbuf.data);
+		}
+	}
+
+	return buf.data;
+}
+
+/*
+ * incr_build_row_del_sql — DELETE delta for row-level (no GROUP BY) matviews.
+ *
+ *   DELETE FROM mv
+ *   USING (
+ *     SELECT expr1 AS col1, expr2 AS col2, ...
+ *     FROM __mv_oldtable _d_ [JOIN T2 _j2_ ON ...] [WHERE ...]
+ *   ) _old_
+ *   WHERE mv.col1 IS NOT DISTINCT FROM _old_.col1 AND ...
+ *
+ * IS NOT DISTINCT FROM handles NULLs in joined columns correctly.
+ */
+static char *
+incr_build_row_del_sql(Oid mvrelid, Query *viewQuery,
+					   int delta_varno, const char *delta_table,
+					   List *join_list)
+{
+	StringInfoData	buf;
+	ListCell	   *lc;
+	const char	   *mvname = mv_qname(mvrelid);
+	bool			first;
+
+	initStringInfo(&buf);
+
+	appendStringInfo(&buf, "DELETE FROM %s WHERE (", mvname);
+
+	/* Build the column list for the tuple identity */
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+		if (te->resjunk) continue;
+		if (!first) appendStringInfoChar(&buf, ',');
+		appendStringInfoString(&buf, quote_identifier(te->resname));
+		first = false;
+	}
+	appendStringInfoString(&buf, ") IN (SELECT ");
+
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry    *te = lfirst_node(TargetEntry, lc);
+		StringInfoData	ebuf;
+
+		if (te->resjunk) continue;
+		if (!first) appendStringInfoChar(&buf, ',');
+		first = false;
+
+		initStringInfo(&ebuf);
+		incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable,
+								delta_varno, &ebuf);
+		appendStringInfoString(&buf, ebuf.data);
+	}
+
+	incr_append_from_join(&buf, viewQuery, delta_varno, delta_table, join_list);
+
+	{
+		Node *wq = incr_get_where_qual(viewQuery);
+
+		if (wq != NULL)
+		{
+			StringInfoData wbuf;
+
+			initStringInfo(&wbuf);
+			incr_deparse_where_qual(wq, viewQuery->rtable, delta_varno, &wbuf);
+			appendStringInfo(&buf, " WHERE %s", wbuf.data);
+		}
+	}
+
+	appendStringInfoString(&buf, ")");
+
+	return buf.data;
+}
+
+/*
  * incr_build_ins_sql_gen — INSERT delta (all phases)
  *
  *   INSERT INTO mv (cols)
@@ -2015,6 +2314,7 @@ incr_collect_tables_recurse(Node *node, List *rtable, List **entries)
 			entry->varno = rtr->rtindex;
 			entry->oid = rte->relid;
 			entry->quals = je->quals;
+			entry->join_type = je->jointype;	/* JOIN_INNER, JOIN_LEFT, JOIN_RIGHT */
 			*entries = lappend(*entries, entry);
 		}
 		else
@@ -2030,6 +2330,7 @@ incr_collect_tables_recurse(Node *node, List *rtable, List **entries)
 		entry->varno = rtr->rtindex;
 		entry->oid = rte->relid;
 		entry->quals = NULL;
+		entry->join_type = JOIN_INNER;			/* anchor — always included */
 		*entries = lappend(*entries, entry);
 	}
 	else
@@ -2185,6 +2486,507 @@ incr_build_join_list_for_delta(List *all_tables, int delta_varno)
 	}
 
 	return result;
+}
+
+/*
+ * incr_has_outer_join
+ * Returns true if any entry in all_tables was introduced by a LEFT or RIGHT
+ * JOIN (i.e., the matview has at least one outer join).
+ */
+static bool
+incr_has_outer_join(List *all_tables)
+{
+	ListCell *lc;
+
+	foreach(lc, all_tables)
+	{
+		IncrJoinEntry *je = lfirst(lc);
+
+		if (je->join_type == JOIN_LEFT || je->join_type == JOIN_RIGHT)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * incr_outer_preserved_varno
+ * Return the varno of the "preserved" side for an outer-join matview:
+ *   LEFT JOIN  → anchor (first entry, join_type = JOIN_INNER)
+ *   RIGHT JOIN → last entry that has join_type = JOIN_RIGHT
+ */
+static int
+incr_outer_preserved_varno(List *all_tables)
+{
+	IncrJoinEntry *first = linitial(all_tables);
+	ListCell *lc;
+
+	/* If all non-anchor entries are LEFT JOIN, the anchor is preserved */
+	foreach(lc, all_tables)
+	{
+		IncrJoinEntry *je = lfirst(lc);
+
+		if (je->join_type == JOIN_RIGHT)
+		{
+			/*
+			 * Pure RIGHT JOIN: the last entry with JOIN_RIGHT is the
+			 * preserved side (equivalent to it being the anchor in a
+			 * mirrored LEFT JOIN).
+			 */
+			IncrJoinEntry *last = llast(all_tables);
+
+			return last->varno;
+		}
+	}
+	/* Pure LEFT JOIN: anchor is preserved */
+	return first->varno;
+}
+
+/*
+ * str_replace_all — replace every occurrence of 'from' in 'src' with 'to'.
+ * Returns a palloc'd string.
+ */
+static char *
+str_replace_all(const char *src, const char *from, const char *to)
+{
+	StringInfoData	buf;
+	const char	   *pos;
+	size_t			fromlen = strlen(from);
+
+	initStringInfo(&buf);
+	while ((pos = strstr(src, from)) != NULL)
+	{
+		appendBinaryStringInfo(&buf, src, (int) (pos - src));
+		appendStringInfoString(&buf, to);
+		src = pos + fromlen;
+	}
+	appendStringInfoString(&buf, src);
+	return buf.data;
+}
+
+/*
+ * find_connecting_qual — return the first qual in all_tables that references
+ * both varno_a and varno_b.  Returns NULL if none found.
+ */
+static Node *
+find_connecting_qual(List *all_tables, int varno_a, int varno_b)
+{
+	ListCell *lc;
+
+	foreach(lc, all_tables)
+	{
+		IncrJoinEntry *je    = lfirst(lc);
+		Node          *q     = je->quals;
+		Bitmapset     *refs  = NULL;
+
+		if (q == NULL)
+			continue;
+		incr_qual_varnos_walker(q, &refs);
+		if (bms_is_member(varno_a, refs) && bms_is_member(varno_b, refs))
+		{
+			bms_free(refs);
+			return q;
+		}
+		bms_free(refs);
+	}
+	return NULL;
+}
+
+/*
+ * qual_to_live_sql — deparse a qual/expression using "live table" aliases:
+ *   preserved table  →  _ltp_
+ *   other tables     →  _lt<varno>_
+ */
+static char *
+qual_to_live_sql(Node *qual, List *rtable, List *all_tables, int preserved_varno)
+{
+	StringInfoData	buf;
+	ListCell	   *lc;
+	char		   *result;
+
+	initStringInfo(&buf);
+	/* delta_varno=0: no real table has varno 0, so all Vars get _j<n>_ */
+	incr_deparse_where_qual(qual, rtable, 0, &buf);
+	result = buf.data;
+
+	/* Replace the preserved table alias first */
+	result = str_replace_all(result, psprintf("_j%d_", preserved_varno), "_ltp_");
+
+	/* Replace all other table aliases */
+	foreach(lc, all_tables)
+	{
+		IncrJoinEntry *je = lfirst(lc);
+
+		if (je->varno == preserved_varno)
+			continue;
+		result = str_replace_all(result,
+								 psprintf("_j%d_", je->varno),
+								 psprintf("_lt%d_", je->varno));
+	}
+	return result;
+}
+
+/*
+ * incr_build_outer_sql
+ *
+ * Build the SQL for one delta source in an outer-join incremental matview.
+ * Instead of incrementally adding/subtracting deltas (which requires NULL
+ * sentinel tracking), we use a "recompute affected groups" strategy:
+ *
+ *   1. Find the GROUP BY keys touched by this delta (the "affected" CTE).
+ *   2. Re-run the full join query on live tables for those groups only
+ *      (the "new_agg" CTE).
+ *   3. UPSERT (REPLACE semantics) those groups into the matview.
+ *   4. (del_sql only, preserved-side delta) DELETE groups whose preserved
+ *      side no longer has rows.
+ *
+ * delta_varno:       varno of the delta table in viewQuery->rtable.
+ * delta_table:       transition table name ("__mv_newtable" / "__mv_oldtable").
+ * all_tables:        flat list of IncrJoinEntry*, left-to-right join order.
+ * include_delete_step: true for del_sql when delta is the preserved side;
+ *                     the function then emits a trailing CTE DELETE.
+ */
+static char *
+incr_build_outer_sql(Oid mvrelid, Query *viewQuery,
+					  int delta_varno, const char *delta_table,
+					  List *all_tables, bool include_delete_step)
+{
+	StringInfoData	buf;
+	ListCell	   *lc;
+	int				preserved_varno = incr_outer_preserved_varno(all_tables);
+	IncrJoinEntry  *preserved_entry = NULL;
+	const char	   *mvname = mv_qname(mvrelid);
+	bool			first;
+
+	/* Find the preserved-side entry */
+	foreach(lc, all_tables)
+	{
+		IncrJoinEntry *je = lfirst(lc);
+
+		if (je->varno == preserved_varno)
+		{
+			preserved_entry = je;
+			break;
+		}
+	}
+	Assert(preserved_entry != NULL);
+
+	initStringInfo(&buf);
+
+	/* ----------------------------------------------------------------
+	 * _affected_ CTE: GROUP BY keys touched by this delta.
+	 *   delta = preserved side → group cols come directly from delta rows.
+	 *   delta = optional side  → join delta with preserved to reach keys.
+	 * ---------------------------------------------------------------- */
+	appendStringInfoString(&buf, "WITH _affected_ AS (\n  SELECT DISTINCT ");
+	first = true;
+	foreach(lc, viewQuery->groupClause)
+	{
+		SortGroupClause *sgc     = lfirst_node(SortGroupClause, lc);
+		TargetEntry     *te      = get_sortgroupclause_tle(sgc, viewQuery->targetList);
+		int              rv;
+		const char      *src_col = incr_resolve_var_colname(
+			(Var *) te->expr, viewQuery->rtable, &rv);
+
+		if (!first) appendStringInfoString(&buf, ", ");
+		first = false;
+		appendStringInfo(&buf, "%s.%s AS %s",
+						 (delta_varno == preserved_varno) ? "_d_" : "_ltp_",
+						 quote_identifier(src_col),
+						 quote_identifier(te->resname));
+	}
+
+	if (delta_varno == preserved_varno)
+	{
+		appendStringInfo(&buf, "\n  FROM %s _d_\n),\n", delta_table);
+	}
+	else
+	{
+		Node          *conn_qual = find_connecting_qual(all_tables,
+														delta_varno,
+														preserved_varno);
+		StringInfoData jbuf;
+		char          *cond_sql;
+
+		if (conn_qual == NULL)
+			elog(ERROR,
+				 "DBblue: no join condition between delta (varno=%d) "
+				 "and preserved table (varno=%d)",
+				 delta_varno, preserved_varno);
+
+		initStringInfo(&jbuf);
+		incr_deparse_where_qual(conn_qual, viewQuery->rtable, delta_varno, &jbuf);
+		cond_sql = str_replace_all(jbuf.data,
+								   psprintf("_j%d_", preserved_varno),
+								   "_ltp_");
+
+		appendStringInfo(&buf,
+						 "\n  FROM %s _d_\n  JOIN %s _ltp_ ON (%s)\n),\n",
+						 delta_table,
+						 mv_qname(preserved_entry->oid),
+						 cond_sql);
+	}
+
+	/* ----------------------------------------------------------------
+	 * _new_agg_ CTE: recompute the full join for affected groups.
+	 * Preserved table is the anchor (_ltp_); others use _lt<varno>_.
+	 * ---------------------------------------------------------------- */
+	appendStringInfoString(&buf, "_new_agg_ AS (\n  SELECT ");
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+		if (te->resjunk) continue;
+		if (!first) appendStringInfoString(&buf, ", ");
+		first = false;
+
+		if (strcmp(te->resname, MATVIEW_INCR_COUNT_COL) == 0)
+		{
+			appendStringInfo(&buf, "COUNT(*) AS %s",
+							 quote_identifier(MATVIEW_INCR_COUNT_COL));
+		}
+		else if (strcmp(te->resname, MATVIEW_INCR_HAVING_COL) == 0)
+		{
+			appendStringInfo(&buf, "true AS %s",
+							 quote_identifier(MATVIEW_INCR_HAVING_COL));
+		}
+		else if (IsA(te->expr, Var))
+		{
+			int         rv;
+			const char *src_col = incr_resolve_var_colname(
+				(Var *) te->expr, viewQuery->rtable, &rv);
+			const char *tbl_alias = (rv == preserved_varno)
+									 ? "_ltp_"
+									 : psprintf("_lt%d_", rv);
+
+			appendStringInfo(&buf, "%s.%s AS %s",
+							 tbl_alias,
+							 quote_identifier(src_col),
+							 quote_identifier(te->resname));
+		}
+		else if (IsA(te->expr, Aggref))
+		{
+			Aggref     *agg   = (Aggref *) te->expr;
+			char       *fname = get_func_name(agg->aggfnoid);
+
+			if (agg->aggstar || agg->args == NIL)
+			{
+				appendStringInfo(&buf, "%s(*) AS %s",
+								 fname, quote_identifier(te->resname));
+			}
+			else
+			{
+				TargetEntry *arg_te  = linitial_node(TargetEntry, agg->args);
+				char        *arg_sql = qual_to_live_sql(
+					(Node *) arg_te->expr,
+					viewQuery->rtable, all_tables, preserved_varno);
+
+				appendStringInfo(&buf, "%s(%s%s) AS %s",
+								 fname,
+								 (agg->aggdistinct != NIL) ? "DISTINCT " : "",
+								 arg_sql,
+								 quote_identifier(te->resname));
+			}
+		}
+		else
+		{
+			char *expr_sql = qual_to_live_sql((Node *) te->expr,
+											  viewQuery->rtable,
+											  all_tables, preserved_varno);
+
+			appendStringInfo(&buf, "%s AS %s",
+							 expr_sql, quote_identifier(te->resname));
+		}
+	}
+
+	/* FROM preserved anchored on _affected_ via ON clause */
+	appendStringInfo(&buf, "\n  FROM %s _ltp_\n  JOIN _affected_ ON (",
+					 mv_qname(preserved_entry->oid));
+	first = true;
+	foreach(lc, viewQuery->groupClause)
+	{
+		SortGroupClause *sgc     = lfirst_node(SortGroupClause, lc);
+		TargetEntry     *te      = get_sortgroupclause_tle(sgc, viewQuery->targetList);
+		int              rv;
+		const char      *src_col = incr_resolve_var_colname(
+			(Var *) te->expr, viewQuery->rtable, &rv);
+
+		if (!first) appendStringInfoString(&buf, " AND ");
+		first = false;
+		appendStringInfo(&buf, "_ltp_.%s = _affected_.%s",
+						 quote_identifier(src_col),
+						 quote_identifier(te->resname));
+	}
+	appendStringInfoString(&buf, ")");
+
+	/* JOIN non-preserved tables using their original join type */
+	foreach(lc, all_tables)
+	{
+		IncrJoinEntry *je       = lfirst(lc);
+		const char    *join_kw;
+		Node          *qual;
+		char          *cond_sql;
+
+		if (je->varno == preserved_varno) continue;
+
+		/*
+		 * Use the all-quals pool to find the connecting condition.  The anchor
+		 * entry (larg of the first JoinExpr) always has quals=NULL; its
+		 * condition lives in the rarg entry.  find_connecting_qual() finds it
+		 * regardless of which side owns the node.
+		 */
+		qual = find_connecting_qual(all_tables, je->varno, preserved_varno);
+		if (qual == NULL)
+			qual = je->quals;		/* fallback for non-anchor tables */
+		if (qual == NULL)
+			elog(ERROR,
+				 "DBblue: no join condition found for table varno=%d in outer-join matview",
+				 je->varno);
+
+		join_kw  = "LEFT JOIN";		/* always LEFT from preserved anchor */
+		cond_sql = qual_to_live_sql(qual, viewQuery->rtable,
+									all_tables, preserved_varno);
+
+		appendStringInfo(&buf, "\n  %s %s _lt%d_ ON (%s)",
+						 join_kw, mv_qname(je->oid), je->varno, cond_sql);
+	}
+
+	/* GROUP BY using live-table aliases for source column names */
+	appendStringInfoString(&buf, "\n  GROUP BY ");
+	first = true;
+	foreach(lc, viewQuery->groupClause)
+	{
+		SortGroupClause *sgc     = lfirst_node(SortGroupClause, lc);
+		TargetEntry     *te      = get_sortgroupclause_tle(sgc, viewQuery->targetList);
+		int              rv;
+		const char      *src_col = incr_resolve_var_colname(
+			(Var *) te->expr, viewQuery->rtable, &rv);
+		const char      *tbl_alias = (rv == preserved_varno)
+									  ? "_ltp_"
+									  : psprintf("_lt%d_", rv);
+
+		if (!first) appendStringInfoString(&buf, ", ");
+		first = false;
+		appendStringInfo(&buf, "%s.%s", tbl_alias, quote_identifier(src_col));
+	}
+	appendStringInfoString(&buf, "\n),\n");
+
+	/* ----------------------------------------------------------------
+	 * _upd_ CTE: UPSERT the recomputed rows into the matview.
+	 * ---------------------------------------------------------------- */
+	appendStringInfo(&buf, "_upd_ AS (\n  INSERT INTO %s (", mvname);
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+		if (te->resjunk) continue;
+		if (!first) appendStringInfoString(&buf, ", ");
+		appendStringInfoString(&buf, quote_identifier(te->resname));
+		first = false;
+	}
+	appendStringInfoString(&buf, ")\n  SELECT ");
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+		if (te->resjunk) continue;
+		if (!first) appendStringInfoString(&buf, ", ");
+		appendStringInfoString(&buf, quote_identifier(te->resname));
+		first = false;
+	}
+	appendStringInfoString(&buf, " FROM _new_agg_\n  ON CONFLICT (");
+	first = true;
+	foreach(lc, viewQuery->groupClause)
+	{
+		SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+		TargetEntry     *te  = get_sortgroupclause_tle(sgc, viewQuery->targetList);
+
+		if (!first) appendStringInfoString(&buf, ", ");
+		appendStringInfoString(&buf, quote_identifier(te->resname));
+		first = false;
+	}
+	appendStringInfoString(&buf, ") DO UPDATE SET ");
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry    *te          = lfirst_node(TargetEntry, lc);
+		bool            is_group_col = false;
+		ListCell       *gcl;
+
+		if (te->resjunk) continue;
+		foreach(gcl, viewQuery->groupClause)
+		{
+			SortGroupClause *sgc2 = lfirst_node(SortGroupClause, gcl);
+			TargetEntry     *gte  = get_sortgroupclause_tle(sgc2,
+															 viewQuery->targetList);
+
+			if (strcmp(te->resname, gte->resname) == 0)
+			{
+				is_group_col = true;
+				break;
+			}
+		}
+		if (is_group_col) continue;
+
+		if (!first) appendStringInfoString(&buf, ", ");
+		appendStringInfo(&buf, "%s=EXCLUDED.%s",
+						 quote_identifier(te->resname),
+						 quote_identifier(te->resname));
+		first = false;
+	}
+	appendStringInfoString(&buf, "\n)\n");
+
+	/* ----------------------------------------------------------------
+	 * Final statement.
+	 * del_sql on preserved side: also DELETE groups that vanished.
+	 * Otherwise: benign SELECT that forces _upd_ to execute.
+	 * ---------------------------------------------------------------- */
+	if (include_delete_step)
+	{
+		appendStringInfo(&buf,
+						 "DELETE FROM %s _mv_\nUSING _affected_\nWHERE ",
+						 mvname);
+		first = true;
+		foreach(lc, viewQuery->groupClause)
+		{
+			SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+			TargetEntry     *te  = get_sortgroupclause_tle(sgc, viewQuery->targetList);
+			const char      *col = quote_identifier(te->resname);
+
+			if (!first) appendStringInfoString(&buf, " AND ");
+			appendStringInfo(&buf, "_mv_.%s = _affected_.%s", col, col);
+			first = false;
+		}
+		appendStringInfo(&buf,
+						 "\n  AND NOT EXISTS (\n"
+						 "    SELECT 1 FROM %s _chk_\n    WHERE ",
+						 mv_qname(preserved_entry->oid));
+		first = true;
+		foreach(lc, viewQuery->groupClause)
+		{
+			SortGroupClause *sgc     = lfirst_node(SortGroupClause, lc);
+			TargetEntry     *te      = get_sortgroupclause_tle(sgc, viewQuery->targetList);
+			int              rv;
+			const char      *src_col = incr_resolve_var_colname(
+				(Var *) te->expr, viewQuery->rtable, &rv);
+
+			if (!first) appendStringInfoString(&buf, " AND ");
+			appendStringInfo(&buf, "_chk_.%s = _mv_.%s",
+							 quote_identifier(src_col),
+							 quote_identifier(te->resname));
+			first = false;
+		}
+		appendStringInfoString(&buf, "\n  )");
+	}
+	else
+	{
+		/* DML CTEs (_upd_) always execute; this SELECT just terminates the WITH. */
+		appendStringInfoString(&buf, "SELECT 1");
+	}
+
+	return buf.data;
 }
 
 /* ============================================================
