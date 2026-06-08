@@ -137,10 +137,8 @@ typedef struct IncrJoinEntry
 static bool incr_is_hidden_col(const char *resname);
 static Oid	incr_find_sum_agg(Oid avg_fnoid, Oid *rettype_out);
 static Oid	incr_get_source_table(Query *viewQuery);
-static void incr_get_join_info(Query *viewQuery,
-							   int *tbl1_varno, Oid *tbl1_oid,
-							   int *tbl2_varno, Oid *tbl2_oid,
-							   Node **join_quals);
+static List *incr_collect_tables(Query *viewQuery);
+static List *incr_build_join_list_for_delta(List *all_tables, int delta_varno);
 static void incr_collect_group_cols(Query *viewQuery, List **groupColNames);
 static void incr_append_from_join(StringInfo buf, Query *viewQuery,
 								  int delta_varno, const char *delta_table,
@@ -262,39 +260,58 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 
 	if (nbasetables == 1)
 	{
-		/* Phase 1: nothing extra to check */
+		/* Phase 1: single source table — nothing extra to check */
 	}
-	else if (nbasetables == 2)
+	else if (nbasetables >= 2)
 	{
-		/* Phase 2: require an INNER JOIN condition */
-		bool		has_join = false;
+		/*
+		 * Phase 2+: N-table INNER JOIN.  Require an explicit JOIN ... ON tree
+		 * rooted at the single FromExpr.fromlist entry.  Walk the JoinExpr
+		 * tree to confirm every step is INNER with a non-null ON condition.
+		 */
+		Node	   *jtree_root = NULL;
 
 		if (IsA(viewQuery->jointree, FromExpr))
 		{
 			FromExpr   *fe = (FromExpr *) viewQuery->jointree;
 
-			if (fe->fromlist != NIL && IsA(linitial(fe->fromlist), JoinExpr))
-			{
-				JoinExpr   *je = (JoinExpr *) linitial(fe->fromlist);
-
-				if (je->jointype == JOIN_INNER && je->quals != NULL)
-					has_join = true;
-			}
-			else if (fe->quals != NULL)
-				has_join = true;	/* implicit join: FROM T1, T2 WHERE join_cond */
+			if (fe->fromlist != NIL)
+				jtree_root = linitial(fe->fromlist);
 		}
 
-		if (!has_join)
+		if (jtree_root == NULL || !IsA(jtree_root, JoinExpr))
 		{
-			*reason = "two source tables require an INNER JOIN condition (Phase 2);"
-				" LEFT/OUTER JOINs are Phase 3";
+			*reason = "multiple source tables require explicit INNER JOIN ... ON syntax";
 			return false;
 		}
-	}
-	else
-	{
-		*reason = "more than two source tables not supported; Phase 2 maximum is two tables";
-		return false;
+
+		/* Walk every JoinExpr in the tree: must all be INNER with quals */
+		{
+			List	   *stack = list_make1(jtree_root);
+			ListCell   *slc;
+
+			foreach(slc, stack)
+			{
+				JoinExpr   *je = lfirst(slc);
+
+				if (!IsA(je, JoinExpr))
+					continue;
+				if (je->jointype != JOIN_INNER)
+				{
+					*reason = "only INNER JOINs are supported for incremental refresh";
+					return false;
+				}
+				if (je->quals == NULL)
+				{
+					*reason = "each JOIN step must have an ON condition";
+					return false;
+				}
+				if (IsA(je->larg, JoinExpr))
+					stack = lappend(stack, je->larg);
+				if (IsA(je->rarg, JoinExpr))
+					stack = lappend(stack, je->rarg);
+			}
+		}
 	}
 
 	/* Only Var (group col) or Aggref (SUM/COUNT/AVG) in target list */
@@ -478,66 +495,40 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 	}
 	else
 	{
-		/* ---- Phase 2+: INNER JOIN (N tables) ---- */
-		int			tbl1_varno,
-					tbl2_varno;
-		Oid			tbl1_oid,
-					tbl2_oid;
-		Node	   *join_quals;
-		IncrJoinEntry *je1,
-				   *je2;
-		List	   *join_for_t1,
-				   *join_for_t2;
+		/* ---- Phase 2+: N-table INNER JOIN ---- */
+		List	   *all_tables = incr_collect_tables(viewQuery);
+		ListCell   *jlc;
 
-		incr_get_join_info(viewQuery,
-						   &tbl1_varno, &tbl1_oid,
-						   &tbl2_varno, &tbl2_oid,
-						   &join_quals);
+		foreach(jlc, all_tables)
+		{
+			IncrJoinEntry *delta = lfirst(jlc);
+			List		  *join_list = incr_build_join_list_for_delta(all_tables,
+																	 delta->varno);
 
-		je1 = palloc0(sizeof(IncrJoinEntry));
-		je1->varno = tbl2_varno;
-		je1->oid = tbl2_oid;
-		je1->quals = join_quals;
-		join_for_t1 = list_make1(je1);
-
-		je2 = palloc0(sizeof(IncrJoinEntry));
-		je2->varno = tbl1_varno;
-		je2->oid = tbl1_oid;
-		je2->quals = join_quals;
-		join_for_t2 = list_make1(je2);
-
-		/* Delta SQL when T1 rows change — join transition table with current T2 */
-		ins_sql = incr_build_ins_sql_gen(mvrelid, viewQuery,
-										 tbl1_varno, MATVIEW_INCR_NEWTABLE,
-										 join_for_t1);
-		del_sql = incr_build_del_sql_gen(mvrelid, viewQuery,
-										 tbl1_varno, MATVIEW_INCR_OLDTABLE,
-										 join_for_t1);
-		incr_store_catalog(mvrelid, tbl1_oid, ins_sql, del_sql, cln_sql, hav_sql);
-		incr_install_triggers(mvrelid, tbl1_oid);
-
-		/* Delta SQL when T2 rows change — join transition table with current T1 */
-		ins_sql = incr_build_ins_sql_gen(mvrelid, viewQuery,
-										 tbl2_varno, MATVIEW_INCR_NEWTABLE,
-										 join_for_t2);
-		del_sql = incr_build_del_sql_gen(mvrelid, viewQuery,
-										 tbl2_varno, MATVIEW_INCR_OLDTABLE,
-										 join_for_t2);
-		incr_store_catalog(mvrelid, tbl2_oid, ins_sql, del_sql, cln_sql, hav_sql);
-		incr_install_triggers(mvrelid, tbl2_oid);
+			ins_sql = incr_build_ins_sql_gen(mvrelid, viewQuery,
+											 delta->varno, MATVIEW_INCR_NEWTABLE,
+											 join_list);
+			del_sql = incr_build_del_sql_gen(mvrelid, viewQuery,
+											 delta->varno, MATVIEW_INCR_OLDTABLE,
+											 join_list);
+			incr_store_catalog(mvrelid, delta->oid, ins_sql, del_sql, cln_sql, hav_sql);
+			incr_install_triggers(mvrelid, delta->oid);
+		}
 
 		/*
-		 * HAVING backfill for JOIN: seed all groups (not just HAVING-passing
-		 * ones) so groups that initially fail HAVING are tracked from the start.
-		 * We join the real tables instead of transition tables.  DO NOTHING
-		 * leaves the already-passing groups intact.
+		 * HAVING backfill: seed all groups from the real tables so groups that
+		 * initially fail HAVING are tracked.  Pick the first table as the
+		 * "anchor"; its join_list covers all others.
 		 */
 		if (hasHaving)
 		{
-			char	   *backfill_sql = incr_build_backfill_sql_gen(
+			IncrJoinEntry *first = linitial(all_tables);
+			List		  *join_list = incr_build_join_list_for_delta(all_tables,
+																	 first->varno);
+			char		  *backfill_sql = incr_build_backfill_sql_gen(
 				mvrelid, viewQuery,
-				tbl1_varno, mv_qname(tbl1_oid), join_for_t1);
-			int			spi_ret;
+				first->varno, mv_qname(first->oid), join_list);
+			int			   spi_ret;
 
 			OpenMatViewIncrementalMaintenance();
 			SPI_connect();
@@ -1986,67 +1977,216 @@ incr_build_cln_sql(Oid mvrelid)
 
 
 /* ============================================================
- * Phase 2 helpers
+ * Join table helpers — Phase 2+
  * ============================================================
  */
 
 /*
- * incr_get_join_info
- * Walk the rtable to find the two RTE_RELATION entries and extract the
- * INNER JOIN qualification from either a JoinExpr or FromExpr->quals.
+ * incr_collect_tables
+ *
+ * Walk the explicit JoinExpr tree and return a flat List of IncrJoinEntry*
+ * in left-to-right join order.  The first entry always has quals=NULL (it
+ * is the leftmost RangeTblRef).  Every subsequent entry carries the ON
+ * condition of the JoinExpr that introduces it.
+ *
+ * Example: T1 JOIN T2 ON c12 JOIN T3 ON c23 produces:
+ *   [{varno=1, oid=T1, quals=NULL}, {varno=2, oid=T2, quals=c12},
+ *    {varno=3, oid=T3, quals=c23}]
  */
 static void
-incr_get_join_info(Query *viewQuery,
-				   int *tbl1_varno, Oid *tbl1_oid,
-				   int *tbl2_varno, Oid *tbl2_oid,
-				   Node **join_quals)
+incr_collect_tables_recurse(Node *node, List *rtable, List **entries)
 {
-	ListCell   *lc;
-	int			varno = 0;
+	if (node == NULL)
+		return;
 
-	*tbl1_varno = *tbl2_varno = 0;
-	*tbl1_oid = *tbl2_oid = InvalidOid;
-	*join_quals = NULL;
-
-	foreach(lc, viewQuery->rtable)
+	if (IsA(node, JoinExpr))
 	{
-		RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+		JoinExpr   *je = (JoinExpr *) node;
 
-		varno++;
-		if (rte->rtekind != RTE_RELATION)
-			continue;
+		incr_collect_tables_recurse(je->larg, rtable, entries);
 
-		if (*tbl1_varno == 0)
+		/* rarg must be a leaf RangeTblRef in a left-deep tree */
+		if (IsA(je->rarg, RangeTblRef))
 		{
-			*tbl1_varno = varno;
-			*tbl1_oid = rte->relid;
+			RangeTblRef    *rtr = (RangeTblRef *) je->rarg;
+			RangeTblEntry  *rte = rt_fetch(rtr->rtindex, rtable);
+			IncrJoinEntry  *entry = palloc0(sizeof(IncrJoinEntry));
+
+			entry->varno = rtr->rtindex;
+			entry->oid = rte->relid;
+			entry->quals = je->quals;
+			*entries = lappend(*entries, entry);
 		}
 		else
-		{
-			*tbl2_varno = varno;
-			*tbl2_oid = rte->relid;
-		}
+			elog(ERROR, "DBblue: incr_collect_tables: unexpected rarg node type %d",
+				 (int) nodeTag(je->rarg));
 	}
-
-	if (IsA(viewQuery->jointree, FromExpr))
+	else if (IsA(node, RangeTblRef))
 	{
-		FromExpr   *fe = (FromExpr *) viewQuery->jointree;
+		RangeTblRef    *rtr = (RangeTblRef *) node;
+		RangeTblEntry  *rte = rt_fetch(rtr->rtindex, rtable);
+		IncrJoinEntry  *entry = palloc0(sizeof(IncrJoinEntry));
 
-		if (fe->fromlist != NIL &&
-			IsA(linitial(fe->fromlist), JoinExpr))
-		{
-			JoinExpr   *je = (JoinExpr *) linitial(fe->fromlist);
+		entry->varno = rtr->rtindex;
+		entry->oid = rte->relid;
+		entry->quals = NULL;
+		*entries = lappend(*entries, entry);
+	}
+	else
+		elog(ERROR, "DBblue: incr_collect_tables: unexpected node type %d",
+			 (int) nodeTag(node));
+}
 
-			*join_quals = je->quals;	/* explicit: FROM T1 JOIN T2 ON ... */
-			/* fe->quals is the WHERE clause — handled separately */
-		}
-		else if (fe->quals != NULL)
-			*join_quals = fe->quals;	/* implicit: FROM T1, T2 WHERE join_cond */
+static List *
+incr_collect_tables(Query *viewQuery)
+{
+	List	   *entries = NIL;
+	FromExpr   *fe;
+
+	if (!IsA(viewQuery->jointree, FromExpr))
+		elog(ERROR, "DBblue: incr_collect_tables: jointree is not a FromExpr");
+
+	fe = (FromExpr *) viewQuery->jointree;
+	incr_collect_tables_recurse(linitial(fe->fromlist),
+								viewQuery->rtable, &entries);
+	return entries;
+}
+
+/*
+ * incr_qual_varnos_walker / incr_qual_varnos
+ * Return the set of base-level varno values referenced by an expression.
+ */
+static bool
+incr_qual_varnos_walker(Node *node, Bitmapset **varnos)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Var))
+	{
+		Var *v = (Var *) node;
+
+		if (v->varlevelsup == 0)
+			*varnos = bms_add_member(*varnos, v->varno);
+		return false;
+	}
+	return expression_tree_walker(node, incr_qual_varnos_walker, varnos);
+}
+
+/*
+ * incr_build_join_list_for_delta
+ *
+ * Given the full table list (from incr_collect_tables) and the varno of the
+ * delta table, return the remaining tables in an order where each entry's
+ * ON condition only references varnos already in the "known" set (delta +
+ * previously added entries).
+ *
+ * This greedy expansion works for chains, stars, and any acyclic join graph.
+ */
+static List *
+incr_build_join_list_for_delta(List *all_tables, int delta_varno)
+{
+	Bitmapset  *known = bms_make_singleton(delta_varno);
+	List	   *all_quals = NIL;
+	List	   *remaining = NIL;
+	List	   *result = NIL;
+	ListCell   *lc;
+
+	/*
+	 * Collect every non-NULL ON condition from the original join tree.
+	 * The leftmost table has quals=NULL in all_tables (it is the bare
+	 * starting leaf of the left-deep tree), but its join condition is
+	 * stored in another entry's quals field.  By searching all_quals we
+	 * can always find a connecting condition regardless of which table is
+	 * the delta.
+	 */
+	foreach(lc, all_tables)
+	{
+		IncrJoinEntry *je = lfirst(lc);
+
+		if (je->quals != NULL)
+			all_quals = lappend(all_quals, je->quals);
 	}
 
-	if (*join_quals == NULL)
-		elog(ERROR, "incr_get_join_info: no join condition found");
+	/* Build the candidate list (all tables except the delta) */
+	foreach(lc, all_tables)
+	{
+		IncrJoinEntry *je = lfirst(lc);
+
+		if (je->varno != delta_varno)
+			remaining = lappend(remaining, je);
+	}
+
+	/*
+	 * Greedy: repeatedly scan remaining; each pass adds all entries whose
+	 * connecting condition only references already-known varnos.
+	 *
+	 * We search all_quals (not just je->quals) so that the leftmost table
+	 * (quals=NULL in all_tables) still gets the right ON clause when it
+	 * appears as a non-delta join table.
+	 *
+	 * After each deletion we restart the scan from list_head because
+	 * PostgreSQL 13+ uses a flat array for List — list_delete_cell shifts
+	 * elements down, making any pre-saved "next" pointer stale and
+	 * tripping the Assert in lnext().
+	 */
+	while (remaining != NIL)
+	{
+		bool		progress = false;
+
+		lc = list_head(remaining);
+		while (lc != NULL)
+		{
+			IncrJoinEntry *je = lfirst(lc);
+			Node		  *connecting_qual = NULL;
+			ListCell	  *qlc;
+
+			/* Find an ON condition that connects je->varno to the known set */
+			foreach(qlc, all_quals)
+			{
+				Node	   *q = lfirst(qlc);
+				Bitmapset  *refs = NULL;
+				bool		this_table_in_q;
+				bool		others_all_known;
+
+				incr_qual_varnos_walker(q, &refs);
+				this_table_in_q = bms_is_member(je->varno, refs);
+				others_all_known = bms_is_subset(
+					bms_del_member(bms_copy(refs), je->varno), known);
+				bms_free(refs);
+
+				if (this_table_in_q && others_all_known)
+				{
+					connecting_qual = q;
+					break;
+				}
+			}
+
+			if (connecting_qual != NULL)
+			{
+				IncrJoinEntry *new_je = palloc(sizeof(IncrJoinEntry));
+
+				new_je->varno = je->varno;
+				new_je->oid = je->oid;
+				new_je->quals = connecting_qual;
+				result = lappend(result, new_je);
+				remaining = list_delete_cell(remaining, lc);
+				known = bms_add_member(known, je->varno);
+				progress = true;
+				break;			/* restart scan — stale pointer after delete */
+			}
+
+			lc = lnext(remaining, lc);
+		}
+
+		if (!progress)
+			elog(ERROR,
+				 "DBblue: cannot determine a valid join order for incremental refresh; "
+				 "check that join conditions form an acyclic graph");
+	}
+
+	return result;
 }
+
 /* ============================================================
  * Catalog helpers
  * ============================================================
