@@ -112,25 +112,23 @@ typedef struct IncrPlanEntry
 static HTAB *incr_plan_cache = NULL;
 
 /*
- * Per-AVG-column metadata collected from the view's query tree.
- * Used by SQL builders to emit correct hidden-column maintenance.
- */
-typedef struct AvgColInfo
-{
-	char   *avg_col;		/* visible output column name */
-	char   *sum_col;		/* __mv_avgsum_<avg_col> hidden column */
-	char   *cnt_col;		/* __mv_avgcnt_<avg_col> hidden column */
-	Oid		avg_rettype;	/* return type of the AVG (numeric, float8, …) */
-	Node   *arg_expr;		/* AVG argument expression — deparsed by incr_deparse_where_qual */
-} AvgColInfo;
-
-/*
- * Fixed aliases used in Phase 2 delta SQL.
- * The transition table (__mv_newtable/__mv_oldtable) gets alias _d_;
- * the other (non-changing) source table gets alias _j_.
+ * Alias for the delta (transition) table in Phase 2+ SQL.
+ * Non-delta join tables get per-varno aliases "_j<varno>_" built at runtime.
  */
 #define INCR_DELTA_ALIAS	"_d_"
-#define INCR_JOIN_ALIAS		"_j_"
+
+/*
+ * One entry in the join list passed to incr_build_*_gen builders.
+ * Phase 1: join_list = NIL.
+ * Phase 2: one entry (the other table).
+ * Phase 3+: one entry per additional table, in join order.
+ */
+typedef struct IncrJoinEntry
+{
+	int		varno;		/* varno of this table in viewQuery->rtable */
+	Oid		oid;		/* table OID */
+	Node   *quals;		/* ON condition for this join step */
+} IncrJoinEntry;
 
 /* ----------
  * Forward declarations
@@ -138,45 +136,37 @@ typedef struct AvgColInfo
  */
 static bool incr_is_hidden_col(const char *resname);
 static Oid	incr_find_sum_agg(Oid avg_fnoid, Oid *rettype_out);
-static void incr_collect_avg_info(Query *viewQuery, List **avgInfoList);
 static Oid	incr_get_source_table(Query *viewQuery);
 static void incr_get_join_info(Query *viewQuery,
 							   int *tbl1_varno, Oid *tbl1_oid,
 							   int *tbl2_varno, Oid *tbl2_oid,
 							   Node **join_quals);
-static void incr_deparse_expr(Node *expr, List *rtable,
-							  int delta_varno, StringInfo buf);
 static void incr_collect_group_cols(Query *viewQuery, List **groupColNames);
-static void incr_collect_agg_info(Query *viewQuery,
-								  List **aggColNames,
-								  List **aggFuncNames,
-								  List **aggArgColNames);
-static char *incr_build_ins_sql(Oid mvrelid, Query *viewQuery);
-static char *incr_build_backfill_sql(Oid mvrelid, Query *viewQuery,
-									 Oid srctable);
-static char *incr_build_del_sql(Oid mvrelid, Query *viewQuery);
+static void incr_append_from_join(StringInfo buf, Query *viewQuery,
+								  int delta_varno, const char *delta_table,
+								  List *join_list);
+static char *incr_build_ins_sql_gen(Oid mvrelid, Query *viewQuery,
+									int delta_varno, const char *delta_table,
+									List *join_list);
+static char *incr_build_backfill_sql_gen(Oid mvrelid, Query *viewQuery,
+										 int delta_varno, const char *delta_table,
+										 List *join_list);
+static char *incr_build_del_sql_gen(Oid mvrelid, Query *viewQuery,
+									int delta_varno, const char *delta_table,
+									List *join_list);
 static char *incr_build_cln_sql(Oid mvrelid);
-static char *incr_build_ins_sql_join(Oid mvrelid, Query *viewQuery,
-									 int delta_varno, Oid other_oid,
-									 Node *join_quals);
-static char *incr_build_backfill_sql_join(Oid mvrelid, Query *viewQuery,
-										  int delta_varno, Oid delta_oid,
-										  Oid other_oid, Node *join_quals);
-static char *incr_build_del_sql_join(Oid mvrelid, Query *viewQuery,
-									 int delta_varno, Oid other_oid,
-									 Node *join_quals);
 static void incr_store_catalog(Oid mvrelid, Oid srctable,
 							   const char *ins_sql,
 							   const char *del_sql,
 							   const char *cln_sql,
 							   const char *having_sql);
 static void incr_create_unique_index(Oid mvrelid, List *groupColNames);
-static bool incr_validate_having(Node *expr, Query *viewQuery);
-static bool incr_validate_where_qual(Node *qual);
+static bool incr_validate_expr(Node *expr, Query *viewQuery, bool allow_aggref);
 static Node *incr_get_where_qual(Query *viewQuery);
 static void incr_deparse_where_qual(Node *qual, List *rtable, int delta_varno,
 									StringInfo buf);
-static const char *incr_resolve_var_colname(Var *v, List *rtable);
+static const char *incr_resolve_var_colname(Var *v, List *rtable,
+											int *resolved_varno_out);
 static void incr_deparse_having_cond(Node *expr, Query *viewQuery, StringInfo buf);
 static char *incr_build_hav_sql(Oid mvrelid, Query *viewQuery);
 static void incr_create_having_view(Oid mvrelid,
@@ -227,7 +217,7 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 	}
 	if (viewQuery->havingQual != NULL)
 	{
-		if (!incr_validate_having(viewQuery->havingQual, viewQuery))
+		if (!incr_validate_expr(viewQuery->havingQual, viewQuery, true))
 		{
 			*reason = "HAVING uses unsupported expressions; "
 				"only maintained aggregates (COUNT/SUM/AVG), "
@@ -331,7 +321,7 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 				{
 					TargetEntry *arg_te = linitial_node(TargetEntry, agg->args);
 
-					if (!incr_validate_where_qual((Node *) arg_te->expr))
+					if (!incr_validate_expr((Node *) arg_te->expr, NULL, false))
 					{
 						*reason = psprintf("argument of aggregate \"%s\" uses "
 										   "unsupported expressions; only column "
@@ -355,7 +345,7 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 	{
 		Node	   *where_qual = incr_get_where_qual(viewQuery);
 
-		if (where_qual != NULL && !incr_validate_where_qual(where_qual))
+		if (where_qual != NULL && !incr_validate_expr(where_qual, NULL, false))
 		{
 			*reason = "WHERE clause uses unsupported expressions; "
 				"only column references, constants, comparisons, "
@@ -457,8 +447,10 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 		/* ---- Phase 1: single source table ---- */
 		Oid			srctable = incr_get_source_table(viewQuery);
 
-		ins_sql = incr_build_ins_sql(mvrelid, viewQuery);
-		del_sql = incr_build_del_sql(mvrelid, viewQuery);
+		ins_sql = incr_build_ins_sql_gen(mvrelid, viewQuery, -1,
+										 MATVIEW_INCR_NEWTABLE, NIL);
+		del_sql = incr_build_del_sql_gen(mvrelid, viewQuery, -1,
+										 MATVIEW_INCR_OLDTABLE, NIL);
 		incr_store_catalog(mvrelid, srctable, ins_sql, del_sql, cln_sql, hav_sql);
 
 		/*
@@ -469,7 +461,8 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 		 */
 		if (hasHaving)
 		{
-			char	   *backfill_sql = incr_build_backfill_sql(mvrelid, viewQuery, srctable);
+			char	   *backfill_sql = incr_build_backfill_sql_gen(
+				mvrelid, viewQuery, -1, mv_qname(srctable), NIL);
 			int			spi_ret;
 
 			OpenMatViewIncrementalMaintenance();
@@ -485,31 +478,51 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 	}
 	else
 	{
-		/* ---- Phase 2: two-table INNER JOIN ---- */
+		/* ---- Phase 2+: INNER JOIN (N tables) ---- */
 		int			tbl1_varno,
 					tbl2_varno;
 		Oid			tbl1_oid,
 					tbl2_oid;
 		Node	   *join_quals;
+		IncrJoinEntry *je1,
+				   *je2;
+		List	   *join_for_t1,
+				   *join_for_t2;
 
 		incr_get_join_info(viewQuery,
 						   &tbl1_varno, &tbl1_oid,
 						   &tbl2_varno, &tbl2_oid,
 						   &join_quals);
 
+		je1 = palloc0(sizeof(IncrJoinEntry));
+		je1->varno = tbl2_varno;
+		je1->oid = tbl2_oid;
+		je1->quals = join_quals;
+		join_for_t1 = list_make1(je1);
+
+		je2 = palloc0(sizeof(IncrJoinEntry));
+		je2->varno = tbl1_varno;
+		je2->oid = tbl1_oid;
+		je2->quals = join_quals;
+		join_for_t2 = list_make1(je2);
+
 		/* Delta SQL when T1 rows change — join transition table with current T2 */
-		ins_sql = incr_build_ins_sql_join(mvrelid, viewQuery,
-										  tbl1_varno, tbl2_oid, join_quals);
-		del_sql = incr_build_del_sql_join(mvrelid, viewQuery,
-										  tbl1_varno, tbl2_oid, join_quals);
+		ins_sql = incr_build_ins_sql_gen(mvrelid, viewQuery,
+										 tbl1_varno, MATVIEW_INCR_NEWTABLE,
+										 join_for_t1);
+		del_sql = incr_build_del_sql_gen(mvrelid, viewQuery,
+										 tbl1_varno, MATVIEW_INCR_OLDTABLE,
+										 join_for_t1);
 		incr_store_catalog(mvrelid, tbl1_oid, ins_sql, del_sql, cln_sql, hav_sql);
 		incr_install_triggers(mvrelid, tbl1_oid);
 
 		/* Delta SQL when T2 rows change — join transition table with current T1 */
-		ins_sql = incr_build_ins_sql_join(mvrelid, viewQuery,
-										  tbl2_varno, tbl1_oid, join_quals);
-		del_sql = incr_build_del_sql_join(mvrelid, viewQuery,
-										  tbl2_varno, tbl1_oid, join_quals);
+		ins_sql = incr_build_ins_sql_gen(mvrelid, viewQuery,
+										 tbl2_varno, MATVIEW_INCR_NEWTABLE,
+										 join_for_t2);
+		del_sql = incr_build_del_sql_gen(mvrelid, viewQuery,
+										 tbl2_varno, MATVIEW_INCR_OLDTABLE,
+										 join_for_t2);
 		incr_store_catalog(mvrelid, tbl2_oid, ins_sql, del_sql, cln_sql, hav_sql);
 		incr_install_triggers(mvrelid, tbl2_oid);
 
@@ -521,9 +534,9 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 		 */
 		if (hasHaving)
 		{
-			char	   *backfill_sql = incr_build_backfill_sql_join(
+			char	   *backfill_sql = incr_build_backfill_sql_gen(
 				mvrelid, viewQuery,
-				tbl1_varno, tbl1_oid, tbl2_oid, join_quals);
+				tbl1_varno, mv_qname(tbl1_oid), join_for_t1);
 			int			spi_ret;
 
 			OpenMatViewIncrementalMaintenance();
@@ -763,48 +776,6 @@ incr_find_sum_agg(Oid avg_fnoid, Oid *rettype_out)
 	return InvalidOid;
 }
 
-/*
- * incr_collect_avg_info
- * Build a list of AvgColInfo for every AVG() column in the target list.
- * arg_col is the plain column name (for Phase 1 single-table SQL builders);
- * arg_expr is the raw Var node (for Phase 2 builders that call incr_deparse_expr).
- */
-static void
-incr_collect_avg_info(Query *viewQuery, List **avgInfoList)
-{
-	ListCell   *lc;
-
-	*avgInfoList = NIL;
-	foreach(lc, viewQuery->targetList)
-	{
-		TargetEntry *te = lfirst_node(TargetEntry, lc);
-		Aggref	   *agg;
-		AvgColInfo *info;
-
-		if (te->resjunk || !IsA(te->expr, Aggref))
-			continue;
-		agg = (Aggref *) te->expr;
-		if (strcmp(get_func_name(agg->aggfnoid), "avg") != 0)
-			continue;
-
-		info = palloc(sizeof(AvgColInfo));
-		info->avg_col = pstrdup(te->resname);
-		info->sum_col = psprintf("%s%s", MATVIEW_INCR_AVGSUM_PREFIX, te->resname);
-		info->cnt_col = psprintf("%s%s", MATVIEW_INCR_AVGCNT_PREFIX, te->resname);
-		info->avg_rettype = agg->aggtype;
-		info->arg_expr = NULL;
-
-		if (agg->args != NIL)
-		{
-			TargetEntry *arg_te = linitial_node(TargetEntry, agg->args);
-
-			info->arg_expr = (Node *) arg_te->expr;
-		}
-
-		*avgInfoList = lappend(*avgInfoList, info);
-	}
-}
-
 /* ============================================================
  * HAVING helpers — Phase 4
  * ============================================================
@@ -838,76 +809,115 @@ incr_get_where_qual(Query *viewQuery)
 }
 
 /*
- * incr_validate_where_qual
- * Return true if qual only uses expressions safe for WHERE maintenance:
- * Var, Const, OpExpr, BoolExpr, FuncExpr (stable/immutable), NullTest,
- * ScalarArrayOpExpr (col IN/NOT IN list), ArrayExpr.
- * Aggregates and sublinks are not permitted in WHERE.
+ * incr_validate_expr — general expression validator.
+ *
+ *   allow_aggref = true  (HAVING): Aggref allowed when matched in SELECT list;
+ *                         FuncExpr allowed without volatility check.
+ *   allow_aggref = false (WHERE / aggregate arg): no Aggref; FuncExpr must be
+ *                         stable or immutable; ScalarArrayOpExpr and ArrayExpr
+ *                         (IN lists) are also permitted.
+ *
+ * viewQuery is used only when allow_aggref=true; pass NULL otherwise.
  */
 static bool
-incr_validate_where_qual(Node *qual)
+incr_validate_expr(Node *expr, Query *viewQuery, bool allow_aggref)
 {
 	ListCell   *lc;
 
-	if (qual == NULL)
+	if (expr == NULL)
 		return true;
 
-	if (IsA(qual, Var) || IsA(qual, Const))
+	if (IsA(expr, Var) || IsA(expr, Const))
 		return true;
 
-	if (IsA(qual, NullTest))
-		return incr_validate_where_qual((Node *) ((NullTest *) qual)->arg);
-
-	if (IsA(qual, OpExpr))
+	if (IsA(expr, Aggref))
 	{
-		OpExpr	   *op = (OpExpr *) qual;
+		Aggref	   *agg = (Aggref *) expr;
+		char	   *fname;
+
+		if (!allow_aggref)
+			return false;
+
+		fname = get_func_name(agg->aggfnoid);
+
+		/* COUNT(*) is always maintained via __mv_count__ */
+		if (strcmp(fname, "count") == 0 && agg->aggstar)
+			return true;
+
+		/* Other aggregates must match a SELECT target */
+		foreach(lc, viewQuery->targetList)
+		{
+			TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+			if (!IsA(te->expr, Aggref))
+				continue;
+			if (((Aggref *) te->expr)->aggfnoid == agg->aggfnoid)
+				return true;
+		}
+		return false;
+	}
+
+	if (IsA(expr, NullTest))
+		return incr_validate_expr((Node *) ((NullTest *) expr)->arg,
+								  viewQuery, allow_aggref);
+
+	if (IsA(expr, OpExpr))
+	{
+		OpExpr	   *op = (OpExpr *) expr;
 
 		foreach(lc, op->args)
-			if (!incr_validate_where_qual(lfirst(lc)))
+			if (!incr_validate_expr(lfirst(lc), viewQuery, allow_aggref))
 				return false;
 		return true;
 	}
 
-	if (IsA(qual, BoolExpr))
+	if (IsA(expr, BoolExpr))
 	{
-		BoolExpr   *be = (BoolExpr *) qual;
+		BoolExpr   *be = (BoolExpr *) expr;
 
 		foreach(lc, be->args)
-			if (!incr_validate_where_qual(lfirst(lc)))
+			if (!incr_validate_expr(lfirst(lc), viewQuery, allow_aggref))
 				return false;
 		return true;
 	}
 
-	if (IsA(qual, FuncExpr))
+	if (IsA(expr, FuncExpr))
 	{
-		FuncExpr   *fe = (FuncExpr *) qual;
+		FuncExpr   *fe = (FuncExpr *) expr;
 
-		if (fe->funcretset || func_volatile(fe->funcid) == PROVOLATILE_VOLATILE)
+		if (fe->funcretset)
+			return false;
+		/* WHERE/agg-arg mode: volatile functions break incremental maintenance */
+		if (!allow_aggref && func_volatile(fe->funcid) == PROVOLATILE_VOLATILE)
 			return false;
 		foreach(lc, fe->args)
-			if (!incr_validate_where_qual(lfirst(lc)))
+			if (!incr_validate_expr(lfirst(lc), viewQuery, allow_aggref))
 				return false;
 		return true;
 	}
 
-	if (IsA(qual, ScalarArrayOpExpr))
+	if (!allow_aggref)
 	{
-		ScalarArrayOpExpr *sao = (ScalarArrayOpExpr *) qual;
+		/* WHERE-only node types (not meaningful in HAVING) */
+		if (IsA(expr, ScalarArrayOpExpr))
+		{
+			ScalarArrayOpExpr *sao = (ScalarArrayOpExpr *) expr;
 
-		foreach(lc, sao->args)
-			if (!incr_validate_where_qual(lfirst(lc)))
-				return false;
-		return true;
-	}
+			foreach(lc, sao->args)
+				if (!incr_validate_expr(lfirst(lc), viewQuery, allow_aggref))
+					return false;
+			return true;
+		}
 
-	if (IsA(qual, ArrayExpr))
-	{
-		ArrayExpr  *ae = (ArrayExpr *) qual;
+		if (IsA(expr, ArrayExpr))
+		{
+			ArrayExpr  *ae = (ArrayExpr *) expr;
 
-		foreach(lc, ae->elements)
-			if (!incr_validate_where_qual(lfirst(lc)))
-				return false;
-		return true;
+			foreach(lc, ae->elements)
+				if (!incr_validate_expr(lfirst(lc), viewQuery, allow_aggref))
+					return false;
+			return true;
+		}
 	}
 
 	return false;
@@ -930,18 +940,18 @@ incr_deparse_where_qual(Node *qual, List *rtable, int delta_varno, StringInfo bu
 	if (IsA(qual, Var))
 	{
 		Var		   *v = (Var *) qual;
+		int			resolved_varno;
+		const char *colname = incr_resolve_var_colname(v, rtable, &resolved_varno);
 
 		if (delta_varno < 0)
-		{
-			/* Phase 1: bare column name — the transition table has no alias */
-			appendStringInfoString(buf,
-								   quote_identifier(incr_resolve_var_colname(v, rtable)));
-		}
+			/* Phase 1: bare column name — transition table has no alias */
+			appendStringInfoString(buf, quote_identifier(colname));
+		else if (resolved_varno == delta_varno)
+			/* delta table always gets _d_ */
+			appendStringInfo(buf, "%s.%s", INCR_DELTA_ALIAS, quote_identifier(colname));
 		else
-		{
-			/* Phase 2: use incr_deparse_expr for _d_ / _j_ aliasing */
-			incr_deparse_expr(qual, rtable, delta_varno, buf);
-		}
+			/* each join table gets its own _j<varno>_ alias */
+			appendStringInfo(buf, "_j%d_.%s", resolved_varno, quote_identifier(colname));
 		return;
 	}
 
@@ -1095,10 +1105,11 @@ incr_deparse_where_qual(Node *qual, List *rtable, int delta_varno, StringInfo bu
 
 /*
  * Chase RTE_GROUP / RTE_JOIN indirection and return the base-table column
- * name for a Var node.  Shared by incr_deparse_expr and incr_deparse_having_cond.
+ * name for a Var node.  If resolved_varno_out is non-NULL, also returns the
+ * varno of the resolved base RTE (used by incr_deparse_where_qual for aliasing).
  */
 static const char *
-incr_resolve_var_colname(Var *v, List *rtable)
+incr_resolve_var_colname(Var *v, List *rtable, int *resolved_varno_out)
 {
 	RangeTblEntry *rte;
 
@@ -1127,90 +1138,9 @@ incr_resolve_var_colname(Var *v, List *rtable)
 			elog(ERROR, "incr_resolve_var_colname: unexpected RTE kind %d",
 				 (int) rte->rtekind);
 	}
+	if (resolved_varno_out)
+		*resolved_varno_out = v->varno;
 	return get_attname(rte->relid, v->varattno, false);
-}
-
-/*
- * incr_validate_having
- * Return true if expr uses only maintained aggregates (COUNT/SUM/AVG),
- * group-by Vars, constants, comparisons, and boolean operators.
- * Used by MatviewIncrIsEligible to gate Phase 4 eligibility.
- */
-static bool
-incr_validate_having(Node *expr, Query *viewQuery)
-{
-	if (expr == NULL)
-		return true;
-
-	if (IsA(expr, Aggref))
-	{
-		Aggref	   *agg = (Aggref *) expr;
-		char	   *fname = get_func_name(agg->aggfnoid);
-		ListCell   *lc;
-
-		/* COUNT(*) — always maintained via __mv_count__ */
-		if (strcmp(fname, "count") == 0 && agg->aggstar)
-			return true;
-
-		/* Other aggregates must match a SELECT target */
-		foreach(lc, viewQuery->targetList)
-		{
-			TargetEntry *te = lfirst_node(TargetEntry, lc);
-
-			if (!IsA(te->expr, Aggref))
-				continue;
-			if (((Aggref *) te->expr)->aggfnoid == agg->aggfnoid)
-				return true;	/* same function — good enough for eligibility */
-		}
-		return false;
-	}
-	else if (IsA(expr, Var))
-		return true;
-	else if (IsA(expr, Const))
-		return true;
-	else if (IsA(expr, OpExpr))
-	{
-		OpExpr	   *op = (OpExpr *) expr;
-		ListCell   *lc;
-
-		foreach(lc, op->args)
-		{
-			if (!incr_validate_having(lfirst(lc), viewQuery))
-				return false;
-		}
-		return true;
-	}
-	else if (IsA(expr, BoolExpr))
-	{
-		BoolExpr   *be = (BoolExpr *) expr;
-		ListCell   *lc;
-
-		foreach(lc, be->args)
-		{
-			if (!incr_validate_having(lfirst(lc), viewQuery))
-				return false;
-		}
-		return true;
-	}
-	else if (IsA(expr, NullTest))
-		return true;			/* IS NULL / IS NOT NULL on group cols is fine */
-	else if (IsA(expr, FuncExpr))
-	{
-		/* Allow implicit type-coercion functions (e.g. int4 → numeric) */
-		FuncExpr   *fe = (FuncExpr *) expr;
-		ListCell   *lc;
-
-		if (!fe->funcretset)
-		{
-			foreach(lc, fe->args)
-			{
-				if (!incr_validate_having(lfirst(lc), viewQuery))
-					return false;
-			}
-			return true;
-		}
-	}
-	return false;
 }
 
 /*
@@ -1257,7 +1187,7 @@ incr_deparse_having_cond(Node *expr, Query *viewQuery, StringInfo buf)
 	{
 		/* Group column — resolve to base column name, then find the output resname */
 		Var		   *v = (Var *) expr;
-		const char *colname = incr_resolve_var_colname(v, viewQuery->rtable);
+		const char *colname = incr_resolve_var_colname(v, viewQuery->rtable, NULL);
 		ListCell   *lc;
 
 		foreach(lc, viewQuery->targetList)
@@ -1267,7 +1197,7 @@ incr_deparse_having_cond(Node *expr, Query *viewQuery, StringInfo buf)
 			if (!IsA(te->expr, Var))
 				continue;
 			if (strcmp(incr_resolve_var_colname((Var *) te->expr,
-												viewQuery->rtable),
+												viewQuery->rtable, NULL),
 					   colname) == 0)
 			{
 				appendStringInfoString(buf, quote_identifier(te->resname));
@@ -1470,162 +1400,144 @@ incr_collect_group_cols(Query *viewQuery, List **groupColNames)
 	}
 }
 
-/*
- * Collect aggregate column info: output name, function name, arg expression.
- * For COUNT(*), the arg node is NULL.
- */
-static void
-incr_collect_agg_info(Query *viewQuery,
-					  List **aggColNames,
-					  List **aggFuncNames,
-					  List **aggArgColNames)
-{
-	ListCell   *lc;
-
-	*aggColNames = NIL;
-	*aggFuncNames = NIL;
-	*aggArgColNames = NIL;
-
-	foreach(lc, viewQuery->targetList)
-	{
-		TargetEntry *te = lfirst_node(TargetEntry, lc);
-		Aggref	   *agg;
-		char	   *fname;
-		Node	   *arg_node = NULL;
-
-		if (te->resjunk || !IsA(te->expr, Aggref))
-			continue;
-
-		/* Hidden maintenance columns and AVG are handled separately */
-		if (incr_is_hidden_col(te->resname))
-			continue;
-
-		agg = (Aggref *) te->expr;
-		fname = get_func_name(agg->aggfnoid);
-
-		/* AVG is handled by incr_collect_avg_info, not here */
-		if (strcmp(fname, "avg") == 0)
-			continue;
-
-		if (agg->args != NIL)
-		{
-			TargetEntry *arg_te = linitial_node(TargetEntry, agg->args);
-
-			arg_node = (Node *) arg_te->expr;
-		}
-
-		*aggColNames = lappend(*aggColNames, makeString(pstrdup(te->resname)));
-		*aggFuncNames = lappend(*aggFuncNames, makeString(pstrdup(fname)));
-		*aggArgColNames = lappend(*aggArgColNames, arg_node); /* NULL = COUNT(*) */
-	}
-}
-
 /* ============================================================
- * SQL builders
+ * SQL builders — unified for Phase 1 (single table) and Phase 2+ (N-way joins)
+ *
+ * delta_varno: -1  = Phase 1 (bare column names, no table alias)
+ *             >=1  = Phase 2+ (_d_ for the delta table; _j<varno>_ for each
+ *                              additional join table)
+ * delta_table: FROM source name — "__mv_newtable", "__mv_oldtable", or the
+ *              qualified real table name (used by the HAVING backfill).
+ * join_list:  NIL          = Phase 1 (no join)
+ *             List of IncrJoinEntry* = one entry per additional join table,
+ *             in join order.  Phase 3+ just adds more entries here.
  * ============================================================
  */
 
 /*
- * incr_build_ins_sql — INSERT delta
+ * incr_append_from_join
+ * Append the FROM clause (including optional joins) to buf.
+ */
+static void
+incr_append_from_join(StringInfo buf, Query *viewQuery,
+					  int delta_varno,
+					  const char *delta_table,
+					  List *join_list)
+{
+	ListCell   *lc;
+
+	if (join_list == NIL)
+	{
+		appendStringInfo(buf, " FROM %s", delta_table);
+		return;
+	}
+
+	appendStringInfo(buf, " FROM %s %s", delta_table, INCR_DELTA_ALIAS);
+	foreach(lc, join_list)
+	{
+		IncrJoinEntry  *je = lfirst(lc);
+		StringInfoData	jbuf;
+
+		initStringInfo(&jbuf);
+		incr_deparse_where_qual(je->quals, viewQuery->rtable, delta_varno, &jbuf);
+		appendStringInfo(buf, " JOIN %s _j%d_ ON (%s)",
+						 mv_qname(je->oid), je->varno, jbuf.data);
+	}
+}
+
+/*
+ * incr_build_ins_sql_gen — INSERT delta (all phases)
  *
- *   INSERT INTO mv (g1, g2, sum_col, cnt_col, __mv_count__)
- *   SELECT g1, g2, SUM(col), COUNT(*), COUNT(*)
- *   FROM __mv_newtable
- *   GROUP BY g1, g2
- *   ON CONFLICT (g1, g2) DO UPDATE SET
- *     sum_col      = mv.sum_col      + EXCLUDED.sum_col,
- *     cnt_col      = mv.cnt_col      + EXCLUDED.cnt_col,
- *     __mv_count__ = mv.__mv_count__ + EXCLUDED.__mv_count__
+ *   INSERT INTO mv (cols)
+ *   SELECT ... FROM delta_table [_d_ JOIN t _j<v>_ ON (...)] [WHERE ...]
+ *   GROUP BY ...
+ *   ON CONFLICT (group_cols) DO UPDATE SET +deltas
  */
 static char *
-incr_build_ins_sql(Oid mvrelid, Query *viewQuery)
+incr_build_ins_sql_gen(Oid mvrelid, Query *viewQuery,
+					   int delta_varno,
+					   const char *delta_table,
+					   List *join_list)
 {
 	StringInfoData buf;
 	List	   *groupColNames = NIL;
-	List	   *aggColNames = NIL,
-			   *aggFuncNames = NIL,
-			   *aggArgColNames = NIL;
-	List	   *avgInfoList = NIL;
-	ListCell   *gcl,
-			   *acl,
-			   *fcl,
-			   *arcl,
-			   *lc;
+	ListCell   *lc,
+			   *gcl;
 	const char *mvname = mv_qname(mvrelid);
-	const char *cntcol = quote_identifier(MATVIEW_INCR_COUNT_COL);
 	bool		first;
 
 	incr_collect_group_cols(viewQuery, &groupColNames);
-	incr_collect_agg_info(viewQuery, &aggColNames, &aggFuncNames, &aggArgColNames);
-	incr_collect_avg_info(viewQuery, &avgInfoList);
-
 	initStringInfo(&buf);
 
-	/* INSERT INTO mv (group_cols, agg_cols, avg_cols, hidden_avg_cols, __mv_count__) */
+	/* INSERT INTO mv (...) */
 	appendStringInfo(&buf, "INSERT INTO %s (", mvname);
 	first = true;
-	foreach(gcl, groupColNames)
+	foreach(lc, viewQuery->targetList)
 	{
-		if (!first) appendStringInfoChar(&buf, ',');
-		appendStringInfoString(&buf, quote_identifier(strVal(lfirst(gcl))));
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+		if (te->resjunk)
+			continue;
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		appendStringInfoString(&buf, quote_identifier(te->resname));
 		first = false;
 	}
-	foreach(acl, aggColNames)
-		appendStringInfo(&buf, ",%s", quote_identifier(strVal(lfirst(acl))));
-	foreach(lc, avgInfoList)
-	{
-		AvgColInfo *ai = lfirst(lc);
+	appendStringInfoString(&buf, ") SELECT ");
 
-		appendStringInfo(&buf, ",%s,%s,%s",
-						 quote_identifier(ai->avg_col),
-						 quote_identifier(ai->sum_col),
-						 quote_identifier(ai->cnt_col));
-	}
-	if (viewQuery->havingQual != NULL)
-		appendStringInfo(&buf, ",%s", quote_identifier(MATVIEW_INCR_HAVING_COL));
-	appendStringInfo(&buf, ",%s) ", cntcol);
-
-	/* SELECT group_cols, agg_exprs, avg+hidden exprs, COUNT(*) FROM __mv_newtable GROUP BY ... */
-	appendStringInfoString(&buf, "SELECT ");
+	/* SELECT expressions */
 	first = true;
-	foreach(gcl, groupColNames)
+	foreach(lc, viewQuery->targetList)
 	{
-		if (!first) appendStringInfoChar(&buf, ',');
-		appendStringInfoString(&buf, quote_identifier(strVal(lfirst(gcl))));
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+		if (te->resjunk)
+			continue;
+		if (!first)
+			appendStringInfoChar(&buf, ',');
 		first = false;
-	}
-	forthree(acl, aggColNames, fcl, aggFuncNames, arcl, aggArgColNames)
-	{
-		const char *fname = strVal(lfirst(fcl));
-		Node	   *argnode = lfirst(arcl);
 
-		if (strcmp(fname, "count") == 0 && argnode == NULL)
-			appendStringInfoString(&buf, ",COUNT(*)");
-		else
+		if (strcmp(te->resname, MATVIEW_INCR_COUNT_COL) == 0)
+			appendStringInfoString(&buf, "COUNT(*)");
+		else if (strcmp(te->resname, MATVIEW_INCR_HAVING_COL) == 0)
+			appendStringInfoString(&buf, "true");
+		else if (IsA(te->expr, Var))
 		{
-			StringInfoData abuf;
+			StringInfoData ebuf;
 
-			initStringInfo(&abuf);
-			incr_deparse_where_qual(argnode, viewQuery->rtable, -1, &abuf);
-			appendStringInfo(&buf, ",%s(%s)", fname, abuf.data);
+			initStringInfo(&ebuf);
+			incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable,
+									delta_varno, &ebuf);
+			appendStringInfoString(&buf, ebuf.data);
 		}
-	}
-	foreach(lc, avgInfoList)
-	{
-		AvgColInfo *ai = lfirst(lc);
-		StringInfoData abuf;
+		else if (IsA(te->expr, Aggref))
+		{
+			Aggref		   *agg = (Aggref *) te->expr;
+			char		   *fname = get_func_name(agg->aggfnoid);
+			StringInfoData	ebuf;
 
-		initStringInfo(&abuf);
-		if (ai->arg_expr)
-			incr_deparse_where_qual(ai->arg_expr, viewQuery->rtable, -1, &abuf);
+			if (strcmp(fname, "count") == 0 && agg->aggstar)
+				appendStringInfoString(&buf, "COUNT(*)");
+			else if (agg->args != NIL)
+			{
+				TargetEntry *arg_te = linitial_node(TargetEntry, agg->args);
+
+				initStringInfo(&ebuf);
+				incr_deparse_where_qual((Node *) arg_te->expr, viewQuery->rtable,
+										delta_varno, &ebuf);
+				appendStringInfo(&buf, "%s(%s)", fname, ebuf.data);
+			}
+			else
+				appendStringInfo(&buf, "%s(*)", fname);
+		}
 		else
-			appendStringInfoString(&abuf, "NULL");
-		appendStringInfo(&buf, ",AVG(%s),SUM(%s),COUNT(%s)",
-						 abuf.data, abuf.data, abuf.data);
+			elog(ERROR,
+				 "incr_build_ins_sql_gen: unexpected expression type %d",
+				 (int) nodeTag(te->expr));
 	}
-	if (viewQuery->havingQual != NULL)
-		appendStringInfoString(&buf, ",true");
-	appendStringInfo(&buf, ",COUNT(*) FROM %s", MATVIEW_INCR_NEWTABLE);
+
+	/* FROM ... [JOIN ...] [WHERE ...] */
+	incr_append_from_join(&buf, viewQuery, delta_varno, delta_table, join_list);
 	{
 		Node	   *wq = incr_get_where_qual(viewQuery);
 
@@ -1634,175 +1546,192 @@ incr_build_ins_sql(Oid mvrelid, Query *viewQuery)
 			StringInfoData wbuf;
 
 			initStringInfo(&wbuf);
-			incr_deparse_where_qual(wq, viewQuery->rtable, -1, &wbuf);
+			incr_deparse_where_qual(wq, viewQuery->rtable, delta_varno, &wbuf);
 			appendStringInfo(&buf, " WHERE %s", wbuf.data);
 		}
 	}
+
+	/* GROUP BY */
 	appendStringInfoString(&buf, " GROUP BY ");
 	first = true;
-	foreach(gcl, groupColNames)
+	foreach(lc, viewQuery->targetList)
 	{
-		if (!first) appendStringInfoChar(&buf, ',');
-		appendStringInfoString(&buf, quote_identifier(strVal(lfirst(gcl))));
+		TargetEntry    *te = lfirst_node(TargetEntry, lc);
+		StringInfoData	ebuf;
+
+		if (te->resjunk || !IsA(te->expr, Var))
+			continue;
+		if (!first)
+			appendStringInfoChar(&buf, ',');
 		first = false;
+		initStringInfo(&ebuf);
+		incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable,
+								delta_varno, &ebuf);
+		appendStringInfoString(&buf, ebuf.data);
 	}
 
-	/* ON CONFLICT (group_cols) DO UPDATE SET ... */
+	/* ON CONFLICT (group_cols) DO UPDATE SET */
 	appendStringInfoString(&buf, " ON CONFLICT (");
 	first = true;
 	foreach(gcl, groupColNames)
 	{
-		if (!first) appendStringInfoChar(&buf, ',');
+		if (!first)
+			appendStringInfoChar(&buf, ',');
 		appendStringInfoString(&buf, quote_identifier(strVal(lfirst(gcl))));
 		first = false;
 	}
 	appendStringInfoString(&buf, ") DO UPDATE SET ");
 
-	/* Regular SUM/COUNT aggregates: simple addition */
 	first = true;
-	foreach(acl, aggColNames)
+	foreach(lc, viewQuery->targetList)
 	{
-		const char *colq = quote_identifier(strVal(lfirst(acl)));
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+		const char  *colq;
 
-		if (!first) appendStringInfoChar(&buf, ',');
-		appendStringInfo(&buf, "%s=%s.%s+EXCLUDED.%s", colq, mvname, colq, colq);
-		first = false;
+		if (te->resjunk || IsA(te->expr, Var))
+			continue;
+		if (strcmp(te->resname, MATVIEW_INCR_HAVING_COL) == 0)
+			continue;
+		/* hidden avgsum/avgcnt emitted as part of their parent AVG column */
+		if (strncmp(te->resname, MATVIEW_INCR_AVGSUM_PREFIX,
+					strlen(MATVIEW_INCR_AVGSUM_PREFIX)) == 0 ||
+			strncmp(te->resname, MATVIEW_INCR_AVGCNT_PREFIX,
+					strlen(MATVIEW_INCR_AVGCNT_PREFIX)) == 0)
+			continue;
+
+		colq = quote_identifier(te->resname);
+
+		if (IsA(te->expr, Aggref) &&
+			strcmp(get_func_name(((Aggref *) te->expr)->aggfnoid), "avg") == 0)
+		{
+			/* AVG: update hidden sum/cnt then recompute visible avg */
+			Aggref	   *agg = (Aggref *) te->expr;
+			char	   *sum_col = psprintf("%s%s", MATVIEW_INCR_AVGSUM_PREFIX, te->resname);
+			char	   *cnt_col = psprintf("%s%s", MATVIEW_INCR_AVGCNT_PREFIX, te->resname);
+			const char *sum_q = quote_identifier(sum_col);
+			const char *cnt_q = quote_identifier(cnt_col);
+			const char *type_name = format_type_be(agg->aggtype);
+
+			if (!first)
+				appendStringInfoChar(&buf, ',');
+			appendStringInfo(&buf,
+							 "%s=%s.%s+EXCLUDED.%s"
+							 ",%s=%s.%s+EXCLUDED.%s"
+							 ",%s=((%s.%s+EXCLUDED.%s)::%s/NULLIF(%s.%s+EXCLUDED.%s,0))",
+							 sum_q, mvname, sum_q, sum_q,
+							 cnt_q, mvname, cnt_q, cnt_q,
+							 colq,
+							 mvname, sum_q, sum_q, type_name,
+							 mvname, cnt_q, cnt_q);
+			first = false;
+		}
+		else
+		{
+			if (!first)
+				appendStringInfoChar(&buf, ',');
+			appendStringInfo(&buf, "%s=%s.%s+EXCLUDED.%s", colq, mvname, colq, colq);
+			first = false;
+		}
 	}
-
-	/* AVG aggregates: update hidden sum/cnt, then recompute visible avg */
-	foreach(lc, avgInfoList)
-	{
-		AvgColInfo *ai = lfirst(lc);
-		const char *avg_q = quote_identifier(ai->avg_col);
-		const char *sum_q = quote_identifier(ai->sum_col);
-		const char *cnt_q = quote_identifier(ai->cnt_col);
-		const char *type_name = format_type_be(ai->avg_rettype);
-
-		if (!first) appendStringInfoChar(&buf, ',');
-		appendStringInfo(&buf,
-						 "%s=%s.%s+EXCLUDED.%s"
-						 ",%s=%s.%s+EXCLUDED.%s"
-						 ",%s=((%s.%s+EXCLUDED.%s)::%s/NULLIF(%s.%s+EXCLUDED.%s,0))",
-						 sum_q, mvname, sum_q, sum_q,
-						 cnt_q, mvname, cnt_q, cnt_q,
-						 avg_q,
-						 mvname, sum_q, sum_q, type_name,
-						 mvname, cnt_q, cnt_q);
-		first = false;
-	}
-
-	if (!first) appendStringInfoChar(&buf, ',');
-	appendStringInfo(&buf, "%s=%s.%s+EXCLUDED.%s", cntcol, mvname, cntcol, cntcol);
 
 	return buf.data;
 }
 
 /*
- * incr_build_backfill_sql — one-time setup for HAVING matviews
+ * incr_build_backfill_sql_gen — one-time HAVING backfill (all phases)
  *
- * Inserts all groups (not just HAVING-passing ones) into the base table so
- * that groups which initially fail HAVING are still tracked.  Groups already
- * present (they passed HAVING during initial population) are left untouched
- * via ON CONFLICT DO NOTHING.
+ * Like incr_build_ins_sql_gen but:
+ *   __mv_having_ok__ = false   (DO NOTHING leaves passing rows intact)
+ *   ON CONFLICT DO NOTHING     (no delta accumulation)
  *
- *   INSERT INTO base (g1, ..., agg_cols, ..., __mv_having_ok__, __mv_count__)
- *   SELECT g1, ..., agg_exprs, ..., false, COUNT(*)
- *   FROM <srctable>
- *   GROUP BY g1, ...
- *   ON CONFLICT (g1, ...) DO NOTHING
+ * delta_table must be the actual source table name, not a transition table.
  */
 static char *
-incr_build_backfill_sql(Oid mvrelid, Query *viewQuery, Oid srctable)
+incr_build_backfill_sql_gen(Oid mvrelid, Query *viewQuery,
+							int delta_varno,
+							const char *delta_table,
+							List *join_list)
 {
 	StringInfoData buf;
 	List	   *groupColNames = NIL;
-	List	   *aggColNames = NIL,
-			   *aggFuncNames = NIL,
-			   *aggArgColNames = NIL;
-	List	   *avgInfoList = NIL;
-	ListCell   *gcl,
-			   *acl,
-			   *fcl,
-			   *arcl,
-			   *lc;
+	ListCell   *lc,
+			   *gcl;
 	const char *mvname = mv_qname(mvrelid);
-	const char *cntcol = quote_identifier(MATVIEW_INCR_COUNT_COL);
-	const char *srctable_name;
 	bool		first;
 
 	incr_collect_group_cols(viewQuery, &groupColNames);
-	incr_collect_agg_info(viewQuery, &aggColNames, &aggFuncNames, &aggArgColNames);
-	incr_collect_avg_info(viewQuery, &avgInfoList);
-
-	srctable_name = quote_qualified_identifier(
-		get_namespace_name(get_rel_namespace(srctable)),
-		get_rel_name(srctable));
-
 	initStringInfo(&buf);
 
-	/* INSERT INTO base (group_cols, agg_cols, ..., __mv_having_ok__, __mv_count__) */
+	/* INSERT INTO mv (...) */
 	appendStringInfo(&buf, "INSERT INTO %s (", mvname);
 	first = true;
-	foreach(gcl, groupColNames)
+	foreach(lc, viewQuery->targetList)
 	{
-		if (!first) appendStringInfoChar(&buf, ',');
-		appendStringInfoString(&buf, quote_identifier(strVal(lfirst(gcl))));
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+		if (te->resjunk)
+			continue;
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		appendStringInfoString(&buf, quote_identifier(te->resname));
 		first = false;
 	}
-	foreach(acl, aggColNames)
-		appendStringInfo(&buf, ",%s", quote_identifier(strVal(lfirst(acl))));
-	foreach(lc, avgInfoList)
-	{
-		AvgColInfo *ai = lfirst(lc);
+	appendStringInfoString(&buf, ") SELECT ");
 
-		appendStringInfo(&buf, ",%s,%s,%s",
-						 quote_identifier(ai->avg_col),
-						 quote_identifier(ai->sum_col),
-						 quote_identifier(ai->cnt_col));
-	}
-	appendStringInfo(&buf, ",%s,%s) ",
-					 quote_identifier(MATVIEW_INCR_HAVING_COL), cntcol);
-
-	/* SELECT group_cols, agg_exprs, ..., false, COUNT(*) FROM srctable GROUP BY ... */
-	appendStringInfoString(&buf, "SELECT ");
+	/* SELECT expressions — same as ins_sql_gen except __mv_having_ok__ = false */
 	first = true;
-	foreach(gcl, groupColNames)
+	foreach(lc, viewQuery->targetList)
 	{
-		if (!first) appendStringInfoChar(&buf, ',');
-		appendStringInfoString(&buf, quote_identifier(strVal(lfirst(gcl))));
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+		if (te->resjunk)
+			continue;
+		if (!first)
+			appendStringInfoChar(&buf, ',');
 		first = false;
-	}
-	forthree(acl, aggColNames, fcl, aggFuncNames, arcl, aggArgColNames)
-	{
-		const char *fname = strVal(lfirst(fcl));
-		Node	   *argnode = lfirst(arcl);
 
-		if (strcmp(fname, "count") == 0 && argnode == NULL)
-			appendStringInfoString(&buf, ",COUNT(*)");
-		else
+		if (strcmp(te->resname, MATVIEW_INCR_COUNT_COL) == 0)
+			appendStringInfoString(&buf, "COUNT(*)");
+		else if (strcmp(te->resname, MATVIEW_INCR_HAVING_COL) == 0)
+			/* false so DO NOTHING leaves already-passing rows (having_ok=true) alone */
+			appendStringInfoString(&buf, "false");
+		else if (IsA(te->expr, Var))
 		{
-			StringInfoData abuf;
+			StringInfoData ebuf;
 
-			initStringInfo(&abuf);
-			incr_deparse_where_qual(argnode, viewQuery->rtable, -1, &abuf);
-			appendStringInfo(&buf, ",%s(%s)", fname, abuf.data);
+			initStringInfo(&ebuf);
+			incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable,
+									delta_varno, &ebuf);
+			appendStringInfoString(&buf, ebuf.data);
 		}
-	}
-	foreach(lc, avgInfoList)
-	{
-		AvgColInfo *ai = lfirst(lc);
-		StringInfoData abuf;
+		else if (IsA(te->expr, Aggref))
+		{
+			Aggref		   *agg = (Aggref *) te->expr;
+			char		   *fname = get_func_name(agg->aggfnoid);
+			StringInfoData	ebuf;
 
-		initStringInfo(&abuf);
-		if (ai->arg_expr)
-			incr_deparse_where_qual(ai->arg_expr, viewQuery->rtable, -1, &abuf);
+			if (strcmp(fname, "count") == 0 && agg->aggstar)
+				appendStringInfoString(&buf, "COUNT(*)");
+			else if (agg->args != NIL)
+			{
+				TargetEntry *arg_te = linitial_node(TargetEntry, agg->args);
+
+				initStringInfo(&ebuf);
+				incr_deparse_where_qual((Node *) arg_te->expr, viewQuery->rtable,
+										delta_varno, &ebuf);
+				appendStringInfo(&buf, "%s(%s)", fname, ebuf.data);
+			}
+			else
+				appendStringInfo(&buf, "%s(*)", fname);
+		}
 		else
-			appendStringInfoString(&abuf, "NULL");
-		appendStringInfo(&buf, ",AVG(%s),SUM(%s),COUNT(%s)",
-						 abuf.data, abuf.data, abuf.data);
+			elog(ERROR,
+				 "incr_build_backfill_sql_gen: unexpected expression type %d",
+				 (int) nodeTag(te->expr));
 	}
-	/* __mv_having_ok__ = false for all backfill rows; DO NOTHING leaves passing rows alone */
-	appendStringInfo(&buf, ",false,COUNT(*) FROM %s", srctable_name);
+
+	/* FROM ... [JOIN ...] [WHERE ...] */
+	incr_append_from_join(&buf, viewQuery, delta_varno, delta_table, join_list);
 	{
 		Node	   *wq = incr_get_where_qual(viewQuery);
 
@@ -1811,25 +1740,37 @@ incr_build_backfill_sql(Oid mvrelid, Query *viewQuery, Oid srctable)
 			StringInfoData wbuf;
 
 			initStringInfo(&wbuf);
-			incr_deparse_where_qual(wq, viewQuery->rtable, -1, &wbuf);
+			incr_deparse_where_qual(wq, viewQuery->rtable, delta_varno, &wbuf);
 			appendStringInfo(&buf, " WHERE %s", wbuf.data);
 		}
 	}
+
+	/* GROUP BY */
 	appendStringInfoString(&buf, " GROUP BY ");
 	first = true;
-	foreach(gcl, groupColNames)
+	foreach(lc, viewQuery->targetList)
 	{
-		if (!first) appendStringInfoChar(&buf, ',');
-		appendStringInfoString(&buf, quote_identifier(strVal(lfirst(gcl))));
+		TargetEntry    *te = lfirst_node(TargetEntry, lc);
+		StringInfoData	ebuf;
+
+		if (te->resjunk || !IsA(te->expr, Var))
+			continue;
+		if (!first)
+			appendStringInfoChar(&buf, ',');
 		first = false;
+		initStringInfo(&ebuf);
+		incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable,
+								delta_varno, &ebuf);
+		appendStringInfoString(&buf, ebuf.data);
 	}
 
-	/* ON CONFLICT DO NOTHING — don't overwrite already-passing groups */
+	/* ON CONFLICT DO NOTHING — passing groups already present */
 	appendStringInfoString(&buf, " ON CONFLICT (");
 	first = true;
 	foreach(gcl, groupColNames)
 	{
-		if (!first) appendStringInfoChar(&buf, ',');
+		if (!first)
+			appendStringInfoChar(&buf, ',');
 		appendStringInfoString(&buf, quote_identifier(strVal(lfirst(gcl))));
 		first = false;
 	}
@@ -1839,84 +1780,100 @@ incr_build_backfill_sql(Oid mvrelid, Query *viewQuery, Oid srctable)
 }
 
 /*
- * incr_build_del_sql — DELETE delta
+ * incr_build_del_sql_gen — DELETE delta (all phases)
  *
  *   WITH d AS (
- *     SELECT g1, g2, SUM(col) AS sum_col, COUNT(*) AS __mv_count__
- *     FROM __mv_oldtable GROUP BY g1, g2
+ *     SELECT group_col AS colname, ..., agg_col AS colname, ...,
+ *            COUNT(*) AS __mv_count__
+ *     FROM delta_table [_d_ JOIN t _j<v>_ ON (...)] [WHERE ...]
+ *     GROUP BY ...
  *   )
- *   UPDATE mv SET
- *     sum_col      = mv.sum_col      - d.sum_col,
- *     __mv_count__ = mv.__mv_count__ - d.__mv_count__
+ *   UPDATE mv SET agg = mv.agg - d.agg, ..., __mv_count__ = mv.__mv_count__ - d.__mv_count__
  *   FROM d
- *   WHERE mv.g1 = d.g1 AND mv.g2 = d.g2
+ *   WHERE mv.g1 = d.g1 AND ...
+ *
+ * The visible AVG column is excluded from the CTE and recomputed from the
+ * hidden sum/cnt columns in the UPDATE SET.
  */
 static char *
-incr_build_del_sql(Oid mvrelid, Query *viewQuery)
+incr_build_del_sql_gen(Oid mvrelid, Query *viewQuery,
+					   int delta_varno,
+					   const char *delta_table,
+					   List *join_list)
 {
 	StringInfoData buf;
 	List	   *groupColNames = NIL;
-	List	   *aggColNames = NIL,
-			   *aggFuncNames = NIL,
-			   *aggArgColNames = NIL;
-	List	   *avgInfoList = NIL;
-	ListCell   *gcl,
-			   *acl,
-			   *fcl,
-			   *arcl,
-			   *lc;
+	ListCell   *lc,
+			   *gcl;
 	const char *mvname = mv_qname(mvrelid);
 	const char *cntcol = quote_identifier(MATVIEW_INCR_COUNT_COL);
 	bool		first;
 
 	incr_collect_group_cols(viewQuery, &groupColNames);
-	incr_collect_agg_info(viewQuery, &aggColNames, &aggFuncNames, &aggArgColNames);
-	incr_collect_avg_info(viewQuery, &avgInfoList);
-
 	initStringInfo(&buf);
 
-	/* WITH d AS (SELECT group_cols, agg_exprs, hidden avg cols, COUNT(*) FROM __mv_oldtable ...) */
+	/* WITH d AS (SELECT ... */
 	appendStringInfoString(&buf, "WITH d AS (SELECT ");
 	first = true;
-	foreach(gcl, groupColNames)
+	foreach(lc, viewQuery->targetList)
 	{
-		if (!first) appendStringInfoChar(&buf, ',');
-		appendStringInfoString(&buf, quote_identifier(strVal(lfirst(gcl))));
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+		if (te->resjunk)
+			continue;
+		/* visible AVG is recomputed from hidden sum/cnt — exclude from CTE */
+		if (IsA(te->expr, Aggref) &&
+			strcmp(get_func_name(((Aggref *) te->expr)->aggfnoid), "avg") == 0)
+			continue;
+		/* HAVING flag is not a delta quantity */
+		if (strcmp(te->resname, MATVIEW_INCR_HAVING_COL) == 0)
+			continue;
+
+		if (!first)
+			appendStringInfoChar(&buf, ',');
 		first = false;
-	}
-	forthree(acl, aggColNames, fcl, aggFuncNames, arcl, aggArgColNames)
-	{
-		const char *fname = strVal(lfirst(fcl));
-		Node	   *argnode = lfirst(arcl);
-		const char *colq = quote_identifier(strVal(lfirst(acl)));
 
-		if (strcmp(fname, "count") == 0 && argnode == NULL)
-			appendStringInfo(&buf, ",COUNT(*) AS %s", colq);
-		else
+		if (strcmp(te->resname, MATVIEW_INCR_COUNT_COL) == 0)
+			appendStringInfo(&buf, "COUNT(*) AS %s", cntcol);
+		else if (IsA(te->expr, Var))
 		{
-			StringInfoData abuf;
+			StringInfoData ebuf;
 
-			initStringInfo(&abuf);
-			incr_deparse_where_qual(argnode, viewQuery->rtable, -1, &abuf);
-			appendStringInfo(&buf, ",%s(%s) AS %s", fname, abuf.data, colq);
+			initStringInfo(&ebuf);
+			incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable,
+									delta_varno, &ebuf);
+			appendStringInfo(&buf, "%s AS %s", ebuf.data,
+							 quote_identifier(te->resname));
 		}
-	}
-	/* Hidden AVG support cols in CTE */
-	foreach(lc, avgInfoList)
-	{
-		AvgColInfo *ai = lfirst(lc);
-		StringInfoData abuf;
+		else if (IsA(te->expr, Aggref))
+		{
+			Aggref		   *agg = (Aggref *) te->expr;
+			char		   *fname = get_func_name(agg->aggfnoid);
+			const char	   *colq = quote_identifier(te->resname);
+			StringInfoData	ebuf;
 
-		initStringInfo(&abuf);
-		if (ai->arg_expr)
-			incr_deparse_where_qual(ai->arg_expr, viewQuery->rtable, -1, &abuf);
+			if (strcmp(fname, "count") == 0 && agg->aggstar)
+				appendStringInfo(&buf, "COUNT(*) AS %s", colq);
+			else if (agg->args != NIL)
+			{
+				TargetEntry *arg_te = linitial_node(TargetEntry, agg->args);
+
+				initStringInfo(&ebuf);
+				incr_deparse_where_qual((Node *) arg_te->expr, viewQuery->rtable,
+										delta_varno, &ebuf);
+				appendStringInfo(&buf, "%s(%s) AS %s", fname, ebuf.data, colq);
+			}
+			else
+				appendStringInfo(&buf, "%s(*) AS %s", fname, colq);
+		}
 		else
-			appendStringInfoString(&abuf, "NULL");
-		appendStringInfo(&buf, ",SUM(%s) AS %s,COUNT(%s) AS %s",
-						 abuf.data, quote_identifier(ai->sum_col),
-						 abuf.data, quote_identifier(ai->cnt_col));
+			elog(ERROR,
+				 "incr_build_del_sql_gen: unexpected expression type %d",
+				 (int) nodeTag(te->expr));
 	}
-	appendStringInfo(&buf, ",COUNT(*) AS %s FROM %s", cntcol, MATVIEW_INCR_OLDTABLE);
+
+	/* FROM ... [JOIN ...] [WHERE ...] GROUP BY ... ) */
+	incr_append_from_join(&buf, viewQuery, delta_varno, delta_table, join_list);
 	{
 		Node	   *wq = incr_get_where_qual(viewQuery);
 
@@ -1925,62 +1882,92 @@ incr_build_del_sql(Oid mvrelid, Query *viewQuery)
 			StringInfoData wbuf;
 
 			initStringInfo(&wbuf);
-			incr_deparse_where_qual(wq, viewQuery->rtable, -1, &wbuf);
+			incr_deparse_where_qual(wq, viewQuery->rtable, delta_varno, &wbuf);
 			appendStringInfo(&buf, " WHERE %s", wbuf.data);
 		}
 	}
 	appendStringInfoString(&buf, " GROUP BY ");
 	first = true;
-	foreach(gcl, groupColNames)
+	foreach(lc, viewQuery->targetList)
 	{
-		if (!first) appendStringInfoChar(&buf, ',');
-		appendStringInfoString(&buf, quote_identifier(strVal(lfirst(gcl))));
+		TargetEntry    *te = lfirst_node(TargetEntry, lc);
+		StringInfoData	ebuf;
+
+		if (te->resjunk || !IsA(te->expr, Var))
+			continue;
+		if (!first)
+			appendStringInfoChar(&buf, ',');
 		first = false;
+		initStringInfo(&ebuf);
+		incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable,
+								delta_varno, &ebuf);
+		appendStringInfoString(&buf, ebuf.data);
 	}
 	appendStringInfoString(&buf, ") ");
 
-	/* UPDATE mv SET agg=mv.agg-d.agg, hidden_avg, avg_recompute, __mv_count__ */
+	/* UPDATE mv SET agg = mv.agg - d.agg, ... */
 	appendStringInfo(&buf, "UPDATE %s SET ", mvname);
 	first = true;
-	foreach(acl, aggColNames)
+	foreach(lc, viewQuery->targetList)
 	{
-		const char *colq = quote_identifier(strVal(lfirst(acl)));
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+		const char  *colq;
 
-		if (!first) appendStringInfoChar(&buf, ',');
-		appendStringInfo(&buf, "%s=%s.%s-d.%s", colq, mvname, colq, colq);
-		first = false;
+		if (te->resjunk || IsA(te->expr, Var))
+			continue;
+		if (strcmp(te->resname, MATVIEW_INCR_HAVING_COL) == 0)
+			continue;
+		/* hidden avgsum/avgcnt emitted as part of their parent AVG column */
+		if (strncmp(te->resname, MATVIEW_INCR_AVGSUM_PREFIX,
+					strlen(MATVIEW_INCR_AVGSUM_PREFIX)) == 0 ||
+			strncmp(te->resname, MATVIEW_INCR_AVGCNT_PREFIX,
+					strlen(MATVIEW_INCR_AVGCNT_PREFIX)) == 0)
+			continue;
+
+		colq = quote_identifier(te->resname);
+
+		if (IsA(te->expr, Aggref) &&
+			strcmp(get_func_name(((Aggref *) te->expr)->aggfnoid), "avg") == 0)
+		{
+			/* AVG: subtract from hidden sum/cnt then recompute visible avg */
+			Aggref	   *agg = (Aggref *) te->expr;
+			char	   *sum_col = psprintf("%s%s", MATVIEW_INCR_AVGSUM_PREFIX, te->resname);
+			char	   *cnt_col = psprintf("%s%s", MATVIEW_INCR_AVGCNT_PREFIX, te->resname);
+			const char *sum_q = quote_identifier(sum_col);
+			const char *cnt_q = quote_identifier(cnt_col);
+			const char *type_name = format_type_be(agg->aggtype);
+
+			if (!first)
+				appendStringInfoChar(&buf, ',');
+			appendStringInfo(&buf,
+							 "%s=%s.%s-d.%s"
+							 ",%s=%s.%s-d.%s"
+							 ",%s=((%s.%s-d.%s)::%s/NULLIF(%s.%s-d.%s,0))",
+							 sum_q, mvname, sum_q, sum_q,
+							 cnt_q, mvname, cnt_q, cnt_q,
+							 colq,
+							 mvname, sum_q, sum_q, type_name,
+							 mvname, cnt_q, cnt_q);
+			first = false;
+		}
+		else
+		{
+			if (!first)
+				appendStringInfoChar(&buf, ',');
+			appendStringInfo(&buf, "%s=%s.%s-d.%s", colq, mvname, colq, colq);
+			first = false;
+		}
 	}
-	foreach(lc, avgInfoList)
-	{
-		AvgColInfo *ai = lfirst(lc);
-		const char *avg_q = quote_identifier(ai->avg_col);
-		const char *sum_q = quote_identifier(ai->sum_col);
-		const char *cnt_q = quote_identifier(ai->cnt_col);
-		const char *type_name = format_type_be(ai->avg_rettype);
 
-		if (!first) appendStringInfoChar(&buf, ',');
-		appendStringInfo(&buf,
-						 "%s=%s.%s-d.%s"
-						 ",%s=%s.%s-d.%s"
-						 ",%s=((%s.%s-d.%s)::%s/NULLIF(%s.%s-d.%s,0))",
-						 sum_q, mvname, sum_q, sum_q,
-						 cnt_q, mvname, cnt_q, cnt_q,
-						 avg_q,
-						 mvname, sum_q, sum_q, type_name,
-						 mvname, cnt_q, cnt_q);
-		first = false;
-	}
-	if (!first) appendStringInfoChar(&buf, ',');
-	appendStringInfo(&buf, "%s=%s.%s-d.%s", cntcol, mvname, cntcol, cntcol);
-
-	/* FROM d WHERE mv.g = d.g */
+	/* FROM d WHERE mv.g = d.g AND ... */
 	appendStringInfo(&buf, " FROM d WHERE ");
 	first = true;
 	foreach(gcl, groupColNames)
 	{
 		const char *colq = quote_identifier(strVal(lfirst(gcl)));
 
-		if (!first) appendStringInfoString(&buf, " AND ");
+		if (!first)
+			appendStringInfoString(&buf, " AND ");
 		appendStringInfo(&buf, "%s.%s=d.%s", mvname, colq, colq);
 		first = false;
 	}
@@ -1995,6 +1982,8 @@ incr_build_cln_sql(Oid mvrelid)
 					mv_qname(mvrelid),
 					quote_identifier(MATVIEW_INCR_COUNT_COL));
 }
+
+
 
 /* ============================================================
  * Phase 2 helpers
@@ -2058,677 +2047,6 @@ incr_get_join_info(Query *viewQuery,
 	if (*join_quals == NULL)
 		elog(ERROR, "incr_get_join_info: no join condition found");
 }
-
-/*
- * incr_deparse_expr
- * Render a query-tree Node to SQL, substituting aliases:
- *   Var(varno == delta_varno)  →  _d_."colname"
- *   Var(other varno)           →  _j_."colname"
- * Handles Var, OpExpr (binary operators), and BoolExpr (AND/OR/NOT).
- *
- * PG17+ wraps GROUP BY columns in an RTE_GROUP entry; explicit JOINs add an
- * RTE_JOIN.  Both have relid=0, so we follow the indirection chain until we
- * reach an RTE_RELATION.
- */
-static void
-incr_deparse_expr(Node *expr, List *rtable, int delta_varno, StringInfo buf)
-{
-	if (expr == NULL)
-		return;
-
-	if (IsA(expr, Var))
-	{
-		Var		   *v = (Var *) expr;
-		RangeTblEntry *rte;
-		const char *colname;
-		const char *alias;
-
-		/* Chase RTE_JOIN/RTE_GROUP indirection until we find the base table */
-		for (;;)
-		{
-			rte = rt_fetch(v->varno, rtable);
-			if (rte->rtekind == RTE_RELATION)
-				break;
-			if (rte->rtekind == RTE_JOIN)
-			{
-				/* joinaliasvars maps output col position → underlying Var */
-				Node *av = list_nth(rte->joinaliasvars, v->varattno - 1);
-				if (!IsA(av, Var))
-					elog(ERROR, "incr_deparse_expr: non-Var in joinaliasvars");
-				v = (Var *) av;
-			}
-			else if (rte->rtekind == RTE_GROUP)
-			{
-				/* groupexprs maps output position → grouping expression */
-				Node *ge = list_nth(rte->groupexprs, v->varattno - 1);
-				if (!IsA(ge, Var))
-					elog(ERROR, "incr_deparse_expr: non-Var in groupexprs");
-				v = (Var *) ge;
-			}
-			else
-				elog(ERROR,
-					 "incr_deparse_expr: unexpected RTE kind %d at varno %d",
-					 (int) rte->rtekind, v->varno);
-		}
-
-		colname = get_attname(rte->relid, v->varattno, false);
-		alias = (v->varno == delta_varno) ? INCR_DELTA_ALIAS : INCR_JOIN_ALIAS;
-		appendStringInfo(buf, "%s.%s", alias, quote_identifier(colname));
-	}
-	else if (IsA(expr, OpExpr))
-	{
-		OpExpr	   *op = (OpExpr *) expr;
-		HeapTuple	tup;
-		Form_pg_operator opform;
-		char	   *opname;
-
-		tup = SearchSysCache1(OPEROID, ObjectIdGetDatum(op->opno));
-		if (!HeapTupleIsValid(tup))
-			elog(ERROR, "incr_deparse_expr: operator %u not found", op->opno);
-		opform = (Form_pg_operator) GETSTRUCT(tup);
-		opname = pstrdup(NameStr(opform->oprname));
-		ReleaseSysCache(tup);
-
-		appendStringInfoChar(buf, '(');
-		incr_deparse_expr(linitial(op->args), rtable, delta_varno, buf);
-		appendStringInfo(buf, " %s ", opname);
-		incr_deparse_expr(lsecond(op->args), rtable, delta_varno, buf);
-		appendStringInfoChar(buf, ')');
-	}
-	else if (IsA(expr, BoolExpr))
-	{
-		BoolExpr   *boolexpr = (BoolExpr *) expr;
-		const char *opstr;
-		ListCell   *lc;
-		bool		first = true;
-
-		opstr = (boolexpr->boolop == AND_EXPR) ? " AND " :
-				(boolexpr->boolop == OR_EXPR)  ? " OR "  : " NOT ";
-
-		appendStringInfoChar(buf, '(');
-		foreach(lc, boolexpr->args)
-		{
-			if (!first)
-				appendStringInfoString(buf, opstr);
-			incr_deparse_expr(lfirst(lc), rtable, delta_varno, buf);
-			first = false;
-		}
-		appendStringInfoChar(buf, ')');
-	}
-	else
-		elog(ERROR,
-			 "incr_deparse_expr: unsupported expression type %d in join condition",
-			 (int) nodeTag(expr));
-}
-
-/*
- * incr_build_ins_sql_join — Phase 2 INSERT delta
- *
- * When rows in the delta-side table change, join the transition table with the
- * current state of the other table:
- *
- *   INSERT INTO mv (g1, agg_col, __mv_count__)
- *   SELECT _d_.g1, SUM(_j_.agg_arg), COUNT(*)
- *   FROM __mv_newtable _d_ JOIN schema.other _j_ ON (join_cond)
- *   GROUP BY _d_.g1
- *   ON CONFLICT (g1) DO UPDATE SET
- *     agg_col      = mv.agg_col      + EXCLUDED.agg_col,
- *     __mv_count__ = mv.__mv_count__ + EXCLUDED.__mv_count__
- */
-static char *
-incr_build_ins_sql_join(Oid mvrelid, Query *viewQuery,
-						int delta_varno, Oid other_oid,
-						Node *join_quals)
-{
-	StringInfoData buf;
-	StringInfoData jbuf;
-	List	   *groupColNames = NIL;
-	ListCell   *lc,
-			   *gcl;
-	const char *mvname = mv_qname(mvrelid);
-	const char *other_qname = mv_qname(other_oid);
-	bool		first;
-
-	incr_collect_group_cols(viewQuery, &groupColNames);
-	initStringInfo(&buf);
-	initStringInfo(&jbuf);
-
-	incr_deparse_expr(join_quals, viewQuery->rtable, delta_varno, &jbuf);
-
-	/* INSERT INTO mv (output_cols) */
-	appendStringInfo(&buf, "INSERT INTO %s (", mvname);
-	first = true;
-	foreach(lc, viewQuery->targetList)
-	{
-		TargetEntry *te = lfirst_node(TargetEntry, lc);
-
-		if (te->resjunk)
-			continue;
-		if (!first)
-			appendStringInfoChar(&buf, ',');
-		appendStringInfoString(&buf, quote_identifier(te->resname));
-		first = false;
-	}
-	appendStringInfoString(&buf, ") SELECT ");
-
-	/* SELECT: group cols as _d_.col/_j_.col, aggs with aliased args */
-	first = true;
-	foreach(lc, viewQuery->targetList)
-	{
-		TargetEntry *te = lfirst_node(TargetEntry, lc);
-
-		if (te->resjunk)
-			continue;
-		if (!first)
-			appendStringInfoChar(&buf, ',');
-		first = false;
-
-		if (strcmp(te->resname, MATVIEW_INCR_COUNT_COL) == 0)
-		{
-			appendStringInfoString(&buf, "COUNT(*)");
-		}
-		else if (strcmp(te->resname, MATVIEW_INCR_HAVING_COL) == 0)
-		{
-			/* new groups start as passing; hav_sql corrects after delta */
-			appendStringInfoString(&buf, "true");
-		}
-		else if (IsA(te->expr, Var))
-		{
-			StringInfoData ebuf;
-
-			initStringInfo(&ebuf);
-			incr_deparse_expr((Node *) te->expr, viewQuery->rtable,
-							  delta_varno, &ebuf);
-			appendStringInfoString(&buf, ebuf.data);
-		}
-		else if (IsA(te->expr, Aggref))
-		{
-			Aggref	   *agg = (Aggref *) te->expr;
-			char	   *fname = get_func_name(agg->aggfnoid);
-
-			if (strcmp(fname, "count") == 0 && agg->aggstar)
-				appendStringInfoString(&buf, "COUNT(*)");
-			else if (agg->args != NIL)
-			{
-				TargetEntry *arg_te = linitial_node(TargetEntry, agg->args);
-				StringInfoData ebuf;
-
-				initStringInfo(&ebuf);
-				incr_deparse_where_qual((Node *) arg_te->expr, viewQuery->rtable,
-										delta_varno, &ebuf);
-				appendStringInfo(&buf, "%s(%s)", fname, ebuf.data);
-			}
-			else
-				appendStringInfo(&buf, "%s(*)", fname);
-		}
-	}
-
-	/* FROM __mv_newtable _d_ JOIN other _j_ ON (condition) [WHERE ...] */
-	appendStringInfo(&buf, " FROM %s %s JOIN %s %s ON (%s)",
-					 MATVIEW_INCR_NEWTABLE, INCR_DELTA_ALIAS,
-					 other_qname, INCR_JOIN_ALIAS,
-					 jbuf.data);
-	{
-		Node	   *wq = incr_get_where_qual(viewQuery);
-
-		if (wq != NULL)
-		{
-			StringInfoData wbuf;
-
-			initStringInfo(&wbuf);
-			incr_deparse_where_qual(wq, viewQuery->rtable, delta_varno, &wbuf);
-			appendStringInfo(&buf, " WHERE %s", wbuf.data);
-		}
-	}
-
-	/* GROUP BY _d_.g1, ... */
-	appendStringInfoString(&buf, " GROUP BY ");
-	first = true;
-	foreach(lc, viewQuery->targetList)
-	{
-		TargetEntry *te = lfirst_node(TargetEntry, lc);
-		StringInfoData ebuf;
-
-		if (te->resjunk || !IsA(te->expr, Var))
-			continue;
-		if (!first)
-			appendStringInfoChar(&buf, ',');
-		first = false;
-		initStringInfo(&ebuf);
-		incr_deparse_expr((Node *) te->expr, viewQuery->rtable,
-						  delta_varno, &ebuf);
-		appendStringInfoString(&buf, ebuf.data);
-	}
-
-	/* ON CONFLICT (group_cols) DO UPDATE SET agg = mv.agg + EXCLUDED.agg */
-	appendStringInfoString(&buf, " ON CONFLICT (");
-	first = true;
-	foreach(gcl, groupColNames)
-	{
-		if (!first)
-			appendStringInfoChar(&buf, ',');
-		appendStringInfoString(&buf, quote_identifier(strVal(lfirst(gcl))));
-		first = false;
-	}
-	appendStringInfoString(&buf, ") DO UPDATE SET ");
-
-	first = true;
-	foreach(lc, viewQuery->targetList)
-	{
-		TargetEntry *te = lfirst_node(TargetEntry, lc);
-
-		if (te->resjunk || IsA(te->expr, Var))
-			continue;
-		/* hidden avgsum/avgcnt and having cols handled separately — skip generic path */
-		if (strncmp(te->resname, MATVIEW_INCR_AVGSUM_PREFIX,
-					sizeof(MATVIEW_INCR_AVGSUM_PREFIX) - 1) == 0 ||
-			strncmp(te->resname, MATVIEW_INCR_AVGCNT_PREFIX,
-					sizeof(MATVIEW_INCR_AVGCNT_PREFIX) - 1) == 0 ||
-			strcmp(te->resname, MATVIEW_INCR_HAVING_COL) == 0)
-			continue;
-
-		if (IsA(te->expr, Aggref))
-		{
-			Aggref	   *agg = (Aggref *) te->expr;
-			char	   *fname = get_func_name(agg->aggfnoid);
-
-			if (strcmp(fname, "avg") == 0)
-			{
-				char	   *sum_col = psprintf("%s%s",
-											  MATVIEW_INCR_AVGSUM_PREFIX,
-											  te->resname);
-				char	   *cnt_col = psprintf("%s%s",
-											  MATVIEW_INCR_AVGCNT_PREFIX,
-											  te->resname);
-				const char *avg_q = quote_identifier(te->resname);
-				const char *sum_q = quote_identifier(sum_col);
-				const char *cnt_q = quote_identifier(cnt_col);
-				const char *type_name = format_type_be(agg->aggtype);
-
-				if (!first) appendStringInfoChar(&buf, ',');
-				appendStringInfo(&buf,
-								 "%s=%s.%s+EXCLUDED.%s"
-								 ",%s=%s.%s+EXCLUDED.%s"
-								 ",%s=((%s.%s+EXCLUDED.%s)::%s/NULLIF(%s.%s+EXCLUDED.%s,0))",
-								 sum_q, mvname, sum_q, sum_q,
-								 cnt_q, mvname, cnt_q, cnt_q,
-								 avg_q,
-								 mvname, sum_q, sum_q, type_name,
-								 mvname, cnt_q, cnt_q);
-				first = false;
-				continue;
-			}
-		}
-
-		{
-			const char *colq = quote_identifier(te->resname);
-
-			if (!first) appendStringInfoChar(&buf, ',');
-			appendStringInfo(&buf, "%s=%s.%s+EXCLUDED.%s", colq, mvname, colq, colq);
-			first = false;
-		}
-	}
-
-	return buf.data;
-}
-
-/*
- * incr_build_backfill_sql_join — one-time setup for Phase 2 HAVING matviews
- *
- * Same idea as incr_build_backfill_sql but for a two-table JOIN:
- * replaces __mv_newtable with the actual delta table so all groups are
- * seeded before triggers are installed.
- *
- *   INSERT INTO base (group_cols, agg_cols, ..., __mv_having_ok__, __mv_count__)
- *   SELECT _d_.g1, agg_exprs, ..., false, COUNT(*)
- *   FROM delta_table _d_ JOIN other_table _j_ ON (join_cond)
- *   GROUP BY _d_.g1, ...
- *   ON CONFLICT (group_cols) DO NOTHING
- */
-static char *
-incr_build_backfill_sql_join(Oid mvrelid, Query *viewQuery,
-							 int delta_varno, Oid delta_oid,
-							 Oid other_oid, Node *join_quals)
-{
-	StringInfoData buf;
-	StringInfoData jbuf;
-	List	   *groupColNames = NIL;
-	ListCell   *lc,
-			   *gcl;
-	const char *mvname = mv_qname(mvrelid);
-	const char *delta_qname = quote_qualified_identifier(
-		get_namespace_name(get_rel_namespace(delta_oid)),
-		get_rel_name(delta_oid));
-	const char *other_qname = mv_qname(other_oid);
-	bool		first;
-
-	incr_collect_group_cols(viewQuery, &groupColNames);
-	initStringInfo(&buf);
-	initStringInfo(&jbuf);
-
-	incr_deparse_expr(join_quals, viewQuery->rtable, delta_varno, &jbuf);
-
-	/* INSERT INTO base (output_cols) */
-	appendStringInfo(&buf, "INSERT INTO %s (", mvname);
-	first = true;
-	foreach(lc, viewQuery->targetList)
-	{
-		TargetEntry *te = lfirst_node(TargetEntry, lc);
-
-		if (te->resjunk)
-			continue;
-		if (!first)
-			appendStringInfoChar(&buf, ',');
-		appendStringInfoString(&buf, quote_identifier(te->resname));
-		first = false;
-	}
-	appendStringInfoString(&buf, ") SELECT ");
-
-	/* SELECT: same structure as ins_sql_join but __mv_having_ok__ = false */
-	first = true;
-	foreach(lc, viewQuery->targetList)
-	{
-		TargetEntry *te = lfirst_node(TargetEntry, lc);
-
-		if (te->resjunk)
-			continue;
-		if (!first)
-			appendStringInfoChar(&buf, ',');
-		first = false;
-
-		if (strcmp(te->resname, MATVIEW_INCR_COUNT_COL) == 0)
-			appendStringInfoString(&buf, "COUNT(*)");
-		else if (strcmp(te->resname, MATVIEW_INCR_HAVING_COL) == 0)
-			appendStringInfoString(&buf, "false");	/* DO NOTHING leaves t=true intact */
-		else if (IsA(te->expr, Var))
-		{
-			StringInfoData ebuf;
-
-			initStringInfo(&ebuf);
-			incr_deparse_expr((Node *) te->expr, viewQuery->rtable,
-							  delta_varno, &ebuf);
-			appendStringInfoString(&buf, ebuf.data);
-		}
-		else if (IsA(te->expr, Aggref))
-		{
-			Aggref	   *agg = (Aggref *) te->expr;
-			char	   *fname = get_func_name(agg->aggfnoid);
-
-			if (strcmp(fname, "count") == 0 && agg->aggstar)
-				appendStringInfoString(&buf, "COUNT(*)");
-			else if (agg->args != NIL)
-			{
-				TargetEntry *arg_te = linitial_node(TargetEntry, agg->args);
-				StringInfoData ebuf;
-
-				initStringInfo(&ebuf);
-				incr_deparse_where_qual((Node *) arg_te->expr, viewQuery->rtable,
-										delta_varno, &ebuf);
-				appendStringInfo(&buf, "%s(%s)", fname, ebuf.data);
-			}
-			else
-				appendStringInfo(&buf, "%s(*)", fname);
-		}
-	}
-
-	/* FROM actual_delta_table _d_ JOIN other _j_ ON (cond) [WHERE ...] */
-	appendStringInfo(&buf, " FROM %s %s JOIN %s %s ON (%s)",
-					 delta_qname, INCR_DELTA_ALIAS,
-					 other_qname, INCR_JOIN_ALIAS,
-					 jbuf.data);
-	{
-		Node	   *wq = incr_get_where_qual(viewQuery);
-
-		if (wq != NULL)
-		{
-			StringInfoData wbuf;
-
-			initStringInfo(&wbuf);
-			incr_deparse_where_qual(wq, viewQuery->rtable, delta_varno, &wbuf);
-			appendStringInfo(&buf, " WHERE %s", wbuf.data);
-		}
-	}
-
-	/* GROUP BY */
-	appendStringInfoString(&buf, " GROUP BY ");
-	first = true;
-	foreach(lc, viewQuery->targetList)
-	{
-		TargetEntry *te = lfirst_node(TargetEntry, lc);
-		StringInfoData ebuf;
-
-		if (te->resjunk || !IsA(te->expr, Var))
-			continue;
-		if (!first)
-			appendStringInfoChar(&buf, ',');
-		first = false;
-		initStringInfo(&ebuf);
-		incr_deparse_expr((Node *) te->expr, viewQuery->rtable,
-						  delta_varno, &ebuf);
-		appendStringInfoString(&buf, ebuf.data);
-	}
-
-	/* ON CONFLICT DO NOTHING — passing groups already in base */
-	appendStringInfoString(&buf, " ON CONFLICT (");
-	first = true;
-	foreach(gcl, groupColNames)
-	{
-		if (!first)
-			appendStringInfoChar(&buf, ',');
-		appendStringInfoString(&buf, quote_identifier(strVal(lfirst(gcl))));
-		first = false;
-	}
-	appendStringInfoString(&buf, ") DO NOTHING");
-
-	return buf.data;
-}
-
-/*
- * incr_build_del_sql_join — Phase 2 DELETE delta
- *
- * When rows in the delta-side table are removed, join the old transition
- * table with the current state of the other table and subtract:
- *
- *   WITH d AS (
- *     SELECT _d_.g1 AS g1, SUM(_j_.agg_arg) AS agg_col,
- *            COUNT(*) AS __mv_count__
- *     FROM __mv_oldtable _d_ JOIN schema.other _j_ ON (join_cond)
- *     GROUP BY _d_.g1
- *   )
- *   UPDATE mv SET
- *     agg_col      = mv.agg_col      - d.agg_col,
- *     __mv_count__ = mv.__mv_count__ - d.__mv_count__
- *   FROM d
- *   WHERE mv.g1 = d.g1
- */
-static char *
-incr_build_del_sql_join(Oid mvrelid, Query *viewQuery,
-						int delta_varno, Oid other_oid,
-						Node *join_quals)
-{
-	StringInfoData buf;
-	StringInfoData jbuf;
-	List	   *groupColNames = NIL;
-	ListCell   *lc,
-			   *gcl;
-	const char *mvname = mv_qname(mvrelid);
-	const char *other_qname = mv_qname(other_oid);
-	const char *cntcol = quote_identifier(MATVIEW_INCR_COUNT_COL);
-	bool		first;
-
-	incr_collect_group_cols(viewQuery, &groupColNames);
-	initStringInfo(&buf);
-	initStringInfo(&jbuf);
-
-	incr_deparse_expr(join_quals, viewQuery->rtable, delta_varno, &jbuf);
-
-	/* WITH d AS (SELECT ...) */
-	appendStringInfoString(&buf, "WITH d AS (SELECT ");
-	first = true;
-	foreach(lc, viewQuery->targetList)
-	{
-		TargetEntry *te = lfirst_node(TargetEntry, lc);
-
-		if (te->resjunk)
-			continue;
-		/* skip avg visible col (recomputed from hidden sum/cnt) and having col */
-		if (strcmp(te->resname, MATVIEW_INCR_HAVING_COL) == 0)
-			continue;
-		if (IsA(te->expr, Aggref) &&
-			strcmp(get_func_name(((Aggref *) te->expr)->aggfnoid), "avg") == 0)
-			continue;
-		if (!first)
-			appendStringInfoChar(&buf, ',');
-		first = false;
-
-		if (strcmp(te->resname, MATVIEW_INCR_COUNT_COL) == 0)
-		{
-			appendStringInfo(&buf, "COUNT(*) AS %s", cntcol);
-		}
-		else if (IsA(te->expr, Var))
-		{
-			StringInfoData ebuf;
-
-			initStringInfo(&ebuf);
-			incr_deparse_expr((Node *) te->expr, viewQuery->rtable,
-							  delta_varno, &ebuf);
-			appendStringInfo(&buf, "%s AS %s",
-							 ebuf.data, quote_identifier(te->resname));
-		}
-		else if (IsA(te->expr, Aggref))
-		{
-			Aggref	   *agg = (Aggref *) te->expr;
-			char	   *fname = get_func_name(agg->aggfnoid);
-			const char *colq = quote_identifier(te->resname);
-
-			if (strcmp(fname, "count") == 0 && agg->aggstar)
-				appendStringInfo(&buf, "COUNT(*) AS %s", colq);
-			else if (agg->args != NIL)
-			{
-				TargetEntry *arg_te = linitial_node(TargetEntry, agg->args);
-				StringInfoData ebuf;
-
-				initStringInfo(&ebuf);
-				incr_deparse_where_qual((Node *) arg_te->expr, viewQuery->rtable,
-										delta_varno, &ebuf);
-				appendStringInfo(&buf, "%s(%s) AS %s", fname, ebuf.data, colq);
-			}
-			else
-				appendStringInfo(&buf, "%s(*) AS %s", fname, colq);
-		}
-	}
-
-	/* FROM __mv_oldtable _d_ JOIN other _j_ ON (cond) [WHERE ...] GROUP BY ... ) */
-	appendStringInfo(&buf, " FROM %s %s JOIN %s %s ON (%s)",
-					 MATVIEW_INCR_OLDTABLE, INCR_DELTA_ALIAS,
-					 other_qname, INCR_JOIN_ALIAS,
-					 jbuf.data);
-	{
-		Node	   *wq = incr_get_where_qual(viewQuery);
-
-		if (wq != NULL)
-		{
-			StringInfoData wbuf;
-
-			initStringInfo(&wbuf);
-			incr_deparse_where_qual(wq, viewQuery->rtable, delta_varno, &wbuf);
-			appendStringInfo(&buf, " WHERE %s", wbuf.data);
-		}
-	}
-	appendStringInfoString(&buf, " GROUP BY ");
-	first = true;
-	foreach(lc, viewQuery->targetList)
-	{
-		TargetEntry *te = lfirst_node(TargetEntry, lc);
-		StringInfoData ebuf;
-
-		if (te->resjunk || !IsA(te->expr, Var))
-			continue;
-		if (!first)
-			appendStringInfoChar(&buf, ',');
-		first = false;
-		initStringInfo(&ebuf);
-		incr_deparse_expr((Node *) te->expr, viewQuery->rtable,
-						  delta_varno, &ebuf);
-		appendStringInfoString(&buf, ebuf.data);
-	}
-	appendStringInfoString(&buf, ") ");
-
-	/* UPDATE mv SET agg = mv.agg - d.agg ... */
-	appendStringInfo(&buf, "UPDATE %s SET ", mvname);
-	first = true;
-	foreach(lc, viewQuery->targetList)
-	{
-		TargetEntry *te = lfirst_node(TargetEntry, lc);
-
-		if (te->resjunk || IsA(te->expr, Var))
-			continue;
-		/* hidden avgsum/avgcnt and having cols handled separately — skip generic path */
-		if (strncmp(te->resname, MATVIEW_INCR_AVGSUM_PREFIX,
-					sizeof(MATVIEW_INCR_AVGSUM_PREFIX) - 1) == 0 ||
-			strncmp(te->resname, MATVIEW_INCR_AVGCNT_PREFIX,
-					sizeof(MATVIEW_INCR_AVGCNT_PREFIX) - 1) == 0 ||
-			strcmp(te->resname, MATVIEW_INCR_HAVING_COL) == 0)
-			continue;
-
-		if (IsA(te->expr, Aggref))
-		{
-			Aggref	   *agg = (Aggref *) te->expr;
-			char	   *fname = get_func_name(agg->aggfnoid);
-
-			if (strcmp(fname, "avg") == 0)
-			{
-				char	   *sum_col = psprintf("%s%s",
-											  MATVIEW_INCR_AVGSUM_PREFIX,
-											  te->resname);
-				char	   *cnt_col = psprintf("%s%s",
-											  MATVIEW_INCR_AVGCNT_PREFIX,
-											  te->resname);
-				const char *avg_q = quote_identifier(te->resname);
-				const char *sum_q = quote_identifier(sum_col);
-				const char *cnt_q = quote_identifier(cnt_col);
-				const char *type_name = format_type_be(agg->aggtype);
-
-				if (!first) appendStringInfoChar(&buf, ',');
-				appendStringInfo(&buf,
-								 "%s=%s.%s-d.%s"
-								 ",%s=%s.%s-d.%s"
-								 ",%s=((%s.%s-d.%s)::%s/NULLIF(%s.%s-d.%s,0))",
-								 sum_q, mvname, sum_q, sum_q,
-								 cnt_q, mvname, cnt_q, cnt_q,
-								 avg_q,
-								 mvname, sum_q, sum_q, type_name,
-								 mvname, cnt_q, cnt_q);
-				first = false;
-				continue;
-			}
-		}
-
-		{
-			const char *colq = quote_identifier(te->resname);
-
-			if (!first) appendStringInfoChar(&buf, ',');
-			appendStringInfo(&buf, "%s=%s.%s-d.%s", colq, mvname, colq, colq);
-			first = false;
-		}
-	}
-
-	/* FROM d WHERE mv.g = d.g */
-	appendStringInfo(&buf, " FROM d WHERE ");
-	first = true;
-	foreach(gcl, groupColNames)
-	{
-		const char *colq = quote_identifier(strVal(lfirst(gcl)));
-
-		if (!first)
-			appendStringInfoString(&buf, " AND ");
-		appendStringInfo(&buf, "%s.%s=d.%s", mvname, colq, colq);
-		first = false;
-	}
-
-	return buf.data;
-}
-
 /* ============================================================
  * Catalog helpers
  * ============================================================
