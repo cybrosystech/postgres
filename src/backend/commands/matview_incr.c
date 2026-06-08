@@ -169,6 +169,7 @@ static char *incr_build_del_sql_gen(Oid mvrelid, Query *viewQuery,
 									int delta_varno, const char *delta_table,
 									List *join_list);
 static char *incr_build_cln_sql(Oid mvrelid);
+static void incr_warn_row_level_missing_key(Query *viewQuery);
 static void incr_store_catalog(Oid mvrelid, Oid srctable,
 							   const char *ins_sql,
 							   const char *del_sql,
@@ -557,6 +558,7 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 		if (viewQuery->groupClause == NIL)
 		{
 			/* Phase 9a: row-level, no GROUP BY */
+			incr_warn_row_level_missing_key(viewQuery);
 			ins_sql = incr_build_row_ins_sql(mvrelid, viewQuery, -1,
 											 MATVIEW_INCR_NEWTABLE, NIL);
 			del_sql = incr_build_row_del_sql(mvrelid, viewQuery, -1,
@@ -602,6 +604,7 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 		if (viewQuery->groupClause == NIL)
 		{
 			/* ---- Phase 9b: row-level JOIN matview ---- */
+			incr_warn_row_level_missing_key(viewQuery);
 			foreach(jlc, all_tables)
 			{
 				IncrJoinEntry *delta     = lfirst(jlc);
@@ -1590,6 +1593,108 @@ incr_append_from_join(StringInfo buf, Query *viewQuery,
 		incr_deparse_where_qual(je->quals, viewQuery->rtable, delta_varno, &jbuf);
 		appendStringInfo(buf, " JOIN %s _j%d_ ON (%s)",
 						 mv_qname(je->oid), je->varno, jbuf.data);
+	}
+}
+
+/*
+ * incr_warn_row_level_missing_key
+ *
+ * For row-level incremental matviews (no GROUP BY), the del_sql identifies
+ * matview rows by matching ALL selected columns.  If two rows in the matview
+ * are identical, a single-row DELETE on a source table will remove BOTH.
+ *
+ * The safest way to avoid this is to include the primary key of every source
+ * table in the SELECT list so that every matview row is distinct.
+ *
+ * This function checks each base relation in the query.  If the SELECT list
+ * does NOT contain any primary-key column for that table, it emits a WARNING
+ * so the user is informed at CREATE MATERIALIZED VIEW time.
+ */
+static void
+incr_warn_row_level_missing_key(Query *viewQuery)
+{
+	ListCell *lc;
+
+	foreach(lc, viewQuery->rtable)
+	{
+		RangeTblEntry  *rte     = lfirst_node(RangeTblEntry, lc);
+		int             varno   = foreach_current_index(lc) + 1;
+		Relation        rel;
+		List		   *idxlist;
+		ListCell	   *ilc;
+		Bitmapset	   *pk_attrs = NULL;
+		bool            covered = false;
+
+		if (rte->rtekind != RTE_RELATION)
+			continue;
+
+		/* Collect primary key attribute numbers for this table */
+		rel     = table_open(rte->relid, AccessShareLock);
+		idxlist = RelationGetIndexList(rel);
+
+		foreach(ilc, idxlist)
+		{
+			Oid			 indexoid  = lfirst_oid(ilc);
+			HeapTuple	 indextup  = SearchSysCache1(INDEXRELID,
+												ObjectIdGetDatum(indexoid));
+			Form_pg_index idxform;
+			int			 k;
+
+			if (!HeapTupleIsValid(indextup))
+				continue;
+			idxform = (Form_pg_index) GETSTRUCT(indextup);
+
+			if (!idxform->indisprimary)
+			{
+				ReleaseSysCache(indextup);
+				continue;
+			}
+			for (k = 0; k < idxform->indnkeyatts; k++)
+				pk_attrs = bms_add_member(pk_attrs,
+										  (int) idxform->indkey.values[k]);
+			ReleaseSysCache(indextup);
+			break;				/* only one primary key per table */
+		}
+
+		table_close(rel, AccessShareLock);
+
+		if (pk_attrs == NULL)
+			continue;			/* table has no PK — nothing to check */
+
+		/* Check whether any PK column of this table appears in the SELECT */
+		{
+			ListCell *tlc;
+
+			foreach(tlc, viewQuery->targetList)
+			{
+				TargetEntry *te = lfirst_node(TargetEntry, tlc);
+				Var         *v;
+
+				if (te->resjunk || !IsA(te->expr, Var))
+					continue;
+				v = (Var *) te->expr;
+				if (v->varno != varno)
+					continue;
+				if (bms_is_member((int) v->varattno, pk_attrs))
+				{
+					covered = true;
+					break;
+				}
+			}
+		}
+
+		bms_free(pk_attrs);
+
+		if (!covered)
+			ereport(WARNING,
+					(errmsg("DBblue incremental matview: table \"%s\" has no "
+							"primary-key column in the SELECT list",
+							get_rel_name(rte->relid)),
+					 errdetail("If two matview rows are identical, a single-row "
+							   "DELETE on \"%s\" will remove all matching rows. "
+							   "Include the primary key column(s) of each source "
+							   "table to avoid this.",
+							   get_rel_name(rte->relid))));
 	}
 }
 
