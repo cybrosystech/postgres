@@ -268,8 +268,29 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 	}
 	if (viewQuery->distinctClause != NIL)
 	{
-		*reason = "DISTINCT is not supported";
-		return false;
+		int			distinct_count = list_length(viewQuery->distinctClause);
+		int			visible_count = 0;
+		ListCell   *tc;
+
+		if (viewQuery->groupClause != NIL)
+		{
+			*reason = "DISTINCT with GROUP BY is not supported";
+			return false;
+		}
+		foreach(tc, viewQuery->targetList)
+		{
+			TargetEntry *te2 = lfirst_node(TargetEntry, tc);
+
+			if (!te2->resjunk && !incr_is_hidden_col(te2->resname))
+				visible_count++;
+		}
+		if (distinct_count < visible_count)
+		{
+			*reason = "DISTINCT ON is not supported; use full DISTINCT (DISTINCT on all output columns)";
+			return false;
+		}
+		/* Full DISTINCT is allowed — MatviewIncrAddCountTarget converts it to
+		 * GROUP BY on all output columns before the matview is created. */
 	}
 	if (viewQuery->limitCount != NULL || viewQuery->limitOffset != NULL)
 	{
@@ -354,10 +375,11 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 
 		hash_destroy(oid_counts);
 
-		if (has_self_join && viewQuery->groupClause != NIL)
+		if (has_self_join &&
+			(viewQuery->groupClause != NIL || viewQuery->distinctClause != NIL))
 		{
-			*reason = "self-joins with GROUP BY are not supported; "
-					  "use a row-level (no GROUP BY) matview instead";
+			*reason = "self-joins with GROUP BY or DISTINCT are not supported; "
+					  "use a row-level (no GROUP BY/DISTINCT) matview instead";
 			return false;
 		}
 	}
@@ -923,9 +945,26 @@ MatviewIncrAddCountTarget(Query *q)
 	Aggref	   *aggref;
 	TargetEntry *te;
 
-	/* Row-level views (no GROUP BY) need no hidden maintenance columns */
-	if (q->groupClause == NIL)
+	/* Row-level views (no GROUP BY or DISTINCT) need no hidden maintenance columns */
+	if (q->groupClause == NIL && q->distinctClause == NIL)
 		return;
+
+	/*
+	 * DISTINCT is equivalent to GROUP BY on all output columns.  Convert it
+	 * here so the rest of the aggregate machinery (COUNT(*) injection, SQL
+	 * builders, unique index) works without modification.
+	 *
+	 * Also set hasAggs = true so the planner creates an Agg node and fills in
+	 * aggtranstype for the COUNT(*) we are about to inject.  Without this the
+	 * planner skips aggregate pre-processing and ExecInitAgg asserts on
+	 * InvalidOid.
+	 */
+	if (q->distinctClause != NIL && q->groupClause == NIL)
+	{
+		q->groupClause    = q->distinctClause;
+		q->distinctClause = NIL;
+		q->hasAggs        = true;
+	}
 
 	/* Inject SUM(x) / COUNT(x) pairs for each AVG column */
 	foreach(lc, orig_tl)
