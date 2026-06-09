@@ -128,7 +128,7 @@ typedef struct IncrJoinEntry
 	int			varno;		/* varno of this table in viewQuery->rtable */
 	Oid			oid;		/* table OID */
 	Node	   *quals;		/* ON condition for this join step */
-	JoinType	join_type;	/* JOIN_INNER (anchor/inner), JOIN_LEFT, JOIN_RIGHT */
+	JoinType	join_type;	/* JOIN_INNER (anchor), JOIN_LEFT, JOIN_RIGHT, JOIN_FULL */
 } IncrJoinEntry;
 
 /* ----------
@@ -142,6 +142,11 @@ static List *incr_collect_tables(Query *viewQuery);
 static List *incr_build_join_list_for_delta(List *all_tables, int delta_varno);
 static bool incr_has_outer_join(List *all_tables);
 static int	incr_outer_preserved_varno(List *all_tables);
+static const char *incr_qual_get_colname_for_varno(Node *qual, List *rtable, int varno);
+static int	incr_qual_get_other_varno(Node *qual, int own_varno);
+static char *incr_build_outer_row_sync_sql(Oid mvrelid, Query *viewQuery,
+										   int delta_varno, const char *delta_table,
+										   List *all_tables);
 static char *str_replace_all(const char *src, const char *from, const char *to);
 static Node *find_connecting_qual(List *all_tables, int varno_a, int varno_b);
 static char *qual_to_live_sql(Node *qual, List *rtable, List *all_tables,
@@ -282,9 +287,8 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 	else if (nbasetables >= 2)
 	{
 		/*
-		 * Phase 2+: N-table INNER JOIN.  Require an explicit JOIN ... ON tree
-		 * rooted at the single FromExpr.fromlist entry.  Walk the JoinExpr
-		 * tree to confirm every step is INNER with a non-null ON condition.
+		 * Phase 2+: N-table JOIN.  Require an explicit JOIN ... ON tree
+		 * rooted at the single FromExpr.fromlist entry.
 		 */
 		Node	   *jtree_root = NULL;
 
@@ -303,19 +307,18 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 		}
 
 		/*
-		 * Walk every JoinExpr in the tree.  We accept:
-		 *   - Pure INNER JOIN
-		 *   - Pure LEFT JOIN  (or mixed INNER + LEFT)
-		 *   - Pure RIGHT JOIN (or mixed INNER + RIGHT)
-		 * FULL OUTER JOIN and CROSS JOIN are not supported.
+		 * Walk every JoinExpr in the tree.  We accept INNER, LEFT, RIGHT, and
+		 * FULL OUTER JOINs with an explicit ON condition.  CROSS JOIN (no ON)
+		 * is not supported.
 		 *
-		 * The outer join type (LEFT or RIGHT) must be consistent — no
-		 * mixing LEFT and RIGHT in the same matview.
+		 * FULL JOIN with GROUP BY is also rejected: orphan rows produce NULL
+		 * group keys which break the ON CONFLICT UPSERT strategy.  FULL JOIN
+		 * without GROUP BY (row-level sync) works correctly.
 		 */
 		{
 			List	   *stack = list_make1(jtree_root);
 			ListCell   *slc;
-			JoinType	outer_type = JOIN_INNER; /* tracks any outer join seen */
+			bool		has_full_join = false;
 
 			foreach(slc, stack)
 			{
@@ -323,15 +326,12 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 
 				if (!IsA(je, JoinExpr))
 					continue;
-				if (je->jointype == JOIN_FULL)
+				if (je->jointype != JOIN_INNER &&
+					je->jointype != JOIN_LEFT &&
+					je->jointype != JOIN_RIGHT &&
+					je->jointype != JOIN_FULL)
 				{
-					*reason = "FULL OUTER JOIN is not supported";
-					return false;
-				}
-				if (je->jointype != JOIN_INNER && je->jointype != JOIN_LEFT &&
-					je->jointype != JOIN_RIGHT)
-				{
-					*reason = "only INNER, LEFT, and RIGHT JOINs are supported";
+					*reason = "only INNER, LEFT, RIGHT, and FULL OUTER JOINs are supported";
 					return false;
 				}
 				if (je->quals == NULL)
@@ -339,40 +339,20 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 					*reason = "each JOIN step must have an ON condition";
 					return false;
 				}
-				/* Track whether we have an outer join and ensure consistency */
-				if (je->jointype == JOIN_LEFT || je->jointype == JOIN_RIGHT)
-				{
-					if (outer_type == JOIN_INNER)
-						outer_type = je->jointype;
-					else if (outer_type != je->jointype)
-					{
-						*reason = "mixing LEFT and RIGHT JOINs in the same matview "
-								  "is not supported";
-						return false;
-					}
-				}
+				if (je->jointype == JOIN_FULL)
+					has_full_join = true;
 				if (IsA(je->larg, JoinExpr))
 					stack = lappend(stack, je->larg);
 				if (IsA(je->rarg, JoinExpr))
 					stack = lappend(stack, je->rarg);
 			}
 
-			/*
-			 * For outer joins, verify that GROUP BY columns come from the
-			 * preserved side so that groups are well-defined.
-			 *
-			 * We check this after collecting tables so we have the preserved
-			 * varno.  A quick pre-check: if outer_type != JOIN_INNER, walk
-			 * the targetList and verify each group-by Var resolves to a
-			 * table that is NOT the optional side.
-			 *
-			 * Preserved side: LEFT JOIN → anchor (leftmost RangeTblRef varno),
-			 *                  RIGHT JOIN → rightmost RangeTblRef varno.
-			 * We do the precise check in MatviewIncrSetup after incr_collect_tables.
-			 * Here just flag if there are outer joins so the caller knows.
-			 */
-			/* outer_type != JOIN_INNER flags outer-join matviews (no error here) */
-			(void) outer_type;		/* used implicitly via incr_collect_tables */
+			if (has_full_join && viewQuery->groupClause != NIL)
+			{
+				*reason = "FULL OUTER JOIN with GROUP BY is not supported; "
+						  "omit GROUP BY or use INNER/LEFT/RIGHT JOIN instead";
+				return false;
+			}
 		}
 	}
 
@@ -605,28 +585,53 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 		{
 			/* ---- Phase 9b: row-level JOIN matview ---- */
 			incr_warn_row_level_missing_key(viewQuery);
-			foreach(jlc, all_tables)
-			{
-				IncrJoinEntry *delta     = lfirst(jlc);
-				List		  *join_list = incr_build_join_list_for_delta(
-					all_tables, delta->varno);
 
-				ins_sql = incr_build_row_ins_sql(mvrelid, viewQuery,
-												 delta->varno,
-												 MATVIEW_INCR_NEWTABLE,
-												 join_list);
-				del_sql = incr_build_row_del_sql(mvrelid, viewQuery,
-												 delta->varno,
-												 MATVIEW_INCR_OLDTABLE,
-												 join_list);
-				incr_store_catalog(mvrelid, delta->oid,
-								   ins_sql, del_sql, "SELECT 1", NULL);
-				incr_install_triggers(mvrelid, delta->oid);
+			if (incr_has_outer_join(all_tables))
+			{
+				/* Outer join: sync-region approach preserves LEFT/RIGHT/FULL semantics */
+				foreach(jlc, all_tables)
+				{
+					IncrJoinEntry *delta = lfirst(jlc);
+
+					ins_sql = incr_build_outer_row_sync_sql(mvrelid, viewQuery,
+															delta->varno,
+															MATVIEW_INCR_NEWTABLE,
+															all_tables);
+					del_sql = incr_build_outer_row_sync_sql(mvrelid, viewQuery,
+															delta->varno,
+															MATVIEW_INCR_OLDTABLE,
+															all_tables);
+					incr_store_catalog(mvrelid, delta->oid,
+									   ins_sql, del_sql, "SELECT 1", NULL);
+					incr_install_triggers(mvrelid, delta->oid);
+				}
+			}
+			else
+			{
+				/* Inner join: simple row-level delta */
+				foreach(jlc, all_tables)
+				{
+					IncrJoinEntry *delta     = lfirst(jlc);
+					List		  *join_list = incr_build_join_list_for_delta(
+						all_tables, delta->varno);
+
+					ins_sql = incr_build_row_ins_sql(mvrelid, viewQuery,
+													 delta->varno,
+													 MATVIEW_INCR_NEWTABLE,
+													 join_list);
+					del_sql = incr_build_row_del_sql(mvrelid, viewQuery,
+													 delta->varno,
+													 MATVIEW_INCR_OLDTABLE,
+													 join_list);
+					incr_store_catalog(mvrelid, delta->oid,
+									   ins_sql, del_sql, "SELECT 1", NULL);
+					incr_install_triggers(mvrelid, delta->oid);
+				}
 			}
 		}
 		else if (incr_has_outer_join(all_tables))
 		{
-			/* ---- Phase 8: LEFT/RIGHT outer join (recompute strategy) ---- */
+			/* ---- Phase 8: outer join (LEFT/RIGHT/FULL) recompute strategy ---- */
 			int		preserved_varno = incr_outer_preserved_varno(all_tables);
 
 			foreach(jlc, all_tables)
@@ -2607,7 +2612,8 @@ incr_has_outer_join(List *all_tables)
 	{
 		IncrJoinEntry *je = lfirst(lc);
 
-		if (je->join_type == JOIN_LEFT || je->join_type == JOIN_RIGHT)
+		if (je->join_type == JOIN_LEFT || je->join_type == JOIN_RIGHT ||
+			je->join_type == JOIN_FULL)
 			return true;
 	}
 	return false;
@@ -2615,8 +2621,9 @@ incr_has_outer_join(List *all_tables)
 
 /*
  * incr_outer_preserved_varno
- * Return the varno of the "preserved" side for an outer-join matview:
- *   LEFT JOIN  → anchor (first entry, join_type = JOIN_INNER)
+ * Return the varno of the "preserved" (anchor) side for an outer-join matview:
+ *   LEFT JOIN  → anchor/first entry (join_type = JOIN_INNER in all_tables)
+ *   FULL JOIN  → same as LEFT JOIN: treat anchor as preserved
  *   RIGHT JOIN → last entry that has join_type = JOIN_RIGHT
  */
 static int
@@ -2948,7 +2955,7 @@ incr_build_outer_sql(Oid mvrelid, Query *viewQuery,
 				 "DBblue: no join condition found for table varno=%d in outer-join matview",
 				 je->varno);
 
-		join_kw  = "LEFT JOIN";		/* always LEFT from preserved anchor */
+		join_kw  = (je->join_type == JOIN_FULL) ? "FULL JOIN" : "LEFT JOIN";
 		cond_sql = qual_to_live_sql(qual, viewQuery->rtable,
 									all_tables, preserved_varno);
 
@@ -3050,6 +3057,15 @@ incr_build_outer_sql(Oid mvrelid, Query *viewQuery,
 	 * ---------------------------------------------------------------- */
 	if (include_delete_step)
 	{
+		bool		has_full_join = false;
+		ListCell   *jlc;
+
+		foreach(jlc, all_tables)
+		{
+			IncrJoinEntry *je2 = lfirst(jlc);
+			if (je2->join_type == JOIN_FULL) { has_full_join = true; break; }
+		}
+
 		appendStringInfo(&buf,
 						 "DELETE FROM %s _mv_\nUSING _affected_\nWHERE ",
 						 mvname);
@@ -3064,6 +3080,8 @@ incr_build_outer_sql(Oid mvrelid, Query *viewQuery,
 			appendStringInfo(&buf, "_mv_.%s = _affected_.%s", col, col);
 			first = false;
 		}
+
+		/* NOT EXISTS on the preserved table */
 		appendStringInfo(&buf,
 						 "\n  AND NOT EXISTS (\n"
 						 "    SELECT 1 FROM %s _chk_\n    WHERE ",
@@ -3084,11 +3102,510 @@ incr_build_outer_sql(Oid mvrelid, Query *viewQuery,
 			first = false;
 		}
 		appendStringInfoString(&buf, "\n  )");
+
+		/*
+		 * FULL JOIN: a group can survive on EITHER side.  Add NOT EXISTS
+		 * checks for every non-preserved table using their FK column.
+		 */
+		if (has_full_join)
+		{
+			int chk_alias = 2;
+
+			foreach(jlc, all_tables)
+			{
+				IncrJoinEntry *je2 = lfirst(jlc);
+				Node		  *q;
+				const char	  *fk_col;
+
+				if (je2->varno == preserved_varno)
+					continue;
+
+				q = find_connecting_qual(all_tables, je2->varno, preserved_varno);
+				if (q == NULL)
+					q = je2->quals;
+				if (q == NULL)
+					continue;
+
+				fk_col = incr_qual_get_colname_for_varno(q, viewQuery->rtable,
+														 je2->varno);
+				if (fk_col == NULL)
+					continue;
+
+				appendStringInfo(&buf,
+								 "\n  AND NOT EXISTS (\n"
+								 "    SELECT 1 FROM %s _chk%d_\n    WHERE ",
+								 mv_qname(je2->oid), chk_alias);
+				first = true;
+				foreach(lc, viewQuery->groupClause)
+				{
+					SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+					TargetEntry     *te  = get_sortgroupclause_tle(sgc,
+																   viewQuery->targetList);
+
+					if (!first) appendStringInfoString(&buf, " AND ");
+					appendStringInfo(&buf, "_chk%d_.%s = _mv_.%s",
+									 chk_alias,
+									 quote_identifier(fk_col),
+									 quote_identifier(te->resname));
+					first = false;
+					break;		/* use first group key for the FK match */
+				}
+				appendStringInfoString(&buf, "\n  )");
+				chk_alias++;
+			}
+		}
 	}
 	else
 	{
 		/* DML CTEs (_upd_) always execute; this SELECT just terminates the WITH. */
 		appendStringInfoString(&buf, "SELECT 1");
+	}
+
+	return buf.data;
+}
+
+/*
+ * incr_qual_get_colname_for_varno
+ * Given a join qual (typically an equality OpExpr), return the source
+ * column name for the Var belonging to the requested varno.
+ * Handles simple A=B OpExpr and AND BoolExpr of such conditions.
+ * Returns NULL if the varno is not found in the qual.
+ */
+static const char *
+incr_qual_get_colname_for_varno(Node *qual, List *rtable, int varno)
+{
+	if (qual == NULL)
+		return NULL;
+
+	if (IsA(qual, OpExpr))
+	{
+		OpExpr *op = (OpExpr *) qual;
+
+		if (list_length(op->args) == 2)
+		{
+			Node *lhs = linitial(op->args);
+			Node *rhs = lsecond(op->args);
+			int   rv;
+
+			if (IsA(lhs, Var) && ((Var *) lhs)->varno == varno)
+				return incr_resolve_var_colname((Var *) lhs, rtable, &rv);
+			if (IsA(rhs, Var) && ((Var *) rhs)->varno == varno)
+				return incr_resolve_var_colname((Var *) rhs, rtable, &rv);
+		}
+	}
+	else if (IsA(qual, BoolExpr))
+	{
+		BoolExpr *bexpr = (BoolExpr *) qual;
+		ListCell *alc;
+
+		foreach(alc, bexpr->args)
+		{
+			const char *result =
+				incr_qual_get_colname_for_varno(lfirst(alc), rtable, varno);
+
+			if (result != NULL)
+				return result;
+		}
+	}
+	return NULL;
+}
+
+/*
+ * incr_qual_get_other_varno
+ * Given an equality join qual and one side's varno, return the varno of
+ * the other side.  Returns -1 if not found.
+ */
+static int
+incr_qual_get_other_varno(Node *qual, int own_varno)
+{
+	if (qual == NULL)
+		return -1;
+
+	if (IsA(qual, OpExpr))
+	{
+		OpExpr *op = (OpExpr *) qual;
+
+		if (list_length(op->args) == 2)
+		{
+			Node *lhs = linitial(op->args);
+			Node *rhs = lsecond(op->args);
+
+			if (IsA(lhs, Var) && ((Var *) lhs)->varno == own_varno && IsA(rhs, Var))
+				return ((Var *) rhs)->varno;
+			if (IsA(rhs, Var) && ((Var *) rhs)->varno == own_varno && IsA(lhs, Var))
+				return ((Var *) lhs)->varno;
+		}
+	}
+	else if (IsA(qual, BoolExpr))
+	{
+		BoolExpr *bexpr = (BoolExpr *) qual;
+		ListCell *alc;
+
+		foreach(alc, bexpr->args)
+		{
+			int result = incr_qual_get_other_varno(lfirst(alc), own_varno);
+
+			if (result != -1)
+				return result;
+		}
+	}
+	return -1;
+}
+
+/*
+ * incr_build_outer_row_sync_sql
+ * "Sync-region" SQL for row-level (no GROUP BY) outer-join matviews.
+ *
+ * Strategy: identify the "affected region" from the delta via the delta's
+ * DIRECT join-neighbor key, delete all current matview rows in that region,
+ * then re-insert fresh rows from the live query for that region.
+ *
+ * Using the direct neighbor (not always the ultimate preserved anchor) handles
+ * N-table chains like (c JOIN o LEFT JOIN i): when i fires, the region key is
+ * o.id (direct neighbor), not c.id (ultimate anchor).
+ *
+ * Generated SQL:
+ *   WITH
+ *     _aff_ AS (SELECT DISTINCT <delta_jkey> AS jkey FROM <delta_table>),
+ *     _del_ AS (
+ *       DELETE FROM mv WHERE <mv_peer_key> IN (SELECT jkey FROM _aff_)
+ *       [OR <mv_delta_pk> IN (SELECT <delta_pk> FROM delta_table)]  -- FULL JOIN
+ *     )
+ *   INSERT INTO mv (cols)
+ *   SELECT cols FROM <preserved_table> _ltp_
+ *   [JOIN_TYPE] <other_table> _lt<n>_ ON (cond) ...
+ *   WHERE <peer_alias>.<peer_key> IN (SELECT jkey FROM _aff_)
+ *   [OR _lt<n>_.<fk> IN (SELECT jkey FROM _aff_)]  -- FULL JOIN
+ *   [AND <view_where>]
+ */
+static char *
+incr_build_outer_row_sync_sql(Oid mvrelid, Query *viewQuery,
+							   int delta_varno, const char *delta_table,
+							   List *all_tables)
+{
+	StringInfoData	buf;
+	ListCell	   *lc;
+	int				preserved_varno  = incr_outer_preserved_varno(all_tables);
+	IncrJoinEntry  *preserved_entry  = NULL;
+	IncrJoinEntry  *delta_entry      = NULL;
+	const char	   *mvname           = mv_qname(mvrelid);
+	bool			delta_is_preserved;
+	bool			has_full_join     = false;
+	Node		   *conn_qual;
+	const char	   *delta_jkey_col;	/* column in delta for _aff_ */
+	int				peer_varno;		/* direct neighbor of delta */
+	const char	   *peer_jkey_col;	/* peer's key column for INSERT WHERE */
+	const char	   *mv_peer_col      = NULL;	/* matview col for peer key */
+	const char	   *mv_delta_pk_col  = NULL;
+	const char	   *delta_pk_src_col = NULL;
+	bool			first;
+
+	foreach(lc, all_tables)
+	{
+		IncrJoinEntry *je = lfirst(lc);
+
+		if (je->varno == preserved_varno)
+			preserved_entry = je;
+		if (je->varno == delta_varno)
+			delta_entry = je;
+		if (je->join_type == JOIN_FULL)
+			has_full_join = true;
+	}
+	Assert(preserved_entry != NULL && delta_entry != NULL);
+
+	delta_is_preserved = (delta_varno == preserved_varno);
+
+	/*
+	 * Determine the region key.
+	 *
+	 * For the preserved (anchor) delta: use the ON condition to the first
+	 * non-preserved neighbor; the preserved table's own key is the region.
+	 *
+	 * For a non-preserved delta: use delta_entry->quals (the ON condition of
+	 * the JoinExpr step that introduced this table) to find the DIRECT
+	 * neighbor.  This handles N-table chains correctly — for
+	 * c JOIN o LEFT JOIN i with delta=i, the direct neighbor is o (not c).
+	 */
+	if (delta_is_preserved)
+	{
+		IncrJoinEntry *other = NULL;
+
+		foreach(lc, all_tables)
+		{
+			IncrJoinEntry *je = lfirst(lc);
+
+			if (je->varno != preserved_varno) { other = je; break; }
+		}
+		conn_qual = find_connecting_qual(all_tables, preserved_varno,
+										 other ? other->varno : -1);
+		delta_jkey_col = incr_qual_get_colname_for_varno(conn_qual,
+														  viewQuery->rtable,
+														  preserved_varno);
+		peer_varno    = preserved_varno;
+		peer_jkey_col = delta_jkey_col;
+	}
+	else
+	{
+		/*
+		 * Use the delta's stored ON condition (direct neighbor).
+		 * Fall back to find_connecting_qual only if quals is NULL.
+		 */
+		conn_qual = delta_entry->quals;
+		if (conn_qual == NULL)
+			conn_qual = find_connecting_qual(all_tables, delta_varno,
+											 preserved_varno);
+		if (conn_qual == NULL)
+			elog(ERROR,
+				 "DBblue: no join condition found for delta table (varno=%d) "
+				 "in outer-join row-level matview",
+				 delta_varno);
+
+		delta_jkey_col = incr_qual_get_colname_for_varno(conn_qual,
+														  viewQuery->rtable,
+														  delta_varno);
+		peer_varno     = incr_qual_get_other_varno(conn_qual, delta_varno);
+		if (peer_varno == -1)
+			elog(ERROR,
+				 "DBblue: cannot identify peer varno in join condition for "
+				 "delta table (varno=%d)",
+				 delta_varno);
+		peer_jkey_col = incr_qual_get_colname_for_varno(conn_qual,
+														 viewQuery->rtable,
+														 peer_varno);
+	}
+
+	if (delta_jkey_col == NULL || peer_jkey_col == NULL)
+		elog(ERROR,
+			 "DBblue: cannot determine join-key columns for delta (varno=%d) "
+			 "in outer-join row-level matview",
+			 delta_varno);
+
+	/*
+	 * Find the matview column corresponding to peer_varno.peer_jkey_col.
+	 * This is used in the DELETE WHERE clause to identify affected rows.
+	 */
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+		Var         *v;
+		int          rv;
+		const char  *src_col;
+
+		if (te->resjunk || !IsA(te->expr, Var))
+			continue;
+		v = (Var *) te->expr;
+		if (v->varno != peer_varno)
+			continue;
+		src_col = incr_resolve_var_colname(v, viewQuery->rtable, &rv);
+		if (strcmp(src_col, peer_jkey_col) == 0)
+		{
+			mv_peer_col = te->resname;
+			break;
+		}
+	}
+
+	if (mv_peer_col == NULL)
+	{
+		/*
+		 * The peer's join-key column is not in the SELECT list.  We cannot
+		 * identify the affected region.  Emit a clear error — the PK warning
+		 * at CREATE time should have flagged this already.
+		 */
+		RangeTblEntry *peer_rte = rt_fetch(peer_varno, viewQuery->rtable);
+
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("DBblue: outer-join incremental matview requires the "
+						"join-key column \"%s\" of table \"%s\" in the SELECT list",
+						peer_jkey_col,
+						get_rel_name(peer_rte->relid))));
+	}
+
+	/*
+	 * For FULL JOIN + non-preserved delta: standalone non-preserved rows have
+	 * a NULL preserved-side key and will not be found by the standard DELETE.
+	 * Use the delta table's own PK to identify and delete them.
+	 */
+	if (has_full_join && !delta_is_preserved)
+	{
+		Relation   delta_rel = table_open(delta_entry->oid, AccessShareLock);
+		List      *idxlist   = RelationGetIndexList(delta_rel);
+		AttrNumber pk_attnum = InvalidAttrNumber;
+
+		foreach(lc, idxlist)
+		{
+			Oid           indexoid = lfirst_oid(lc);
+			HeapTuple     indextup = SearchSysCache1(INDEXRELID,
+													 ObjectIdGetDatum(indexoid));
+			Form_pg_index idxform;
+
+			if (!HeapTupleIsValid(indextup))
+				continue;
+			idxform = (Form_pg_index) GETSTRUCT(indextup);
+			if (idxform->indisprimary)
+			{
+				pk_attnum = idxform->indkey.values[0];
+				ReleaseSysCache(indextup);
+				break;
+			}
+			ReleaseSysCache(indextup);
+		}
+		list_free(idxlist);
+		table_close(delta_rel, AccessShareLock);
+
+		if (pk_attnum != InvalidAttrNumber)
+		{
+			delta_pk_src_col = get_attname(delta_entry->oid, pk_attnum, true);
+
+			foreach(lc, viewQuery->targetList)
+			{
+				TargetEntry *te = lfirst_node(TargetEntry, lc);
+				Var         *v;
+
+				if (te->resjunk || !IsA(te->expr, Var))
+					continue;
+				v = (Var *) te->expr;
+				if (v->varno == delta_varno && v->varattno == pk_attnum)
+				{
+					mv_delta_pk_col = te->resname;
+					break;
+				}
+			}
+		}
+	}
+
+	initStringInfo(&buf);
+
+	/* ---- _aff_: affected region (join-key values from delta) ---- */
+	appendStringInfo(&buf,
+					 "WITH _aff_ AS (\n"
+					 "  SELECT DISTINCT %s AS jkey FROM %s\n),\n",
+					 quote_identifier(delta_jkey_col), delta_table);
+
+	/* ---- _del_: remove current matview rows in the region ---- */
+	appendStringInfo(&buf,
+					 "_del_ AS (\n"
+					 "  DELETE FROM %s\n"
+					 "  WHERE %s IN (SELECT jkey FROM _aff_)",
+					 mvname,
+					 quote_identifier(mv_peer_col));
+
+	/*
+	 * FULL JOIN + non-preserved delta: also delete standalone non-preserved
+	 * rows using the delta table's own PK (those rows have NULL peer key).
+	 */
+	if (has_full_join && !delta_is_preserved &&
+		mv_delta_pk_col != NULL && delta_pk_src_col != NULL)
+	{
+		appendStringInfo(&buf,
+						 "\n     OR %s IN (SELECT %s FROM %s)",
+						 quote_identifier(mv_delta_pk_col),
+						 quote_identifier(delta_pk_src_col),
+						 delta_table);
+	}
+	appendStringInfoString(&buf, "\n)\n");
+
+	/* ---- INSERT: fresh rows for the affected region ---- */
+	appendStringInfo(&buf, "INSERT INTO %s (", mvname);
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+		if (te->resjunk) continue;
+		if (!first) appendStringInfoChar(&buf, ',');
+		appendStringInfoString(&buf, quote_identifier(te->resname));
+		first = false;
+	}
+	appendStringInfoString(&buf, ")\nSELECT ");
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+		char        *expr_sql;
+
+		if (te->resjunk) continue;
+		if (!first) appendStringInfoChar(&buf, ',');
+		first = false;
+		expr_sql = qual_to_live_sql((Node *) te->expr,
+									viewQuery->rtable, all_tables, preserved_varno);
+		appendStringInfoString(&buf, expr_sql);
+	}
+
+	/* FROM preserved anchor + other tables with their original join types */
+	appendStringInfo(&buf, "\nFROM %s _ltp_", mv_qname(preserved_entry->oid));
+	foreach(lc, all_tables)
+	{
+		IncrJoinEntry *je      = lfirst(lc);
+		const char    *join_kw;
+		Node          *q;
+		char          *cond_sql;
+
+		if (je->varno == preserved_varno)
+			continue;
+
+		join_kw = (je->join_type == JOIN_FULL)  ? "FULL JOIN"  :
+				  (je->join_type == JOIN_LEFT)  ? "LEFT JOIN"  :
+				  (je->join_type == JOIN_RIGHT) ? "RIGHT JOIN" : "JOIN";
+
+		q = find_connecting_qual(all_tables, je->varno, preserved_varno);
+		if (q == NULL)
+			q = je->quals;
+		cond_sql = qual_to_live_sql(q, viewQuery->rtable, all_tables, preserved_varno);
+		appendStringInfo(&buf, "\n  %s %s _lt%d_ ON (%s)",
+						 join_kw, mv_qname(je->oid), je->varno, cond_sql);
+	}
+
+	/*
+	 * WHERE: restrict to the affected region.
+	 * Use the peer table alias — _ltp_ for preserved, _lt<n>_ for others.
+	 */
+	{
+		const char *peer_alias = (peer_varno == preserved_varno)
+								  ? "_ltp_"
+								  : psprintf("_lt%d_", peer_varno);
+
+		appendStringInfo(&buf,
+						 "\nWHERE %s.%s IN (SELECT jkey FROM _aff_)",
+						 peer_alias, quote_identifier(peer_jkey_col));
+
+		if (has_full_join)
+		{
+			/* Also include standalone non-preserved rows in the region */
+			foreach(lc, all_tables)
+			{
+				IncrJoinEntry *je = lfirst(lc);
+				Node          *q;
+				const char    *other_fk_col;
+
+				if (je->varno == preserved_varno)
+					continue;
+
+				q = find_connecting_qual(all_tables, je->varno, preserved_varno);
+				if (q == NULL)
+					q = je->quals;
+				other_fk_col = incr_qual_get_colname_for_varno(q,
+															   viewQuery->rtable,
+															   je->varno);
+				if (other_fk_col)
+					appendStringInfo(&buf,
+									 "\n   OR _lt%d_.%s IN (SELECT jkey FROM _aff_)",
+									 je->varno, quote_identifier(other_fk_col));
+			}
+		}
+	}
+
+	/* View's own WHERE clause, ANDed with the region filter */
+	{
+		Node *wq = incr_get_where_qual(viewQuery);
+
+		if (wq != NULL)
+		{
+			char *wq_sql = qual_to_live_sql(wq, viewQuery->rtable,
+											all_tables, preserved_varno);
+
+			appendStringInfo(&buf, "\n  AND (%s)", wq_sql);
+		}
 	}
 
 	return buf.data;
