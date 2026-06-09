@@ -191,6 +191,14 @@ static char *incr_build_self_join_row_del_sql(Oid mvrelid, Query *viewQuery,
 											   int v1, int v2,
 											   const char *delta_table,
 											   List *all_tables);
+static char *incr_build_self_join_agg_ins_sql(Oid mvrelid, Query *viewQuery,
+											   int v1, int v2,
+											   const char *delta_table,
+											   List *all_tables);
+static char *incr_build_self_join_agg_del_sql(Oid mvrelid, Query *viewQuery,
+											   int v1, int v2,
+											   const char *delta_table,
+											   List *all_tables);
 static bool incr_is_pure_union_all(Node *node);
 static void incr_collect_union_branches(Query *viewQuery, List **branches);
 static char *incr_build_union_ins_sql(Oid mvrelid, Query *viewQuery,
@@ -476,13 +484,7 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 
 		hash_destroy(oid_counts);
 
-		if (has_self_join &&
-			(viewQuery->groupClause != NIL || viewQuery->distinctClause != NIL))
-		{
-			*reason = "self-joins with GROUP BY or DISTINCT are not supported; "
-					  "use a row-level (no GROUP BY/DISTINCT) matview instead";
-			return false;
-		}
+		/* self-join + GROUP BY/DISTINCT is handled by incr_build_self_join_agg_* */
 	}
 
 	if (nbasetables == 1)
@@ -949,6 +951,63 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 		else
 		{
 			/* ---- Phase 2-7: N-table INNER JOIN ---- */
+			if (incr_has_self_join(all_tables))
+			{
+				/*
+				 * Self-join + GROUP BY: each self-joined OID needs both roles
+				 * (e and m) merged into a single catalog entry.  We wrap two
+				 * incr_build_ins/del_sql_gen calls in a CTE so they execute as
+				 * one SPI statement.  Data-modifying CTEs always run to
+				 * completion regardless of whether their output is referenced.
+				 */
+				Bitmapset *done_oids = NULL;
+
+				foreach(jlc, all_tables)
+				{
+					IncrJoinEntry *delta = lfirst(jlc);
+
+					if (bms_is_member((int) delta->oid, done_oids))
+						continue;
+					{
+					int v2 = incr_self_join_other_varno(all_tables, delta->varno, delta->oid);
+					int v1, vtmp;
+
+					if (v2 != -1)
+					{
+						v1 = delta->varno;
+						if (v1 > v2) { vtmp = v1; v1 = v2; v2 = vtmp; }
+
+						ins_sql = incr_build_self_join_agg_ins_sql(
+							mvrelid, viewQuery, v1, v2,
+							MATVIEW_INCR_NEWTABLE, all_tables);
+						del_sql = incr_build_self_join_agg_del_sql(
+							mvrelid, viewQuery, v1, v2,
+							MATVIEW_INCR_OLDTABLE, all_tables);
+					}
+					else
+					{
+						List *join_list = incr_build_join_list_for_delta(
+							all_tables, delta->varno);
+
+						ins_sql = incr_build_ins_sql_gen(mvrelid, viewQuery,
+														 delta->varno,
+														 MATVIEW_INCR_NEWTABLE,
+														 join_list);
+						del_sql = incr_build_del_sql_gen(mvrelid, viewQuery,
+														 delta->varno,
+														 MATVIEW_INCR_OLDTABLE,
+														 join_list);
+					}
+
+					incr_store_catalog(mvrelid, delta->oid,
+									   ins_sql, del_sql, cln_sql, hav_sql);
+					incr_install_triggers(mvrelid, delta->oid);
+					done_oids = bms_add_member(done_oids, (int) delta->oid);
+					} /* end v2 block */
+				}
+			}
+			else
+			{
 			foreach(jlc, all_tables)
 			{
 				IncrJoinEntry *delta     = lfirst(jlc);
@@ -967,6 +1026,7 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 								   ins_sql, del_sql, cln_sql, hav_sql);
 				incr_install_triggers(mvrelid, delta->oid);
 			}
+			} /* end !has_self_join */
 
 			/*
 			 * HAVING backfill: seed all groups from the real tables so groups
@@ -4503,6 +4563,63 @@ matview_delta_apply(PG_FUNCTION_ARGS)
 	CloseMatViewIncrementalMaintenance();
 	SPI_finish();
 	return PointerGetDatum(NULL);
+}
+
+/* ============================================================
+ * Self-join + GROUP BY/DISTINCT helpers — Phase 14
+ * ============================================================ */
+
+/*
+ * incr_build_self_join_agg_ins_sql
+ *
+ * INSERT delta for a self-join with GROUP BY.  Both roles (v1 and v2) must be
+ * merged into a single catalog entry because the self-joined table has one OID.
+ *
+ * Strategy: wrap arm1 in a data-modifying CTE so both arms execute in a
+ * single SPI call.  PostgreSQL guarantees data-modifying CTEs run exactly
+ * once regardless of whether their output is referenced by the outer query.
+ *
+ *   WITH _sj_ins_ AS ( <arm1: INSERT ... ON CONFLICT DO UPDATE> )
+ *   <arm2: INSERT ... ON CONFLICT DO UPDATE>
+ */
+static char *
+incr_build_self_join_agg_ins_sql(Oid mvrelid, Query *viewQuery,
+								  int v1, int v2,
+								  const char *delta_table,
+								  List *all_tables)
+{
+	List *jl1  = incr_build_join_list_for_delta(all_tables, v1);
+	List *jl2  = incr_build_join_list_for_delta(all_tables, v2);
+	char *arm1 = incr_build_ins_sql_gen(mvrelid, viewQuery, v1, delta_table, jl1);
+	char *arm2 = incr_build_ins_sql_gen(mvrelid, viewQuery, v2, delta_table, jl2);
+
+	return psprintf("WITH _sj_ins_ AS (%s) %s", arm1, arm2);
+}
+
+/*
+ * incr_build_self_join_agg_del_sql
+ *
+ * DELETE delta for a self-join with GROUP BY.  Same CTE wrapping strategy.
+ * Each arm is "WITH d AS (...) UPDATE mv SET ... FROM d WHERE ...".
+ * Both are wrapped as outer CTEs with a terminal SELECT 1.
+ *
+ *   WITH _sj_d1_ AS ( <arm1: WITH d AS (...) UPDATE ...> ),
+ *        _sj_d2_ AS ( <arm2: WITH d AS (...) UPDATE ...> )
+ *   SELECT 1
+ */
+static char *
+incr_build_self_join_agg_del_sql(Oid mvrelid, Query *viewQuery,
+								  int v1, int v2,
+								  const char *delta_table,
+								  List *all_tables)
+{
+	List *jl1  = incr_build_join_list_for_delta(all_tables, v1);
+	List *jl2  = incr_build_join_list_for_delta(all_tables, v2);
+	char *arm1 = incr_build_del_sql_gen(mvrelid, viewQuery, v1, delta_table, jl1);
+	char *arm2 = incr_build_del_sql_gen(mvrelid, viewQuery, v2, delta_table, jl2);
+
+	return psprintf("WITH _sj_d1_ AS (%s),_sj_d2_ AS (%s) SELECT 1",
+					arm1, arm2);
 }
 
 /* ============================================================
