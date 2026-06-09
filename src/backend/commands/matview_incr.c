@@ -191,6 +191,18 @@ static char *incr_build_self_join_row_del_sql(Oid mvrelid, Query *viewQuery,
 											   int v1, int v2,
 											   const char *delta_table,
 											   List *all_tables);
+static bool incr_is_pure_union_all(Node *node);
+static void incr_collect_union_branches(Query *viewQuery, List **branches);
+static char *incr_build_union_ins_sql(Oid mvrelid, Query *viewQuery,
+									   Query *branchQuery,
+									   int delta_varno, const char *delta_table,
+									   List *join_list);
+static char *incr_build_union_del_sql(Oid mvrelid, Query *viewQuery,
+									   Query *branchQuery,
+									   int delta_varno, const char *delta_table,
+									   List *join_list);
+static void incr_union_dedup_backfill(Oid mvrelid, Query *viewQuery);
+static void incr_setup_union_all(Oid mvrelid, Query *viewQuery);
 static bool incr_validate_expr(Node *expr, Query *viewQuery, bool allow_aggref);
 static Node *incr_get_where_qual(Query *viewQuery);
 static void incr_deparse_where_qual(Node *qual, List *rtable, int delta_varno,
@@ -257,9 +269,98 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 	}
 	if (viewQuery->setOperations != NULL)
 	{
-		*reason = "set operations (UNION/INTERSECT/EXCEPT) are not supported; "
-				  "for UNION ALL use separate matviews";
-		return false;
+		/*
+		 * UNION ALL: validate the full tree and each branch, then return.
+		 * All other eligibility checks below are for non-UNION-ALL queries.
+		 */
+		if (!incr_is_pure_union_all(viewQuery->setOperations))
+		{
+			*reason = "only UNION ALL is supported for set operations; "
+					  "UNION DISTINCT, INTERSECT, and EXCEPT are not supported";
+			return false;
+		}
+		if (viewQuery->groupClause != NIL)
+		{
+			*reason = "UNION ALL with GROUP BY is not supported; "
+					  "place GROUP BY inside each branch query";
+			return false;
+		}
+		if (viewQuery->distinctClause != NIL)
+		{
+			*reason = "UNION ALL with DISTINCT is not supported";
+			return false;
+		}
+		if (viewQuery->havingQual != NULL)
+		{
+			*reason = "UNION ALL with HAVING is not supported";
+			return false;
+		}
+		if (viewQuery->limitCount != NULL || viewQuery->limitOffset != NULL)
+		{
+			*reason = "UNION ALL with LIMIT/OFFSET is not supported";
+			return false;
+		}
+
+		/* Validate each branch and check for cross-branch duplicate tables */
+		{
+			List	   *branches = NIL;
+			ListCell   *blc;
+			HTAB	   *seen_tables;
+			HASHCTL		ctl;
+
+			incr_collect_union_branches(viewQuery, &branches);
+
+			memset(&ctl, 0, sizeof(ctl));
+			ctl.keysize   = sizeof(Oid);
+			ctl.entrysize = sizeof(Oid) * 2;
+			ctl.hcxt      = CurrentMemoryContext;
+			seen_tables = hash_create("union_seen", 16, &ctl,
+									  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+
+			foreach(blc, branches)
+			{
+				Query	   *branchQuery = (Query *) lfirst(blc);
+				const char *branch_reason;
+				List	   *btables;
+				ListCell   *tlc;
+
+				if (!MatviewIncrIsEligible(branchQuery, &branch_reason))
+				{
+					*reason = psprintf("UNION ALL branch is not eligible: %s",
+									   branch_reason);
+					hash_destroy(seen_tables);
+					return false;
+				}
+				if (branchQuery->groupClause != NIL ||
+					branchQuery->distinctClause != NIL)
+				{
+					*reason = "UNION ALL branches with GROUP BY or DISTINCT "
+							  "are not supported; use a subquery if needed";
+					hash_destroy(seen_tables);
+					return false;
+				}
+
+				btables = incr_collect_tables(branchQuery);
+				foreach(tlc, btables)
+				{
+					IncrJoinEntry *je = lfirst(tlc);
+					bool		   found;
+
+					hash_search(seen_tables, &je->oid, HASH_ENTER, &found);
+					if (found)
+					{
+						*reason = psprintf(
+							"table \"%s\" appears in multiple UNION ALL branches; "
+							"each source table must appear in at most one branch",
+							get_rel_name(je->oid));
+						hash_destroy(seen_tables);
+						return false;
+					}
+				}
+			}
+			hash_destroy(seen_tables);
+		}
+		return true; /* UNION ALL is eligible */
 	}
 	if (viewQuery->hasSubLinks)
 	{
@@ -608,6 +709,16 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot use incremental_refresh: %s", reason)));
 
+	/* UNION ALL: separate setup path */
+	if (viewQuery->setOperations != NULL)
+	{
+		incr_setup_union_all(mvrelid, viewQuery);
+		ereport(DEBUG1,
+				(errmsg("DBblue: incremental refresh (UNION ALL) set up for matview %s",
+						get_rel_name(mvrelid))));
+		return;
+	}
+
 	/* Count base tables to determine phase */
 	foreach(lc, viewQuery->rtable)
 	{
@@ -944,6 +1055,10 @@ MatviewIncrAddCountTarget(Query *q)
 	int			next_resno = list_length(q->targetList) + 1;
 	Aggref	   *aggref;
 	TargetEntry *te;
+
+	/* UNION ALL: __mv_count__ is added via ALTER TABLE in incr_setup_union_all */
+	if (q->setOperations != NULL)
+		return;
 
 	/* Row-level views (no GROUP BY or DISTINCT) need no hidden maintenance columns */
 	if (q->groupClause == NIL && q->distinctClause == NIL)
@@ -4388,4 +4503,454 @@ matview_delta_apply(PG_FUNCTION_ARGS)
 	CloseMatViewIncrementalMaintenance();
 	SPI_finish();
 	return PointerGetDatum(NULL);
+}
+
+/* ============================================================
+ * UNION ALL helpers — Phase 13
+ * ============================================================
+ */
+
+/*
+ * incr_is_pure_union_all — returns true iff every node in the setOperations
+ * tree is a UNION ALL.  Leaves (RangeTblRef) are always acceptable.
+ */
+static bool
+incr_is_pure_union_all(Node *node)
+{
+	if (IsA(node, SetOperationStmt))
+	{
+		SetOperationStmt *so = (SetOperationStmt *) node;
+
+		if (so->op != SETOP_UNION || !so->all)
+			return false;
+		return incr_is_pure_union_all(so->larg) &&
+			   incr_is_pure_union_all(so->rarg);
+	}
+	/* Leaf: RangeTblRef */
+	return true;
+}
+
+static void
+incr_collect_union_branches_recurse(Node *node, List *rtable, List **branches)
+{
+	if (IsA(node, SetOperationStmt))
+	{
+		SetOperationStmt *so = (SetOperationStmt *) node;
+
+		incr_collect_union_branches_recurse(so->larg, rtable, branches);
+		incr_collect_union_branches_recurse(so->rarg, rtable, branches);
+	}
+	else if (IsA(node, RangeTblRef))
+	{
+		RangeTblRef   *rtr = (RangeTblRef *) node;
+		RangeTblEntry *rte = rt_fetch(rtr->rtindex, rtable);
+
+		Assert(rte->rtekind == RTE_SUBQUERY);
+		*branches = lappend(*branches, rte->subquery);
+	}
+}
+
+static void
+incr_collect_union_branches(Query *viewQuery, List **branches)
+{
+	*branches = NIL;
+	incr_collect_union_branches_recurse(viewQuery->setOperations,
+										viewQuery->rtable, branches);
+}
+
+/*
+ * incr_build_union_ins_sql
+ *
+ * INSERT INTO mv (col1, ..., __mv_count__)
+ * SELECT expr1, ..., COUNT(*)
+ * FROM delta_table [_d_ JOIN ...] [WHERE ...]
+ * GROUP BY expr1, ...
+ * ON CONFLICT (col1, ...) DO UPDATE SET __mv_count__ = mv.__mv_count__ + EXCLUDED.__mv_count__
+ *
+ * viewQuery targetList  → matview column names (resname)
+ * branchQuery targetList → column expressions
+ * delta_varno = -1 for single-table branch (bare names), ≥1 for JOIN branch
+ */
+static char *
+incr_build_union_ins_sql(Oid mvrelid, Query *viewQuery, Query *branchQuery,
+						 int delta_varno, const char *delta_table,
+						 List *join_list)
+{
+	StringInfoData	buf;
+	ListCell	   *vlc,	/* view targetList cursor */
+				   *blc;	/* branch targetList cursor */
+	const char	   *mvname    = mv_qname(mvrelid);
+	const char	   *cntcol    = quote_identifier(MATVIEW_INCR_COUNT_COL);
+	List		   *view_cols  = NIL;	/* non-junk, non-hidden view TEs */
+	List		   *branch_cols = NIL;	/* matching branch TEs */
+	bool			first;
+
+	/* Collect visible (non-junk, non-hidden) column pairs */
+	forboth(vlc, viewQuery->targetList, blc, branchQuery->targetList)
+	{
+		TargetEntry *vte = lfirst_node(TargetEntry, vlc);
+		TargetEntry *bte = lfirst_node(TargetEntry, blc);
+
+		if (vte->resjunk || incr_is_hidden_col(vte->resname))
+			continue;
+		view_cols   = lappend(view_cols,   vte);
+		branch_cols = lappend(branch_cols, bte);
+	}
+
+	initStringInfo(&buf);
+
+	/* INSERT INTO mv (col1, ..., __mv_count__) */
+	appendStringInfo(&buf, "INSERT INTO %s (", mvname);
+	first = true;
+	foreach(vlc, view_cols)
+	{
+		TargetEntry *vte = lfirst_node(TargetEntry, vlc);
+
+		if (!first) appendStringInfoChar(&buf, ',');
+		appendStringInfoString(&buf, quote_identifier(vte->resname));
+		first = false;
+	}
+	appendStringInfo(&buf, ",%s) SELECT ", cntcol);
+
+	/* SELECT expr1, ..., COUNT(*) */
+	first = true;
+	foreach(blc, branch_cols)
+	{
+		TargetEntry    *bte = lfirst_node(TargetEntry, blc);
+		StringInfoData	ebuf;
+
+		if (!first) appendStringInfoChar(&buf, ',');
+		first = false;
+
+		initStringInfo(&ebuf);
+		incr_deparse_where_qual((Node *) bte->expr, branchQuery->rtable,
+								delta_varno, &ebuf);
+		appendStringInfoString(&buf, ebuf.data);
+	}
+	appendStringInfo(&buf, ",COUNT(*)");
+
+	/* FROM delta [_d_ JOIN ...] [WHERE ...] */
+	incr_append_from_join(&buf, branchQuery, delta_varno, delta_table, join_list);
+	{
+		Node *wq = incr_get_where_qual(branchQuery);
+
+		if (wq != NULL)
+		{
+			StringInfoData wbuf;
+
+			initStringInfo(&wbuf);
+			incr_deparse_where_qual(wq, branchQuery->rtable, delta_varno, &wbuf);
+			appendStringInfo(&buf, " WHERE %s", wbuf.data);
+		}
+	}
+
+	/* GROUP BY expr1, ... */
+	appendStringInfoString(&buf, " GROUP BY ");
+	first = true;
+	foreach(blc, branch_cols)
+	{
+		TargetEntry    *bte = lfirst_node(TargetEntry, blc);
+		StringInfoData	ebuf;
+
+		if (!first) appendStringInfoChar(&buf, ',');
+		first = false;
+
+		initStringInfo(&ebuf);
+		incr_deparse_where_qual((Node *) bte->expr, branchQuery->rtable,
+								delta_varno, &ebuf);
+		appendStringInfoString(&buf, ebuf.data);
+	}
+
+	/* ON CONFLICT (col1, ...) DO UPDATE SET __mv_count__ = mv + EXCLUDED */
+	appendStringInfoString(&buf, " ON CONFLICT (");
+	first = true;
+	foreach(vlc, view_cols)
+	{
+		TargetEntry *vte = lfirst_node(TargetEntry, vlc);
+
+		if (!first) appendStringInfoChar(&buf, ',');
+		appendStringInfoString(&buf, quote_identifier(vte->resname));
+		first = false;
+	}
+	appendStringInfo(&buf,
+					 ") DO UPDATE SET %s=%s.%s+EXCLUDED.%s",
+					 cntcol, mvname, cntcol, cntcol);
+
+	return buf.data;
+}
+
+/*
+ * incr_build_union_del_sql
+ *
+ * WITH d AS (
+ *   SELECT expr1 AS col1, ..., COUNT(*) AS __mv_count__
+ *   FROM delta_table [_d_ JOIN ...] [WHERE ...]
+ *   GROUP BY expr1, ...
+ * )
+ * UPDATE mv SET __mv_count__ = mv.__mv_count__ - d.__mv_count__
+ * FROM d
+ * WHERE mv.col1 = d.col1 AND ...
+ */
+static char *
+incr_build_union_del_sql(Oid mvrelid, Query *viewQuery, Query *branchQuery,
+						 int delta_varno, const char *delta_table,
+						 List *join_list)
+{
+	StringInfoData	buf;
+	ListCell	   *vlc,
+				   *blc;
+	const char	   *mvname   = mv_qname(mvrelid);
+	const char	   *cntcol   = quote_identifier(MATVIEW_INCR_COUNT_COL);
+	List		   *view_cols  = NIL;
+	List		   *branch_cols = NIL;
+	bool			first;
+
+	forboth(vlc, viewQuery->targetList, blc, branchQuery->targetList)
+	{
+		TargetEntry *vte = lfirst_node(TargetEntry, vlc);
+		TargetEntry *bte = lfirst_node(TargetEntry, blc);
+
+		if (vte->resjunk || incr_is_hidden_col(vte->resname))
+			continue;
+		view_cols   = lappend(view_cols,   vte);
+		branch_cols = lappend(branch_cols, bte);
+	}
+
+	initStringInfo(&buf);
+
+	/* WITH d AS (SELECT expr1 AS col1, ..., COUNT(*) AS __mv_count__ */
+	appendStringInfoString(&buf, "WITH d AS (SELECT ");
+	first = true;
+	forboth(vlc, view_cols, blc, branch_cols)
+	{
+		TargetEntry    *vte = lfirst_node(TargetEntry, vlc);
+		TargetEntry    *bte = lfirst_node(TargetEntry, blc);
+		StringInfoData	ebuf;
+
+		if (!first) appendStringInfoChar(&buf, ',');
+		first = false;
+
+		initStringInfo(&ebuf);
+		incr_deparse_where_qual((Node *) bte->expr, branchQuery->rtable,
+								delta_varno, &ebuf);
+		appendStringInfo(&buf, "%s AS %s", ebuf.data,
+						 quote_identifier(vte->resname));
+	}
+	appendStringInfo(&buf, ",COUNT(*) AS %s", cntcol);
+
+	/* FROM ... [WHERE ...] GROUP BY ... ) */
+	incr_append_from_join(&buf, branchQuery, delta_varno, delta_table, join_list);
+	{
+		Node *wq = incr_get_where_qual(branchQuery);
+
+		if (wq != NULL)
+		{
+			StringInfoData wbuf;
+
+			initStringInfo(&wbuf);
+			incr_deparse_where_qual(wq, branchQuery->rtable, delta_varno, &wbuf);
+			appendStringInfo(&buf, " WHERE %s", wbuf.data);
+		}
+	}
+	appendStringInfoString(&buf, " GROUP BY ");
+	first = true;
+	foreach(blc, branch_cols)
+	{
+		TargetEntry    *bte = lfirst_node(TargetEntry, blc);
+		StringInfoData	ebuf;
+
+		if (!first) appendStringInfoChar(&buf, ',');
+		first = false;
+
+		initStringInfo(&ebuf);
+		incr_deparse_where_qual((Node *) bte->expr, branchQuery->rtable,
+								delta_varno, &ebuf);
+		appendStringInfoString(&buf, ebuf.data);
+	}
+	appendStringInfoString(&buf, ") ");
+
+	/* UPDATE mv SET __mv_count__ = mv.__mv_count__ - d.__mv_count__ FROM d WHERE ... */
+	appendStringInfo(&buf,
+					 "UPDATE %s SET %s=%s.%s-d.%s FROM d WHERE ",
+					 mvname, cntcol, mvname, cntcol, cntcol);
+	first = true;
+	foreach(vlc, view_cols)
+	{
+		TargetEntry *vte = lfirst_node(TargetEntry, vlc);
+		const char  *colq = quote_identifier(vte->resname);
+
+		if (!first) appendStringInfoString(&buf, " AND ");
+		appendStringInfo(&buf, "%s.%s IS NOT DISTINCT FROM d.%s",
+						 mvname, colq, colq);
+		first = false;
+	}
+
+	return buf.data;
+}
+
+/*
+ * incr_union_dedup_backfill
+ *
+ * The matview was created from a plain UNION ALL query (no __mv_count__ yet).
+ * We need to:
+ *   1. Aggregate the existing rows into (col1,...,count) via a temp table.
+ *   2. Truncate the matview.
+ *   3. Re-insert the deduped rows with their counts.
+ */
+static void
+incr_union_dedup_backfill(Oid mvrelid, Query *viewQuery)
+{
+	StringInfoData	col_list;
+	StringInfoData	sql;
+	ListCell	   *lc;
+	const char	   *mvname = mv_qname(mvrelid);
+	const char	   *cntcol = quote_identifier(MATVIEW_INCR_COUNT_COL);
+	bool			first;
+	int				ret;
+
+	/* Build comma-separated list of visible column names */
+	initStringInfo(&col_list);
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+		if (te->resjunk || incr_is_hidden_col(te->resname))
+			continue;
+		if (!first) appendStringInfoChar(&col_list, ',');
+		appendStringInfoString(&col_list, quote_identifier(te->resname));
+		first = false;
+	}
+
+	OpenMatViewIncrementalMaintenance();
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "incr_union_dedup_backfill: SPI_connect failed");
+
+	/* Step 1: create temp table with aggregated counts */
+	initStringInfo(&sql);
+	appendStringInfo(&sql,
+					 "CREATE TEMP TABLE __dbblue_union_tmp__ AS "
+					 "SELECT %s,COUNT(*) AS __cnt__ FROM %s GROUP BY %s",
+					 col_list.data, mvname, col_list.data);
+	ret = SPI_execute(sql.data, false, 0);
+	if (ret < 0)
+		elog(ERROR, "incr_union_dedup_backfill: CREATE TEMP TABLE failed (%d)", ret);
+
+	/* Step 2: delete all rows from the matview */
+	initStringInfo(&sql);
+	appendStringInfo(&sql, "DELETE FROM %s", mvname);
+	ret = SPI_execute(sql.data, false, 0);
+	if (ret < 0)
+		elog(ERROR, "incr_union_dedup_backfill: DELETE failed (%d)", ret);
+
+	/* Step 3: re-insert deduped rows with counts */
+	initStringInfo(&sql);
+	appendStringInfo(&sql,
+					 "INSERT INTO %s (%s,%s) "
+					 "SELECT %s,__cnt__ FROM __dbblue_union_tmp__",
+					 mvname, col_list.data, cntcol, col_list.data);
+	ret = SPI_execute(sql.data, false, 0);
+	if (ret < 0)
+		elog(ERROR, "incr_union_dedup_backfill: INSERT failed (%d)", ret);
+
+	/* Step 4: drop temp table */
+	ret = SPI_execute("DROP TABLE __dbblue_union_tmp__", false, 0);
+	if (ret < 0)
+		elog(ERROR, "incr_union_dedup_backfill: DROP TABLE failed (%d)", ret);
+
+	SPI_finish();
+	CloseMatViewIncrementalMaintenance();
+}
+
+/*
+ * incr_setup_union_all
+ *
+ * Orchestrate incremental setup for a UNION ALL matview:
+ *   1. ALTER TABLE mv ADD COLUMN __mv_count__ bigint NOT NULL DEFAULT 0
+ *   2. Dedup-backfill: collapse duplicate rows into a single row with count
+ *   3. Create unique index on all visible columns
+ *   4. For each UNION ALL branch, install per-table triggers
+ */
+static void
+incr_setup_union_all(Oid mvrelid, Query *viewQuery)
+{
+	List	   *branches = NIL;
+	List	   *allColNames = NIL;
+	ListCell   *lc;
+	char	   *alter_sql;
+	int			ret;
+	const char *cntcol = quote_identifier(MATVIEW_INCR_COUNT_COL);
+
+	/* Step 1: add __mv_count__ column */
+	alter_sql = psprintf(
+		"ALTER TABLE %s ADD COLUMN %s bigint NOT NULL DEFAULT 0",
+		mv_qname(mvrelid), cntcol);
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "incr_setup_union_all: SPI_connect failed");
+	ret = SPI_execute(alter_sql, false, 0);
+	SPI_finish();
+	if (ret != SPI_OK_UTILITY)
+		elog(ERROR, "incr_setup_union_all: ALTER TABLE failed (%d)", ret);
+
+	CommandCounterIncrement();
+
+	/* Step 2: dedup-backfill */
+	incr_union_dedup_backfill(mvrelid, viewQuery);
+	CommandCounterIncrement();
+
+	/* Step 3: unique index on all visible columns */
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+		if (te->resjunk || incr_is_hidden_col(te->resname))
+			continue;
+		allColNames = lappend(allColNames, makeString(pstrdup(te->resname)));
+	}
+	incr_create_unique_index(mvrelid, allColNames);
+
+	/* Step 4: per-branch triggers */
+	incr_collect_union_branches(viewQuery, &branches);
+
+	foreach(lc, branches)
+	{
+		Query	   *branchQuery = (Query *) lfirst(lc);
+		List	   *all_tables  = incr_collect_tables(branchQuery);
+		ListCell   *jlc;
+		char	   *ins_sql,
+				   *del_sql;
+		char	   *cln_sql = psprintf("DELETE FROM %s WHERE %s<=0",
+									  mv_qname(mvrelid), cntcol);
+
+		foreach(jlc, all_tables)
+		{
+			IncrJoinEntry *delta     = lfirst(jlc);
+			List		  *join_list;
+			int			   dv;
+
+			if (list_length(all_tables) == 1)
+			{
+				/* Single-table branch: no alias */
+				join_list = NIL;
+				dv        = -1;
+			}
+			else
+			{
+				join_list = incr_build_join_list_for_delta(all_tables, delta->varno);
+				dv        = delta->varno;
+			}
+
+			ins_sql = incr_build_union_ins_sql(mvrelid, viewQuery, branchQuery,
+											   dv, MATVIEW_INCR_NEWTABLE,
+											   join_list);
+			del_sql = incr_build_union_del_sql(mvrelid, viewQuery, branchQuery,
+											   dv, MATVIEW_INCR_OLDTABLE,
+											   join_list);
+
+			incr_store_catalog(mvrelid, delta->oid,
+							   ins_sql, del_sql, cln_sql, NULL);
+			incr_install_triggers(mvrelid, delta->oid);
+		}
+	}
 }
