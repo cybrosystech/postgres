@@ -181,6 +181,16 @@ static void incr_store_catalog(Oid mvrelid, Oid srctable,
 							   const char *cln_sql,
 							   const char *having_sql);
 static void incr_create_unique_index(Oid mvrelid, List *groupColNames);
+static bool incr_has_self_join(List *all_tables);
+static int  incr_self_join_other_varno(List *all_tables, int own_varno, Oid shared_oid);
+static char *incr_build_self_join_row_ins_sql(Oid mvrelid, Query *viewQuery,
+											   int v1, int v2,
+											   const char *delta_table,
+											   List *all_tables);
+static char *incr_build_self_join_row_del_sql(Oid mvrelid, Query *viewQuery,
+											   int v1, int v2,
+											   const char *delta_table,
+											   List *all_tables);
 static bool incr_validate_expr(Node *expr, Query *viewQuery, bool allow_aggref);
 static Node *incr_get_where_qual(Query *viewQuery);
 static void incr_deparse_where_qual(Node *qual, List *rtable, int delta_varno,
@@ -247,7 +257,8 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 	}
 	if (viewQuery->setOperations != NULL)
 	{
-		*reason = "set operations are not supported";
+		*reason = "set operations (UNION/INTERSECT/EXCEPT) are not supported; "
+				  "for UNION ALL use separate matviews";
 		return false;
 	}
 	if (viewQuery->hasSubLinks)
@@ -260,22 +271,93 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 		*reason = "DISTINCT is not supported";
 		return false;
 	}
-
-	/* Count base relations: 1 = Phase 1 (single table), 2 = Phase 2 (INNER JOIN) */
-	foreach(lc, viewQuery->rtable)
+	if (viewQuery->limitCount != NULL || viewQuery->limitOffset != NULL)
 	{
-		RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+		*reason = "LIMIT/OFFSET cannot be maintained incrementally; "
+				  "the result set would shift on every row change";
+		return false;
+	}
+	if (viewQuery->hasWindowFuncs)
+	{
+		*reason = "window functions cannot be maintained incrementally";
+		return false;
+	}
+	if (viewQuery->cteList != NIL)
+	{
+		*reason = "WITH clauses (CTEs) are not supported; inline the subquery instead";
+		return false;
+	}
 
-		/* PG19 RTE_GROUP, RTE_RESULT, and explicit-JOIN's RTE_JOIN are bookkeeping — skip */
-		if (rte->rtekind == RTE_GROUP || rte->rtekind == RTE_RESULT ||
-			rte->rtekind == RTE_JOIN)
-			continue;
+	/* Count base relations; also check for LATERAL and duplicate OIDs */
+	{
+		/*
+		 * Track how many times each table OID appears — self-join (2×) is
+		 * allowed for row-level matviews; 3+ is not supported.
+		 */
+		HTAB	   *oid_counts;
+		HASHCTL		ctl;
+		bool		has_self_join = false;
 
-		if (rte->rtekind == RTE_RELATION)
-			nbasetables++;
-		else
+		memset(&ctl, 0, sizeof(ctl));
+		ctl.keysize   = sizeof(Oid);
+		ctl.entrysize = sizeof(Oid) * 2; /* key + count */
+		ctl.hcxt      = CurrentMemoryContext;
+		oid_counts = hash_create("incr_oid_counts", 16, &ctl,
+								 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+
+		foreach(lc, viewQuery->rtable)
 		{
-			*reason = "only plain table references are supported (no functions, VALUES, etc.)";
+			RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+			Oid		*entry;
+			bool	 found;
+
+			/* PG19 RTE_GROUP, RTE_RESULT, and explicit-JOIN's RTE_JOIN are bookkeeping */
+			if (rte->rtekind == RTE_GROUP || rte->rtekind == RTE_RESULT ||
+				rte->rtekind == RTE_JOIN)
+				continue;
+
+			if (rte->lateral)
+			{
+				*reason = "LATERAL joins are not supported for incremental refresh";
+				hash_destroy(oid_counts);
+				return false;
+			}
+
+			if (rte->rtekind == RTE_RELATION)
+			{
+				nbasetables++;
+				entry = (Oid *) hash_search(oid_counts, &rte->relid, HASH_ENTER, &found);
+				if (!found)
+					entry[1] = 1;
+				else
+				{
+					entry[1]++;
+					if (entry[1] == 2)
+						has_self_join = true;
+					else if (entry[1] > 2)
+					{
+						*reason = psprintf("table \"%s\" appears more than twice; "
+										   "diamond join patterns are not supported",
+										   get_rel_name(rte->relid));
+						hash_destroy(oid_counts);
+						return false;
+					}
+				}
+			}
+			else
+			{
+				*reason = "only plain table references are supported (no functions, VALUES, etc.)";
+				hash_destroy(oid_counts);
+				return false;
+			}
+		}
+
+		hash_destroy(oid_counts);
+
+		if (has_self_join && viewQuery->groupClause != NIL)
+		{
+			*reason = "self-joins with GROUP BY are not supported; "
+					  "use a row-level (no GROUP BY) matview instead";
 			return false;
 		}
 	}
@@ -307,18 +389,24 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 		}
 
 		/*
-		 * Walk every JoinExpr in the tree.  We accept INNER, LEFT, RIGHT, and
-		 * FULL OUTER JOINs with an explicit ON condition.  CROSS JOIN (no ON)
-		 * is not supported.
+		 * Walk every JoinExpr in the tree.
 		 *
-		 * FULL JOIN with GROUP BY is also rejected: orphan rows produce NULL
-		 * group keys which break the ON CONFLICT UPSERT strategy.  FULL JOIN
-		 * without GROUP BY (row-level sync) works correctly.
+		 * Accepted:
+		 *   INNER JOIN with ON (equi or non-equi) or without ON (CROSS JOIN)
+		 *   LEFT / RIGHT / FULL OUTER JOIN with ON
+		 *
+		 * Rejected:
+		 *   CROSS JOIN mixed with any outer join (the Phase 8 recompute strategy
+		 *   needs an equi-join key to identify the preserved-side anchor)
+		 *   FULL OUTER JOIN with GROUP BY (orphan rows produce NULL group keys
+		 *   that break the ON CONFLICT UPSERT strategy)
 		 */
 		{
 			List	   *stack = list_make1(jtree_root);
 			ListCell   *slc;
 			bool		has_full_join = false;
+			bool		has_outer_join = false;
+			bool		has_cross_join = false;
 
 			foreach(slc, stack)
 			{
@@ -331,14 +419,19 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 					je->jointype != JOIN_RIGHT &&
 					je->jointype != JOIN_FULL)
 				{
-					*reason = "only INNER, LEFT, RIGHT, and FULL OUTER JOINs are supported";
+					*reason = "only INNER/CROSS, LEFT, RIGHT, and FULL OUTER JOINs are supported";
+					return false;
+				}
+				if (je->quals == NULL && je->jointype != JOIN_INNER)
+				{
+					*reason = "LEFT, RIGHT, and FULL OUTER JOINs require an ON condition";
 					return false;
 				}
 				if (je->quals == NULL)
-				{
-					*reason = "each JOIN step must have an ON condition";
-					return false;
-				}
+					has_cross_join = true;
+				if (je->jointype == JOIN_LEFT || je->jointype == JOIN_RIGHT ||
+					je->jointype == JOIN_FULL)
+					has_outer_join = true;
 				if (je->jointype == JOIN_FULL)
 					has_full_join = true;
 				if (IsA(je->larg, JoinExpr))
@@ -347,6 +440,12 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 					stack = lappend(stack, je->rarg);
 			}
 
+			if (has_cross_join && has_outer_join)
+			{
+				*reason = "CROSS JOIN cannot be combined with LEFT/RIGHT/FULL OUTER JOIN "
+						  "in an incremental matview";
+				return false;
+			}
 			if (has_full_join && viewQuery->groupClause != NIL)
 			{
 				*reason = "FULL OUTER JOIN with GROUP BY is not supported; "
@@ -608,24 +707,86 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 			}
 			else
 			{
-				/* Inner join: simple row-level delta */
-				foreach(jlc, all_tables)
+				/* Inner join (and CROSS JOIN): simple row-level delta.
+			 * For self-joins, combine both roles into a UNION ALL. */
+				if (incr_has_self_join(all_tables))
 				{
-					IncrJoinEntry *delta     = lfirst(jlc);
-					List		  *join_list = incr_build_join_list_for_delta(
-						all_tables, delta->varno);
+					/*
+					 * Self-join: iterate unique OIDs only.  For each
+					 * self-joined OID, build a combined UNION ALL SQL that
+					 * handles the delta in both roles.
+					 */
+					Bitmapset *done_oids = NULL;
 
-					ins_sql = incr_build_row_ins_sql(mvrelid, viewQuery,
-													 delta->varno,
-													 MATVIEW_INCR_NEWTABLE,
-													 join_list);
-					del_sql = incr_build_row_del_sql(mvrelid, viewQuery,
-													 delta->varno,
-													 MATVIEW_INCR_OLDTABLE,
-													 join_list);
-					incr_store_catalog(mvrelid, delta->oid,
-									   ins_sql, del_sql, "SELECT 1", NULL);
-					incr_install_triggers(mvrelid, delta->oid);
+					foreach(jlc, all_tables)
+					{
+						IncrJoinEntry *delta = lfirst(jlc);
+
+						if (bms_is_member((int) delta->oid, done_oids))
+							continue;
+
+						/* Check if this OID appears twice (self-join) */
+						{
+						int v2 = incr_self_join_other_varno(all_tables,
+														 delta->varno,
+														 delta->oid);
+						int v1;
+						int vtmp;
+						if (v2 != -1)
+						{
+							/* Ensure v1 < v2 so we process each pair once */
+							v1 = delta->varno;
+							if (v1 > v2) { vtmp = v1; v1 = v2; v2 = vtmp; }
+
+							ins_sql = incr_build_self_join_row_ins_sql(
+								mvrelid, viewQuery, v1, v2,
+								MATVIEW_INCR_NEWTABLE, all_tables);
+							del_sql = incr_build_self_join_row_del_sql(
+								mvrelid, viewQuery, v1, v2,
+								MATVIEW_INCR_OLDTABLE, all_tables);
+						}
+						else
+						{
+							/* Regular (non-self-joined) table */
+							List *join_list = incr_build_join_list_for_delta(
+								all_tables, delta->varno);
+							ins_sql = incr_build_row_ins_sql(mvrelid, viewQuery,
+															 delta->varno,
+															 MATVIEW_INCR_NEWTABLE,
+															 join_list);
+							del_sql = incr_build_row_del_sql(mvrelid, viewQuery,
+															 delta->varno,
+															 MATVIEW_INCR_OLDTABLE,
+															 join_list);
+						}
+
+						incr_store_catalog(mvrelid, delta->oid,
+										   ins_sql, del_sql, "SELECT 1", NULL);
+						incr_install_triggers(mvrelid, delta->oid);
+						done_oids = bms_add_member(done_oids, (int) delta->oid);
+						} /* end v2 block */
+					}
+				}
+				else
+				{
+					foreach(jlc, all_tables)
+					{
+						IncrJoinEntry *delta     = lfirst(jlc);
+						List		  *join_list = incr_build_join_list_for_delta(
+							all_tables, delta->varno);
+
+						ins_sql = incr_build_row_ins_sql(mvrelid, viewQuery,
+														 delta->varno,
+														 MATVIEW_INCR_NEWTABLE,
+														 join_list);
+						del_sql = incr_build_row_del_sql(mvrelid, viewQuery,
+														 delta->varno,
+														 MATVIEW_INCR_OLDTABLE,
+														 join_list);
+						incr_store_catalog(mvrelid, delta->oid,
+										   ins_sql, del_sql, "SELECT 1", NULL);
+						incr_install_triggers(mvrelid, delta->oid);
+					}
 				}
 			}
 		}
@@ -1592,12 +1753,22 @@ incr_append_from_join(StringInfo buf, Query *viewQuery,
 	foreach(lc, join_list)
 	{
 		IncrJoinEntry  *je = lfirst(lc);
-		StringInfoData	jbuf;
 
-		initStringInfo(&jbuf);
-		incr_deparse_where_qual(je->quals, viewQuery->rtable, delta_varno, &jbuf);
-		appendStringInfo(buf, " JOIN %s _j%d_ ON (%s)",
-						 mv_qname(je->oid), je->varno, jbuf.data);
+		if (je->quals == NULL)
+		{
+			/* CROSS JOIN — no ON condition */
+			appendStringInfo(buf, " CROSS JOIN %s _j%d_",
+							 mv_qname(je->oid), je->varno);
+		}
+		else
+		{
+			StringInfoData	jbuf;
+
+			initStringInfo(&jbuf);
+			incr_deparse_where_qual(je->quals, viewQuery->rtable, delta_varno, &jbuf);
+			appendStringInfo(buf, " JOIN %s _j%d_ ON (%s)",
+							 mv_qname(je->oid), je->varno, jbuf.data);
+		}
 	}
 }
 
@@ -1841,6 +2012,176 @@ incr_build_row_del_sql(Oid mvrelid, Query *viewQuery,
 	}
 
 	appendStringInfoString(&buf, ")");
+
+	return buf.data;
+}
+
+/* ============================================================
+ * Self-join helpers (Phase 11)
+ * ============================================================ */
+
+/*
+ * incr_has_self_join — true if any two all_tables entries share an OID.
+ */
+static bool
+incr_has_self_join(List *all_tables)
+{
+	ListCell *lc1, *lc2;
+
+	foreach(lc1, all_tables)
+	{
+		IncrJoinEntry *je1 = lfirst(lc1);
+		foreach(lc2, all_tables)
+		{
+			IncrJoinEntry *je2 = lfirst(lc2);
+			if (je2 != je1 && je2->oid == je1->oid)
+				return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * incr_self_join_other_varno — given one varno of a self-joined OID, return
+ * the other varno.
+ */
+static int
+incr_self_join_other_varno(List *all_tables, int own_varno, Oid shared_oid)
+{
+	ListCell *lc;
+
+	foreach(lc, all_tables)
+	{
+		IncrJoinEntry *je = lfirst(lc);
+		if (je->oid == shared_oid && je->varno != own_varno)
+			return je->varno;
+	}
+	return -1;
+}
+
+/*
+ * incr_build_self_join_select — emit one SELECT arm of the self-join UNION ALL.
+ * Appends directly to *buf; does NOT emit "INSERT INTO mv".
+ */
+static void
+incr_build_self_join_select(StringInfo buf, Query *viewQuery,
+							int delta_varno, const char *delta_table,
+							List *all_tables)
+{
+	List	   *join_list = incr_build_join_list_for_delta(all_tables, delta_varno);
+	ListCell   *lc;
+	bool		first;
+	Node	   *wq;
+
+	appendStringInfoString(buf, "SELECT ");
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry    *te = lfirst_node(TargetEntry, lc);
+		StringInfoData	ebuf;
+
+		if (te->resjunk) continue;
+		if (!first) appendStringInfoChar(buf, ',');
+		first = false;
+		initStringInfo(&ebuf);
+		incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable,
+								delta_varno, &ebuf);
+		appendStringInfoString(buf, ebuf.data);
+	}
+
+	incr_append_from_join(buf, viewQuery, delta_varno, delta_table, join_list);
+
+	wq = incr_get_where_qual(viewQuery);
+	if (wq != NULL)
+	{
+		StringInfoData wbuf;
+		initStringInfo(&wbuf);
+		incr_deparse_where_qual(wq, viewQuery->rtable, delta_varno, &wbuf);
+		appendStringInfo(buf, " WHERE %s", wbuf.data);
+	}
+}
+
+/*
+ * incr_build_self_join_row_ins_sql
+ * INSERT for a self-join: handles both roles (v1 = anchor, v2 = join partner)
+ * by unioning two SELECT arms.
+ *
+ *   INSERT INTO mv (cols)
+ *   SELECT ... FROM delta _d_ JOIN t _j<v2>_ ON ...   -- delta as v1
+ *   UNION ALL
+ *   SELECT ... FROM t _j<v1>_ JOIN delta _d_ ON ...   -- delta as v2
+ */
+static char *
+incr_build_self_join_row_ins_sql(Oid mvrelid, Query *viewQuery,
+								  int v1, int v2,
+								  const char *delta_table,
+								  List *all_tables)
+{
+	StringInfoData	buf;
+	ListCell	   *lc;
+	bool			first;
+
+	initStringInfo(&buf);
+
+	/* INSERT INTO mv (...) */
+	appendStringInfo(&buf, "INSERT INTO %s (", mv_qname(mvrelid));
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+		if (te->resjunk) continue;
+		if (!first) appendStringInfoChar(&buf, ',');
+		appendStringInfoString(&buf, quote_identifier(te->resname));
+		first = false;
+	}
+	appendStringInfoString(&buf, ") ");
+
+	incr_build_self_join_select(&buf, viewQuery, v1, delta_table, all_tables);
+	appendStringInfoString(&buf, "\nUNION ALL\n");
+	incr_build_self_join_select(&buf, viewQuery, v2, delta_table, all_tables);
+
+	return buf.data;
+}
+
+/*
+ * incr_build_self_join_row_del_sql
+ * DELETE for a self-join: same UNION ALL strategy as INSERT.
+ *
+ *   DELETE FROM mv WHERE (cols) IN (
+ *     SELECT ... FROM delta _d_ JOIN t _j<v2>_ ON ...
+ *     UNION ALL
+ *     SELECT ... FROM t _j<v1>_ JOIN delta _d_ ON ...
+ *   )
+ */
+static char *
+incr_build_self_join_row_del_sql(Oid mvrelid, Query *viewQuery,
+								  int v1, int v2,
+								  const char *delta_table,
+								  List *all_tables)
+{
+	StringInfoData	buf;
+	ListCell	   *lc;
+	bool			first;
+
+	initStringInfo(&buf);
+
+	appendStringInfo(&buf, "DELETE FROM %s WHERE (", mv_qname(mvrelid));
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+		if (te->resjunk) continue;
+		if (!first) appendStringInfoChar(&buf, ',');
+		appendStringInfoString(&buf, quote_identifier(te->resname));
+		first = false;
+	}
+	appendStringInfoString(&buf, ") IN (\n");
+
+	incr_build_self_join_select(&buf, viewQuery, v1, delta_table, all_tables);
+	appendStringInfoString(&buf, "\nUNION ALL\n");
+	incr_build_self_join_select(&buf, viewQuery, v2, delta_table, all_tables);
+
+	appendStringInfoString(&buf, "\n)");
 
 	return buf.data;
 }
@@ -2572,12 +2913,23 @@ incr_build_join_list_for_delta(List *all_tables, int delta_varno)
 				}
 			}
 
-			if (connecting_qual != NULL)
+			/*
+		 * If a connecting condition was found, use it (covers regular tables
+		 * and the leftmost anchor whose ON condition lives in another entry).
+		 * If no connecting condition exists AND this entry has no original ON
+		 * condition (je->quals == NULL), it is a true CROSS JOIN — include it
+		 * unconditionally with a NULL quals so incr_append_from_join emits
+		 * "CROSS JOIN".
+		 * If no connecting condition exists AND je->quals != NULL, we cannot
+		 * place this table yet; continue scanning.
+		 */
+		if (connecting_qual != NULL || je->quals == NULL)
 			{
 				IncrJoinEntry *new_je = palloc(sizeof(IncrJoinEntry));
 
 				new_je->varno = je->varno;
 				new_je->oid = je->oid;
+				/* Use found connecting_qual; NULL only for true CROSS JOIN */
 				new_je->quals = connecting_qual;
 				result = lappend(result, new_je);
 				remaining = list_delete_cell(remaining, lc);
