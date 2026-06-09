@@ -556,6 +556,9 @@ char	   *event_source;
 bool		row_security;
 bool		check_function_bodies = true;
 
+char	   *dbblue_brin_database = NULL;
+bool		dbblue_create_brin = false;
+
 /*
  * These GUCs exist solely for backward compatibility.
  */

@@ -623,6 +623,20 @@
   assign_hook => 'assign_datestyle',
 },
 
+{ name => 'dbblue_brin_database', type => 'string', context => 'PGC_POSTMASTER', group => 'RESOURCES_WORKER_PROCESSES',
+  short_desc => 'Database name for automatic BRIN index creation.',
+  long_desc => 'The background worker created by dbblue_create_brin will connect to this database to create BRIN indexes.',
+  variable => 'dbblue_brin_database',
+  boot_val => '"odoo"',
+},
+
+{ name => 'dbblue_create_brin', type => 'bool', context => 'PGC_POSTMASTER', group => 'RESOURCES_WORKER_PROCESSES',
+  short_desc => 'Enable automatic BRIN index creation for create_date columns.',
+  long_desc => 'When enabled, a background worker periodically checks pg_stats and creates BRIN indexes on create_date columns with high correlation (>0.9).',
+  variable => 'dbblue_create_brin',
+  boot_val => 'false',
+},
+
 # This is PGC_SUSET to prevent hiding from log_lock_waits.
 { name => 'deadlock_timeout', type => 'int', context => 'PGC_SUSET', group => 'LOCK_MANAGEMENT',
   short_desc => 'Sets the time to wait on a lock before checking for deadlock.',

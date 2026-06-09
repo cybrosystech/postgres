@@ -100,6 +100,7 @@
 #include "pgstat.h"
 #include "port/pg_bswap.h"
 #include "port/pg_getopt_ctx.h"
+#include "commands/dbblue_brin_worker.h"
 #include "postmaster/autovacuum.h"
 #include "postmaster/bgworker_internals.h"
 #include "postmaster/pgarch.h"
@@ -924,6 +925,11 @@ PostmasterMain(int argc, char *argv[])
 	 * before any modules had a chance to take the background worker slots.
 	 */
 	ApplyLauncherRegister();
+
+	/*
+	 * Register the BRIN worker for automatic BRIN index creation
+	 */
+	DBBlueBrinWorkerRegister();
 
 	/*
 	 * Register the shared memory needs of all core subsystems.
