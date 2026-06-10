@@ -215,6 +215,24 @@ static bool incr_has_minmax_agg(Query *viewQuery);
 static char *incr_build_minmax_del_sql_gen(Oid mvrelid, Query *viewQuery,
 										   int delta_varno, const char *delta_table,
 										   List *join_list, Oid delta_oid);
+/* Phase 16: CTE / FROM-subquery normalization */
+static int   incr_single_base_varno(Query *q);
+static int   incr_find_cte_varno(Query *q, const char *ctename);
+static bool  incr_q_is_filter_proj(Query *q);
+static bool  incr_q_is_single_agg(Query *q);
+static bool  incr_q_is_distinct_only(Query *q);
+static bool  incr_outer_sole_source_is(Query *outer, int src_varno);
+static Node *incr_remap_var_mutator(Node *node, void *ctx_ptr);
+static Node *incr_subst_col_mutator(Node *node, void *ctx_ptr);
+static Node *incr_subst_merge_mutator(Node *node, void *ctx_ptr);
+static bool  incr_try_inline_filter(Query *outer, Query *srcq, int src_varno);
+static bool  incr_try_merge_agg(Query *outer, Query *srcq, int src_varno);
+static bool  incr_try_merge_distinct(Query *outer, Query *srcq, int src_varno);
+static bool  incr_subst_inner_cte_refs(Query *srcq, Query *outer_with_ctes);
+static bool  incr_try_normalize_cte(Query *outer, CommonTableExpr *cte, int cte_varno);
+static bool  incr_try_normalize_subq(Query *outer, int sq_varno);
+static Query *incr_normalize_query_body(Query *q);
+
 static bool incr_validate_expr(Node *expr, Query *viewQuery, bool allow_aggref);
 static Node *incr_get_where_qual(Query *viewQuery);
 static void incr_deparse_where_qual(Node *qual, List *rtable, int delta_varno,
@@ -5478,4 +5496,775 @@ incr_build_minmax_del_sql_gen(Oid mvrelid, Query *viewQuery,
 	appendStringInfoChar(&buf, ')');
 
 	return buf.data;
+}
+
+
+/* ================================================================
+ * Phase 16: CTE / FROM-subquery normalization
+ *
+ * Pre-processing pass that rewrites CTEs and non-LATERAL FROM-subqueries
+ * into equivalent forms that the existing IVM SQL generators support.
+ *
+ * Three transformations:
+ *
+ *  T1 (filter/projection inline): CTE or subquery has a single base
+ *     table, no GROUP BY, no aggregates, no DISTINCT, no set ops.
+ *     Replace the RTE_CTE/RTE_SUBQUERY slot with the base-table RTE,
+ *     substitute all column references, merge WHERE conditions.
+ *
+ *  T2 (aggregate merge): CTE/subquery has GROUP BY + aggregates; the
+ *     outer query uses it as its sole source with no GROUP BY of its
+ *     own.  Outer WHERE becomes HAVING in the merged query.
+ *
+ *  T3 (DISTINCT merge): CTE/subquery has DISTINCT (no GROUP BY); outer
+ *     uses it as sole source with no aggregates.  Outer WHERE merges
+ *     into the inner WHERE.
+ *
+ * Nested CTE chains are unravelled iteratively.
+ * ================================================================ */
+
+/* ----------------------------------------------------------------
+ * Mutator context types
+ * ---------------------------------------------------------------- */
+
+typedef struct IncrVarRemap
+{
+	int		src_varno;
+	int		dst_varno;
+} IncrVarRemap;
+
+typedef struct IncrSubstColCtx
+{
+	int		src_varno;
+	List   *src_tlist;
+	int		src_base_varno;		/* inner base-table varno in source query */
+} IncrSubstColCtx;
+
+typedef struct IncrSubstMergeCtx
+{
+	int		src_varno;
+	List   *src_tlist;
+} IncrSubstMergeCtx;
+
+
+/* ----------------------------------------------------------------
+ * incr_remap_var_mutator: copy-on-write remap Var.varno
+ * ---------------------------------------------------------------- */
+static Node *
+incr_remap_var_mutator(Node *node, void *ctx_ptr)
+{
+	IncrVarRemap *ctx = (IncrVarRemap *) ctx_ptr;
+
+	if (node == NULL)
+		return NULL;
+	if (IsA(node, Var))
+	{
+		Var *v = (Var *) node;
+
+		if (v->varno == ctx->src_varno && v->varlevelsup == 0)
+		{
+			Var *nv = (Var *) copyObject(v);
+
+			nv->varno = ctx->dst_varno;
+			return (Node *) nv;
+		}
+	}
+	return expression_tree_mutator(node, incr_remap_var_mutator, ctx_ptr);
+}
+
+/*
+ * incr_subst_col_mutator (T1): substitute Var(src_varno, K) with the
+ * K-th target expression from src_tlist, remapping the inner base-table
+ * varno to src_varno so the expression fits in the outer query's rtable.
+ */
+static Node *
+incr_subst_col_mutator(Node *node, void *ctx_ptr)
+{
+	IncrSubstColCtx *ctx = (IncrSubstColCtx *) ctx_ptr;
+
+	if (node == NULL)
+		return NULL;
+	if (IsA(node, Var))
+	{
+		Var *v = (Var *) node;
+
+		if (v->varno == ctx->src_varno && v->varlevelsup == 0 &&
+			v->varattno >= 1)
+		{
+			TargetEntry *te;
+			Node		*expr;
+			IncrVarRemap remap;
+
+			te   = list_nth_node(TargetEntry, ctx->src_tlist,
+								 v->varattno - 1);
+			expr = (Node *) copyObject(te->expr);
+
+			remap.src_varno = ctx->src_base_varno;
+			remap.dst_varno = ctx->src_varno;
+			return incr_remap_var_mutator(expr, &remap);
+		}
+	}
+	return expression_tree_mutator(node, incr_subst_col_mutator, ctx_ptr);
+}
+
+/*
+ * incr_subst_merge_mutator (T2/T3): substitute Var(src_varno, K) with
+ * the K-th target expression AS-IS (inner varnos preserved because we
+ * are building into the inner query's structure).
+ */
+static Node *
+incr_subst_merge_mutator(Node *node, void *ctx_ptr)
+{
+	IncrSubstMergeCtx *ctx = (IncrSubstMergeCtx *) ctx_ptr;
+
+	if (node == NULL)
+		return NULL;
+	if (IsA(node, Var))
+	{
+		Var *v = (Var *) node;
+
+		if (v->varno == ctx->src_varno && v->varlevelsup == 0 &&
+			v->varattno >= 1)
+		{
+			TargetEntry *te = list_nth_node(TargetEntry, ctx->src_tlist,
+											v->varattno - 1);
+
+			return (Node *) copyObject(te->expr);
+		}
+	}
+	return expression_tree_mutator(node, incr_subst_merge_mutator, ctx_ptr);
+}
+
+/* Apply IncrSubstColCtx to target list, jointree, HAVING, and GROUP RTE
+ * groupexprs.  In PostgreSQL 16+, grouped TL entries use Var(group_rte, K)
+ * rather than Var(src, K), so we must also substitute the GROUP RTE's
+ * groupexprs to keep the group key expressions consistent. */
+static void
+incr_apply_subst_col(Query *q, IncrSubstColCtx *ctx)
+{
+	ListCell   *lc;
+
+	q->targetList = (List *)
+		incr_subst_col_mutator((Node *) q->targetList, ctx);
+	if (q->jointree)
+		q->jointree = (FromExpr *)
+			incr_subst_col_mutator((Node *) q->jointree, ctx);
+	if (q->havingQual)
+		q->havingQual = incr_subst_col_mutator(q->havingQual, ctx);
+
+	foreach(lc, q->rtable)
+	{
+		RangeTblEntry *r = lfirst_node(RangeTblEntry, lc);
+
+		if (r->rtekind == RTE_GROUP && r->groupexprs != NIL)
+			r->groupexprs = (List *)
+				incr_subst_col_mutator((Node *) r->groupexprs, ctx);
+	}
+}
+
+
+/* ----------------------------------------------------------------
+ * Predicate helpers
+ * ---------------------------------------------------------------- */
+
+/*
+ * Return the varno of the single RTE_RELATION in q, or -1.
+ * Skips system RTEs (JOIN, RESULT, GROUP).
+ */
+static int
+incr_single_base_varno(Query *q)
+{
+	ListCell   *lc;
+	int			vno		 = 1;
+	int			base_vno = -1;
+
+	foreach(lc, q->rtable)
+	{
+		RangeTblEntry *r = lfirst_node(RangeTblEntry, lc);
+
+		if (r->rtekind == RTE_JOIN || r->rtekind == RTE_RESULT ||
+			r->rtekind == RTE_GROUP)
+		{
+			vno++;
+			continue;
+		}
+		if (r->rtekind == RTE_RELATION)
+		{
+			if (base_vno != -1)
+				return -1;		/* more than one */
+			base_vno = vno;
+		}
+		else
+			return -1;			/* subquery, CTE, function, … */
+		vno++;
+	}
+	return base_vno;
+}
+
+/* Find the outer-query varno for RTE_CTE named ctename, or -1. */
+static int
+incr_find_cte_varno(Query *q, const char *ctename)
+{
+	ListCell   *lc;
+	int			vno = 1;
+
+	foreach(lc, q->rtable)
+	{
+		RangeTblEntry *r = lfirst_node(RangeTblEntry, lc);
+
+		if (r->rtekind == RTE_CTE &&
+			strcmp(r->ctename, ctename) == 0 &&
+			r->ctelevelsup == 0)
+			return vno;
+		vno++;
+	}
+	return -1;
+}
+
+/* Single base table, no GROUP BY, no aggregates, no DISTINCT,
+ * no set ops, no window funcs, no CTEs, no sublinks. */
+static bool
+incr_q_is_filter_proj(Query *q)
+{
+	if (q->groupClause != NIL || q->hasAggs)
+		return false;
+	if (q->distinctClause != NIL || q->setOperations)
+		return false;
+	if (q->limitCount || q->limitOffset)
+		return false;
+	if (q->hasWindowFuncs || q->cteList != NIL || q->hasSubLinks)
+		return false;
+	return (incr_single_base_varno(q) > 0);
+}
+
+/* Single base table, GROUP BY + aggregates, no set ops, no window funcs,
+ * no CTEs, no sublinks. */
+static bool
+incr_q_is_single_agg(Query *q)
+{
+	if (q->groupClause == NIL || !q->hasAggs)
+		return false;
+	if (q->setOperations || q->hasWindowFuncs)
+		return false;
+	if (q->cteList != NIL || q->hasSubLinks)
+		return false;
+	return (incr_single_base_varno(q) > 0);
+}
+
+/* Single base table, DISTINCT (no GROUP BY, no aggregates), no set ops,
+ * no window funcs, no CTEs, no sublinks. */
+static bool
+incr_q_is_distinct_only(Query *q)
+{
+	if (q->distinctClause == NIL || q->groupClause != NIL || q->hasAggs)
+		return false;
+	if (q->setOperations || q->hasWindowFuncs)
+		return false;
+	if (q->cteList != NIL || q->hasSubLinks)
+		return false;
+	return (incr_single_base_varno(q) > 0);
+}
+
+/*
+ * True if outer's only non-system RTE is at src_varno (the CTE/subquery
+ * we want to inline/merge).
+ */
+static bool
+incr_outer_sole_source_is(Query *outer, int src_varno)
+{
+	ListCell   *lc;
+	int			vno = 1;
+
+	foreach(lc, outer->rtable)
+	{
+		RangeTblEntry *r = lfirst_node(RangeTblEntry, lc);
+
+		if (r->rtekind == RTE_JOIN || r->rtekind == RTE_RESULT ||
+			r->rtekind == RTE_GROUP)
+		{
+			vno++;
+			continue;
+		}
+		if (vno != src_varno)
+			return false;
+		vno++;
+	}
+	return true;
+}
+
+
+/* ----------------------------------------------------------------
+ * T1: Inline a filter/projection CTE or FROM-subquery.
+ *
+ * Replaces the slot at src_varno in outer->rtable with the source's
+ * base-table RTE.  Substitutes all column references in outer.
+ * Merges source WHERE into outer WHERE.
+ *
+ * Does NOT remove the CTE from outer->cteList; caller does that.
+ * ---------------------------------------------------------------- */
+static bool
+incr_try_inline_filter(Query *outer, Query *srcq, int src_varno)
+{
+	int				base_vno;
+	RangeTblEntry  *base_rte;
+	RangeTblEntry  *new_rte;
+	IncrSubstColCtx subst;
+
+	if (!incr_q_is_filter_proj(srcq))
+		return false;
+
+	base_vno = incr_single_base_varno(srcq);
+	if (base_vno < 0)
+		return false;
+
+	base_rte = list_nth_node(RangeTblEntry, srcq->rtable, base_vno - 1);
+	new_rte  = copyObject(base_rte);
+
+	/* Migrate the base table's permission entry to the outer query */
+	if (base_rte->perminfoindex != 0 && srcq->rteperminfos != NIL)
+	{
+		RTEPermissionInfo *src_perm;
+		RTEPermissionInfo *new_perm;
+
+		src_perm = list_nth_node(RTEPermissionInfo, srcq->rteperminfos,
+								 base_rte->perminfoindex - 1);
+		new_perm = copyObject(src_perm);
+		outer->rteperminfos = lappend(outer->rteperminfos, new_perm);
+		new_rte->perminfoindex = list_length(outer->rteperminfos);
+	}
+	else
+		new_rte->perminfoindex = 0;
+
+	/* Replace the CTE/subquery slot with the base table */
+	lfirst(list_nth_cell(outer->rtable, src_varno - 1)) = new_rte;
+
+	/* Substitute all column references in outer */
+	subst.src_varno      = src_varno;
+	subst.src_tlist      = srcq->targetList;
+	subst.src_base_varno = base_vno;
+	incr_apply_subst_col(outer, &subst);
+
+	/* Merge source WHERE into outer WHERE */
+	if (srcq->jointree != NULL && srcq->jointree->quals != NULL)
+	{
+		IncrVarRemap remap;
+		Node		*extra;
+
+		extra = copyObject(srcq->jointree->quals);
+
+		remap.src_varno = base_vno;
+		remap.dst_varno = src_varno;
+		extra = incr_remap_var_mutator(extra, &remap);
+
+		if (outer->jointree->quals == NULL)
+			outer->jointree->quals = extra;
+		else
+			outer->jointree->quals =
+				(Node *) makeBoolExpr(AND_EXPR,
+									  list_make2(outer->jointree->quals,
+												 extra),
+									  -1);
+	}
+
+	return true;
+}
+
+
+/* ----------------------------------------------------------------
+ * T2: Merge a single-table aggregate CTE/subquery into the outer query.
+ *
+ * Outer must use the CTE/subquery as its sole source, have no GROUP BY /
+ * aggregates of its own.  Outer WHERE becomes HAVING in the merged query.
+ *
+ * Replaces outer query fields in-place.
+ * ---------------------------------------------------------------- */
+static bool
+incr_try_merge_agg(Query *outer, Query *srcq, int src_varno)
+{
+	Query			  *new_q;
+	IncrSubstMergeCtx  ctx;
+	ListCell		  *olc;
+	ListCell		  *nlc;
+
+	if (!incr_q_is_single_agg(srcq))
+		return false;
+	if (!incr_outer_sole_source_is(outer, src_varno))
+		return false;
+	if (outer->hasAggs || outer->groupClause != NIL)
+		return false;
+	if (outer->hasSubLinks)
+		return false;
+
+	new_q = copyObject(srcq);
+
+	/* Merge outer WHERE → HAVING */
+	if (outer->jointree != NULL && outer->jointree->quals != NULL)
+	{
+		Node *having;
+
+		ctx.src_varno = src_varno;
+		ctx.src_tlist = srcq->targetList;
+		having = incr_subst_merge_mutator(
+			copyObject(outer->jointree->quals), &ctx);
+
+		if (new_q->havingQual == NULL)
+			new_q->havingQual = having;
+		else
+			new_q->havingQual =
+				(Node *) makeBoolExpr(AND_EXPR,
+									  list_make2(new_q->havingQual, having),
+									  -1);
+	}
+
+	/* Preserve outer column aliases */
+	olc = list_head(outer->targetList);
+	nlc = list_head(new_q->targetList);
+	while (olc && nlc)
+	{
+		TargetEntry *ote = lfirst_node(TargetEntry, olc);
+		TargetEntry *nte = lfirst_node(TargetEntry, nlc);
+
+		if (!ote->resjunk && !nte->resjunk && ote->resname)
+			nte->resname = pstrdup(ote->resname);
+		olc = lnext(outer->targetList, olc);
+		nlc = lnext(new_q->targetList, nlc);
+	}
+
+	/* Replace outer query with merged form */
+	outer->cteList		  = NIL;
+	outer->rtable		  = new_q->rtable;
+	outer->rteperminfos	  = new_q->rteperminfos;
+	outer->jointree		  = new_q->jointree;
+	outer->targetList	  = new_q->targetList;
+	outer->groupClause	  = new_q->groupClause;
+	outer->havingQual	  = new_q->havingQual;
+	outer->hasAggs		  = new_q->hasAggs;
+	outer->hasSubLinks	  = new_q->hasSubLinks;
+	outer->hasWindowFuncs = new_q->hasWindowFuncs;
+	outer->distinctClause = new_q->distinctClause;
+	outer->hasDistinctOn  = new_q->hasDistinctOn;
+	outer->setOperations  = new_q->setOperations;
+	outer->sortClause	  = new_q->sortClause;
+	outer->limitCount	  = new_q->limitCount;
+	outer->limitOffset	  = new_q->limitOffset;
+	outer->hasGroupRTE	  = new_q->hasGroupRTE;
+
+	return true;
+}
+
+
+/* ----------------------------------------------------------------
+ * T3: Merge a DISTINCT-only CTE/subquery into the outer query.
+ *
+ * Outer must be sole-source with no GROUP BY / aggregates / DISTINCT.
+ * Outer WHERE merges into the inner WHERE.
+ *
+ * Replaces outer query fields in-place.
+ * ---------------------------------------------------------------- */
+static bool
+incr_try_merge_distinct(Query *outer, Query *srcq, int src_varno)
+{
+	Query			  *new_q;
+	IncrSubstMergeCtx  ctx;
+	ListCell		  *olc;
+	ListCell		  *nlc;
+
+	if (!incr_q_is_distinct_only(srcq))
+		return false;
+	if (!incr_outer_sole_source_is(outer, src_varno))
+		return false;
+	if (outer->hasAggs || outer->groupClause != NIL)
+		return false;
+	if (outer->distinctClause != NIL || outer->hasSubLinks)
+		return false;
+
+	new_q = copyObject(srcq);
+
+	/* Merge outer WHERE into new_q WHERE */
+	if (outer->jointree != NULL && outer->jointree->quals != NULL)
+	{
+		Node *extra;
+
+		ctx.src_varno = src_varno;
+		ctx.src_tlist = srcq->targetList;
+		extra = incr_subst_merge_mutator(
+			copyObject(outer->jointree->quals), &ctx);
+
+		if (new_q->jointree->quals == NULL)
+			new_q->jointree->quals = extra;
+		else
+			new_q->jointree->quals =
+				(Node *) makeBoolExpr(AND_EXPR,
+									  list_make2(new_q->jointree->quals,
+												 extra),
+									  -1);
+	}
+
+	/* Preserve outer column aliases */
+	olc = list_head(outer->targetList);
+	nlc = list_head(new_q->targetList);
+	while (olc && nlc)
+	{
+		TargetEntry *ote = lfirst_node(TargetEntry, olc);
+		TargetEntry *nte = lfirst_node(TargetEntry, nlc);
+
+		if (!ote->resjunk && !nte->resjunk && ote->resname)
+			nte->resname = pstrdup(ote->resname);
+		olc = lnext(outer->targetList, olc);
+		nlc = lnext(new_q->targetList, nlc);
+	}
+
+	/* Replace outer query with merged form */
+	outer->cteList		  = NIL;
+	outer->rtable		  = new_q->rtable;
+	outer->rteperminfos	  = new_q->rteperminfos;
+	outer->jointree		  = new_q->jointree;
+	outer->targetList	  = new_q->targetList;
+	outer->groupClause	  = new_q->groupClause;
+	outer->havingQual	  = new_q->havingQual;
+	outer->hasAggs		  = new_q->hasAggs;
+	outer->hasSubLinks	  = new_q->hasSubLinks;
+	outer->hasWindowFuncs = new_q->hasWindowFuncs;
+	outer->distinctClause = new_q->distinctClause;
+	outer->hasDistinctOn  = new_q->hasDistinctOn;
+	outer->setOperations  = new_q->setOperations;
+	outer->sortClause	  = new_q->sortClause;
+	outer->limitCount	  = new_q->limitCount;
+	outer->limitOffset	  = new_q->limitOffset;
+	outer->hasGroupRTE	  = new_q->hasGroupRTE;
+
+	return true;
+}
+
+
+/* ----------------------------------------------------------------
+ * incr_subst_inner_cte_refs — inline CTEs from outer_with_ctes into
+ * srcq's body (handles nested CTE chains before inlining srcq itself).
+ * Returns true if any substitution occurred.
+ * ---------------------------------------------------------------- */
+static bool
+incr_subst_inner_cte_refs(Query *srcq, Query *outer_with_ctes)
+{
+	bool	any_changed = false;
+	bool	changed;
+
+	do
+	{
+		ListCell   *lc;
+		int			vno;
+
+		changed = false;
+		vno		= 1;
+		foreach(lc, srcq->rtable)
+		{
+			RangeTblEntry *r = lfirst_node(RangeTblEntry, lc);
+
+			if (r->rtekind == RTE_CTE && r->ctelevelsup == 1)
+			{
+				ListCell *clc;
+
+				foreach(clc, outer_with_ctes->cteList)
+				{
+					CommonTableExpr *ref =
+						lfirst_node(CommonTableExpr, clc);
+
+					if (strcmp(ref->ctename, r->ctename) == 0 &&
+						!ref->cterecursive)
+					{
+						Query *ref_body =
+							castNode(Query, ref->ctequery);
+
+						if (incr_try_inline_filter(srcq, ref_body, vno) ||
+							incr_try_merge_agg(srcq, ref_body, vno) ||
+							incr_try_merge_distinct(srcq, ref_body, vno))
+						{
+							changed		= true;
+							any_changed = true;
+						}
+						break;
+					}
+				}
+				if (changed)
+					break;
+			}
+			vno++;
+		}
+	} while (changed);
+
+	return any_changed;
+}
+
+
+/* ----------------------------------------------------------------
+ * Dispatch: try to normalize one CTE in the outer query.
+ * ---------------------------------------------------------------- */
+static bool
+incr_try_normalize_cte(Query *outer, CommonTableExpr *cte, int cte_varno)
+{
+	Query *cteq;
+
+	if (cte->cterecursive)
+		return false;
+
+	cteq = castNode(Query, cte->ctequery);
+
+	/* Pre-process: inline any CTEs referenced within cteq */
+	incr_subst_inner_cte_refs(cteq, outer);
+
+	/* T1: filter/projection inline */
+	if (incr_try_inline_filter(outer, cteq, cte_varno))
+	{
+		outer->cteList = list_delete_ptr(outer->cteList, cte);
+		return true;
+	}
+	/* T2: aggregate merge */
+	if (incr_try_merge_agg(outer, cteq, cte_varno))
+		return true;	/* cteList set to NIL inside T2 */
+	/* T3: DISTINCT merge */
+	if (incr_try_merge_distinct(outer, cteq, cte_varno))
+		return true;	/* cteList set to NIL inside T3 */
+
+	return false;
+}
+
+
+/* ----------------------------------------------------------------
+ * Dispatch: try to normalize one FROM-subquery in the outer query.
+ * ---------------------------------------------------------------- */
+static bool
+incr_try_normalize_subq(Query *outer, int sq_varno)
+{
+	RangeTblEntry *rte;
+	Query		  *sq;
+
+	rte = list_nth_node(RangeTblEntry, outer->rtable, sq_varno - 1);
+	if (rte->rtekind != RTE_SUBQUERY || rte->lateral)
+		return false;
+
+	sq = rte->subquery;
+
+	if (incr_try_inline_filter(outer, sq, sq_varno))
+		return true;
+	if (incr_try_merge_agg(outer, sq, sq_varno))
+		return true;
+	if (incr_try_merge_distinct(outer, sq, sq_varno))
+		return true;
+
+	return false;
+}
+
+
+/* ----------------------------------------------------------------
+ * incr_normalize_query_body — iteratively normalize q in place.
+ * ---------------------------------------------------------------- */
+static Query *
+incr_normalize_query_body(Query *q)
+{
+	bool	changed;
+
+	do
+	{
+		ListCell   *lc;
+		int			vno;
+
+		changed = false;
+
+		/* Process CTEs — iterate over a snapshot so mutations are safe */
+		{
+			List	   *snap = list_copy(q->cteList);
+
+			foreach(lc, snap)
+			{
+				CommonTableExpr *cte = lfirst_node(CommonTableExpr, lc);
+				int				 cv  = incr_find_cte_varno(q, cte->ctename);
+
+				if (cv < 0)
+					continue;	/* not directly referenced in outer FROM */
+
+				if (incr_try_normalize_cte(q, cte, cv))
+				{
+					changed = true;
+					break;	/* restart outer loop */
+				}
+			}
+			list_free(snap);
+		}
+
+		/* Process FROM-subqueries */
+		if (!changed)
+		{
+			vno = 1;
+			foreach(lc, q->rtable)
+			{
+				RangeTblEntry *r = lfirst_node(RangeTblEntry, lc);
+
+				if (r->rtekind == RTE_SUBQUERY && !r->lateral)
+				{
+					if (incr_try_normalize_subq(q, vno))
+					{
+						changed = true;
+						break;
+					}
+				}
+				vno++;
+			}
+		}
+	} while (changed);
+
+	/* Remove CTEs no longer directly referenced in outer FROM */
+	{
+		List	   *snap2 = list_copy(q->cteList);
+		ListCell   *lc2;
+
+		foreach(lc2, snap2)
+		{
+			CommonTableExpr *cte = lfirst_node(CommonTableExpr, lc2);
+
+			if (incr_find_cte_varno(q, cte->ctename) < 0)
+				q->cteList = list_delete_ptr(q->cteList, cte);
+		}
+		list_free(snap2);
+	}
+
+	return q;
+}
+
+
+/*
+ * MatviewIncrNormalize — public entry point.
+ *
+ * Returns a normalized copy of viewQuery if any CTE or FROM-subquery
+ * was inlined/merged, otherwise returns viewQuery unchanged.
+ */
+Query *
+MatviewIncrNormalize(Query *viewQuery)
+{
+	ListCell   *lc;
+	bool		has_cte;
+	bool		has_subq;
+	Query	   *q;
+
+	has_cte  = (viewQuery->cteList != NIL);
+	has_subq = false;
+
+	if (!has_cte)
+	{
+		foreach(lc, viewQuery->rtable)
+		{
+			RangeTblEntry *r = lfirst_node(RangeTblEntry, lc);
+
+			if (r->rtekind == RTE_SUBQUERY && !r->lateral)
+			{
+				has_subq = true;
+				break;
+			}
+		}
+	}
+
+	if (!has_cte && !has_subq)
+		return viewQuery;	/* nothing to normalize */
+
+	q = copyObject(viewQuery);
+	incr_normalize_query_body(q);
+	return q;
 }

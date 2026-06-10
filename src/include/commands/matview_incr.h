@@ -72,6 +72,14 @@ extern bool MatviewIncrIsEligible(Query *viewQuery, const char **reason);
  */
 extern void MatviewIncrAddCountTarget(Query *q);
 
+/*
+ * Normalize a view query by inlining CTEs and FROM-subqueries that can
+ * be resolved to forms the incremental refresh engine supports.
+ * Returns a new Query* if any transformation was applied, or viewQuery
+ * itself if nothing changed.
+ */
+extern Query *MatviewIncrNormalize(Query *viewQuery);
+
 /* Trigger function — registered in pg_proc as matview_delta_apply */
 extern Datum matview_delta_apply(PG_FUNCTION_ARGS);
 

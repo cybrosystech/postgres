@@ -307,6 +307,27 @@ ExecCreateTableAs(ParseState *pstate, CreateTableAsStmt *stmt,
 		if (want_incr)
 		{
 			const char *reason;
+			Query	   *norm;
+
+			/* Phase 16: inline CTEs and FROM-subqueries before eligibility check */
+			norm = MatviewIncrNormalize(vq);
+			if (norm != vq)
+			{
+				into->viewQuery			  = norm;
+				vq						  = norm;
+				/* Sync execution-query structure so the matview schema matches */
+				query->rtable			  = copyObject(norm->rtable);
+				query->jointree			  = copyObject(norm->jointree);
+				query->targetList		  = copyObject(norm->targetList);
+				query->groupClause		  = copyObject(norm->groupClause);
+				query->havingQual		  = copyObject(norm->havingQual);
+				query->distinctClause	  = copyObject(norm->distinctClause);
+				query->hasAggs			  = norm->hasAggs;
+				query->hasSubLinks		  = norm->hasSubLinks;
+				query->hasWindowFuncs	  = norm->hasWindowFuncs;
+				query->cteList			  = NIL;
+				query->setOperations	  = copyObject(norm->setOperations);
+			}
 
 			if (!MatviewIncrIsEligible(vq, &reason))
 				ereport(ERROR,
