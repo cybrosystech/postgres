@@ -211,6 +211,10 @@ static char *incr_build_union_del_sql(Oid mvrelid, Query *viewQuery,
 									   List *join_list);
 static void incr_union_dedup_backfill(Oid mvrelid, Query *viewQuery);
 static void incr_setup_union_all(Oid mvrelid, Query *viewQuery);
+static bool incr_has_minmax_agg(Query *viewQuery);
+static char *incr_build_minmax_del_sql_gen(Oid mvrelid, Query *viewQuery,
+										   int delta_varno, const char *delta_table,
+										   List *join_list, Oid delta_oid);
 static bool incr_validate_expr(Node *expr, Query *viewQuery, bool allow_aggref);
 static Node *incr_get_where_qual(Query *viewQuery);
 static void incr_deparse_where_qual(Node *qual, List *rtable, int delta_varno,
@@ -426,7 +430,6 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 		 */
 		HTAB	   *oid_counts;
 		HASHCTL		ctl;
-		bool		has_self_join = false;
 
 		memset(&ctl, 0, sizeof(ctl));
 		ctl.keysize   = sizeof(Oid);
@@ -462,9 +465,7 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 				else
 				{
 					entry[1]++;
-					if (entry[1] == 2)
-						has_self_join = true;
-					else if (entry[1] > 2)
+					if (entry[1] > 2)
 					{
 						*reason = psprintf("table \"%s\" appears more than twice; "
 										   "diamond join patterns are not supported",
@@ -620,7 +621,8 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 			char	   *fname = get_func_name(agg->aggfnoid);
 
 			if (strcmp(fname, "sum") == 0 || strcmp(fname, "count") == 0 ||
-				strcmp(fname, "avg") == 0)
+				strcmp(fname, "avg") == 0 || strcmp(fname, "min") == 0 ||
+				strcmp(fname, "max") == 0)
 			{
 				if (agg->args != NIL)
 				{
@@ -639,10 +641,10 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 			}
 
 			*reason = psprintf("aggregate \"%s\" not supported "
-							   "(supported: SUM, COUNT, AVG)", fname);
+							   "(supported: SUM, COUNT, AVG, MIN, MAX)", fname);
 			return false;
 		}
-		*reason = "only column references and SUM/COUNT/AVG aggregates are allowed "
+		*reason = "only column references and SUM/COUNT/AVG/MIN/MAX aggregates are allowed "
 			"in GROUP BY matviews";
 		return false;
 	}
@@ -785,8 +787,13 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 			/* Phase 1: aggregate with GROUP BY */
 			ins_sql = incr_build_ins_sql_gen(mvrelid, viewQuery, -1,
 											 MATVIEW_INCR_NEWTABLE, NIL);
-			del_sql = incr_build_del_sql_gen(mvrelid, viewQuery, -1,
-											 MATVIEW_INCR_OLDTABLE, NIL);
+			if (incr_has_minmax_agg(viewQuery))
+				del_sql = incr_build_minmax_del_sql_gen(mvrelid, viewQuery, -1,
+														MATVIEW_INCR_OLDTABLE, NIL,
+														srctable);
+			else
+				del_sql = incr_build_del_sql_gen(mvrelid, viewQuery, -1,
+												 MATVIEW_INCR_OLDTABLE, NIL);
 			incr_store_catalog(mvrelid, srctable, ins_sql, del_sql,
 							   cln_sql, hav_sql);
 
@@ -959,8 +966,17 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 				 * incr_build_ins/del_sql_gen calls in a CTE so they execute as
 				 * one SPI statement.  Data-modifying CTEs always run to
 				 * completion regardless of whether their output is referenced.
+				 *
+				 * MIN/MAX with self-join is not supported: the CTE-wrapping
+				 * approach would require nested WITH which PostgreSQL disallows.
 				 */
 				Bitmapset *done_oids = NULL;
+
+				if (incr_has_minmax_agg(viewQuery))
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("cannot use incremental_refresh: "
+									"self-join with MIN or MAX is not yet supported")));
 
 				foreach(jlc, all_tables)
 				{
@@ -1018,10 +1034,16 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 												 delta->varno,
 												 MATVIEW_INCR_NEWTABLE,
 												 join_list);
-				del_sql = incr_build_del_sql_gen(mvrelid, viewQuery,
-												 delta->varno,
-												 MATVIEW_INCR_OLDTABLE,
-												 join_list);
+				if (incr_has_minmax_agg(viewQuery))
+					del_sql = incr_build_minmax_del_sql_gen(mvrelid, viewQuery,
+															delta->varno,
+															MATVIEW_INCR_OLDTABLE,
+															join_list, delta->oid);
+				else
+					del_sql = incr_build_del_sql_gen(mvrelid, viewQuery,
+													 delta->varno,
+													 MATVIEW_INCR_OLDTABLE,
+													 join_list);
 				incr_store_catalog(mvrelid, delta->oid,
 								   ins_sql, del_sql, cln_sql, hav_sql);
 				incr_install_triggers(mvrelid, delta->oid);
@@ -2578,6 +2600,23 @@ incr_build_ins_sql_gen(Oid mvrelid, Query *viewQuery,
 							 colq,
 							 mvname, sum_q, sum_q, type_name,
 							 mvname, cnt_q, cnt_q);
+			first = false;
+		}
+		else if (IsA(te->expr, Aggref))
+		{
+			/* MIN/MAX: replace if better; everything else: accumulate */
+			char *fn = get_func_name(((Aggref *) te->expr)->aggfnoid);
+
+			if (!first)
+				appendStringInfoChar(&buf, ',');
+			if (strcmp(fn, "min") == 0)
+				appendStringInfo(&buf, "%s=LEAST(%s.%s,EXCLUDED.%s)",
+								 colq, mvname, colq, colq);
+			else if (strcmp(fn, "max") == 0)
+				appendStringInfo(&buf, "%s=GREATEST(%s.%s,EXCLUDED.%s)",
+								 colq, mvname, colq, colq);
+			else
+				appendStringInfo(&buf, "%s=%s.%s+EXCLUDED.%s", colq, mvname, colq, colq);
 			first = false;
 		}
 		else
@@ -5070,4 +5109,373 @@ incr_setup_union_all(Oid mvrelid, Query *viewQuery)
 			incr_install_triggers(mvrelid, delta->oid);
 		}
 	}
+}
+
+/* ============================================================
+ * MIN/MAX aggregate helpers — Phase 15
+ * ============================================================
+ */
+
+/*
+ * incr_has_minmax_agg
+ * Returns true if viewQuery's target list contains any MIN or MAX aggregate.
+ */
+static bool
+incr_has_minmax_agg(Query *viewQuery)
+{
+	ListCell *lc;
+
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+		if (te->resjunk || !IsA(te->expr, Aggref))
+			continue;
+		{
+			char *fname = get_func_name(((Aggref *) te->expr)->aggfnoid);
+
+			if (strcmp(fname, "min") == 0 || strcmp(fname, "max") == 0)
+				return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * incr_build_minmax_del_sql_gen — rescan-based DELETE delta for MIN/MAX views
+ *
+ * MIN and MAX cannot be decremented like SUM; when the min/max row is deleted
+ * we must re-scan the source table(s) to find the new extremum.  Strategy:
+ *
+ *   1. affected CTE   — collect the GROUP BY keys touched by the delta.
+ *   2. new_agg CTE    — recompute all aggregates from live tables for those keys.
+ *   3. upd CTE        — UPDATE matview rows that still have live rows.
+ *   4. Final DELETE   — remove matview rows whose group vanished entirely.
+ *
+ * Single-table (delta_varno < 0):
+ *   affected uses bare column names (no alias).
+ *   new_agg restricts via "(g1[,g2...]) IN (SELECT g1[,g2...] FROM affected)".
+ *
+ * JOIN (delta_varno >= 1):
+ *   Standard _d_ / _j<v>_ alias scheme throughout.
+ *   new_agg joins live tables to affected ON group-key equality.
+ */
+static char *
+incr_build_minmax_del_sql_gen(Oid mvrelid, Query *viewQuery,
+							   int delta_varno, const char *delta_table,
+							   List *join_list, Oid delta_oid)
+{
+	StringInfoData	buf;
+	List		   *groupColNames = NIL;
+	ListCell	   *lc,
+				   *gcl;
+	const char	   *mvname   = mv_qname(mvrelid);
+	const char	   *livename = mv_qname(delta_oid);
+	bool			has_join = (join_list != NIL || delta_varno >= 1);
+	bool			first;
+
+	incr_collect_group_cols(viewQuery, &groupColNames);
+	initStringInfo(&buf);
+
+	/* ----------------------------------------------------------------
+	 * affected CTE: distinct group keys touched by the old-table delta.
+	 * ---------------------------------------------------------------- */
+	appendStringInfoString(&buf, "WITH affected AS (SELECT DISTINCT ");
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry    *te = lfirst_node(TargetEntry, lc);
+		StringInfoData	ebuf;
+
+		if (te->resjunk || !IsA(te->expr, Var))
+			continue;
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		first = false;
+		initStringInfo(&ebuf);
+		incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable,
+								delta_varno, &ebuf);
+		if (has_join)
+			/* In JOIN mode emit  _d_.col AS resname  so affected.resname is stable */
+			appendStringInfo(&buf, "%s AS %s", ebuf.data,
+							 quote_identifier(te->resname));
+		else
+			appendStringInfoString(&buf, ebuf.data);
+	}
+	/* FROM __mv_oldtable__ [_d_ JOIN ...] */
+	incr_append_from_join(&buf, viewQuery, delta_varno, delta_table, join_list);
+	{
+		Node *wq = incr_get_where_qual(viewQuery);
+
+		if (wq != NULL)
+		{
+			StringInfoData wbuf;
+
+			initStringInfo(&wbuf);
+			incr_deparse_where_qual(wq, viewQuery->rtable, delta_varno, &wbuf);
+			appendStringInfo(&buf, " WHERE %s", wbuf.data);
+		}
+	}
+	appendStringInfoString(&buf, "),");
+
+	/* ----------------------------------------------------------------
+	 * new_agg CTE: recompute aggregates from live tables for affected groups.
+	 * ---------------------------------------------------------------- */
+	appendStringInfoString(&buf, " new_agg AS (SELECT ");
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry    *te = lfirst_node(TargetEntry, lc);
+		StringInfoData	ebuf;
+
+		if (te->resjunk)
+			continue;
+		if (strcmp(te->resname, MATVIEW_INCR_HAVING_COL) == 0)
+			continue;
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		first = false;
+
+		if (strcmp(te->resname, MATVIEW_INCR_COUNT_COL) == 0)
+		{
+			appendStringInfo(&buf, "COUNT(*) AS %s",
+							 quote_identifier(MATVIEW_INCR_COUNT_COL));
+		}
+		else if (IsA(te->expr, Var))
+		{
+			initStringInfo(&ebuf);
+			incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable,
+									delta_varno, &ebuf);
+			appendStringInfo(&buf, "%s AS %s", ebuf.data,
+							 quote_identifier(te->resname));
+		}
+		else if (IsA(te->expr, Aggref))
+		{
+			Aggref		   *agg   = (Aggref *) te->expr;
+			char		   *fname = get_func_name(agg->aggfnoid);
+			const char	   *colq  = quote_identifier(te->resname);
+
+			if (strcmp(fname, "count") == 0 && agg->aggstar)
+				appendStringInfo(&buf, "COUNT(*) AS %s", colq);
+			else if (agg->args != NIL)
+			{
+				TargetEntry *arg_te = linitial_node(TargetEntry, agg->args);
+
+				initStringInfo(&ebuf);
+				incr_deparse_where_qual((Node *) arg_te->expr, viewQuery->rtable,
+										delta_varno, &ebuf);
+				appendStringInfo(&buf, "%s(%s) AS %s", fname, ebuf.data, colq);
+			}
+			else
+				appendStringInfo(&buf, "%s(*) AS %s", fname, colq);
+		}
+		else
+			elog(ERROR,
+				 "incr_build_minmax_del_sql_gen: unexpected expression type %d",
+				 (int) nodeTag(te->expr));
+	}
+
+	/* FROM live_tables [JOIN affected ON grp-key conditions] */
+	if (has_join)
+	{
+		/* Rebuild same alias scheme but using live tables */
+		appendStringInfo(&buf, " FROM %s %s", livename, INCR_DELTA_ALIAS);
+		foreach(lc, join_list)
+		{
+			IncrJoinEntry  *je = lfirst(lc);
+
+			if (je->quals == NULL)
+			{
+				appendStringInfo(&buf, " CROSS JOIN %s _j%d_",
+								 mv_qname(je->oid), je->varno);
+			}
+			else
+			{
+				StringInfoData jbuf;
+
+				initStringInfo(&jbuf);
+				incr_deparse_where_qual(je->quals, viewQuery->rtable,
+										delta_varno, &jbuf);
+				appendStringInfo(&buf, " JOIN %s _j%d_ ON (%s)",
+								 mv_qname(je->oid), je->varno, jbuf.data);
+			}
+		}
+
+		/* JOIN affected ON (alias.col = affected.resname AND ...) */
+		appendStringInfoString(&buf, " JOIN affected ON (");
+		first = true;
+		foreach(lc, viewQuery->targetList)
+		{
+			TargetEntry    *te = lfirst_node(TargetEntry, lc);
+			StringInfoData	ebuf;
+
+			if (te->resjunk || !IsA(te->expr, Var))
+				continue;
+			if (!first)
+				appendStringInfoString(&buf, " AND ");
+			first = false;
+			initStringInfo(&ebuf);
+			incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable,
+									delta_varno, &ebuf);
+			appendStringInfo(&buf, "%s=affected.%s",
+							 ebuf.data, quote_identifier(te->resname));
+		}
+		appendStringInfoChar(&buf, ')');
+	}
+	else
+	{
+		/* Single-table: FROM live_table WHERE (g1[,g2]) IN (SELECT g1[,g2] FROM affected) */
+		appendStringInfo(&buf, " FROM %s", livename);
+
+		/* Collect group-col TEs for the IN list */
+		{
+			List	   *grp_tes = NIL;
+			ListCell   *glc;
+
+			foreach(glc, viewQuery->targetList)
+			{
+				TargetEntry *te = lfirst_node(TargetEntry, glc);
+
+				if (!te->resjunk && IsA(te->expr, Var))
+					grp_tes = lappend(grp_tes, te);
+			}
+
+			if (list_length(grp_tes) == 1)
+			{
+				TargetEntry *te = linitial(grp_tes);
+				const char  *colq = quote_identifier(te->resname);
+
+				appendStringInfo(&buf, " WHERE %s IN (SELECT %s FROM affected)",
+								 colq, colq);
+			}
+			else
+			{
+				/* Row expression: (g1, g2, ...) IN (SELECT g1, g2, ... FROM affected) */
+				appendStringInfoString(&buf, " WHERE (");
+				first = true;
+				foreach(glc, grp_tes)
+				{
+					TargetEntry *te = lfirst(glc);
+
+					if (!first)
+						appendStringInfoChar(&buf, ',');
+					first = false;
+					appendStringInfoString(&buf, quote_identifier(te->resname));
+				}
+				appendStringInfoString(&buf, ") IN (SELECT ");
+				first = true;
+				foreach(glc, grp_tes)
+				{
+					TargetEntry *te = lfirst(glc);
+
+					if (!first)
+						appendStringInfoChar(&buf, ',');
+					first = false;
+					appendStringInfoString(&buf, quote_identifier(te->resname));
+				}
+				appendStringInfoString(&buf, " FROM affected)");
+			}
+		}
+	}
+
+	/* AND view WHERE clause (additional source-table filter) */
+	{
+		Node *wq = incr_get_where_qual(viewQuery);
+
+		if (wq != NULL)
+		{
+			StringInfoData wbuf;
+
+			initStringInfo(&wbuf);
+			incr_deparse_where_qual(wq, viewQuery->rtable, delta_varno, &wbuf);
+			if (has_join)
+				appendStringInfo(&buf, " AND %s", wbuf.data);
+			else
+				appendStringInfo(&buf, " AND %s", wbuf.data);
+		}
+	}
+
+	/* GROUP BY */
+	appendStringInfoString(&buf, " GROUP BY ");
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry    *te = lfirst_node(TargetEntry, lc);
+		StringInfoData	ebuf;
+
+		if (te->resjunk || !IsA(te->expr, Var))
+			continue;
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		first = false;
+		initStringInfo(&ebuf);
+		incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable,
+								delta_varno, &ebuf);
+		appendStringInfoString(&buf, ebuf.data);
+	}
+	appendStringInfoString(&buf, "),");
+
+	/* ----------------------------------------------------------------
+	 * upd CTE: UPDATE matview with recomputed values for surviving groups.
+	 * ---------------------------------------------------------------- */
+	appendStringInfo(&buf, " upd AS (UPDATE %s SET ", mvname);
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+		const char  *colq;
+
+		if (te->resjunk || IsA(te->expr, Var))
+			continue;
+		if (strcmp(te->resname, MATVIEW_INCR_HAVING_COL) == 0)
+			continue;
+
+		colq = quote_identifier(te->resname);
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		first = false;
+		appendStringInfo(&buf, "%s=new_agg.%s", colq, colq);
+	}
+	appendStringInfo(&buf, " FROM new_agg WHERE ");
+	first = true;
+	foreach(gcl, groupColNames)
+	{
+		const char *colq = quote_identifier(strVal(lfirst(gcl)));
+
+		if (!first)
+			appendStringInfoString(&buf, " AND ");
+		first = false;
+		appendStringInfo(&buf, "%s.%s=new_agg.%s", mvname, colq, colq);
+	}
+	appendStringInfoString(&buf, ")");
+
+	/* ----------------------------------------------------------------
+	 * Final DELETE: remove groups that vanished entirely (not in new_agg).
+	 * ---------------------------------------------------------------- */
+	appendStringInfo(&buf, " DELETE FROM %s USING affected WHERE ", mvname);
+	first = true;
+	foreach(gcl, groupColNames)
+	{
+		const char *colq = quote_identifier(strVal(lfirst(gcl)));
+
+		if (!first)
+			appendStringInfoString(&buf, " AND ");
+		first = false;
+		appendStringInfo(&buf, "%s.%s=affected.%s", mvname, colq, colq);
+	}
+	appendStringInfoString(&buf,
+						   " AND NOT EXISTS (SELECT 1 FROM new_agg WHERE ");
+	first = true;
+	foreach(gcl, groupColNames)
+	{
+		const char *colq = quote_identifier(strVal(lfirst(gcl)));
+
+		if (!first)
+			appendStringInfoString(&buf, " AND ");
+		first = false;
+		appendStringInfo(&buf, "new_agg.%s=%s.%s", colq, mvname, colq);
+	}
+	appendStringInfoChar(&buf, ')');
+
+	return buf.data;
 }
