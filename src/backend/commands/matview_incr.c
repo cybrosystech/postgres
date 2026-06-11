@@ -5237,6 +5237,118 @@ incr_build_minmax_del_sql_gen(Oid mvrelid, Query *viewQuery,
 	appendStringInfoString(&buf, "),");
 
 	/* ----------------------------------------------------------------
+	 * old_counts CTE: count how many rows from the delta belong to each
+	 * affected group.  Used in upd to maintain COUNT via delta arithmetic
+	 * (cnt = mv.cnt - del_cnt) rather than the rescan value, which avoids
+	 * a race where a concurrent INSERT commits between new_agg's scan and
+	 * the row-lock acquisition in upd, causing its delta to be silently
+	 * overwritten by a stale absolute count.
+	 * ---------------------------------------------------------------- */
+	appendStringInfoString(&buf, " old_counts AS (SELECT ");
+	first = true;
+	{
+		ListCell *lc2;
+
+		foreach(lc2, viewQuery->targetList)
+		{
+			TargetEntry    *te2 = lfirst_node(TargetEntry, lc2);
+			StringInfoData  ebuf2;
+
+			if (te2->resjunk || !IsA(te2->expr, Var))
+				continue;
+			if (!first)
+				appendStringInfoChar(&buf, ',');
+			first = false;
+			initStringInfo(&ebuf2);
+			incr_deparse_where_qual((Node *) te2->expr, viewQuery->rtable,
+									delta_varno, &ebuf2);
+			if (has_join)
+				appendStringInfo(&buf, "%s AS %s", ebuf2.data,
+								 quote_identifier(te2->resname));
+			else
+				appendStringInfoString(&buf, ebuf2.data);
+		}
+	}
+	appendStringInfoString(&buf, ",COUNT(*) AS del_cnt");
+	incr_append_from_join(&buf, viewQuery, delta_varno, delta_table, join_list);
+	{
+		Node *wq2 = incr_get_where_qual(viewQuery);
+
+		if (wq2 != NULL)
+		{
+			StringInfoData wbuf2;
+
+			initStringInfo(&wbuf2);
+			incr_deparse_where_qual(wq2, viewQuery->rtable, delta_varno, &wbuf2);
+			appendStringInfo(&buf, " WHERE %s", wbuf2.data);
+		}
+	}
+	appendStringInfoString(&buf, " GROUP BY ");
+	first = true;
+	{
+		ListCell *lc2;
+
+		foreach(lc2, viewQuery->targetList)
+		{
+			TargetEntry    *te2 = lfirst_node(TargetEntry, lc2);
+			StringInfoData  ebuf2;
+
+			if (te2->resjunk || !IsA(te2->expr, Var))
+				continue;
+			if (!first)
+				appendStringInfoChar(&buf, ',');
+			first = false;
+			if (has_join)
+			{
+				appendStringInfoString(&buf, quote_identifier(te2->resname));
+			}
+			else
+			{
+				initStringInfo(&ebuf2);
+				incr_deparse_where_qual((Node *) te2->expr, viewQuery->rtable,
+										delta_varno, &ebuf2);
+				appendStringInfoString(&buf, ebuf2.data);
+			}
+		}
+	}
+	appendStringInfoString(&buf, "),");
+
+	/* ----------------------------------------------------------------
+	 * lock_mv CTE: acquire a per-group advisory transaction lock before
+	 * the rescan so concurrent MIN/MAX updates on the same group key
+	 * serialise.  The second transaction blocks at pg_advisory_xact_lock
+	 * until the first commits, then runs new_agg against fully committed
+	 * source data.
+	 *
+	 * Key space: (matview OID as int4, hashtext of group col values).
+	 * FOR NO KEY UPDATE cannot be used on materialized views, hence the
+	 * advisory lock approach.
+	 * ---------------------------------------------------------------- */
+	appendStringInfo(&buf,
+					 " lock_mv AS (SELECT pg_advisory_xact_lock(%u, hashtext(",
+					 (unsigned) mvrelid);
+	if (list_length(groupColNames) == 1)
+	{
+		const char *colq = quote_identifier(strVal(linitial(groupColNames)));
+
+		appendStringInfo(&buf, "%s::text", colq);
+	}
+	else
+	{
+		first = true;
+		foreach(gcl, groupColNames)
+		{
+			const char *colq = quote_identifier(strVal(lfirst(gcl)));
+
+			if (!first)
+				appendStringInfoString(&buf, " || '|' || ");
+			first = false;
+			appendStringInfo(&buf, "%s::text", colq);
+		}
+	}
+	appendStringInfoString(&buf, ")) FROM affected),");
+
+	/* ----------------------------------------------------------------
 	 * new_agg CTE: recompute aggregates from live tables for affected groups.
 	 * ---------------------------------------------------------------- */
 	appendStringInfoString(&buf, " new_agg AS (SELECT ");
@@ -5396,6 +5508,18 @@ incr_build_minmax_del_sql_gen(Oid mvrelid, Query *viewQuery,
 		}
 	}
 
+	/*
+	 * Reference lock_mv in the scan's WHERE clause so PostgreSQL evaluates it
+	 * (acquiring the row locks) before reading any live-table rows in new_agg.
+	 * COUNT(*) >= 0 is always TRUE — it never filters rows.
+	 */
+	if (has_join)
+		appendStringInfoString(&buf,
+			" WHERE (SELECT COUNT(*) FROM lock_mv) >= 0");
+	else
+		appendStringInfoString(&buf,
+			" AND (SELECT COUNT(*) FROM lock_mv) >= 0");
+
 	/* AND view WHERE clause (additional source-table filter) */
 	{
 		Node *wq = incr_get_where_qual(viewQuery);
@@ -5452,9 +5576,45 @@ incr_build_minmax_del_sql_gen(Oid mvrelid, Query *viewQuery,
 		if (!first)
 			appendStringInfoChar(&buf, ',');
 		first = false;
-		appendStringInfo(&buf, "%s=new_agg.%s", colq, colq);
+
+		/*
+		 * COUNT columns use delta (mv.cnt - del_cnt) rather than the
+		 * rescan value from new_agg.  This prevents a concurrent INSERT
+		 * that commits between new_agg's READ COMMITTED scan and the
+		 * row-lock acquisition in this UPDATE from being silently lost.
+		 */
+		{
+			bool is_count = false;
+
+			if (strcmp(te->resname, MATVIEW_INCR_COUNT_COL) == 0)
+				is_count = true;
+			else if (IsA(te->expr, Aggref))
+			{
+				Aggref *agg2  = (Aggref *) te->expr;
+				char   *fname2 = get_func_name(agg2->aggfnoid);
+
+				is_count = (strcmp(fname2, "count") == 0);
+			}
+
+			if (is_count)
+				appendStringInfo(&buf, "%s=%s.%s-old_counts.del_cnt",
+								 colq, mvname, colq);
+			else
+				appendStringInfo(&buf, "%s=new_agg.%s", colq, colq);
+		}
 	}
-	appendStringInfo(&buf, " FROM new_agg WHERE ");
+	appendStringInfo(&buf, " FROM new_agg JOIN old_counts USING (");
+	first = true;
+	foreach(gcl, groupColNames)
+	{
+		const char *colq = quote_identifier(strVal(lfirst(gcl)));
+
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		first = false;
+		appendStringInfoString(&buf, colq);
+	}
+	appendStringInfoString(&buf, ") WHERE ");
 	first = true;
 	foreach(gcl, groupColNames)
 	{
