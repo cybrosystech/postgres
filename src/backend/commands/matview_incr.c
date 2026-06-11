@@ -1508,6 +1508,11 @@ incr_validate_expr(Node *expr, Query *viewQuery, bool allow_aggref)
 		return true;
 	}
 
+	/* RelabelType: a no-op type coercion (e.g. varchar = 'x' -> text = 'x') */
+	if (IsA(expr, RelabelType))
+		return incr_validate_expr((Node *) ((RelabelType *) expr)->arg,
+								  viewQuery, allow_aggref);
+
 	if (!allow_aggref)
 	{
 		/* WHERE-only node types (not meaningful in HAVING) */
@@ -1707,6 +1712,16 @@ incr_deparse_where_qual(Node *qual, List *rtable, int delta_varno, StringInfo bu
 		appendStringInfo(buf, " %s %s(", opname, sao->useOr ? "ANY" : "ALL");
 		incr_deparse_where_qual(lsecond(sao->args), rtable, delta_varno, buf);
 		appendStringInfoString(buf, "))");
+		return;
+	}
+
+	if (IsA(qual, RelabelType))
+	{
+		RelabelType *rt = (RelabelType *) qual;
+
+		appendStringInfoChar(buf, '(');
+		incr_deparse_where_qual((Node *) rt->arg, rtable, delta_varno, buf);
+		appendStringInfo(buf, ")::%s", format_type_be(rt->resulttype));
 		return;
 	}
 
