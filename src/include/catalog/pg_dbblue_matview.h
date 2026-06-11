@@ -39,6 +39,7 @@ CATALOG(pg_dbblue_matview,8330,DbblueMatviewRelationId)
 	text	del_sql BKI_FORCE_NOT_NULL;		/* DELETE delta (UPDATE) SQL */
 	text	cln_sql BKI_FORCE_NOT_NULL;		/* cleanup SQL: DELETE WHERE __mv_count__ <= 0 */
 	text	having_sql;						/* HAVING update SQL (NULL if no HAVING) */
+	text	lock_sql;						/* advisory-lock pre-SQL for MIN/MAX views (NULL otherwise) */
 #endif
 } FormData_pg_dbblue_matview;
 

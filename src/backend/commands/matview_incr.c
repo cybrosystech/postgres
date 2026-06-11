@@ -83,18 +83,20 @@
 /* ----------
  * Process-local plan cache.
  *
- * Four plans per matview:
- *   INCR_PLAN_INS — apply __mv_newtable delta to matview (INSERT ON CONFLICT)
- *   INCR_PLAN_DEL — subtract __mv_oldtable delta from matview (UPDATE)
- *   INCR_PLAN_CLN — remove zero-count groups (DELETE WHERE __mv_count__ <= 0)
- *   INCR_PLAN_HAV — recompute __mv_having_ok__ for all active groups (HAVING)
+ * Five plans per matview:
+ *   INCR_PLAN_INS  — apply __mv_newtable delta to matview (INSERT ON CONFLICT)
+ *   INCR_PLAN_DEL  — subtract __mv_oldtable delta from matview (UPDATE)
+ *   INCR_PLAN_CLN  — remove zero-count groups (DELETE WHERE __mv_count__ <= 0)
+ *   INCR_PLAN_HAV  — recompute __mv_having_ok__ for all active groups (HAVING)
+ *   INCR_PLAN_LOCK — acquire per-group advisory locks before DELETE rescan (MIN/MAX)
  * ----------
  */
 #define INCR_PLAN_INS	0
 #define INCR_PLAN_DEL	1
 #define INCR_PLAN_CLN	2
 #define INCR_PLAN_HAV	3
-#define INCR_NUM_PLANS	4
+#define INCR_PLAN_LOCK	4
+#define INCR_NUM_PLANS	5
 
 typedef struct IncrPlanKey
 {
@@ -179,7 +181,8 @@ static void incr_store_catalog(Oid mvrelid, Oid srctable,
 							   const char *ins_sql,
 							   const char *del_sql,
 							   const char *cln_sql,
-							   const char *having_sql);
+							   const char *having_sql,
+							   const char *lock_sql);
 static void incr_create_unique_index(Oid mvrelid, List *groupColNames);
 static bool incr_has_self_join(List *all_tables);
 static int  incr_self_join_other_varno(List *all_tables, int own_varno, Oid shared_oid);
@@ -212,9 +215,15 @@ static char *incr_build_union_del_sql(Oid mvrelid, Query *viewQuery,
 static void incr_union_dedup_backfill(Oid mvrelid, Query *viewQuery);
 static void incr_setup_union_all(Oid mvrelid, Query *viewQuery);
 static bool incr_has_minmax_agg(Query *viewQuery);
+static char *incr_build_minmax_ins_sql_gen(Oid mvrelid, Query *viewQuery,
+										   int delta_varno, const char *delta_table,
+										   List *join_list);
 static char *incr_build_minmax_del_sql_gen(Oid mvrelid, Query *viewQuery,
 										   int delta_varno, const char *delta_table,
 										   List *join_list, Oid delta_oid);
+static char *incr_build_minmax_lock_sql_gen(Oid mvrelid, Query *viewQuery,
+											int delta_varno, const char *delta_table,
+											List *join_list);
 /* Phase 16: CTE / FROM-subquery normalization */
 static int   incr_single_base_varno(Query *q);
 static int   incr_find_cte_varno(Query *q, const char *ctename);
@@ -798,22 +807,34 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 			del_sql = incr_build_row_del_sql(mvrelid, viewQuery, -1,
 											 MATVIEW_INCR_OLDTABLE, NIL);
 			incr_store_catalog(mvrelid, srctable,
-							   ins_sql, del_sql, "SELECT 1", NULL);
+							   ins_sql, del_sql, "SELECT 1", NULL, NULL);
 		}
 		else
 		{
 			/* Phase 1: aggregate with GROUP BY */
-			ins_sql = incr_build_ins_sql_gen(mvrelid, viewQuery, -1,
-											 MATVIEW_INCR_NEWTABLE, NIL);
 			if (incr_has_minmax_agg(viewQuery))
-				del_sql = incr_build_minmax_del_sql_gen(mvrelid, viewQuery, -1,
-														MATVIEW_INCR_OLDTABLE, NIL,
-														srctable);
+			{
+				char *lock_sql;
+
+				ins_sql  = incr_build_minmax_ins_sql_gen(mvrelid, viewQuery, -1,
+														 MATVIEW_INCR_NEWTABLE, NIL);
+				del_sql  = incr_build_minmax_del_sql_gen(mvrelid, viewQuery, -1,
+														 MATVIEW_INCR_OLDTABLE, NIL,
+														 srctable);
+				lock_sql = incr_build_minmax_lock_sql_gen(mvrelid, viewQuery, -1,
+														  MATVIEW_INCR_OLDTABLE, NIL);
+				incr_store_catalog(mvrelid, srctable, ins_sql, del_sql,
+								   cln_sql, hav_sql, lock_sql);
+			}
 			else
+			{
+				ins_sql = incr_build_ins_sql_gen(mvrelid, viewQuery, -1,
+												 MATVIEW_INCR_NEWTABLE, NIL);
 				del_sql = incr_build_del_sql_gen(mvrelid, viewQuery, -1,
 												 MATVIEW_INCR_OLDTABLE, NIL);
-			incr_store_catalog(mvrelid, srctable, ins_sql, del_sql,
-							   cln_sql, hav_sql);
+				incr_store_catalog(mvrelid, srctable, ins_sql, del_sql,
+								   cln_sql, hav_sql, NULL);
+			}
 
 			if (hasHaving)
 			{
@@ -861,7 +882,7 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 															MATVIEW_INCR_OLDTABLE,
 															all_tables);
 					incr_store_catalog(mvrelid, delta->oid,
-									   ins_sql, del_sql, "SELECT 1", NULL);
+									   ins_sql, del_sql, "SELECT 1", NULL, NULL);
 					incr_install_triggers(mvrelid, delta->oid);
 				}
 			}
@@ -921,7 +942,7 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 						}
 
 						incr_store_catalog(mvrelid, delta->oid,
-										   ins_sql, del_sql, "SELECT 1", NULL);
+										   ins_sql, del_sql, "SELECT 1", NULL, NULL);
 						incr_install_triggers(mvrelid, delta->oid);
 						done_oids = bms_add_member(done_oids, (int) delta->oid);
 						} /* end v2 block */
@@ -944,7 +965,7 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 														 MATVIEW_INCR_OLDTABLE,
 														 join_list);
 						incr_store_catalog(mvrelid, delta->oid,
-										   ins_sql, del_sql, "SELECT 1", NULL);
+										   ins_sql, del_sql, "SELECT 1", NULL, NULL);
 						incr_install_triggers(mvrelid, delta->oid);
 					}
 				}
@@ -969,7 +990,7 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 											   MATVIEW_INCR_OLDTABLE,
 											   all_tables, is_preserved);
 				incr_store_catalog(mvrelid, delta->oid,
-								   ins_sql, del_sql, "SELECT 1", hav_sql);
+								   ins_sql, del_sql, "SELECT 1", hav_sql, NULL);
 				incr_install_triggers(mvrelid, delta->oid);
 			}
 		}
@@ -1023,10 +1044,15 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 						List *join_list = incr_build_join_list_for_delta(
 							all_tables, delta->varno);
 
-						ins_sql = incr_build_ins_sql_gen(mvrelid, viewQuery,
-														 delta->varno,
-														 MATVIEW_INCR_NEWTABLE,
-														 join_list);
+						if (incr_has_minmax_agg(viewQuery))
+							ins_sql = incr_build_minmax_ins_sql_gen(
+								mvrelid, viewQuery, delta->varno,
+								MATVIEW_INCR_NEWTABLE, join_list);
+						else
+							ins_sql = incr_build_ins_sql_gen(mvrelid, viewQuery,
+															 delta->varno,
+															 MATVIEW_INCR_NEWTABLE,
+															 join_list);
 						del_sql = incr_build_del_sql_gen(mvrelid, viewQuery,
 														 delta->varno,
 														 MATVIEW_INCR_OLDTABLE,
@@ -1034,7 +1060,7 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 					}
 
 					incr_store_catalog(mvrelid, delta->oid,
-									   ins_sql, del_sql, cln_sql, hav_sql);
+									   ins_sql, del_sql, cln_sql, hav_sql, NULL);
 					incr_install_triggers(mvrelid, delta->oid);
 					done_oids = bms_add_member(done_oids, (int) delta->oid);
 					} /* end v2 block */
@@ -1048,22 +1074,37 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 				List		  *join_list = incr_build_join_list_for_delta(
 					all_tables, delta->varno);
 
-				ins_sql = incr_build_ins_sql_gen(mvrelid, viewQuery,
-												 delta->varno,
-												 MATVIEW_INCR_NEWTABLE,
-												 join_list);
 				if (incr_has_minmax_agg(viewQuery))
-					del_sql = incr_build_minmax_del_sql_gen(mvrelid, viewQuery,
-															delta->varno,
-															MATVIEW_INCR_OLDTABLE,
-															join_list, delta->oid);
+				{
+					char *lock_sql;
+
+					ins_sql  = incr_build_minmax_ins_sql_gen(
+						mvrelid, viewQuery, delta->varno,
+						MATVIEW_INCR_NEWTABLE, join_list);
+					del_sql  = incr_build_minmax_del_sql_gen(mvrelid, viewQuery,
+															 delta->varno,
+															 MATVIEW_INCR_OLDTABLE,
+															 join_list, delta->oid);
+					lock_sql = incr_build_minmax_lock_sql_gen(mvrelid, viewQuery,
+															  delta->varno,
+															  MATVIEW_INCR_OLDTABLE,
+															  join_list);
+					incr_store_catalog(mvrelid, delta->oid,
+									   ins_sql, del_sql, cln_sql, hav_sql, lock_sql);
+				}
 				else
+				{
+					ins_sql = incr_build_ins_sql_gen(mvrelid, viewQuery,
+													 delta->varno,
+													 MATVIEW_INCR_NEWTABLE,
+													 join_list);
 					del_sql = incr_build_del_sql_gen(mvrelid, viewQuery,
 													 delta->varno,
 													 MATVIEW_INCR_OLDTABLE,
 													 join_list);
-				incr_store_catalog(mvrelid, delta->oid,
-								   ins_sql, del_sql, cln_sql, hav_sql);
+					incr_store_catalog(mvrelid, delta->oid,
+									   ins_sql, del_sql, cln_sql, hav_sql, NULL);
+				}
 				incr_install_triggers(mvrelid, delta->oid);
 			}
 			} /* end !has_self_join */
@@ -4244,7 +4285,8 @@ incr_store_catalog(Oid mvrelid, Oid srctable,
 				   const char *ins_sql,
 				   const char *del_sql,
 				   const char *cln_sql,
-				   const char *having_sql)
+				   const char *having_sql,
+				   const char *lock_sql)
 {
 	Relation	catalog;
 	HeapTuple	tup;
@@ -4263,6 +4305,13 @@ incr_store_catalog(Oid mvrelid, Oid srctable,
 	{
 		values[Anum_pg_dbblue_matview_having_sql - 1] = (Datum) 0;
 		nulls[Anum_pg_dbblue_matview_having_sql - 1] = true;
+	}
+	if (lock_sql)
+		values[Anum_pg_dbblue_matview_lock_sql - 1] = CStringGetTextDatum(lock_sql);
+	else
+	{
+		values[Anum_pg_dbblue_matview_lock_sql - 1] = (Datum) 0;
+		nulls[Anum_pg_dbblue_matview_lock_sql - 1] = true;
 	}
 
 	catalog = table_open(DbblueMatviewRelationId, RowExclusiveLock);
@@ -4442,10 +4491,11 @@ incr_fetch_sql(Oid mvrelid, Oid srctable, int plan_type)
 	char	   *sql = NULL;
 	int			attnum;
 
-	attnum = (plan_type == INCR_PLAN_INS) ? Anum_pg_dbblue_matview_ins_sql :
-			 (plan_type == INCR_PLAN_DEL) ? Anum_pg_dbblue_matview_del_sql :
-			 (plan_type == INCR_PLAN_CLN) ? Anum_pg_dbblue_matview_cln_sql :
-											Anum_pg_dbblue_matview_having_sql;
+	attnum = (plan_type == INCR_PLAN_INS)  ? Anum_pg_dbblue_matview_ins_sql  :
+			 (plan_type == INCR_PLAN_DEL)  ? Anum_pg_dbblue_matview_del_sql  :
+			 (plan_type == INCR_PLAN_CLN)  ? Anum_pg_dbblue_matview_cln_sql  :
+			 (plan_type == INCR_PLAN_HAV)  ? Anum_pg_dbblue_matview_having_sql :
+											 Anum_pg_dbblue_matview_lock_sql;
 
 	catalog = table_open(DbblueMatviewRelationId, AccessShareLock);
 	ScanKeyInit(&keys[0], Anum_pg_dbblue_matview_mvrelid,
@@ -4543,27 +4593,63 @@ matview_delta_apply(PG_FUNCTION_ARGS)
 	/* ----- delete delta (DELETE or UPDATE old-side) ----- */
 	if (is_delete || is_update)
 	{
-		SPIPlanPtr	plan = incr_get_plan(mvrelid, srctable, INCR_PLAN_DEL);
-
-		if (plan == NULL)
+		/*
+		 * For MIN/MAX views a lock_sql row is stored.  Execute it first as a
+		 * separate SPI call so it gets a fresh READ COMMITTED snapshot — this
+		 * forces all concurrent INSERT transactions to commit before we
+		 * proceed.  The subsequent del_sql (rescan) then also gets a fresh
+		 * snapshot that includes those INSERTs, eliminating the stale-snapshot
+		 * MIN/MAX race.  For non-MIN/MAX views lock_sql is NULL and we skip
+		 * straight to del_sql.
+		 */
 		{
-			char *sql = incr_fetch_sql(mvrelid, srctable, INCR_PLAN_DEL);
+			char *lock_sql_str = incr_fetch_sql(mvrelid, srctable, INCR_PLAN_LOCK);
 
-			if (!sql)
-				elog(ERROR, "matview_delta_apply: missing delete-delta SQL for mv %u",
-					 mvrelid);
-			plan = SPI_prepare(sql, 0, NULL);
-			if (!plan)
-				elog(ERROR, "matview_delta_apply: SPI_prepare (delete) failed: %s",
-					 SPI_result_code_string(SPI_result));
-			SPI_keepplan(plan);
-			incr_cache_plan(mvrelid, srctable, INCR_PLAN_DEL, plan);
+			if (lock_sql_str)
+			{
+				SPIPlanPtr lplan = incr_get_plan(mvrelid, srctable, INCR_PLAN_LOCK);
+
+				if (lplan == NULL)
+				{
+					lplan = SPI_prepare(lock_sql_str, 0, NULL);
+					if (!lplan)
+						elog(ERROR,
+							 "matview_delta_apply: SPI_prepare (lock) failed: %s",
+							 SPI_result_code_string(SPI_result));
+					SPI_keepplan(lplan);
+					incr_cache_plan(mvrelid, srctable, INCR_PLAN_LOCK, lplan);
+				}
+
+				ret = SPI_execute_plan(lplan, NULL, NULL, false, 0);
+				if (ret < 0)
+					elog(ERROR, "matview_delta_apply: lock step failed: %s",
+						 SPI_result_code_string(ret));
+			}
 		}
 
-		ret = SPI_execute_plan(plan, NULL, NULL, false, 0);
-		if (ret < 0)
-			elog(ERROR, "matview_delta_apply: delete delta failed: %s",
-				 SPI_result_code_string(ret));
+		{
+			SPIPlanPtr	plan = incr_get_plan(mvrelid, srctable, INCR_PLAN_DEL);
+
+			if (plan == NULL)
+			{
+				char *sql = incr_fetch_sql(mvrelid, srctable, INCR_PLAN_DEL);
+
+				if (!sql)
+					elog(ERROR, "matview_delta_apply: missing delete-delta SQL for mv %u",
+						 mvrelid);
+				plan = SPI_prepare(sql, 0, NULL);
+				if (!plan)
+					elog(ERROR, "matview_delta_apply: SPI_prepare (delete) failed: %s",
+						 SPI_result_code_string(SPI_result));
+				SPI_keepplan(plan);
+				incr_cache_plan(mvrelid, srctable, INCR_PLAN_DEL, plan);
+			}
+
+			ret = SPI_execute_plan(plan, NULL, NULL, false, 0);
+			if (ret < 0)
+				elog(ERROR, "matview_delta_apply: delete delta failed: %s",
+					 SPI_result_code_string(ret));
+		}
 
 		/* Cleanup: remove group rows whose count dropped to zero */
 		{
@@ -5123,7 +5209,7 @@ incr_setup_union_all(Oid mvrelid, Query *viewQuery)
 											   join_list);
 
 			incr_store_catalog(mvrelid, delta->oid,
-							   ins_sql, del_sql, cln_sql, NULL);
+							   ins_sql, del_sql, cln_sql, NULL, NULL);
 			incr_install_triggers(mvrelid, delta->oid);
 		}
 	}
@@ -5157,6 +5243,380 @@ incr_has_minmax_agg(Query *viewQuery)
 		}
 	}
 	return false;
+}
+
+/*
+ * incr_build_minmax_ins_sql_gen — INSERT delta for MIN/MAX views with advisory lock
+ *
+ * Unlike incr_build_ins_sql_gen (which uses INSERT ... ON CONFLICT), this
+ * generates a CTE-based INSERT+UPDATE that acquires the same advisory lock
+ * as incr_build_minmax_del_sql_gen before touching a matview row.  This
+ * serialises concurrent INSERT and DELETE operations on the same group key,
+ * preventing a concurrent DELETE's stale new_agg scan from overwriting an
+ * INSERT that committed between the advisory-lock acquisition and the UPDATE.
+ *
+ *   WITH ins AS (SELECT <aliased group cols + aggregates>
+ *                FROM __mv_newtable__ [JOIN ...] [WHERE ...] GROUP BY ...),
+ *        lock_mv AS (SELECT pg_advisory_xact_lock(<oid>, hashtext(<key>))
+ *                    FROM ins),
+ *        upd AS (UPDATE mv SET min=LEAST(mv.min,ins.min),
+ *                              max=GREATEST(mv.max,ins.max), cnt=mv.cnt+ins.cnt ...
+ *                FROM ins WHERE mv.g=ins.g AND lock_ref >= 0
+ *                RETURNING <group cols>)
+ *   INSERT INTO mv (<cols>)
+ *   SELECT ins.<col>, ... FROM ins
+ *   WHERE NOT EXISTS (SELECT 1 FROM upd WHERE upd.g=ins.g ...)
+ */
+static char *
+incr_build_minmax_ins_sql_gen(Oid mvrelid, Query *viewQuery,
+							   int delta_varno, const char *delta_table,
+							   List *join_list)
+{
+	StringInfoData  buf;
+	List		   *groupColNames = NIL;
+	ListCell	   *lc,
+				   *gcl;
+	const char	   *mvname = mv_qname(mvrelid);
+	bool			first;
+
+	incr_collect_group_cols(viewQuery, &groupColNames);
+	initStringInfo(&buf);
+
+	/* ----------------------------------------------------------------
+	 * ins CTE: aggregate the delta rows — same expressions as the INSERT
+	 * SELECT in incr_build_ins_sql_gen, but with explicit column aliases
+	 * so the CTE columns can be referenced by name in upd and the final
+	 * INSERT SELECT.
+	 * ---------------------------------------------------------------- */
+	appendStringInfoString(&buf, "WITH ins AS (SELECT ");
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry    *te = lfirst_node(TargetEntry, lc);
+		const char	   *colq;
+
+		if (te->resjunk)
+			continue;
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		first = false;
+
+		colq = quote_identifier(te->resname);
+
+		if (strcmp(te->resname, MATVIEW_INCR_COUNT_COL) == 0)
+			appendStringInfo(&buf, "COUNT(*) AS %s", colq);
+		else if (strcmp(te->resname, MATVIEW_INCR_HAVING_COL) == 0)
+			appendStringInfo(&buf, "true AS %s", colq);
+		else if (IsA(te->expr, Var))
+		{
+			StringInfoData ebuf;
+
+			initStringInfo(&ebuf);
+			incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable,
+									delta_varno, &ebuf);
+			appendStringInfo(&buf, "%s AS %s", ebuf.data, colq);
+		}
+		else if (IsA(te->expr, Aggref))
+		{
+			Aggref		   *agg = (Aggref *) te->expr;
+			char		   *fname = get_func_name(agg->aggfnoid);
+			StringInfoData	ebuf;
+
+			if (strcmp(fname, "count") == 0 && agg->aggstar)
+				appendStringInfo(&buf, "COUNT(*) AS %s", colq);
+			else if (agg->args != NIL)
+			{
+				TargetEntry *arg_te = linitial_node(TargetEntry, agg->args);
+
+				initStringInfo(&ebuf);
+				incr_deparse_where_qual((Node *) arg_te->expr, viewQuery->rtable,
+										delta_varno, &ebuf);
+				appendStringInfo(&buf, "%s(%s) AS %s", fname, ebuf.data, colq);
+			}
+			else
+				appendStringInfo(&buf, "%s(*) AS %s", fname, colq);
+		}
+		else
+			elog(ERROR,
+				 "incr_build_minmax_ins_sql_gen: unexpected expression type %d",
+				 (int) nodeTag(te->expr));
+	}
+
+	/* FROM ... [JOIN ...] [WHERE ...] GROUP BY ... ) */
+	incr_append_from_join(&buf, viewQuery, delta_varno, delta_table, join_list);
+	{
+		Node	   *wq = incr_get_where_qual(viewQuery);
+
+		if (wq != NULL)
+		{
+			StringInfoData wbuf;
+
+			initStringInfo(&wbuf);
+			incr_deparse_where_qual(wq, viewQuery->rtable, delta_varno, &wbuf);
+			appendStringInfo(&buf, " WHERE %s", wbuf.data);
+		}
+	}
+	appendStringInfoString(&buf, " GROUP BY ");
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry    *te = lfirst_node(TargetEntry, lc);
+		StringInfoData	ebuf;
+
+		if (te->resjunk || !IsA(te->expr, Var))
+			continue;
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		first = false;
+		initStringInfo(&ebuf);
+		incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable,
+								delta_varno, &ebuf);
+		appendStringInfoString(&buf, ebuf.data);
+	}
+	appendStringInfoString(&buf, "),");
+
+	/* ----------------------------------------------------------------
+	 * lock_mv CTE: acquire per-group advisory lock before touching the
+	 * matview row.  Uses the same key space as incr_build_minmax_del_sql_gen
+	 * so INSERT and DELETE on the same group key serialise globally.
+	 * ---------------------------------------------------------------- */
+	appendStringInfo(&buf,
+					 " lock_mv AS (SELECT pg_advisory_xact_lock(%u, hashtext(",
+					 (unsigned) mvrelid);
+	if (list_length(groupColNames) == 1)
+	{
+		const char *colq = quote_identifier(strVal(linitial(groupColNames)));
+
+		appendStringInfo(&buf, "ins.%s::text", colq);
+	}
+	else
+	{
+		first = true;
+		foreach(gcl, groupColNames)
+		{
+			const char *colq = quote_identifier(strVal(lfirst(gcl)));
+
+			if (!first)
+				appendStringInfoString(&buf, " || '|' || ");
+			first = false;
+			appendStringInfo(&buf, "ins.%s::text", colq);
+		}
+	}
+	appendStringInfoString(&buf, ")) FROM ins),");
+
+	/* ----------------------------------------------------------------
+	 * upd CTE: UPDATE existing matview rows.
+	 * Lock reference forces sequencing after lock_mv.
+	 * ---------------------------------------------------------------- */
+	appendStringInfo(&buf, " upd AS (UPDATE %s SET ", mvname);
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+		const char  *colq;
+
+		if (te->resjunk || IsA(te->expr, Var))
+			continue;
+		if (strcmp(te->resname, MATVIEW_INCR_HAVING_COL) == 0)
+			continue;
+		if (strncmp(te->resname, MATVIEW_INCR_AVGSUM_PREFIX,
+					strlen(MATVIEW_INCR_AVGSUM_PREFIX)) == 0 ||
+			strncmp(te->resname, MATVIEW_INCR_AVGCNT_PREFIX,
+					strlen(MATVIEW_INCR_AVGCNT_PREFIX)) == 0)
+			continue;
+
+		colq = quote_identifier(te->resname);
+
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		first = false;
+
+		if (IsA(te->expr, Aggref) &&
+			strcmp(get_func_name(((Aggref *) te->expr)->aggfnoid), "avg") == 0)
+		{
+			Aggref	   *agg = (Aggref *) te->expr;
+			char	   *sum_col = psprintf("%s%s", MATVIEW_INCR_AVGSUM_PREFIX, te->resname);
+			char	   *cnt_col = psprintf("%s%s", MATVIEW_INCR_AVGCNT_PREFIX, te->resname);
+			const char *sum_q = quote_identifier(sum_col);
+			const char *cnt_q = quote_identifier(cnt_col);
+			const char *type_name = format_type_be(agg->aggtype);
+
+			appendStringInfo(&buf,
+							 "%s=%s.%s+ins.%s"
+							 ",%s=%s.%s+ins.%s"
+							 ",%s=((%s.%s+ins.%s)::%s/NULLIF(%s.%s+ins.%s,0))",
+							 sum_q, mvname, sum_q, sum_q,
+							 cnt_q, mvname, cnt_q, cnt_q,
+							 colq,
+							 mvname, sum_q, sum_q, type_name,
+							 mvname, cnt_q, cnt_q);
+		}
+		else if (IsA(te->expr, Aggref))
+		{
+			char *fn = get_func_name(((Aggref *) te->expr)->aggfnoid);
+
+			if (strcmp(fn, "min") == 0)
+				appendStringInfo(&buf, "%s=LEAST(%s.%s,ins.%s)",
+								 colq, mvname, colq, colq);
+			else if (strcmp(fn, "max") == 0)
+				appendStringInfo(&buf, "%s=GREATEST(%s.%s,ins.%s)",
+								 colq, mvname, colq, colq);
+			else
+				appendStringInfo(&buf, "%s=%s.%s+ins.%s",
+								 colq, mvname, colq, colq);
+		}
+		else
+			appendStringInfo(&buf, "%s=%s.%s+ins.%s",
+							 colq, mvname, colq, colq);
+	}
+
+	appendStringInfoString(&buf, " FROM ins WHERE ");
+	first = true;
+	foreach(gcl, groupColNames)
+	{
+		const char *colq = quote_identifier(strVal(lfirst(gcl)));
+
+		if (!first)
+			appendStringInfoString(&buf, " AND ");
+		first = false;
+		appendStringInfo(&buf, "%s.%s=ins.%s", mvname, colq, colq);
+	}
+	appendStringInfoString(&buf, " AND (SELECT COUNT(*) FROM lock_mv) >= 0 RETURNING ");
+	first = true;
+	foreach(gcl, groupColNames)
+	{
+		const char *colq = quote_identifier(strVal(lfirst(gcl)));
+
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		first = false;
+		/* qualify to resolve ambiguity when mv and ins share column names */
+		appendStringInfo(&buf, "%s.%s", mvname, colq);
+	}
+	appendStringInfoString(&buf, ")");
+
+	/* ----------------------------------------------------------------
+	 * Final INSERT: rows not matched by upd are new groups.
+	 * ---------------------------------------------------------------- */
+	appendStringInfo(&buf, " INSERT INTO %s (", mvname);
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+		if (te->resjunk)
+			continue;
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		first = false;
+		appendStringInfoString(&buf, quote_identifier(te->resname));
+	}
+	appendStringInfoString(&buf, ") SELECT ");
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+		if (te->resjunk)
+			continue;
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		first = false;
+		appendStringInfo(&buf, "ins.%s", quote_identifier(te->resname));
+	}
+	appendStringInfoString(&buf, " FROM ins WHERE NOT EXISTS (SELECT 1 FROM upd WHERE ");
+	first = true;
+	foreach(gcl, groupColNames)
+	{
+		const char *colq = quote_identifier(strVal(lfirst(gcl)));
+
+		if (!first)
+			appendStringInfoString(&buf, " AND ");
+		first = false;
+		appendStringInfo(&buf, "upd.%s=ins.%s", colq, colq);
+	}
+	appendStringInfoChar(&buf, ')');
+
+	/*
+	 * ON CONFLICT: two concurrent INSERTs can both reach the final INSERT
+	 * when the group is brand-new.  The advisory lock serialises them for
+	 * existing groups (upd returns the key so the INSERT is skipped), but
+	 * for new groups one transaction's INSERT commits between the other's
+	 * advisory-lock acquisition and its final INSERT.  ON CONFLICT resolves
+	 * this with the same LEAST/GREATEST/+ logic as the original upsert path.
+	 */
+	appendStringInfoString(&buf, " ON CONFLICT (");
+	first = true;
+	foreach(gcl, groupColNames)
+	{
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		first = false;
+		appendStringInfoString(&buf, quote_identifier(strVal(lfirst(gcl))));
+	}
+	appendStringInfoString(&buf, ") DO UPDATE SET ");
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+		const char  *colq;
+
+		if (te->resjunk || IsA(te->expr, Var))
+			continue;
+		if (strcmp(te->resname, MATVIEW_INCR_HAVING_COL) == 0)
+			continue;
+		if (strncmp(te->resname, MATVIEW_INCR_AVGSUM_PREFIX,
+					strlen(MATVIEW_INCR_AVGSUM_PREFIX)) == 0 ||
+			strncmp(te->resname, MATVIEW_INCR_AVGCNT_PREFIX,
+					strlen(MATVIEW_INCR_AVGCNT_PREFIX)) == 0)
+			continue;
+
+		colq = quote_identifier(te->resname);
+
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		first = false;
+
+		if (IsA(te->expr, Aggref) &&
+			strcmp(get_func_name(((Aggref *) te->expr)->aggfnoid), "avg") == 0)
+		{
+			Aggref	   *agg = (Aggref *) te->expr;
+			char	   *sum_col = psprintf("%s%s", MATVIEW_INCR_AVGSUM_PREFIX, te->resname);
+			char	   *cnt_col = psprintf("%s%s", MATVIEW_INCR_AVGCNT_PREFIX, te->resname);
+			const char *sum_q = quote_identifier(sum_col);
+			const char *cnt_q = quote_identifier(cnt_col);
+			const char *type_name = format_type_be(agg->aggtype);
+
+			appendStringInfo(&buf,
+							 "%s=%s.%s+EXCLUDED.%s"
+							 ",%s=%s.%s+EXCLUDED.%s"
+							 ",%s=((%s.%s+EXCLUDED.%s)::%s/NULLIF(%s.%s+EXCLUDED.%s,0))",
+							 sum_q, mvname, sum_q, sum_q,
+							 cnt_q, mvname, cnt_q, cnt_q,
+							 colq,
+							 mvname, sum_q, sum_q, type_name,
+							 mvname, cnt_q, cnt_q);
+		}
+		else if (IsA(te->expr, Aggref))
+		{
+			char *fn = get_func_name(((Aggref *) te->expr)->aggfnoid);
+
+			if (strcmp(fn, "min") == 0)
+				appendStringInfo(&buf, "%s=LEAST(%s.%s,EXCLUDED.%s)",
+								 colq, mvname, colq, colq);
+			else if (strcmp(fn, "max") == 0)
+				appendStringInfo(&buf, "%s=GREATEST(%s.%s,EXCLUDED.%s)",
+								 colq, mvname, colq, colq);
+			else
+				appendStringInfo(&buf, "%s=%s.%s+EXCLUDED.%s",
+								 colq, mvname, colq, colq);
+		}
+		else
+			appendStringInfo(&buf, "%s=%s.%s+EXCLUDED.%s",
+							 colq, mvname, colq, colq);
+	}
+
+	return buf.data;
 }
 
 /*
@@ -5237,14 +5697,14 @@ incr_build_minmax_del_sql_gen(Oid mvrelid, Query *viewQuery,
 	appendStringInfoString(&buf, "),");
 
 	/* ----------------------------------------------------------------
-	 * old_counts CTE: count how many rows from the delta belong to each
-	 * affected group.  Used in upd to maintain COUNT via delta arithmetic
-	 * (cnt = mv.cnt - del_cnt) rather than the rescan value, which avoids
-	 * a race where a concurrent INSERT commits between new_agg's scan and
-	 * the row-lock acquisition in upd, causing its delta to be silently
-	 * overwritten by a stale absolute count.
+	 * old_delta CTE: count rows and sum SUM-aggregate arguments from the
+	 * delta per affected group.  Used in upd to maintain COUNT and SUM via
+	 * delta arithmetic (col = mv.col - del_col) rather than the rescan
+	 * value, which avoids a race where a concurrent INSERT commits between
+	 * new_agg's scan and the row-lock acquisition in upd, causing its delta
+	 * to be silently overwritten by a stale absolute value.
 	 * ---------------------------------------------------------------- */
-	appendStringInfoString(&buf, " old_counts AS (SELECT ");
+	appendStringInfoString(&buf, " old_delta AS (SELECT ");
 	first = true;
 	{
 		ListCell *lc2;
@@ -5270,6 +5730,38 @@ incr_build_minmax_del_sql_gen(Oid mvrelid, Query *viewQuery,
 		}
 	}
 	appendStringInfoString(&buf, ",COUNT(*) AS del_cnt");
+	/* SUM delta columns: SUM(arg) AS del_<resname> for each SUM aggregate */
+	{
+		ListCell *lc2;
+
+		foreach(lc2, viewQuery->targetList)
+		{
+			TargetEntry    *te2 = lfirst_node(TargetEntry, lc2);
+			Aggref		   *agg2;
+			TargetEntry    *arg_te;
+			StringInfoData  ebuf2;
+
+			if (te2->resjunk || !IsA(te2->expr, Aggref))
+				continue;
+			if (strcmp(te2->resname, MATVIEW_INCR_HAVING_COL) == 0 ||
+				strcmp(te2->resname, MATVIEW_INCR_COUNT_COL) == 0)
+				continue;
+
+			agg2 = (Aggref *) te2->expr;
+			if (strcmp(get_func_name(agg2->aggfnoid), "sum") != 0)
+				continue;
+			if (agg2->args == NIL)
+				continue;
+
+			arg_te = linitial_node(TargetEntry, agg2->args);
+			initStringInfo(&ebuf2);
+			incr_deparse_where_qual((Node *) arg_te->expr, viewQuery->rtable,
+									delta_varno, &ebuf2);
+			appendStringInfo(&buf, ",SUM(%s) AS %s",
+							 ebuf2.data,
+							 quote_identifier(psprintf("del_%s", te2->resname)));
+		}
+	}
 	incr_append_from_join(&buf, viewQuery, delta_varno, delta_table, join_list);
 	{
 		Node *wq2 = incr_get_where_qual(viewQuery);
@@ -5312,41 +5804,6 @@ incr_build_minmax_del_sql_gen(Oid mvrelid, Query *viewQuery,
 		}
 	}
 	appendStringInfoString(&buf, "),");
-
-	/* ----------------------------------------------------------------
-	 * lock_mv CTE: acquire a per-group advisory transaction lock before
-	 * the rescan so concurrent MIN/MAX updates on the same group key
-	 * serialise.  The second transaction blocks at pg_advisory_xact_lock
-	 * until the first commits, then runs new_agg against fully committed
-	 * source data.
-	 *
-	 * Key space: (matview OID as int4, hashtext of group col values).
-	 * FOR NO KEY UPDATE cannot be used on materialized views, hence the
-	 * advisory lock approach.
-	 * ---------------------------------------------------------------- */
-	appendStringInfo(&buf,
-					 " lock_mv AS (SELECT pg_advisory_xact_lock(%u, hashtext(",
-					 (unsigned) mvrelid);
-	if (list_length(groupColNames) == 1)
-	{
-		const char *colq = quote_identifier(strVal(linitial(groupColNames)));
-
-		appendStringInfo(&buf, "%s::text", colq);
-	}
-	else
-	{
-		first = true;
-		foreach(gcl, groupColNames)
-		{
-			const char *colq = quote_identifier(strVal(lfirst(gcl)));
-
-			if (!first)
-				appendStringInfoString(&buf, " || '|' || ");
-			first = false;
-			appendStringInfo(&buf, "%s::text", colq);
-		}
-	}
-	appendStringInfoString(&buf, ")) FROM affected),");
 
 	/* ----------------------------------------------------------------
 	 * new_agg CTE: recompute aggregates from live tables for affected groups.
@@ -5508,18 +5965,6 @@ incr_build_minmax_del_sql_gen(Oid mvrelid, Query *viewQuery,
 		}
 	}
 
-	/*
-	 * Reference lock_mv in the scan's WHERE clause so PostgreSQL evaluates it
-	 * (acquiring the row locks) before reading any live-table rows in new_agg.
-	 * COUNT(*) >= 0 is always TRUE — it never filters rows.
-	 */
-	if (has_join)
-		appendStringInfoString(&buf,
-			" WHERE (SELECT COUNT(*) FROM lock_mv) >= 0");
-	else
-		appendStringInfoString(&buf,
-			" AND (SELECT COUNT(*) FROM lock_mv) >= 0");
-
 	/* AND view WHERE clause (additional source-table filter) */
 	{
 		Node *wq = incr_get_where_qual(viewQuery);
@@ -5578,32 +6023,47 @@ incr_build_minmax_del_sql_gen(Oid mvrelid, Query *viewQuery,
 		first = false;
 
 		/*
-		 * COUNT columns use delta (mv.cnt - del_cnt) rather than the
-		 * rescan value from new_agg.  This prevents a concurrent INSERT
-		 * that commits between new_agg's READ COMMITTED scan and the
-		 * row-lock acquisition in this UPDATE from being silently lost.
+		 * COUNT and SUM columns use delta arithmetic (mv.col - del_col)
+		 * rather than the rescan value from new_agg.  This prevents a
+		 * concurrent INSERT that commits between new_agg's READ COMMITTED
+		 * scan and the row-lock acquisition in this UPDATE from being
+		 * silently lost.
 		 */
 		{
-			bool is_count = false;
+			bool		is_delta = false;
+			const char *delta_colname = NULL;
 
 			if (strcmp(te->resname, MATVIEW_INCR_COUNT_COL) == 0)
-				is_count = true;
+			{
+				is_delta = true;
+				delta_colname = "del_cnt";
+			}
 			else if (IsA(te->expr, Aggref))
 			{
-				Aggref *agg2  = (Aggref *) te->expr;
+				Aggref *agg2   = (Aggref *) te->expr;
 				char   *fname2 = get_func_name(agg2->aggfnoid);
 
-				is_count = (strcmp(fname2, "count") == 0);
+				if (strcmp(fname2, "count") == 0)
+				{
+					is_delta = true;
+					delta_colname = "del_cnt";
+				}
+				else if (strcmp(fname2, "sum") == 0)
+				{
+					is_delta = true;
+					delta_colname = psprintf("del_%s", te->resname);
+				}
 			}
 
-			if (is_count)
-				appendStringInfo(&buf, "%s=%s.%s-old_counts.del_cnt",
-								 colq, mvname, colq);
+			if (is_delta)
+				appendStringInfo(&buf, "%s=%s.%s-old_delta.%s",
+								 colq, mvname, colq,
+								 quote_identifier(delta_colname));
 			else
 				appendStringInfo(&buf, "%s=new_agg.%s", colq, colq);
 		}
 	}
-	appendStringInfo(&buf, " FROM new_agg JOIN old_counts USING (");
+	appendStringInfo(&buf, " FROM new_agg JOIN old_delta USING (");
 	first = true;
 	foreach(gcl, groupColNames)
 	{
@@ -5654,6 +6114,99 @@ incr_build_minmax_del_sql_gen(Oid mvrelid, Query *viewQuery,
 		appendStringInfo(&buf, "new_agg.%s=%s.%s", colq, mvname, colq);
 	}
 	appendStringInfoChar(&buf, ')');
+
+	return buf.data;
+}
+
+/*
+ * incr_build_minmax_lock_sql_gen — lock SQL for two-phase MIN/MAX DELETE
+ *
+ * Generates a SELECT that acquires one advisory transaction lock per affected
+ * group key from __mv_oldtable__.  Executed as a separate SPI call BEFORE
+ * del_sql so that READ COMMITTED takes a new snapshot after the locks are
+ * held, making all concurrent committed INSERTs visible to new_agg.
+ *
+ * Lock key space: (matview OID as int4, hashtext of concatenated group cols).
+ */
+static char *
+incr_build_minmax_lock_sql_gen(Oid mvrelid, Query *viewQuery,
+							   int delta_varno, const char *delta_table,
+							   List *join_list)
+{
+	StringInfoData	buf;
+	List		   *groupColNames = NIL;
+	ListCell	   *lc,
+				   *gcl;
+	bool			has_join = (join_list != NIL || delta_varno >= 1);
+	bool			first;
+
+	incr_collect_group_cols(viewQuery, &groupColNames);
+	initStringInfo(&buf);
+
+	/* SELECT pg_advisory_xact_lock(oid, hashtext(g1::text [|| '|' || g2::text ...])) */
+	appendStringInfo(&buf,
+					 "SELECT pg_advisory_xact_lock(%u, hashtext(",
+					 (unsigned) mvrelid);
+	if (list_length(groupColNames) == 1)
+	{
+		const char *colq = quote_identifier(strVal(linitial(groupColNames)));
+
+		appendStringInfo(&buf, "%s::text", colq);
+	}
+	else
+	{
+		first = true;
+		foreach(gcl, groupColNames)
+		{
+			const char *colq = quote_identifier(strVal(lfirst(gcl)));
+
+			if (!first)
+				appendStringInfoString(&buf, " || '|' || ");
+			first = false;
+			appendStringInfo(&buf, "%s::text", colq);
+		}
+	}
+	appendStringInfoString(&buf, ")) FROM (SELECT DISTINCT ");
+
+	/* emit group-col expressions */
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry    *te = lfirst_node(TargetEntry, lc);
+		StringInfoData	ebuf;
+
+		if (te->resjunk || !IsA(te->expr, Var))
+			continue;
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		first = false;
+		initStringInfo(&ebuf);
+		incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable,
+								delta_varno, &ebuf);
+		if (has_join)
+			appendStringInfo(&buf, "%s AS %s", ebuf.data,
+							 quote_identifier(te->resname));
+		else
+			appendStringInfoString(&buf, ebuf.data);
+	}
+
+	/* FROM delta_table [alias JOIN ...] */
+	incr_append_from_join(&buf, viewQuery, delta_varno, delta_table, join_list);
+
+	/* Optional WHERE from view definition */
+	{
+		Node *wq = incr_get_where_qual(viewQuery);
+
+		if (wq != NULL)
+		{
+			StringInfoData wbuf;
+
+			initStringInfo(&wbuf);
+			incr_deparse_where_qual(wq, viewQuery->rtable, delta_varno, &wbuf);
+			appendStringInfo(&buf, " WHERE %s", wbuf.data);
+		}
+	}
+	appendStringInfoString(&buf, ") _aff_");
 
 	return buf.data;
 }
