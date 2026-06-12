@@ -427,7 +427,25 @@ CopyToJsonOneRow(CopyToState cstate, TupleTableSlot *slot)
 		}
 	}
 
-	CopySendData(cstate, cstate->json_buf->data, cstate->json_buf->len);
+	/*
+	 * Convert the JSON output to the target encoding if needed.  Unlike the
+	 * text and CSV paths which convert per-attribute via CopyAttributeOut*,
+	 * composite_to_json() emits the whole row as one buffer, so we transcode
+	 * it here in a single call before sending.
+	 */
+	if (cstate->need_transcoding)
+	{
+		char	   *converted;
+
+		converted = pg_server_to_any(cstate->json_buf->data,
+									 cstate->json_buf->len,
+									 cstate->file_encoding);
+		CopySendData(cstate, converted, strlen(converted));
+		if (converted != cstate->json_buf->data)
+			pfree(converted);
+	}
+	else
+		CopySendData(cstate, cstate->json_buf->data, cstate->json_buf->len);
 
 	CopySendTextLikeEndOfRow(cstate);
 }
@@ -1327,7 +1345,7 @@ DoCopyTo(CopyToState cstate)
  * root_rel can be set to the root table of rel if rel is a partition
  * table so that we can send tuples in root_rel's rowtype, which might
  * differ from individual partitions.
-*/
+ */
 static void
 CopyRelationTo(CopyToState cstate, Relation rel, Relation root_rel, uint64 *processed)
 {
@@ -1348,8 +1366,8 @@ CopyRelationTo(CopyToState cstate, Relation rel, Relation root_rel, uint64 *proc
 	if (root_rel != NULL)
 	{
 		root_slot = table_slot_create(root_rel, NULL);
-		map = build_attrmap_by_name_if_req(RelationGetDescr(root_rel),
-										   RelationGetDescr(rel),
+		map = build_attrmap_by_name_if_req(RelationGetDescr(rel),
+										   RelationGetDescr(root_rel),
 										   false);
 	}
 
