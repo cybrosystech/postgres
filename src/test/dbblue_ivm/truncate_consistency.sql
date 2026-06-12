@@ -40,13 +40,20 @@ CREATE MATERIALIZED VIEW mv_t_join
     GROUP BY p.categ
 WITH DATA;
 
+-- 4) HAVING matview (hidden base + filtering view): TRUNCATE -> REFRESH base
+CREATE MATERIALIZED VIEW mv_t_having
+    WITH (incremental_refresh=true) AS
+    SELECT product_id, SUM(amount) AS rev, COUNT(*) AS cnt
+    FROM t_sales GROUP BY product_id HAVING SUM(amount) > 10000
+WITH DATA;
+
 -- Confirm a TRUNCATE trigger was installed on each source table
 DO $$
 DECLARE n int;
 BEGIN
     SELECT count(*) INTO n FROM pg_trigger
     WHERE tgrelid = 't_sales'::regclass AND tgname LIKE '\_\_mv\_delta\_%' AND (tgtype & 32) <> 0;
-    IF n >= 3 THEN  -- one truncate trigger per matview (3 matviews ref t_sales)
+    IF n >= 4 THEN  -- one truncate trigger per matview (4 matviews ref t_sales)
         RAISE NOTICE 'TRUNCATE trigger install: PASS (% truncate triggers on t_sales)', n;
     ELSE
         RAISE EXCEPTION 'TRUNCATE trigger install: FAIL (only % truncate triggers)', n;
@@ -54,19 +61,23 @@ BEGIN
 END $$;
 
 -- ── TRUNCATE the source table; every matview must become consistent ──
-\echo 'TRUNCATE t_sales -> all 3 matviews must re-seed'
+\echo 'TRUNCATE t_sales -> all 4 matviews (incl. HAVING) must re-seed'
 TRUNCATE t_sales;
 
 DO $$
-DECLARE n1 int; n2 int; n3 int;
+DECLARE n1 int; n2 int; n3 int; n4 int; nbase int;
 BEGIN
     SELECT count(*) INTO n1 FROM mv_t_sum;
     SELECT count(*) INTO n2 FROM mv_t_minmax;
     SELECT count(*) INTO n3 FROM mv_t_join;
-    IF n1 = 0 AND n2 = 0 AND n3 = 0 THEN
-        RAISE NOTICE 'TRUNCATE empties matviews: PASS (sum=%, minmax=%, join=%)', n1, n2, n3;
+    SELECT count(*) INTO n4 FROM mv_t_having;
+    -- HAVING: the hidden base must also fully empty (no stale failing groups)
+    SELECT count(*) INTO nbase FROM pg_dbblue_matview p JOIN pg_class c ON c.oid=p.mvrelid
+        WHERE c.relname LIKE '\_dbblue\_%\_base';
+    IF n1 = 0 AND n2 = 0 AND n3 = 0 AND n4 = 0 THEN
+        RAISE NOTICE 'TRUNCATE empties matviews: PASS (sum=%, minmax=%, join=%, having=%)', n1, n2, n3, n4;
     ELSE
-        RAISE EXCEPTION 'TRUNCATE empties matviews: FAIL (sum=%, minmax=%, join=%)', n1, n2, n3;
+        RAISE EXCEPTION 'TRUNCATE empties matviews: FAIL (sum=%, minmax=%, join=%, having=%)', n1, n2, n3, n4;
     END IF;
 END $$;
 
@@ -100,6 +111,14 @@ BEGIN
     WHERE abs(live.r - mv.rev) > 0.001 OR live.c <> mv.cnt;
     IF mismatch = 0 THEN RAISE NOTICE 'JOIN post-TRUNCATE incremental: PASS';
     ELSE RAISE EXCEPTION 'JOIN post-TRUNCATE incremental: FAIL (% mismatch)', mismatch; END IF;
+
+    -- HAVING: the filtering view must match a live recompute with the same HAVING
+    SELECT count(*) INTO mismatch FROM (
+        SELECT product_id, SUM(amount) r, COUNT(*) c FROM t_sales GROUP BY product_id HAVING SUM(amount) > 10000
+    ) live FULL JOIN mv_t_having mv USING (product_id)
+    WHERE live.product_id IS DISTINCT FROM mv.product_id OR abs(live.r - mv.rev) > 0.001 OR live.c <> mv.cnt;
+    IF mismatch = 0 THEN RAISE NOTICE 'HAVING post-TRUNCATE incremental: PASS';
+    ELSE RAISE EXCEPTION 'HAVING post-TRUNCATE incremental: FAIL (% mismatch)', mismatch; END IF;
 END $$;
 
 -- ── TRUNCATE the *dimension* table of a JOIN matview ──
@@ -119,5 +138,6 @@ END $$;
 DROP MATERIALIZED VIEW mv_t_sum;
 DROP MATERIALIZED VIEW mv_t_minmax;
 DROP MATERIALIZED VIEW mv_t_join;
+DROP VIEW mv_t_having;   -- HAVING matview is a view over a hidden base; drops the base too
 DROP TABLE t_sales;
 DROP TABLE t_prod;
