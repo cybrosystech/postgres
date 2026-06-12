@@ -623,6 +623,30 @@
   assign_hook => 'assign_datestyle',
 },
 
+{ name => 'dbblue_create_standby', type => 'bool', context => 'PGC_SIGHUP', group => 'REPLICATION_PRIMARY',
+  short_desc => 'Automatically creates and runs a local streaming-replication standby.',
+  long_desc => 'When enabled, a background worker provisions a standby of this cluster with pg_basebackup (if dbblue_standby_directory does not contain one yet), starts it on the first free port above this server\'s port, and keeps it running. The chosen port is reported in the server log and in the dbblue_standby.port file in the data directory, ready for Odoo\'s db_replica_port setting.',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'dbblue_create_standby',
+  boot_val => 'false',
+},
+
+{ name => 'dbblue_standby_directory', type => 'string', context => 'PGC_SIGHUP', group => 'REPLICATION_PRIMARY',
+  short_desc => 'Data directory of the standby managed by dbblue_create_standby.',
+  long_desc => 'An empty value (the default) means a sibling of the data directory named "<datadir>_standby". A relative path is interpreted against the parent directory of the data directory, so the standby never nests inside the primary.',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'dbblue_standby_directory',
+  boot_val => '""',
+},
+
+{ name => 'dbblue_standby_user', type => 'string', context => 'PGC_SIGHUP', group => 'REPLICATION_PRIMARY',
+  short_desc => 'Role pg_basebackup connects as when dbblue_create_standby provisions the standby.',
+  long_desc => 'The role must have REPLICATION privilege and a matching pg_hba.conf replication entry that does not require an interactive password (trust, peer, or a password from a passfile). An empty value (the default) connects as the operating-system user, which works with initdb\'s default pg_hba.conf. Set this to e.g. "replicator" if you use a dedicated replication role.',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'dbblue_standby_user',
+  boot_val => '""',
+},
+
 # This is PGC_SUSET to prevent hiding from log_lock_waits.
 { name => 'deadlock_timeout', type => 'int', context => 'PGC_SUSET', group => 'LOCK_MANAGEMENT',
   short_desc => 'Sets the time to wait on a lock before checking for deadlock.',

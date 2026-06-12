@@ -67,6 +67,7 @@
 #include "postmaster/autovacuum.h"
 #include "postmaster/bgworker_internals.h"
 #include "postmaster/bgwriter.h"
+#include "postmaster/dbblue_create_standby.h"
 #include "postmaster/postmaster.h"
 #include "postmaster/startup.h"
 #include "postmaster/syslogger.h"
