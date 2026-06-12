@@ -52,13 +52,16 @@ DO $$ BEGIN
   RAISE NOTICE 'RENAME unused column: PASS (allowed)';
 END $$;
 
-\echo '--- DROP used column: blocked by dependency ---'
-DO $$ BEGIN
+\echo '--- DROP used column: blocked by dependency, with incremental hint ---'
+DO $$ DECLARE h text; BEGIN
   BEGIN
     EXECUTE 'ALTER TABLE ddl_src DROP COLUMN amt';
     RAISE EXCEPTION 'DROP used column: FAIL (was allowed)';
   EXCEPTION WHEN dependent_objects_still_exist THEN
-    RAISE NOTICE 'DROP used column: PASS (blocked)';
+    GET STACKED DIAGNOSTICS h = PG_EXCEPTION_HINT;
+    IF h ILIKE '%incremental materialized view%'
+    THEN RAISE NOTICE 'DROP used column: PASS (blocked, incremental hint)';
+    ELSE RAISE EXCEPTION 'DROP used column: blocked but hint missing incremental wording: %', h; END IF;
   END;
 END $$;
 
@@ -72,13 +75,16 @@ DO $$ BEGIN
   END;
 END $$;
 
-\echo '--- DROP TABLE source: blocked by dependency ---'
-DO $$ BEGIN
+\echo '--- DROP TABLE source: blocked by dependency, with incremental hint ---'
+DO $$ DECLARE h text; BEGIN
   BEGIN
     EXECUTE 'DROP TABLE ddl_src';
     RAISE EXCEPTION 'DROP TABLE source: FAIL (was allowed)';
   EXCEPTION WHEN dependent_objects_still_exist THEN
-    RAISE NOTICE 'DROP TABLE source: PASS (blocked)';
+    GET STACKED DIAGNOSTICS h = PG_EXCEPTION_HINT;
+    IF h ILIKE '%incremental materialized view%'
+    THEN RAISE NOTICE 'DROP TABLE source: PASS (blocked, incremental hint)';
+    ELSE RAISE EXCEPTION 'DROP TABLE source: blocked but hint missing incremental wording: %', h; END IF;
   END;
 END $$;
 

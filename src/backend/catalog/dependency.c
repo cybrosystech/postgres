@@ -1211,6 +1211,28 @@ reportDependentObjects(const ObjectAddresses *targetObjects,
 
 	if (!ok)
 	{
+		/*
+		 * DBblue: if one of the blocking dependents is an incremental
+		 * materialized view, give a tailored hint so the operator gets a
+		 * consistent message across DROP TABLE / DROP COLUMN / ALTER TYPE —
+		 * matching the rename guard.  Only reached on the RESTRICT error path,
+		 * so DROP ... CASCADE is unaffected.
+		 */
+		char	   *incr_mv = NULL;
+
+		for (i = 0; i < targetObjects->numrefs; i++)
+		{
+			const ObjectAddress *obj = &targetObjects->refs[i];
+
+			if (obj->classId == RelationRelationId && obj->objectSubId == 0 &&
+				get_rel_relkind(obj->objectId) == RELKIND_MATVIEW &&
+				MatviewIncrIsSetUp(obj->objectId))
+			{
+				incr_mv = get_rel_name(obj->objectId);
+				break;
+			}
+		}
+
 		if (origObject)
 			ereport(ERROR,
 					(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
@@ -1218,14 +1240,20 @@ reportDependentObjects(const ObjectAddresses *targetObjects,
 							getObjectDescription(origObject, false)),
 					 errdetail_internal("%s", clientdetail.data),
 					 errdetail_log("%s", logdetail.data),
-					 errhint("Use DROP ... CASCADE to drop the dependent objects too.")));
+					 incr_mv
+					 ? errhint("Incremental materialized view \"%s\" depends on it; drop it (recreate afterward) or use DROP ... CASCADE.",
+							   incr_mv)
+					 : errhint("Use DROP ... CASCADE to drop the dependent objects too.")));
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
 					 errmsg("cannot drop desired object(s) because other objects depend on them"),
 					 errdetail_internal("%s", clientdetail.data),
 					 errdetail_log("%s", logdetail.data),
-					 errhint("Use DROP ... CASCADE to drop the dependent objects too.")));
+					 incr_mv
+					 ? errhint("Incremental materialized view \"%s\" depends on them; drop it (recreate afterward) or use DROP ... CASCADE.",
+							   incr_mv)
+					 : errhint("Use DROP ... CASCADE to drop the dependent objects too.")));
 	}
 	else if (numReportedClient > 1)
 	{
