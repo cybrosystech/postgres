@@ -653,6 +653,28 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 				strcmp(fname, "avg") == 0 || strcmp(fname, "min") == 0 ||
 				strcmp(fname, "max") == 0)
 			{
+				/*
+				 * Reject SUM/AVG over floating-point (real/double precision).
+				 * They are maintained by adding and subtracting deltas from a
+				 * running total, and floating-point addition is not
+				 * associative — the running total accumulates rounding error
+				 * and drifts away from a true recompute over many deltas.
+				 * MIN/MAX (comparison only) and COUNT are unaffected, and
+				 * numeric/integer SUM/AVG are exact, so only float SUM/AVG is
+				 * blocked.  (agg->aggtype is the result type, so this also
+				 * catches SUM(<float expression>).)
+				 */
+				if ((strcmp(fname, "sum") == 0 || strcmp(fname, "avg") == 0) &&
+					(agg->aggtype == FLOAT4OID || agg->aggtype == FLOAT8OID))
+				{
+					*reason = psprintf("incremental %s() over floating-point "
+									   "(real/double precision) is not supported: "
+									   "running-total maintenance accumulates "
+									   "rounding error. Use numeric for exact "
+									   "incremental aggregation.", fname);
+					return false;
+				}
+
 				if (agg->args != NIL)
 				{
 					TargetEntry *arg_te = linitial_node(TargetEntry, agg->args);

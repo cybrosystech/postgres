@@ -355,8 +355,10 @@ Some shapes need a one-time backfill that can only run once the matview is popul
 
 ## Limitations
 
+- **No SUM/AVG over floating point**: `SUM`/`AVG` over `real`/`double precision` are rejected at `CREATE` time. Incremental maintenance keeps a running total via add/subtract, and floating-point addition is not associative, so the total would drift from a true recompute over many deltas. Use `numeric` (exact) instead. `MIN`/`MAX`/`COUNT` over floats are allowed (no arithmetic), as are `SUM`/`AVG` over `numeric` and integer types.
 - **HAVING requires `WITH DATA`**: a HAVING incremental matview cannot be set up `WITH NO DATA` (a warning is emitted); dump/restore is unaffected.
 - **No subqueries in WHERE**: correlated or uncorrelated subqueries in the WHERE clause are rejected. Use a JOIN instead.
+- **Triggers fire on origin only**: source-table changes applied on a *logical* replication subscriber do not maintain the matview (the delta triggers are `TRIGGER_FIRES_ON_ORIGIN`). Physical replicas are unaffected (matview data ships via WAL).
 - **No volatile functions in WHERE or aggregate arguments**: `now()`, `random()`, etc. are rejected because they would produce different results per-row vs. per-delta.
 - **Outer joins with NULLs**: LEFT/RIGHT/FULL OUTER JOIN matviews are supported but the delta for the NULL-extended side requires full-group rescans, similar to MIN/MAX.
 - **`__mv_count__` column**: always present in the matview. Queries against the matview should ignore it or exclude it from `SELECT *` projections.
