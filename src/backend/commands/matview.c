@@ -26,6 +26,7 @@
 #include "catalog/pg_opclass.h"
 #include "commands/matview.h"
 #include "commands/matview_dirty.h"
+#include "commands/matview_incr.h"
 #include "commands/repack.h"
 #include "commands/tablecmds.h"
 #include "commands/tablespace.h"
@@ -425,6 +426,18 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 
 	/* Restore userid and security context */
 	SetUserIdAndSecContext(save_userid, save_sec_context);
+
+	/*
+	 * DBblue: after a non-create REFRESH has populated the matview, run any
+	 * one-time hidden-state backfills (HAVING failing-group seeding, UNION ALL
+	 * dedup).  This makes a plain REFRESH of those incremental matviews correct
+	 * and re-arms incremental maintenance after a pg_dump/restore (which
+	 * restores them as CREATE ... WITH NO DATA + a standalone REFRESH).  The
+	 * create path drives its own backfill from ExecCreateTableAs, so skip it
+	 * here, as well as for WITH NO DATA refreshes that loaded no data.
+	 */
+	if (!is_create && !skipData)
+		MatviewIncrPostRefresh(matviewOid, dataQuery);
 
 	ObjectAddressSet(address, RelationRelationId, matviewOid);
 

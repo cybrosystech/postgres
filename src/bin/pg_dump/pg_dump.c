@@ -8094,6 +8094,17 @@ getIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
 						  "ON (inh.inhrelid = indexrelid) "
 						  "WHERE (i.indisvalid OR t2.relkind = 'p') "
 						  "AND i.indisready "
+	/*
+	 * DBblue: skip indexes that are engine-managed incremental-matview
+	 * infrastructure — they carry an INTERNAL dependency on their matview
+	 * (a relation) and are recreated by MatviewIncrSetup on restore, so they
+	 * must not be dumped as standalone CREATE INDEX statements.
+	 */
+						  "AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend dep "
+						  "WHERE dep.classid = 'pg_catalog.pg_class'::pg_catalog.regclass "
+						  "AND dep.objid = i.indexrelid "
+						  "AND dep.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass "
+						  "AND dep.deptype = 'i') "
 						  "ORDER BY i.indrelid, indexname",
 						  tbloids->data);
 	}
@@ -8112,6 +8123,12 @@ getIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
 						  "i.indexrelid = c.conindid AND "
 						  "c.contype IN ('p','u','x')) "
 						  "WHERE i.indisvalid AND i.indisready "
+	/* DBblue: skip engine-managed incremental-matview indexes (see above) */
+						  "AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend dep "
+						  "WHERE dep.classid = 'pg_catalog.pg_class'::pg_catalog.regclass "
+						  "AND dep.objid = i.indexrelid "
+						  "AND dep.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass "
+						  "AND dep.deptype = 'i') "
 						  "ORDER BY i.indrelid, indexname",
 						  tbloids->data);
 	}

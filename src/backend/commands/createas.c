@@ -286,8 +286,14 @@ ExecCreateTableAs(ParseState *pstate, CreateTableAsStmt *stmt,
 	 * stored view-definition query.  Do this before create_ctas_nodata so
 	 * that the column is created as part of the matview schema and populated
 	 * naturally by the initial REFRESH — no ALTER TABLE needed afterward.
+	 *
+	 * This runs for the WITH NO DATA case too (do_refresh false), which is the
+	 * pg_dump/restore path.  There the stored query already carries the hidden
+	 * columns verbatim, so MatviewIncrNormalize is a no-op and
+	 * MatviewIncrAddCountTarget detects the existing __mv_count__ and skips
+	 * re-injection — leaving the schema correct either way.
 	 */
-	if (is_matview && do_refresh)
+	if (is_matview)
 	{
 		Query	   *vq = castNode(Query, into->viewQuery);
 		ListCell   *lc;
@@ -360,18 +366,63 @@ ExecCreateTableAs(ParseState *pstate, CreateTableAsStmt *stmt,
 
 		/*
 		 * DBblue: if incremental_refresh is enabled, set up the delta
-		 * triggers, unique index, and catalog rows now that the matview
-		 * is fully populated.
+		 * triggers, unique index, and catalog rows.
+		 *
+		 * WITH DATA (do_refresh true): the RefreshMatViewByOid call above has
+		 * already populated the matview, so setup runs over populated data.
+		 *
+		 * WITH NO DATA (do_refresh false) is the pg_dump/restore path: the
+		 * dumped query carries the hidden columns, so the matview schema is
+		 * already correct.  Setup runs here on the freshly defined (empty)
+		 * matview — before it is in active use, which is essential because
+		 * setup issues CREATE INDEX, and that would conflict with the dump's
+		 * subsequent standalone REFRESH if attempted from inside it.  The
+		 * MatviewIncrIsSetUp guard keeps this idempotent.
 		 */
-		if (is_matview && do_refresh)
+		if (is_matview)
 		{
 			Relation	mvrel = table_open(address.objectId, AccessShareLock);
 			bool		incr = RelationGetIncrementalRefresh(mvrel);
 
 			table_close(mvrel, AccessShareLock);
-			if (incr)
-				MatviewIncrSetup(address.objectId,
-								 castNode(Query, into->viewQuery));
+
+			if (incr && !MatviewIncrIsSetUp(address.objectId))
+			{
+				Query	   *vq = castNode(Query, into->viewQuery);
+
+				/*
+				 * A HAVING incremental matview is built as a renamed base
+				 * matview plus a user-facing filtering view.  On the
+				 * pg_dump/restore path both objects are dumped and the base
+				 * arrives already named "_dbblue_<oid>_base"; setup then wires
+				 * up the delta machinery and MatviewIncrPostRefresh seeds the
+				 * failing groups after the dump's REFRESH (mv_populated is
+				 * false here, so the rename/view/backfill are deferred).
+				 *
+				 * But a *fresh* CREATE ... WITH NO DATA + HAVING (not a restore,
+				 * so not base-named) cannot set up the filtering view over an
+				 * unpopulated matview.  That combination is unsupported: warn
+				 * and leave it as a plain matview rather than build a broken
+				 * half-state.  HAVING incremental matviews must be created
+				 * WITH DATA.  (UNION ALL and all other shapes set up fine on
+				 * both paths.)
+				 */
+				const char *nm = get_rel_name(address.objectId);
+				size_t		len = nm ? strlen(nm) : 0;
+				bool		is_having_base = (nm != NULL &&
+											  strncmp(nm, "_dbblue_", 8) == 0 &&
+											  len > 5 &&
+											  strcmp(nm + len - 5, "_base") == 0);
+
+				if (!do_refresh && vq->havingQual != NULL && !is_having_base)
+					ereport(WARNING,
+							(errmsg("incremental refresh not enabled for materialized view \"%s\"",
+									nm),
+							 errdetail("A HAVING incremental materialized view cannot be set up WITH NO DATA."),
+							 errhint("Create it WITH DATA to enable incremental refresh.")));
+				else
+					MatviewIncrSetup(address.objectId, vq);
+			}
 		}
 
 	}

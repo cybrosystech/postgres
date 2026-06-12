@@ -59,6 +59,23 @@ extern void MatviewIncrSetup(Oid mvrelid, Query *viewQuery);
 extern void MatviewIncrTeardown(Oid mvrelid);
 
 /*
+ * Run one-time hidden-state backfills (HAVING failing-group seeding, UNION ALL
+ * dedup) after an incremental matview is populated by a full REFRESH.  Called
+ * from the REFRESH path; re-arms incremental maintenance for HAVING/UNION ALL
+ * matviews across a pg_dump/restore cycle.  No-op for non-incremental matviews
+ * and for plain single-table / JOIN aggregates.
+ */
+extern void MatviewIncrPostRefresh(Oid mvrelid, Query *viewQuery);
+
+/*
+ * Return true if incremental-refresh infrastructure (catalog rows) already
+ * exists for this matview.  Used by ExecCreateTableAs to make setup idempotent
+ * on the WITH NO DATA path that pg_dump/restore takes — the reloption is
+ * present but the triggers/catalog are not, and must be re-established.
+ */
+extern bool MatviewIncrIsSetUp(Oid mvrelid);
+
+/*
  * Check whether the given Query is eligible for incremental refresh.
  * Returns true if eligible; sets *reason to a human-readable explanation
  * if not.

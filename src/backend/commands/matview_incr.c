@@ -51,6 +51,7 @@
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/table.h"
+#include "access/xact.h"
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
@@ -213,7 +214,7 @@ static char *incr_build_union_del_sql(Oid mvrelid, Query *viewQuery,
 									   int delta_varno, const char *delta_table,
 									   List *join_list);
 static void incr_union_dedup_backfill(Oid mvrelid, Query *viewQuery);
-static void incr_setup_union_all(Oid mvrelid, Query *viewQuery);
+static void incr_setup_union_all(Oid mvrelid, Query *viewQuery, bool mv_populated);
 static bool incr_has_minmax_agg(Query *viewQuery);
 static char *incr_build_minmax_ins_sql_gen(Oid mvrelid, Query *viewQuery,
 										   int delta_varno, const char *delta_table,
@@ -693,8 +694,15 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 }
 
 /*
- * incr_install_triggers — install the three AFTER STATEMENT triggers (INSERT,
- * DELETE, UPDATE) on srctable that drive matview mvrelid.
+ * incr_install_triggers — install the AFTER STATEMENT triggers on srctable
+ * that drive matview mvrelid: INSERT, DELETE, UPDATE (delta-based) plus
+ * TRUNCATE (full-recompute fallback).
+ *
+ * TRUNCATE removes every row at once and exposes no per-row transition data,
+ * so the delta machinery cannot represent it.  Its trigger therefore carries
+ * no transition tables; matview_delta_apply() recognises the TRUNCATE event
+ * and falls back to a full REFRESH.  Without this trigger a TRUNCATE on a
+ * source table would silently leave the matview stale.
  */
 static void
 incr_install_triggers(Oid mvrelid, Oid srctable)
@@ -708,6 +716,9 @@ incr_install_triggers(Oid mvrelid, Oid srctable)
 	incr_create_trigger(mvrelid, srctable,
 						TRIGGER_TYPE_UPDATE,
 						MATVIEW_INCR_NEWTABLE, MATVIEW_INCR_OLDTABLE);
+	incr_create_trigger(mvrelid, srctable,
+						TRIGGER_TYPE_TRUNCATE,
+						NULL, NULL);
 }
 
 /*
@@ -731,6 +742,7 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 			   *hav_sql;
 	int			nbasetables = 0;
 	bool		hasHaving;
+	bool		mv_populated;
 	char	   *origschema = NULL;
 	char	   *origname = NULL;
 	ListCell   *lc;
@@ -740,10 +752,28 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot use incremental_refresh: %s", reason)));
 
+	/*
+	 * Is the matview already populated?  On the normal CREATE ... WITH DATA
+	 * path it is (createas refreshed it before calling us), so the one-time
+	 * backfills that seed hidden state (HAVING failing-group seeding, UNION
+	 * dedup) run here.  On the pg_dump/restore path the matview is created
+	 * WITH NO DATA and populated later by a standalone REFRESH, so those
+	 * backfills — and the HAVING rename/view scaffolding — are deferred to
+	 * MatviewIncrPostRefresh(), which runs after that REFRESH populates it.
+	 */
+	{
+		HeapTuple	cltup = SearchSysCache1(RELOID, ObjectIdGetDatum(mvrelid));
+
+		mv_populated = HeapTupleIsValid(cltup)
+			? ((Form_pg_class) GETSTRUCT(cltup))->relispopulated : true;
+		if (HeapTupleIsValid(cltup))
+			ReleaseSysCache(cltup);
+	}
+
 	/* UNION ALL: separate setup path */
 	if (viewQuery->setOperations != NULL)
 	{
-		incr_setup_union_all(mvrelid, viewQuery);
+		incr_setup_union_all(mvrelid, viewQuery, mv_populated);
 		ereport(DEBUG1,
 				(errmsg("DBblue: incremental refresh (UNION ALL) set up for matview %s",
 						get_rel_name(mvrelid))));
@@ -779,7 +809,7 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 	 * After this rename mv_qname(mvrelid) returns the base table name, so
 	 * all subsequent SQL builders reference the base table automatically.
 	 */
-	if (hasHaving)
+	if (hasHaving && mv_populated)
 	{
 		origschema = pstrdup(get_namespace_name(get_rel_namespace(mvrelid)));
 		origname   = pstrdup(get_rel_name(mvrelid));
@@ -836,7 +866,7 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 								   cln_sql, hav_sql, NULL);
 			}
 
-			if (hasHaving)
+			if (hasHaving && mv_populated)
 			{
 				char *backfill_sql = incr_build_backfill_sql_gen(
 					mvrelid, viewQuery, -1, mv_qname(srctable), NIL);
@@ -1113,7 +1143,7 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 			 * HAVING backfill: seed all groups from the real tables so groups
 			 * that initially fail HAVING are tracked.
 			 */
-			if (hasHaving)
+			if (hasHaving && mv_populated)
 			{
 				IncrJoinEntry *first_je  = linitial(all_tables);
 				List		  *join_list = incr_build_join_list_for_delta(
@@ -1136,15 +1166,130 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 		}
 	}
 
-	/* Step 3 (HAVING only): create the user-facing VIEW over the base table */
-	if (hasHaving)
+	/*
+	 * Step 3 (HAVING only): rename the matview to its base name and create the
+	 * user-facing filtering VIEW.  Only on the WITH DATA path (mv_populated).
+	 * On restore the base is already named "_dbblue_<oid>_base" and the view
+	 * is dumped/restored as its own object, so this is skipped.
+	 */
+	if (hasHaving && mv_populated)
 		incr_create_having_view(mvrelid, origschema, origname, viewQuery);
 
 	ereport(DEBUG1,
 			(errmsg("DBblue: incremental refresh (Phase %d%s) set up for matview %s",
 					nbasetables,
 					hasHaving ? " + HAVING" : "",
-					hasHaving ? origname : get_rel_name(mvrelid))));
+					(hasHaving && origname) ? origname : get_rel_name(mvrelid))));
+}
+
+/*
+ * MatviewIncrPostRefresh
+ *
+ * Run the one-time hidden-state backfills that must happen *after* an
+ * incremental matview is populated by a full REFRESH:
+ *
+ *   - HAVING: seed groups that currently fail the HAVING condition (with
+ *     __mv_having_ok__ = false) so they are tracked and can become visible
+ *     later via an incremental delta.  The visible (passing) groups were
+ *     populated by the REFRESH itself; this adds the rest from the source.
+ *   - UNION ALL: collapse the raw per-branch rows the REFRESH produced into
+ *     one row per distinct value with a correct __mv_count__.
+ *
+ * Called from RefreshMatViewByOid for any non-create REFRESH of a matview that
+ * has incremental infrastructure.  This makes a plain REFRESH of a HAVING or
+ * UNION ALL incremental matview correct, and — because pg_dump restores such a
+ * matview as CREATE ... WITH NO DATA followed by a standalone REFRESH — it is
+ * what re-arms incremental maintenance across a dump/restore cycle.
+ *
+ * A no-op for matviews without incremental setup, and for single-table /
+ * JOIN aggregate matviews (whose deltas are self-contained, needing no seed).
+ */
+void
+MatviewIncrPostRefresh(Oid mvrelid, Query *viewQuery)
+{
+	int			nbasetables = 0;
+	ListCell   *lc;
+
+	/* Only matviews that actually have incremental infrastructure. */
+	if (!MatviewIncrIsSetUp(mvrelid))
+		return;
+
+	/* UNION ALL: re-collapse duplicates, then build the deferred unique index. */
+	if (viewQuery->setOperations != NULL)
+	{
+		incr_union_dedup_backfill(mvrelid, viewQuery);
+		CommandCounterIncrement();
+
+		/*
+		 * On the restore path the unique index was deferred (setup could not
+		 * build it before the REFRESH reloaded raw duplicate rows).  Now that
+		 * the dedup has collapsed them, build it.  Skip if it already exists.
+		 */
+		if (!OidIsValid(get_relname_relid(psprintf("__mv_uniq_%u", mvrelid),
+										  get_rel_namespace(mvrelid))))
+		{
+			List	   *allColNames = NIL;
+
+			foreach(lc, viewQuery->targetList)
+			{
+				TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+				if (te->resjunk || incr_is_hidden_col(te->resname))
+					continue;
+				allColNames = lappend(allColNames,
+									  makeString(pstrdup(te->resname)));
+			}
+			incr_create_unique_index(mvrelid, allColNames);
+			CommandCounterIncrement();
+		}
+		return;
+	}
+
+	/* Everything below is HAVING-only; plain aggregates need no backfill. */
+	if (viewQuery->havingQual == NULL)
+		return;
+
+	foreach(lc, viewQuery->rtable)
+	{
+		RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+
+		if (rte->rtekind == RTE_RELATION)
+			nbasetables++;
+	}
+
+	{
+		char	   *backfill_sql;
+		int			spi_ret;
+
+		if (nbasetables == 1)
+		{
+			Oid		srctable = incr_get_source_table(viewQuery);
+
+			backfill_sql = incr_build_backfill_sql_gen(
+				mvrelid, viewQuery, -1, mv_qname(srctable), NIL);
+		}
+		else
+		{
+			List		  *all_tables = incr_collect_tables(viewQuery);
+			IncrJoinEntry *first_je   = linitial(all_tables);
+			List		  *join_list  = incr_build_join_list_for_delta(
+				all_tables, first_je->varno);
+
+			backfill_sql = incr_build_backfill_sql_gen(
+				mvrelid, viewQuery, first_je->varno,
+				mv_qname(first_je->oid), join_list);
+		}
+
+		OpenMatViewIncrementalMaintenance();
+		SPI_connect();
+		spi_ret = SPI_execute(backfill_sql, false, 0);
+		SPI_finish();
+		CloseMatViewIncrementalMaintenance();
+		if (spi_ret < 0)
+			elog(ERROR, "DBblue: HAVING post-refresh backfill failed (code %d)",
+				 spi_ret);
+		CommandCounterIncrement();
+	}
 }
 
 /*
@@ -1175,6 +1320,37 @@ MatviewIncrTeardown(Oid mvrelid)
 }
 
 /*
+ * MatviewIncrIsSetUp
+ * Return true if a pg_dbblue_matview catalog row already exists for this
+ * matview (i.e. incremental setup has run).  Used by ExecCreateTableAs to make
+ * setup idempotent on the WITH NO DATA path taken by pg_dump/restore — the
+ * incremental_refresh reloption is present but the triggers/catalog are not,
+ * and must be re-established.
+ */
+bool
+MatviewIncrIsSetUp(Oid mvrelid)
+{
+	Relation	catalog;
+	SysScanDesc scan;
+	ScanKeyData key;
+	bool		found;
+
+	catalog = table_open(DbblueMatviewRelationId, AccessShareLock);
+	ScanKeyInit(&key,
+				Anum_pg_dbblue_matview_mvrelid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(mvrelid));
+	scan = systable_beginscan(catalog,
+							  DbblueMatviewMvrelidIndexId,
+							  true, NULL, 1, &key);
+	found = (systable_getnext(scan) != NULL);
+	systable_endscan(scan);
+	table_close(catalog, AccessShareLock);
+
+	return found;
+}
+
+/*
  * MatviewIncrAddCountTarget
  * Append hidden maintenance columns to the query's target list.
  *
@@ -1200,6 +1376,21 @@ MatviewIncrAddCountTarget(Query *q)
 	/* UNION ALL: __mv_count__ is added via ALTER TABLE in incr_setup_union_all */
 	if (q->setOperations != NULL)
 		return;
+
+	/*
+	 * Idempotency guard: if __mv_count__ is already present the query has
+	 * already been prepared (e.g. it is the stored view query reparsed from a
+	 * pg_dump/restore, which carries the hidden columns verbatim).  Re-adding
+	 * would create a duplicate column, so do nothing.
+	 */
+	foreach(lc, q->targetList)
+	{
+		TargetEntry *t = lfirst_node(TargetEntry, lc);
+
+		if (!t->resjunk && t->resname != NULL &&
+			strcmp(t->resname, MATVIEW_INCR_COUNT_COL) == 0)
+			return;
+	}
 
 	/* Row-level views (no GROUP BY or DISTINCT) need no hidden maintenance columns */
 	if (q->groupClause == NIL && q->distinctClause == NIL)
@@ -4348,9 +4539,18 @@ incr_create_unique_index(Oid mvrelid, List *groupColNames)
 	ListCell   *lc;
 	bool		first = true;
 	int			ret;
+	char	   *idxname;
+	Oid			idxoid;
+
+	/*
+	 * Deterministic name so we can locate the index afterward to record its
+	 * dependency.  One incremental matview has exactly one such index.
+	 */
+	idxname = psprintf("__mv_uniq_%u", mvrelid);
 
 	initStringInfo(&sql);
-	appendStringInfo(&sql, "CREATE UNIQUE INDEX ON %s (", mv_qname(mvrelid));
+	appendStringInfo(&sql, "CREATE UNIQUE INDEX %s ON %s (",
+					 quote_identifier(idxname), mv_qname(mvrelid));
 	foreach(lc, groupColNames)
 	{
 		if (!first) appendStringInfoChar(&sql, ',');
@@ -4366,6 +4566,28 @@ incr_create_unique_index(Oid mvrelid, List *groupColNames)
 
 	if (ret != SPI_OK_UTILITY)
 		elog(ERROR, "incr_create_unique_index: failed (%d)", ret);
+
+	/*
+	 * Record an INTERNAL dependency from the index to the matview.  This marks
+	 * the index as engine-managed infrastructure — just like the delta
+	 * triggers — so pg_dump skips dumping it as a standalone CREATE INDEX
+	 * (see getIndexes() in pg_dump.c).  On restore the index is recreated by
+	 * MatviewIncrSetup instead, avoiding a duplicate-index conflict.
+	 */
+	CommandCounterIncrement();		/* make the new index visible to syscache */
+	idxoid = get_relname_relid(idxname,
+							   get_rel_namespace(mvrelid));
+	if (OidIsValid(idxoid))
+	{
+		ObjectAddress idxaddr,
+					  mvaddr;
+
+		ObjectAddressSet(idxaddr, RelationRelationId, idxoid);
+		ObjectAddressSet(mvaddr, RelationRelationId, mvrelid);
+		recordDependencyOn(&idxaddr, &mvaddr, DEPENDENCY_INTERNAL);
+	}
+
+	pfree(idxname);
 }
 
 static void
@@ -4548,7 +4770,8 @@ matview_delta_apply(PG_FUNCTION_ARGS)
 	Oid			srctable;
 	bool		is_insert,
 				is_delete,
-				is_update;
+				is_update,
+				is_truncate;
 	int			ret;
 
 	if (!CALLED_AS_TRIGGER(fcinfo))
@@ -4566,9 +4789,71 @@ matview_delta_apply(PG_FUNCTION_ARGS)
 	is_insert = TRIGGER_FIRED_BY_INSERT(trigdata->tg_event);
 	is_delete = TRIGGER_FIRED_BY_DELETE(trigdata->tg_event);
 	is_update = TRIGGER_FIRED_BY_UPDATE(trigdata->tg_event);
+	is_truncate = TRIGGER_FIRED_BY_TRUNCATE(trigdata->tg_event);
 
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "matview_delta_apply: SPI_connect failed");
+
+	/*
+	 * Skip maintenance while the matview is unpopulated.  An unpopulated
+	 * incremental matview has no baseline to apply deltas to — for example
+	 * during pg_dump/restore the delta triggers are installed before the
+	 * dump's COPY loads the source tables and before the matview is populated
+	 * by the dump's REFRESH.  Any DML in that window is captured wholesale by
+	 * the eventual REFRESH, so applying deltas now is both pointless and
+	 * (for the HAVING/MIN-MAX paths, which read the matview) an error.
+	 */
+	{
+		HeapTuple	cltup = SearchSysCache1(RELOID, ObjectIdGetDatum(mvrelid));
+		bool		populated = true;
+
+		if (HeapTupleIsValid(cltup))
+		{
+			populated = ((Form_pg_class) GETSTRUCT(cltup))->relispopulated;
+			ReleaseSysCache(cltup);
+		}
+		if (!populated)
+		{
+			SPI_finish();
+			return PointerGetDatum(NULL);
+		}
+	}
+
+	/* ----- TRUNCATE: no transition data exists, fall back to full refresh ----- */
+	if (is_truncate)
+	{
+		StringInfoData refresh_sql;
+		char	   *nspname = get_namespace_name(get_rel_namespace(mvrelid));
+		char	   *relname = get_rel_name(mvrelid);
+
+		if (relname == NULL)		/* matview already dropped in this txn */
+		{
+			SPI_finish();
+			return PointerGetDatum(NULL);
+		}
+
+		/*
+		 * The stored view query carries the hidden __mv_count__ target
+		 * (injected at CREATE time), so a standard non-concurrent REFRESH
+		 * rebuilds every column — visible and hidden — from the current
+		 * source-table contents.  REFRESH performs a heap swap on the matview
+		 * and issues no DML against the source tables, so it does not re-enter
+		 * this trigger.
+		 */
+		initStringInfo(&refresh_sql);
+		appendStringInfo(&refresh_sql,
+						 "REFRESH MATERIALIZED VIEW %s",
+						 quote_qualified_identifier(nspname, relname));
+
+		ret = SPI_execute(refresh_sql.data, false, 0);
+		if (ret != SPI_OK_UTILITY)
+			elog(ERROR, "matview_delta_apply: TRUNCATE refresh failed: %s",
+				 SPI_result_code_string(ret));
+
+		pfree(refresh_sql.data);
+		SPI_finish();
+		return PointerGetDatum(NULL);
+	}
 
 	/* Register __mv_newtable / __mv_oldtable as ENRs visible to SPI queries */
 	SPI_register_trigger_data(trigdata);
@@ -5145,9 +5430,17 @@ incr_union_dedup_backfill(Oid mvrelid, Query *viewQuery)
  *   2. Dedup-backfill: collapse duplicate rows into a single row with count
  *   3. Create unique index on all visible columns
  *   4. For each UNION ALL branch, install per-table triggers
+ *
+ * Steps 2 and 3 only run when the matview is already populated (the
+ * CREATE ... WITH DATA path).  On the pg_dump/restore path the matview is empty
+ * here and populated later by a standalone REFRESH that reloads the raw
+ * per-branch rows — which contain cross-branch duplicates and would violate
+ * the unique index if it already existed.  So both the dedup and the unique
+ * index are deferred to MatviewIncrPostRefresh(), which dedups first and then
+ * builds the index on the now-unique rows.
  */
 static void
-incr_setup_union_all(Oid mvrelid, Query *viewQuery)
+incr_setup_union_all(Oid mvrelid, Query *viewQuery, bool mv_populated)
 {
 	List	   *branches = NIL;
 	List	   *allColNames = NIL;
@@ -5170,20 +5463,27 @@ incr_setup_union_all(Oid mvrelid, Query *viewQuery)
 
 	CommandCounterIncrement();
 
-	/* Step 2: dedup-backfill */
-	incr_union_dedup_backfill(mvrelid, viewQuery);
-	CommandCounterIncrement();
-
-	/* Step 3: unique index on all visible columns */
-	foreach(lc, viewQuery->targetList)
+	/*
+	 * Steps 2 + 3: dedup, then build the unique index on the deduped rows.
+	 * Deferred to MatviewIncrPostRefresh() on the restore path (matview not yet
+	 * populated) so the index is never present while the REFRESH reloads raw
+	 * duplicate rows.
+	 */
+	if (mv_populated)
 	{
-		TargetEntry *te = lfirst_node(TargetEntry, lc);
+		incr_union_dedup_backfill(mvrelid, viewQuery);
+		CommandCounterIncrement();
 
-		if (te->resjunk || incr_is_hidden_col(te->resname))
-			continue;
-		allColNames = lappend(allColNames, makeString(pstrdup(te->resname)));
+		foreach(lc, viewQuery->targetList)
+		{
+			TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+			if (te->resjunk || incr_is_hidden_col(te->resname))
+				continue;
+			allColNames = lappend(allColNames, makeString(pstrdup(te->resname)));
+		}
+		incr_create_unique_index(mvrelid, allColNames);
 	}
-	incr_create_unique_index(mvrelid, allColNames);
 
 	/* Step 4: per-branch triggers */
 	incr_collect_union_branches(viewQuery, &branches);
@@ -6971,6 +7271,17 @@ MatviewIncrNormalize(Query *viewQuery)
 	bool		has_cte;
 	bool		has_subq;
 	Query	   *q;
+
+	/*
+	 * Set-operation (UNION ALL) queries: the rtable subqueries are the union
+	 * branches, not FROM-subqueries to inline.  Normalizing them would rewrite
+	 * the branch RTEs out from under the setOperations tree and corrupt it
+	 * (incr_collect_union_branches would then find a non-subquery leaf).  The
+	 * UNION ALL setup path handles each branch directly, so leave the query as
+	 * is.
+	 */
+	if (viewQuery->setOperations != NULL)
+		return viewQuery;
 
 	has_cte  = (viewQuery->cteList != NIL);
 	has_subq = false;
