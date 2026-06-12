@@ -59,6 +59,14 @@ extern void MatviewIncrSetup(Oid mvrelid, Query *viewQuery);
 extern void MatviewIncrTeardown(Oid mvrelid);
 
 /*
+ * Raise an error if (relid, attnum) is a column used by an incremental
+ * materialized view.  Called from the column-rename path: the stored delta SQL
+ * is text keyed by column name, so a rename would break it; we refuse early
+ * with a clear message rather than fail later on the next write.
+ */
+extern void MatviewIncrCheckColumnRename(Oid relid, int attnum);
+
+/*
  * Run one-time hidden-state backfills (HAVING failing-group seeding, UNION ALL
  * dedup) after an incremental matview is populated by a full REFRESH.  Called
  * from the REFRESH path; re-arms incremental maintenance for HAVING/UNION ALL

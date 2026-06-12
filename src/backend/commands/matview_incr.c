@@ -68,6 +68,7 @@
 #include "commands/trigger.h"
 #include "executor/spi.h"
 #include "lib/stringinfo.h"
+#include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/primnodes.h"
@@ -1347,6 +1348,72 @@ MatviewIncrTeardown(Oid mvrelid)
 		CatalogTupleDelete(catalog, &tup->t_self);
 	systable_endscan(scan);
 	table_close(catalog, RowExclusiveLock);
+}
+
+/*
+ * MatviewIncrCheckColumnRename
+ *
+ * Block renaming a source-table column that an incremental matview depends on.
+ *
+ * PostgreSQL allows renaming a column that ordinary views/rules reference,
+ * because rules track columns by attribute number and follow the rename
+ * automatically.  But the incremental engine stores its delta SQL as text with
+ * literal column names; a rename would silently invalidate it and every write
+ * to the source table would then fail with a confusing "column ... does not
+ * exist".  DROP COLUMN and ALTER COLUMN TYPE are already refused by the
+ * matview's column-level dependency — this gives renames the same early, clear
+ * error instead of a deferred failure.
+ *
+ * The matview's rewrite rule already records a dependency on (relid, attnum);
+ * we error if any such dependent matview is incremental.  Columns no
+ * incremental matview uses (or non-incremental matviews) are unaffected.
+ */
+void
+MatviewIncrCheckColumnRename(Oid relid, int attnum)
+{
+	char	   *sql;
+	char	   *mvname = NULL;
+	MemoryContext outer = CurrentMemoryContext;
+	int			ret;
+
+	if (attnum <= 0)
+		return;
+
+	/* No user matviews during bootstrap; the catalog may not exist yet. */
+	if (IsBootstrapProcessingMode())
+		return;
+
+	sql = psprintf(
+		"SELECT c.relname FROM pg_catalog.pg_depend d "
+		"JOIN pg_catalog.pg_rewrite rw "
+		"  ON d.classid='pg_catalog.pg_rewrite'::pg_catalog.regclass AND d.objid=rw.oid "
+		"JOIN pg_catalog.pg_class c ON c.oid=rw.ev_class AND c.relkind='m' "
+		"JOIN pg_catalog.pg_dbblue_matview m ON m.mvrelid=c.oid "
+		"WHERE d.refclassid='pg_catalog.pg_class'::pg_catalog.regclass "
+		"  AND d.refobjid=%u AND d.refobjsubid=%d LIMIT 1",
+		relid, attnum);
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "MatviewIncrCheckColumnRename: SPI_connect failed");
+	ret = SPI_execute(sql, true, 1);
+	if (ret == SPI_OK_SELECT && SPI_processed == 1)
+	{
+		char *v = SPI_getvalue(SPI_tuptable->vals[0],
+							   SPI_tuptable->tupdesc, 1);
+
+		/* Copy out of the SPI context, which SPI_finish will free. */
+		if (v != NULL)
+			mvname = MemoryContextStrdup(outer, v);
+	}
+	SPI_finish();
+
+	if (mvname != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot rename column: it is used by incremental materialized view \"%s\"",
+						mvname),
+				 errdetail("Incremental refresh stores delta SQL by column name, which a rename would invalidate."),
+				 errhint("Drop and recreate the materialized view, then rename the column.")));
 }
 
 /*

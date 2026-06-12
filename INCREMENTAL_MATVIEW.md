@@ -362,4 +362,7 @@ Some shapes need a one-time backfill that can only run once the matview is popul
 - **No volatile functions in WHERE or aggregate arguments**: `now()`, `random()`, etc. are rejected because they would produce different results per-row vs. per-delta.
 - **Outer joins with NULLs**: LEFT/RIGHT/FULL OUTER JOIN matviews are supported but the delta for the NULL-extended side requires full-group rescans, similar to MIN/MAX.
 - **`__mv_count__` column**: always present in the matview. Queries against the matview should ignore it or exclude it from `SELECT *` projections.
-- **No DDL on source tables while active**: `ALTER TABLE … ADD/DROP COLUMN` on a tracked source table requires dropping and recreating the matview.
+- **DDL on source tables**: schema changes never silently corrupt or silently disable a matview. The behavior by operation:
+  - `ADD COLUMN` (and changes to columns the matview doesn't use) — allowed; the matview stays incremental and correct.
+  - `DROP COLUMN` / `ALTER COLUMN TYPE` of a used column, and `DROP TABLE` — refused by PostgreSQL's column/table dependency (drop the matview first, or use `CASCADE`).
+  - `RENAME COLUMN` of a used column — refused by the engine with a clear error (the stored delta SQL is keyed by column name). Drop and recreate the matview, then rename.

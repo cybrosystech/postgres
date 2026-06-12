@@ -62,6 +62,7 @@
 #include "commands/defrem.h"
 #include "commands/event_trigger.h"
 #include "commands/extension.h"
+#include "commands/matview_incr.h"
 #include "commands/repack.h"
 #include "commands/sequence.h"
 #include "commands/tablecmds.h"
@@ -4004,6 +4005,13 @@ renameatt_internal(Oid myrelid,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot rename system column \"%s\"",
 						oldattname)));
+
+	/*
+	 * DBblue: refuse renaming a column an incremental materialized view depends
+	 * on — its stored delta SQL is keyed by column name and a rename would
+	 * silently break it.
+	 */
+	MatviewIncrCheckColumnRename(myrelid, attnum);
 
 	/*
 	 * if the attribute is inherited, forbid the renaming.  if this is a
