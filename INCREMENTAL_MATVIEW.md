@@ -136,6 +136,15 @@ When the view has a HAVING clause, a fourth step re-checks the condition after e
 DELETE FROM mv_sales WHERE __mv_count__ > 0 AND NOT (revenue > 1000);
 ```
 
+### HAVING object lifecycle
+
+A HAVING incremental matview is materialized as two objects: a hidden base matview `_dbblue_<oid>_base` (holding all groups, including failing ones, plus `__mv_having_ok__`) and a user-facing **view** of the original name that exposes only the passing groups. The base carries an `INTERNAL` dependency on the view, so the two live and die together:
+
+- `DROP <name>` (the view) drops the base as well, and `doDeletion` removes its catalog rows and cascade-drops its triggers — no orphaned `_dbblue_*_base`.
+- `DROP MATERIALIZED VIEW _dbblue_<oid>_base` is refused with a hint to drop the user-facing view instead.
+
+This link is recorded at create time and re-established on restore by `MatviewIncrPostRefresh`.
+
 ---
 
 ## MIN/MAX Aggregate Support
@@ -335,7 +344,7 @@ Some shapes need a one-time backfill that can only run once the matview is popul
 
 `MatviewIncrPostRefresh()` runs these backfills at the end of every non-create `REFRESH`. Because the dump restores a matview as `WITH NO DATA` + a standalone `REFRESH`, this is exactly what re-arms HAVING/UNION matviews across a dump/restore — and it also makes a plain manual `REFRESH` of those matviews correct.
 
-- For **HAVING**, the base matview (`_dbblue_<oid>_base`) and its filtering view restore as their own objects; the rename/view scaffolding is skipped (the base is already named) and only the delta wiring + failing-group seed are rebuilt.
+- For **HAVING**, the base matview (`_dbblue_<oid>_base`) and its filtering view restore as their own objects; the rename/view scaffolding is skipped (the base is already named) and only the delta wiring + failing-group seed are rebuilt. The base↔view lifetime link is re-established too (see below).
 - For **UNION ALL**, the unique index is also deferred: the restore `REFRESH` reloads the raw per-branch rows (which contain cross-branch duplicates), so the index is built by `MatviewIncrPostRefresh()` *after* the dedup collapses them — never while duplicates are present.
 
 **Verified by** `src/test/dbblue_ivm/dump_restore_consistency.sh`: SUM/COUNT, AVG, MIN/MAX, JOIN, HAVING, and UNION ALL matviews dump, restore with a clean exit, and remain incrementally correct afterward — including a HAVING group that crosses the threshold after restore (correct only if the failing-group seed was rebuilt), UNION ALL dedup counts, and TRUNCATE re-seeding.

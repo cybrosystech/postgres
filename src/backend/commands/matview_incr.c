@@ -251,6 +251,7 @@ static const char *incr_resolve_var_colname(Var *v, List *rtable,
 											int *resolved_varno_out);
 static void incr_deparse_having_cond(Node *expr, Query *viewQuery, StringInfo buf);
 static char *incr_build_hav_sql(Oid mvrelid, Query *viewQuery);
+static void incr_link_having_base_to_view(Oid base);
 static void incr_create_having_view(Oid mvrelid,
 									const char *origschema,
 									const char *origname,
@@ -1290,6 +1291,13 @@ MatviewIncrPostRefresh(Oid mvrelid, Query *viewQuery)
 				 spi_ret);
 		CommandCounterIncrement();
 	}
+
+	/*
+	 * Re-establish the base->view INTERNAL dependency (the create path records
+	 * it in incr_create_having_view, but on restore the view is its own dumped
+	 * object and that path is skipped).  Idempotent, so harmless on a re-run.
+	 */
+	incr_link_having_base_to_view(mvrelid);
 }
 
 /*
@@ -2183,6 +2191,92 @@ incr_create_having_view(Oid mvrelid,
 	if (ret < 0)
 		elog(ERROR, "incr_create_having_view: CREATE VIEW failed: %s",
 			 SPI_result_code_string(ret));
+
+	/*
+	 * Tie the hidden base matview's lifetime to the user-facing view by
+	 * recording an INTERNAL dependency from the base to the view.  This makes
+	 * the two objects live and die together:
+	 *   - DROP VIEW <name>  drops the base too (and, via doDeletion, its
+	 *     incremental triggers and catalog rows) — no orphaned _dbblue_*_base.
+	 *   - DROP MATERIALIZED VIEW _dbblue_*_base is redirected with a hint to
+	 *     drop the user-facing view instead.
+	 * The view already carries a normal dependency on the base (its query
+	 * reads from it); the two are walked in different drop scenarios, so the
+	 * pair is resolved cleanly in both directions.
+	 */
+	CommandCounterIncrement();
+	{
+		Oid			viewoid = get_relname_relid(origname,
+												get_rel_namespace(mvrelid));
+
+		if (OidIsValid(viewoid))
+		{
+			ObjectAddress baseaddr,
+						  viewaddr;
+
+			ObjectAddressSet(baseaddr, RelationRelationId, mvrelid);
+			ObjectAddressSet(viewaddr, RelationRelationId, viewoid);
+			recordDependencyOn(&baseaddr, &viewaddr, DEPENDENCY_INTERNAL);
+		}
+	}
+}
+
+/*
+ * incr_link_having_base_to_view
+ *
+ * Record the INTERNAL dependency that ties a HAVING base matview's lifetime to
+ * its user-facing filtering view (see incr_create_having_view).  Used on the
+ * pg_dump/restore path, where the view is restored as its own object and
+ * incr_create_having_view is not run, so the dependency would otherwise be
+ * missing and dropping the view would orphan the base.
+ *
+ * Finds the view by its rewrite rule's dependency on the base, and is a no-op
+ * if the link already exists (so it is safe to call on every REFRESH).
+ */
+static void
+incr_link_having_base_to_view(Oid base)
+{
+	Oid			viewoid = InvalidOid;
+	char	   *sql;
+	int			ret;
+
+	sql = psprintf(
+		"SELECT r.ev_class FROM pg_catalog.pg_rewrite r "
+		"JOIN pg_catalog.pg_depend d ON d.classid='pg_catalog.pg_rewrite'::pg_catalog.regclass "
+		"  AND d.objid = r.oid "
+		"WHERE d.refclassid='pg_catalog.pg_class'::pg_catalog.regclass "
+		"  AND d.refobjid=%u AND r.ev_class<>%u "
+		"  AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend e "
+		"     WHERE e.classid='pg_catalog.pg_class'::pg_catalog.regclass AND e.objid=%u "
+		"       AND e.refclassid='pg_catalog.pg_class'::pg_catalog.regclass "
+		"       AND e.refobjid=r.ev_class AND e.deptype='i') "
+		"LIMIT 1",
+		base, base, base);
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "incr_link_having_base_to_view: SPI_connect failed");
+	ret = SPI_execute(sql, true, 1);
+	if (ret == SPI_OK_SELECT && SPI_processed == 1)
+	{
+		bool	isnull;
+		Datum	d = SPI_getbinval(SPI_tuptable->vals[0],
+								  SPI_tuptable->tupdesc, 1, &isnull);
+
+		if (!isnull)
+			viewoid = DatumGetObjectId(d);
+	}
+	SPI_finish();
+
+	if (OidIsValid(viewoid))
+	{
+		ObjectAddress baseaddr,
+					  viewaddr;
+
+		ObjectAddressSet(baseaddr, RelationRelationId, base);
+		ObjectAddressSet(viewaddr, RelationRelationId, viewoid);
+		recordDependencyOn(&baseaddr, &viewaddr, DEPENDENCY_INTERNAL);
+		CommandCounterIncrement();
+	}
 }
 
 static Oid
