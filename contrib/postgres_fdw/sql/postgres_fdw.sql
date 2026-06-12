@@ -4573,11 +4573,24 @@ ALTER FOREIGN TABLE simport_fview OPTIONS (ADD restore_stats 'true');
 
 ANALYZE simport_fview;                    -- should fail
 
+-- This tests build_remattrmap()'s deparsing of column names that include
+-- single quotes or backslashes
+CREATE TABLE dtest_table ("col'quote" int, "col\backslash" int);
+CREATE FOREIGN TABLE dtest_ftable ("col'quote" int, "col\backslash" int)
+       SERVER loopback OPTIONS (table_name 'dtest_table', restore_stats 'true');
+
+INSERT INTO dtest_table SELECT g, g FROM generate_series(1, 10) g;
+ANALYZE dtest_table;
+
+ANALYZE VERBOSE dtest_ftable;             -- should work
+
 -- cleanup
 DROP FOREIGN TABLE simport_ftable;
 DROP FOREIGN TABLE simport_fview;
 DROP VIEW simport_view;
 DROP TABLE simport_table;
+DROP FOREIGN TABLE dtest_ftable;
+DROP TABLE dtest_table;
 
 -- ===================================================================
 -- test for postgres_fdw_get_connections function with check_conn = true
@@ -4620,3 +4633,54 @@ SELECT server_name,
 -- Clean up
 \set VERBOSITY default
 RESET debug_discard_caches;
+
+-- ===================================================================
+-- test cleanup of failed connections on abort
+-- ===================================================================
+
+CREATE VIEW my_backend_pid (pid) AS SELECT pg_backend_pid();
+CREATE FOREIGN TABLE remote_backend_pid (pid int)
+  SERVER loopback OPTIONS (table_name 'my_backend_pid');
+CREATE FUNCTION wait_for_backend_termination(int) RETURNS void AS $$
+  BEGIN
+    WHILE (SELECT count(*) FROM pg_stat_activity WHERE pid = $1) > 0
+    LOOP
+      PERFORM pg_stat_clear_snapshot();
+    END LOOP;
+  END
+$$ LANGUAGE plpgsql;
+
+SET client_min_messages = 'ERROR';
+
+BEGIN;
+DECLARE c CURSOR FOR SELECT * FROM ft1 ORDER BY c1;
+SAVEPOINT s;
+SELECT pid AS remote_pid FROM remote_backend_pid \gset
+SELECT pg_terminate_backend(:remote_pid);
+SELECT wait_for_backend_termination(:remote_pid);
+ROLLBACK TO SAVEPOINT s;
+SELECT pid FROM remote_backend_pid;
+ROLLBACK TO SAVEPOINT s;
+RELEASE SAVEPOINT s;
+FETCH c;
+ABORT;
+
+BEGIN;
+DECLARE c CURSOR FOR SELECT * FROM ft1 ORDER BY c1;
+FETCH c;
+SAVEPOINT s;
+SELECT pid AS remote_pid FROM remote_backend_pid \gset
+SELECT pg_terminate_backend(:remote_pid);
+SELECT wait_for_backend_termination(:remote_pid);
+ROLLBACK TO SAVEPOINT s;
+SELECT pid FROM remote_backend_pid;
+ROLLBACK TO SAVEPOINT s;
+RELEASE SAVEPOINT s;
+CLOSE c;
+ABORT;
+
+RESET client_min_messages;
+
+DROP FUNCTION wait_for_backend_termination(int);
+DROP FOREIGN TABLE remote_backend_pid;
+DROP VIEW my_backend_pid;

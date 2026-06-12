@@ -325,8 +325,8 @@ typedef struct
 typedef struct
 {
 	AttrNumber	local_attnum;
-	char		local_attname[NAMEDATALEN];
-	char		remote_attname[NAMEDATALEN];
+	char	   *local_attname;
+	char	   *remote_attname;
 	int			res_index;
 } RemoteAttributeMapping;
 
@@ -704,6 +704,7 @@ static PGresult *fetch_attstats(PGconn *conn, int server_version_num,
 								const char *column_list);
 static RemoteAttributeMapping *build_remattrmap(Relation relation, List *va_cols,
 												int *p_attrcnt, StringInfo column_list);
+static void free_remattrmap(RemoteAttributeMapping *map, int len);
 static bool attname_in_list(const char *attname, List *va_cols);
 static int	remattrmap_cmp(const void *v1, const void *v2);
 static bool match_attrmap(PGresult *res,
@@ -5593,7 +5594,7 @@ postgresImportForeignStatistics(Relation relation, List *va_cols, int elevel)
 	const char *relname = NULL;
 	ForeignTable *table;
 	ForeignServer *server;
-	RemoteStatsResults remstats = {.rel = NULL,.att = NULL};
+	RemoteStatsResults remstats = {.rel = NULL, .att = NULL};
 	RemoteAttributeMapping *remattrmap = NULL;
 	int			attrcnt = 0;
 	bool		restore_stats = false;
@@ -5670,8 +5671,7 @@ postgresImportForeignStatistics(Relation relation, List *va_cols, int elevel)
 
 	PQclear(remstats.rel);
 	PQclear(remstats.att);
-	if (remattrmap)
-		pfree(remattrmap);
+	free_remattrmap(remattrmap, attrcnt);
 
 	return ok;
 }
@@ -5876,7 +5876,7 @@ fetch_attstats(PGconn *conn, int server_version_num,
 							   " range_bounds_histogram");
 	else
 		appendStringInfoString(&sql,
-							   " NULL, NULL, NULL,");
+							   " NULL, NULL, NULL");
 
 	appendStringInfoString(&sql,
 						   " FROM pg_catalog.pg_stats"
@@ -5886,7 +5886,7 @@ fetch_attstats(PGconn *conn, int server_version_num,
 						   " AND tablename = ");
 	deparseStringLiteral(&sql, remote_relname);
 	appendStringInfo(&sql,
-					 " AND attname = ANY('%s'::text[])",
+					 " AND attname = ANY(%s)",
 					 column_list);
 
 	/* inherited is supported since Postgres 9.0 */
@@ -5921,7 +5921,7 @@ build_remattrmap(Relation relation, List *va_cols,
 
 	remattrmap = palloc_array(RemoteAttributeMapping, tupdesc->natts);
 	initStringInfo(column_list);
-	appendStringInfoChar(column_list, '{');
+	appendStringInfoString(column_list, "ARRAY[");
 	for (int i = 0; i < tupdesc->natts; i++)
 	{
 		Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
@@ -5954,15 +5954,15 @@ build_remattrmap(Relation relation, List *va_cols,
 
 		if (attrcnt > 0)
 			appendStringInfoString(column_list, ", ");
-		appendStringInfoString(column_list, quote_identifier(remote_attname));
+		deparseStringLiteral(column_list, remote_attname);
 
 		remattrmap[attrcnt].local_attnum = attnum;
-		strncpy(remattrmap[attrcnt].local_attname, attname, NAMEDATALEN);
-		strncpy(remattrmap[attrcnt].remote_attname, remote_attname, NAMEDATALEN);
+		remattrmap[attrcnt].local_attname = pstrdup(attname);
+		remattrmap[attrcnt].remote_attname = pstrdup(remote_attname);
 		remattrmap[attrcnt].res_index = -1;
 		attrcnt++;
 	}
-	appendStringInfoChar(column_list, '}');
+	appendStringInfoChar(column_list, ']');
 
 	/* Sort mapping by remote attribute name if needed. */
 	if (attrcnt > 1)
@@ -5970,6 +5970,26 @@ build_remattrmap(Relation relation, List *va_cols,
 
 	*p_attrcnt = attrcnt;
 	return remattrmap;
+}
+
+/*
+ * Free the structure created by build_remattrmap().
+ */
+static void
+free_remattrmap(RemoteAttributeMapping *map, int len)
+{
+	if (!map)
+		return;
+
+	for (int i = 0; i < len; i++)
+	{
+		Assert(map[i].local_attname);
+		pfree(map[i].local_attname);
+		Assert(map[i].remote_attname);
+		pfree(map[i].remote_attname);
+	}
+
+	pfree(map);
 }
 
 /*

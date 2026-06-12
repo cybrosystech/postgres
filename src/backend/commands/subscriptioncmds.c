@@ -356,6 +356,11 @@ parse_subscription_options(ParseState *pstate, List *stmt_options,
 
 			opts->specified_opts |= SUBOPT_MAX_RETENTION_DURATION;
 			opts->maxretention = defGetInt32(defel);
+
+			if (opts->maxretention < 0)
+				ereport(ERROR,
+						errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("max_retention_duration cannot be negative"));
 		}
 		else if (IsSet(supported_opts, SUBOPT_ORIGIN) &&
 				 strcmp(defel->defname, "origin") == 0)
@@ -796,7 +801,7 @@ CreateSubscription(ParseState *pstate, CreateSubscriptionStmt *stmt,
 	values[Anum_pg_subscription_submaxretention - 1] =
 		Int32GetDatum(opts.maxretention);
 	values[Anum_pg_subscription_subretentionactive - 1] =
-		Int32GetDatum(opts.retaindeadtuples);
+		BoolGetDatum(opts.retaindeadtuples);
 	values[Anum_pg_subscription_subserver - 1] = ObjectIdGetDatum(serverid);
 	if (!OidIsValid(serverid))
 		values[Anum_pg_subscription_subconninfo - 1] =
@@ -1427,6 +1432,7 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 	bool		retain_dead_tuples;
 	int			max_retention;
 	bool		retention_active;
+	char	   *new_conninfo = NULL;
 	char	   *origin;
 	Subscription *sub;
 	Form_pg_subscription form;
@@ -1747,9 +1753,11 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 					/*
 					 * Check if changes from different origins may be received
 					 * from the publisher when the origin is changed to ANY
-					 * and retain_dead_tuples is enabled.
+					 * and retain_dead_tuples is enabled. Use |= so that we
+					 * don't clear the flag already set when
+					 * retain_dead_tuples was changed in the same command.
 					 */
-					check_pub_rdt = retain_dead_tuples &&
+					check_pub_rdt |= retain_dead_tuples &&
 						pg_strcasecmp(opts.origin, LOGICALREP_ORIGIN_ANY) == 0;
 
 					origin = opts.origin;
@@ -1810,7 +1818,6 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 				ForeignServer *new_server;
 				ObjectAddress referenced;
 				AclResult	aclresult;
-				char	   *conninfo;
 
 				/*
 				 * Remove what was there before, either another foreign server
@@ -1846,13 +1853,13 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 				/* make sure a user mapping exists */
 				GetUserMapping(form->subowner, new_server->serverid);
 
-				conninfo = ForeignServerConnectionString(form->subowner,
-														 new_server);
+				new_conninfo = ForeignServerConnectionString(form->subowner,
+															 new_server);
 
 				/* Load the library providing us libpq calls. */
 				load_file("libpqwalreceiver", false);
 				/* Check the connection info string. */
-				walrcv_check_conninfo(conninfo,
+				walrcv_check_conninfo(new_conninfo,
 									  sub->passwordrequired && !sub->ownersuperuser);
 
 				values[Anum_pg_subscription_subserver - 1] = ObjectIdGetDatum(new_server->serverid);
@@ -1863,6 +1870,13 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 
 				update_tuple = true;
 			}
+
+			/*
+			 * Since the remote server configuration might have changed,
+			 * perform a check to ensure it permits enabling
+			 * retain_dead_tuples.
+			 */
+			check_pub_rdt = sub->retaindeadtuples;
 			break;
 
 		case ALTER_SUBSCRIPTION_CONNECTION:
@@ -1877,10 +1891,12 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 				replaces[Anum_pg_subscription_subserver - 1] = true;
 			}
 
+			new_conninfo = stmt->conninfo;
+
 			/* Load the library providing us libpq calls. */
 			load_file("libpqwalreceiver", false);
 			/* Check the connection info string. */
-			walrcv_check_conninfo(stmt->conninfo,
+			walrcv_check_conninfo(new_conninfo,
 								  sub->passwordrequired && !sub->ownersuperuser);
 
 			values[Anum_pg_subscription_subconninfo - 1] =
@@ -2129,7 +2145,7 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 		 * available.
 		 */
 		must_use_password = sub->passwordrequired && !sub->ownersuperuser;
-		wrconn = walrcv_connect(stmt->conninfo ? stmt->conninfo : sub->conninfo,
+		wrconn = walrcv_connect(new_conninfo ? new_conninfo : sub->conninfo,
 								true, true, must_use_password, sub->name,
 								&err);
 		if (!wrconn)
@@ -2775,9 +2791,14 @@ check_publications_origin_tables(WalReceiverConn *wrconn, List *publications,
 			Oid			relid = subrel_local_oids[i];
 			char	   *schemaname = get_namespace_name(get_rel_namespace(relid));
 			char	   *tablename = get_rel_name(relid);
+			char	   *schemaname_lit = quote_literal_cstr(schemaname);
+			char	   *tablename_lit = quote_literal_cstr(tablename);
 
-			appendStringInfo(&cmd, "AND NOT (N.nspname = '%s' AND C.relname = '%s')\n",
-							 schemaname, tablename);
+			appendStringInfo(&cmd, "AND NOT (N.nspname = %s AND C.relname = %s)\n",
+							 schemaname_lit, tablename_lit);
+
+			pfree(schemaname_lit);
+			pfree(tablename_lit);
 		}
 	}
 
@@ -2897,10 +2918,15 @@ check_publications_origin_sequences(WalReceiverConn *wrconn, List *publications,
 		Oid			relid = subrel_local_oids[i];
 		char	   *schemaname = get_namespace_name(get_rel_namespace(relid));
 		char	   *seqname = get_rel_name(relid);
+		char	   *schemaname_lit = quote_literal_cstr(schemaname);
+		char	   *seqname_lit = quote_literal_cstr(seqname);
 
 		appendStringInfo(&cmd,
-						 "AND NOT (N.nspname = '%s' AND C.relname = '%s')\n",
-						 schemaname, seqname);
+						 "AND NOT (N.nspname = %s AND C.relname = %s)\n",
+						 schemaname_lit, seqname_lit);
+
+		pfree(schemaname_lit);
+		pfree(seqname_lit);
 	}
 
 	res = walrcv_exec(wrconn, cmd.data, 1, tableRow);

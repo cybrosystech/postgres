@@ -520,7 +520,7 @@ extended_statistics_update(FunctionCallInfo fcinfo)
 		{
 			ereport(WARNING,
 					errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					errmsg("cannot specify parameters \"%s\", \"%s\" or \"%s\"",
+					errmsg("cannot specify parameters \"%s\", \"%s\", or \"%s\"",
 						   extarginfo[MOST_COMMON_VALS_ARG].argname,
 						   extarginfo[MOST_COMMON_FREQS_ARG].argname,
 						   extarginfo[MOST_COMMON_BASE_FREQS_ARG].argname),
@@ -544,7 +544,7 @@ extended_statistics_update(FunctionCallInfo fcinfo)
 		{
 			ereport(WARNING,
 					errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					errmsg("could not use \"%s\", \"%s\" and \"%s\": missing one or more parameters",
+					errmsg("could not use \"%s\", \"%s\", and \"%s\": missing one or more parameters",
 						   extarginfo[MOST_COMMON_VALS_ARG].argname,
 						   extarginfo[MOST_COMMON_FREQS_ARG].argname,
 						   extarginfo[MOST_COMMON_BASE_FREQS_ARG].argname));
@@ -886,7 +886,8 @@ key_in_expr_argnames(JsonbValue *key)
 	Assert(key->type == jbvString);
 	for (int i = 0; i < NUM_ATTRIBUTE_STATS_ELEMS; i++)
 	{
-		if (strncmp(extexprargname[i], key->val.string.val, key->val.string.len) == 0)
+		if (strlen(extexprargname[i]) == key->val.string.len &&
+			strncmp(extexprargname[i], key->val.string.val, key->val.string.len) == 0)
 			return true;
 	}
 	return false;
@@ -1070,6 +1071,15 @@ array_in_safe(FmgrInfo *array_in, const char *s, Oid typid, int32 typmod,
 		return (Datum) 0;
 	}
 
+	if (ARR_NDIM(DatumGetArrayTypeP(result)) != 1)
+	{
+		ereport(WARNING,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("could not import element \"%s\" in expression %d: must be a one-dimensional array",
+						element_name, exprnum)));
+		return (Datum) 0;
+	}
+
 	if (array_contains_nulls(DatumGetArrayTypeP(result)))
 	{
 		ereport(WARNING,
@@ -1150,7 +1160,7 @@ import_pg_statistic(Relation pgsd, JsonbContainer *cont,
 				ereport(WARNING,
 						errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						errmsg("could not parse \"%s\": invalid element in expression %d", argname, exprnum),
-						errhint("Value of element \"%s\" must be type a null or a string.", s));
+						errhint("Value of element \"%s\" must be a null or a string.", s));
 				goto pg_statistic_error;
 		}
 	}
@@ -1332,10 +1342,27 @@ import_pg_statistic(Relation pgsd, JsonbContainer *cont,
 
 		/* Only set the slot if both datums have been built */
 		if (val_ok && num_ok)
+		{
+			ArrayType  *vals_arr = DatumGetArrayTypeP(stavalues);
+			ArrayType  *nums_arr = DatumGetArrayTypeP(stanumbers);
+			int			nvals = ARR_DIMS(vals_arr)[0];
+			int			nnums = ARR_DIMS(nums_arr)[0];
+
+			if (nvals != nnums)
+			{
+				ereport(WARNING,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("could not parse \"%s\": incorrect number of elements (same as \"%s\" required)",
+								"most_common_vals",
+								"most_common_freqs")));
+				goto pg_statistic_error;
+			}
+
 			statatt_set_slot(values, nulls, replaces,
 							 STATISTIC_KIND_MCV,
 							 typcache->eq_opr, typcoll,
 							 stanumbers, false, stavalues, false);
+		}
 		else
 			goto pg_statistic_error;
 	}
@@ -1566,7 +1593,7 @@ import_expressions(Relation pgsd, int numexprs,
 		ereport(WARNING,
 				errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				errmsg("could not parse \"%s\": incorrect number of elements (%d required)",
-					   argname, num_root_elements));
+					   argname, numexprs));
 		goto exprs_error;
 	}
 
@@ -1790,6 +1817,7 @@ pg_clear_extended_stats(PG_FUNCTION_ARGS)
 	 */
 	if (stxform->stxrelid != relid)
 	{
+		heap_freetuple(tup);
 		table_close(pg_stext, RowExclusiveLock);
 		ereport(WARNING,
 				errcode(ERRCODE_INVALID_PARAMETER_VALUE),

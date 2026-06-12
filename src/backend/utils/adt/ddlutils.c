@@ -76,7 +76,7 @@ typedef struct DdlOption
 static void parse_ddl_options(FunctionCallInfo fcinfo, int variadic_start,
 							  DdlOption *opts, int nopts);
 static void append_ddl_option(StringInfo buf, bool pretty, int indent,
-							  const char *fmt,...)
+							  const char *fmt, ...)
 			pg_attribute_printf(4, 5);
 static void append_guc_value(StringInfo buf, const char *name,
 							 const char *value);
@@ -232,7 +232,7 @@ parse_ddl_options(FunctionCallInfo fcinfo, int variadic_start,
  */
 static void
 append_ddl_option(StringInfo buf, bool pretty, int indent,
-				  const char *fmt,...)
+				  const char *fmt, ...)
 {
 	if (pretty)
 	{
@@ -985,6 +985,13 @@ pg_get_database_ddl_internal(Oid dbid, bool pretty,
 	if (!no_tablespace && OidIsValid(dbform->dattablespace))
 	{
 		char	   *spcname = get_tablespace_name(dbform->dattablespace);
+
+		if (spcname == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("tablespace with OID %u does not exist",
+							dbform->dattablespace),
+					 errdetail("It may have been concurrently dropped.")));
 
 		if (pg_strcasecmp(spcname, "pg_default") != 0)
 			append_ddl_option(&buf, pretty, 4, "TABLESPACE = %s",
