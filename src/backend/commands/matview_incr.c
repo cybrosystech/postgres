@@ -2923,6 +2923,32 @@ incr_build_self_join_row_del_sql(Oid mvrelid, Query *viewQuery,
 }
 
 /*
+ * incr_nullsafe_accum — build a NULL-safe running-total expression.
+ *
+ * SUM over an all-NULL delta group yields NULL, and "running + NULL" (or
+ * "running - NULL") would corrupt the stored total to NULL.  Emit instead:
+ *   add:  (CASE WHEN <delta> IS NULL THEN <run>
+ *               WHEN <run> IS NULL THEN <delta> ELSE <run>+<delta> END)
+ *   sub:  (CASE WHEN <delta> IS NULL THEN <run> ELSE <run>-<delta> END)
+ * This is type-agnostic (no literal zero, so SUM(interval) etc. are safe).
+ * COUNT deltas are never NULL, so wrapping them is a harmless no-op.
+ *
+ * (A group whose every contributing value is NULL will show 0 rather than the
+ * SQL-exact NULL after the last non-NULL value is removed — an accepted
+ * residual that would require a per-column non-NULL counter to close.)
+ */
+static char *
+incr_nullsafe_accum(const char *run, const char *delta, bool subtract)
+{
+	if (subtract)
+		return psprintf("(CASE WHEN %s IS NULL THEN %s ELSE %s-%s END)",
+						delta, run, run, delta);
+	return psprintf("(CASE WHEN %s IS NULL THEN %s WHEN %s IS NULL THEN %s "
+					"ELSE %s+%s END)",
+					delta, run, run, delta, run, delta);
+}
+
+/*
  * incr_build_ins_sql_gen — INSERT delta (all phases)
  *
  *   INSERT INTO mv (cols)
@@ -3089,16 +3115,19 @@ incr_build_ins_sql_gen(Oid mvrelid, Query *viewQuery,
 			const char *cnt_q = quote_identifier(cnt_col);
 			const char *type_name = format_type_be(agg->aggtype);
 
+			char	   *sum_expr = incr_nullsafe_accum(
+				psprintf("%s.%s", mvname, sum_q),
+				psprintf("EXCLUDED.%s", sum_q), false);
+
 			if (!first)
 				appendStringInfoChar(&buf, ',');
 			appendStringInfo(&buf,
-							 "%s=%s.%s+EXCLUDED.%s"
+							 "%s=%s"
 							 ",%s=%s.%s+EXCLUDED.%s"
-							 ",%s=((%s.%s+EXCLUDED.%s)::%s/NULLIF(%s.%s+EXCLUDED.%s,0))",
-							 sum_q, mvname, sum_q, sum_q,
+							 ",%s=(%s::%s/NULLIF(%s.%s+EXCLUDED.%s,0))",
+							 sum_q, sum_expr,
 							 cnt_q, mvname, cnt_q, cnt_q,
-							 colq,
-							 mvname, sum_q, sum_q, type_name,
+							 colq, sum_expr, type_name,
 							 mvname, cnt_q, cnt_q);
 			first = false;
 		}
@@ -3116,14 +3145,18 @@ incr_build_ins_sql_gen(Oid mvrelid, Query *viewQuery,
 				appendStringInfo(&buf, "%s=GREATEST(%s.%s,EXCLUDED.%s)",
 								 colq, mvname, colq, colq);
 			else
-				appendStringInfo(&buf, "%s=%s.%s+EXCLUDED.%s", colq, mvname, colq, colq);
+				appendStringInfo(&buf, "%s=%s", colq,
+								 incr_nullsafe_accum(psprintf("%s.%s", mvname, colq),
+													 psprintf("EXCLUDED.%s", colq), false));
 			first = false;
 		}
 		else
 		{
 			if (!first)
 				appendStringInfoChar(&buf, ',');
-			appendStringInfo(&buf, "%s=%s.%s+EXCLUDED.%s", colq, mvname, colq, colq);
+			appendStringInfo(&buf, "%s=%s", colq,
+							 incr_nullsafe_accum(psprintf("%s.%s", mvname, colq),
+												 psprintf("EXCLUDED.%s", colq), false));
 			first = false;
 		}
 	}
@@ -3431,16 +3464,19 @@ incr_build_del_sql_gen(Oid mvrelid, Query *viewQuery,
 			const char *cnt_q = quote_identifier(cnt_col);
 			const char *type_name = format_type_be(agg->aggtype);
 
+			char	   *sum_expr = incr_nullsafe_accum(
+				psprintf("%s.%s", mvname, sum_q),
+				psprintf("d.%s", sum_q), true);
+
 			if (!first)
 				appendStringInfoChar(&buf, ',');
 			appendStringInfo(&buf,
-							 "%s=%s.%s-d.%s"
+							 "%s=%s"
 							 ",%s=%s.%s-d.%s"
-							 ",%s=((%s.%s-d.%s)::%s/NULLIF(%s.%s-d.%s,0))",
-							 sum_q, mvname, sum_q, sum_q,
+							 ",%s=(%s::%s/NULLIF(%s.%s-d.%s,0))",
+							 sum_q, sum_expr,
 							 cnt_q, mvname, cnt_q, cnt_q,
-							 colq,
-							 mvname, sum_q, sum_q, type_name,
+							 colq, sum_expr, type_name,
 							 mvname, cnt_q, cnt_q);
 			first = false;
 		}
@@ -3448,7 +3484,9 @@ incr_build_del_sql_gen(Oid mvrelid, Query *viewQuery,
 		{
 			if (!first)
 				appendStringInfoChar(&buf, ',');
-			appendStringInfo(&buf, "%s=%s.%s-d.%s", colq, mvname, colq, colq);
+			appendStringInfo(&buf, "%s=%s", colq,
+							 incr_nullsafe_accum(psprintf("%s.%s", mvname, colq),
+												 psprintf("d.%s", colq), true));
 			first = false;
 		}
 	}
@@ -6137,14 +6175,17 @@ incr_build_minmax_ins_sql_gen(Oid mvrelid, Query *viewQuery,
 			const char *cnt_q = quote_identifier(cnt_col);
 			const char *type_name = format_type_be(agg->aggtype);
 
+			char	   *sum_expr = incr_nullsafe_accum(
+				psprintf("%s.%s", mvname, sum_q),
+				psprintf("EXCLUDED.%s", sum_q), false);
+
 			appendStringInfo(&buf,
-							 "%s=%s.%s+EXCLUDED.%s"
+							 "%s=%s"
 							 ",%s=%s.%s+EXCLUDED.%s"
-							 ",%s=((%s.%s+EXCLUDED.%s)::%s/NULLIF(%s.%s+EXCLUDED.%s,0))",
-							 sum_q, mvname, sum_q, sum_q,
+							 ",%s=(%s::%s/NULLIF(%s.%s+EXCLUDED.%s,0))",
+							 sum_q, sum_expr,
 							 cnt_q, mvname, cnt_q, cnt_q,
-							 colq,
-							 mvname, sum_q, sum_q, type_name,
+							 colq, sum_expr, type_name,
 							 mvname, cnt_q, cnt_q);
 		}
 		else if (IsA(te->expr, Aggref))
@@ -6158,12 +6199,14 @@ incr_build_minmax_ins_sql_gen(Oid mvrelid, Query *viewQuery,
 				appendStringInfo(&buf, "%s=GREATEST(%s.%s,EXCLUDED.%s)",
 								 colq, mvname, colq, colq);
 			else
-				appendStringInfo(&buf, "%s=%s.%s+EXCLUDED.%s",
-								 colq, mvname, colq, colq);
+				appendStringInfo(&buf, "%s=%s", colq,
+								 incr_nullsafe_accum(psprintf("%s.%s", mvname, colq),
+													 psprintf("EXCLUDED.%s", colq), false));
 		}
 		else
-			appendStringInfo(&buf, "%s=%s.%s+EXCLUDED.%s",
-							 colq, mvname, colq, colq);
+			appendStringInfo(&buf, "%s=%s", colq,
+							 incr_nullsafe_accum(psprintf("%s.%s", mvname, colq),
+												 psprintf("EXCLUDED.%s", colq), false));
 	}
 
 	return buf.data;
@@ -6223,12 +6266,14 @@ incr_build_minmax_del_sql_gen(Oid mvrelid, Query *viewQuery,
 		initStringInfo(&ebuf);
 		incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable,
 								delta_varno, &ebuf);
-		if (has_join)
-			/* In JOIN mode emit  _d_.col AS resname  so affected.resname is stable */
-			appendStringInfo(&buf, "%s AS %s", ebuf.data,
-							 quote_identifier(te->resname));
-		else
-			appendStringInfoString(&buf, ebuf.data);
+		/*
+		 * Always alias the group column to its matview output name.  Later
+		 * CTEs and the upd/DELETE reference these keys by output name
+		 * (groupColNames = resname), so the source column must be exposed under
+		 * that name even when it differs (e.g. "SELECT g AS k").
+		 */
+		appendStringInfo(&buf, "%s AS %s", ebuf.data,
+						 quote_identifier(te->resname));
 	}
 	/* FROM __mv_oldtable__ [_d_ JOIN ...] */
 	incr_append_from_join(&buf, viewQuery, delta_varno, delta_table, join_list);
@@ -6272,11 +6317,9 @@ incr_build_minmax_del_sql_gen(Oid mvrelid, Query *viewQuery,
 			initStringInfo(&ebuf2);
 			incr_deparse_where_qual((Node *) te2->expr, viewQuery->rtable,
 									delta_varno, &ebuf2);
-			if (has_join)
-				appendStringInfo(&buf, "%s AS %s", ebuf2.data,
-								 quote_identifier(te2->resname));
-			else
-				appendStringInfoString(&buf, ebuf2.data);
+			/* Always alias to output name (see affected CTE above) */
+			appendStringInfo(&buf, "%s AS %s", ebuf2.data,
+							 quote_identifier(te2->resname));
 		}
 	}
 	appendStringInfoString(&buf, ",COUNT(*) AS del_cnt");
@@ -6477,27 +6520,38 @@ incr_build_minmax_del_sql_gen(Oid mvrelid, Query *viewQuery,
 					grp_tes = lappend(grp_tes, te);
 			}
 
+			/*
+			 * <source-col(s)> IN (SELECT <output-name(s)> FROM affected):
+			 * the left side references the live source table (source column
+			 * name), the right side references the affected CTE (output name).
+			 */
 			if (list_length(grp_tes) == 1)
 			{
-				TargetEntry *te = linitial(grp_tes);
-				const char  *colq = quote_identifier(te->resname);
+				TargetEntry   *te = linitial(grp_tes);
+				StringInfoData srcbuf;
 
+				initStringInfo(&srcbuf);
+				incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable,
+										delta_varno, &srcbuf);
 				appendStringInfo(&buf, " WHERE %s IN (SELECT %s FROM affected)",
-								 colq, colq);
+								 srcbuf.data, quote_identifier(te->resname));
 			}
 			else
 			{
-				/* Row expression: (g1, g2, ...) IN (SELECT g1, g2, ... FROM affected) */
 				appendStringInfoString(&buf, " WHERE (");
 				first = true;
 				foreach(glc, grp_tes)
 				{
-					TargetEntry *te = lfirst(glc);
+					TargetEntry   *te = lfirst(glc);
+					StringInfoData srcbuf;
 
 					if (!first)
 						appendStringInfoChar(&buf, ',');
 					first = false;
-					appendStringInfoString(&buf, quote_identifier(te->resname));
+					initStringInfo(&srcbuf);
+					incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable,
+											delta_varno, &srcbuf);
+					appendStringInfoString(&buf, srcbuf.data);
 				}
 				appendStringInfoString(&buf, ") IN (SELECT ");
 				first = true;
@@ -6606,9 +6660,12 @@ incr_build_minmax_del_sql_gen(Oid mvrelid, Query *viewQuery,
 			}
 
 			if (is_delta)
-				appendStringInfo(&buf, "%s=%s.%s-old_delta.%s",
-								 colq, mvname, colq,
-								 quote_identifier(delta_colname));
+				appendStringInfo(&buf, "%s=%s", colq,
+								 incr_nullsafe_accum(
+									 psprintf("%s.%s", mvname, colq),
+									 psprintf("old_delta.%s",
+											  quote_identifier(delta_colname)),
+									 true));
 			else
 				appendStringInfo(&buf, "%s=new_agg.%s", colq, colq);
 		}
@@ -6687,7 +6744,6 @@ incr_build_minmax_lock_sql_gen(Oid mvrelid, Query *viewQuery,
 	List		   *groupColNames = NIL;
 	ListCell	   *lc,
 				   *gcl;
-	bool			has_join = (join_list != NIL || delta_varno >= 1);
 	bool			first;
 
 	incr_collect_group_cols(viewQuery, &groupColNames);
@@ -6733,11 +6789,15 @@ incr_build_minmax_lock_sql_gen(Oid mvrelid, Query *viewQuery,
 		initStringInfo(&ebuf);
 		incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable,
 								delta_varno, &ebuf);
-		if (has_join)
-			appendStringInfo(&buf, "%s AS %s", ebuf.data,
-							 quote_identifier(te->resname));
-		else
-			appendStringInfoString(&buf, ebuf.data);
+		/*
+		 * Always alias the grouping column to its matview output name: the
+		 * outer hashtext() references the group columns by output name
+		 * (incr_collect_group_cols returns resname), so when the output name
+		 * differs from the source column (e.g. "SELECT g AS k") the bare
+		 * source column would not be found.
+		 */
+		appendStringInfo(&buf, "%s AS %s", ebuf.data,
+						 quote_identifier(te->resname));
 	}
 
 	/* FROM delta_table [alias JOIN ...] */
