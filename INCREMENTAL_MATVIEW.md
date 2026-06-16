@@ -355,6 +355,9 @@ Some shapes need a one-time backfill that can only run once the matview is popul
 
 ## Limitations
 
+- **No `DISTINCT` aggregates**: `COUNT(DISTINCT x)` (and other `agg(DISTINCT …)`) are rejected — a per-row delta can't tell whether a deleted row removed the last occurrence of a value without per-value occurrence tracking.
+- **No aggregate `FILTER`**: `agg(…) FILTER (WHERE …)` is rejected (the filter is not yet honored by the delta SQL). Planned: support via the same path as `SUM(CASE WHEN …)`.
+- **`GROUP BY` must be plain columns**: grouping on an expression (`GROUP BY date_trunc('month', d)`) is rejected; add the bucket as a generated/stored column and group on that, or pre-project it. Planned.
 - **No SUM/AVG over floating point**: `SUM`/`AVG` over `real`/`double precision` are rejected at `CREATE` time. Incremental maintenance keeps a running total via add/subtract, and floating-point addition is not associative, so the total would drift from a true recompute over many deltas. Use `numeric` (exact) instead. `MIN`/`MAX`/`COUNT` over floats are allowed (no arithmetic), as are `SUM`/`AVG` over `numeric` and integer types.
 - **HAVING requires `WITH DATA`**: a HAVING incremental matview cannot be set up `WITH NO DATA` (a warning is emitted); dump/restore is unaffected.
 - **No subqueries in WHERE**: correlated or uncorrelated subqueries in the WHERE clause are rejected. Use a JOIN instead.

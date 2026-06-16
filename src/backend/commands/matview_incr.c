@@ -611,6 +611,31 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 		}
 	}
 
+	/*
+	 * GROUP BY must be on plain columns.  A grouping expression
+	 * (e.g. GROUP BY date_trunc('month', d)) shows up as a non-Var entry in the
+	 * grouping RTE; the delta builders resolve grouping keys to column names and
+	 * cannot deparse an arbitrary expression, so reject it cleanly here instead
+	 * of failing with an internal error during SQL generation.
+	 */
+	foreach(lc, viewQuery->rtable)
+	{
+		RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+		ListCell   *gc;
+
+		if (rte->rtekind != RTE_GROUP)
+			continue;
+		foreach(gc, rte->groupexprs)
+		{
+			if (!IsA((Node *) lfirst(gc), Var))
+			{
+				*reason = "GROUP BY on an expression is not supported; "
+					"group by plain columns only";
+				return false;
+			}
+		}
+	}
+
 	/* Validate SELECT list expressions */
 	foreach(lc, viewQuery->targetList)
 	{
@@ -649,6 +674,33 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 		{
 			Aggref	   *agg = (Aggref *) te->expr;
 			char	   *fname = get_func_name(agg->aggfnoid);
+
+			/*
+			 * DISTINCT aggregates (e.g. COUNT(DISTINCT x)) cannot be maintained
+			 * by the simple per-row delta: a deleted row only removes a value
+			 * if it was the last occurrence in the group, which the ±1 delta
+			 * cannot know without tracking per-value occurrence counts.
+			 * Rejected rather than maintained incorrectly.
+			 */
+			if (agg->aggdistinct != NIL)
+			{
+				*reason = psprintf("incremental %s(DISTINCT ...) is not supported "
+								   "(distinct aggregates cannot be maintained by a "
+								   "per-row delta)", fname);
+				return false;
+			}
+
+			/*
+			 * FILTER (WHERE ...) on an aggregate is not yet honored by the
+			 * delta builders, so the filter would be silently ignored.  Reject
+			 * until proper support lands.
+			 */
+			if (agg->aggfilter != NULL)
+			{
+				*reason = psprintf("incremental %s(...) FILTER (WHERE ...) is not "
+								   "supported", fname);
+				return false;
+			}
 
 			if (strcmp(fname, "sum") == 0 || strcmp(fname, "count") == 0 ||
 				strcmp(fname, "avg") == 0 || strcmp(fname, "min") == 0 ||
