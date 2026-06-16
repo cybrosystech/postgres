@@ -627,7 +627,9 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 			continue;
 		foreach(gc, rte->groupexprs)
 		{
-			if (!IsA((Node *) lfirst(gc), Var))
+			Node *ge = (Node *) lfirst(gc);
+
+			if (!IsA(ge, Var))
 			{
 				*reason = "GROUP BY on an expression is not supported; "
 					"group by plain columns only";
