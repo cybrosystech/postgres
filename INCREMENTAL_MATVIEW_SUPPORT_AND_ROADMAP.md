@@ -90,8 +90,15 @@ writes."* They are **not** blocked.
 ## 4. Data requirements & boundaries
 
 - 🔒 **Group-key columns must not contain NULL values.** A runtime guard raises
-  a clear error (rolling back the statement) if an insert delta would introduce
-  a NULL group key — never silent corruption. `NOT NULL`-schema keys pay nothing.
+  a clear error if an insert delta would introduce a NULL group key — never
+  silent corruption. `NOT NULL`-schema keys pay nothing.
+  **Consequence:** the guard fires inside the source `INSERT`'s transaction, so
+  it **fails that source write** — while the matview exists, the grouped column
+  effectively behaves like `NOT NULL` for the source table. Do not group an
+  incremental matview on a column the application writes NULL to.
+  **Escape hatch (verified):** add `WHERE <col> IS NOT NULL` to the matview —
+  the source can then freely store NULLs in that column; the matview simply
+  ignores those rows and maintains the non-NULL groups correctly.
 - **HAVING matviews must be created `WITH DATA`** (a `WARNING` is emitted
   otherwise); dump/restore is unaffected.
 - **Logical-replication subscribers do not maintain** the matview (delta
