@@ -800,6 +800,39 @@ incr_install_triggers(Oid mvrelid, Oid srctable)
 }
 
 /*
+ * incr_warn_uncertified_shape
+ * Emit a one-time WARNING at CREATE for view shapes that work but have not yet
+ * been certified under concurrent writes (outer join, self-join, UNION ALL).
+ * These shapes pass single-threaded correctness but were not in the adversarial
+ * concurrency battery; the warning lets an operator make an informed call
+ * before relying on them in production.  Non-blocking by design.
+ */
+static void
+incr_warn_uncertified_shape(Query *viewQuery)
+{
+	const char *shape = NULL;
+
+	if (viewQuery->setOperations != NULL)
+		shape = "UNION ALL";
+	else
+	{
+		List *tabs = incr_collect_tables(viewQuery);
+
+		if (incr_has_self_join(tabs))
+			shape = "a self-join";
+		else if (incr_has_outer_join(tabs))
+			shape = "an outer join";
+	}
+
+	if (shape != NULL)
+		ereport(WARNING,
+				(errmsg("incremental materialized view uses %s, which is not yet certified under concurrent writes",
+						shape),
+				 errdetail("This shape passes single-threaded correctness but is not covered by the concurrency test battery."),
+				 errhint("Validate it under your write workload before relying on it in production.")));
+}
+
+/*
  * MatviewIncrSetup
  * Called from ExecCreateTableAs after the matview is created and populated.
  * __mv_count__ is already present and populated — injected by
@@ -829,6 +862,9 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot use incremental_refresh: %s", reason)));
+
+	/* Caution operators about shapes not yet certified under concurrency. */
+	incr_warn_uncertified_shape(viewQuery);
 
 	/*
 	 * Is the matview already populated?  On the normal CREATE ... WITH DATA
@@ -5030,6 +5066,93 @@ incr_fetch_sql(Oid mvrelid, Oid srctable, int plan_type)
 	return sql;
 }
 
+/*
+ * incr_guard_null_group_key
+ *
+ * Phase-1 safety guard.  A NULL value in a GROUP BY / DISTINCT key cannot be
+ * maintained incrementally: the unique index / ON CONFLICT treats NULLs as
+ * distinct (so a delta would create duplicate, never-merged NULL-key rows) and
+ * the delete-side "mv.k = d.k" predicates are never true for NULL.  Rather than
+ * corrupt the matview silently, detect a NULL group key after an insert delta
+ * and raise a clear error, which rolls the whole statement back.
+ *
+ * The group-key columns are read from the matview's own unique index (so this
+ * works regardless of column aliasing and across all shapes).  Matviews whose
+ * key columns are all NOT NULL by schema, and shapes with no unique index
+ * (row-level), pay nothing.
+ */
+static void
+incr_guard_null_group_key(Oid mvrelid)
+{
+	Relation	mvrel;
+	List	   *idxlist;
+	ListCell   *lc;
+	StringInfoData preds;
+	bool		any_nullable = false;
+	bool		first = true;
+
+	mvrel = table_open(mvrelid, NoLock);	/* already RowExclusiveLock-held */
+	idxlist = RelationGetIndexList(mvrel);
+	initStringInfo(&preds);
+
+	foreach(lc, idxlist)
+	{
+		Relation	idx = index_open(lfirst_oid(lc), AccessShareLock);
+
+		if (idx->rd_index->indisunique)
+		{
+			int		nkeys = idx->rd_index->indnkeyatts;
+
+			for (int i = 0; i < nkeys; i++)
+			{
+				AttrNumber	mvattno = idx->rd_index->indkey.values[i];
+				Form_pg_attribute att;
+
+				if (mvattno <= 0)		/* expression key — be conservative */
+				{
+					any_nullable = true;
+					continue;
+				}
+				att = TupleDescAttr(RelationGetDescr(mvrel), mvattno - 1);
+				if (att->attnotnull)
+					continue;			/* cannot be NULL */
+				any_nullable = true;
+				appendStringInfo(&preds, "%s%s IS NULL",
+								 first ? "" : " OR ",
+								 quote_identifier(NameStr(att->attname)));
+				first = false;
+			}
+			index_close(idx, AccessShareLock);
+			break;
+		}
+		index_close(idx, AccessShareLock);
+	}
+	list_free(idxlist);
+	table_close(mvrel, NoLock);
+
+	/* No group-key unique index, or every key column is NOT NULL: nothing to do. */
+	if (!any_nullable || preds.len == 0)
+		return;
+
+	{
+		StringInfoData q;
+		int			ret;
+
+		initStringInfo(&q);
+		appendStringInfo(&q, "SELECT 1 FROM %s WHERE %s LIMIT 1",
+						 mv_qname(mvrelid), preds.data);
+		/* read_only=false so this sees the just-applied insert delta */
+		ret = SPI_execute(q.data, false, 1);
+		if (ret == SPI_OK_SELECT && SPI_processed > 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("incremental materialized view \"%s\": a NULL value in a GROUP BY/DISTINCT key is not supported",
+							get_rel_name(mvrelid)),
+					 errdetail("NULL group keys cannot be maintained incrementally and would create duplicate, never-cleaned rows."),
+					 errhint("Ensure the grouped column(s) never contain NULL, or filter NULLs out in the matview's WHERE clause.")));
+	}
+}
+
 PG_FUNCTION_INFO_V1(matview_delta_apply);
 
 /*
@@ -5163,6 +5286,9 @@ matview_delta_apply(PG_FUNCTION_ARGS)
 		if (ret < 0)
 			elog(ERROR, "matview_delta_apply: insert delta failed: %s",
 				 SPI_result_code_string(ret));
+
+		/* Fail loudly if the delta introduced a NULL group key (Phase 1 guard). */
+		incr_guard_null_group_key(mvrelid);
 	}
 
 	/* ----- delete delta (DELETE or UPDATE old-side) ----- */
