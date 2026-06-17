@@ -55,4 +55,7 @@ extern void get_reloptions(StringInfo buf, Datum reloptions);
 
 extern char *pg_get_statisticsobjdef_string(Oid statextid);
 
+/* DBblue: deparse a Query to SQL (incremental matview delta rendering) */
+extern char *dbblue_deparse_query(Query *query);
+
 #endif							/* RULEUTILS_H */
