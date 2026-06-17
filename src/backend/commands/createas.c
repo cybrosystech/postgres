@@ -340,6 +340,36 @@ ExecCreateTableAs(ParseState *pstate, CreateTableAsStmt *stmt,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						 errmsg("cannot use incremental_refresh: %s", reason)));
 
+			/*
+			 * Keep NULL-key rows out of scope (writes to the source are never
+			 * blocked; the matview excludes NULL GROUP BY/DISTINCT keys and
+			 * stays consistent with REFRESH).  Apply to both the schema and the
+			 * stored view query so initial population, REFRESH, and deltas agree.
+			 */
+			{
+				List *filtered = MatviewIncrAddNotNullKeyFilters(vq);
+
+				(void) MatviewIncrAddNotNullKeyFilters(query);
+				if (filtered != NIL)
+				{
+					StringInfoData cols;
+					ListCell   *fc;
+					bool		first = true;
+
+					initStringInfo(&cols);
+					foreach(fc, filtered)
+					{
+						appendStringInfo(&cols, "%s%s", first ? "" : ", ",
+										 strVal(lfirst(fc)));
+						first = false;
+					}
+					ereport(NOTICE,
+							(errmsg("incremental matview excludes rows where %s IS NULL",
+									cols.data),
+							 errdetail("NULL group keys are not maintained incrementally; such rows are left out of the matview (source writes are unaffected).")));
+				}
+			}
+
 			MatviewIncrAddCountTarget(query);
 			MatviewIncrAddCountTarget(vq);
 		}

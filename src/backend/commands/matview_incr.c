@@ -1538,6 +1538,164 @@ MatviewIncrIsSetUp(Oid mvrelid)
 }
 
 /*
+ * incr_key_var_nullable — true if a grouping/distinct key Var can be NULL
+ * (base column nullable, or an outer join can NULL-extend it).  Conservative:
+ * returns true if the key can't be resolved to a plain base column.
+ */
+static bool
+incr_key_var_nullable(Var *v, List *rtable)
+{
+	for (;;)
+	{
+		RangeTblEntry *rte;
+
+		if (!bms_is_empty(v->varnullingrels))
+			return true;
+		rte = rt_fetch(v->varno, rtable);
+		if (rte->rtekind == RTE_RELATION)
+		{
+			HeapTuple	tp;
+			bool		nullable = true;
+
+			tp = SearchSysCache2(ATTNUM, ObjectIdGetDatum(rte->relid),
+								 Int16GetDatum(v->varattno));
+			if (HeapTupleIsValid(tp))
+			{
+				nullable = !((Form_pg_attribute) GETSTRUCT(tp))->attnotnull;
+				ReleaseSysCache(tp);
+			}
+			return nullable;
+		}
+		else if (rte->rtekind == RTE_JOIN)
+		{
+			Node *av = list_nth(rte->joinaliasvars, v->varattno - 1);
+
+			if (!IsA(av, Var))
+				return true;
+			v = (Var *) av;
+		}
+		else if (rte->rtekind == RTE_GROUP)
+		{
+			Node *ge = list_nth(rte->groupexprs, v->varattno - 1);
+
+			if (!IsA(ge, Var))
+				return true;
+			v = (Var *) ge;
+		}
+		else
+			return true;
+	}
+}
+
+/*
+ * MatviewIncrAddNotNullKeyFilters
+ *
+ * A NULL value in a GROUP BY / DISTINCT key cannot be maintained incrementally.
+ * Rather than block the source write (the guard's old behavior) or corrupt the
+ * matview, we keep NULL-key rows *outside the matview's scope* by injecting
+ * "<key> IS NOT NULL" into the view's WHERE clause for every nullable key.
+ *
+ * Because the filter lives in the stored view query, the initial population, a
+ * full REFRESH, and the incremental deltas all agree (they all exclude NULL
+ * keys) — so the matview stays consistent, and writes to the source are never
+ * blocked.  The matview simply does not represent NULL-key rows (the sensible
+ * default for a grouped report; a NULL "unknown" group is rarely wanted).
+ *
+ * Returns the list of key column names that were filtered (for a NOTICE), or
+ * NIL if every key is already NOT NULL.  Idempotent-safe to call on both the
+ * schema query and the stored view query.
+ */
+List *
+MatviewIncrAddNotNullKeyFilters(Query *q)
+{
+	List	   *keyvars = NIL;	/* base Var nodes of the grouping/distinct keys */
+	List	   *injected = NIL;	/* column-name strings, for the NOTICE */
+	List	   *newquals = NIL;
+	ListCell   *lc;
+
+	/*
+	 * Idempotency: if __mv_count__ is already present the query was already
+	 * prepared (e.g. reparsed from a pg_dump/restore, which carries the
+	 * IS NOT NULL filters verbatim).  Re-injecting would duplicate the quals.
+	 */
+	foreach(lc, q->targetList)
+	{
+		TargetEntry *t = lfirst_node(TargetEntry, lc);
+
+		if (!t->resjunk && t->resname != NULL &&
+			strcmp(t->resname, MATVIEW_INCR_COUNT_COL) == 0)
+			return NIL;
+	}
+
+	/* Collect key Vars: from the grouping RTE, or (DISTINCT) the output Vars. */
+	{
+		bool		found_group_rte = false;
+
+		foreach(lc, q->rtable)
+		{
+			RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+			ListCell   *gc;
+
+			if (rte->rtekind != RTE_GROUP)
+				continue;
+			found_group_rte = true;
+			foreach(gc, rte->groupexprs)
+			{
+				Node *ge = (Node *) lfirst(gc);
+
+				if (IsA(ge, Var))
+					keyvars = lappend(keyvars, ge);
+			}
+			break;
+		}
+		if (!found_group_rte && q->distinctClause != NIL)
+		{
+			foreach(lc, q->targetList)
+			{
+				TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+				if (te->resjunk || incr_is_hidden_col(te->resname))
+					continue;
+				if (IsA(te->expr, Var))
+					keyvars = lappend(keyvars, te->expr);
+			}
+		}
+	}
+
+	foreach(lc, keyvars)
+	{
+		Var		   *v = (Var *) lfirst(lc);
+		NullTest   *nt;
+		int			rv;
+
+		if (!incr_key_var_nullable(v, q->rtable))
+			continue;
+
+		nt = makeNode(NullTest);
+		nt->arg = (Expr *) copyObject(v);
+		nt->nulltesttype = IS_NOT_NULL;
+		nt->argisrow = false;
+		nt->location = -1;
+		newquals = lappend(newquals, nt);
+		injected = lappend(injected,
+						   makeString(pstrdup(incr_resolve_var_colname(v, q->rtable, &rv))));
+	}
+
+	if (newquals == NIL)
+		return NIL;
+
+	/* AND the IS NOT NULL tests into the existing WHERE quals. */
+	if (q->jointree->quals != NULL)
+		newquals = lcons(q->jointree->quals, newquals);
+	if (list_length(newquals) == 1)
+		q->jointree->quals = (Node *) linitial(newquals);
+	else
+		q->jointree->quals = (Node *) makeBoolExpr(AND_EXPR, newquals, -1);
+
+	return injected;
+}
+
+/*
  * MatviewIncrAddCountTarget
  * Append hidden maintenance columns to the query's target list.
  *
@@ -5066,93 +5224,6 @@ incr_fetch_sql(Oid mvrelid, Oid srctable, int plan_type)
 	return sql;
 }
 
-/*
- * incr_guard_null_group_key
- *
- * Phase-1 safety guard.  A NULL value in a GROUP BY / DISTINCT key cannot be
- * maintained incrementally: the unique index / ON CONFLICT treats NULLs as
- * distinct (so a delta would create duplicate, never-merged NULL-key rows) and
- * the delete-side "mv.k = d.k" predicates are never true for NULL.  Rather than
- * corrupt the matview silently, detect a NULL group key after an insert delta
- * and raise a clear error, which rolls the whole statement back.
- *
- * The group-key columns are read from the matview's own unique index (so this
- * works regardless of column aliasing and across all shapes).  Matviews whose
- * key columns are all NOT NULL by schema, and shapes with no unique index
- * (row-level), pay nothing.
- */
-static void
-incr_guard_null_group_key(Oid mvrelid)
-{
-	Relation	mvrel;
-	List	   *idxlist;
-	ListCell   *lc;
-	StringInfoData preds;
-	bool		any_nullable = false;
-	bool		first = true;
-
-	mvrel = table_open(mvrelid, NoLock);	/* already RowExclusiveLock-held */
-	idxlist = RelationGetIndexList(mvrel);
-	initStringInfo(&preds);
-
-	foreach(lc, idxlist)
-	{
-		Relation	idx = index_open(lfirst_oid(lc), AccessShareLock);
-
-		if (idx->rd_index->indisunique)
-		{
-			int		nkeys = idx->rd_index->indnkeyatts;
-
-			for (int i = 0; i < nkeys; i++)
-			{
-				AttrNumber	mvattno = idx->rd_index->indkey.values[i];
-				Form_pg_attribute att;
-
-				if (mvattno <= 0)		/* expression key — be conservative */
-				{
-					any_nullable = true;
-					continue;
-				}
-				att = TupleDescAttr(RelationGetDescr(mvrel), mvattno - 1);
-				if (att->attnotnull)
-					continue;			/* cannot be NULL */
-				any_nullable = true;
-				appendStringInfo(&preds, "%s%s IS NULL",
-								 first ? "" : " OR ",
-								 quote_identifier(NameStr(att->attname)));
-				first = false;
-			}
-			index_close(idx, AccessShareLock);
-			break;
-		}
-		index_close(idx, AccessShareLock);
-	}
-	list_free(idxlist);
-	table_close(mvrel, NoLock);
-
-	/* No group-key unique index, or every key column is NOT NULL: nothing to do. */
-	if (!any_nullable || preds.len == 0)
-		return;
-
-	{
-		StringInfoData q;
-		int			ret;
-
-		initStringInfo(&q);
-		appendStringInfo(&q, "SELECT 1 FROM %s WHERE %s LIMIT 1",
-						 mv_qname(mvrelid), preds.data);
-		/* read_only=false so this sees the just-applied insert delta */
-		ret = SPI_execute(q.data, false, 1);
-		if (ret == SPI_OK_SELECT && SPI_processed > 0)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("incremental materialized view \"%s\": a NULL value in a GROUP BY/DISTINCT key is not supported",
-							get_rel_name(mvrelid)),
-					 errdetail("NULL group keys cannot be maintained incrementally and would create duplicate, never-cleaned rows."),
-					 errhint("Ensure the grouped column(s) never contain NULL, or filter NULLs out in the matview's WHERE clause.")));
-	}
-}
-
 PG_FUNCTION_INFO_V1(matview_delta_apply);
 
 /*
@@ -5286,9 +5357,6 @@ matview_delta_apply(PG_FUNCTION_ARGS)
 		if (ret < 0)
 			elog(ERROR, "matview_delta_apply: insert delta failed: %s",
 				 SPI_result_code_string(ret));
-
-		/* Fail loudly if the delta introduced a NULL group key (Phase 1 guard). */
-		incr_guard_null_group_key(mvrelid);
 	}
 
 	/* ----- delete delta (DELETE or UPDATE old-side) ----- */

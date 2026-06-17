@@ -98,6 +98,15 @@ extern bool MatviewIncrIsEligible(Query *viewQuery, const char **reason);
 extern void MatviewIncrAddCountTarget(Query *q);
 
 /*
+ * Inject "<key> IS NOT NULL" into the view query's WHERE for every nullable
+ * GROUP BY / DISTINCT key, so NULL-key rows stay outside the matview (writes
+ * are never blocked, and the matview stays consistent with a full REFRESH).
+ * Returns the list of filtered key column names (for a NOTICE), or NIL.
+ * Call before MatviewIncrAddCountTarget, on both the schema and view queries.
+ */
+extern List *MatviewIncrAddNotNullKeyFilters(Query *q);
+
+/*
  * Normalize a view query by inlining CTEs and FROM-subqueries that can
  * be resolved to forms the incremental refresh engine supports.
  * Returns a new Query* if any transformation was applied, or viewQuery

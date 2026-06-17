@@ -89,16 +89,15 @@ writes."* They are **not** blocked.
 
 ## 4. Data requirements & boundaries
 
-- 🔒 **Group-key columns must not contain NULL values.** A runtime guard raises
-  a clear error if an insert delta would introduce a NULL group key — never
-  silent corruption. `NOT NULL`-schema keys pay nothing.
-  **Consequence:** the guard fires inside the source `INSERT`'s transaction, so
-  it **fails that source write** — while the matview exists, the grouped column
-  effectively behaves like `NOT NULL` for the source table. Do not group an
-  incremental matview on a column the application writes NULL to.
-  **Escape hatch (verified):** add `WHERE <col> IS NOT NULL` to the matview —
-  the source can then freely store NULLs in that column; the matview simply
-  ignores those rows and maintains the non-NULL groups correctly.
+- **NULL group keys are auto-excluded; writes are never blocked.** A NULL in a
+  GROUP BY/DISTINCT key can't be maintained incrementally, so at `CREATE` the
+  engine injects `<key> IS NOT NULL` into the matview's stored query for every
+  *nullable* key (a `NOTICE` lists them). Effect: the source `INSERT`/`UPDATE`
+  **always succeeds** (e.g. Odoo section/note lines with `product_id = NULL`),
+  the matview leaves those rows out of scope, and it stays **consistent with a
+  full `REFRESH`** (the filter is in the stored query). `NOT NULL` keys are
+  untouched. There is no "NULL/unknown" group — the sensible default for a
+  grouped report; maintaining one is deferred (see roadmap).
 - **HAVING matviews must be created `WITH DATA`** (a `WARNING` is emitted
   otherwise); dump/restore is unaffected.
 - **Logical-replication subscribers do not maintain** the matview (delta
@@ -173,8 +172,9 @@ Prioritized by value for Odoo reporting:
 4. **Certify outer / self / UNION ALL under concurrency** — via the battery on
    the `Query`-tree implementation (lifts them from 🟡 to ✅).
 5. **`COUNT(DISTINCT)`** — needs a per-(group, value) auxiliary count table.
-6. **Full NULL group-key support** — `NULLS NOT DISTINCT` index +
-   `IS NOT DISTINCT FROM` joins (removes the 🔒 guard's restriction).
+6. **Maintain an explicit NULL group** (instead of auto-excluding it) —
+   `NULLS NOT DISTINCT` index + `IS NOT DISTINCT FROM` joins. Only needed if a
+   report genuinely wants a NULL/"unknown" bucket.
 7. **Exact all-NULL `SUM` semantics** — per-column non-null counter.
 8. *(Optional)* **automatic subquery→join rewrite** for WHERE/SELECT sublinks.
 
