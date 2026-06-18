@@ -138,6 +138,22 @@ scalar expressions, `GROUP BY <expr>`, `FILTER`, and full NULL-group fidelity.
 ## Status
 - ✅ Foundation committed (`ea92a4e5ea9`): ENR-aware `get_query_def` +
   `dbblue_deparse_query`; verified non-regressing; feasibility proven.
-- ⏭ Next: `incr_build_delta_select_query` + GUC + shell factoring + the
-  off/on equivalence proof for the plain single-table aggregate shape (step 1),
-  built beside the existing engine.
+- ✅ **Step 1 landed**: GUC `dbblue_ivm_deparse_delta` (default off,
+  `DEVELOPER_OPTIONS`); `incr_build_delta_select_query` (copy view Query, swap
+  source RTE → transition-table ENR); INS/DEL shells factored out of the hand
+  builders so both paths share the merge logic byte-for-byte; deparse builders
+  wired for the **plain single-table aggregate** shape only (MIN/MAX and HAVING
+  bypass — their delta SELECT must not be a literal render of the view query).
+  - Equivalence proven: full `dbblue_ivm` suite passes with the GUC **off and
+    on**; dump/restore passes off and on (the deparse-generated catalog SQL
+    round-trips and re-arms); RR/SERIALIZABLE concurrency passes off and on.
+  - Correctness bonus: fixed a latent **default-path** bug — the hand deparser
+    treated every single-arg `FuncExpr` as a cast, silently dropping
+    `floor()`/`abs()` and corrupting the running total. Now rendered as a call.
+  - New test: `src/test/dbblue_ivm/phase2_deparse_delta.sql`.
+- ⏭ Next increment: **auto-routing** for shapes only deparse can express
+  (`SUM(CASE…)`, `COALESCE`, scalar/aggregate-arg expressions) — the engine
+  must select deparse automatically (GUC-independent) so such matviews remain
+  restorable; eligibility relaxation scoped to plain single-table aggregates;
+  plus a dump/restore test for the new shapes. Then widen shape-by-shape:
+  JOIN → MIN/MAX → HAVING → UNION, deleting each hand builder as it lands.

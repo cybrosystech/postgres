@@ -623,6 +623,13 @@
   assign_hook => 'assign_datestyle',
 },
 
+{ name => 'dbblue_ivm_deparse_delta', type => 'bool', context => 'PGC_USERSET', group => 'DEVELOPER_OPTIONS',
+  short_desc => 'DBblue: build incremental-matview delta SQL via the query-tree deparse core.',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'dbblue_ivm_deparse_delta',
+  boot_val => 'false',
+},
+
 # This is PGC_SUSET to prevent hiding from log_lock_waits.
 { name => 'deadlock_timeout', type => 'int', context => 'PGC_SUSET', group => 'LOCK_MANAGEMENT',
   short_desc => 'Sets the time to wait on a lock before checking for deadlock.',

@@ -80,6 +80,7 @@
 #include "utils/hsearch.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
+#include "utils/ruleutils.h"
 #include "utils/syscache.h"
 
 /* ----------
@@ -114,6 +115,13 @@ typedef struct IncrPlanEntry
 } IncrPlanEntry;
 
 static HTAB *incr_plan_cache = NULL;
+
+/*
+ * GUC (default off): route plain single-table aggregate delta-SQL generation
+ * through the Query-tree deparse core instead of the hand-written builders.
+ * See matview_incr.h and INCREMENTAL_MATVIEW_PHASE2_DESIGN.md.
+ */
+bool		dbblue_ivm_deparse_delta = false;
 
 /*
  * Alias for the delta (transition) table in Phase 2+ SQL.
@@ -177,6 +185,18 @@ static char *incr_build_backfill_sql_gen(Oid mvrelid, Query *viewQuery,
 static char *incr_build_del_sql_gen(Oid mvrelid, Query *viewQuery,
 									int delta_varno, const char *delta_table,
 									List *join_list);
+/* Phase 2 deparse core — plain single-table aggregate (gated by GUC) */
+static void incr_emit_ins_head(StringInfo buf, Oid mvrelid, Query *viewQuery);
+static void incr_emit_ins_conflict_tail(StringInfo buf, Oid mvrelid,
+										 Query *viewQuery);
+static void incr_emit_del_update_tail(StringInfo buf, Oid mvrelid,
+									  Query *viewQuery);
+static Query *incr_build_delta_select_query(Query *viewQuery, Oid srctable,
+											 const char *enrName);
+static char *incr_build_ins_sql_deparse(Oid mvrelid, Query *viewQuery,
+										Oid srctable, const char *enrName);
+static char *incr_build_del_sql_deparse(Oid mvrelid, Query *viewQuery,
+										Oid srctable, const char *enrName);
 static char *incr_build_cln_sql(Oid mvrelid);
 static void incr_warn_row_level_missing_key(Query *viewQuery);
 static void incr_store_catalog(Oid mvrelid, Oid srctable,
@@ -969,6 +989,20 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 														  MATVIEW_INCR_OLDTABLE, NIL);
 				incr_store_catalog(mvrelid, srctable, ins_sql, del_sql,
 								   cln_sql, hav_sql, lock_sql);
+			}
+			else if (dbblue_ivm_deparse_delta && !hasHaving)
+			{
+				/* Phase 2: produce the delta SELECT via the ruleutils deparse
+				 * core (plain single-table aggregate only; MIN/MAX above and
+				 * HAVING here keep their hand builders — the delta SELECT must
+				 * not apply HAVING, but get_query_def would render it).
+				 * Shell-identical to the hand path. */
+				ins_sql = incr_build_ins_sql_deparse(mvrelid, viewQuery,
+													 srctable, MATVIEW_INCR_NEWTABLE);
+				del_sql = incr_build_del_sql_deparse(mvrelid, viewQuery,
+													 srctable, MATVIEW_INCR_OLDTABLE);
+				incr_store_catalog(mvrelid, srctable, ins_sql, del_sql,
+								   cln_sql, hav_sql, NULL);
 			}
 			else
 			{
@@ -2187,8 +2221,15 @@ incr_deparse_where_qual(Node *qual, List *rtable, int delta_varno, StringInfo bu
 	{
 		FuncExpr   *fe = (FuncExpr *) qual;
 
-		/* Implicit cast: single-arg function — emit (arg)::returntype */
-		if (list_length(fe->args) == 1)
+		/*
+		 * A single-arg FuncExpr is a cast ONLY when funcformat says so; a
+		 * genuine single-argument function (floor(amt), abs(amt), ...) must be
+		 * rendered as a call.  Treating every single-arg FuncExpr as a cast
+		 * silently dropped the function and corrupted the running total.
+		 */
+		if (list_length(fe->args) == 1 &&
+			(fe->funcformat == COERCE_IMPLICIT_CAST ||
+			 fe->funcformat == COERCE_EXPLICIT_CAST))
 		{
 			appendStringInfoChar(buf, '(');
 			incr_deparse_where_qual(linitial(fe->args), rtable, delta_varno, buf);
@@ -3144,6 +3185,353 @@ incr_nullsafe_accum(const char *run, const char *delta, bool subtract)
 					delta, run, run, delta, run, delta);
 }
 
+/* ============================================================
+ * Phase 2 deparse core — plain single-table aggregate
+ *
+ * The INS/DEL "shells" (the INSERT head + ON CONFLICT accumulation tail, and
+ * the DEL UPDATE...FROM d tail) are factored into the helpers below so that
+ * BOTH the hand-written builders and the deparse-based builders share the exact
+ * same merge logic.  Only the delta SELECT body differs: the hand builders
+ * deparse each target expression themselves, while the deparse builders let
+ * ruleutils render the whole SELECT from the view Query with the source table
+ * swapped for its transition-table ENR.  Gated by dbblue_ivm_deparse_delta.
+ * ============================================================
+ */
+
+/*
+ * incr_emit_ins_head — "INSERT INTO mv (col1,col2,...) "
+ * Column list is the view's non-junk target list, in order.
+ */
+static void
+incr_emit_ins_head(StringInfo buf, Oid mvrelid, Query *viewQuery)
+{
+	ListCell   *lc;
+	bool		first = true;
+
+	appendStringInfo(buf, "INSERT INTO %s (", mv_qname(mvrelid));
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+		if (te->resjunk)
+			continue;
+		if (!first)
+			appendStringInfoChar(buf, ',');
+		appendStringInfoString(buf, quote_identifier(te->resname));
+		first = false;
+	}
+	appendStringInfoString(buf, ") ");
+}
+
+/*
+ * incr_emit_ins_conflict_tail — " ON CONFLICT (group_cols) DO UPDATE SET ..."
+ * Accumulates each delta into the stored running totals.  AVG is recomputed
+ * from its hidden sum/cnt pair; MIN/MAX use LEAST/GREATEST; everything else
+ * uses the NULL-safe additive accumulator.
+ */
+static void
+incr_emit_ins_conflict_tail(StringInfo buf, Oid mvrelid, Query *viewQuery)
+{
+	const char *mvname = mv_qname(mvrelid);
+	List	   *groupColNames = NIL;
+	ListCell   *lc,
+			   *gcl;
+	bool		first;
+
+	incr_collect_group_cols(viewQuery, &groupColNames);
+
+	appendStringInfoString(buf, " ON CONFLICT (");
+	first = true;
+	foreach(gcl, groupColNames)
+	{
+		if (!first)
+			appendStringInfoChar(buf, ',');
+		appendStringInfoString(buf, quote_identifier(strVal(lfirst(gcl))));
+		first = false;
+	}
+	appendStringInfoString(buf, ") DO UPDATE SET ");
+
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+		const char  *colq;
+
+		if (te->resjunk || IsA(te->expr, Var))
+			continue;
+		if (strcmp(te->resname, MATVIEW_INCR_HAVING_COL) == 0)
+			continue;
+		/* hidden avgsum/avgcnt emitted as part of their parent AVG column */
+		if (strncmp(te->resname, MATVIEW_INCR_AVGSUM_PREFIX,
+					strlen(MATVIEW_INCR_AVGSUM_PREFIX)) == 0 ||
+			strncmp(te->resname, MATVIEW_INCR_AVGCNT_PREFIX,
+					strlen(MATVIEW_INCR_AVGCNT_PREFIX)) == 0)
+			continue;
+
+		colq = quote_identifier(te->resname);
+
+		if (IsA(te->expr, Aggref) &&
+			strcmp(get_func_name(((Aggref *) te->expr)->aggfnoid), "avg") == 0)
+		{
+			/* AVG: update hidden sum/cnt then recompute visible avg */
+			Aggref	   *agg = (Aggref *) te->expr;
+			char	   *sum_col = psprintf("%s%s", MATVIEW_INCR_AVGSUM_PREFIX, te->resname);
+			char	   *cnt_col = psprintf("%s%s", MATVIEW_INCR_AVGCNT_PREFIX, te->resname);
+			const char *sum_q = quote_identifier(sum_col);
+			const char *cnt_q = quote_identifier(cnt_col);
+			const char *type_name = format_type_be(agg->aggtype);
+
+			char	   *sum_expr = incr_nullsafe_accum(
+				psprintf("%s.%s", mvname, sum_q),
+				psprintf("EXCLUDED.%s", sum_q), false);
+
+			if (!first)
+				appendStringInfoChar(buf, ',');
+			appendStringInfo(buf,
+							 "%s=%s"
+							 ",%s=%s.%s+EXCLUDED.%s"
+							 ",%s=(%s::%s/NULLIF(%s.%s+EXCLUDED.%s,0))",
+							 sum_q, sum_expr,
+							 cnt_q, mvname, cnt_q, cnt_q,
+							 colq, sum_expr, type_name,
+							 mvname, cnt_q, cnt_q);
+			first = false;
+		}
+		else if (IsA(te->expr, Aggref))
+		{
+			/* MIN/MAX: replace if better; everything else: accumulate */
+			char *fn = get_func_name(((Aggref *) te->expr)->aggfnoid);
+
+			if (!first)
+				appendStringInfoChar(buf, ',');
+			if (strcmp(fn, "min") == 0)
+				appendStringInfo(buf, "%s=LEAST(%s.%s,EXCLUDED.%s)",
+								 colq, mvname, colq, colq);
+			else if (strcmp(fn, "max") == 0)
+				appendStringInfo(buf, "%s=GREATEST(%s.%s,EXCLUDED.%s)",
+								 colq, mvname, colq, colq);
+			else
+				appendStringInfo(buf, "%s=%s", colq,
+								 incr_nullsafe_accum(psprintf("%s.%s", mvname, colq),
+													 psprintf("EXCLUDED.%s", colq), false));
+			first = false;
+		}
+		else
+		{
+			if (!first)
+				appendStringInfoChar(buf, ',');
+			appendStringInfo(buf, "%s=%s", colq,
+							 incr_nullsafe_accum(psprintf("%s.%s", mvname, colq),
+												 psprintf("EXCLUDED.%s", colq), false));
+			first = false;
+		}
+	}
+}
+
+/*
+ * incr_emit_del_update_tail — "UPDATE mv SET ... FROM d WHERE mv.g=d.g AND ..."
+ * Subtracts the delta CTE "d" from the stored running totals (mirror of the
+ * INSERT conflict tail).  The CTE "d" must expose every column referenced here
+ * under its output name (it does: both the hand and deparse SELECTs alias to
+ * the view's output column names).
+ */
+static void
+incr_emit_del_update_tail(StringInfo buf, Oid mvrelid, Query *viewQuery)
+{
+	const char *mvname = mv_qname(mvrelid);
+	List	   *groupColNames = NIL;
+	ListCell   *lc,
+			   *gcl;
+	bool		first;
+
+	incr_collect_group_cols(viewQuery, &groupColNames);
+
+	appendStringInfo(buf, "UPDATE %s SET ", mvname);
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+		const char  *colq;
+
+		if (te->resjunk || IsA(te->expr, Var))
+			continue;
+		if (strcmp(te->resname, MATVIEW_INCR_HAVING_COL) == 0)
+			continue;
+		/* hidden avgsum/avgcnt emitted as part of their parent AVG column */
+		if (strncmp(te->resname, MATVIEW_INCR_AVGSUM_PREFIX,
+					strlen(MATVIEW_INCR_AVGSUM_PREFIX)) == 0 ||
+			strncmp(te->resname, MATVIEW_INCR_AVGCNT_PREFIX,
+					strlen(MATVIEW_INCR_AVGCNT_PREFIX)) == 0)
+			continue;
+
+		colq = quote_identifier(te->resname);
+
+		if (IsA(te->expr, Aggref) &&
+			strcmp(get_func_name(((Aggref *) te->expr)->aggfnoid), "avg") == 0)
+		{
+			/* AVG: subtract from hidden sum/cnt then recompute visible avg */
+			Aggref	   *agg = (Aggref *) te->expr;
+			char	   *sum_col = psprintf("%s%s", MATVIEW_INCR_AVGSUM_PREFIX, te->resname);
+			char	   *cnt_col = psprintf("%s%s", MATVIEW_INCR_AVGCNT_PREFIX, te->resname);
+			const char *sum_q = quote_identifier(sum_col);
+			const char *cnt_q = quote_identifier(cnt_col);
+			const char *type_name = format_type_be(agg->aggtype);
+
+			char	   *sum_expr = incr_nullsafe_accum(
+				psprintf("%s.%s", mvname, sum_q),
+				psprintf("d.%s", sum_q), true);
+
+			if (!first)
+				appendStringInfoChar(buf, ',');
+			appendStringInfo(buf,
+							 "%s=%s"
+							 ",%s=%s.%s-d.%s"
+							 ",%s=(%s::%s/NULLIF(%s.%s-d.%s,0))",
+							 sum_q, sum_expr,
+							 cnt_q, mvname, cnt_q, cnt_q,
+							 colq, sum_expr, type_name,
+							 mvname, cnt_q, cnt_q);
+			first = false;
+		}
+		else
+		{
+			if (!first)
+				appendStringInfoChar(buf, ',');
+			appendStringInfo(buf, "%s=%s", colq,
+							 incr_nullsafe_accum(psprintf("%s.%s", mvname, colq),
+												 psprintf("d.%s", colq), true));
+			first = false;
+		}
+	}
+
+	appendStringInfo(buf, " FROM d WHERE ");
+	first = true;
+	foreach(gcl, groupColNames)
+	{
+		const char *colq = quote_identifier(strVal(lfirst(gcl)));
+
+		if (!first)
+			appendStringInfoString(buf, " AND ");
+		appendStringInfo(buf, "%s.%s=d.%s", mvname, colq, colq);
+		first = false;
+	}
+}
+
+/*
+ * incr_build_delta_select_query — copy the stored view Query and swap the
+ * single source relation RTE for a named-tuplestore (ENR) RTE that points at
+ * the transition table enrName ("__mv_newtable" / "__mv_oldtable").  The
+ * resulting Query deparses (via dbblue_deparse_query) to the per-group delta
+ * SELECT over only the changed rows.  Mirrors addRangeTableEntryForENR().
+ *
+ * The copied Query already carries the hidden maintenance targets
+ * (__mv_count__, AVG sum/cnt pairs, __mv_having_ok__) added by
+ * MatviewIncrAddCountTarget, so the deparsed SELECT yields the matview's full
+ * column set.  The visible AVG column is kept in the SELECT — harmless for the
+ * DELETE CTE because the UPDATE recomputes AVG from the sum/cnt pair and never
+ * reads it.
+ */
+static Query *
+incr_build_delta_select_query(Query *viewQuery, Oid srctable, const char *enrName)
+{
+	Query		   *q = copyObject(viewQuery);
+	RangeTblEntry  *target = NULL;
+	ListCell	   *lc;
+	Relation		rel;
+	TupleDesc		tupdesc;
+	int				attno;
+
+	foreach(lc, q->rtable)
+	{
+		RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+
+		if (rte->rtekind == RTE_RELATION && rte->relid == srctable)
+		{
+			target = rte;
+			break;
+		}
+	}
+	if (target == NULL)
+		elog(ERROR,
+			 "incr_build_delta_select_query: source relation %u not found",
+			 srctable);
+
+	rel = table_open(srctable, AccessShareLock);
+	tupdesc = RelationGetDescr(rel);
+
+	target->rtekind = RTE_NAMEDTUPLESTORE;
+	target->enrname = pstrdup(enrName);
+	target->enrtuples = 0;
+	target->coltypes = NIL;
+	target->coltypmods = NIL;
+	target->colcollations = NIL;
+	for (attno = 1; attno <= tupdesc->natts; attno++)
+	{
+		Form_pg_attribute att = TupleDescAttr(tupdesc, attno - 1);
+
+		if (att->attisdropped)
+		{
+			/* zeroes for a dropped column, matching addRangeTableEntryForENR */
+			target->coltypes = lappend_oid(target->coltypes, InvalidOid);
+			target->coltypmods = lappend_int(target->coltypmods, 0);
+			target->colcollations = lappend_oid(target->colcollations, InvalidOid);
+		}
+		else
+		{
+			target->coltypes = lappend_oid(target->coltypes, att->atttypid);
+			target->coltypmods = lappend_int(target->coltypmods, att->atttypmod);
+			target->colcollations = lappend_oid(target->colcollations,
+												att->attcollation);
+		}
+	}
+	table_close(rel, AccessShareLock);
+
+	/* ENRs carry no permission info; deparse ignores rteperminfos either way. */
+	target->perminfoindex = 0;
+	/* keep relid (plan invalidation) and eref (column names) unchanged */
+
+	return q;
+}
+
+/*
+ * incr_build_ins_sql_deparse — INSERT delta via the deparse core.
+ * Shell-identical to incr_build_ins_sql_gen; only the SELECT body is produced
+ * by ruleutils instead of hand-deparsing each target expression.
+ */
+static char *
+incr_build_ins_sql_deparse(Oid mvrelid, Query *viewQuery,
+						   Oid srctable, const char *enrName)
+{
+	StringInfoData	buf;
+	Query		   *dq = incr_build_delta_select_query(viewQuery, srctable, enrName);
+	char		   *sel = dbblue_deparse_query(dq);
+
+	initStringInfo(&buf);
+	incr_emit_ins_head(&buf, mvrelid, viewQuery);
+	appendStringInfoString(&buf, sel);
+	incr_emit_ins_conflict_tail(&buf, mvrelid, viewQuery);
+	return buf.data;
+}
+
+/*
+ * incr_build_del_sql_deparse — DELETE delta via the deparse core.
+ */
+static char *
+incr_build_del_sql_deparse(Oid mvrelid, Query *viewQuery,
+						   Oid srctable, const char *enrName)
+{
+	StringInfoData	buf;
+	Query		   *dq = incr_build_delta_select_query(viewQuery, srctable, enrName);
+	char		   *sel = dbblue_deparse_query(dq);
+
+	initStringInfo(&buf);
+	appendStringInfoString(&buf, "WITH d AS (");
+	appendStringInfoString(&buf, sel);
+	appendStringInfoString(&buf, ") ");
+	incr_emit_del_update_tail(&buf, mvrelid, viewQuery);
+	return buf.data;
+}
+
 /*
  * incr_build_ins_sql_gen — INSERT delta (all phases)
  *
@@ -3159,30 +3547,14 @@ incr_build_ins_sql_gen(Oid mvrelid, Query *viewQuery,
 					   List *join_list)
 {
 	StringInfoData buf;
-	List	   *groupColNames = NIL;
-	ListCell   *lc,
-			   *gcl;
-	const char *mvname = mv_qname(mvrelid);
+	ListCell   *lc;
 	bool		first;
 
-	incr_collect_group_cols(viewQuery, &groupColNames);
 	initStringInfo(&buf);
 
-	/* INSERT INTO mv (...) */
-	appendStringInfo(&buf, "INSERT INTO %s (", mvname);
-	first = true;
-	foreach(lc, viewQuery->targetList)
-	{
-		TargetEntry *te = lfirst_node(TargetEntry, lc);
-
-		if (te->resjunk)
-			continue;
-		if (!first)
-			appendStringInfoChar(&buf, ',');
-		appendStringInfoString(&buf, quote_identifier(te->resname));
-		first = false;
-	}
-	appendStringInfoString(&buf, ") SELECT ");
+	/* INSERT INTO mv (cols) SELECT ... (shell shared with the deparse path) */
+	incr_emit_ins_head(&buf, mvrelid, viewQuery);
+	appendStringInfoString(&buf, "SELECT ");
 
 	/* SELECT expressions */
 	first = true;
@@ -3269,93 +3641,8 @@ incr_build_ins_sql_gen(Oid mvrelid, Query *viewQuery,
 		appendStringInfoString(&buf, ebuf.data);
 	}
 
-	/* ON CONFLICT (group_cols) DO UPDATE SET */
-	appendStringInfoString(&buf, " ON CONFLICT (");
-	first = true;
-	foreach(gcl, groupColNames)
-	{
-		if (!first)
-			appendStringInfoChar(&buf, ',');
-		appendStringInfoString(&buf, quote_identifier(strVal(lfirst(gcl))));
-		first = false;
-	}
-	appendStringInfoString(&buf, ") DO UPDATE SET ");
-
-	first = true;
-	foreach(lc, viewQuery->targetList)
-	{
-		TargetEntry *te = lfirst_node(TargetEntry, lc);
-		const char  *colq;
-
-		if (te->resjunk || IsA(te->expr, Var))
-			continue;
-		if (strcmp(te->resname, MATVIEW_INCR_HAVING_COL) == 0)
-			continue;
-		/* hidden avgsum/avgcnt emitted as part of their parent AVG column */
-		if (strncmp(te->resname, MATVIEW_INCR_AVGSUM_PREFIX,
-					strlen(MATVIEW_INCR_AVGSUM_PREFIX)) == 0 ||
-			strncmp(te->resname, MATVIEW_INCR_AVGCNT_PREFIX,
-					strlen(MATVIEW_INCR_AVGCNT_PREFIX)) == 0)
-			continue;
-
-		colq = quote_identifier(te->resname);
-
-		if (IsA(te->expr, Aggref) &&
-			strcmp(get_func_name(((Aggref *) te->expr)->aggfnoid), "avg") == 0)
-		{
-			/* AVG: update hidden sum/cnt then recompute visible avg */
-			Aggref	   *agg = (Aggref *) te->expr;
-			char	   *sum_col = psprintf("%s%s", MATVIEW_INCR_AVGSUM_PREFIX, te->resname);
-			char	   *cnt_col = psprintf("%s%s", MATVIEW_INCR_AVGCNT_PREFIX, te->resname);
-			const char *sum_q = quote_identifier(sum_col);
-			const char *cnt_q = quote_identifier(cnt_col);
-			const char *type_name = format_type_be(agg->aggtype);
-
-			char	   *sum_expr = incr_nullsafe_accum(
-				psprintf("%s.%s", mvname, sum_q),
-				psprintf("EXCLUDED.%s", sum_q), false);
-
-			if (!first)
-				appendStringInfoChar(&buf, ',');
-			appendStringInfo(&buf,
-							 "%s=%s"
-							 ",%s=%s.%s+EXCLUDED.%s"
-							 ",%s=(%s::%s/NULLIF(%s.%s+EXCLUDED.%s,0))",
-							 sum_q, sum_expr,
-							 cnt_q, mvname, cnt_q, cnt_q,
-							 colq, sum_expr, type_name,
-							 mvname, cnt_q, cnt_q);
-			first = false;
-		}
-		else if (IsA(te->expr, Aggref))
-		{
-			/* MIN/MAX: replace if better; everything else: accumulate */
-			char *fn = get_func_name(((Aggref *) te->expr)->aggfnoid);
-
-			if (!first)
-				appendStringInfoChar(&buf, ',');
-			if (strcmp(fn, "min") == 0)
-				appendStringInfo(&buf, "%s=LEAST(%s.%s,EXCLUDED.%s)",
-								 colq, mvname, colq, colq);
-			else if (strcmp(fn, "max") == 0)
-				appendStringInfo(&buf, "%s=GREATEST(%s.%s,EXCLUDED.%s)",
-								 colq, mvname, colq, colq);
-			else
-				appendStringInfo(&buf, "%s=%s", colq,
-								 incr_nullsafe_accum(psprintf("%s.%s", mvname, colq),
-													 psprintf("EXCLUDED.%s", colq), false));
-			first = false;
-		}
-		else
-		{
-			if (!first)
-				appendStringInfoChar(&buf, ',');
-			appendStringInfo(&buf, "%s=%s", colq,
-							 incr_nullsafe_accum(psprintf("%s.%s", mvname, colq),
-												 psprintf("EXCLUDED.%s", colq), false));
-			first = false;
-		}
-	}
+	/* ON CONFLICT (group_cols) DO UPDATE SET ... (shell shared with deparse) */
+	incr_emit_ins_conflict_tail(&buf, mvrelid, viewQuery);
 
 	return buf.data;
 }
@@ -3525,14 +3812,10 @@ incr_build_del_sql_gen(Oid mvrelid, Query *viewQuery,
 					   List *join_list)
 {
 	StringInfoData buf;
-	List	   *groupColNames = NIL;
-	ListCell   *lc,
-			   *gcl;
-	const char *mvname = mv_qname(mvrelid);
+	ListCell   *lc;
 	const char *cntcol = quote_identifier(MATVIEW_INCR_COUNT_COL);
 	bool		first;
 
-	incr_collect_group_cols(viewQuery, &groupColNames);
 	initStringInfo(&buf);
 
 	/* WITH d AS (SELECT ... */
@@ -3628,77 +3911,8 @@ incr_build_del_sql_gen(Oid mvrelid, Query *viewQuery,
 	}
 	appendStringInfoString(&buf, ") ");
 
-	/* UPDATE mv SET agg = mv.agg - d.agg, ... */
-	appendStringInfo(&buf, "UPDATE %s SET ", mvname);
-	first = true;
-	foreach(lc, viewQuery->targetList)
-	{
-		TargetEntry *te = lfirst_node(TargetEntry, lc);
-		const char  *colq;
-
-		if (te->resjunk || IsA(te->expr, Var))
-			continue;
-		if (strcmp(te->resname, MATVIEW_INCR_HAVING_COL) == 0)
-			continue;
-		/* hidden avgsum/avgcnt emitted as part of their parent AVG column */
-		if (strncmp(te->resname, MATVIEW_INCR_AVGSUM_PREFIX,
-					strlen(MATVIEW_INCR_AVGSUM_PREFIX)) == 0 ||
-			strncmp(te->resname, MATVIEW_INCR_AVGCNT_PREFIX,
-					strlen(MATVIEW_INCR_AVGCNT_PREFIX)) == 0)
-			continue;
-
-		colq = quote_identifier(te->resname);
-
-		if (IsA(te->expr, Aggref) &&
-			strcmp(get_func_name(((Aggref *) te->expr)->aggfnoid), "avg") == 0)
-		{
-			/* AVG: subtract from hidden sum/cnt then recompute visible avg */
-			Aggref	   *agg = (Aggref *) te->expr;
-			char	   *sum_col = psprintf("%s%s", MATVIEW_INCR_AVGSUM_PREFIX, te->resname);
-			char	   *cnt_col = psprintf("%s%s", MATVIEW_INCR_AVGCNT_PREFIX, te->resname);
-			const char *sum_q = quote_identifier(sum_col);
-			const char *cnt_q = quote_identifier(cnt_col);
-			const char *type_name = format_type_be(agg->aggtype);
-
-			char	   *sum_expr = incr_nullsafe_accum(
-				psprintf("%s.%s", mvname, sum_q),
-				psprintf("d.%s", sum_q), true);
-
-			if (!first)
-				appendStringInfoChar(&buf, ',');
-			appendStringInfo(&buf,
-							 "%s=%s"
-							 ",%s=%s.%s-d.%s"
-							 ",%s=(%s::%s/NULLIF(%s.%s-d.%s,0))",
-							 sum_q, sum_expr,
-							 cnt_q, mvname, cnt_q, cnt_q,
-							 colq, sum_expr, type_name,
-							 mvname, cnt_q, cnt_q);
-			first = false;
-		}
-		else
-		{
-			if (!first)
-				appendStringInfoChar(&buf, ',');
-			appendStringInfo(&buf, "%s=%s", colq,
-							 incr_nullsafe_accum(psprintf("%s.%s", mvname, colq),
-												 psprintf("d.%s", colq), true));
-			first = false;
-		}
-	}
-
-	/* FROM d WHERE mv.g = d.g AND ... */
-	appendStringInfo(&buf, " FROM d WHERE ");
-	first = true;
-	foreach(gcl, groupColNames)
-	{
-		const char *colq = quote_identifier(strVal(lfirst(gcl)));
-
-		if (!first)
-			appendStringInfoString(&buf, " AND ");
-		appendStringInfo(&buf, "%s.%s=d.%s", mvname, colq, colq);
-		first = false;
-	}
+	/* UPDATE mv SET ... FROM d WHERE ... (shell shared with the deparse path) */
+	incr_emit_del_update_tail(&buf, mvrelid, viewQuery);
 
 	return buf.data;
 }

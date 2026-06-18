@@ -15,6 +15,14 @@
 #include "utils/relcache.h"
 
 /*
+ * GUC: when on, the plain single-table aggregate delta SQL is produced by the
+ * Query-tree deparse core (incr_build_delta_select_query + dbblue_deparse_query)
+ * instead of the hand-written string builders.  Default off; the two paths are
+ * proven equivalent by the dbblue_ivm suite run with this on and off.
+ */
+extern PGDLLIMPORT bool dbblue_ivm_deparse_delta;
+
+/*
  * Hidden column names / prefixes used by the incremental refresh engine.
  *
  * __mv_count__          — source-row count per group (group is deleted when 0)
