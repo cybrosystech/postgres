@@ -197,6 +197,8 @@ static char *incr_build_ins_sql_deparse(Oid mvrelid, Query *viewQuery,
 										Oid srctable, const char *enrName);
 static char *incr_build_del_sql_deparse(Oid mvrelid, Query *viewQuery,
 										Oid srctable, const char *enrName);
+static void incr_emit_conflict_do_nothing(StringInfo buf, Query *viewQuery);
+static char *incr_build_backfill_sql_deparse(Oid mvrelid, Query *viewQuery);
 static char *incr_build_cln_sql(Oid mvrelid);
 static void incr_warn_row_level_missing_key(Query *viewQuery);
 static void incr_store_catalog(Oid mvrelid, Oid srctable,
@@ -665,24 +667,20 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 
 	/*
 	 * Shapes the deparse delta core is wired for: a GROUP BY aggregate with no
-	 * HAVING and no MIN/MAX, over either a single table or a pure INNER JOIN
-	 * (no outer join, no self-join).  For those, an aggregate argument may use
-	 * any deterministic scalar expression (CASE, COALESCE, function calls)
-	 * because ruleutils renders it; other shapes keep the restricted hand
-	 * grammar until deparse is widened to them.  This must mirror the routing
-	 * decision in MatviewIncrSetup so a shape accepted here is actually one the
-	 * deparse path will build (and re-build identically on restore).
-	 *
-	 * HAVING is excluded from the expression-arg relaxation: the one-time
-	 * failing-group backfill is still a hand builder, so HAVING with an
-	 * expression aggregate would need a deparse backfill first (a later step).
-	 * Plain-argument HAVING is unaffected and still routes through deparse.
+	 * MIN/MAX, over either a single table (HAVING supported — delta + deparse
+	 * backfill) or a pure INNER JOIN with no HAVING (no outer join, no
+	 * self-join).  For those, an aggregate argument may use any deterministic
+	 * scalar expression (CASE, COALESCE, function calls) because ruleutils
+	 * renders it; other shapes keep the restricted hand grammar until deparse is
+	 * widened to them.  This must mirror the routing decision in
+	 * MatviewIncrSetup so a shape accepted here is actually one the deparse path
+	 * will build (and re-build identically on restore).
 	 */
 	deparse_agg_shape = (viewQuery->groupClause != NIL &&
-						viewQuery->havingQual == NULL &&
 						!incr_has_minmax_agg(viewQuery) &&
-						(nbasetables == 1 ||
-						 incr_inner_join_deparse_shape(viewQuery, nbasetables)));
+						((nbasetables == 1) ||
+						 (viewQuery->havingQual == NULL &&
+						  incr_inner_join_deparse_shape(viewQuery, nbasetables))));
 
 	/* Validate SELECT list expressions */
 	foreach(lc, viewQuery->targetList)
@@ -1013,6 +1011,9 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 		else
 		{
 			/* Phase 1: aggregate with GROUP BY */
+			bool	used_deparse = !incr_has_minmax_agg(viewQuery) &&
+				(dbblue_ivm_deparse_delta || incr_aggs_need_deparse(viewQuery));
+
 			if (incr_has_minmax_agg(viewQuery))
 			{
 				char *lock_sql;
@@ -1027,8 +1028,7 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 				incr_store_catalog(mvrelid, srctable, ins_sql, del_sql,
 								   cln_sql, hav_sql, lock_sql);
 			}
-			else if (dbblue_ivm_deparse_delta ||
-					 incr_aggs_need_deparse(viewQuery))
+			else if (used_deparse)
 			{
 				/* Phase 2: produce the delta SELECT via the ruleutils deparse
 				 * core (single-table aggregate; MIN/MAX above keeps its hand
@@ -1058,8 +1058,10 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 
 			if (hasHaving && mv_populated)
 			{
-				char *backfill_sql = incr_build_backfill_sql_gen(
-					mvrelid, viewQuery, -1, mv_qname(srctable), NIL);
+				char *backfill_sql = used_deparse
+					? incr_build_backfill_sql_deparse(mvrelid, viewQuery)
+					: incr_build_backfill_sql_gen(mvrelid, viewQuery, -1,
+												  mv_qname(srctable), NIL);
 				int   spi_ret;
 
 				OpenMatViewIncrementalMaintenance();
@@ -1470,9 +1472,16 @@ MatviewIncrPostRefresh(Oid mvrelid, Query *viewQuery)
 		if (nbasetables == 1)
 		{
 			Oid		srctable = incr_get_source_table(viewQuery);
+			/* Mirror the CREATE-path routing so the backfill SQL is rebuilt the
+			 * same way on restore (expression-arg HAVING must use deparse — the
+			 * hand backfill can't render CASE/COALESCE/etc.). */
+			bool	used_deparse = !incr_has_minmax_agg(viewQuery) &&
+				(dbblue_ivm_deparse_delta || incr_aggs_need_deparse(viewQuery));
 
-			backfill_sql = incr_build_backfill_sql_gen(
-				mvrelid, viewQuery, -1, mv_qname(srctable), NIL);
+			backfill_sql = used_deparse
+				? incr_build_backfill_sql_deparse(mvrelid, viewQuery)
+				: incr_build_backfill_sql_gen(mvrelid, viewQuery, -1,
+											  mv_qname(srctable), NIL);
 		}
 		else
 		{
@@ -1481,6 +1490,8 @@ MatviewIncrPostRefresh(Oid mvrelid, Query *viewQuery)
 			List		  *join_list  = incr_build_join_list_for_delta(
 				all_tables, first_je->varno);
 
+			/* JOIN + HAVING is not deparse-enabled, so its arguments are always
+			 * within the hand grammar. */
 			backfill_sql = incr_build_backfill_sql_gen(
 				mvrelid, viewQuery, first_je->varno,
 				mv_qname(first_je->oid), join_list);
@@ -3686,6 +3697,74 @@ incr_build_del_sql_deparse(Oid mvrelid, Query *viewQuery,
 	appendStringInfoString(&buf, sel);
 	appendStringInfoString(&buf, ") ");
 	incr_emit_del_update_tail(&buf, mvrelid, viewQuery);
+	return buf.data;
+}
+
+/*
+ * incr_emit_conflict_do_nothing — " ON CONFLICT (group_cols) DO NOTHING"
+ */
+static void
+incr_emit_conflict_do_nothing(StringInfo buf, Query *viewQuery)
+{
+	List	   *groupColNames = NIL;
+	ListCell   *gcl;
+	bool		first = true;
+
+	incr_collect_group_cols(viewQuery, &groupColNames);
+	appendStringInfoString(buf, " ON CONFLICT (");
+	foreach(gcl, groupColNames)
+	{
+		if (!first)
+			appendStringInfoChar(buf, ',');
+		appendStringInfoString(buf, quote_identifier(strVal(lfirst(gcl))));
+		first = false;
+	}
+	appendStringInfoString(buf, ") DO NOTHING");
+}
+
+/*
+ * incr_build_backfill_sql_deparse — one-time HAVING failing-group backfill via
+ * the deparse core (counterpart of incr_build_backfill_sql_gen).
+ *
+ *   INSERT INTO mv (cols) <SELECT over the REAL source tables, no HAVING,
+ *                          __mv_having_ok__ = false> ON CONFLICT (g) DO NOTHING
+ *
+ * Unlike the delta builders this reads the real base relations (it deparses the
+ * view query with no ENR swap), so it can seed groups that initially fail
+ * HAVING; DO NOTHING leaves the already-populated passing groups (having_ok =
+ * true) intact.  havingQual is stripped so failing groups are included, and the
+ * __mv_having_ok__ Const is flipped from true to false.
+ */
+static char *
+incr_build_backfill_sql_deparse(Oid mvrelid, Query *viewQuery)
+{
+	StringInfoData	buf;
+	Query		   *q = copyObject(viewQuery);
+	ListCell	   *lc;
+	char		   *sel;
+
+	q->havingQual = NULL;
+	foreach(lc, q->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+		if (!te->resjunk && te->resname != NULL &&
+			strcmp(te->resname, MATVIEW_INCR_HAVING_COL) == 0 &&
+			IsA(te->expr, Const))
+		{
+			Const *c = (Const *) te->expr;
+
+			c->constvalue = BoolGetDatum(false);
+			c->constisnull = false;
+		}
+	}
+
+	sel = dbblue_deparse_query(q);
+
+	initStringInfo(&buf);
+	incr_emit_ins_head(&buf, mvrelid, viewQuery);
+	appendStringInfoString(&buf, sel);
+	incr_emit_conflict_do_nothing(&buf, viewQuery);
 	return buf.data;
 }
 

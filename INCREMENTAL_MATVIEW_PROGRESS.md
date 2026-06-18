@@ -10,7 +10,31 @@ _Last updated: 2026-06-18 · branch `feature/ivm-incremental-refresh`_
 
 ---
 
-## Most recent work: argument-aware HAVING-aggregate binding (latent bug fix)
+## Most recent work: deparse failing-group backfill → `SUM(CASE)` + HAVING
+
+Enabled expression-arg aggregates with HAVING (single table) — e.g.
+`SUM(CASE WHEN … END) … HAVING SUM(CASE …) > X` — by giving the HAVING
+failing-group backfill a deparse builder.
+
+- New `incr_build_backfill_sql_deparse`: deparses the view query over the REAL
+  base tables (no ENR swap), with `havingQual` stripped and the
+  `__mv_having_ok__` Const flipped to `false`, wrapped as
+  `INSERT … <SELECT> ON CONFLICT (g) DO NOTHING` (+ `incr_emit_conflict_do_nothing`).
+- Both the CREATE path and the **restore** path (`MatviewIncrPostRefresh`) now
+  pick the backfill builder via the same `used_deparse` rule, so an
+  expression-arg HAVING matview rebuilds identically on dump/restore. (This was
+  caught by the dump/restore test: restore initially hit the hand backfill and
+  failed on `CASE`.)
+- `deparse_agg_shape` re-extended to allow single-table HAVING.
+
+**Proof:** gold-standard oracle now **11 shapes** incl. `SUM(CASE)`+HAVING —
+incremental == full `REFRESH`, both paths; dump/restore (off+on) gains
+`mv_having_expr` (auto-routed, restorable, correct after restore, incl.
+threshold crossings); full suite + concurrency green.
+
+---
+
+## Earlier this work: argument-aware HAVING-aggregate binding (latent bug fix)
 
 Fixed a real correctness bug in HAVING maintenance (affects both the hand and
 deparse paths): a HAVING aggregate was bound to a SELECT column by **function
@@ -204,11 +228,10 @@ New test: `src/test/dbblue_ivm/phase2_deparse_delta.sql`.
 Migrate each shape to deparse and delete its hand builder once equivalent:
 1. ✅ **INNER JOIN** (multi-table) — done (step 3). ENR refname-alias fixed.
    Outer/self joins still excluded.
-2. ✅ **single-table HAVING** — done (step 4), equivalence only. JOIN+HAVING and
-   expression-arg HAVING still excluded.
-3. ✅ **Argument-aware HAVING-aggregate match** — done (`incr_having_agg_column`).
-   Next: a **deparse failing-group backfill** so `SUM(CASE…)` + HAVING (and then
-   JOIN + HAVING) can be enabled.
+2. ✅ **single-table HAVING** — done, incl. argument-aware aggregate binding and
+   expression-arg HAVING (`SUM(CASE…)` + HAVING) via the deparse backfill.
+3. **JOIN + HAVING** — needs the failing-group backfill on the deparse JOIN path
+   (currently JOIN+HAVING stays on hand builders).
 4. **OUTER / SELF JOIN** — deparse the recompute/sync SELECT; subtle delta
    semantics (nullable side, both roles) — verify carefully.
 5. **MIN/MAX** — keep the two-phase rescan; deparse only the scan SELECT.

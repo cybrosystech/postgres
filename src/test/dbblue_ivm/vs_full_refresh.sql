@@ -67,7 +67,9 @@ DECLARE
     ['SELECT g AS k, SUM(amt) s, COUNT(*) c FROM vt GROUP BY g HAVING COUNT(*) > 60', 'k,s,c'],
     -- two same-OID sums, HAVING on the SECOND: guards the argument-aware bind
     -- (an OID-only match would filter on SUM(amt) and diverge from REFRESH)
-    ['SELECT g AS k, SUM(amt) sa, SUM(qty) sb, COUNT(*) c FROM vt GROUP BY g HAVING SUM(qty) > 3000', 'k,sa,sb,c']
+    ['SELECT g AS k, SUM(amt) sa, SUM(qty) sb, COUNT(*) c FROM vt GROUP BY g HAVING SUM(qty) > 3000', 'k,sa,sb,c'],
+    -- expression-arg aggregate + HAVING on it: delta + deparse failing-group backfill
+    ['SELECT g AS k, SUM(CASE WHEN st=''done'' THEN amt ELSE 0 END) d, COUNT(*) c FROM vt GROUP BY g HAVING SUM(CASE WHEN st=''done'' THEN amt ELSE 0 END) > 2000', 'k,d,c']
   ];
   i int; n int; bad int := 0;
 BEGIN
