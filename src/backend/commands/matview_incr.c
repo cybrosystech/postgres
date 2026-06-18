@@ -265,6 +265,7 @@ static bool  incr_try_normalize_subq(Query *outer, int sq_varno);
 static Query *incr_normalize_query_body(Query *q);
 
 static bool incr_validate_expr(Node *expr, Query *viewQuery, bool allow_aggref);
+static const char *incr_having_agg_column(Aggref *hagg, Query *viewQuery);
 static bool incr_agg_arg_deparse_safe(Node *expr);
 static bool incr_aggs_need_deparse(Query *viewQuery);
 static bool incr_inner_join_deparse_shape(Query *viewQuery, int nbasetables);
@@ -671,6 +672,11 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 	 * grammar until deparse is widened to them.  This must mirror the routing
 	 * decision in MatviewIncrSetup so a shape accepted here is actually one the
 	 * deparse path will build (and re-build identically on restore).
+	 *
+	 * HAVING is excluded from the expression-arg relaxation: the one-time
+	 * failing-group backfill is still a hand builder, so HAVING with an
+	 * expression aggregate would need a deparse backfill first (a later step).
+	 * Plain-argument HAVING is unaffected and still routes through deparse.
 	 */
 	deparse_agg_shape = (viewQuery->groupClause != NIL &&
 						viewQuery->havingQual == NULL &&
@@ -2139,6 +2145,39 @@ incr_aggs_need_deparse(Query *viewQuery)
  *
  * viewQuery is used only when allow_aggref=true; pass NULL otherwise.
  */
+/*
+ * incr_having_agg_column — the stored matview column that holds the value of a
+ * HAVING aggregate.
+ *
+ * count(*) is always maintained as __mv_count__.  Any other aggregate must be
+ * present in the SELECT list and is bound to that output column.  The match is
+ * ARGUMENT-AWARE (full structural equality via equal()), not function-OID only:
+ * SUM(a) and SUM(b) — or SUM(CASE ...) with different branches — are distinct
+ * aggregates and must bind to their own columns, never to the first sum found.
+ *
+ * Returns the column name, or NULL if the HAVING aggregate is not a stored
+ * column (HAVING references an aggregate absent from the SELECT list).  Used by
+ * both eligibility (incr_validate_expr) and the recompute SQL builder
+ * (incr_deparse_having_cond) so the two never disagree.
+ */
+static const char *
+incr_having_agg_column(Aggref *hagg, Query *viewQuery)
+{
+	ListCell   *lc;
+
+	if (hagg->aggstar && strcmp(get_func_name(hagg->aggfnoid), "count") == 0)
+		return MATVIEW_INCR_COUNT_COL;
+
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+		if (IsA(te->expr, Aggref) && equal(te->expr, hagg))
+			return te->resname;
+	}
+	return NULL;
+}
+
 static bool
 incr_validate_expr(Node *expr, Query *viewQuery, bool allow_aggref)
 {
@@ -2153,28 +2192,12 @@ incr_validate_expr(Node *expr, Query *viewQuery, bool allow_aggref)
 	if (IsA(expr, Aggref))
 	{
 		Aggref	   *agg = (Aggref *) expr;
-		char	   *fname;
 
 		if (!allow_aggref)
 			return false;
 
-		fname = get_func_name(agg->aggfnoid);
-
-		/* COUNT(*) is always maintained via __mv_count__ */
-		if (strcmp(fname, "count") == 0 && agg->aggstar)
-			return true;
-
-		/* Other aggregates must match a SELECT target */
-		foreach(lc, viewQuery->targetList)
-		{
-			TargetEntry *te = lfirst_node(TargetEntry, lc);
-
-			if (!IsA(te->expr, Aggref))
-				continue;
-			if (((Aggref *) te->expr)->aggfnoid == agg->aggfnoid)
-				return true;
-		}
-		return false;
+		/* HAVING aggregate must resolve to a stored matview column */
+		return incr_having_agg_column(agg, viewQuery) != NULL;
 	}
 
 	if (IsA(expr, NullTest))
@@ -2500,30 +2523,14 @@ incr_deparse_having_cond(Node *expr, Query *viewQuery, StringInfo buf)
 	if (IsA(expr, Aggref))
 	{
 		Aggref	   *hagg = (Aggref *) expr;
-		char	   *fname = get_func_name(hagg->aggfnoid);
-		ListCell   *lc;
+		const char *col = incr_having_agg_column(hagg, viewQuery);
 
-		if (strcmp(fname, "count") == 0 && hagg->aggstar)
-		{
-			appendStringInfoString(buf, quote_identifier(MATVIEW_INCR_COUNT_COL));
-			return;
-		}
-
-		/* Find matching SELECT aggregate by function OID */
-		foreach(lc, viewQuery->targetList)
-		{
-			TargetEntry *te = lfirst_node(TargetEntry, lc);
-
-			if (!IsA(te->expr, Aggref))
-				continue;
-			if (((Aggref *) te->expr)->aggfnoid == hagg->aggfnoid)
-			{
-				appendStringInfoString(buf, quote_identifier(te->resname));
-				return;
-			}
-		}
-		elog(ERROR, "incr_deparse_having_cond: aggregate %s not found in SELECT list",
-			 fname);
+		/* argument-aware bind (eligibility guarantees a match exists) */
+		if (col == NULL)
+			elog(ERROR, "incr_deparse_having_cond: aggregate %s not found in SELECT list",
+				 get_func_name(hagg->aggfnoid));
+		appendStringInfoString(buf, quote_identifier(col));
+		return;
 	}
 	else if (IsA(expr, Var))
 	{

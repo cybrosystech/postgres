@@ -10,7 +10,31 @@ _Last updated: 2026-06-18 · branch `feature/ivm-incremental-refresh`_
 
 ---
 
-## Most recent work: Phase 2 step 4 — single-table HAVING via the deparse core
+## Most recent work: argument-aware HAVING-aggregate binding (latent bug fix)
+
+Fixed a real correctness bug in HAVING maintenance (affects both the hand and
+deparse paths): a HAVING aggregate was bound to a SELECT column by **function
+OID only**, so `... SUM(a) sa, SUM(b) sb ... HAVING SUM(b) > X` filtered on
+`sa` (the first sum) instead of `sb`.
+
+- New `incr_having_agg_column(hagg, viewQuery)` binds a HAVING aggregate to its
+  stored column by **full structural equality** (`equal()`), with `count(*)` →
+  `__mv_count__`. Used by both `incr_validate_expr` (eligibility) and
+  `incr_deparse_having_cond` (the `hav_sql` recompute), so the two can't
+  disagree. HAVING aggregates absent from the SELECT list are rejected cleanly.
+- **Deferred:** `SUM(CASE…)` + HAVING. It additionally needs a *deparse*
+  failing-group backfill (`incr_build_backfill_sql_gen` is still a hand builder
+  and can't render `CASE`). Tried and reverted within this increment; it's the
+  next step.
+
+**Proof:** gold-standard oracle extended to **10 shapes** incl. a two-same-OID-sum
+HAVING shape that the old bug would have failed — incremental == full `REFRESH`
+on both paths; full suite, dump/restore, concurrency green off+on; `SUM(CASE)`
++HAVING and HAVING-on-unselected-aggregate both rejected cleanly.
+
+---
+
+## Earlier this work: Phase 2 step 4 — single-table HAVING via the deparse core
 
 Routed single-table HAVING aggregates through the deparse core (equivalence;
 strangler consolidation), and added a `REFRESH`-oracle test that now covers
@@ -182,8 +206,9 @@ Migrate each shape to deparse and delete its hand builder once equivalent:
    Outer/self joins still excluded.
 2. ✅ **single-table HAVING** — done (step 4), equivalence only. JOIN+HAVING and
    expression-arg HAVING still excluded.
-3. **Argument-aware HAVING-aggregate match** (`incr_deparse_having_cond`) — fix
-   the OID-only bind, then enable `SUM(CASE…)` + HAVING, then JOIN + HAVING.
+3. ✅ **Argument-aware HAVING-aggregate match** — done (`incr_having_agg_column`).
+   Next: a **deparse failing-group backfill** so `SUM(CASE…)` + HAVING (and then
+   JOIN + HAVING) can be enabled.
 4. **OUTER / SELF JOIN** — deparse the recompute/sync SELECT; subtle delta
    semantics (nullable side, both roles) — verify carefully.
 5. **MIN/MAX** — keep the two-phase rescan; deparse only the scan SELECT.

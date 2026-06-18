@@ -64,7 +64,10 @@ DECLARE
     ['SELECT p.categ k, SUM(t.amt) s, COUNT(*) c, AVG(t.amt) a FROM vt t JOIN vp p ON p.id=t.product_id GROUP BY p.categ', 'k,s,c,a'],
     ['SELECT p.categ k, SUM(CASE WHEN t.st=''done'' THEN t.amt ELSE 0 END) d, COUNT(*) c FROM vt t JOIN vp p ON p.id=t.product_id GROUP BY p.categ', 'k,d,c'],
     ['SELECT g AS k, SUM(amt) s, COUNT(*) c FROM vt GROUP BY g HAVING SUM(amt) > 1500', 'k,s,c'],
-    ['SELECT g AS k, SUM(amt) s, COUNT(*) c FROM vt GROUP BY g HAVING COUNT(*) > 60', 'k,s,c']
+    ['SELECT g AS k, SUM(amt) s, COUNT(*) c FROM vt GROUP BY g HAVING COUNT(*) > 60', 'k,s,c'],
+    -- two same-OID sums, HAVING on the SECOND: guards the argument-aware bind
+    -- (an OID-only match would filter on SUM(amt) and diverge from REFRESH)
+    ['SELECT g AS k, SUM(amt) sa, SUM(qty) sb, COUNT(*) c FROM vt GROUP BY g HAVING SUM(qty) > 3000', 'k,sa,sb,c']
   ];
   i int; n int; bad int := 0;
 BEGIN
