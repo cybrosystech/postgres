@@ -265,6 +265,8 @@ static bool  incr_try_normalize_subq(Query *outer, int sq_varno);
 static Query *incr_normalize_query_body(Query *q);
 
 static bool incr_validate_expr(Node *expr, Query *viewQuery, bool allow_aggref);
+static bool incr_agg_arg_deparse_safe(Node *expr);
+static bool incr_plain_agg_needs_deparse(Query *viewQuery);
 static Node *incr_get_where_qual(Query *viewQuery);
 static void incr_deparse_where_qual(Node *qual, List *rtable, int delta_varno,
 									StringInfo buf);
@@ -313,6 +315,7 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 {
 	ListCell   *lc;
 	int			nbasetables = 0;
+	bool		plain_single_agg;
 
 	if (viewQuery->havingQual != NULL && viewQuery->groupClause == NIL)
 	{
@@ -658,6 +661,18 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 		}
 	}
 
+	/*
+	 * The deparse delta core is wired only for the plain single-table
+	 * aggregate shape; for that shape an aggregate argument may use any
+	 * deterministic scalar expression (CASE, COALESCE, function calls) because
+	 * ruleutils renders it.  Other shapes (JOIN, MIN/MAX, HAVING) keep the
+	 * restricted hand grammar until deparse is widened to them.
+	 */
+	plain_single_agg = (nbasetables == 1 &&
+						viewQuery->groupClause != NIL &&
+						viewQuery->havingQual == NULL &&
+						!incr_has_minmax_agg(viewQuery));
+
 	/* Validate SELECT list expressions */
 	foreach(lc, viewQuery->targetList)
 	{
@@ -753,8 +768,19 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 				if (agg->args != NIL)
 				{
 					TargetEntry *arg_te = linitial_node(TargetEntry, agg->args);
+					Node	   *arg = (Node *) arg_te->expr;
 
-					if (!incr_validate_expr((Node *) arg_te->expr, NULL, false))
+					/*
+					 * Accept the hand grammar always; for the plain single-table
+					 * aggregate shape also accept any deterministic deparse-able
+					 * expression (the delta SQL is then auto-routed to the
+					 * deparse core).  The union never narrows what was accepted
+					 * before.
+					 */
+					bool	arg_ok = incr_validate_expr(arg, NULL, false) ||
+						(plain_single_agg && incr_agg_arg_deparse_safe(arg));
+
+					if (!arg_ok)
 					{
 						*reason = psprintf("argument of aggregate \"%s\" uses "
 										   "unsupported expressions; only column "
@@ -990,12 +1016,16 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 				incr_store_catalog(mvrelid, srctable, ins_sql, del_sql,
 								   cln_sql, hav_sql, lock_sql);
 			}
-			else if (dbblue_ivm_deparse_delta && !hasHaving)
+			else if ((dbblue_ivm_deparse_delta ||
+					  incr_plain_agg_needs_deparse(viewQuery)) && !hasHaving)
 			{
 				/* Phase 2: produce the delta SELECT via the ruleutils deparse
 				 * core (plain single-table aggregate only; MIN/MAX above and
 				 * HAVING here keep their hand builders — the delta SELECT must
 				 * not apply HAVING, but get_query_def would render it).
+				 * Auto-routed when the shape needs it (e.g. SUM(CASE ...)) so
+				 * such matviews are restorable regardless of the GUC; the GUC
+				 * additionally forces deparse for shapes both paths can express.
 				 * Shell-identical to the hand path. */
 				ins_sql = incr_build_ins_sql_deparse(mvrelid, viewQuery,
 													 srctable, MATVIEW_INCR_NEWTABLE);
@@ -1988,6 +2018,74 @@ incr_get_where_qual(Query *viewQuery)
 		return NULL;
 
 	return fe->quals;				/* single table or explicit JOIN */
+}
+
+/*
+ * incr_agg_arg_unsafe_walker — reject the constructs that make an aggregate
+ * argument unmaintainable by a per-row delta.  Used (with the immutability
+ * check below) when the deparse delta core renders the SELECT: ruleutils can
+ * render arbitrary scalar expressions, so the only hard limits are semantic.
+ */
+static bool
+incr_agg_arg_unsafe_walker(Node *node, void *ctx)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Aggref) || IsA(node, GroupingFunc) ||
+		IsA(node, WindowFunc) || IsA(node, SubLink) || IsA(node, Query))
+		return true;			/* unmaintainable — stop and report */
+	return expression_tree_walker(node, incr_agg_arg_unsafe_walker, ctx);
+}
+
+/*
+ * incr_agg_arg_deparse_safe — true if expr is a deterministic, deparse-able
+ * aggregate argument: no nested aggregate / window / subquery, and IMMUTABLE
+ * (a stable/volatile function would return different values for the same row
+ * across transactions, so its insert-delta and a later delete-delta would not
+ * cancel — the running total would drift).  This is the bar for the expression
+ * shapes that only the deparse core can express (CASE, COALESCE, function
+ * calls); the hand grammar (incr_validate_expr) remains accepted as-is.
+ */
+static bool
+incr_agg_arg_deparse_safe(Node *expr)
+{
+	if (expr == NULL)
+		return true;
+	if (incr_agg_arg_unsafe_walker(expr, NULL))
+		return false;
+	if (contain_mutable_functions(expr))
+		return false;
+	return true;
+}
+
+/*
+ * incr_plain_agg_needs_deparse — true if any aggregate argument in this plain
+ * single-table aggregate query is outside the hand builders' grammar (so the
+ * delta SQL must be produced by the deparse core).  Used to AUTO-ROUTE such
+ * shapes to deparse regardless of the GUC, which keeps them restorable: the
+ * restore path re-runs setup and routes the same way.
+ */
+static bool
+incr_plain_agg_needs_deparse(Query *viewQuery)
+{
+	ListCell   *lc;
+
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+		Aggref	   *agg;
+		TargetEntry *arg_te;
+
+		if (te->resjunk || !IsA(te->expr, Aggref))
+			continue;
+		agg = (Aggref *) te->expr;
+		if (agg->args == NIL)			/* COUNT(*) */
+			continue;
+		arg_te = linitial_node(TargetEntry, agg->args);
+		if (!incr_validate_expr((Node *) arg_te->expr, NULL, false))
+			return true;				/* hand grammar can't render it */
+	}
+	return false;
 }
 
 /*

@@ -10,7 +10,37 @@ _Last updated: 2026-06-18 · branch `feature/ivm-incremental-refresh`_
 
 ---
 
-## Most recent work (this session): Phase 2 step 1 — deparse delta core
+## Most recent work: Phase 2 step 2 — expression aggregate args (auto-routed)
+
+Made expression aggregate arguments — `SUM(CASE …)`, `AVG(COALESCE(…))`,
+immutable function calls — incrementally maintainable **and restorable**, by
+auto-routing such shapes to the deparse core independent of the GUC.
+
+**What it does**
+- `incr_plain_agg_needs_deparse(viewQuery)` — true when any aggregate argument
+  is outside the hand grammar. Generation now uses deparse when
+  `dbblue_ivm_deparse_delta || incr_plain_agg_needs_deparse(...)`, so the shape
+  is routed the same way at CREATE and at restore → **no dump/restore footgun**.
+- Eligibility relaxed **only for the plain single-table aggregate shape**
+  (`nbasetables==1 && GROUP BY && !HAVING && !MIN/MAX`): an aggregate arg is
+  accepted if the hand grammar accepts it **or** it is `incr_agg_arg_deparse_safe`
+  (deterministic — no nested agg/window/subquery, and **immutable**, so the
+  insert-delta and a later delete-delta cancel exactly). The union never narrows
+  what was accepted before.
+- Other shapes (JOIN, MIN/MAX, HAVING) keep the restricted hand grammar until
+  deparse is widened to them.
+
+**Safety rails (all rejected at CREATE):** volatile/stable args (would drift),
+nested agg/window/subquery args, and expression args in non-deparse shapes.
+
+**Proof:** full `.sql` suite off+on; dump/restore under the **default GUC** now
+includes an auto-routed `SUM(CASE)+AVG(COALESCE)` matview (`mv_expr`) that
+survives restore and is correct; concurrency green. New test
+`src/test/dbblue_ivm/phase2_expr_aggregates.sql` (4 PASS).
+
+---
+
+## Earlier this work: Phase 2 step 1 — deparse delta core
 
 Landed the query-tree **deparse** path for the plain single-table aggregate
 shape, behind a default-off GUC, beside the existing engine and proven
@@ -76,34 +106,15 @@ New test: `src/test/dbblue_ivm/phase2_deparse_delta.sql`.
 
 ### Phase 2 — query-tree deparse redesign
 - Foundation: ENR-aware `get_query_def` + `dbblue_deparse_query` (proven).
-- **Step 1: plain single-table aggregate via deparse (this session).**
+- Step 1: plain single-table aggregate via deparse, behind the GUC.
+- **Step 2: expression aggregate args (`SUM(CASE)`, `COALESCE`, immutable
+  functions) auto-routed to deparse — maintainable and restorable.**
 
 ---
 
 ## What's left to do
 
-### Next increment — auto-routing for deparse-only shapes
-Make expression aggregate arguments (`SUM(CASE…)`, `COALESCE(...)`, scalar
-expressions, function calls the hand grammar can't express) incrementally
-maintainable **and restorable**.
-
-- **Auto-route, do not GUC-gate eligibility.** The engine must pick the deparse
-  path automatically for shapes the hand path cannot render — independent of the
-  session GUC. _Why:_ `MatviewIncrSetup` re-runs eligibility on the WITH-NO-DATA
-  restore path; if a shape were eligible only when the GUC is on, a matview
-  created with it on would **fail to restore** under the default. (This is the
-  reason `SUM(CASE)` was deferred rather than shipped in step 1.)
-- Add `incr_plain_agg_needs_deparse(viewQuery)` (true if any aggregate arg is
-  deparse-safe but not hand-renderable); generation uses deparse when
-  `dbblue_ivm_deparse_delta || incr_plain_agg_needs_deparse(...)`.
-- Relax the aggregate-arg eligibility check **scoped to** the plain
-  single-table aggregate shape (deterministic, no nested agg/window/subquery,
-  no volatile functions — a `incr_agg_arg_deparse_safe` walker, drafted then
-  reverted in step 1).
-- New test: create `SUM(CASE…)` matview, dump, **restore under default GUC**,
-  assert correctness — closes the restore footgun.
-
-### Then — widen the deparse gate shape-by-shape (strangler)
+### Next increment — widen the deparse gate shape-by-shape (strangler)
 Migrate each shape to deparse and delete its hand builder once equivalent:
 1. **JOIN** (multi-table). Fix the latent ENR-name-vs-refname issue here: a
    deparsed `Var` qualifies with the RTE refname, which may differ from the ENR

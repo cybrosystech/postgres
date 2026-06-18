@@ -33,7 +33,7 @@ check() { # check <label> <actual> <expected>
 $PSQL -d postgres -q -c "DROP DATABASE IF EXISTS $SRC;" -c "DROP DATABASE IF EXISTS $DST;"
 $PSQL -d postgres -q -c "CREATE DATABASE $SRC;" -c "CREATE DATABASE $DST;"
 
-note "=== building source matviews (SUM/COUNT, AVG, MIN/MAX, JOIN, HAVING) ==="
+note "=== building source matviews (SUM/COUNT, AVG, MIN/MAX, JOIN, HAVING, expr) ==="
 $PSQL -d $SRC -q <<'SQL'
 \set ON_ERROR_STOP on
 CREATE TABLE prod (id int PRIMARY KEY, categ int);
@@ -53,6 +53,17 @@ CREATE MATERIALIZED VIEW mv_join WITH (incremental_refresh=true) AS
   FROM sales s JOIN prod p ON p.id = s.product_id GROUP BY p.categ WITH DATA;
 CREATE MATERIALIZED VIEW mv_having WITH (incremental_refresh=true) AS
   SELECT product_id, SUM(amount) AS rev, COUNT(*) AS cnt FROM sales GROUP BY product_id HAVING SUM(amount) > 100 WITH DATA;
+
+-- Expression aggregates (SUM(CASE...), AVG(COALESCE...)) are auto-routed to the
+-- deparse delta core regardless of the GUC; this matview proves such a shape is
+-- restorable under DEFAULT settings (the restore path re-runs setup, which must
+-- route it the same way — otherwise restore would fail).
+CREATE MATERIALIZED VIEW mv_expr WITH (incremental_refresh=true) AS
+  SELECT product_id,
+         SUM(CASE WHEN amount > 50 THEN amount ELSE 0 END) AS hi_rev,
+         AVG(COALESCE(amount, 0)) AS avg_amt,
+         COUNT(*) AS cnt
+  FROM sales GROUP BY product_id WITH DATA;
 
 -- Row-level UNION ALL with cross-branch duplicates (exercises dedup + count).
 CREATE TABLE tag_a (id int PRIMARY KEY, tag text);
@@ -79,10 +90,13 @@ check "restore had no re-establish warnings" "$n_warn" "0"
 note "=== triggers + catalog re-established (incl. HAVING base) ==="
 # Single-source matviews have one catalog row; the JOIN matview has one per
 # source table (sales + prod = 2).
-for mv in mv_sum mv_avg mv_minmax; do
+for mv in mv_sum mv_avg mv_minmax mv_expr; do
   cat=$($PSQL -d $DST -tAc "SELECT count(*) FROM pg_dbblue_matview WHERE mvrelid='$mv'::regclass;")
   check "$mv catalog rows" "$cat" "1"
 done
+# mv_expr must have been auto-routed to the deparse core (CASE rendered natively).
+ec=$($PSQL -d $DST -tAc "SELECT (ins_sql LIKE '%CASE%')::int FROM pg_dbblue_matview WHERE mvrelid='mv_expr'::regclass;")
+check "mv_expr auto-routed to deparse core (CASE in delta SQL)" "$ec" "1"
 catj=$($PSQL -d $DST -tAc "SELECT count(*) FROM pg_dbblue_matview WHERE mvrelid='mv_join'::regclass;")
 check "mv_join catalog rows (one per source table)" "$catj" "2"
 hbase=$($PSQL -d $DST -tAc "SELECT count(*) FROM pg_dbblue_matview p JOIN pg_class c ON c.oid=p.mvrelid WHERE c.relname LIKE '\_dbblue\_%\_base';")
@@ -102,6 +116,14 @@ SELECT
      JOIN mv_join m USING(categ) WHERE abs(l.rev-m.rev)>0.001 OR l.c<>m.cnt);
 ")
 check "mismatches (sum+avg+minmax+join)" "$mm" "0"
+me=$($PSQL -d $DST -tAc "
+WITH live AS (SELECT product_id,
+                     SUM(CASE WHEN amount>50 THEN amount ELSE 0 END) hi,
+                     AVG(COALESCE(amount,0)) a, COUNT(*) c
+              FROM sales GROUP BY product_id)
+SELECT count(*) FROM live JOIN mv_expr m USING(product_id)
+  WHERE abs(live.hi-m.hi_rev)>0.001 OR abs(live.a-m.avg_amt)>0.001 OR live.c<>m.cnt;")
+check "mv_expr (SUM(CASE)+AVG(COALESCE)) mismatches after restore" "$me" "0"
 
 note "=== HAVING: failing group crosses threshold after restore (needs rebuilt seed) ==="
 # pick a currently-failing product and push it well over the threshold
@@ -129,7 +151,7 @@ check "mv_union mismatches after restore+DML" "$umm" "0"
 
 note "=== TRUNCATE re-seeding after restore ==="
 $PSQL -d $DST -q -c "TRUNCATE sales CASCADE;"
-rows=$($PSQL -d $DST -tAc "SELECT (SELECT count(*) FROM mv_sum)+(SELECT count(*) FROM mv_avg)+(SELECT count(*) FROM mv_minmax)+(SELECT count(*) FROM mv_join)+(SELECT count(*) FROM mv_having);")
+rows=$($PSQL -d $DST -tAc "SELECT (SELECT count(*) FROM mv_sum)+(SELECT count(*) FROM mv_avg)+(SELECT count(*) FROM mv_minmax)+(SELECT count(*) FROM mv_join)+(SELECT count(*) FROM mv_having)+(SELECT count(*) FROM mv_expr);")
 check "all aggregate matviews empty after TRUNCATE" "$rows" "0"
 
 $PSQL -d postgres -q -c "DROP DATABASE IF EXISTS $SRC;" -c "DROP DATABASE IF EXISTS $DST;"
