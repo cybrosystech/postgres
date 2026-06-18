@@ -10,7 +10,35 @@ _Last updated: 2026-06-18 · branch `feature/ivm-incremental-refresh`_
 
 ---
 
-## Most recent work: Phase 2 step 2 — expression aggregate args (auto-routed)
+## Most recent work: Phase 2 step 3 — INNER JOIN via the deparse core
+
+Extended the deparse delta core to **INNER JOIN aggregates** (the most common
+Odoo report shape), and brought expression aggregate args along for free.
+
+**What it does**
+- ruleutils `get_rte_alias`: added the `RTE_NAMEDTUPLESTORE` case so the ENR
+  FROM item carries its refname alias (`__mv_newtable s`). Without it a JOIN's
+  qualified Vars (`s.amount`) couldn't resolve — this was the latent
+  ENR-name-vs-refname issue flagged in the design.
+- For each source table of a pure INNER JOIN, the delta swaps only that table's
+  RTE for its transition ENR and leaves the others as relations, so ruleutils
+  renders the join naturally. Routed to deparse when
+  `dbblue_ivm_deparse_delta || incr_aggs_need_deparse(...)`.
+- Eligibility relaxation (immutable expression args) extended from single-table
+  to the pure INNER JOIN shape, via `incr_inner_join_deparse_shape` — mirrors the
+  routing exactly, so a shape accepted at CREATE is rebuilt identically on restore.
+- **Excluded (keep hand builders):** outer joins, self-joins, MIN/MAX, HAVING.
+
+**Proof:** full suite off+on; dump/restore off+on now includes `mv_join` (plain)
+and `mv_join_expr` (`SUM(CASE)` over JOIN) — both auto-routed, restorable, and
+correct after restore under the **default GUC**; RR/SERIALIZABLE concurrency
+green off+on. New test `phase2_join_deparse.sql` (5 PASS: equivalence on both
+paths for both-table changes, `SUM(CASE)` over JOIN auto-routed + correct, and
+OUTER/SELF-join expression args rejected).
+
+---
+
+## Earlier this work: Phase 2 step 2 — expression aggregate args (auto-routed)
 
 Made expression aggregate arguments — `SUM(CASE …)`, `AVG(COALESCE(…))`,
 immutable function calls — incrementally maintainable **and restorable**, by
@@ -107,8 +135,10 @@ New test: `src/test/dbblue_ivm/phase2_deparse_delta.sql`.
 ### Phase 2 — query-tree deparse redesign
 - Foundation: ENR-aware `get_query_def` + `dbblue_deparse_query` (proven).
 - Step 1: plain single-table aggregate via deparse, behind the GUC.
-- **Step 2: expression aggregate args (`SUM(CASE)`, `COALESCE`, immutable
-  functions) auto-routed to deparse — maintainable and restorable.**
+- Step 2: expression aggregate args (`SUM(CASE)`, `COALESCE`, immutable
+  functions) auto-routed to deparse — maintainable and restorable.
+- **Step 3: INNER JOIN aggregates via deparse (incl. expression args over
+  joins); ENR refname-alias fix in ruleutils.**
 
 ---
 
@@ -116,13 +146,15 @@ New test: `src/test/dbblue_ivm/phase2_deparse_delta.sql`.
 
 ### Next increment — widen the deparse gate shape-by-shape (strangler)
 Migrate each shape to deparse and delete its hand builder once equivalent:
-1. **JOIN** (multi-table). Fix the latent ENR-name-vs-refname issue here: a
-   deparsed `Var` qualifies with the RTE refname, which may differ from the ENR
-   name; the emitted relation reference and the Var qualifier must agree.
-2. **MIN/MAX** — keep the two-phase rescan; deparse only the scan SELECT.
-3. **HAVING** — strip `havingQual` from the delta copy (the delta must not
-   apply HAVING), keep `__mv_having_ok__` + `hav_sql` recompute.
-4. **UNION ALL** — and revisit its concurrency certification.
+1. ✅ **INNER JOIN** (multi-table) — done (step 3). ENR refname-alias fixed.
+   Outer/self joins still excluded.
+2. **HAVING** — strip `havingQual` from the delta copy (the delta must not
+   apply HAVING), keep `__mv_having_ok__` + `hav_sql` recompute. Unlocks
+   expression args + HAVING.
+3. **OUTER / SELF JOIN** — deparse the recompute/sync SELECT; subtle delta
+   semantics (nullable side, both roles) — verify carefully.
+4. **MIN/MAX** — keep the two-phase rescan; deparse only the scan SELECT.
+5. **UNION ALL** — and revisit its concurrency certification.
 - Each step: prove equivalence (suite + dump/restore + concurrency) with the
   GUC off and on, then remove the superseded hand builder.
 

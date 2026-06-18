@@ -266,7 +266,8 @@ static Query *incr_normalize_query_body(Query *q);
 
 static bool incr_validate_expr(Node *expr, Query *viewQuery, bool allow_aggref);
 static bool incr_agg_arg_deparse_safe(Node *expr);
-static bool incr_plain_agg_needs_deparse(Query *viewQuery);
+static bool incr_aggs_need_deparse(Query *viewQuery);
+static bool incr_inner_join_deparse_shape(Query *viewQuery, int nbasetables);
 static Node *incr_get_where_qual(Query *viewQuery);
 static void incr_deparse_where_qual(Node *qual, List *rtable, int delta_varno,
 									StringInfo buf);
@@ -315,7 +316,7 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 {
 	ListCell   *lc;
 	int			nbasetables = 0;
-	bool		plain_single_agg;
+	bool		deparse_agg_shape;
 
 	if (viewQuery->havingQual != NULL && viewQuery->groupClause == NIL)
 	{
@@ -662,16 +663,20 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 	}
 
 	/*
-	 * The deparse delta core is wired only for the plain single-table
-	 * aggregate shape; for that shape an aggregate argument may use any
-	 * deterministic scalar expression (CASE, COALESCE, function calls) because
-	 * ruleutils renders it.  Other shapes (JOIN, MIN/MAX, HAVING) keep the
-	 * restricted hand grammar until deparse is widened to them.
+	 * Shapes the deparse delta core is wired for: a GROUP BY aggregate with no
+	 * HAVING and no MIN/MAX, over either a single table or a pure INNER JOIN
+	 * (no outer join, no self-join).  For those, an aggregate argument may use
+	 * any deterministic scalar expression (CASE, COALESCE, function calls)
+	 * because ruleutils renders it; other shapes keep the restricted hand
+	 * grammar until deparse is widened to them.  This must mirror the routing
+	 * decision in MatviewIncrSetup so a shape accepted here is actually one the
+	 * deparse path will build (and re-build identically on restore).
 	 */
-	plain_single_agg = (nbasetables == 1 &&
-						viewQuery->groupClause != NIL &&
+	deparse_agg_shape = (viewQuery->groupClause != NIL &&
 						viewQuery->havingQual == NULL &&
-						!incr_has_minmax_agg(viewQuery));
+						!incr_has_minmax_agg(viewQuery) &&
+						(nbasetables == 1 ||
+						 incr_inner_join_deparse_shape(viewQuery, nbasetables)));
 
 	/* Validate SELECT list expressions */
 	foreach(lc, viewQuery->targetList)
@@ -778,7 +783,7 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 					 * before.
 					 */
 					bool	arg_ok = incr_validate_expr(arg, NULL, false) ||
-						(plain_single_agg && incr_agg_arg_deparse_safe(arg));
+						(deparse_agg_shape && incr_agg_arg_deparse_safe(arg));
 
 					if (!arg_ok)
 					{
@@ -1017,7 +1022,7 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 								   cln_sql, hav_sql, lock_sql);
 			}
 			else if ((dbblue_ivm_deparse_delta ||
-					  incr_plain_agg_needs_deparse(viewQuery)) && !hasHaving)
+					  incr_aggs_need_deparse(viewQuery)) && !hasHaving)
 			{
 				/* Phase 2: produce the delta SELECT via the ruleutils deparse
 				 * core (plain single-table aggregate only; MIN/MAX above and
@@ -1299,6 +1304,22 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 															  join_list);
 					incr_store_catalog(mvrelid, delta->oid,
 									   ins_sql, del_sql, cln_sql, hav_sql, lock_sql);
+				}
+				else if ((dbblue_ivm_deparse_delta ||
+						  incr_aggs_need_deparse(viewQuery)) && !hasHaving)
+				{
+					/* Phase 2: INNER JOIN delta via the deparse core.  The
+					 * delta for table delta->oid swaps only that table's RTE
+					 * for the transition-table ENR; the other tables stay as
+					 * relations, so deparse renders the join naturally.
+					 * Auto-routed when the shape needs it (expression args);
+					 * HAVING/MIN-MAX/outer/self joins keep hand builders. */
+					ins_sql = incr_build_ins_sql_deparse(mvrelid, viewQuery,
+										 delta->oid, MATVIEW_INCR_NEWTABLE);
+					del_sql = incr_build_del_sql_deparse(mvrelid, viewQuery,
+										 delta->oid, MATVIEW_INCR_OLDTABLE);
+					incr_store_catalog(mvrelid, delta->oid,
+								   ins_sql, del_sql, cln_sql, hav_sql, NULL);
 				}
 				else
 				{
@@ -2059,14 +2080,32 @@ incr_agg_arg_deparse_safe(Node *expr)
 }
 
 /*
- * incr_plain_agg_needs_deparse — true if any aggregate argument in this plain
- * single-table aggregate query is outside the hand builders' grammar (so the
- * delta SQL must be produced by the deparse core).  Used to AUTO-ROUTE such
+ * incr_aggs_need_deparse — true if any aggregate argument in this aggregate
+ * query (single-table or INNER JOIN) is outside the hand builders' grammar (so
+ * the delta SQL must be produced by the deparse core).  Used to AUTO-ROUTE such
  * shapes to deparse regardless of the GUC, which keeps them restorable: the
  * restore path re-runs setup and routes the same way.
  */
+/*
+ * incr_inner_join_deparse_shape — true for a multi-table query whose per-table
+ * deltas the deparse core can build: a pure INNER JOIN (no outer join, no
+ * self-join).  Outer joins use the recompute strategy and self-joins the
+ * combined-role builders, neither of which the deparse path expresses yet.
+ * Mirrors the routing in MatviewIncrSetup's N-table INNER JOIN branch.
+ */
 static bool
-incr_plain_agg_needs_deparse(Query *viewQuery)
+incr_inner_join_deparse_shape(Query *viewQuery, int nbasetables)
+{
+	List	   *tabs;
+
+	if (nbasetables < 2)
+		return false;
+	tabs = incr_collect_tables(viewQuery);
+	return !incr_has_outer_join(tabs) && !incr_has_self_join(tabs);
+}
+
+static bool
+incr_aggs_need_deparse(Query *viewQuery)
 {
 	ListCell   *lc;
 

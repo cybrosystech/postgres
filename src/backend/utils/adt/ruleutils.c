@@ -13358,6 +13358,18 @@ get_rte_alias(RangeTblEntry *rte, int varno, bool use_as,
 		if (strcmp(refname, rte->ctename) != 0)
 			printalias = true;
 	}
+	else if (rte->rtekind == RTE_NAMEDTUPLESTORE)
+	{
+		/*
+		 * The FROM item is rendered as the bare ENR name (enrname), but a
+		 * reference's columns are qualified by its refname.  When they differ
+		 * — e.g. a DBblue incremental-matview delta query that swaps a source
+		 * table aliased "s" for the transition tuplestore "__mv_newtable" —
+		 * print the refname as an alias so qualified Vars resolve.
+		 */
+		if (strcmp(refname, rte->enrname) != 0)
+			printalias = true;
+	}
 
 	if (printalias)
 		appendStringInfo(context->buf, "%s%s",
