@@ -27,7 +27,7 @@ INSERT INTO vt(g,amt,qty,st,product_id)
 -- Build incremental + normal from one definition, mutate base tables, REFRESH the
 -- normal MV (the oracle), return the symmetric difference over `cols`.
 CREATE FUNCTION _vs(qdef text, cols text) RETURNS int LANGUAGE plpgsql AS $$
-DECLARE n int;
+DECLARE n int; kind text;
 BEGIN
   EXECUTE 'CREATE MATERIALIZED VIEW _inc WITH (incremental_refresh=true) AS '||qdef;
   EXECUTE 'CREATE MATERIALIZED VIEW _norm AS '||qdef;
@@ -43,7 +43,11 @@ BEGIN
   EXECUTE format('SELECT (SELECT count(*) FROM (SELECT %1$s FROM _inc EXCEPT SELECT %1$s FROM _norm) a)
                        + (SELECT count(*) FROM (SELECT %1$s FROM _norm EXCEPT SELECT %1$s FROM _inc) b)',
                  cols) INTO n;
-  EXECUTE 'DROP MATERIALIZED VIEW _inc';
+  -- A HAVING incremental matview is exposed as a filtering VIEW over a renamed
+  -- base; everything else is a materialized view.  Drop by actual relkind.
+  SELECT relkind::text INTO kind FROM pg_class WHERE relname = '_inc';
+  IF kind = 'v' THEN EXECUTE 'DROP VIEW _inc';
+  ELSE EXECUTE 'DROP MATERIALIZED VIEW _inc'; END IF;
   EXECUTE 'DROP MATERIALIZED VIEW _norm';
   RETURN n;
 END $$;
@@ -58,7 +62,9 @@ DECLARE
     ['SELECT g AS k, SUM(CASE WHEN st=''done'' THEN amt ELSE 0 END) d, AVG(COALESCE(amt,0)) a, COUNT(*) c FROM vt GROUP BY g', 'k,d,a,c'],
     ['SELECT g AS k, MIN(amt) mn, MAX(amt) mx, COUNT(*) c FROM vt GROUP BY g', 'k,mn,mx,c'],
     ['SELECT p.categ k, SUM(t.amt) s, COUNT(*) c, AVG(t.amt) a FROM vt t JOIN vp p ON p.id=t.product_id GROUP BY p.categ', 'k,s,c,a'],
-    ['SELECT p.categ k, SUM(CASE WHEN t.st=''done'' THEN t.amt ELSE 0 END) d, COUNT(*) c FROM vt t JOIN vp p ON p.id=t.product_id GROUP BY p.categ', 'k,d,c']
+    ['SELECT p.categ k, SUM(CASE WHEN t.st=''done'' THEN t.amt ELSE 0 END) d, COUNT(*) c FROM vt t JOIN vp p ON p.id=t.product_id GROUP BY p.categ', 'k,d,c'],
+    ['SELECT g AS k, SUM(amt) s, COUNT(*) c FROM vt GROUP BY g HAVING SUM(amt) > 1500', 'k,s,c'],
+    ['SELECT g AS k, SUM(amt) s, COUNT(*) c FROM vt GROUP BY g HAVING COUNT(*) > 60', 'k,s,c']
   ];
   i int; n int; bad int := 0;
 BEGIN
@@ -69,7 +75,8 @@ BEGIN
       bad := bad + 1;
     END IF;
   END LOOP;
-  IF bad = 0 THEN RAISE NOTICE 'incremental == full REFRESH for all 7 shapes [%]: PASS', tag;
+  IF bad = 0 THEN RAISE NOTICE 'incremental == full REFRESH for all % shapes [%]: PASS',
+                              array_length(shapes,1), tag;
   ELSE RAISE EXCEPTION 'incremental diverged from full REFRESH in % shape(s) [%]: FAIL', bad, tag; END IF;
 END $$;
 

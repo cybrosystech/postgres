@@ -1021,17 +1021,18 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 				incr_store_catalog(mvrelid, srctable, ins_sql, del_sql,
 								   cln_sql, hav_sql, lock_sql);
 			}
-			else if ((dbblue_ivm_deparse_delta ||
-					  incr_aggs_need_deparse(viewQuery)) && !hasHaving)
+			else if (dbblue_ivm_deparse_delta ||
+					 incr_aggs_need_deparse(viewQuery))
 			{
 				/* Phase 2: produce the delta SELECT via the ruleutils deparse
-				 * core (plain single-table aggregate only; MIN/MAX above and
-				 * HAVING here keep their hand builders — the delta SELECT must
-				 * not apply HAVING, but get_query_def would render it).
+				 * core (single-table aggregate; MIN/MAX above keeps its hand
+				 * builders).  HAVING is supported: incr_build_delta_select_query
+				 * strips havingQual so the delta covers every group, and the
+				 * separate __mv_having_ok__ flag + hav_sql recompute (stored
+				 * here) maintain the filter — identical to the hand path.
 				 * Auto-routed when the shape needs it (e.g. SUM(CASE ...)) so
 				 * such matviews are restorable regardless of the GUC; the GUC
-				 * additionally forces deparse for shapes both paths can express.
-				 * Shell-identical to the hand path. */
+				 * additionally forces deparse for shapes both paths can express. */
 				ins_sql = incr_build_ins_sql_deparse(mvrelid, viewQuery,
 													 srctable, MATVIEW_INCR_NEWTABLE);
 				del_sql = incr_build_del_sql_deparse(mvrelid, viewQuery,
@@ -3577,6 +3578,18 @@ incr_build_delta_select_query(Query *viewQuery, Oid srctable, const char *enrNam
 	Relation		rel;
 	TupleDesc		tupdesc;
 	int				attno;
+
+	/*
+	 * The delta SELECT must compute per-group aggregate deltas for EVERY group
+	 * the transition rows touch, including groups that currently fail HAVING —
+	 * HAVING is maintained separately (the __mv_having_ok__ flag recomputed by
+	 * hav_sql).  Applying it here would drop deltas for failing groups and
+	 * corrupt their running totals, so strip it from the copy.  (No-op when the
+	 * view has no HAVING.)  Any aggregate that existed only for HAVING is a
+	 * resjunk target and is skipped by both the deparse and the INSERT column
+	 * list, exactly as in the hand builders.
+	 */
+	q->havingQual = NULL;
 
 	foreach(lc, q->rtable)
 	{

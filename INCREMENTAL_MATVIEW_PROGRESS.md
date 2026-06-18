@@ -10,7 +10,37 @@ _Last updated: 2026-06-18 · branch `feature/ivm-incremental-refresh`_
 
 ---
 
-## Most recent work: Phase 2 step 3 — INNER JOIN via the deparse core
+## Most recent work: Phase 2 step 4 — single-table HAVING via the deparse core
+
+Routed single-table HAVING aggregates through the deparse core (equivalence;
+strangler consolidation), and added a `REFRESH`-oracle test that now covers
+HAVING on both paths.
+
+**What it does**
+- `incr_build_delta_select_query` strips `havingQual` from the copy: the delta
+  must compute per-group deltas for **every** group the transition rows touch
+  (including groups that currently fail HAVING). HAVING itself is maintained
+  separately by the `__mv_having_ok__` flag + the `hav_sql` recompute + the
+  user-facing filtering view — all unchanged.
+- Removed the `!hasHaving` gate from the **single-table** deparse branch (JOIN +
+  HAVING still uses hand builders). Since expression-arg HAVING is not yet
+  eligible, HAVING routes to deparse only when the GUC is on → a pure
+  equivalence path, no behaviour change by default.
+
+**Deferred (needs a prerequisite fix):** `SUM(CASE…)` + HAVING. The HAVING
+recompute `incr_deparse_having_cond` resolves a HAVING aggregate to a SELECT
+column **by function OID only**, so two sums with different arguments could bind
+to the wrong column. That match must be made argument-aware before relaxing
+eligibility for expression-arg HAVING — its own increment.
+
+**Proof:** gold-standard oracle (`vs_full_refresh.sql`) extended to **9 shapes**
+incl. two HAVING shapes — incremental == full `REFRESH` on hand AND deparse
+paths; full suite, `having_teardown`, and dump/restore (incl. HAVING
+threshold-cross-after-restore) green off+on; concurrency green.
+
+---
+
+## Earlier this work: Phase 2 step 3 — INNER JOIN via the deparse core
 
 Extended the deparse delta core to **INNER JOIN aggregates** (the most common
 Odoo report shape), and brought expression aggregate args along for free.
@@ -137,8 +167,10 @@ New test: `src/test/dbblue_ivm/phase2_deparse_delta.sql`.
 - Step 1: plain single-table aggregate via deparse, behind the GUC.
 - Step 2: expression aggregate args (`SUM(CASE)`, `COALESCE`, immutable
   functions) auto-routed to deparse — maintainable and restorable.
-- **Step 3: INNER JOIN aggregates via deparse (incl. expression args over
-  joins); ENR refname-alias fix in ruleutils.**
+- Step 3: INNER JOIN aggregates via deparse (incl. expression args over
+  joins); ENR refname-alias fix in ruleutils.
+- **Step 4: single-table HAVING via deparse (equivalence); gold-standard
+  `REFRESH`-oracle test (`vs_full_refresh.sql`) covering 9 shapes, both paths.**
 
 ---
 
@@ -148,13 +180,14 @@ New test: `src/test/dbblue_ivm/phase2_deparse_delta.sql`.
 Migrate each shape to deparse and delete its hand builder once equivalent:
 1. ✅ **INNER JOIN** (multi-table) — done (step 3). ENR refname-alias fixed.
    Outer/self joins still excluded.
-2. **HAVING** — strip `havingQual` from the delta copy (the delta must not
-   apply HAVING), keep `__mv_having_ok__` + `hav_sql` recompute. Unlocks
-   expression args + HAVING.
-3. **OUTER / SELF JOIN** — deparse the recompute/sync SELECT; subtle delta
+2. ✅ **single-table HAVING** — done (step 4), equivalence only. JOIN+HAVING and
+   expression-arg HAVING still excluded.
+3. **Argument-aware HAVING-aggregate match** (`incr_deparse_having_cond`) — fix
+   the OID-only bind, then enable `SUM(CASE…)` + HAVING, then JOIN + HAVING.
+4. **OUTER / SELF JOIN** — deparse the recompute/sync SELECT; subtle delta
    semantics (nullable side, both roles) — verify carefully.
-4. **MIN/MAX** — keep the two-phase rescan; deparse only the scan SELECT.
-5. **UNION ALL** — and revisit its concurrency certification.
+5. **MIN/MAX** — keep the two-phase rescan; deparse only the scan SELECT.
+6. **UNION ALL** — and revisit its concurrency certification.
 - Each step: prove equivalence (suite + dump/restore + concurrency) with the
   GUC off and on, then remove the superseded hand builder.
 
