@@ -115,5 +115,40 @@ BEGIN
   ELSE RAISE EXCEPTION 'BUGA: row-level multiset diverged (% rows)', n; END IF;
 END $$;
 DROP MATERIALIZED VIEW rli; DROP MATERIALIZED VIEW rln; DROP TABLE rl CASCADE;
+
+-- BUG D (audit round 2): a self-join aggregate matview used two per-role delta
+-- arms that double-counted the delta-joins-delta overlap and aborted the user's
+-- write with "ON CONFLICT ... cannot affect row a second time" on self/mutually
+-- referential DML.  Now affected groups are recomputed in one statement: writes
+-- must never abort, and the result must equal a full REFRESH.
+DROP TABLE IF EXISTS emp CASCADE;
+CREATE TABLE emp(id int primary key, mgr int, sal int);
+INSERT INTO emp VALUES (1,NULL,100),(2,1,50),(3,1,60),(4,2,40);
+CREATE MATERIALIZED VIEW ei WITH (incremental_refresh=true) AS
+  SELECT m.id mgr_id, count(*) nreports, sum(e.sal) rep_sal, avg(e.sal) avg_sal
+  FROM emp e JOIN emp m ON e.mgr=m.id GROUP BY m.id;
+CREATE MATERIALIZED VIEW en AS
+  SELECT m.id mgr_id, count(*) nreports, sum(e.sal) rep_sal, avg(e.sal) avg_sal
+  FROM emp e JOIN emp m ON e.mgr=m.id GROUP BY m.id;
+DO $$
+BEGIN
+  INSERT INTO emp VALUES (5,5,77);            -- self-referential
+  INSERT INTO emp VALUES (6,7,25),(7,6,15);   -- mutually referential, one statement
+  UPDATE emp SET mgr=2 WHERE id=2;            -- existing row becomes self-referential
+  INSERT INTO emp VALUES (8,1,90); DELETE FROM emp WHERE id=4; UPDATE emp SET sal=sal+5 WHERE id=3;
+EXCEPTION WHEN OTHERS THEN
+  RAISE EXCEPTION 'BUGD: a self-join base-table write was aborted (% / %)', SQLSTATE, SQLERRM;
+END $$;
+REFRESH MATERIALIZED VIEW en;
+DO $$
+DECLARE n int;
+BEGIN
+  SELECT count(*) INTO n FROM (
+    (SELECT mgr_id,nreports,rep_sal,avg_sal FROM ei EXCEPT SELECT mgr_id,nreports,rep_sal,avg_sal FROM en)
+    UNION ALL (SELECT mgr_id,nreports,rep_sal,avg_sal FROM en EXCEPT SELECT mgr_id,nreports,rep_sal,avg_sal FROM ei)) d;
+  IF n=0 THEN RAISE NOTICE 'BUGD self-join (incl. self/mutually referential) == REFRESH, no write aborted: PASS';
+  ELSE RAISE EXCEPTION 'BUGD: self-join diverged from REFRESH (% rows)', n; END IF;
+END $$;
+DROP MATERIALIZED VIEW ei; DROP MATERIALIZED VIEW en; DROP TABLE emp CASCADE;
 \echo ''
 \echo '=== audit regression tests complete ==='

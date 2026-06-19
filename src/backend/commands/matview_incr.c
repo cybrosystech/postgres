@@ -5972,30 +5972,336 @@ matview_delta_apply(PG_FUNCTION_ARGS)
  * ============================================================ */
 
 /*
- * incr_build_self_join_agg_ins_sql
+ * incr_build_self_join_agg_apply_sql
  *
- * INSERT delta for a self-join with GROUP BY.  Both roles (v1 and v2) must be
- * merged into a single catalog entry because the self-joined table has one OID.
+ * Maintenance for a self-join GROUP BY aggregate (count/sum/avg; MIN/MAX with a
+ * self-join is rejected earlier).  Correct AND write-safe.
  *
- * Strategy: wrap arm1 in a data-modifying CTE so both arms execute in a
- * single SPI call.  PostgreSQL guarantees data-modifying CTEs run exactly
- * once regardless of whether their output is referenced by the outer query.
+ * The previous design ran two per-role delta arms (delta-as-v1 and delta-as-v2)
+ * as INSERT ... ON CONFLICT in one statement.  That double-counted the
+ * delta-joins-delta overlap (a row that joins to another changed row, e.g. a
+ * self-referential row) and could abort the user's base-table write with
+ * "ON CONFLICT DO UPDATE command cannot affect row a second time".
  *
- *   WITH _sj_ins_ AS ( <arm1: INSERT ... ON CONFLICT DO UPDATE> )
- *   <arm2: INSERT ... ON CONFLICT DO UPDATE>
+ * Instead, recompute every group key the delta touches in EITHER role from the
+ * LIVE tables and reconcile in a single statement (one row per key, so the
+ * upsert never affects a row twice):
+ *
+ *   WITH _aff_ AS (<keys from delta-as-v1>  UNION  <keys from delta-as-v2>),
+ *        _rc_  AS (<full view aggregate over the live self-join>
+ *                  WHERE <keys> IN _aff_ GROUP BY <keys>),
+ *        _upd_ AS (UPDATE mv SET <col = _rc_.col> FROM _rc_
+ *                  WHERE <mv.key = _rc_.key> RETURNING <mv.key>)
+ *   -- is_delete=false: INSERT groups in _rc_ not matched by _upd_ (new groups)
+ *   -- is_delete=true : DELETE affected groups absent from _rc_ (vanished groups)
  */
+static char *
+incr_build_self_join_agg_apply_sql(Oid mvrelid, Query *viewQuery,
+								   int v1, int v2,
+								   const char *delta_table,
+								   List *all_tables, bool is_delete)
+{
+	StringInfoData	buf;
+	List		   *groupColNames = NIL;
+	List		   *jl1 = incr_build_join_list_for_delta(all_tables, v1);
+	List		   *jl2 = incr_build_join_list_for_delta(all_tables, v2);
+	const char	   *mvname = mv_qname(mvrelid);
+	const char	   *livename = NULL;
+	Node		   *wq = incr_get_where_qual(viewQuery);
+	ListCell	   *lc,
+				   *gcl;
+	bool			first;
+	int				roles[2];
+	int				ri;
+
+	incr_collect_group_cols(viewQuery, &groupColNames);
+	foreach(lc, all_tables)
+	{
+		IncrJoinEntry *je = lfirst(lc);
+
+		if (je->varno == v1)
+		{
+			livename = mv_qname(je->oid);
+			break;
+		}
+	}
+	roles[0] = v1;
+	roles[1] = v2;
+
+	initStringInfo(&buf);
+
+	/* ---- _aff_: distinct group keys the delta touches in either role ---- */
+	appendStringInfoString(&buf, "WITH _aff_ AS (");
+	for (ri = 0; ri < 2; ri++)
+	{
+		int		dv = roles[ri];
+		List   *jl = (ri == 0) ? jl1 : jl2;
+
+		if (ri == 1)
+			appendStringInfoString(&buf, " UNION ");
+		appendStringInfoString(&buf, "SELECT ");
+		first = true;
+		foreach(lc, viewQuery->targetList)
+		{
+			TargetEntry    *te = lfirst_node(TargetEntry, lc);
+			StringInfoData	ebuf;
+
+			if (te->resjunk || !IsA(te->expr, Var))
+				continue;
+			if (!first)
+				appendStringInfoChar(&buf, ',');
+			first = false;
+			initStringInfo(&ebuf);
+			incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable, dv, &ebuf);
+			appendStringInfo(&buf, "%s AS %s", ebuf.data,
+							 quote_identifier(te->resname));
+		}
+		incr_append_from_join(&buf, viewQuery, dv, delta_table, jl);
+		if (wq != NULL)
+		{
+			StringInfoData wbuf;
+
+			initStringInfo(&wbuf);
+			incr_deparse_where_qual(wq, viewQuery->rtable, dv, &wbuf);
+			appendStringInfo(&buf, " WHERE %s", wbuf.data);
+		}
+	}
+	appendStringInfoString(&buf, "),");
+
+	/* ---- _rc_: full recompute of the affected groups over the LIVE join ---- */
+	appendStringInfoString(&buf, " _rc_ AS (SELECT ");
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry    *te = lfirst_node(TargetEntry, lc);
+		const char	   *colq;
+		StringInfoData	ebuf;
+
+		if (te->resjunk)
+			continue;
+		colq = quote_identifier(te->resname);
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		first = false;
+
+		if (strcmp(te->resname, MATVIEW_INCR_COUNT_COL) == 0)
+			appendStringInfo(&buf, "COUNT(*) AS %s", colq);
+		else if (strcmp(te->resname, MATVIEW_INCR_HAVING_COL) == 0)
+			appendStringInfo(&buf, "true AS %s", colq);
+		else if (IsA(te->expr, Var))
+		{
+			initStringInfo(&ebuf);
+			incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable, v1, &ebuf);
+			appendStringInfo(&buf, "%s AS %s", ebuf.data, colq);
+		}
+		else if (IsA(te->expr, Aggref))
+		{
+			Aggref	   *agg = (Aggref *) te->expr;
+			char	   *fname = get_func_name(agg->aggfnoid);
+
+			if (strcmp(fname, "count") == 0 && agg->aggstar)
+				appendStringInfo(&buf, "COUNT(*) AS %s", colq);
+			else if (agg->args != NIL)
+			{
+				TargetEntry *arg_te = linitial_node(TargetEntry, agg->args);
+
+				initStringInfo(&ebuf);
+				incr_deparse_where_qual((Node *) arg_te->expr, viewQuery->rtable,
+										v1, &ebuf);
+				appendStringInfo(&buf, "%s(%s) AS %s", fname, ebuf.data, colq);
+			}
+			else
+				appendStringInfo(&buf, "%s(*) AS %s", fname, colq);
+		}
+		else
+			elog(ERROR, "incr_build_self_join_agg_apply_sql: unexpected expr %d",
+				 (int) nodeTag(te->expr));
+	}
+	/* FROM the live self-join (delta_table replaced by the live table name) */
+	incr_append_from_join(&buf, viewQuery, v1, livename, jl1);
+	/* WHERE (keys) IN (SELECT keys FROM _aff_) [AND view WHERE] */
+	appendStringInfoString(&buf, " WHERE (");
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry    *te = lfirst_node(TargetEntry, lc);
+		StringInfoData	ebuf;
+
+		if (te->resjunk || !IsA(te->expr, Var))
+			continue;
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		first = false;
+		initStringInfo(&ebuf);
+		incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable, v1, &ebuf);
+		appendStringInfoString(&buf, ebuf.data);
+	}
+	appendStringInfoString(&buf, ") IN (SELECT ");
+	first = true;
+	foreach(gcl, groupColNames)
+	{
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		first = false;
+		appendStringInfoString(&buf, quote_identifier(strVal(lfirst(gcl))));
+	}
+	appendStringInfoString(&buf, " FROM _aff_)");
+	if (wq != NULL)
+	{
+		StringInfoData wbuf;
+
+		initStringInfo(&wbuf);
+		incr_deparse_where_qual(wq, viewQuery->rtable, v1, &wbuf);
+		appendStringInfo(&buf, " AND %s", wbuf.data);
+	}
+	appendStringInfoString(&buf, " GROUP BY ");
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry    *te = lfirst_node(TargetEntry, lc);
+		StringInfoData	ebuf;
+
+		if (te->resjunk || !IsA(te->expr, Var))
+			continue;
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		first = false;
+		initStringInfo(&ebuf);
+		incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable, v1, &ebuf);
+		appendStringInfoString(&buf, ebuf.data);
+	}
+	appendStringInfoString(&buf, "),");
+
+	/* ---- _upd_: overwrite surviving affected groups with recomputed values ---- */
+	appendStringInfo(&buf, " _upd_ AS (UPDATE %s SET ", mvname);
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+		const char  *colq;
+
+		if (te->resjunk || IsA(te->expr, Var))
+			continue;
+		if (strcmp(te->resname, MATVIEW_INCR_HAVING_COL) == 0)
+			continue;
+		colq = quote_identifier(te->resname);
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		first = false;
+		appendStringInfo(&buf, "%s=_rc_.%s", colq, colq);
+	}
+	appendStringInfo(&buf, " FROM _rc_ WHERE ");
+	first = true;
+	foreach(gcl, groupColNames)
+	{
+		const char *colq = quote_identifier(strVal(lfirst(gcl)));
+
+		if (!first)
+			appendStringInfoString(&buf, " AND ");
+		first = false;
+		appendStringInfo(&buf, "%s.%s=_rc_.%s", mvname, colq, colq);
+	}
+	appendStringInfoString(&buf, " RETURNING ");
+	first = true;
+	foreach(gcl, groupColNames)
+	{
+		const char *colq = quote_identifier(strVal(lfirst(gcl)));
+
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		first = false;
+		appendStringInfo(&buf, "%s.%s", mvname, colq);
+	}
+	appendStringInfoString(&buf, ")");
+
+	if (is_delete)
+	{
+		/* groups affected but absent from the recompute have vanished */
+		appendStringInfo(&buf, " DELETE FROM %s WHERE (", mvname);
+		first = true;
+		foreach(gcl, groupColNames)
+		{
+			if (!first)
+				appendStringInfoChar(&buf, ',');
+			first = false;
+			appendStringInfo(&buf, "%s.%s", mvname, quote_identifier(strVal(lfirst(gcl))));
+		}
+		appendStringInfoString(&buf, ") IN (SELECT ");
+		first = true;
+		foreach(gcl, groupColNames)
+		{
+			if (!first)
+				appendStringInfoChar(&buf, ',');
+			first = false;
+			appendStringInfoString(&buf, quote_identifier(strVal(lfirst(gcl))));
+		}
+		appendStringInfoString(&buf, " FROM _aff_) AND NOT EXISTS (SELECT 1 FROM _rc_ WHERE ");
+		first = true;
+		foreach(gcl, groupColNames)
+		{
+			const char *colq = quote_identifier(strVal(lfirst(gcl)));
+
+			if (!first)
+				appendStringInfoString(&buf, " AND ");
+			first = false;
+			appendStringInfo(&buf, "_rc_.%s=%s.%s", colq, mvname, colq);
+		}
+		appendStringInfoString(&buf, ")");
+	}
+	else
+	{
+		/* groups in the recompute not matched by _upd_ are new */
+		appendStringInfo(&buf, " INSERT INTO %s (", mvname);
+		first = true;
+		foreach(lc, viewQuery->targetList)
+		{
+			TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+			if (te->resjunk)
+				continue;
+			if (!first)
+				appendStringInfoChar(&buf, ',');
+			first = false;
+			appendStringInfoString(&buf, quote_identifier(te->resname));
+		}
+		appendStringInfoString(&buf, ") SELECT ");
+		first = true;
+		foreach(lc, viewQuery->targetList)
+		{
+			TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+			if (te->resjunk)
+				continue;
+			if (!first)
+				appendStringInfoChar(&buf, ',');
+			first = false;
+			appendStringInfo(&buf, "_rc_.%s", quote_identifier(te->resname));
+		}
+		appendStringInfoString(&buf, " FROM _rc_ WHERE NOT EXISTS (SELECT 1 FROM _upd_ WHERE ");
+		first = true;
+		foreach(gcl, groupColNames)
+		{
+			const char *colq = quote_identifier(strVal(lfirst(gcl)));
+
+			if (!first)
+				appendStringInfoString(&buf, " AND ");
+			first = false;
+			appendStringInfo(&buf, "_upd_.%s=_rc_.%s", colq, colq);
+		}
+		appendStringInfoString(&buf, ")");
+	}
+
+	return buf.data;
+}
+
 static char *
 incr_build_self_join_agg_ins_sql(Oid mvrelid, Query *viewQuery,
 								  int v1, int v2,
 								  const char *delta_table,
 								  List *all_tables)
 {
-	List *jl1  = incr_build_join_list_for_delta(all_tables, v1);
-	List *jl2  = incr_build_join_list_for_delta(all_tables, v2);
-	char *arm1 = incr_build_ins_sql_gen(mvrelid, viewQuery, v1, delta_table, jl1);
-	char *arm2 = incr_build_ins_sql_gen(mvrelid, viewQuery, v2, delta_table, jl2);
-
-	return psprintf("WITH _sj_ins_ AS (%s) %s", arm1, arm2);
+	return incr_build_self_join_agg_apply_sql(mvrelid, viewQuery, v1, v2,
+											  delta_table, all_tables, false);
 }
 
 /*
@@ -6015,13 +6321,8 @@ incr_build_self_join_agg_del_sql(Oid mvrelid, Query *viewQuery,
 								  const char *delta_table,
 								  List *all_tables)
 {
-	List *jl1  = incr_build_join_list_for_delta(all_tables, v1);
-	List *jl2  = incr_build_join_list_for_delta(all_tables, v2);
-	char *arm1 = incr_build_del_sql_gen(mvrelid, viewQuery, v1, delta_table, jl1);
-	char *arm2 = incr_build_del_sql_gen(mvrelid, viewQuery, v2, delta_table, jl2);
-
-	return psprintf("WITH _sj_d1_ AS (%s),_sj_d2_ AS (%s) SELECT 1",
-					arm1, arm2);
+	return incr_build_self_join_agg_apply_sql(mvrelid, viewQuery, v1, v2,
+											  delta_table, all_tables, true);
 }
 
 /* ============================================================
