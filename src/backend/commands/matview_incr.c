@@ -1732,6 +1732,44 @@ MatviewIncrAddNotNullKeyFilters(Query *q)
 			return NIL;
 	}
 
+	/*
+	 * NULL group keys are now maintained with full fidelity (the unique index is
+	 * NULLS NOT DISTINCT and the delta key joins use IS NOT DISTINCT FROM, so a
+	 * NULL/partial-NULL key is one arbiter row that the upsert maintains exactly
+	 * like a REFRESH).  This holds for every shape whose delta SQL goes through
+	 * the shared shells: single-table and INNER JOIN aggregates, DISTINCT, and
+	 * HAVING.  Only MIN/MAX (two-phase rescan: USING/IN/hashtext key matching)
+	 * and self-joins (recompute with =/IN key matching) still need NULL keys
+	 * kept out — exclude them there (writes are still never blocked).  For all
+	 * other shapes, inject nothing so NULL keys are maintained.
+	 */
+	{
+		bool		needs_exclusion = incr_has_minmax_agg(q);
+
+		if (!needs_exclusion)
+		{
+			ListCell   *l1;
+			List	   *seen = NIL;		/* relation OIDs already seen */
+
+			foreach(l1, q->rtable)
+			{
+				RangeTblEntry *rte = lfirst_node(RangeTblEntry, l1);
+
+				if (rte->rtekind != RTE_RELATION)
+					continue;
+				if (list_member_oid(seen, rte->relid))
+				{
+					needs_exclusion = true;		/* self-join */
+					break;
+				}
+				seen = lappend_oid(seen, rte->relid);
+			}
+		}
+
+		if (!needs_exclusion)
+			return NIL;
+	}
+
 	/* Collect key Vars: from the grouping RTE, or (DISTINCT) the output Vars. */
 	{
 		bool		found_group_rte = false;
@@ -3584,7 +3622,8 @@ incr_emit_del_update_tail(StringInfo buf, Oid mvrelid, Query *viewQuery)
 
 		if (!first)
 			appendStringInfoString(buf, " AND ");
-		appendStringInfo(buf, "%s.%s=d.%s", mvname, colq, colq);
+		/* NULL-safe so a NULL/partial-NULL group key matches its delta row */
+		appendStringInfo(buf, "%s.%s IS NOT DISTINCT FROM d.%s", mvname, colq, colq);
 		first = false;
 	}
 }
@@ -5543,7 +5582,14 @@ incr_create_unique_index(Oid mvrelid, List *groupColNames)
 		appendStringInfoString(&sql, quote_identifier(strVal(lfirst(lc))));
 		first = false;
 	}
-	appendStringInfoChar(&sql, ')');
+	/*
+	 * NULLS NOT DISTINCT so a NULL (or partial-NULL) group key is a single
+	 * arbiter row for ON CONFLICT — otherwise NULL keys would never conflict and
+	 * the delta upsert would pile up duplicate rows.  This is what lets NULL
+	 * group keys be maintained with full fidelity (matching a REFRESH) instead
+	 * of being excluded.  Identical to a plain unique index for non-NULL keys.
+	 */
+	appendStringInfoString(&sql, ") NULLS NOT DISTINCT");
 
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "incr_create_unique_index: SPI_connect failed");

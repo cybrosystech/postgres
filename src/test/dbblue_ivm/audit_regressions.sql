@@ -208,5 +208,30 @@ BEGIN
   ELSE RAISE EXCEPTION 'BUGC: FULL OUTER JOIN diverged (% rows)', ndiff; END IF;
 END $$;
 DROP MATERIALIZED VIEW fi; DROP MATERIALIZED VIEW fn; DROP TABLE fl, fr CASCADE;
+
+-- BUG E (audit round 2): a multi-column group key with a partial NULL like
+-- (5, NULL) was over-excluded (any-key-NULL), diverging from a REFRESH that
+-- keeps it as its own group.  NULL/partial-NULL keys are now maintained with
+-- full fidelity (NULLS NOT DISTINCT index + IS NOT DISTINCT FROM joins) for the
+-- shared-shell shapes.  (Full coverage in null_key_exclusion.sql.)
+DROP TABLE IF EXISTS ek CASCADE;
+CREATE TABLE ek(id int primary key, a int, b int, amt numeric NOT NULL);
+INSERT INTO ek VALUES (1,1,2,10),(2,5,NULL,7),(3,NULL,NULL,3);
+CREATE MATERIALIZED VIEW eki WITH (incremental_refresh=true) AS
+  SELECT a,b,SUM(amt) s,COUNT(*) c FROM ek GROUP BY a,b;
+CREATE MATERIALIZED VIEW ekn AS
+  SELECT a,b,SUM(amt) s,COUNT(*) c FROM ek GROUP BY a,b;
+INSERT INTO ek VALUES (4,5,NULL,4),(5,NULL,9,2); DELETE FROM ek WHERE id=3; UPDATE ek SET a=NULL WHERE id=1;
+REFRESH MATERIALIZED VIEW ekn;
+DO $$
+DECLARE ndiff int;
+BEGIN
+  SELECT count(*) INTO ndiff FROM (
+    (SELECT a,b,s,c FROM eki EXCEPT SELECT a,b,s,c FROM ekn)
+    UNION ALL (SELECT a,b,s,c FROM ekn EXCEPT SELECT a,b,s,c FROM eki)) d;
+  IF ndiff=0 THEN RAISE NOTICE 'BUGE multi-key partial-NULL groups maintained == REFRESH: PASS';
+  ELSE RAISE EXCEPTION 'BUGE: partial-NULL key diverged (% rows)', ndiff; END IF;
+END $$;
+DROP MATERIALIZED VIEW eki; DROP MATERIALIZED VIEW ekn; DROP TABLE ek CASCADE;
 \echo ''
 \echo '=== audit regression tests complete ==='

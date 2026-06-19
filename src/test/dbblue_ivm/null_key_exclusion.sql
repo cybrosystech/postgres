@@ -1,89 +1,118 @@
--- DBblue IVM — NULL group-key exclusion (writes are never blocked).
+-- DBblue IVM — NULL group-key fidelity (writes are never blocked).
 --
--- A NULL value in a GROUP BY/DISTINCT key cannot be maintained incrementally.
--- Instead of blocking the source write or corrupting the matview, the engine
--- injects "<key> IS NOT NULL" into the matview's stored query, so NULL-key rows
--- stay OUTSIDE the matview's scope: the source write always succeeds, the
--- matview excludes those rows, and it stays consistent with a full REFRESH.
+-- NULL (and partial-NULL, for multi-column keys) group keys are MAINTAINED with
+-- full fidelity for every shape whose delta goes through the shared shells:
+-- single-table and INNER JOIN aggregates, DISTINCT, and HAVING.  This works via
+-- a NULLS NOT DISTINCT unique index (so a NULL key is one ON CONFLICT arbiter
+-- row) plus IS NOT DISTINCT FROM delta key joins, so the matview equals a full
+-- REFRESH including the NULL group.
+--
+-- MIN/MAX and self-joins still EXCLUDE NULL keys (their hand-written delta SQL
+-- matches keys with =/USING/IN, which NULLs break) — the source write still
+-- always succeeds; those rows are simply left out of the matview.
 \set ON_ERROR_STOP on
 \echo ''
-\echo '=== DBblue IVM: NULL group-key exclusion (writes never blocked) ==='
+\echo '=== DBblue IVM: NULL group-key fidelity ==='
 \echo ''
 
+-- 1) Single nullable key, plain aggregate: the NULL group is maintained and the
+--    matview equals a full REFRESH (including the NULL group) through DML.
 DROP MATERIALIZED VIEW IF EXISTS nx_mv CASCADE;
 DROP TABLE IF EXISTS nx CASCADE;
-CREATE TABLE nx(id serial PRIMARY KEY, g int, amt numeric NOT NULL);  -- g nullable
-INSERT INTO nx(g,amt) VALUES (1,10),(2,20),(NULL,99);                  -- one NULL key at create
+CREATE TABLE nx(id serial PRIMARY KEY, g int, amt numeric NOT NULL);   -- g nullable
+INSERT INTO nx(g,amt) VALUES (1,10),(2,20),(NULL,99);
 CREATE MATERIALIZED VIEW nx_mv WITH (incremental_refresh=true) AS
-  SELECT g, SUM(amt) s FROM nx GROUP BY g WITH DATA;                   -- auto-filtered to g IS NOT NULL
-
+  SELECT g, SUM(amt) s, COUNT(*) c FROM nx GROUP BY g WITH DATA;
 DO $$
-DECLARE nullrows int; mm int; src int;
+DECLARE nullrows int; src int; mm int;
 BEGIN
-  -- 1) initial population excludes the NULL-key row
+  -- NULL group is present (maintained), not excluded
   SELECT count(*) INTO nullrows FROM nx_mv WHERE g IS NULL;
-  IF nullrows = 0 THEN RAISE NOTICE 'NULL key excluded at create: PASS';
-  ELSE RAISE EXCEPTION 'NULL key excluded at create: FAIL (% null rows)', nullrows; END IF;
+  IF nullrows = 1 THEN RAISE NOTICE 'NULL group maintained at create: PASS';
+  ELSE RAISE EXCEPTION 'NULL group at create: FAIL (% null rows)', nullrows; END IF;
 
-  -- 2) inserting a NULL-key row SUCCEEDS (write not blocked) and is ignored
-  INSERT INTO nx(g,amt) VALUES (NULL, 555);
-  SELECT count(*) INTO src FROM nx WHERE g IS NULL;
-  SELECT count(*) INTO nullrows FROM nx_mv WHERE g IS NULL;
-  IF src = 2 AND nullrows = 0 THEN RAISE NOTICE 'NULL-key write succeeds + ignored: PASS';
-  ELSE RAISE EXCEPTION 'NULL-key write: FAIL (src null=%, mv null=%)', src, nullrows; END IF;
-
-  -- 3) normal maintenance stays consistent with the (non-null) live recompute
-  INSERT INTO nx(g,amt) VALUES (1,5);
+  -- NULL-key write SUCCEEDS (never blocked) and updates the NULL group.
+  -- Compare with EXCEPT (NULL-safe: set ops treat NULLs as equal), not a join.
+  INSERT INTO nx(g,amt) VALUES (NULL,555),(1,5);
   DELETE FROM nx WHERE g=2;
-  SELECT count(*) INTO mm FROM
-    (SELECT g, SUM(amt) s FROM nx WHERE g IS NOT NULL GROUP BY g) l
-    FULL JOIN nx_mv m USING (g)
-    WHERE l.g IS DISTINCT FROM m.g OR l.s IS DISTINCT FROM m.s;
-  IF mm = 0 THEN RAISE NOTICE 'incremental consistency: PASS';
-  ELSE RAISE EXCEPTION 'incremental consistency: FAIL (% diff)', mm; END IF;
+  SELECT count(*) INTO src FROM nx WHERE g IS NULL;
+  SELECT count(*) INTO mm FROM (
+    (SELECT g, SUM(amt) s, COUNT(*) c FROM nx GROUP BY g EXCEPT SELECT g,s,c FROM nx_mv)
+    UNION ALL
+    (SELECT g,s,c FROM nx_mv EXCEPT SELECT g, SUM(amt) s, COUNT(*) c FROM nx GROUP BY g)) d;
+  IF src = 2 AND mm = 0 THEN RAISE NOTICE 'NULL-key write succeeds + NULL group == live (incl. NULL): PASS';
+  ELSE RAISE EXCEPTION 'NULL-key maintenance: FAIL (src null=%, diff=%)', src, mm; END IF;
 END $$;
-
--- 4) incremental result == full REFRESH (the core invariant)
 REFRESH MATERIALIZED VIEW nx_mv;
 DO $$
 DECLARE mm int;
 BEGIN
-  SELECT count(*) INTO mm FROM
-    (SELECT g, SUM(amt) s FROM nx WHERE g IS NOT NULL GROUP BY g) l
-    FULL JOIN nx_mv m USING (g)
-    WHERE l.g IS DISTINCT FROM m.g OR l.s IS DISTINCT FROM m.s;
-  IF mm = 0 THEN RAISE NOTICE 'REFRESH equivalence: PASS';
+  SELECT count(*) INTO mm FROM (
+    (SELECT g, SUM(amt) s, COUNT(*) c FROM nx GROUP BY g EXCEPT SELECT g,s,c FROM nx_mv)
+    UNION ALL
+    (SELECT g,s,c FROM nx_mv EXCEPT SELECT g, SUM(amt) s, COUNT(*) c FROM nx GROUP BY g)) d;
+  IF mm = 0 THEN RAISE NOTICE 'incremental == full REFRESH (incl. NULL group): PASS';
   ELSE RAISE EXCEPTION 'REFRESH equivalence: FAIL (% diff)', mm; END IF;
 END $$;
+DROP MATERIALIZED VIEW nx_mv; DROP TABLE nx CASCADE;
 
--- 5) an explicit WHERE g IS NOT NULL is not double-filtered (still correct)
-DROP MATERIALIZED VIEW nx_mv;
-CREATE MATERIALIZED VIEW nx_mv WITH (incremental_refresh=true) AS
-  SELECT g, SUM(amt) s FROM nx WHERE g IS NOT NULL GROUP BY g WITH DATA;
-INSERT INTO nx(g,amt) VALUES (NULL, 1),(3, 30);
+-- 2) Multi-column key with partial NULLs: each distinct (a,b) — including
+--    (5,NULL) and (NULL,NULL) — is its own group, matching a full REFRESH.
+DROP TABLE IF EXISTS nm CASCADE;
+CREATE TABLE nm(id serial PRIMARY KEY, a int, b int, amt numeric NOT NULL);
+INSERT INTO nm(a,b,amt) VALUES (1,2,10),(5,NULL,7),(NULL,NULL,3);
+CREATE MATERIALIZED VIEW nm_mv WITH (incremental_refresh=true) AS
+  SELECT a, b, SUM(amt) s, COUNT(*) c FROM nm GROUP BY a,b WITH DATA;
+INSERT INTO nm(a,b,amt) VALUES (5,NULL,4),(NULL,7,9),(1,2,1);
+DELETE FROM nm WHERE a IS NULL AND b IS NULL;
+UPDATE nm SET b=NULL WHERE a=1;
 DO $$
 DECLARE mm int;
 BEGIN
-  SELECT count(*) INTO mm FROM
-    (SELECT g, SUM(amt) s FROM nx WHERE g IS NOT NULL GROUP BY g) l
-    FULL JOIN nx_mv m USING (g)
-    WHERE l.g IS DISTINCT FROM m.g OR l.s IS DISTINCT FROM m.s;
-  IF mm = 0 THEN RAISE NOTICE 'explicit WHERE IS NOT NULL: PASS';
-  ELSE RAISE EXCEPTION 'explicit WHERE: FAIL (% diff)', mm; END IF;
+  SELECT count(*) INTO mm FROM (
+    (SELECT a,b,SUM(amt) s,COUNT(*) c FROM nm GROUP BY a,b
+       EXCEPT SELECT a,b,s,c FROM nm_mv)
+    UNION ALL
+    (SELECT a,b,s,c FROM nm_mv
+       EXCEPT SELECT a,b,SUM(amt) s,COUNT(*) c FROM nm GROUP BY a,b)) d;
+  IF mm = 0 THEN RAISE NOTICE 'multi-key partial-NULL groups == REFRESH: PASS';
+  ELSE RAISE EXCEPTION 'multi-key partial-NULL: FAIL (% diff)', mm; END IF;
 END $$;
+DROP MATERIALIZED VIEW nm_mv; DROP TABLE nm CASCADE;
 
--- 6) NOT NULL group key: no filter injected, maintenance correct
-DROP MATERIALIZED VIEW nx_mv; DROP TABLE nx;
-CREATE TABLE nx(id serial PRIMARY KEY, g int NOT NULL, amt numeric NOT NULL);
-INSERT INTO nx(g,amt) VALUES (1,10);
-CREATE MATERIALIZED VIEW nx_mv WITH (incremental_refresh=true) AS
-  SELECT g, SUM(amt) s FROM nx GROUP BY g WITH DATA;
-INSERT INTO nx(g,amt) VALUES (1,7),(2,3);
+-- 3) MIN/MAX: NULL keys are still EXCLUDED (documented); the write still succeeds.
+DROP TABLE IF EXISTS mmx CASCADE;
+CREATE TABLE mmx(id serial PRIMARY KEY, g int, v numeric);
+INSERT INTO mmx(g,v) VALUES (1,5),(NULL,9);
+CREATE MATERIALIZED VIEW mmx_mv WITH (incremental_refresh=true) AS
+  SELECT g, MIN(v) mn, MAX(v) mx, COUNT(*) c FROM mmx GROUP BY g WITH DATA;
+DO $$
+DECLARE nullrows int; mm int;
+BEGIN
+  INSERT INTO mmx(g,v) VALUES (NULL,1),(1,8);   -- NULL-key write must not block
+  SELECT count(*) INTO nullrows FROM mmx_mv WHERE g IS NULL;
+  -- non-null groups stay consistent with the (NULL-excluded) live recompute
+  SELECT count(*) INTO mm FROM
+    (SELECT g, MIN(v) mn, MAX(v) mx, COUNT(*) c FROM mmx WHERE g IS NOT NULL GROUP BY g) l
+    FULL JOIN mmx_mv m USING(g)
+    WHERE l.g IS DISTINCT FROM m.g OR l.mn<>m.mn OR l.mx<>m.mx OR l.c<>m.c;
+  IF nullrows = 0 AND mm = 0
+  THEN RAISE NOTICE 'MIN/MAX still excludes NULL key, write not blocked: PASS';
+  ELSE RAISE EXCEPTION 'MIN/MAX NULL handling: FAIL (nullrows=%, diff=%)', nullrows, mm; END IF;
+END $$;
+DROP MATERIALIZED VIEW mmx_mv; DROP TABLE mmx CASCADE;
+
+-- 4) NOT NULL key: nothing injected, maintenance correct (regression guard).
+DROP TABLE IF EXISTS nn CASCADE;
+CREATE TABLE nn(id serial PRIMARY KEY, g int NOT NULL, amt numeric NOT NULL);
+INSERT INTO nn(g,amt) VALUES (1,10);
+CREATE MATERIALIZED VIEW nn_mv WITH (incremental_refresh=true) AS
+  SELECT g, SUM(amt) s FROM nn GROUP BY g WITH DATA;
+INSERT INTO nn(g,amt) VALUES (1,7),(2,3);
 DO $$ DECLARE mm int; BEGIN
-  SELECT count(*) INTO mm FROM (SELECT g, SUM(amt) s FROM nx GROUP BY g) l JOIN nx_mv m USING(g) WHERE l.s<>m.s;
+  SELECT count(*) INTO mm FROM (SELECT g, SUM(amt) s FROM nn GROUP BY g) l JOIN nn_mv m USING(g) WHERE l.s<>m.s;
   IF mm=0 THEN RAISE NOTICE 'NOT NULL key matview: PASS'; ELSE RAISE EXCEPTION 'NOT NULL key: FAIL'; END IF;
 END $$;
-
-DROP MATERIALIZED VIEW nx_mv; DROP TABLE nx;
+DROP MATERIALIZED VIEW nn_mv; DROP TABLE nn CASCADE;
 \echo ''
-\echo '=== NULL group-key exclusion test complete ==='
+\echo '=== NULL group-key fidelity test complete ==='

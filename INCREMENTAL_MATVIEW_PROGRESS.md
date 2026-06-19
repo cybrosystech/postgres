@@ -10,7 +10,36 @@ _Last updated: 2026-06-18 · branch `feature/ivm-incremental-refresh`_
 
 ---
 
-## Most recent work: audit round 2 — exotic-shape bugs (1 fixed, 4 documented)
+## Most recent work: NULL-group fidelity (bug E)
+
+NULL and partial-NULL group keys are now **maintained with full fidelity**
+(== a full `REFRESH`) for every shape whose delta goes through the shared shells:
+single-table & INNER JOIN aggregates, DISTINCT, and HAVING. Previously a row
+with any NULL key was excluded — fine for a single key, but a multi-column key
+like `(5, NULL)` was wrongly dropped though a REFRESH keeps it as its own group.
+
+- `incr_create_unique_index` → `NULLS NOT DISTINCT`, so a NULL/partial-NULL key
+  is a single `ON CONFLICT` arbiter row (otherwise NULL keys never conflict and
+  the upsert piles up duplicates). Identical to before for non-NULL keys.
+- `incr_emit_del_update_tail` (shared by hand + deparse DELETE) → key join uses
+  `IS NOT DISTINCT FROM` so a NULL key matches its delta row.
+- `MatviewIncrAddNotNullKeyFilters` now injects the `IS NOT NULL` exclusion
+  **only** for MIN/MAX and self-join shapes (whose hand delta SQL still matches
+  keys with `=`/`USING`/`IN`/`hashtext`); every other shape keeps NULL keys.
+  Writes are still never blocked in any case.
+
+**Proof:** rewrote `null_key_exclusion.sql` → NULL-group **fidelity** (NULL group
+maintained == REFRESH; multi-key partial-NULL == REFRESH; MIN/MAX still excludes
++ write not blocked; NOT-NULL regression). `audit_regressions.sql` BUGE; full
+suite, dump/restore, and RR/SERIALIZABLE concurrency green off+on.
+
+**Still excluded by design (documented):** MIN/MAX and self-join NULL keys; and
+the accepted all-NULL `SUM` showing `0` (per-column non-null counter would close
+that — separate, minor).
+
+---
+
+## Earlier this work: audit round 2 — exotic-shape bugs
 
 A second adversarial audit targeted the shapes still on **hand builders** (outer/
 self joins, UNION ALL, row-level, MIN/MAX-over-join, DISTINCT). The aggregate
@@ -37,14 +66,13 @@ Rewrote the row-level DELETE to drop exactly `k` copies per tuple via
 - ✅ **C — FULL OUTER JOIN stale NULL-extended phantom** on the
   unmatched→matched transition. Fixed (`5b38733`): the sync-region DELETE now
   mirrors the INSERT region (delete by both sides' join keys).
-- ⏳ **E — multi-key NULL over-exclusion** (deferred). `MatviewIncrAddNotNullKeyFilters`
-  ANDs `IS NOT NULL` over every key, so a partial-NULL key like `(5, NULL)` is
-  dropped though a REFRESH keeps it as its own group. This is the
-  **NULL-group-fidelity** project (needs `NULLS NOT DISTINCT` index +
-  `IS NOT DISTINCT FROM`); see the fidelity backlog below.
+- ✅ **E — multi-key NULL over-exclusion** — fixed (NULL-group fidelity; see the
+  section above). NULL/partial-NULL keys are maintained for the shared-shell
+  shapes via a `NULLS NOT DISTINCT` index + `IS NOT DISTINCT FROM` joins; MIN/MAX
+  and self-join still exclude NULL keys (documented).
 
-All confirmed wrong-answer/write-abort bugs from both audits are now fixed except
-E. Regressions for every fix live in `audit_regressions.sql` (7 cases, each vs a
+All confirmed wrong-answer/write-abort bugs from both audits are now fixed.
+Regressions for every fix live in `audit_regressions.sql` (8 cases, each vs a
 full `REFRESH` or a clean rejection).
 
 ---
