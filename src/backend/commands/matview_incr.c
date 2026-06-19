@@ -320,6 +320,7 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 	ListCell   *lc;
 	int			nbasetables = 0;
 	bool		deparse_agg_shape;
+	bool		self_join_seen = false;
 
 	if (viewQuery->havingQual != NULL && viewQuery->groupClause == NIL)
 	{
@@ -522,6 +523,7 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 				else
 				{
 					entry[1]++;
+					self_join_seen = true;
 					if (entry[1] > 2)
 					{
 						*reason = psprintf("table \"%s\" appears more than twice; "
@@ -627,6 +629,16 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 			{
 				*reason = "CROSS JOIN cannot be combined with LEFT/RIGHT/FULL OUTER JOIN "
 						  "in an incremental matview";
+				return false;
+			}
+			if (has_outer_join && self_join_seen)
+			{
+				/* The outer-join maintenance path registers one catalog row per
+				 * join alias keyed by (mvrelid, srctable); a self-join would
+				 * collide on that key.  Reject cleanly rather than leak an
+				 * internal unique-constraint violation at CREATE time. */
+				*reason = "a self-join combined with LEFT/RIGHT/FULL OUTER JOIN "
+						  "is not supported";
 				return false;
 			}
 			if (has_full_join && viewQuery->groupClause != NIL)
@@ -1218,12 +1230,14 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 		else
 		{
 			/* ---- Phase 2-7: N-table INNER JOIN ---- */
-			/* The deparse core builds per-table deltas for a non-self-join,
-			 * non-MIN/MAX inner join; used for both the delta SQL and the
-			 * failing-group backfill so HAVING is handled the same way. */
+			/* Pure INNER JOIN aggregates ALWAYS use the deparse core (not gated
+			 * by the GUC): it computes per-table join deltas correctly for any
+			 * number of tables, whereas the hand join-delta builder
+			 * mis-attributes a single-row delta to other groups once there are
+			 * 3+ tables.  Drives both the delta SQL and the failing-group
+			 * backfill.  MIN/MAX and self-joins keep their hand builders. */
 			bool	used_deparse = !incr_has_self_join(all_tables) &&
-				!incr_has_minmax_agg(viewQuery) &&
-				(dbblue_ivm_deparse_delta || incr_aggs_need_deparse(viewQuery));
+				!incr_has_minmax_agg(viewQuery);
 
 			if (incr_has_self_join(all_tables))
 			{
@@ -1497,11 +1511,10 @@ MatviewIncrPostRefresh(Oid mvrelid, Query *viewQuery)
 			IncrJoinEntry *first_je   = linitial(all_tables);
 			List		  *join_list  = incr_build_join_list_for_delta(
 				all_tables, first_je->varno);
-			/* Mirror the CREATE-path routing for a pure INNER JOIN. */
+			/* Mirror the CREATE-path routing: pure INNER JOINs always deparse. */
 			bool		   used_deparse = !incr_has_self_join(all_tables) &&
 				!incr_has_outer_join(all_tables) &&
-				!incr_has_minmax_agg(viewQuery) &&
-				(dbblue_ivm_deparse_delta || incr_aggs_need_deparse(viewQuery));
+				!incr_has_minmax_agg(viewQuery);
 
 			backfill_sql = used_deparse
 				? incr_build_backfill_sql_deparse(mvrelid, viewQuery)
@@ -6687,15 +6700,19 @@ incr_build_minmax_ins_sql_gen(Oid mvrelid, Query *viewQuery,
 			const char *sum_q = quote_identifier(sum_col);
 			const char *cnt_q = quote_identifier(cnt_col);
 			const char *type_name = format_type_be(agg->aggtype);
+			/* SUM accumulates NULL-safely (a NULL running total must not be
+			 * poisoned by + ins, and vice versa); COUNT is never NULL. */
+			char	   *sum_expr = incr_nullsafe_accum(
+				psprintf("%s.%s", mvname, sum_q),
+				psprintf("ins.%s", sum_q), false);
 
 			appendStringInfo(&buf,
-							 "%s=%s.%s+ins.%s"
+							 "%s=%s"
 							 ",%s=%s.%s+ins.%s"
-							 ",%s=((%s.%s+ins.%s)::%s/NULLIF(%s.%s+ins.%s,0))",
-							 sum_q, mvname, sum_q, sum_q,
+							 ",%s=(%s::%s/NULLIF(%s.%s+ins.%s,0))",
+							 sum_q, sum_expr,
 							 cnt_q, mvname, cnt_q, cnt_q,
-							 colq,
-							 mvname, sum_q, sum_q, type_name,
+							 colq, sum_expr, type_name,
 							 mvname, cnt_q, cnt_q);
 		}
 		else if (IsA(te->expr, Aggref))
@@ -6709,12 +6726,16 @@ incr_build_minmax_ins_sql_gen(Oid mvrelid, Query *viewQuery,
 				appendStringInfo(&buf, "%s=GREATEST(%s.%s,ins.%s)",
 								 colq, mvname, colq, colq);
 			else
-				appendStringInfo(&buf, "%s=%s.%s+ins.%s",
-								 colq, mvname, colq, colq);
+				/* SUM/COUNT: NULL-safe so a NULL running total (left by an
+				 * earlier delete) is not poisoned by "+ ins". */
+				appendStringInfo(&buf, "%s=%s", colq,
+								 incr_nullsafe_accum(psprintf("%s.%s", mvname, colq),
+													 psprintf("ins.%s", colq), false));
 		}
 		else
-			appendStringInfo(&buf, "%s=%s.%s+ins.%s",
-							 colq, mvname, colq, colq);
+			appendStringInfo(&buf, "%s=%s", colq,
+							 incr_nullsafe_accum(psprintf("%s.%s", mvname, colq),
+												 psprintf("ins.%s", colq), false));
 	}
 
 	appendStringInfoString(&buf, " FROM ins WHERE ");
@@ -7014,6 +7035,43 @@ incr_build_minmax_del_sql_gen(Oid mvrelid, Query *viewQuery,
 							 quote_identifier(psprintf("del_%s", te2->resname)));
 		}
 	}
+	/*
+	 * COUNT(arg) delta columns: COUNT(arg) AS del_<resname> for each
+	 * count-of-an-argument aggregate — both the visible count(col) and the
+	 * hidden AVG count (__mv_avgcnt_*).  These exclude NULL arguments, so they
+	 * must be decremented by COUNT(arg) of the delta, NOT by del_cnt (COUNT(*)),
+	 * which would over-subtract whenever the argument is NULL.  COUNT(*) and
+	 * __mv_count__ keep using del_cnt.
+	 */
+	{
+		ListCell *lc2;
+
+		foreach(lc2, viewQuery->targetList)
+		{
+			TargetEntry    *te2 = lfirst_node(TargetEntry, lc2);
+			Aggref		   *agg2;
+			TargetEntry    *arg_te;
+			StringInfoData  ebuf2;
+
+			if (te2->resjunk || !IsA(te2->expr, Aggref))
+				continue;
+			if (strcmp(te2->resname, MATVIEW_INCR_COUNT_COL) == 0)
+				continue;
+			agg2 = (Aggref *) te2->expr;
+			if (strcmp(get_func_name(agg2->aggfnoid), "count") != 0)
+				continue;
+			if (agg2->aggstar || agg2->args == NIL)		/* COUNT(*) uses del_cnt */
+				continue;
+
+			arg_te = linitial_node(TargetEntry, agg2->args);
+			initStringInfo(&ebuf2);
+			incr_deparse_where_qual((Node *) arg_te->expr, viewQuery->rtable,
+									delta_varno, &ebuf2);
+			appendStringInfo(&buf, ",COUNT(%s) AS %s",
+							 ebuf2.data,
+							 quote_identifier(psprintf("del_%s", te2->resname)));
+		}
+	}
 	incr_append_from_join(&buf, viewQuery, delta_varno, delta_table, join_list);
 	{
 		Node *wq2 = incr_get_where_qual(viewQuery);
@@ -7309,7 +7367,11 @@ incr_build_minmax_del_sql_gen(Oid mvrelid, Query *viewQuery,
 				if (strcmp(fname2, "count") == 0)
 				{
 					is_delta = true;
-					delta_colname = "del_cnt";
+					/* COUNT(*) uses del_cnt; COUNT(arg) excludes NULLs and has
+					 * its own COUNT(arg) delta column. */
+					delta_colname = (agg2->aggstar || agg2->args == NIL)
+						? "del_cnt"
+						: psprintf("del_%s", te->resname);
 				}
 				else if (strcmp(fname2, "sum") == 0)
 				{

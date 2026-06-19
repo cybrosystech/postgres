@@ -10,7 +10,37 @@ _Last updated: 2026-06-18 · branch `feature/ivm-incremental-refresh`_
 
 ---
 
-## Most recent work: JOIN + HAVING via the deparse core
+## Most recent work: adversarial audit + 3 correctness fixes
+
+Ran an adversarial correctness audit (workflow: 8 dimensions, each probing with
+real SQL against the full-`REFRESH` oracle, then independent verification). The
+deparse core came back **clean** (expression/HAVING/lifecycle dimensions found
+nothing); all confirmed bugs were in the **hand builders**. Three fixed:
+
+1. **MIN/MAX corrupted co-located SUM/COUNT/AVG** (critical, silent wrong answer,
+   both GUC states). A matview with MIN/MAX *and* SUM/COUNT(arg)/AVG over the
+   same column lost SUM/COUNT when an argument went NULL→value (or a group's last
+   non-NULL was removed then re-added). Causes: the MIN/MAX INS `upd` used plain
+   `+` (so `NULL + delta = NULL`) instead of the NULL-safe accumulator; and the
+   DEL subtracted `COUNT(*)` from `COUNT(arg)`/`avgcnt` columns (which exclude
+   NULLs). Fixed: NULL-safe INS accumulation + a proper `COUNT(arg)` delta column.
+2. **3+-table INNER JOIN broadcast a single-row delta to other groups** (hand
+   join path; the deparse path was already correct). Fixed by routing **all pure
+   inner-join aggregates to the deparse core** (GUC-independent), retiring the
+   buggy hand join-delta for these shapes.
+3. **LEFT/RIGHT/FULL self-join** leaked an internal catalog unique-constraint
+   error at CREATE (fail-closed). Now rejected cleanly (`feature_not_supported`).
+
+Not bugs (correctly dismissed by verification): a cosmetic numeric display-scale
+difference (values equal), and a REFRESH-side snapshot-timing test artifact.
+
+**Proof:** new `audit_regressions.sql` (the three minimized repros, vs REFRESH /
+clean reject); full suite, dump/restore, and RR/SERIALIZABLE concurrency green
+off+on.
+
+---
+
+## Earlier this work: JOIN + HAVING via the deparse core
 
 Extended HAVING support to pure INNER JOINs — including expression aggregates
 over the join (e.g. `… JOIN … GROUP BY p.categ HAVING SUM(CASE …) > X`).
