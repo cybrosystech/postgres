@@ -10,7 +10,47 @@ _Last updated: 2026-06-18 · branch `feature/ivm-incremental-refresh`_
 
 ---
 
-## Most recent work: adversarial audit + 3 correctness fixes
+## Most recent work: audit round 2 — exotic-shape bugs (1 fixed, 4 documented)
+
+A second adversarial audit targeted the shapes still on **hand builders** (outer/
+self joins, UNION ALL, row-level, MIN/MAX-over-join, DISTINCT). The aggregate
+core stayed clean again — **MIN/MAX-over-join, MIN/MAX edge cases, and LEFT JOIN
+all verified clean**, confirming the round-1 MIN/MAX fix holds. Five real issues
+were found in the exotic shapes; one fixed, four documented as known gaps.
+
+**Fixed — row-level duplicate multiplicity (bug A):** a row-level (no GROUP BY)
+matview keeps duplicate rows, but the DELETE matched by value and removed *all*
+identical copies instead of the deleted multiplicity (single-table and join).
+Rewrote the row-level DELETE to drop exactly `k` copies per tuple via
+`row_number()`+`ctid`. Verified == REFRESH (multiset); regression in
+`audit_regressions.sql`.
+
+### ⚠ Known correctness gaps in exotic (uncertified) shapes — NOT yet fixed
+These shapes already emit a "not yet certified" WARNING at CREATE. Each needs a
+substantial hand-builder rewrite (or a deparse migration / clean rejection):
+
+- **B — UNION ALL drops duplicate multiplicity.** The UNION ALL path stores one
+  row per distinct value + `__mv_count__`, but `UNION ALL` semantically keeps
+  duplicates, so the visible matview shows 1 where a REFRESH shows N. Fix =
+  maintain duplicates (rework `incr_setup_union_all` / dedup-backfill), or expose
+  `__mv_count__` copies.
+- **C — FULL OUTER JOIN leaves a stale NULL-extended phantom** when an unmatched
+  row gains its first partner (asymmetric: only the right-only→matched case). The
+  outer-join delta inserts the matched row but doesn't retract the prior
+  NULL-extended row.
+- **D — self-join self-referential DML aborts the user's write** (raw "ON
+  CONFLICT … cannot affect row a second time"). The two role-arms both touch the
+  same group key and double-count the `ΔR⋈ΔR` self-tuple. **Violates the
+  no-blocked-writes principle** → highest priority among the four. Proper fix =
+  inclusion-exclusion self-join delta merged into one upsert per key.
+- **E — multi-key NULL over-exclusion.** `MatviewIncrAddNotNullKeyFilters` ANDs
+  `IS NOT NULL` over every key, so a partial-NULL key like `(5, NULL)` is dropped
+  though a REFRESH keeps it as its own group. This is the **NULL-group-fidelity**
+  project (needs `NULLS NOT DISTINCT` index + `IS NOT DISTINCT FROM`).
+
+---
+
+## Earlier this work: adversarial audit + 3 correctness fixes
 
 Ran an adversarial correctness audit (workflow: 8 dimensions, each probing with
 real SQL against the full-`REFRESH` oracle, then independent verification). The

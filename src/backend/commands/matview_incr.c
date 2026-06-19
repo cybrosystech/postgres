@@ -3113,60 +3113,74 @@ incr_build_row_del_sql(Oid mvrelid, Query *viewQuery,
 					   int delta_varno, const char *delta_table,
 					   List *join_list)
 {
-	StringInfoData	buf;
+	StringInfoData	buf,
+					part,
+					sel,
+					grp,
+					joincond;
 	ListCell	   *lc;
 	const char	   *mvname = mv_qname(mvrelid);
+	Node		   *wq = incr_get_where_qual(viewQuery);
 	bool			first;
 
 	initStringInfo(&buf);
-
-	appendStringInfo(&buf, "DELETE FROM %s WHERE (", mvname);
-
-	/* Build the column list for the tuple identity */
-	first = true;
-	foreach(lc, viewQuery->targetList)
-	{
-		TargetEntry *te = lfirst_node(TargetEntry, lc);
-
-		if (te->resjunk) continue;
-		if (!first) appendStringInfoChar(&buf, ',');
-		appendStringInfoString(&buf, quote_identifier(te->resname));
-		first = false;
-	}
-	appendStringInfoString(&buf, ") IN (SELECT ");
+	initStringInfo(&part);		/* PARTITION BY _m.col, ...           */
+	initStringInfo(&sel);		/* delta SELECT: <expr> AS col, ...   */
+	initStringInfo(&grp);		/* delta GROUP BY: <expr>, ...        */
+	initStringInfo(&joincond);	/* _m.col IS NOT DISTINCT FROM _rd.col */
 
 	first = true;
 	foreach(lc, viewQuery->targetList)
 	{
 		TargetEntry    *te = lfirst_node(TargetEntry, lc);
+		const char	   *cq;
 		StringInfoData	ebuf;
 
-		if (te->resjunk) continue;
-		if (!first) appendStringInfoChar(&buf, ',');
-		first = false;
-
+		if (te->resjunk)
+			continue;
+		cq = quote_identifier(te->resname);
 		initStringInfo(&ebuf);
 		incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable,
 								delta_varno, &ebuf);
-		appendStringInfoString(&buf, ebuf.data);
+		if (!first)
+		{
+			appendStringInfoChar(&part, ',');
+			appendStringInfoChar(&sel, ',');
+			appendStringInfoChar(&grp, ',');
+			appendStringInfoString(&joincond, " AND ");
+		}
+		appendStringInfo(&part, "_m.%s", cq);
+		appendStringInfo(&sel, "%s AS %s", ebuf.data, cq);
+		appendStringInfoString(&grp, ebuf.data);
+		appendStringInfo(&joincond, "_m.%s IS NOT DISTINCT FROM _rd.%s", cq, cq);
+		first = false;
 	}
+
+	/*
+	 * A row-level matview keeps duplicate output rows, so a DELETE must remove
+	 * exactly the deleted MULTIPLICITY of each tuple, not every value-identical
+	 * copy.  Aggregate the delta into one row per distinct output tuple with its
+	 * count _k, number the matview's copies of that tuple, and drop the first _k.
+	 */
+	appendStringInfo(&buf,
+					 "DELETE FROM %s WHERE ctid IN ("
+					 "SELECT s.ctid FROM ("
+					 "SELECT _m.ctid, row_number() OVER (PARTITION BY %s) AS _rn, _rd._k "
+					 "FROM %s _m JOIN (SELECT %s, count(*) AS _k",
+					 mvname, part.data, mvname, sel.data);
 
 	incr_append_from_join(&buf, viewQuery, delta_varno, delta_table, join_list);
-
+	if (wq != NULL)
 	{
-		Node *wq = incr_get_where_qual(viewQuery);
+		StringInfoData wbuf;
 
-		if (wq != NULL)
-		{
-			StringInfoData wbuf;
-
-			initStringInfo(&wbuf);
-			incr_deparse_where_qual(wq, viewQuery->rtable, delta_varno, &wbuf);
-			appendStringInfo(&buf, " WHERE %s", wbuf.data);
-		}
+		initStringInfo(&wbuf);
+		incr_deparse_where_qual(wq, viewQuery->rtable, delta_varno, &wbuf);
+		appendStringInfo(&buf, " WHERE %s", wbuf.data);
 	}
-
-	appendStringInfoString(&buf, ")");
+	appendStringInfo(&buf,
+					 " GROUP BY %s) _rd ON (%s)) s WHERE s._rn <= s._k)",
+					 grp.data, joincond.data);
 
 	return buf.data;
 }

@@ -91,5 +91,29 @@ EXCEPTION
   WHEN others THEN RAISE EXCEPTION 'BUG3: wrong error % (%) — expected feature_not_supported', SQLSTATE, SQLERRM;
 END $$;
 DROP TABLE emp CASCADE;
+
+-- BUG A (audit round 2): a row-level (no GROUP BY) matview keeps duplicate rows;
+-- a DELETE of one source row used to remove ALL value-identical output copies.
+-- Verify the multiset matches a full REFRESH after duplicate-touching DML, for
+-- a single table and an inner join.
+DROP TABLE IF EXISTS rl CASCADE;
+CREATE TABLE rl(id int, name text, val int);
+INSERT INTO rl VALUES (1,'a',10),(1,'a',10),(1,'a',10),(2,'b',20);
+CREATE MATERIALIZED VIEW rli WITH (incremental_refresh=true) AS SELECT id,name,val FROM rl;
+CREATE MATERIALIZED VIEW rln AS SELECT id,name,val FROM rl;
+DELETE FROM rl WHERE ctid IN (SELECT ctid FROM rl WHERE id=1 LIMIT 1);   -- one of three copies
+INSERT INTO rl VALUES (2,'b',20);
+DELETE FROM rl WHERE ctid IN (SELECT ctid FROM rl WHERE id=2 LIMIT 1);
+REFRESH MATERIALIZED VIEW rln;
+DO $$
+DECLARE n int;
+BEGIN
+  SELECT count(*) INTO n FROM (
+    (SELECT id,name,val FROM rli EXCEPT ALL SELECT id,name,val FROM rln)
+    UNION ALL (SELECT id,name,val FROM rln EXCEPT ALL SELECT id,name,val FROM rli)) d;
+  IF n=0 THEN RAISE NOTICE 'BUGA row-level duplicate multiplicity == REFRESH: PASS';
+  ELSE RAISE EXCEPTION 'BUGA: row-level multiset diverged (% rows)', n; END IF;
+END $$;
+DROP MATERIALIZED VIEW rli; DROP MATERIALIZED VIEW rln; DROP TABLE rl CASCADE;
 \echo ''
 \echo '=== audit regression tests complete ==='
