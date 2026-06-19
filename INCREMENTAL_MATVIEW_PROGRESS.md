@@ -25,28 +25,27 @@ Rewrote the row-level DELETE to drop exactly `k` copies per tuple via
 `row_number()`+`ctid`. Verified == REFRESH (multiset); regression in
 `audit_regressions.sql`.
 
-### ⚠ Known correctness gaps in exotic (uncertified) shapes — NOT yet fixed
-These shapes already emit a "not yet certified" WARNING at CREATE. Each needs a
-substantial hand-builder rewrite (or a deparse migration / clean rejection):
+### Exotic-shape bugs from round 2 — D, B, C fixed; E deferred
+- ✅ **D — self-join self-referential DML aborted the user's write** ("ON
+  CONFLICT … cannot affect row a second time", from the `ΔR⋈ΔR` double-count).
+  Fixed (`72fdd4e`): replaced the two role-arms with a recompute-of-affected-
+  groups apply — one upsert per key, correct by construction, never aborts a
+  write.
+- ✅ **B — UNION ALL dropped duplicate multiplicity** (deduped into one row +
+  `__mv_count__`). Fixed (`00b1cec`): maintained as a plain multiset — plain
+  INSERT keeps duplicates, multiplicity-respecting DELETE; no count/dedup/index.
+- ✅ **C — FULL OUTER JOIN stale NULL-extended phantom** on the
+  unmatched→matched transition. Fixed (`5b38733`): the sync-region DELETE now
+  mirrors the INSERT region (delete by both sides' join keys).
+- ⏳ **E — multi-key NULL over-exclusion** (deferred). `MatviewIncrAddNotNullKeyFilters`
+  ANDs `IS NOT NULL` over every key, so a partial-NULL key like `(5, NULL)` is
+  dropped though a REFRESH keeps it as its own group. This is the
+  **NULL-group-fidelity** project (needs `NULLS NOT DISTINCT` index +
+  `IS NOT DISTINCT FROM`); see the fidelity backlog below.
 
-- **B — UNION ALL drops duplicate multiplicity.** The UNION ALL path stores one
-  row per distinct value + `__mv_count__`, but `UNION ALL` semantically keeps
-  duplicates, so the visible matview shows 1 where a REFRESH shows N. Fix =
-  maintain duplicates (rework `incr_setup_union_all` / dedup-backfill), or expose
-  `__mv_count__` copies.
-- **C — FULL OUTER JOIN leaves a stale NULL-extended phantom** when an unmatched
-  row gains its first partner (asymmetric: only the right-only→matched case). The
-  outer-join delta inserts the matched row but doesn't retract the prior
-  NULL-extended row.
-- **D — self-join self-referential DML aborts the user's write** (raw "ON
-  CONFLICT … cannot affect row a second time"). The two role-arms both touch the
-  same group key and double-count the `ΔR⋈ΔR` self-tuple. **Violates the
-  no-blocked-writes principle** → highest priority among the four. Proper fix =
-  inclusion-exclusion self-join delta merged into one upsert per key.
-- **E — multi-key NULL over-exclusion.** `MatviewIncrAddNotNullKeyFilters` ANDs
-  `IS NOT NULL` over every key, so a partial-NULL key like `(5, NULL)` is dropped
-  though a REFRESH keeps it as its own group. This is the **NULL-group-fidelity**
-  project (needs `NULLS NOT DISTINCT` index + `IS NOT DISTINCT FROM`).
+All confirmed wrong-answer/write-abort bugs from both audits are now fixed except
+E. Regressions for every fix live in `audit_regressions.sql` (7 cases, each vs a
+full `REFRESH` or a clean rejection).
 
 ---
 
