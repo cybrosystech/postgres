@@ -10,7 +10,28 @@ _Last updated: 2026-06-18 · branch `feature/ivm-incremental-refresh`_
 
 ---
 
-## Most recent work: deparse failing-group backfill → `SUM(CASE)` + HAVING
+## Most recent work: JOIN + HAVING via the deparse core
+
+Extended HAVING support to pure INNER JOINs — including expression aggregates
+over the join (e.g. `… JOIN … GROUP BY p.categ HAVING SUM(CASE …) > X`).
+
+- Dropped the `!hasHaving` gate from the JOIN deparse branch; a single
+  `used_deparse` flag (`!self-join && !MIN/MAX && (GUC || needs-deparse)`) drives
+  both the per-table delta builders and the failing-group backfill.
+- The deparse backfill (`incr_build_backfill_sql_deparse`) already deparses over
+  the real base relations, so it renders the join with no change.
+- Routed the **restore**-path JOIN backfill (`MatviewIncrPostRefresh`, ≥2-table
+  branch) the same way, so JOIN + HAVING is restorable.
+- `deparse_agg_shape` now allows HAVING for the INNER-JOIN shape too.
+
+**Proof:** gold-standard oracle → **13 shapes** incl. plain JOIN+HAVING and
+JOIN+`SUM(CASE)`+HAVING (incremental == full `REFRESH`, both paths); dump/restore
+(off+on) gains `mv_join_having` (auto-routed, restorable, correct after restore);
+full suite + RR/SERIALIZABLE concurrency green.
+
+---
+
+## Earlier this work: deparse failing-group backfill → `SUM(CASE)` + HAVING
 
 Enabled expression-arg aggregates with HAVING (single table) — e.g.
 `SUM(CASE WHEN … END) … HAVING SUM(CASE …) > X` — by giving the HAVING
@@ -230,8 +251,7 @@ Migrate each shape to deparse and delete its hand builder once equivalent:
    Outer/self joins still excluded.
 2. ✅ **single-table HAVING** — done, incl. argument-aware aggregate binding and
    expression-arg HAVING (`SUM(CASE…)` + HAVING) via the deparse backfill.
-3. **JOIN + HAVING** — needs the failing-group backfill on the deparse JOIN path
-   (currently JOIN+HAVING stays on hand builders).
+3. ✅ **JOIN + HAVING** — done, incl. expression aggregates over the join.
 4. **OUTER / SELF JOIN** — deparse the recompute/sync SELECT; subtle delta
    semantics (nullable side, both roles) — verify carefully.
 5. **MIN/MAX** — keep the two-phase rescan; deparse only the scan SELECT.

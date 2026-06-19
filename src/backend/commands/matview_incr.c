@@ -667,20 +667,19 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 
 	/*
 	 * Shapes the deparse delta core is wired for: a GROUP BY aggregate with no
-	 * MIN/MAX, over either a single table (HAVING supported — delta + deparse
-	 * backfill) or a pure INNER JOIN with no HAVING (no outer join, no
-	 * self-join).  For those, an aggregate argument may use any deterministic
-	 * scalar expression (CASE, COALESCE, function calls) because ruleutils
-	 * renders it; other shapes keep the restricted hand grammar until deparse is
-	 * widened to them.  This must mirror the routing decision in
-	 * MatviewIncrSetup so a shape accepted here is actually one the deparse path
-	 * will build (and re-build identically on restore).
+	 * MIN/MAX, over either a single table or a pure INNER JOIN (no outer join,
+	 * no self-join).  HAVING is supported on both (delta strips it; the
+	 * failing-group backfill uses deparse too).  For those an aggregate argument
+	 * may use any deterministic scalar expression (CASE, COALESCE, function
+	 * calls) because ruleutils renders it; other shapes keep the restricted hand
+	 * grammar until deparse is widened to them.  This must mirror the routing
+	 * decision in MatviewIncrSetup so a shape accepted here is actually one the
+	 * deparse path will build (and re-build identically on restore).
 	 */
 	deparse_agg_shape = (viewQuery->groupClause != NIL &&
 						!incr_has_minmax_agg(viewQuery) &&
-						((nbasetables == 1) ||
-						 (viewQuery->havingQual == NULL &&
-						  incr_inner_join_deparse_shape(viewQuery, nbasetables))));
+						(nbasetables == 1 ||
+						 incr_inner_join_deparse_shape(viewQuery, nbasetables)));
 
 	/* Validate SELECT list expressions */
 	foreach(lc, viewQuery->targetList)
@@ -1219,6 +1218,13 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 		else
 		{
 			/* ---- Phase 2-7: N-table INNER JOIN ---- */
+			/* The deparse core builds per-table deltas for a non-self-join,
+			 * non-MIN/MAX inner join; used for both the delta SQL and the
+			 * failing-group backfill so HAVING is handled the same way. */
+			bool	used_deparse = !incr_has_self_join(all_tables) &&
+				!incr_has_minmax_agg(viewQuery) &&
+				(dbblue_ivm_deparse_delta || incr_aggs_need_deparse(viewQuery));
+
 			if (incr_has_self_join(all_tables))
 			{
 				/*
@@ -1314,15 +1320,15 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 					incr_store_catalog(mvrelid, delta->oid,
 									   ins_sql, del_sql, cln_sql, hav_sql, lock_sql);
 				}
-				else if ((dbblue_ivm_deparse_delta ||
-						  incr_aggs_need_deparse(viewQuery)) && !hasHaving)
+				else if (used_deparse)
 				{
 					/* Phase 2: INNER JOIN delta via the deparse core.  The
 					 * delta for table delta->oid swaps only that table's RTE
 					 * for the transition-table ENR; the other tables stay as
-					 * relations, so deparse renders the join naturally.
-					 * Auto-routed when the shape needs it (expression args);
-					 * HAVING/MIN-MAX/outer/self joins keep hand builders. */
+					 * relations, so deparse renders the join naturally.  HAVING
+					 * is supported (delta strips it; the failing-group backfill
+					 * below also uses deparse).  MIN/MAX, outer and self joins
+					 * keep their hand builders. */
 					ins_sql = incr_build_ins_sql_deparse(mvrelid, viewQuery,
 										 delta->oid, MATVIEW_INCR_NEWTABLE);
 					del_sql = incr_build_del_sql_deparse(mvrelid, viewQuery,
@@ -1356,9 +1362,11 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 				IncrJoinEntry *first_je  = linitial(all_tables);
 				List		  *join_list = incr_build_join_list_for_delta(
 					all_tables, first_je->varno);
-				char		  *backfill_sql = incr_build_backfill_sql_gen(
-					mvrelid, viewQuery,
-					first_je->varno, mv_qname(first_je->oid), join_list);
+				char		  *backfill_sql = used_deparse
+					? incr_build_backfill_sql_deparse(mvrelid, viewQuery)
+					: incr_build_backfill_sql_gen(
+						mvrelid, viewQuery,
+						first_je->varno, mv_qname(first_je->oid), join_list);
 				int			   spi_ret;
 
 				OpenMatViewIncrementalMaintenance();
@@ -1489,12 +1497,17 @@ MatviewIncrPostRefresh(Oid mvrelid, Query *viewQuery)
 			IncrJoinEntry *first_je   = linitial(all_tables);
 			List		  *join_list  = incr_build_join_list_for_delta(
 				all_tables, first_je->varno);
+			/* Mirror the CREATE-path routing for a pure INNER JOIN. */
+			bool		   used_deparse = !incr_has_self_join(all_tables) &&
+				!incr_has_outer_join(all_tables) &&
+				!incr_has_minmax_agg(viewQuery) &&
+				(dbblue_ivm_deparse_delta || incr_aggs_need_deparse(viewQuery));
 
-			/* JOIN + HAVING is not deparse-enabled, so its arguments are always
-			 * within the hand grammar. */
-			backfill_sql = incr_build_backfill_sql_gen(
-				mvrelid, viewQuery, first_je->varno,
-				mv_qname(first_je->oid), join_list);
+			backfill_sql = used_deparse
+				? incr_build_backfill_sql_deparse(mvrelid, viewQuery)
+				: incr_build_backfill_sql_gen(
+					mvrelid, viewQuery, first_je->varno,
+					mv_qname(first_je->oid), join_list);
 		}
 
 		OpenMatViewIncrementalMaintenance();

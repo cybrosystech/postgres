@@ -69,7 +69,10 @@ DECLARE
     -- (an OID-only match would filter on SUM(amt) and diverge from REFRESH)
     ['SELECT g AS k, SUM(amt) sa, SUM(qty) sb, COUNT(*) c FROM vt GROUP BY g HAVING SUM(qty) > 3000', 'k,sa,sb,c'],
     -- expression-arg aggregate + HAVING on it: delta + deparse failing-group backfill
-    ['SELECT g AS k, SUM(CASE WHEN st=''done'' THEN amt ELSE 0 END) d, COUNT(*) c FROM vt GROUP BY g HAVING SUM(CASE WHEN st=''done'' THEN amt ELSE 0 END) > 2000', 'k,d,c']
+    ['SELECT g AS k, SUM(CASE WHEN st=''done'' THEN amt ELSE 0 END) d, COUNT(*) c FROM vt GROUP BY g HAVING SUM(CASE WHEN st=''done'' THEN amt ELSE 0 END) > 2000', 'k,d,c'],
+    -- INNER JOIN + HAVING (plain) and JOIN + SUM(CASE) + HAVING (deparse backfill over the join)
+    ['SELECT p.categ k, SUM(t.amt) s, COUNT(*) c FROM vt t JOIN vp p ON p.id=t.product_id GROUP BY p.categ HAVING SUM(t.amt) > 3000', 'k,s,c'],
+    ['SELECT p.categ k, SUM(CASE WHEN t.st=''done'' THEN t.amt ELSE 0 END) d, COUNT(*) c FROM vt t JOIN vp p ON p.id=t.product_id GROUP BY p.categ HAVING SUM(CASE WHEN t.st=''done'' THEN t.amt ELSE 0 END) > 1500', 'k,d,c']
   ];
   i int; n int; bad int := 0;
 BEGIN

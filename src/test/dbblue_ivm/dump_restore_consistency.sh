@@ -82,6 +82,15 @@ CREATE MATERIALIZED VIEW mv_having_expr WITH (incremental_refresh=true) AS
   FROM sales GROUP BY product_id
   HAVING SUM(CASE WHEN amount > 50 THEN amount ELSE 0 END) > 200 WITH DATA;
 
+-- INNER JOIN + SUM(CASE) + HAVING: exercises the deparse failing-group backfill
+-- over a join, on both the create and restore paths.
+CREATE MATERIALIZED VIEW mv_join_having WITH (incremental_refresh=true) AS
+  SELECT p.categ,
+         SUM(CASE WHEN s.amount > 50 THEN s.amount ELSE 0 END) AS hi_rev,
+         COUNT(*) AS cnt
+  FROM sales s JOIN prod p ON p.id = s.product_id GROUP BY p.categ
+  HAVING SUM(CASE WHEN s.amount > 50 THEN s.amount ELSE 0 END) > 500 WITH DATA;
+
 -- Row-level UNION ALL with cross-branch duplicates (exercises dedup + count).
 CREATE TABLE tag_a (id int PRIMARY KEY, tag text);
 CREATE TABLE tag_b (id int PRIMARY KEY, tag text);
@@ -120,9 +129,9 @@ catje=$($PSQL -d $DST -tAc "SELECT count(*) FROM pg_dbblue_matview WHERE mvrelid
 check "mv_join_expr catalog rows (one per source table)" "$catje" "2"
 ecj=$($PSQL -d $DST -tAc "SELECT (bool_and(ins_sql LIKE '%CASE%' AND ins_sql LIKE '%__mv_newtable%'))::int FROM pg_dbblue_matview WHERE mvrelid='mv_join_expr'::regclass;")
 check "mv_join_expr auto-routed to deparse core (CASE in delta SQL)" "$ecj" "1"
-# Two HAVING matviews now: mv_having (plain) and mv_having_expr (SUM(CASE)).
+# Three HAVING matviews: mv_having, mv_having_expr, mv_join_having.
 hbase=$($PSQL -d $DST -tAc "SELECT count(DISTINCT p.mvrelid) FROM pg_dbblue_matview p JOIN pg_class c ON c.oid=p.mvrelid WHERE c.relname LIKE '\_dbblue\_%\_base';")
-check "HAVING base catalog rows" "$hbase" "2"
+check "HAVING base catalog rows" "$hbase" "3"
 
 note "=== incremental correctness after restore (INSERT + DELETE) ==="
 $PSQL -d $DST -q -c "INSERT INTO sales(product_id, amount) VALUES (1, 50),(2, 200),(1, 7);"
@@ -160,6 +169,14 @@ SELECT count(*) FROM live FULL JOIN mv_having_expr m USING(product_id)
   WHERE live.product_id IS DISTINCT FROM m.product_id
      OR abs(live.hi-m.hi_rev)>0.001 OR live.c<>m.cnt;")
 check "mv_having_expr (SUM(CASE)+HAVING) mismatches after restore" "$mhe" "0"
+mjh=$($PSQL -d $DST -tAc "
+WITH live AS (SELECT p.categ, SUM(CASE WHEN s.amount>50 THEN s.amount ELSE 0 END) hi, COUNT(*) c
+              FROM sales s JOIN prod p ON p.id=s.product_id GROUP BY p.categ
+              HAVING SUM(CASE WHEN s.amount>50 THEN s.amount ELSE 0 END) > 500)
+SELECT count(*) FROM live FULL JOIN mv_join_having m USING(categ)
+  WHERE live.categ IS DISTINCT FROM m.categ
+     OR abs(live.hi-m.hi_rev)>0.001 OR live.c<>m.cnt;")
+check "mv_join_having (JOIN+SUM(CASE)+HAVING) mismatches after restore" "$mjh" "0"
 
 note "=== HAVING: failing group crosses threshold after restore (needs rebuilt seed) ==="
 # pick a currently-failing product and push it well over the threshold
@@ -187,7 +204,7 @@ check "mv_union mismatches after restore+DML" "$umm" "0"
 
 note "=== TRUNCATE re-seeding after restore ==="
 $PSQL -d $DST -q -c "TRUNCATE sales CASCADE;"
-rows=$($PSQL -d $DST -tAc "SELECT (SELECT count(*) FROM mv_sum)+(SELECT count(*) FROM mv_avg)+(SELECT count(*) FROM mv_minmax)+(SELECT count(*) FROM mv_join)+(SELECT count(*) FROM mv_having)+(SELECT count(*) FROM mv_expr)+(SELECT count(*) FROM mv_join_expr)+(SELECT count(*) FROM mv_having_expr);")
+rows=$($PSQL -d $DST -tAc "SELECT (SELECT count(*) FROM mv_sum)+(SELECT count(*) FROM mv_avg)+(SELECT count(*) FROM mv_minmax)+(SELECT count(*) FROM mv_join)+(SELECT count(*) FROM mv_having)+(SELECT count(*) FROM mv_expr)+(SELECT count(*) FROM mv_join_expr)+(SELECT count(*) FROM mv_having_expr)+(SELECT count(*) FROM mv_join_having);")
 check "all aggregate matviews empty after TRUNCATE" "$rows" "0"
 
 $PSQL -d postgres -q -c "DROP DATABASE IF EXISTS $SRC;" -c "DROP DATABASE IF EXISTS $DST;"
