@@ -5308,6 +5308,57 @@ incr_build_outer_row_sync_sql(Oid mvrelid, Query *viewQuery,
 						 quote_identifier(delta_pk_src_col),
 						 delta_table);
 	}
+
+	/*
+	 * FULL JOIN: the affected region also contains rows matched on the OTHER
+	 * side's key — in particular a previously unmatched (NULL-extended) row that
+	 * the delta now matches has a NULL delta-side key and would be missed by the
+	 * delete above, leaving a stale phantom.  Mirror the INSERT's region filter
+	 * by also deleting via each non-preserved table's join-key matview column.
+	 */
+	if (has_full_join)
+	{
+		foreach(lc, all_tables)
+		{
+			IncrJoinEntry *je = lfirst(lc);
+			Node		  *q;
+			const char	  *other_fk_col;
+			const char	  *mv_other_col = NULL;
+			ListCell	  *tlc;
+
+			if (je->varno == preserved_varno)
+				continue;
+			q = find_connecting_qual(all_tables, je->varno, preserved_varno);
+			if (q == NULL)
+				q = je->quals;
+			other_fk_col = incr_qual_get_colname_for_varno(q, viewQuery->rtable,
+														   je->varno);
+			if (other_fk_col == NULL)
+				continue;
+			foreach(tlc, viewQuery->targetList)
+			{
+				TargetEntry *te = lfirst_node(TargetEntry, tlc);
+				Var		   *v;
+				int			rv;
+
+				if (te->resjunk || !IsA(te->expr, Var))
+					continue;
+				v = (Var *) te->expr;
+				if (v->varno != je->varno)
+					continue;
+				if (strcmp(incr_resolve_var_colname(v, viewQuery->rtable, &rv),
+						   other_fk_col) == 0)
+				{
+					mv_other_col = te->resname;
+					break;
+				}
+			}
+			if (mv_other_col != NULL && strcmp(mv_other_col, mv_peer_col) != 0)
+				appendStringInfo(&buf,
+								 "\n     OR %s IN (SELECT jkey FROM _aff_)",
+								 quote_identifier(mv_other_col));
+		}
+	}
 	appendStringInfoString(&buf, "\n)\n");
 
 	/* ---- INSERT: fresh rows for the affected region ---- */

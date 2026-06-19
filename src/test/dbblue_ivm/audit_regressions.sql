@@ -179,5 +179,34 @@ BEGIN
   ELSE RAISE EXCEPTION 'BUGB: UNION ALL multiset diverged (% rows)', ndiff; END IF;
 END $$;
 DROP MATERIALIZED VIEW ui; DROP MATERIALIZED VIEW un; DROP TABLE ua, ub CASCADE;
+
+-- BUG C (audit round 2): a FULL OUTER JOIN row-level matview left a stale
+-- NULL-extended phantom when a previously-unmatched row gained a partner (the
+-- delete keyed only on the delta-side join column, NULL for that phantom).  Now
+-- the affected region is deleted by both sides' keys.  Verify == REFRESH across
+-- unmatched->matched and matched->unmatched transitions on both sides.
+DROP TABLE IF EXISTS fl, fr CASCADE;
+CREATE TABLE fl(k int);
+CREATE TABLE fr(k int);
+INSERT INTO fr VALUES (4);
+CREATE MATERIALIZED VIEW fi WITH (incremental_refresh=true) AS
+  SELECT l.k lk, r.k rk FROM fl l FULL OUTER JOIN fr r ON l.k=r.k;
+CREATE MATERIALIZED VIEW fn AS
+  SELECT l.k lk, r.k rk FROM fl l FULL OUTER JOIN fr r ON l.k=r.k;
+INSERT INTO fl VALUES (4);        -- right-only row gains its first left partner
+INSERT INTO fl VALUES (8); INSERT INTO fr VALUES (8);   -- mirror
+DELETE FROM fl WHERE k=4;         -- matched -> back to right-only
+INSERT INTO fr VALUES (9);        -- new right-only
+REFRESH MATERIALIZED VIEW fn;
+DO $$
+DECLARE ndiff int;
+BEGIN
+  SELECT count(*) INTO ndiff FROM (
+    (SELECT lk,rk FROM fi EXCEPT ALL SELECT lk,rk FROM fn)
+    UNION ALL (SELECT lk,rk FROM fn EXCEPT ALL SELECT lk,rk FROM fi)) d;
+  IF ndiff=0 THEN RAISE NOTICE 'BUGC FULL OUTER JOIN (no stale phantom) == REFRESH: PASS';
+  ELSE RAISE EXCEPTION 'BUGC: FULL OUTER JOIN diverged (% rows)', ndiff; END IF;
+END $$;
+DROP MATERIALIZED VIEW fi; DROP MATERIALIZED VIEW fn; DROP TABLE fl, fr CASCADE;
 \echo ''
 \echo '=== audit regression tests complete ==='
