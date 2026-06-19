@@ -150,5 +150,34 @@ BEGIN
   ELSE RAISE EXCEPTION 'BUGD: self-join diverged from REFRESH (% rows)', n; END IF;
 END $$;
 DROP MATERIALIZED VIEW ei; DROP MATERIALIZED VIEW en; DROP TABLE emp CASCADE;
+
+-- BUG B (audit round 2): UNION ALL kept duplicates per its definition, but the
+-- matview deduped into one row per value + __mv_count__, so it showed 1 where a
+-- REFRESH showed N.  It is now maintained as a plain multiset; verify the
+-- multiset equals a full REFRESH after cross-branch duplicate DML.
+DROP TABLE IF EXISTS ua, ub CASCADE;
+CREATE TABLE ua(id int, val text, n int);
+CREATE TABLE ub(id int, val text, n int);
+INSERT INTO ua VALUES (1,'y',20),(2,'y',20),(3,'y',20);
+INSERT INTO ub VALUES (4,'y',20),(5,'z',5);
+CREATE MATERIALIZED VIEW ui WITH (incremental_refresh=true) AS
+  SELECT val,n FROM ua UNION ALL SELECT val,n FROM ub;
+CREATE MATERIALIZED VIEW un AS
+  SELECT val,n FROM ua UNION ALL SELECT val,n FROM ub;
+INSERT INTO ua VALUES (6,'y',20),(7,'z',5);
+DELETE FROM ub WHERE id=4;
+DELETE FROM ua WHERE id=1;
+UPDATE ua SET val='z' WHERE id=2;
+REFRESH MATERIALIZED VIEW un;
+DO $$
+DECLARE ndiff int;
+BEGIN
+  SELECT count(*) INTO ndiff FROM (
+    (SELECT val,n FROM ui EXCEPT ALL SELECT val,n FROM un)
+    UNION ALL (SELECT val,n FROM un EXCEPT ALL SELECT val,n FROM ui)) d;
+  IF ndiff=0 THEN RAISE NOTICE 'BUGB UNION ALL multiset (duplicates kept) == REFRESH: PASS';
+  ELSE RAISE EXCEPTION 'BUGB: UNION ALL multiset diverged (% rows)', ndiff; END IF;
+END $$;
+DROP MATERIALIZED VIEW ui; DROP MATERIALIZED VIEW un; DROP TABLE ua, ub CASCADE;
 \echo ''
 \echo '=== audit regression tests complete ==='

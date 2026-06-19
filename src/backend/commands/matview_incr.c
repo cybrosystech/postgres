@@ -236,7 +236,6 @@ static char *incr_build_union_del_sql(Oid mvrelid, Query *viewQuery,
 									   Query *branchQuery,
 									   int delta_varno, const char *delta_table,
 									   List *join_list);
-static void incr_union_dedup_backfill(Oid mvrelid, Query *viewQuery);
 static void incr_setup_union_all(Oid mvrelid, Query *viewQuery, bool mv_populated);
 static bool incr_has_minmax_agg(Query *viewQuery);
 static char *incr_build_minmax_ins_sql_gen(Oid mvrelid, Query *viewQuery,
@@ -1444,36 +1443,13 @@ MatviewIncrPostRefresh(Oid mvrelid, Query *viewQuery)
 	if (!MatviewIncrIsSetUp(mvrelid))
 		return;
 
-	/* UNION ALL: re-collapse duplicates, then build the deferred unique index. */
+	/*
+	 * UNION ALL is maintained as a plain multiset (duplicates kept, no
+	 * __mv_count__, no unique index); a REFRESH/restore reloads the raw rows,
+	 * which is already correct, so there is nothing to re-seed here.
+	 */
 	if (viewQuery->setOperations != NULL)
-	{
-		incr_union_dedup_backfill(mvrelid, viewQuery);
-		CommandCounterIncrement();
-
-		/*
-		 * On the restore path the unique index was deferred (setup could not
-		 * build it before the REFRESH reloaded raw duplicate rows).  Now that
-		 * the dedup has collapsed them, build it.  Skip if it already exists.
-		 */
-		if (!OidIsValid(get_relname_relid(psprintf("__mv_uniq_%u", mvrelid),
-										  get_rel_namespace(mvrelid))))
-		{
-			List	   *allColNames = NIL;
-
-			foreach(lc, viewQuery->targetList)
-			{
-				TargetEntry *te = lfirst_node(TargetEntry, lc);
-
-				if (te->resjunk || incr_is_hidden_col(te->resname))
-					continue;
-				allColNames = lappend(allColNames,
-									  makeString(pstrdup(te->resname)));
-			}
-			incr_create_unique_index(mvrelid, allColNames);
-			CommandCounterIncrement();
-		}
 		return;
-	}
 
 	/* Everything below is HAVING-only; plain aggregates need no backfill. */
 	if (viewQuery->havingQual == NULL)
@@ -6400,7 +6376,6 @@ incr_build_union_ins_sql(Oid mvrelid, Query *viewQuery, Query *branchQuery,
 	ListCell	   *vlc,	/* view targetList cursor */
 				   *blc;	/* branch targetList cursor */
 	const char	   *mvname    = mv_qname(mvrelid);
-	const char	   *cntcol    = quote_identifier(MATVIEW_INCR_COUNT_COL);
 	List		   *view_cols  = NIL;	/* non-junk, non-hidden view TEs */
 	List		   *branch_cols = NIL;	/* matching branch TEs */
 	bool			first;
@@ -6419,7 +6394,13 @@ incr_build_union_ins_sql(Oid mvrelid, Query *viewQuery, Query *branchQuery,
 
 	initStringInfo(&buf);
 
-	/* INSERT INTO mv (col1, ..., __mv_count__) */
+	/*
+	 * UNION ALL keeps duplicates, so the matview is the multiset union of the
+	 * branches: just INSERT the branch's delta rows verbatim (one matview row
+	 * per delta row).  No __mv_count__, no GROUP BY, no ON CONFLICT dedup.
+	 *
+	 *   INSERT INTO mv (col1, ...) SELECT expr1, ... FROM delta [JOIN ...] [WHERE]
+	 */
 	appendStringInfo(&buf, "INSERT INTO %s (", mvname);
 	first = true;
 	foreach(vlc, view_cols)
@@ -6430,9 +6411,8 @@ incr_build_union_ins_sql(Oid mvrelid, Query *viewQuery, Query *branchQuery,
 		appendStringInfoString(&buf, quote_identifier(vte->resname));
 		first = false;
 	}
-	appendStringInfo(&buf, ",%s) SELECT ", cntcol);
+	appendStringInfoString(&buf, ") SELECT ");
 
-	/* SELECT expr1, ..., COUNT(*) */
 	first = true;
 	foreach(blc, branch_cols)
 	{
@@ -6447,9 +6427,7 @@ incr_build_union_ins_sql(Oid mvrelid, Query *viewQuery, Query *branchQuery,
 								delta_varno, &ebuf);
 		appendStringInfoString(&buf, ebuf.data);
 	}
-	appendStringInfo(&buf, ",COUNT(*)");
 
-	/* FROM delta [_d_ JOIN ...] [WHERE ...] */
 	incr_append_from_join(&buf, branchQuery, delta_varno, delta_table, join_list);
 	{
 		Node *wq = incr_get_where_qual(branchQuery);
@@ -6463,38 +6441,6 @@ incr_build_union_ins_sql(Oid mvrelid, Query *viewQuery, Query *branchQuery,
 			appendStringInfo(&buf, " WHERE %s", wbuf.data);
 		}
 	}
-
-	/* GROUP BY expr1, ... */
-	appendStringInfoString(&buf, " GROUP BY ");
-	first = true;
-	foreach(blc, branch_cols)
-	{
-		TargetEntry    *bte = lfirst_node(TargetEntry, blc);
-		StringInfoData	ebuf;
-
-		if (!first) appendStringInfoChar(&buf, ',');
-		first = false;
-
-		initStringInfo(&ebuf);
-		incr_deparse_where_qual((Node *) bte->expr, branchQuery->rtable,
-								delta_varno, &ebuf);
-		appendStringInfoString(&buf, ebuf.data);
-	}
-
-	/* ON CONFLICT (col1, ...) DO UPDATE SET __mv_count__ = mv + EXCLUDED */
-	appendStringInfoString(&buf, " ON CONFLICT (");
-	first = true;
-	foreach(vlc, view_cols)
-	{
-		TargetEntry *vte = lfirst_node(TargetEntry, vlc);
-
-		if (!first) appendStringInfoChar(&buf, ',');
-		appendStringInfoString(&buf, quote_identifier(vte->resname));
-		first = false;
-	}
-	appendStringInfo(&buf,
-					 ") DO UPDATE SET %s=%s.%s+EXCLUDED.%s",
-					 cntcol, mvname, cntcol, cntcol);
 
 	return buf.data;
 }
@@ -6520,7 +6466,6 @@ incr_build_union_del_sql(Oid mvrelid, Query *viewQuery, Query *branchQuery,
 	ListCell	   *vlc,
 				   *blc;
 	const char	   *mvname   = mv_qname(mvrelid);
-	const char	   *cntcol   = quote_identifier(MATVIEW_INCR_COUNT_COL);
 	List		   *view_cols  = NIL;
 	List		   *branch_cols = NIL;
 	bool			first;
@@ -6538,31 +6483,65 @@ incr_build_union_del_sql(Oid mvrelid, Query *viewQuery, Query *branchQuery,
 
 	initStringInfo(&buf);
 
-	/* WITH d AS (SELECT expr1 AS col1, ..., COUNT(*) AS __mv_count__ */
-	appendStringInfoString(&buf, "WITH d AS (SELECT ");
-	first = true;
-	forboth(vlc, view_cols, blc, branch_cols)
+	/*
+	 * UNION ALL keeps duplicates, so a delete must remove exactly the deleted
+	 * MULTIPLICITY of each tuple from the matview (mirror of the row-level
+	 * multiset delete): aggregate the branch delta into one row per distinct
+	 * output tuple with its count _k, number the matview's copies of that tuple,
+	 * and drop the first _k.
+	 *
+	 *   DELETE FROM mv WHERE ctid IN (
+	 *     SELECT s.ctid FROM (
+	 *       SELECT _m.ctid, row_number() OVER (PARTITION BY _m.col...) _rn, _rd._k
+	 *       FROM mv _m JOIN (SELECT <expr AS col>..., count(*) _k
+	 *                        FROM delta [JOIN] [WHERE] GROUP BY <expr>) _rd
+	 *         ON (_m.col IS NOT DISTINCT FROM _rd.col AND ...)
+	 *     ) s WHERE s._rn <= s._k)
+	 */
 	{
-		TargetEntry    *vte = lfirst_node(TargetEntry, vlc);
-		TargetEntry    *bte = lfirst_node(TargetEntry, blc);
-		StringInfoData	ebuf;
+		StringInfoData	part,
+						sel,
+						grp,
+						joincond;
+		Node		   *wq = incr_get_where_qual(branchQuery);
 
-		if (!first) appendStringInfoChar(&buf, ',');
-		first = false;
+		initStringInfo(&part);
+		initStringInfo(&sel);
+		initStringInfo(&grp);
+		initStringInfo(&joincond);
 
-		initStringInfo(&ebuf);
-		incr_deparse_where_qual((Node *) bte->expr, branchQuery->rtable,
-								delta_varno, &ebuf);
-		appendStringInfo(&buf, "%s AS %s", ebuf.data,
-						 quote_identifier(vte->resname));
-	}
-	appendStringInfo(&buf, ",COUNT(*) AS %s", cntcol);
+		first = true;
+		forboth(vlc, view_cols, blc, branch_cols)
+		{
+			TargetEntry    *vte = lfirst_node(TargetEntry, vlc);
+			TargetEntry    *bte = lfirst_node(TargetEntry, blc);
+			const char	   *cq = quote_identifier(vte->resname);
+			StringInfoData	ebuf;
 
-	/* FROM ... [WHERE ...] GROUP BY ... ) */
-	incr_append_from_join(&buf, branchQuery, delta_varno, delta_table, join_list);
-	{
-		Node *wq = incr_get_where_qual(branchQuery);
+			initStringInfo(&ebuf);
+			incr_deparse_where_qual((Node *) bte->expr, branchQuery->rtable,
+									delta_varno, &ebuf);
+			if (!first)
+			{
+				appendStringInfoChar(&part, ',');
+				appendStringInfoChar(&sel, ',');
+				appendStringInfoChar(&grp, ',');
+				appendStringInfoString(&joincond, " AND ");
+			}
+			appendStringInfo(&part, "_m.%s", cq);
+			appendStringInfo(&sel, "%s AS %s", ebuf.data, cq);
+			appendStringInfoString(&grp, ebuf.data);
+			appendStringInfo(&joincond, "_m.%s IS NOT DISTINCT FROM _rd.%s", cq, cq);
+			first = false;
+		}
 
+		appendStringInfo(&buf,
+						 "DELETE FROM %s WHERE ctid IN ("
+						 "SELECT s.ctid FROM ("
+						 "SELECT _m.ctid, row_number() OVER (PARTITION BY %s) AS _rn, _rd._k "
+						 "FROM %s _m JOIN (SELECT %s, count(*) AS _k",
+						 mvname, part.data, mvname, sel.data);
+		incr_append_from_join(&buf, branchQuery, delta_varno, delta_table, join_list);
 		if (wq != NULL)
 		{
 			StringInfoData wbuf;
@@ -6571,181 +6550,37 @@ incr_build_union_del_sql(Oid mvrelid, Query *viewQuery, Query *branchQuery,
 			incr_deparse_where_qual(wq, branchQuery->rtable, delta_varno, &wbuf);
 			appendStringInfo(&buf, " WHERE %s", wbuf.data);
 		}
-	}
-	appendStringInfoString(&buf, " GROUP BY ");
-	first = true;
-	foreach(blc, branch_cols)
-	{
-		TargetEntry    *bte = lfirst_node(TargetEntry, blc);
-		StringInfoData	ebuf;
-
-		if (!first) appendStringInfoChar(&buf, ',');
-		first = false;
-
-		initStringInfo(&ebuf);
-		incr_deparse_where_qual((Node *) bte->expr, branchQuery->rtable,
-								delta_varno, &ebuf);
-		appendStringInfoString(&buf, ebuf.data);
-	}
-	appendStringInfoString(&buf, ") ");
-
-	/* UPDATE mv SET __mv_count__ = mv.__mv_count__ - d.__mv_count__ FROM d WHERE ... */
-	appendStringInfo(&buf,
-					 "UPDATE %s SET %s=%s.%s-d.%s FROM d WHERE ",
-					 mvname, cntcol, mvname, cntcol, cntcol);
-	first = true;
-	foreach(vlc, view_cols)
-	{
-		TargetEntry *vte = lfirst_node(TargetEntry, vlc);
-		const char  *colq = quote_identifier(vte->resname);
-
-		if (!first) appendStringInfoString(&buf, " AND ");
-		appendStringInfo(&buf, "%s.%s IS NOT DISTINCT FROM d.%s",
-						 mvname, colq, colq);
-		first = false;
+		appendStringInfo(&buf,
+						 " GROUP BY %s) _rd ON (%s)) s WHERE s._rn <= s._k)",
+						 grp.data, joincond.data);
 	}
 
 	return buf.data;
 }
 
-/*
- * incr_union_dedup_backfill
- *
- * The matview was created from a plain UNION ALL query (no __mv_count__ yet).
- * We need to:
- *   1. Aggregate the existing rows into (col1,...,count) via a temp table.
- *   2. Truncate the matview.
- *   3. Re-insert the deduped rows with their counts.
- */
-static void
-incr_union_dedup_backfill(Oid mvrelid, Query *viewQuery)
-{
-	StringInfoData	col_list;
-	StringInfoData	sql;
-	ListCell	   *lc;
-	const char	   *mvname = mv_qname(mvrelid);
-	const char	   *cntcol = quote_identifier(MATVIEW_INCR_COUNT_COL);
-	bool			first;
-	int				ret;
-
-	/* Build comma-separated list of visible column names */
-	initStringInfo(&col_list);
-	first = true;
-	foreach(lc, viewQuery->targetList)
-	{
-		TargetEntry *te = lfirst_node(TargetEntry, lc);
-
-		if (te->resjunk || incr_is_hidden_col(te->resname))
-			continue;
-		if (!first) appendStringInfoChar(&col_list, ',');
-		appendStringInfoString(&col_list, quote_identifier(te->resname));
-		first = false;
-	}
-
-	OpenMatViewIncrementalMaintenance();
-	if (SPI_connect() != SPI_OK_CONNECT)
-		elog(ERROR, "incr_union_dedup_backfill: SPI_connect failed");
-
-	/* Step 1: create temp table with aggregated counts */
-	initStringInfo(&sql);
-	appendStringInfo(&sql,
-					 "CREATE TEMP TABLE __dbblue_union_tmp__ AS "
-					 "SELECT %s,COUNT(*) AS __cnt__ FROM %s GROUP BY %s",
-					 col_list.data, mvname, col_list.data);
-	ret = SPI_execute(sql.data, false, 0);
-	if (ret < 0)
-		elog(ERROR, "incr_union_dedup_backfill: CREATE TEMP TABLE failed (%d)", ret);
-
-	/* Step 2: delete all rows from the matview */
-	initStringInfo(&sql);
-	appendStringInfo(&sql, "DELETE FROM %s", mvname);
-	ret = SPI_execute(sql.data, false, 0);
-	if (ret < 0)
-		elog(ERROR, "incr_union_dedup_backfill: DELETE failed (%d)", ret);
-
-	/* Step 3: re-insert deduped rows with counts */
-	initStringInfo(&sql);
-	appendStringInfo(&sql,
-					 "INSERT INTO %s (%s,%s) "
-					 "SELECT %s,__cnt__ FROM __dbblue_union_tmp__",
-					 mvname, col_list.data, cntcol, col_list.data);
-	ret = SPI_execute(sql.data, false, 0);
-	if (ret < 0)
-		elog(ERROR, "incr_union_dedup_backfill: INSERT failed (%d)", ret);
-
-	/* Step 4: drop temp table */
-	ret = SPI_execute("DROP TABLE __dbblue_union_tmp__", false, 0);
-	if (ret < 0)
-		elog(ERROR, "incr_union_dedup_backfill: DROP TABLE failed (%d)", ret);
-
-	SPI_finish();
-	CloseMatViewIncrementalMaintenance();
-}
 
 /*
  * incr_setup_union_all
  *
- * Orchestrate incremental setup for a UNION ALL matview:
- *   1. ALTER TABLE mv ADD COLUMN __mv_count__ bigint NOT NULL DEFAULT 0
- *   2. Dedup-backfill: collapse duplicate rows into a single row with count
- *   3. Create unique index on all visible columns
- *   4. For each UNION ALL branch, install per-table triggers
+ * Set up incremental maintenance for a UNION ALL matview.  UNION ALL keeps
+ * duplicates, so the matview is maintained as the plain multiset union of its
+ * branches: every branch's source-table change inserts/deletes the matching
+ * matview rows verbatim (one matview row per branch row), with no __mv_count__
+ * column, no dedup, and no unique index.  A dump/restore reloads the raw rows
+ * (duplicates included), which is already correct, so MatviewIncrPostRefresh
+ * has nothing to do for this shape.
  *
- * Steps 2 and 3 only run when the matview is already populated (the
- * CREATE ... WITH DATA path).  On the pg_dump/restore path the matview is empty
- * here and populated later by a standalone REFRESH that reloads the raw
- * per-branch rows — which contain cross-branch duplicates and would violate
- * the unique index if it already existed.  So both the dedup and the unique
- * index are deferred to MatviewIncrPostRefresh(), which dedups first and then
- * builds the index on the now-unique rows.
+ * For each UNION ALL branch, install per-source-table triggers carrying the
+ * multiset INSERT/DELETE delta SQL.
  */
 static void
 incr_setup_union_all(Oid mvrelid, Query *viewQuery, bool mv_populated)
 {
 	List	   *branches = NIL;
-	List	   *allColNames = NIL;
 	ListCell   *lc;
-	char	   *alter_sql;
-	int			ret;
-	const char *cntcol = quote_identifier(MATVIEW_INCR_COUNT_COL);
 
-	/* Step 1: add __mv_count__ column */
-	alter_sql = psprintf(
-		"ALTER TABLE %s ADD COLUMN %s bigint NOT NULL DEFAULT 0",
-		mv_qname(mvrelid), cntcol);
+	(void) mv_populated;		/* nothing populated-state-specific to do */
 
-	if (SPI_connect() != SPI_OK_CONNECT)
-		elog(ERROR, "incr_setup_union_all: SPI_connect failed");
-	ret = SPI_execute(alter_sql, false, 0);
-	SPI_finish();
-	if (ret != SPI_OK_UTILITY)
-		elog(ERROR, "incr_setup_union_all: ALTER TABLE failed (%d)", ret);
-
-	CommandCounterIncrement();
-
-	/*
-	 * Steps 2 + 3: dedup, then build the unique index on the deduped rows.
-	 * Deferred to MatviewIncrPostRefresh() on the restore path (matview not yet
-	 * populated) so the index is never present while the REFRESH reloads raw
-	 * duplicate rows.
-	 */
-	if (mv_populated)
-	{
-		incr_union_dedup_backfill(mvrelid, viewQuery);
-		CommandCounterIncrement();
-
-		foreach(lc, viewQuery->targetList)
-		{
-			TargetEntry *te = lfirst_node(TargetEntry, lc);
-
-			if (te->resjunk || incr_is_hidden_col(te->resname))
-				continue;
-			allColNames = lappend(allColNames, makeString(pstrdup(te->resname)));
-		}
-		incr_create_unique_index(mvrelid, allColNames);
-	}
-
-	/* Step 4: per-branch triggers */
 	incr_collect_union_branches(viewQuery, &branches);
 
 	foreach(lc, branches)
@@ -6755,8 +6590,6 @@ incr_setup_union_all(Oid mvrelid, Query *viewQuery, bool mv_populated)
 		ListCell   *jlc;
 		char	   *ins_sql,
 				   *del_sql;
-		char	   *cln_sql = psprintf("DELETE FROM %s WHERE %s<=0",
-									  mv_qname(mvrelid), cntcol);
 
 		foreach(jlc, all_tables)
 		{
@@ -6783,8 +6616,9 @@ incr_setup_union_all(Oid mvrelid, Query *viewQuery, bool mv_populated)
 											   dv, MATVIEW_INCR_OLDTABLE,
 											   join_list);
 
+			/* multiset maintenance needs no cleanup step (no __mv_count__) */
 			incr_store_catalog(mvrelid, delta->oid,
-							   ins_sql, del_sql, cln_sql, NULL, NULL);
+							   ins_sql, del_sql, "SELECT 1", NULL, NULL);
 			incr_install_triggers(mvrelid, delta->oid);
 		}
 	}

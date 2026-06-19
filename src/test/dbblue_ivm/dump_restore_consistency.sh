@@ -189,18 +189,19 @@ SELECT count(*) FROM
   WHERE live.product_id IS DISTINCT FROM m.product_id OR abs(live.rev-m.rev)>0.001 OR live.cnt<>m.cnt;")
 check "HAVING mismatches after threshold cross" "$hmm" "0"
 
-note "=== UNION ALL: dedup + count rebuilt on restore, incremental correct ==="
-# source totals are 100 rows across 5 tags = 20 each, collapsed to 5 distinct
-ud=$($PSQL -d $DST -tAc "SELECT count(*) FROM mv_union;")
-check "mv_union distinct rows" "$ud" "5"
-ut=$($PSQL -d $DST -tAc "SELECT sum(__mv_count__) FROM mv_union;")
-check "mv_union total count" "$ut" "100"
+note "=== UNION ALL: duplicates kept (multiset), incremental correct on restore ==="
+# UNION ALL keeps every row: 100 source rows -> 100 matview rows (no dedup, no __mv_count__).
+ut=$($PSQL -d $DST -tAc "SELECT count(*) FROM mv_union;")
+check "mv_union total rows (duplicates kept)" "$ut" "100"
 $PSQL -d $DST -q -c "INSERT INTO tag_a VALUES (9000,'T0'); DELETE FROM tag_b WHERE id=1;"
+# multiset compare vs a live recompute of the identical UNION ALL
 umm=$($PSQL -d $DST -tAc "
-WITH live AS (SELECT tag FROM tag_a UNION ALL SELECT tag FROM tag_b)
-SELECT count(*) FROM (SELECT tag, count(*) c FROM live GROUP BY tag) l
-  FULL JOIN mv_union m USING(tag) WHERE l.c IS DISTINCT FROM m.__mv_count__;")
-check "mv_union mismatches after restore+DML" "$umm" "0"
+SELECT count(*) FROM (
+  (SELECT tag FROM mv_union EXCEPT ALL (SELECT tag FROM tag_a UNION ALL SELECT tag FROM tag_b))
+  UNION ALL
+  ((SELECT tag FROM tag_a UNION ALL SELECT tag FROM tag_b) EXCEPT ALL SELECT tag FROM mv_union)
+) d;")
+check "mv_union multiset mismatches after restore+DML" "$umm" "0"
 
 note "=== TRUNCATE re-seeding after restore ==="
 $PSQL -d $DST -q -c "TRUNCATE sales CASCADE;"
