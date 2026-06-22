@@ -1,0 +1,4 @@
+comment = 'dbblue_partition - native table partitioning for Odoo workloads'
+default_version = '1.0'
+module_pathname = '$libdir/dbblue_partition'
+relocatable = false

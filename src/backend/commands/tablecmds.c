@@ -13766,6 +13766,21 @@ transformFkeyCheckAttrs(Relation pkrel,
 	ListCell   *indexoidscan;
 	int			i,
 				j;
+	/*
+	 * When the referenced table is a partitioned table, PostgreSQL requires
+	 * that any UNIQUE or PRIMARY KEY index include all partition key columns
+	 * (see indexcmds.c). This means a table partitioned by date_order will
+	 * have a composite PK of (id, date_order) even when only (id) is the
+	 * logical primary key. To allow foreign keys that reference only the
+	 * logical key columns (e.g., REFERENCES sale_order(id)), we relax the
+	 * exact-column-count requirement for partitioned referenced tables: the
+	 * index must contain all FK-referenced columns, but may also contain
+	 * additional partition key columns.
+	 *
+	 * Temporal FKs (WITH PERIOD) keep the strict exact-match requirement
+	 * because their semantics depend on precise column positioning.
+	 */
+	bool		pk_is_partitioned = (pkrel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE);
 
 	/*
 	 * Reject duplicate appearances of columns in the referenced-columns list.
@@ -13804,11 +13819,14 @@ transformFkeyCheckAttrs(Relation pkrel,
 		indexStruct = (Form_pg_index) GETSTRUCT(indexTuple);
 
 		/*
-		 * Must have the right number of columns; must be unique (or if
-		 * temporal then exclusion instead) and not a partial index; forget it
-		 * if there are any expressions, too. Invalid indexes are out as well.
+		 * Must have the right number of columns (or, for non-temporal FKs on
+		 * partitioned tables, at least as many columns as the FK references);
+		 * must be unique (or if temporal then exclusion instead) and not a
+		 * partial index; forget it if there are any expressions, too. Invalid
+		 * indexes are out as well.
 		 */
-		if (indexStruct->indnkeyatts == numattrs &&
+		if ((indexStruct->indnkeyatts == numattrs ||
+			 (pk_is_partitioned && !with_period && indexStruct->indnkeyatts > numattrs)) &&
 			(with_period ? indexStruct->indisexclusion : indexStruct->indisunique) &&
 			indexStruct->indisvalid &&
 			heap_attisnull(indexTuple, Anum_pg_index_indpred, NULL) &&
@@ -13827,15 +13845,16 @@ transformFkeyCheckAttrs(Relation pkrel,
 			 * Check for a match, and extract the appropriate opclasses while
 			 * we're at it.
 			 *
-			 * We know that attnums[] is duplicate-free per the test at the
-			 * start of this function, and we checked above that the number of
-			 * index columns agrees, so if we find a match for each attnums[]
-			 * entry then we must have a one-to-one match in some order.
+			 * For non-partitioned tables the number of index columns equals
+			 * numattrs (verified above), so this is a one-to-one match check.
+			 * For partitioned tables the index may have extra partition key
+			 * columns; we search all indnkeyatts positions to locate each FK
+			 * column anywhere within the index.
 			 */
 			for (i = 0; i < numattrs; i++)
 			{
 				found = false;
-				for (j = 0; j < numattrs; j++)
+				for (j = 0; j < indexStruct->indnkeyatts; j++)
 				{
 					if (attnums[i] == indexStruct->indkey.values[j])
 					{
