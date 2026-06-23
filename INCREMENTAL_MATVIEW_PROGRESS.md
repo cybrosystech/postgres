@@ -10,7 +10,31 @@ _Last updated: 2026-06-18 · branch `feature/ivm-incremental-refresh`_
 
 ---
 
-## Most recent work: NULL-group fidelity (bug E)
+## Most recent work: concurrency battery for the exotic shapes
+
+Added `concurrency_exotic.sh` — concurrent pgbench writers (insert/delete with
+`--max-tries` retries) against the source tables of INNER JOIN, UNION ALL,
+self-join, and LEFT OUTER JOIN matviews, then a `== live recompute` assertion
+under a stable lock, at READ COMMITTED and REPEATABLE READ.
+
+Empirical result (precise, replacing the vague "not covered by the battery"):
+- **INNER JOIN aggregate — consistent at every level** (additive `ON CONFLICT`
+  serializes on the matview row lock). Gated.
+- **UNION ALL / self-join / LEFT JOIN — consistent at REPEATABLE READ or higher**
+  (gated), but **can diverge at READ COMMITTED** under concurrent writers — they
+  recompute/overwrite a region read from a snapshot, so a concurrent committed
+  write can be lost. Reported as a known limitation (not gated, since the RC
+  divergence is race-dependent).
+
+Refined the CREATE-time WARNING for these shapes accordingly: *consistent only at
+REPEATABLE READ or higher under concurrent writes; run source writers at RR+ (or
+let a REFRESH correct it)*. A clean RC fix would add per-affected-group advisory
+locks to the recompute/sync builders (mirroring the MIN/MAX two-phase lock) — a
+scoped follow-up.
+
+---
+
+## Earlier this work: NULL-group fidelity (bug E)
 
 NULL and partial-NULL group keys are now **maintained with full fidelity**
 (== a full `REFRESH`) for every shape whose delta goes through the shared shells:

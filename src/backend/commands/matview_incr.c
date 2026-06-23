@@ -866,11 +866,12 @@ incr_install_triggers(Oid mvrelid, Oid srctable)
 
 /*
  * incr_warn_uncertified_shape
- * Emit a one-time WARNING at CREATE for view shapes that work but have not yet
- * been certified under concurrent writes (outer join, self-join, UNION ALL).
- * These shapes pass single-threaded correctness but were not in the adversarial
- * concurrency battery; the warning lets an operator make an informed call
- * before relying on them in production.  Non-blocking by design.
+ * Emit a one-time WARNING at CREATE for the recompute/multiset shapes (UNION
+ * ALL, self-join, outer join) whose incremental maintenance is correct under
+ * REPEATABLE READ (or higher) but can lose updates under READ COMMITTED with
+ * concurrent writers — because they recompute/overwrite a region read from a
+ * snapshot rather than accumulating additively under the matview row lock.
+ * Characterized by concurrency_exotic.sh.  Non-blocking by design.
  */
 static void
 incr_warn_uncertified_shape(Query *viewQuery)
@@ -891,10 +892,10 @@ incr_warn_uncertified_shape(Query *viewQuery)
 
 	if (shape != NULL)
 		ereport(WARNING,
-				(errmsg("incremental materialized view uses %s, which is not yet certified under concurrent writes",
+				(errmsg("incremental materialized view uses %s, which is consistent only at REPEATABLE READ or higher under concurrent writes",
 						shape),
-				 errdetail("This shape passes single-threaded correctness but is not covered by the concurrency test battery."),
-				 errhint("Validate it under your write workload before relying on it in production.")));
+				 errdetail("Single-threaded and serialized maintenance are correct, but concurrent writers at READ COMMITTED can leave this shape diverged from a full REFRESH."),
+				 errhint("Run writers to this matview's source tables at REPEATABLE READ or higher (or accept eventual correction by a REFRESH).")));
 }
 
 /*
