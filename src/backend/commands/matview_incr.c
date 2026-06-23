@@ -1962,6 +1962,79 @@ MatviewIncrAddCountTarget(Query *q)
 	}
 
 	/*
+	 * Inject COUNT(x) AS __mv_sumcnt_<col> for each visible SUM(x) so SUM can
+	 * show SQL-exact NULL once a group's last non-NULL input is removed (the
+	 * shared shells render visible_sum = sumcnt=0 ? NULL : running_sum).  Only
+	 * for shapes the shared shells maintain: MIN/MAX and self-joins keep their
+	 * own builders (and the 0 residual), so they get no counter.
+	 */
+	{
+		bool		want_sumcnt = !incr_has_minmax_agg(q);
+		ListCell   *l2;
+		List	   *seen = NIL;
+
+		foreach(l2, q->rtable)		/* detect self-join (duplicate relation OID) */
+		{
+			RangeTblEntry *rte = lfirst_node(RangeTblEntry, l2);
+
+			if (!want_sumcnt)
+				break;
+			if (rte->rtekind != RTE_RELATION)
+				continue;
+			if (list_member_oid(seen, rte->relid))
+				want_sumcnt = false;
+			else
+				seen = lappend_oid(seen, rte->relid);
+		}
+
+		if (want_sumcnt)
+		{
+			foreach(lc, orig_tl)
+			{
+				TargetEntry *orig_te = lfirst_node(TargetEntry, lc);
+				Aggref	   *sum_agg;
+				Aggref	   *cnt_agg;
+
+				if (orig_te->resjunk || !IsA(orig_te->expr, Aggref))
+					continue;
+				sum_agg = (Aggref *) orig_te->expr;
+				if (strcmp(get_func_name(sum_agg->aggfnoid), "sum") != 0)
+					continue;
+				if (sum_agg->aggstar || sum_agg->args == NIL)
+					continue;
+
+				/* COUNT(x) over the SUM's argument — count("any") OID 2147 */
+				cnt_agg = makeNode(Aggref);
+				cnt_agg->aggfnoid = 2147;
+				cnt_agg->aggtype = INT8OID;
+				cnt_agg->aggcollid = InvalidOid;
+				cnt_agg->inputcollid = InvalidOid;
+				cnt_agg->aggtranstype = InvalidOid;
+				cnt_agg->aggargtypes = sum_agg->aggargtypes;
+				cnt_agg->aggdirectargs = NIL;
+				cnt_agg->args = copyObject(sum_agg->args);
+				cnt_agg->aggorder = NIL;
+				cnt_agg->aggdistinct = NIL;
+				cnt_agg->aggfilter = NULL;
+				cnt_agg->aggstar = false;
+				cnt_agg->aggvariadic = false;
+				cnt_agg->aggkind = AGGKIND_NORMAL;
+				cnt_agg->aggpresorted = false;
+				cnt_agg->agglevelsup = 0;
+				cnt_agg->aggsplit = AGGSPLIT_SIMPLE;
+				cnt_agg->aggno = -1;
+				cnt_agg->aggtransno = -1;
+				cnt_agg->location = -1;
+				te = makeTargetEntry((Expr *) cnt_agg, next_resno++,
+									 psprintf("%s%s", MATVIEW_INCR_SUMCNT_PREFIX,
+											  orig_te->resname),
+									 false);
+				q->targetList = lappend(q->targetList, te);
+			}
+		}
+	}
+
+	/*
 	 * If HAVING present, inject __mv_having_ok__ = true.  All rows in the
 	 * initial population pass HAVING (PostgreSQL applies it during CREATE),
 	 * so true is correct.  The hav_sql step recomputes it after every delta.
@@ -2024,6 +2097,9 @@ incr_is_hidden_col(const char *resname)
 		return true;
 	if (strncmp(resname, MATVIEW_INCR_AVGCNT_PREFIX,
 				strlen(MATVIEW_INCR_AVGCNT_PREFIX)) == 0)
+		return true;
+	if (strncmp(resname, MATVIEW_INCR_SUMCNT_PREFIX,
+				strlen(MATVIEW_INCR_SUMCNT_PREFIX)) == 0)
 		return true;
 	return false;
 }
@@ -3409,6 +3485,28 @@ incr_nullsafe_accum(const char *run, const char *delta, bool subtract)
  */
 
 /*
+ * incr_sumcnt_sibling — quoted name of the __mv_sumcnt_<resname> hidden column
+ * if the target list carries one (i.e. <resname> is a SUM column with the
+ * all-NULL→NULL non-null counter), else NULL.
+ */
+static const char *
+incr_sumcnt_sibling(Query *viewQuery, const char *resname)
+{
+	char	   *want = psprintf("%s%s", MATVIEW_INCR_SUMCNT_PREFIX, resname);
+	ListCell   *lc;
+
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+		if (!te->resjunk && te->resname != NULL &&
+			strcmp(te->resname, want) == 0)
+			return quote_identifier(want);
+	}
+	return NULL;
+}
+
+/*
  * incr_emit_ins_head — "INSERT INTO mv (col1,col2,...) "
  * Column list is the view's non-junk target list, in order.
  */
@@ -3471,11 +3569,13 @@ incr_emit_ins_conflict_tail(StringInfo buf, Oid mvrelid, Query *viewQuery)
 			continue;
 		if (strcmp(te->resname, MATVIEW_INCR_HAVING_COL) == 0)
 			continue;
-		/* hidden avgsum/avgcnt emitted as part of their parent AVG column */
+		/* hidden avgsum/avgcnt/sumcnt emitted as part of their parent column */
 		if (strncmp(te->resname, MATVIEW_INCR_AVGSUM_PREFIX,
 					strlen(MATVIEW_INCR_AVGSUM_PREFIX)) == 0 ||
 			strncmp(te->resname, MATVIEW_INCR_AVGCNT_PREFIX,
-					strlen(MATVIEW_INCR_AVGCNT_PREFIX)) == 0)
+					strlen(MATVIEW_INCR_AVGCNT_PREFIX)) == 0 ||
+			strncmp(te->resname, MATVIEW_INCR_SUMCNT_PREFIX,
+					strlen(MATVIEW_INCR_SUMCNT_PREFIX)) == 0)
 			continue;
 
 		colq = quote_identifier(te->resname);
@@ -3510,7 +3610,9 @@ incr_emit_ins_conflict_tail(StringInfo buf, Oid mvrelid, Query *viewQuery)
 		else if (IsA(te->expr, Aggref))
 		{
 			/* MIN/MAX: replace if better; everything else: accumulate */
-			char *fn = get_func_name(((Aggref *) te->expr)->aggfnoid);
+			char	   *fn = get_func_name(((Aggref *) te->expr)->aggfnoid);
+			const char *scq = (strcmp(fn, "sum") == 0)
+				? incr_sumcnt_sibling(viewQuery, te->resname) : NULL;
 
 			if (!first)
 				appendStringInfoChar(buf, ',');
@@ -3520,6 +3622,16 @@ incr_emit_ins_conflict_tail(StringInfo buf, Oid mvrelid, Query *viewQuery)
 			else if (strcmp(fn, "max") == 0)
 				appendStringInfo(buf, "%s=GREATEST(%s.%s,EXCLUDED.%s)",
 								 colq, mvname, colq, colq);
+			else if (scq != NULL)
+				/* SUM with non-null counter: maintain the counter and show
+				 * SQL-exact NULL when no non-NULL inputs remain. */
+				appendStringInfo(buf,
+								 "%s=%s.%s+EXCLUDED.%s"
+								 ",%s=CASE WHEN %s.%s+EXCLUDED.%s=0 THEN NULL ELSE %s END",
+								 scq, mvname, scq, scq,
+								 colq, mvname, scq, scq,
+								 incr_nullsafe_accum(psprintf("%s.%s", mvname, colq),
+													 psprintf("EXCLUDED.%s", colq), false));
 			else
 				appendStringInfo(buf, "%s=%s", colq,
 								 incr_nullsafe_accum(psprintf("%s.%s", mvname, colq),
@@ -3567,11 +3679,13 @@ incr_emit_del_update_tail(StringInfo buf, Oid mvrelid, Query *viewQuery)
 			continue;
 		if (strcmp(te->resname, MATVIEW_INCR_HAVING_COL) == 0)
 			continue;
-		/* hidden avgsum/avgcnt emitted as part of their parent AVG column */
+		/* hidden avgsum/avgcnt/sumcnt emitted as part of their parent column */
 		if (strncmp(te->resname, MATVIEW_INCR_AVGSUM_PREFIX,
 					strlen(MATVIEW_INCR_AVGSUM_PREFIX)) == 0 ||
 			strncmp(te->resname, MATVIEW_INCR_AVGCNT_PREFIX,
-					strlen(MATVIEW_INCR_AVGCNT_PREFIX)) == 0)
+					strlen(MATVIEW_INCR_AVGCNT_PREFIX)) == 0 ||
+			strncmp(te->resname, MATVIEW_INCR_SUMCNT_PREFIX,
+					strlen(MATVIEW_INCR_SUMCNT_PREFIX)) == 0)
 			continue;
 
 		colq = quote_identifier(te->resname);
@@ -3605,11 +3719,26 @@ incr_emit_del_update_tail(StringInfo buf, Oid mvrelid, Query *viewQuery)
 		}
 		else
 		{
+			const char *scq = (IsA(te->expr, Aggref) &&
+							   strcmp(get_func_name(((Aggref *) te->expr)->aggfnoid), "sum") == 0)
+				? incr_sumcnt_sibling(viewQuery, te->resname) : NULL;
+
 			if (!first)
 				appendStringInfoChar(buf, ',');
-			appendStringInfo(buf, "%s=%s", colq,
-							 incr_nullsafe_accum(psprintf("%s.%s", mvname, colq),
-												 psprintf("d.%s", colq), true));
+			if (scq != NULL)
+				/* SUM with non-null counter: subtract from the counter and show
+				 * SQL-exact NULL when no non-NULL inputs remain. */
+				appendStringInfo(buf,
+								 "%s=%s.%s-d.%s"
+								 ",%s=CASE WHEN %s.%s-d.%s=0 THEN NULL ELSE %s END",
+								 scq, mvname, scq, scq,
+								 colq, mvname, scq, scq,
+								 incr_nullsafe_accum(psprintf("%s.%s", mvname, colq),
+													 psprintf("d.%s", colq), true));
+			else
+				appendStringInfo(buf, "%s=%s", colq,
+								 incr_nullsafe_accum(psprintf("%s.%s", mvname, colq),
+													 psprintf("d.%s", colq), true));
 			first = false;
 		}
 	}

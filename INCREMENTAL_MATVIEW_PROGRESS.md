@@ -33,9 +33,18 @@ maintained == REFRESH; multi-key partial-NULL == REFRESH; MIN/MAX still excludes
 + write not blocked; NOT-NULL regression). `audit_regressions.sql` BUGE; full
 suite, dump/restore, and RR/SERIALIZABLE concurrency green off+on.
 
-**Still excluded by design (documented):** MIN/MAX and self-join NULL keys; and
-the accepted all-NULL `SUM` showing `0` (per-column non-null counter would close
-that — separate, minor).
+**Still excluded by design (documented):** MIN/MAX and self-join NULL keys.
+
+### Follow-up: all-NULL SUM shows SQL NULL (not 0)
+`SUM(x)` over a group whose inputs are all NULL is SQL NULL; incrementally it
+used to settle to `0` once the last non-NULL was removed. Fixed for the
+shared-shell shapes (single-table, INNER JOIN, HAVING; hand + deparse) with a
+hidden per-SUM non-null counter `__mv_sumcnt_<col>` (added by `AddCountTarget`,
+gated to non-MIN/MAX, non-self-join): the visible SUM is rendered
+`CASE WHEN sumcnt=0 THEN NULL ELSE running_sum END`, and the running sum
+recovers from NULL when a non-NULL input returns. MIN/MAX and self-join keep the
+`0` residual (they don't go through the shared shells). Test:
+`null_sum_fidelity.sql`; suite/dump/restore/concurrency green off+on.
 
 ---
 

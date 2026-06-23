@@ -35,6 +35,14 @@ extern PGDLLIMPORT bool dbblue_ivm_deparse_delta;
 #define MATVIEW_INCR_COUNT_COL		"__mv_count__"
 #define MATVIEW_INCR_AVGSUM_PREFIX	"__mv_avgsum_"
 #define MATVIEW_INCR_AVGCNT_PREFIX	"__mv_avgcnt_"
+/*
+ * __mv_sumcnt_<col>__ — running COUNT(x) of non-NULL inputs to a SUM(x) output
+ * column named <col>.  Lets SUM show SQL-exact NULL (not 0) once a group's last
+ * non-NULL input is removed: visible_sum = (sumcnt = 0 ? NULL : running_sum).
+ * Added only for shapes maintained by the shared shells (single-table/INNER
+ * JOIN aggregates, DISTINCT, HAVING); MIN/MAX and self-join keep the 0 residual.
+ */
+#define MATVIEW_INCR_SUMCNT_PREFIX	"__mv_sumcnt_"
 
 /*
  * Hidden boolean column that tracks whether each group currently satisfies
