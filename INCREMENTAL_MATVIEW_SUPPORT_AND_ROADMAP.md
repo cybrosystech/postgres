@@ -17,7 +17,7 @@ suite in `src/test/dbblue_ivm/` and the adversarial concurrency battery.
 | Tier | Meaning |
 |---|---|
 | ✅ **Proven** | Tested for correctness *and* concurrency (adversarial battery) and/or in production (Odoo, 266K rows); dump/restore verified. Rely on it. |
-| 🟡 **Works, uncertified** | Single-threaded correctness verified, but **not** covered by the concurrency battery. Emits a `WARNING` at `CREATE`. Validate under your workload before production reliance. |
+| 🟡 **Proven, serialized** | Same correctness + concurrency guarantees as ✅ — consistent with a full `REFRESH` at every isolation level — but maintenance of this matview **serializes** under concurrent writes (it takes a matview-level lock; emits a `NOTICE` at `CREATE`). A throughput consideration, **not** a correctness caveat. |
 | ⛔ **Rejected (loud)** | Refused at `CREATE` with a clear, actionable error. Never silently wrong. |
 | 🔒 **Guarded** | Allowed, but a runtime guard raises a clear error if an unsupported *data* condition occurs (e.g. a NULL group key). No silent corruption. |
 
@@ -31,7 +31,7 @@ suite in `src/test/dbblue_ivm/` and the adversarial concurrency battery.
 |---|---|
 | `GROUP BY` on plain column(s), single table | core delta path |
 | `SUM`, `COUNT(*)`, `COUNT(col)`, `AVG` | numeric / integer; AVG kept as a (sum,count) pair |
-| `MIN`, `MAX` | two-phase advisory-lock rescan on delete |
+| `MIN`, `MAX` | delete-rescan, serialized on the matview-level lock (see 🟡 below) |
 | Multi-table **INNER JOIN** + `GROUP BY` | N-table, equi-join |
 | `WHERE` | column comparisons, `AND`/`OR`/`NOT`, `IN (...)`, `IS NULL`, non-volatile functions, varchar/`RelabelType` |
 | `HAVING` | hidden base matview + filtering view |
@@ -42,20 +42,32 @@ suite in `src/test/dbblue_ivm/` and the adversarial concurrency battery.
 | Row-level matview (no `GROUP BY`) | warns if the source has no PK in SELECT |
 | Lifecycle | `TRUNCATE`, `pg_dump`/restore, `DROP`, source-table DDL guards |
 
-**Isolation:** verified consistent under READ COMMITTED, REPEATABLE READ, and
-SERIALIZABLE (deltas are transactional with the source DML, so serialization
-failures roll back both — no partial state).
+**Isolation:** every supported shape is verified consistent with a full
+`REFRESH` under READ COMMITTED, REPEATABLE READ, and SERIALIZABLE. Deltas are
+transactional with the source DML, so a serialization failure rolls back both —
+no partial state. The **additive** shapes above (single-table / INNER JOIN
+`SUM`/`COUNT`/`AVG`) are lock-free and keep full per-group write concurrency at
+all levels (their `ON CONFLICT` upserts serialize only on the matview *row*).
 
-### 🟡 Works, but not concurrency-certified (warns at `CREATE`)
+### 🟡 Proven, but maintenance serializes (NOTICE at `CREATE`)
+
+These shapes recompute or overwrite a region per delta rather than accumulating
+additively, so they take a **matview-level advisory lock** that serializes their
+maintenance. That is exactly what makes them consistent with a full `REFRESH` at
+**every** isolation level, READ COMMITTED included — concurrent writers to the
+source tables simply apply their deltas one at a time. All are in the concurrency
+battery (`concurrency_exotic.sh`, READ COMMITTED + REPEATABLE READ).
 
 | Shape | Status |
 |---|---|
-| `LEFT` / `RIGHT` / `FULL OUTER JOIN` | single-threaded correct; **not** in the concurrency battery |
-| Self-join | single-threaded correct; not in the battery |
-| `UNION ALL` | single-threaded correct; not in the battery (was crash-fixed this audit) |
+| `LEFT` / `RIGHT` / `FULL OUTER JOIN` | correct at all isolation levels; serialized maintenance |
+| Self-join | correct at all isolation levels; serialized maintenance |
+| `UNION ALL` | correct at all isolation levels; serialized maintenance |
+| `MIN` / `MAX`, row-level (no `GROUP BY`) | correct at all isolation levels; serialized maintenance |
 
-A `WARNING` fires at `CREATE` for these: *"…not yet certified under concurrent
-writes."* They are **not** blocked.
+A `NOTICE` (not a `WARNING`) fires at `CREATE` for these:
+*"<shape>; its maintenance is serialized under concurrent writes."* They are
+**not** blocked, and the result is never wrong — only serialized.
 
 ---
 
@@ -151,13 +163,16 @@ its concurrency-battery scenario, deleting the old builder as each lands:
 > plain aggregate → INNER JOIN → MIN/MAX → outer / self / UNION ALL
 
 As each complex shape moves onto the `Query`-tree path, its correctness stops
-depending on hand-written SQL — which is exactly how the 🟡 shapes above become
-✅ (this *is* the "certify under concurrency" work, done on durable code).
+depending on hand-written SQL. (The "certify under concurrency" work is **done**:
+the recompute/multiset shapes now serialize on a matview-level lock and are
+consistent at every isolation level — they sit in the 🟡 tier above, correct but
+serialized, no longer "uncertified".)
 
 ### What Phase 2 keeps (do **not** redesign)
 The `pg_dbblue_matview` catalog, AFTER-STATEMENT/ENR trigger mechanism + plan
-cache, `__mv_count__` counting, AVG-as-(sum,count), the two-phase MIN/MAX lock
-*concept*, and all lifecycle work (dump/restore, TRUNCATE, teardown, DDL guards,
+cache, `__mv_count__` counting, AVG-as-(sum,count), the matview-level
+serialization lock for recompute/multiset shapes, and all lifecycle work
+(dump/restore, TRUNCATE, teardown, DDL guards,
 float rejection, NULL-key guard). These are sound; the new delta core plugs in.
 
 ### What Phase 2 unlocks (nearly free once the `Query`-tree path exists)
@@ -179,8 +194,10 @@ Prioritized by value for Odoo reporting:
 2. **`GROUP BY <expression>`** (e.g. `date_trunc('month', d)`) — time-bucketed
    reports; the key becomes the expression.
 3. **`agg(...) FILTER (WHERE …)`** — once expressions render via `ruleutils`.
-4. **Certify outer / self / UNION ALL under concurrency** — via the battery on
-   the `Query`-tree implementation (lifts them from 🟡 to ✅).
+4. ✅ **Done — concurrency for outer / self / UNION ALL / MIN/MAX** — a
+   matview-level serialization lock makes them consistent at every isolation
+   level (READ COMMITTED included). Possible refinement: per-group locks so
+   non-overlapping groups of one such matview maintain concurrently.
 5. **`COUNT(DISTINCT)`** — needs a per-(group, value) auxiliary count table.
 6. **Full NULL-group fidelity (match a normal matview)** — `NULLS NOT DISTINCT`
    index + `IS NOT DISTINCT FROM` predicates, so the NULL group is *kept and
