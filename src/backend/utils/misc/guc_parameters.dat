@@ -624,10 +624,10 @@
 },
 
 { name => 'dbblue_ivm_deparse_delta', type => 'bool', context => 'PGC_USERSET', group => 'DEVELOPER_OPTIONS',
-  short_desc => 'DBblue: build incremental-matview delta SQL via the query-tree deparse core.',
+  short_desc => 'DBblue: build incremental-matview delta SQL via the query-tree deparse core (on by default; set off only as a hand-builder escape hatch).',
   flags => 'GUC_NOT_IN_SAMPLE',
   variable => 'dbblue_ivm_deparse_delta',
-  boot_val => 'false',
+  boot_val => 'true',
 },
 
 # This is PGC_SUSET to prevent hiding from log_lock_waits.

@@ -397,10 +397,18 @@ Migrate each shape to deparse and delete its hand builder once equivalent:
   shows SQL `NULL`, not `0` (current accepted residual; see `incr_nullsafe_accum`).
 
 ### Eventually
-- Flip the deparse path on by default once every shape is migrated and the hand
-  builders are deleted; retire the GUC (or keep it as an escape hatch).
+- ✅ Deparse is on by default (`dbblue_ivm_deparse_delta` boot_val = true);
+  INNER JOIN is unconditional deparse, single-table defaults to deparse with the
+  hand path kept only as a GUC-off escape hatch.  The one genuinely-unreachable
+  hand call site (the non-self-join JOIN `else`) was removed; the hand builders
+  themselves stay live (self-join's non-self tables + the escape hatch), so they
+  are not deleted.  Fully retiring them / removing the GUC would also drop the
+  A/B `REFRESH`-oracle safety net — left as an optional later step.
 - Broaden Odoo report coverage per `INCREMENTAL_MATVIEW_SUPPORT_AND_ROADMAP.md`
   §6 (window functions, nested aggregation, etc. — where feasible).
+- Optional: per-affected-group advisory locks for the recompute/sync builders
+  (self-join, outer join) and the UNION ALL multiset delete, to make those
+  shapes consistent under READ COMMITTED concurrent writes (today: RR+ only).
 
 ---
 

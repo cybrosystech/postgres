@@ -121,7 +121,7 @@ static HTAB *incr_plan_cache = NULL;
  * through the Query-tree deparse core instead of the hand-written builders.
  * See matview_incr.h and INCREMENTAL_MATVIEW_PHASE2_DESIGN.md.
  */
-bool		dbblue_ivm_deparse_delta = false;
+bool		dbblue_ivm_deparse_delta = true;
 
 /*
  * Alias for the delta (transition) table in Phase 2+ SQL.
@@ -1334,35 +1334,23 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 					incr_store_catalog(mvrelid, delta->oid,
 									   ins_sql, del_sql, cln_sql, hav_sql, lock_sql);
 				}
-				else if (used_deparse)
-				{
-					/* Phase 2: INNER JOIN delta via the deparse core.  The
-					 * delta for table delta->oid swaps only that table's RTE
-					 * for the transition-table ENR; the other tables stay as
-					 * relations, so deparse renders the join naturally.  HAVING
-					 * is supported (delta strips it; the failing-group backfill
-					 * below also uses deparse).  MIN/MAX, outer and self joins
-					 * keep their hand builders. */
-					ins_sql = incr_build_ins_sql_deparse(mvrelid, viewQuery,
-										 delta->oid, MATVIEW_INCR_NEWTABLE);
-					del_sql = incr_build_del_sql_deparse(mvrelid, viewQuery,
-										 delta->oid, MATVIEW_INCR_OLDTABLE);
-					incr_store_catalog(mvrelid, delta->oid,
-								   ins_sql, del_sql, cln_sql, hav_sql, NULL);
-				}
-				else
-				{
-					ins_sql = incr_build_ins_sql_gen(mvrelid, viewQuery,
-													 delta->varno,
-													 MATVIEW_INCR_NEWTABLE,
-													 join_list);
-					del_sql = incr_build_del_sql_gen(mvrelid, viewQuery,
-													 delta->varno,
-													 MATVIEW_INCR_OLDTABLE,
-													 join_list);
-					incr_store_catalog(mvrelid, delta->oid,
+					else
+					{
+						/* Phase 2: INNER JOIN delta via the deparse core.  This is the
+						 * only remaining case here: a non-self, non-MIN/MAX inner join
+						 * (used_deparse).  The delta for table delta->oid swaps only that
+						 * table's RTE for the transition-table ENR; the others stay
+						 * relations, so deparse renders the join.  The hand join-delta
+						 * builder is intentionally not used (it mis-attributes a
+						 * single-row delta to other groups for 3+ tables). */
+						Assert(used_deparse);
+						ins_sql = incr_build_ins_sql_deparse(mvrelid, viewQuery,
+									 delta->oid, MATVIEW_INCR_NEWTABLE);
+						del_sql = incr_build_del_sql_deparse(mvrelid, viewQuery,
+									 delta->oid, MATVIEW_INCR_OLDTABLE);
+						incr_store_catalog(mvrelid, delta->oid,
 									   ins_sql, del_sql, cln_sql, hav_sql, NULL);
-				}
+					}
 				incr_install_triggers(mvrelid, delta->oid);
 			}
 			} /* end !has_self_join */
