@@ -6,31 +6,49 @@ to see what is done and what is next. Companion docs:
 - Supported shapes + roadmap → `INCREMENTAL_MATVIEW_SUPPORT_AND_ROADMAP.md`
 - Phase 2 deparse-core design → `INCREMENTAL_MATVIEW_PHASE2_DESIGN.md`
 
-_Last updated: 2026-06-18 · branch `feature/ivm-incremental-refresh`_
+_Last updated: 2026-06-23 · branch `feature/ivm-incremental-refresh`_
 
 ---
 
-## Most recent work: concurrency battery for the exotic shapes
+## Most recent work: READ COMMITTED safety for the recompute/multiset shapes
 
-Added `concurrency_exotic.sh` — concurrent pgbench writers (insert/delete with
-`--max-tries` retries) against the source tables of INNER JOIN, UNION ALL,
-self-join, and LEFT OUTER JOIN matviews, then a `== live recompute` assertion
-under a stable lock, at READ COMMITTED and REPEATABLE READ.
+The recompute/overwrite and multiset shapes — row-level (no GROUP BY) projections,
+UNION ALL, outer join, self-join, and MIN/MAX — now stay consistent with a full
+`REFRESH` under concurrent writers **at every isolation level, READ COMMITTED
+included** (RC is the default and Odoo's level). They previously diverged at RC
+because they read a region under one snapshot and overwrote it, so a concurrent
+committed write could be lost.
 
-Empirical result (precise, replacing the vague "not covered by the battery"):
-- **INNER JOIN aggregate — consistent at every level** (additive `ON CONFLICT`
-  serializes on the matview row lock). Gated.
-- **UNION ALL / self-join / LEFT JOIN — consistent at REPEATABLE READ or higher**
-  (gated), but **can diverge at READ COMMITTED** under concurrent writers — they
-  recompute/overwrite a region read from a snapshot, so a concurrent committed
-  write can be lost. Reported as a known limitation (not gated, since the RC
-  divergence is race-dependent).
+The fix is a **matview-level advisory lock** (`incr_build_mv_lock_sql` →
+`pg_advisory_xact_lock(mvrelid)`), stored as the catalog `lock_sql` for exactly
+these shapes and run by `matview_delta_apply` **as its own SPI statement before
+the INSERT delta**. Being a *separate* statement is the crux: a concurrent
+maintainer blocks there until the holder commits, and the delta statements that
+follow then take fresh READ-COMMITTED snapshots that already include the
+committed change — so the recompute can't lose an update. (Embedding the lock in
+the delta statement would not work: RC fixes that statement's snapshot *before*
+the lock is acquired.)
 
-Refined the CREATE-time WARNING for these shapes accordingly: *consistent only at
-REPEATABLE READ or higher under concurrent writes; run source writers at RR+ (or
-let a REFRESH correct it)*. A clean RC fix would add per-affected-group advisory
-locks to the recompute/sync builders (mirroring the MIN/MAX two-phase lock) — a
-scoped follow-up.
+- **Additive shapes stay lock-free.** Single-table and INNER JOIN SUM/COUNT/AVG
+  store `NULL` for `lock_sql` and skip the step — their `ON CONFLICT` upserts
+  already serialize on the matview row lock and compose correctly at RC, so they
+  keep full per-group write concurrency.
+- **MIN/MAX** moved from its per-group two-phase del-lock to this matview-level
+  lock (run before INS); the dead `incr_build_minmax_lock_sql_gen` was removed.
+- The CREATE-time message dropped from a correctness **WARNING** to an
+  informational **NOTICE**: *"<shape>; its maintenance is serialized under
+  concurrent writes"* — accurate now that the only cost is serialized
+  maintenance, not possible divergence.
+
+Verification:
+- `concurrency_exotic.sh` — every shape now **gated at READ COMMITTED and
+  REPEATABLE READ** (was: RC informational-only for the recompute shapes).
+  3× clean runs.
+- `isolation_levels.sh` — added a **READ COMMITTED** round: SUM + MIN/MAX
+  consistent with **0 retries / 0 failures** (writers block on the lock rather
+  than aborting), plus the existing RR + SERIALIZABLE rounds.
+- Full `.sql` suite, `dump_restore_consistency.sh`, `truncate_concurrency.sh`
+  all green.
 
 ---
 
@@ -349,10 +367,13 @@ New test: `src/test/dbblue_ivm/phase2_deparse_delta.sql`.
 ### Phase 1 — engine (production-ready for its envelope)
 - AFTER-STATEMENT triggers + precomputed delta SQL in `pg_dbblue_matview`.
 - Counting algorithm (`__mv_count__`); AVG maintained as a (sum, count) pair;
-  MIN/MAX via two-phase advisory-lock rescan.
+  MIN/MAX via rescan under the matview-level serialization lock.
 - Shapes: single-table aggregate, multi-table INNER/LEFT/RIGHT/FULL & CROSS
-  JOIN, row-level (no GROUP BY), DISTINCT, HAVING, UNION ALL (uncertified
-  under concurrency), WHERE filters, CTE/subquery normalization.
+  JOIN, row-level (no GROUP BY), DISTINCT, HAVING, UNION ALL, WHERE filters,
+  CTE/subquery normalization. All consistent with a full `REFRESH` under
+  concurrent writers at every isolation level (recompute/multiset shapes
+  serialize maintenance on a matview-level advisory lock; additive shapes are
+  lock-free).
 - Correctness: Bug A (aliased MIN/MAX), Bug B (NULL aggregate arg), Bug C
   (NULL group key → auto-exclude `IS NOT NULL`, never blocks a write).
 - Hardening: TRUNCATE, dump/restore re-arm, HAVING teardown, float-aggregate
@@ -404,11 +425,16 @@ Migrate each shape to deparse and delete its hand builder once equivalent:
   themselves stay live (self-join's non-self tables + the escape hatch), so they
   are not deleted.  Fully retiring them / removing the GUC would also drop the
   A/B `REFRESH`-oracle safety net — left as an optional later step.
+- ✅ READ COMMITTED safety for the recompute/multiset shapes (self-join, outer
+  join, UNION ALL, row-level, MIN/MAX) via the matview-level serialization lock
+  — see "Most recent work" above. Done with a single matview-level lock rather
+  than per-affected-group locks: simpler, and the cost (serialized maintenance
+  of *that* matview) is acceptable since these shapes are the heavyweight ones.
+  Possible future refinement: per-group locks to let non-overlapping groups of
+  one such matview maintain concurrently — only worth it if a real workload is
+  bottlenecked on a single recompute-shape matview.
 - Broaden Odoo report coverage per `INCREMENTAL_MATVIEW_SUPPORT_AND_ROADMAP.md`
   §6 (window functions, nested aggregation, etc. — where feasible).
-- Optional: per-affected-group advisory locks for the recompute/sync builders
-  (self-join, outer join) and the UNION ALL multiset delete, to make those
-  shapes consistent under READ COMMITTED concurrent writes (today: RR+ only).
 
 ---
 

@@ -91,7 +91,11 @@
  *   INCR_PLAN_DEL  — subtract __mv_oldtable delta from matview (UPDATE)
  *   INCR_PLAN_CLN  — remove zero-count groups (DELETE WHERE __mv_count__ <= 0)
  *   INCR_PLAN_HAV  — recompute __mv_having_ok__ for all active groups (HAVING)
- *   INCR_PLAN_LOCK — acquire per-group advisory locks before DELETE rescan (MIN/MAX)
+ *   INCR_PLAN_LOCK — matview-level advisory lock, run first, that serializes
+ *                    maintenance of the recompute/multiset shapes (row-level,
+ *                    UNION ALL, outer join, self-join, MIN/MAX) so they stay
+ *                    correct under concurrent writers at READ COMMITTED; NULL
+ *                    (skipped) for the additive ON CONFLICT shapes
  * ----------
  */
 #define INCR_PLAN_INS	0
@@ -244,9 +248,7 @@ static char *incr_build_minmax_ins_sql_gen(Oid mvrelid, Query *viewQuery,
 static char *incr_build_minmax_del_sql_gen(Oid mvrelid, Query *viewQuery,
 										   int delta_varno, const char *delta_table,
 										   List *join_list, Oid delta_oid);
-static char *incr_build_minmax_lock_sql_gen(Oid mvrelid, Query *viewQuery,
-											int delta_varno, const char *delta_table,
-											List *join_list);
+static char *incr_build_mv_lock_sql(Oid mvrelid);
 /* Phase 16: CTE / FROM-subquery normalization */
 static int   incr_single_base_varno(Query *q);
 static int   incr_find_cte_varno(Query *q, const char *ctename);
@@ -865,16 +867,19 @@ incr_install_triggers(Oid mvrelid, Oid srctable)
 }
 
 /*
- * incr_warn_uncertified_shape
- * Emit a one-time WARNING at CREATE for the recompute/multiset shapes (UNION
- * ALL, self-join, outer join) whose incremental maintenance is correct under
- * REPEATABLE READ (or higher) but can lose updates under READ COMMITTED with
- * concurrent writers — because they recompute/overwrite a region read from a
- * snapshot rather than accumulating additively under the matview row lock.
- * Characterized by concurrency_exotic.sh.  Non-blocking by design.
+ * incr_notice_serialized_shape
+ * Emit a one-time NOTICE at CREATE for the recompute/multiset shapes (UNION
+ * ALL, self-join, outer join) whose incremental maintenance recomputes or
+ * overwrites a region (rather than accumulating additively under the matview
+ * row lock).  These shapes serialize their maintenance on a matview-level
+ * advisory lock, which makes them correct at every isolation level — including
+ * READ COMMITTED — but means concurrent writers to the source tables apply
+ * their deltas one at a time.  The additive shapes (single-table / INNER JOIN
+ * SUM/COUNT/AVG) are lock-free and unaffected.  Verified by
+ * concurrency_exotic.sh.  Purely informational; never blocks a write.
  */
 static void
-incr_warn_uncertified_shape(Query *viewQuery)
+incr_notice_serialized_shape(Query *viewQuery)
 {
 	const char *shape = NULL;
 
@@ -891,11 +896,10 @@ incr_warn_uncertified_shape(Query *viewQuery)
 	}
 
 	if (shape != NULL)
-		ereport(WARNING,
-				(errmsg("incremental materialized view uses %s, which is consistent only at REPEATABLE READ or higher under concurrent writes",
+		ereport(NOTICE,
+				(errmsg("incremental materialized view uses %s; its maintenance is serialized under concurrent writes",
 						shape),
-				 errdetail("Single-threaded and serialized maintenance are correct, but concurrent writers at READ COMMITTED can leave this shape diverged from a full REFRESH."),
-				 errhint("Run writers to this matview's source tables at REPEATABLE READ or higher (or accept eventual correction by a REFRESH).")));
+				 errdetail("This shape recomputes a region per delta, so it takes a matview-level lock to stay consistent with a full REFRESH at any isolation level (including READ COMMITTED). Concurrent writers to the source tables therefore apply their deltas one at a time.")));
 }
 
 /*
@@ -929,8 +933,8 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot use incremental_refresh: %s", reason)));
 
-	/* Caution operators about shapes not yet certified under concurrency. */
-	incr_warn_uncertified_shape(viewQuery);
+	/* Inform operators that recompute/multiset shapes serialize maintenance. */
+	incr_notice_serialized_shape(viewQuery);
 
 	/*
 	 * Is the matview already populated?  On the normal CREATE ... WITH DATA
@@ -1017,7 +1021,8 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 			del_sql = incr_build_row_del_sql(mvrelid, viewQuery, -1,
 											 MATVIEW_INCR_OLDTABLE, NIL);
 			incr_store_catalog(mvrelid, srctable,
-							   ins_sql, del_sql, "SELECT 1", NULL, NULL);
+							   ins_sql, del_sql, "SELECT 1", NULL,
+								   incr_build_mv_lock_sql(mvrelid));
 		}
 		else
 		{
@@ -1034,8 +1039,7 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 				del_sql  = incr_build_minmax_del_sql_gen(mvrelid, viewQuery, -1,
 														 MATVIEW_INCR_OLDTABLE, NIL,
 														 srctable);
-				lock_sql = incr_build_minmax_lock_sql_gen(mvrelid, viewQuery, -1,
-														  MATVIEW_INCR_OLDTABLE, NIL);
+				lock_sql = incr_build_mv_lock_sql(mvrelid);
 				incr_store_catalog(mvrelid, srctable, ins_sql, del_sql,
 								   cln_sql, hav_sql, lock_sql);
 			}
@@ -1115,7 +1119,8 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 															MATVIEW_INCR_OLDTABLE,
 															all_tables);
 					incr_store_catalog(mvrelid, delta->oid,
-									   ins_sql, del_sql, "SELECT 1", NULL, NULL);
+									   ins_sql, del_sql, "SELECT 1", NULL,
+								   incr_build_mv_lock_sql(mvrelid));
 					incr_install_triggers(mvrelid, delta->oid);
 				}
 			}
@@ -1175,7 +1180,8 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 						}
 
 						incr_store_catalog(mvrelid, delta->oid,
-										   ins_sql, del_sql, "SELECT 1", NULL, NULL);
+										   ins_sql, del_sql, "SELECT 1", NULL,
+								   incr_build_mv_lock_sql(mvrelid));
 						incr_install_triggers(mvrelid, delta->oid);
 						done_oids = bms_add_member(done_oids, (int) delta->oid);
 						} /* end v2 block */
@@ -1198,7 +1204,8 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 														 MATVIEW_INCR_OLDTABLE,
 														 join_list);
 						incr_store_catalog(mvrelid, delta->oid,
-										   ins_sql, del_sql, "SELECT 1", NULL, NULL);
+										   ins_sql, del_sql, "SELECT 1", NULL,
+								   incr_build_mv_lock_sql(mvrelid));
 						incr_install_triggers(mvrelid, delta->oid);
 					}
 				}
@@ -1223,7 +1230,8 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 											   MATVIEW_INCR_OLDTABLE,
 											   all_tables, is_preserved);
 				incr_store_catalog(mvrelid, delta->oid,
-								   ins_sql, del_sql, "SELECT 1", hav_sql, NULL);
+								   ins_sql, del_sql, "SELECT 1", hav_sql,
+								   incr_build_mv_lock_sql(mvrelid));
 				incr_install_triggers(mvrelid, delta->oid);
 			}
 		}
@@ -1302,7 +1310,8 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 					}
 
 					incr_store_catalog(mvrelid, delta->oid,
-									   ins_sql, del_sql, cln_sql, hav_sql, NULL);
+									   ins_sql, del_sql, cln_sql, hav_sql,
+									   incr_build_mv_lock_sql(mvrelid));
 					incr_install_triggers(mvrelid, delta->oid);
 					done_oids = bms_add_member(done_oids, (int) delta->oid);
 					} /* end v2 block */
@@ -1327,10 +1336,7 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 															 delta->varno,
 															 MATVIEW_INCR_OLDTABLE,
 															 join_list, delta->oid);
-					lock_sql = incr_build_minmax_lock_sql_gen(mvrelid, viewQuery,
-															  delta->varno,
-															  MATVIEW_INCR_OLDTABLE,
-															  join_list);
+					lock_sql = incr_build_mv_lock_sql(mvrelid);
 					incr_store_catalog(mvrelid, delta->oid,
 									   ins_sql, del_sql, cln_sql, hav_sql, lock_sql);
 				}
@@ -6014,6 +6020,44 @@ matview_delta_apply(PG_FUNCTION_ARGS)
 	/* RowExclusiveLock — sufficient for non-conflicting group keys */
 	LockRelationOid(mvrelid, RowExclusiveLock);
 
+	/*
+	 * ----- serialization lock (recompute / multiset shapes) -----
+	 *
+	 * Recompute/absolute-overwrite and multiset shapes (row-level projections,
+	 * UNION ALL, outer join, self-join, MIN/MAX) store a matview-level advisory
+	 * lock in lock_sql.  Run it FIRST, as its own SPI statement, for every
+	 * event (insert/update/delete): a concurrent maintainer of the same matview
+	 * blocks here until we commit, and because it is a separate statement, the
+	 * delta statements that follow take fresh READ COMMITTED snapshots that
+	 * already include our committed changes — eliminating lost updates without
+	 * requiring REPEATABLE READ.  Additive shapes store NULL here and skip it,
+	 * keeping their per-group write concurrency.
+	 */
+	{
+		char *lock_sql_str = incr_fetch_sql(mvrelid, srctable, INCR_PLAN_LOCK);
+
+		if (lock_sql_str)
+		{
+			SPIPlanPtr lplan = incr_get_plan(mvrelid, srctable, INCR_PLAN_LOCK);
+
+			if (lplan == NULL)
+			{
+				lplan = SPI_prepare(lock_sql_str, 0, NULL);
+				if (!lplan)
+					elog(ERROR,
+						 "matview_delta_apply: SPI_prepare (lock) failed: %s",
+						 SPI_result_code_string(SPI_result));
+				SPI_keepplan(lplan);
+				incr_cache_plan(mvrelid, srctable, INCR_PLAN_LOCK, lplan);
+			}
+
+			ret = SPI_execute_plan(lplan, NULL, NULL, false, 0);
+			if (ret < 0)
+				elog(ERROR, "matview_delta_apply: lock step failed: %s",
+					 SPI_result_code_string(ret));
+		}
+	}
+
 	/* ----- insert delta (INSERT or UPDATE new-side) ----- */
 	if (is_insert || is_update)
 	{
@@ -6043,40 +6087,6 @@ matview_delta_apply(PG_FUNCTION_ARGS)
 	/* ----- delete delta (DELETE or UPDATE old-side) ----- */
 	if (is_delete || is_update)
 	{
-		/*
-		 * For MIN/MAX views a lock_sql row is stored.  Execute it first as a
-		 * separate SPI call so it gets a fresh READ COMMITTED snapshot — this
-		 * forces all concurrent INSERT transactions to commit before we
-		 * proceed.  The subsequent del_sql (rescan) then also gets a fresh
-		 * snapshot that includes those INSERTs, eliminating the stale-snapshot
-		 * MIN/MAX race.  For non-MIN/MAX views lock_sql is NULL and we skip
-		 * straight to del_sql.
-		 */
-		{
-			char *lock_sql_str = incr_fetch_sql(mvrelid, srctable, INCR_PLAN_LOCK);
-
-			if (lock_sql_str)
-			{
-				SPIPlanPtr lplan = incr_get_plan(mvrelid, srctable, INCR_PLAN_LOCK);
-
-				if (lplan == NULL)
-				{
-					lplan = SPI_prepare(lock_sql_str, 0, NULL);
-					if (!lplan)
-						elog(ERROR,
-							 "matview_delta_apply: SPI_prepare (lock) failed: %s",
-							 SPI_result_code_string(SPI_result));
-					SPI_keepplan(lplan);
-					incr_cache_plan(mvrelid, srctable, INCR_PLAN_LOCK, lplan);
-				}
-
-				ret = SPI_execute_plan(lplan, NULL, NULL, false, 0);
-				if (ret < 0)
-					elog(ERROR, "matview_delta_apply: lock step failed: %s",
-						 SPI_result_code_string(ret));
-			}
-		}
-
 		{
 			SPIPlanPtr	plan = incr_get_plan(mvrelid, srctable, INCR_PLAN_DEL);
 
@@ -6833,7 +6843,8 @@ incr_setup_union_all(Oid mvrelid, Query *viewQuery, bool mv_populated)
 
 			/* multiset maintenance needs no cleanup step (no __mv_count__) */
 			incr_store_catalog(mvrelid, delta->oid,
-							   ins_sql, del_sql, "SELECT 1", NULL, NULL);
+							   ins_sql, del_sql, "SELECT 1", NULL,
+								   incr_build_mv_lock_sql(mvrelid));
 			incr_install_triggers(mvrelid, delta->oid);
 		}
 	}
@@ -7811,99 +7822,36 @@ incr_build_minmax_del_sql_gen(Oid mvrelid, Query *viewQuery,
 }
 
 /*
- * incr_build_minmax_lock_sql_gen — lock SQL for two-phase MIN/MAX DELETE
+ * incr_build_mv_lock_sql — serialize all incremental maintenance of a matview
  *
- * Generates a SELECT that acquires one advisory transaction lock per affected
- * group key from __mv_oldtable__.  Executed as a separate SPI call BEFORE
- * del_sql so that READ COMMITTED takes a new snapshot after the locks are
- * held, making all concurrent committed INSERTs visible to new_agg.
+ * Returns a SELECT that takes a transaction-scoped advisory lock keyed on the
+ * matview OID.  matview_delta_apply() runs this as its own SPI statement at the
+ * very start of maintenance (before the INSERT delta), so a transaction
+ * maintaining this matview holds the lock until commit and concurrent
+ * maintainers run one at a time.  Combined with READ COMMITTED's per-statement
+ * snapshots, this means every recompute/delete statement that runs after the
+ * lock sees a fresh snapshot that already includes whatever the previous
+ * maintainer committed.  That makes the recompute / absolute-overwrite and
+ * multiset shapes — row-level projections, UNION ALL, outer join, self-join and
+ * MIN/MAX — correct under concurrent writers at any isolation level, not just
+ * REPEATABLE READ and above.  (Embedding the lock inside the delta statement
+ * would not help: READ COMMITTED fixes that statement's snapshot before the
+ * lock is acquired, so the recompute would still read pre-lock data.)
  *
- * Lock key space: (matview OID as int4, hashtext of concatenated group cols).
+ * Additive shapes — single-table and INNER JOIN SUM/COUNT/AVG — are left
+ * lock-free: their ON CONFLICT upserts already serialize on the matview row
+ * lock and compose correctly under READ COMMITTED, so they keep full per-group
+ * write concurrency.  Those store NULL for lock_sql and skip this step.
+ *
+ * Lock key space: the single-argument pg_advisory_xact_lock(int8), which is a
+ * different space from the (int4,int4) two-key form, so it never collides with
+ * any other advisory lock.
  */
 static char *
-incr_build_minmax_lock_sql_gen(Oid mvrelid, Query *viewQuery,
-							   int delta_varno, const char *delta_table,
-							   List *join_list)
+incr_build_mv_lock_sql(Oid mvrelid)
 {
-	StringInfoData	buf;
-	List		   *groupColNames = NIL;
-	ListCell	   *lc,
-				   *gcl;
-	bool			first;
-
-	incr_collect_group_cols(viewQuery, &groupColNames);
-	initStringInfo(&buf);
-
-	/* SELECT pg_advisory_xact_lock(oid, hashtext(g1::text [|| '|' || g2::text ...])) */
-	appendStringInfo(&buf,
-					 "SELECT pg_advisory_xact_lock(%u, hashtext(",
-					 (unsigned) mvrelid);
-	if (list_length(groupColNames) == 1)
-	{
-		const char *colq = quote_identifier(strVal(linitial(groupColNames)));
-
-		appendStringInfo(&buf, "%s::text", colq);
-	}
-	else
-	{
-		first = true;
-		foreach(gcl, groupColNames)
-		{
-			const char *colq = quote_identifier(strVal(lfirst(gcl)));
-
-			if (!first)
-				appendStringInfoString(&buf, " || '|' || ");
-			first = false;
-			appendStringInfo(&buf, "%s::text", colq);
-		}
-	}
-	appendStringInfoString(&buf, ")) FROM (SELECT DISTINCT ");
-
-	/* emit group-col expressions */
-	first = true;
-	foreach(lc, viewQuery->targetList)
-	{
-		TargetEntry    *te = lfirst_node(TargetEntry, lc);
-		StringInfoData	ebuf;
-
-		if (te->resjunk || !IsA(te->expr, Var))
-			continue;
-		if (!first)
-			appendStringInfoChar(&buf, ',');
-		first = false;
-		initStringInfo(&ebuf);
-		incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable,
-								delta_varno, &ebuf);
-		/*
-		 * Always alias the grouping column to its matview output name: the
-		 * outer hashtext() references the group columns by output name
-		 * (incr_collect_group_cols returns resname), so when the output name
-		 * differs from the source column (e.g. "SELECT g AS k") the bare
-		 * source column would not be found.
-		 */
-		appendStringInfo(&buf, "%s AS %s", ebuf.data,
-						 quote_identifier(te->resname));
-	}
-
-	/* FROM delta_table [alias JOIN ...] */
-	incr_append_from_join(&buf, viewQuery, delta_varno, delta_table, join_list);
-
-	/* Optional WHERE from view definition */
-	{
-		Node *wq = incr_get_where_qual(viewQuery);
-
-		if (wq != NULL)
-		{
-			StringInfoData wbuf;
-
-			initStringInfo(&wbuf);
-			incr_deparse_where_qual(wq, viewQuery->rtable, delta_varno, &wbuf);
-			appendStringInfo(&buf, " WHERE %s", wbuf.data);
-		}
-	}
-	appendStringInfoString(&buf, ") _aff_");
-
-	return buf.data;
+	return psprintf("SELECT pg_advisory_xact_lock(%u::bigint)",
+					(unsigned) mvrelid);
 }
 
 

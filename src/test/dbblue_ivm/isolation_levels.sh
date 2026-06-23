@@ -2,15 +2,18 @@
 #
 # DBblue IVM — isolation-level stress test.
 #
-# Validates incremental maintenance under REPEATABLE READ and SERIALIZABLE.
-# The matview delta runs in the same transaction as the source DML, so a
-# serialization failure must roll back BOTH (no partial state); the matview
-# must equal a live recompute afterward.  Serialization/deadlock failures are
-# EXPECTED at these isolation levels and are retried via pgbench --max-tries;
-# the test asserts only on final consistency, not on zero retries.
+# Validates incremental maintenance under READ COMMITTED, REPEATABLE READ and
+# SERIALIZABLE.  The matview delta runs in the same transaction as the source
+# DML, so a serialization failure must roll back BOTH (no partial state); the
+# matview must equal a live recompute afterward.  Serialization/deadlock
+# failures are EXPECTED at RR/SER and are retried via pgbench --max-tries; the
+# test asserts only on final consistency, not on zero retries.  READ COMMITTED
+# is the realistic default and the case additive shapes must get right without
+# retries.
 #
-# Covers SUM/COUNT and MIN/MAX (the latter exercises the two-phase advisory
-# lock, whose per-statement-snapshot assumption changes under RR/SER).
+# Covers SUM/COUNT (additive, lock-free — RC-safe via the ON CONFLICT row lock)
+# and MIN/MAX (recompute — serialized on the matview-level advisory lock, which
+# is what makes its rescan RC-safe).
 #
 # Usage:  src/test/dbblue_ivm/isolation_levels.sh [duration_secs] [rounds]
 set -u
@@ -63,7 +66,9 @@ run_iso() {
         processed=$(grep -h "transactions actually processed" /tmp/iso_ins.log /tmp/iso_del.log | grep -oE '[0-9]+' | paste -sd+ | bc 2>/dev/null || echo 0)
         retried=$(grep -h "transactions retried" /tmp/iso_ins.log /tmp/iso_del.log | grep -oE '[0-9]+ ' | head -2 | paste -sd+ | bc 2>/dev/null || echo 0)
         failed=$(grep -h "number of failed transactions" /tmp/iso_ins.log /tmp/iso_del.log | grep -oE '[0-9]+ ' | head -2 | paste -sd+ | bc 2>/dev/null || echo 0)
-        echo "  round $round: processed=${processed:-0} retried=${retried:-0} failed=${failed:-0} (retries/failures expected at $iso)"
+        local note="retries/failures expected at $iso"
+        [ "$iso" = "read committed" ] && note="no serialization retries at $iso — writers block on the lock"
+        echo "  round $round: processed=${processed:-0} retried=${retried:-0} failed=${failed:-0} ($note)"
         if ! grep -q "transactions actually processed" /tmp/iso_ins.log || [ "${processed:-0}" = "0" ]; then
             echo "  round $round: SETUP FAIL — no transactions ran (check PGOPTIONS / connection)"
             sed -n '1,3p' /tmp/iso_ins.log
@@ -87,10 +92,11 @@ run_iso() {
     done
 }
 
+run_iso "read committed"
 run_iso "repeatable read"
 run_iso "serializable"
 
 $PSQL $CONN -q -c "DROP TABLE IF EXISTS iso_src CASCADE;" 2>/dev/null
 echo ""
-if [ "$fail" = "0" ]; then echo "=== ISOLATION TEST PASSED (RR + SERIALIZABLE consistent) ==="; exit 0
+if [ "$fail" = "0" ]; then echo "=== ISOLATION TEST PASSED (RC + RR + SERIALIZABLE consistent) ==="; exit 0
 else echo "=== ISOLATION TEST FAILED ==="; exit 1; fi

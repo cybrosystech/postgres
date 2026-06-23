@@ -59,9 +59,11 @@ EOF
 
 # run_shape <name> <iso> <gate:1|0> <setup-sql> <ins-script> <del-script> <consistency-sql>
 # gate=1: a divergence fails the test (a level/shape that MUST be consistent).
-# gate=0: informational only — characterizes a known limitation without failing
-#         (READ COMMITTED for the recompute/multiset shapes, where concurrent
-#         writers can lose updates; use REPEATABLE READ or higher there).
+#         Every shape is gated at every level now that the recompute/multiset
+#         shapes serialize maintenance on a matview-level advisory lock.
+# gate=0: informational only — report a divergence without failing (kept for
+#         characterizing any future shape whose consistency is not yet a
+#         guarantee at a given isolation level).
 run_shape() {
     local name="$1" iso="$2" gate="$3" setup="$4" insf="$5" delf="$6" check="$7"
     local opt; opt="-c default_transaction_isolation=$(iso_pgopt "$iso")"
@@ -123,15 +125,16 @@ IJ_CHECK="BEGIN; LOCK TABLE cx_line IN SHARE MODE;
   SELECT COUNT(*) FROM live FULL JOIN cx_ij i USING(cat)
     WHERE live.c IS DISTINCT FROM i.c OR live.s IS DISTINCT FROM i.s; COMMIT;"
 
-# INNER JOIN aggregates are additive (ON CONFLICT serializes on the matview row)
-# and are gated at every level.  UNION ALL / self-join / LEFT JOIN are
-# recompute/multiset shapes: gated at REPEATABLE READ (and higher), informational
-# at READ COMMITTED where concurrent writers can lose updates.
+# INNER JOIN aggregates are additive (ON CONFLICT serializes on the matview row).
+# UNION ALL / self-join / LEFT JOIN are recompute/multiset shapes: they take a
+# matview-level advisory lock that serializes their maintenance, so they are now
+# consistent with a full REFRESH at every isolation level — READ COMMITTED
+# included.  Every shape is therefore gated (gate=1) at every level.
 echo "════ isolation = read committed ════"
 run_shape "INNER JOIN" "read committed" 1 "$IJ_SETUP" /tmp/cx_ij_ins.sql /tmp/cx_ij_del.sql "$IJ_CHECK"
-run_shape "UNION ALL"  "read committed" 0 "$UA_SETUP" /tmp/cx_ua_ins.sql /tmp/cx_ua_del.sql "$UA_CHECK"
-run_shape "self-join"  "read committed" 0 "$SJ_SETUP" /tmp/cx_sj_ins.sql /tmp/cx_sj_del.sql "$SJ_CHECK"
-run_shape "LEFT JOIN"  "read committed" 0 "$LJ_SETUP" /tmp/cx_lj_ins.sql /tmp/cx_lj_del.sql "$LJ_CHECK"
+run_shape "UNION ALL"  "read committed" 1 "$UA_SETUP" /tmp/cx_ua_ins.sql /tmp/cx_ua_del.sql "$UA_CHECK"
+run_shape "self-join"  "read committed" 1 "$SJ_SETUP" /tmp/cx_sj_ins.sql /tmp/cx_sj_del.sql "$SJ_CHECK"
+run_shape "LEFT JOIN"  "read committed" 1 "$LJ_SETUP" /tmp/cx_lj_ins.sql /tmp/cx_lj_del.sql "$LJ_CHECK"
 echo "════ isolation = repeatable read ════"
 run_shape "INNER JOIN" "repeatable read" 1 "$IJ_SETUP" /tmp/cx_ij_ins.sql /tmp/cx_ij_del.sql "$IJ_CHECK"
 run_shape "UNION ALL"  "repeatable read" 1 "$UA_SETUP" /tmp/cx_ua_ins.sql /tmp/cx_ua_del.sql "$UA_CHECK"
