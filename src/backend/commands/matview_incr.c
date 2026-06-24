@@ -1826,35 +1826,31 @@ MatviewIncrAddNotNullKeyFilters(Query *q)
 	/*
 	 * NULL group keys are now maintained with full fidelity (the unique index is
 	 * NULLS NOT DISTINCT and the delta key joins use IS NOT DISTINCT FROM, so a
-	 * NULL/partial-NULL key is one arbiter row that the upsert maintains exactly
-	 * like a REFRESH).  This holds for every shape whose delta SQL goes through
-	 * the shared shells: single-table and INNER JOIN aggregates, DISTINCT, and
-	 * HAVING.  Only MIN/MAX (two-phase rescan: USING/IN/hashtext key matching)
-	 * and self-joins (recompute with =/IN key matching) still need NULL keys
-	 * kept out — exclude them there (writes are still never blocked).  For all
-	 * other shapes, inject nothing so NULL keys are maintained.
+	 * NULL/partial-NULL key is one arbiter row that the delta maintains exactly
+	 * like a REFRESH).  This holds for the shared-shell shapes (single-table and
+	 * INNER JOIN aggregates, DISTINCT, HAVING) and for MIN/MAX (whose rescan/delta
+	 * builders also match keys NULL-safely).  Only self-joins still need NULL keys
+	 * kept out — their recompute path matches keys with =/IN — so exclude there
+	 * (writes are still never blocked).  For all other shapes, inject nothing so
+	 * NULL keys are maintained.
 	 */
 	{
-		bool		needs_exclusion = incr_has_minmax_agg(q);
+		bool		needs_exclusion = false;
+		ListCell   *l1;
+		List	   *seen = NIL;		/* relation OIDs already seen */
 
-		if (!needs_exclusion)
+		foreach(l1, q->rtable)
 		{
-			ListCell   *l1;
-			List	   *seen = NIL;		/* relation OIDs already seen */
+			RangeTblEntry *rte = lfirst_node(RangeTblEntry, l1);
 
-			foreach(l1, q->rtable)
+			if (rte->rtekind != RTE_RELATION)
+				continue;
+			if (list_member_oid(seen, rte->relid))
 			{
-				RangeTblEntry *rte = lfirst_node(RangeTblEntry, l1);
-
-				if (rte->rtekind != RTE_RELATION)
-					continue;
-				if (list_member_oid(seen, rte->relid))
-				{
-					needs_exclusion = true;		/* self-join */
-					break;
-				}
-				seen = lappend_oid(seen, rte->relid);
+				needs_exclusion = true;		/* self-join */
+				break;
 			}
+			seen = lappend_oid(seen, rte->relid);
 		}
 
 		if (!needs_exclusion)
@@ -7466,7 +7462,9 @@ incr_build_minmax_ins_sql_gen(Oid mvrelid, Query *viewQuery,
 		}
 		else if (IsA(te->expr, Aggref))
 		{
-			char *fn = get_func_name(((Aggref *) te->expr)->aggfnoid);
+			char	   *fn = get_func_name(((Aggref *) te->expr)->aggfnoid);
+			const char *scq = (strcmp(fn, "sum") == 0)
+				? incr_sumcnt_sibling(viewQuery, te->resname) : NULL;
 
 			if (strcmp(fn, "min") == 0)
 				appendStringInfo(&buf, "%s=LEAST(%s.%s,EXCLUDED.%s)",
@@ -7474,6 +7472,13 @@ incr_build_minmax_ins_sql_gen(Oid mvrelid, Query *viewQuery,
 			else if (strcmp(fn, "max") == 0)
 				appendStringInfo(&buf, "%s=GREATEST(%s.%s,EXCLUDED.%s)",
 								 colq, mvname, colq, colq);
+			else if (scq != NULL)
+				/* SUM: counter (maintained by its own SET entry) drives NULL display */
+				appendStringInfo(&buf,
+								 "%s=CASE WHEN %s.%s+EXCLUDED.%s=0 THEN NULL ELSE %s END",
+								 colq, mvname, scq, scq,
+								 incr_nullsafe_accum(psprintf("%s.%s", mvname, colq),
+													 psprintf("EXCLUDED.%s", colq), false));
 			else
 				appendStringInfo(&buf, "%s=%s", colq,
 								 incr_nullsafe_accum(psprintf("%s.%s", mvname, colq),
@@ -7794,7 +7799,8 @@ incr_build_minmax_del_sql_gen(Oid mvrelid, Query *viewQuery,
 			}
 		}
 
-		/* JOIN affected ON (alias.col = affected.resname AND ...) */
+		/* JOIN affected ON (alias.col IS NOT DISTINCT FROM affected.resname AND ...)
+		 * — NULL-safe so a NULL/partial-NULL group key is rescanned, not dropped. */
 		appendStringInfoString(&buf, " JOIN affected ON (");
 		first = true;
 		foreach(lc, viewQuery->targetList)
@@ -7810,7 +7816,7 @@ incr_build_minmax_del_sql_gen(Oid mvrelid, Query *viewQuery,
 			initStringInfo(&ebuf);
 			incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable,
 									delta_varno, &ebuf);
-			appendStringInfo(&buf, "%s=affected.%s",
+			appendStringInfo(&buf, "%s IS NOT DISTINCT FROM affected.%s",
 							 ebuf.data, quote_identifier(te->resname));
 		}
 		appendStringInfoChar(&buf, ')');
@@ -7834,51 +7840,30 @@ incr_build_minmax_del_sql_gen(Oid mvrelid, Query *viewQuery,
 			}
 
 			/*
-			 * <source-col(s)> IN (SELECT <output-name(s)> FROM affected):
-			 * the left side references the live source table (source column
-			 * name), the right side references the affected CTE (output name).
+			 * Restrict to the affected groups NULL-safely:
+			 *   WHERE EXISTS (SELECT 1 FROM affected
+			 *                 WHERE <src1> IS NOT DISTINCT FROM affected.<out1> AND ...)
+			 * The left side references the live source table (source column name),
+			 * the right side the affected CTE (output name).  IS NOT DISTINCT FROM
+			 * (not IN/=) so a NULL/partial-NULL key group is rescanned, not dropped.
 			 */
-			if (list_length(grp_tes) == 1)
+			appendStringInfoString(&buf, " WHERE EXISTS (SELECT 1 FROM affected WHERE ");
+			first = true;
+			foreach(glc, grp_tes)
 			{
-				TargetEntry   *te = linitial(grp_tes);
+				TargetEntry   *te = lfirst(glc);
 				StringInfoData srcbuf;
 
+				if (!first)
+					appendStringInfoString(&buf, " AND ");
+				first = false;
 				initStringInfo(&srcbuf);
 				incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable,
 										delta_varno, &srcbuf);
-				appendStringInfo(&buf, " WHERE %s IN (SELECT %s FROM affected)",
+				appendStringInfo(&buf, "%s IS NOT DISTINCT FROM affected.%s",
 								 srcbuf.data, quote_identifier(te->resname));
 			}
-			else
-			{
-				appendStringInfoString(&buf, " WHERE (");
-				first = true;
-				foreach(glc, grp_tes)
-				{
-					TargetEntry   *te = lfirst(glc);
-					StringInfoData srcbuf;
-
-					if (!first)
-						appendStringInfoChar(&buf, ',');
-					first = false;
-					initStringInfo(&srcbuf);
-					incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable,
-											delta_varno, &srcbuf);
-					appendStringInfoString(&buf, srcbuf.data);
-				}
-				appendStringInfoString(&buf, ") IN (SELECT ");
-				first = true;
-				foreach(glc, grp_tes)
-				{
-					TargetEntry *te = lfirst(glc);
-
-					if (!first)
-						appendStringInfoChar(&buf, ',');
-					first = false;
-					appendStringInfoString(&buf, quote_identifier(te->resname));
-				}
-				appendStringInfoString(&buf, " FROM affected)");
-			}
+			appendStringInfoChar(&buf, ')');
 		}
 	}
 
@@ -8008,16 +7993,19 @@ incr_build_minmax_del_sql_gen(Oid mvrelid, Query *viewQuery,
 				appendStringInfo(&buf, "%s=new_agg.%s", colq, colq);
 		}
 	}
-	appendStringInfo(&buf, " FROM new_agg JOIN old_delta USING (");
+	/* JOIN old_delta ON new_agg.k IS NOT DISTINCT FROM old_delta.k (NULL-safe,
+	 * not USING, so a NULL/partial-NULL key group still joins). */
+	appendStringInfoString(&buf, " FROM new_agg JOIN old_delta ON (");
 	first = true;
 	foreach(gcl, groupColNames)
 	{
 		const char *colq = quote_identifier(strVal(lfirst(gcl)));
 
 		if (!first)
-			appendStringInfoChar(&buf, ',');
+			appendStringInfoString(&buf, " AND ");
 		first = false;
-		appendStringInfoString(&buf, colq);
+		appendStringInfo(&buf, "new_agg.%s IS NOT DISTINCT FROM old_delta.%s",
+						 colq, colq);
 	}
 	appendStringInfoString(&buf, ") WHERE ");
 	first = true;
@@ -8028,7 +8016,8 @@ incr_build_minmax_del_sql_gen(Oid mvrelid, Query *viewQuery,
 		if (!first)
 			appendStringInfoString(&buf, " AND ");
 		first = false;
-		appendStringInfo(&buf, "%s.%s=new_agg.%s", mvname, colq, colq);
+		appendStringInfo(&buf, "%s.%s IS NOT DISTINCT FROM new_agg.%s",
+						 mvname, colq, colq);
 	}
 	appendStringInfoString(&buf, ")");
 
@@ -8044,7 +8033,8 @@ incr_build_minmax_del_sql_gen(Oid mvrelid, Query *viewQuery,
 		if (!first)
 			appendStringInfoString(&buf, " AND ");
 		first = false;
-		appendStringInfo(&buf, "%s.%s=affected.%s", mvname, colq, colq);
+		appendStringInfo(&buf, "%s.%s IS NOT DISTINCT FROM affected.%s",
+						 mvname, colq, colq);
 	}
 	appendStringInfoString(&buf,
 						   " AND NOT EXISTS (SELECT 1 FROM new_agg WHERE ");
@@ -8056,7 +8046,8 @@ incr_build_minmax_del_sql_gen(Oid mvrelid, Query *viewQuery,
 		if (!first)
 			appendStringInfoString(&buf, " AND ");
 		first = false;
-		appendStringInfo(&buf, "new_agg.%s=%s.%s", colq, mvname, colq);
+		appendStringInfo(&buf, "new_agg.%s IS NOT DISTINCT FROM %s.%s",
+						 colq, mvname, colq);
 	}
 	appendStringInfoChar(&buf, ')');
 

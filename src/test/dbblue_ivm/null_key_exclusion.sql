@@ -1,15 +1,15 @@
 -- DBblue IVM — NULL group-key fidelity (writes are never blocked).
 --
 -- NULL (and partial-NULL, for multi-column keys) group keys are MAINTAINED with
--- full fidelity for every shape whose delta goes through the shared shells:
--- single-table and INNER JOIN aggregates, DISTINCT, and HAVING.  This works via
--- a NULLS NOT DISTINCT unique index (so a NULL key is one ON CONFLICT arbiter
--- row) plus IS NOT DISTINCT FROM delta key joins, so the matview equals a full
--- REFRESH including the NULL group.
+-- full fidelity for the shared-shell shapes (single-table and INNER JOIN
+-- aggregates, DISTINCT, HAVING) AND for MIN/MAX.  This works via a NULLS NOT
+-- DISTINCT unique index (so a NULL key is one ON CONFLICT arbiter row) plus
+-- IS NOT DISTINCT FROM delta key joins (MIN/MAX matches its rescan/affected keys
+-- the same way), so the matview equals a full REFRESH including the NULL group.
 --
--- MIN/MAX and self-joins still EXCLUDE NULL keys (their hand-written delta SQL
--- matches keys with =/USING/IN, which NULLs break) — the source write still
--- always succeeds; those rows are simply left out of the matview.
+-- Only self-joins still EXCLUDE NULL keys (their recompute path matches keys with
+-- =/IN, which NULLs break) — the source write still always succeeds; those rows
+-- are simply left out of the matview.
 \set ON_ERROR_STOP on
 \echo ''
 \echo '=== DBblue IVM: NULL group-key fidelity ==='
@@ -80,26 +80,34 @@ BEGIN
 END $$;
 DROP MATERIALIZED VIEW nm_mv; DROP TABLE nm CASCADE;
 
--- 3) MIN/MAX: NULL keys are still EXCLUDED (documented); the write still succeeds.
+-- 3) MIN/MAX: NULL keys are now MAINTAINED with full fidelity (== REFRESH), not
+--    excluded — the rescan/delta builders match keys NULL-safely (IS NOT DISTINCT
+--    FROM), and the INSERT ON CONFLICT uses the NULLS NOT DISTINCT index.  Covers
+--    the rescan path: removing the NULL group's extremum, and a key moving
+--    to/from NULL.  (Self-joins still exclude — separate.)
 DROP TABLE IF EXISTS mmx CASCADE;
 CREATE TABLE mmx(id serial PRIMARY KEY, g int, v numeric);
-INSERT INTO mmx(g,v) VALUES (1,5),(NULL,9);
+INSERT INTO mmx(g,v) VALUES (1,5),(NULL,9),(NULL,99);
 CREATE MATERIALIZED VIEW mmx_mv WITH (incremental_refresh=true) AS
-  SELECT g, MIN(v) mn, MAX(v) mx, COUNT(*) c FROM mmx GROUP BY g WITH DATA;
+  SELECT g, MIN(v) mn, MAX(v) mx, COUNT(*) c, SUM(v) s FROM mmx GROUP BY g WITH DATA;
+CREATE MATERIALIZED VIEW mmx_ora AS
+  SELECT g, MIN(v) mn, MAX(v) mx, COUNT(*) c, SUM(v) s FROM mmx GROUP BY g WITH DATA;
 DO $$
 DECLARE nullrows int; mm int;
 BEGIN
-  INSERT INTO mmx(g,v) VALUES (NULL,1),(1,8);   -- NULL-key write must not block
+  INSERT INTO mmx(g,v) VALUES (NULL,1),(1,8);    -- NULL-key write must not block
+  DELETE FROM mmx WHERE g IS NULL AND v=99;      -- remove NULL group's MAX -> rescan
+  UPDATE mmx SET g=NULL WHERE id=1;              -- move a key TO NULL
+  REFRESH MATERIALIZED VIEW mmx_ora;
   SELECT count(*) INTO nullrows FROM mmx_mv WHERE g IS NULL;
-  -- non-null groups stay consistent with the (NULL-excluded) live recompute
-  SELECT count(*) INTO mm FROM
-    (SELECT g, MIN(v) mn, MAX(v) mx, COUNT(*) c FROM mmx WHERE g IS NOT NULL GROUP BY g) l
-    FULL JOIN mmx_mv m USING(g)
-    WHERE l.g IS DISTINCT FROM m.g OR l.mn<>m.mn OR l.mx<>m.mx OR l.c<>m.c;
-  IF nullrows = 0 AND mm = 0
-  THEN RAISE NOTICE 'MIN/MAX still excludes NULL key, write not blocked: PASS';
+  SELECT count(*) INTO mm FROM (
+    (SELECT g,mn,mx,c,s FROM mmx_mv EXCEPT SELECT g,mn,mx,c,s FROM mmx_ora)
+    UNION ALL (SELECT g,mn,mx,c,s FROM mmx_ora EXCEPT SELECT g,mn,mx,c,s FROM mmx_mv)) d;
+  IF nullrows = 1 AND mm = 0
+  THEN RAISE NOTICE 'MIN/MAX maintains NULL group == REFRESH (rescan + key->NULL): PASS';
   ELSE RAISE EXCEPTION 'MIN/MAX NULL handling: FAIL (nullrows=%, diff=%)', nullrows, mm; END IF;
 END $$;
+DROP MATERIALIZED VIEW mmx_ora;
 DROP MATERIALIZED VIEW mmx_mv; DROP TABLE mmx CASCADE;
 
 -- 4) NOT NULL key: nothing injected, maintenance correct (regression guard).
