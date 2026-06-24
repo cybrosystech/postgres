@@ -2037,13 +2037,14 @@ MatviewIncrAddCountTarget(Query *q)
 
 	/*
 	 * Inject COUNT(x) AS __mv_sumcnt_<col> for each visible SUM(x) so SUM can
-	 * show SQL-exact NULL once a group's last non-NULL input is removed (the
-	 * shared shells render visible_sum = sumcnt=0 ? NULL : running_sum).  Only
-	 * for shapes the shared shells maintain: MIN/MAX and self-joins keep their
-	 * own builders (and the 0 residual), so they get no counter.
+	 * show SQL-exact NULL once a group's last non-NULL input is removed
+	 * (visible_sum = sumcnt=0 ? NULL : running_sum).  Both the shared shells and
+	 * the MIN/MAX builders render the counter; only self-joins skip it (their
+	 * recompute path derives SUM directly, so an emptied non-NULL set already
+	 * yields NULL without a counter).
 	 */
 	{
-		bool		want_sumcnt = !incr_has_minmax_agg(q);
+		bool		want_sumcnt = true;
 		ListCell   *l2;
 		List	   *seen = NIL;
 
@@ -7284,7 +7285,9 @@ incr_build_minmax_ins_sql_gen(Oid mvrelid, Query *viewQuery,
 		}
 		else if (IsA(te->expr, Aggref))
 		{
-			char *fn = get_func_name(((Aggref *) te->expr)->aggfnoid);
+			char	   *fn = get_func_name(((Aggref *) te->expr)->aggfnoid);
+			const char *scq = (strcmp(fn, "sum") == 0)
+				? incr_sumcnt_sibling(viewQuery, te->resname) : NULL;
 
 			if (strcmp(fn, "min") == 0)
 				appendStringInfo(&buf, "%s=LEAST(%s.%s,ins.%s)",
@@ -7292,9 +7295,18 @@ incr_build_minmax_ins_sql_gen(Oid mvrelid, Query *viewQuery,
 			else if (strcmp(fn, "max") == 0)
 				appendStringInfo(&buf, "%s=GREATEST(%s.%s,ins.%s)",
 								 colq, mvname, colq, colq);
+			else if (scq != NULL)
+				/* SUM with a non-NULL counter: the counter itself is maintained
+				 * by its own (standalone) entry in this SET; here we only render
+				 * the visible SUM as NULL when the running counter reaches 0. */
+				appendStringInfo(&buf,
+								 "%s=CASE WHEN %s.%s+ins.%s=0 THEN NULL ELSE %s END",
+								 colq, mvname, scq, scq,
+								 incr_nullsafe_accum(psprintf("%s.%s", mvname, colq),
+													 psprintf("ins.%s", colq), false));
 			else
-				/* SUM/COUNT: NULL-safe so a NULL running total (left by an
-				 * earlier delete) is not poisoned by "+ ins". */
+				/* COUNT (and SUM without a counter): NULL-safe so a NULL running
+				 * total left by an earlier delete is not poisoned by "+ ins". */
 				appendStringInfo(&buf, "%s=%s", colq,
 								 incr_nullsafe_accum(psprintf("%s.%s", mvname, colq),
 													 psprintf("ins.%s", colq), false));
@@ -7948,12 +7960,33 @@ incr_build_minmax_del_sql_gen(Oid mvrelid, Query *viewQuery,
 			}
 
 			if (is_delta)
-				appendStringInfo(&buf, "%s=%s", colq,
-								 incr_nullsafe_accum(
-									 psprintf("%s.%s", mvname, colq),
-									 psprintf("old_delta.%s",
-											  quote_identifier(delta_colname)),
-									 true));
+			{
+				/* SUM with a non-NULL counter: keep delta arithmetic for the
+				 * running total (so it composes with the insert delta) but render
+				 * the visible value as NULL once the counter (also delta-
+				 * maintained, by its own standalone entry) reaches 0. */
+				const char *scq = (IsA(te->expr, Aggref) &&
+								   strcmp(get_func_name(((Aggref *) te->expr)->aggfnoid),
+										  "sum") == 0)
+					? incr_sumcnt_sibling(viewQuery, te->resname) : NULL;
+				char	   *run = incr_nullsafe_accum(
+					psprintf("%s.%s", mvname, colq),
+					psprintf("old_delta.%s", quote_identifier(delta_colname)),
+					true);
+
+				if (scq != NULL)
+				{
+					const char *del_scnt = quote_identifier(
+						psprintf("del_%s%s", MATVIEW_INCR_SUMCNT_PREFIX,
+								 te->resname));
+
+					appendStringInfo(&buf,
+									 "%s=CASE WHEN %s.%s-old_delta.%s=0 THEN NULL ELSE %s END",
+									 colq, mvname, scq, del_scnt, run);
+				}
+				else
+					appendStringInfo(&buf, "%s=%s", colq, run);
+			}
 			else
 				appendStringInfo(&buf, "%s=new_agg.%s", colq, colq);
 		}

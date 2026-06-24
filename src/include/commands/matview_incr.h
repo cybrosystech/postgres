@@ -39,8 +39,10 @@ extern PGDLLIMPORT bool dbblue_ivm_deparse_delta;
  * __mv_sumcnt_<col>__ — running COUNT(x) of non-NULL inputs to a SUM(x) output
  * column named <col>.  Lets SUM show SQL-exact NULL (not 0) once a group's last
  * non-NULL input is removed: visible_sum = (sumcnt = 0 ? NULL : running_sum).
- * Added only for shapes maintained by the shared shells (single-table/INNER
- * JOIN aggregates, DISTINCT, HAVING); MIN/MAX and self-join keep the 0 residual.
+ * Maintained by the shared shells (single-table/INNER JOIN aggregates, DISTINCT,
+ * HAVING) and by the MIN/MAX builders (which keep SUM on delta arithmetic and
+ * use the counter only for display).  Self-joins skip it — their recompute path
+ * derives SUM directly, so an emptied non-NULL set already yields NULL.
  */
 #define MATVIEW_INCR_SUMCNT_PREFIX	"__mv_sumcnt_"
 

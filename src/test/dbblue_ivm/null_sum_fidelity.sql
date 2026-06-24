@@ -6,7 +6,9 @@
 -- (__mv_sumcnt_<col>) now lets the visible SUM be rendered as
 -- (sumcnt = 0 ? NULL : running_sum), and the running sum recovers from NULL
 -- when a non-NULL input returns.  Verified == full REFRESH for the shared-shell
--- shapes (single-table, INNER JOIN, HAVING) on both the hand and deparse paths.
+-- shapes (single-table, INNER JOIN, HAVING) on both the hand and deparse paths,
+-- AND for the MIN/MAX path (which keeps SUM on delta arithmetic — so it still
+-- composes with the insert delta — and only uses the counter for display).
 \set ON_ERROR_STOP on
 \echo ''
 \echo '=== DBblue IVM: all-NULL SUM fidelity ==='
@@ -65,5 +67,32 @@ BEGIN
   ELSE RAISE EXCEPTION 'JOIN all-NULL SUM: FAIL (% diff)', ndiff; END IF;
 END $$;
 DROP MATERIALIZED VIEW hi; DROP MATERIALIZED VIEW hn; DROP TABLE hp, hs CASCADE;
+
+-- MIN/MAX path: SUM also returns to NULL (not 0) when a group loses its last
+-- non-NULL value but survives — via the same __mv_sumcnt_ counter, while SUM's
+-- running total stays on delta arithmetic so the combined DELETE+INSERT case
+-- (audit_regressions BUGF) is unaffected.  Covers single-table + INNER JOIN,
+-- DELETE and UPDATE-to-NULL, and recovery when a non-NULL returns.
+DROP TABLE IF EXISTS mmn CASCADE;
+CREATE TABLE mmn(id serial primary key, g int, v int);
+INSERT INTO mmn(g,v) VALUES (1,5),(1,NULL),(2,10),(2,20),(3,NULL);
+CREATE MATERIALIZED VIEW mmi WITH (incremental_refresh=true) AS
+  SELECT g, min(v) mn, max(v) mx, sum(v) s, avg(v) a, count(v) cv, count(*) c FROM mmn GROUP BY g;
+DELETE FROM mmn WHERE g=1 AND v=5;        -- g1: last non-NULL gone, NULL row remains -> s NULL
+UPDATE mmn SET v=NULL WHERE g=2 AND v=10; -- g2 still has v=20
+DELETE FROM mmn WHERE g=2 AND v=20;       -- g2: now all-NULL -> s NULL
+INSERT INTO mmn(g,v) VALUES (3,7);        -- g3: recover from all-NULL -> s=7
+CREATE MATERIALIZED VIEW mmnn AS
+  SELECT g, min(v) mn, max(v) mx, sum(v) s, avg(v) a, count(v) cv, count(*) c FROM mmn GROUP BY g;
+DO $$
+DECLARE ndiff int;
+BEGIN
+  SELECT count(*) INTO ndiff FROM (
+    (SELECT g,mn,mx,s,a,cv,c FROM mmi EXCEPT SELECT g,mn,mx,s,a,cv,c FROM mmnn)
+    UNION ALL (SELECT g,mn,mx,s,a,cv,c FROM mmnn EXCEPT SELECT g,mn,mx,s,a,cv,c FROM mmi)) d;
+  IF ndiff=0 THEN RAISE NOTICE 'MIN/MAX all-NULL SUM == REFRESH (NULL, recovers): PASS';
+  ELSE RAISE EXCEPTION 'MIN/MAX all-NULL SUM: FAIL (% diff)', ndiff; END IF;
+END $$;
+DROP MATERIALIZED VIEW mmi; DROP MATERIALIZED VIEW mmnn; DROP TABLE mmn CASCADE;
 \echo ''
 \echo '=== all-NULL SUM fidelity test complete ==='

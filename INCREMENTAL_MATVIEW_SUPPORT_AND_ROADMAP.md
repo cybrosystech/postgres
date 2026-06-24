@@ -129,17 +129,15 @@ A `NOTICE` (not a `WARNING`) fires at `CREATE` for these:
   design excludes objects that don't match the pattern.)
 - **Logical-replication subscribers do not maintain** the matview (delta
   triggers fire on origin only). Physical replicas are fine (data ships via WAL).
-- **All-NULL `SUM`:** for the **additive shapes** (single-table / INNER JOIN /
-  HAVING, no MIN/MAX) a group that loses its last non-NULL input correctly shows
-  SQL `NULL` (not `0`) and recovers when one returns — via a hidden non-NULL
-  counter (`__mv_sumcnt_<col>`), verified in `null_sum_fidelity.sql`. **For
-  MIN/MAX matviews this is a known residual:** such a group's `SUM` shows `0`
-  rather than `NULL` (the MIN/MAX delete path maintains `SUM` by delta arithmetic
-  so it can compose correctly with the insert delta — including a single
-  statement that both deletes and inserts; the trade-off is it lands on `0`, not
-  `NULL`). `AVG` is unaffected (it reads `NULL` via its count). Bounded and
-  cosmetic (`0` vs `NULL` for an all-NULL group); closing it for MIN/MAX needs
-  the non-NULL counter extended to that path.
+- **All-NULL `SUM` returns SQL `NULL`** (not `0`) once a group loses its last
+  non-NULL input, and recovers to a number when one returns — for **every** SUM
+  shape: the additive ones (single-table / INNER JOIN / HAVING) and **MIN/MAX**,
+  both via the hidden non-NULL counter `__mv_sumcnt_<col>`. The MIN/MAX path
+  keeps `SUM` on **delta arithmetic** (so it still composes with the insert delta
+  — a single statement that both deletes and inserts stays correct, guarded by
+  `audit_regressions` BUGF) and uses the counter only to display `NULL`. Verified
+  `== REFRESH` in `null_sum_fidelity.sql`. (Self-joins need no counter — their
+  recompute path yields `NULL` directly.)
 
 ---
 
