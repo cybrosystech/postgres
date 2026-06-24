@@ -7539,11 +7539,12 @@ incr_build_minmax_del_sql_gen(Oid mvrelid, Query *viewQuery,
 	appendStringInfoString(&buf, "),");
 
 	/* ----------------------------------------------------------------
-	 * old_delta CTE: per affected group, count the deleted rows (del_cnt) and,
-	 * for each COUNT(arg) aggregate, the deleted non-NULL arguments.  upd uses
-	 * these to maintain the COUNT columns via delta arithmetic (col = mv.col -
-	 * del_col).  SUM/AVG do NOT use delta arithmetic (they take the new_agg
-	 * rescan instead, so an emptied non-NULL set returns to NULL rather than 0).
+	 * old_delta CTE: count rows and sum SUM-aggregate arguments from the
+	 * delta per affected group.  Used in upd to maintain COUNT and SUM via
+	 * delta arithmetic (col = mv.col - del_col) rather than the rescan
+	 * value, which avoids a race where a concurrent INSERT commits between
+	 * new_agg's scan and the row-lock acquisition in upd, causing its delta
+	 * to be silently overwritten by a stale absolute value.
 	 * ---------------------------------------------------------------- */
 	appendStringInfoString(&buf, " old_delta AS (SELECT ");
 	first = true;
@@ -7569,6 +7570,38 @@ incr_build_minmax_del_sql_gen(Oid mvrelid, Query *viewQuery,
 		}
 	}
 	appendStringInfoString(&buf, ",COUNT(*) AS del_cnt");
+	/* SUM delta columns: SUM(arg) AS del_<resname> for each SUM aggregate */
+	{
+		ListCell *lc2;
+
+		foreach(lc2, viewQuery->targetList)
+		{
+			TargetEntry    *te2 = lfirst_node(TargetEntry, lc2);
+			Aggref		   *agg2;
+			TargetEntry    *arg_te;
+			StringInfoData  ebuf2;
+
+			if (te2->resjunk || !IsA(te2->expr, Aggref))
+				continue;
+			if (strcmp(te2->resname, MATVIEW_INCR_HAVING_COL) == 0 ||
+				strcmp(te2->resname, MATVIEW_INCR_COUNT_COL) == 0)
+				continue;
+
+			agg2 = (Aggref *) te2->expr;
+			if (strcmp(get_func_name(agg2->aggfnoid), "sum") != 0)
+				continue;
+			if (agg2->args == NIL)
+				continue;
+
+			arg_te = linitial_node(TargetEntry, agg2->args);
+			initStringInfo(&ebuf2);
+			incr_deparse_where_qual((Node *) arg_te->expr, viewQuery->rtable,
+									delta_varno, &ebuf2);
+			appendStringInfo(&buf, ",SUM(%s) AS %s",
+							 ebuf2.data,
+							 quote_identifier(psprintf("del_%s", te2->resname)));
+		}
+	}
 	/*
 	 * COUNT(arg) delta columns: COUNT(arg) AS del_<resname> for each
 	 * count-of-an-argument aggregate — both the visible count(col) and the
@@ -7878,15 +7911,11 @@ incr_build_minmax_del_sql_gen(Oid mvrelid, Query *viewQuery,
 		first = false;
 
 		/*
-		 * COUNT columns use delta arithmetic (mv.col - del_col).  SUM (and the
-		 * hidden AVG sum) instead take the rescanned value from new_agg, exactly
-		 * as the visible AVG already does: a group that loses its last non-NULL
-		 * input must go back to SQL NULL, but delta arithmetic (mv.sum - del_sum)
-		 * lands on 0.  This is safe because the matview-level serialization lock
-		 * (incr_build_mv_lock_sql, taken before this transaction's first delta)
-		 * means no other maintenance commits between new_agg's scan and this
-		 * UPDATE — the race the delta arithmetic guarded against can no longer
-		 * occur, so the rescanned absolute value is never stale.
+		 * COUNT and SUM columns use delta arithmetic (mv.col - del_col)
+		 * rather than the rescan value from new_agg.  This prevents a
+		 * concurrent INSERT that commits between new_agg's READ COMMITTED
+		 * scan and the row-lock acquisition in this UPDATE from being
+		 * silently lost.
 		 */
 		{
 			bool		is_delta = false;
@@ -7911,7 +7940,11 @@ incr_build_minmax_del_sql_gen(Oid mvrelid, Query *viewQuery,
 						? "del_cnt"
 						: psprintf("del_%s", te->resname);
 				}
-				/* SUM (and __mv_avgsum_*) fall through to the new_agg rescan. */
+				else if (strcmp(fname2, "sum") == 0)
+				{
+					is_delta = true;
+					delta_colname = psprintf("del_%s", te->resname);
+				}
 			}
 
 			if (is_delta)
