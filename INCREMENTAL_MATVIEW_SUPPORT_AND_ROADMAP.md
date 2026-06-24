@@ -103,22 +103,20 @@ A `NOTICE` (not a `WARNING`) fires at `CREATE` for these:
 
 ## 4. Data requirements & boundaries
 
-- **NULL group keys are auto-excluded; writes are never blocked.** A NULL in a
-  GROUP BY/DISTINCT key can't be maintained incrementally, so at `CREATE` the
-  engine injects `<key> IS NOT NULL` into the matview's stored query for every
-  *nullable* key (a `NOTICE` lists them). Effect: the source `INSERT`/`UPDATE`
-  **always succeeds** (e.g. Odoo section/note lines with `product_id = NULL`),
-  the matview leaves those rows out of scope, and it stays **consistent with a
-  full `REFRESH`** (the filter is in the stored query). `NOT NULL` keys are
-  untouched. There is no "NULL/unknown" group — the sensible default for a
-  grouped report.
-  **Divergence from a normal matview:** a non-incremental matview *keeps* the
-  NULL group (one row aggregating all NULL-key rows); the incremental one omits
-  it. The incremental matview is still self-consistent (it equals its own
-  `REFRESH`, since the `IS NOT NULL` filter is in its stored query) — it just is
-  not identical to a normal matview of the *unfiltered* query. **Phase 2 closes
-  this** (full NULL-group fidelity via `NULLS NOT DISTINCT` + `IS NOT DISTINCT
-  FROM`), so incremental == normal matview for NULL keys too.
+- **NULL group keys — full fidelity for the additive shapes; auto-excluded for
+  MIN/MAX & self-join.** A NULL GROUP BY/DISTINCT key is now **maintained with
+  full fidelity** (`NULLS NOT DISTINCT` unique index + `IS NOT DISTINCT FROM`
+  delta joins) for the additive shapes — single-table / INNER JOIN / DISTINCT /
+  HAVING — so the incremental matview keeps the NULL group exactly like a normal
+  matview (verified in `null_key_exclusion.sql`).
+  **Residual (MIN/MAX and self-join):** these shapes still **auto-exclude** NULL
+  keys — at `CREATE` the engine injects `<key> IS NOT NULL` into the stored query
+  for every *nullable* key and emits a `NOTICE` listing them. The source write
+  always succeeds; the matview leaves NULL-key rows out of scope and stays
+  consistent with its *own* `REFRESH` (the filter is in its stored query), but it
+  omits the NULL group a normal matview of the unfiltered query would keep.
+  Bounded and announced at `CREATE`; closing it needs the `NULLS NOT DISTINCT`
+  treatment extended to the MIN/MAX and self-join builders.
 - **HAVING matviews must be created `WITH DATA`** (a `WARNING` is emitted
   otherwise). A HAVING matview is stored as a user-facing view over a hidden
   `_dbblue_<oid>_base` matview, so a **full-database** `pg_dump`/restore works
