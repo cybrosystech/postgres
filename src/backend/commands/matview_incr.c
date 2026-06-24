@@ -272,6 +272,8 @@ static const char *incr_having_agg_column(Aggref *hagg, Query *viewQuery);
 static bool incr_agg_arg_deparse_safe(Node *expr);
 static bool incr_aggs_need_deparse(Query *viewQuery);
 static bool incr_inner_join_deparse_shape(Query *viewQuery, int nbasetables);
+static Node *incr_group_key_expr(Query *q, TargetEntry *te);
+static bool incr_group_needs_deparse(Query *viewQuery);
 static Node *incr_get_where_qual(Query *viewQuery);
 static void incr_deparse_where_qual(Node *qual, List *rtable, int delta_varno,
 									StringInfo buf);
@@ -652,33 +654,6 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 	}
 
 	/*
-	 * GROUP BY must be on plain columns.  A grouping expression
-	 * (e.g. GROUP BY date_trunc('month', d)) shows up as a non-Var entry in the
-	 * grouping RTE; the delta builders resolve grouping keys to column names and
-	 * cannot deparse an arbitrary expression, so reject it cleanly here instead
-	 * of failing with an internal error during SQL generation.
-	 */
-	foreach(lc, viewQuery->rtable)
-	{
-		RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
-		ListCell   *gc;
-
-		if (rte->rtekind != RTE_GROUP)
-			continue;
-		foreach(gc, rte->groupexprs)
-		{
-			Node *ge = (Node *) lfirst(gc);
-
-			if (!IsA(ge, Var))
-			{
-				*reason = "GROUP BY on an expression is not supported; "
-					"group by plain columns only";
-				return false;
-			}
-		}
-	}
-
-	/*
 	 * Shapes the deparse delta core is wired for: a GROUP BY aggregate with no
 	 * MIN/MAX, over either a single table or a pure INNER JOIN (no outer join,
 	 * no self-join).  HAVING is supported on both (delta strips it; the
@@ -693,6 +668,108 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 						!incr_has_minmax_agg(viewQuery) &&
 						(nbasetables == 1 ||
 						 incr_inner_join_deparse_shape(viewQuery, nbasetables)));
+
+	/*
+	 * GROUP BY on an expression (e.g. GROUP BY date_trunc('month', d)) is
+	 * maintained by the deparse core: it copies the view Query — grouping
+	 * expressions and all — and only swaps the source RTE for the transition
+	 * table, so ruleutils renders the same GROUP BY over the changed rows, and
+	 * every consumer keys on the matview OUTPUT column that holds the value.
+	 * Three conditions make that safe and well-defined:
+	 *   1. the shape is one the deparse path actually builds (deparse_agg_shape:
+	 *      single-table or INNER JOIN, no MIN/MAX, no self-join);
+	 *   2. the expression is IMMUTABLE and free of subqueries/aggregates/window
+	 *      functions (incr_agg_arg_deparse_safe) — a stable/volatile key could
+	 *      map the same row to different groups on its insert- vs delete-delta
+	 *      and corrupt the running totals;
+	 *   3. the expression is in the SELECT list (a non-junk output column), so
+	 *      it has a place to live and to key the unique index / ON CONFLICT on.
+	 * A plain-column key (Var) is always fine and skips these checks.
+	 */
+	{
+		ListCell   *glc;
+
+		foreach(glc, viewQuery->groupClause)
+		{
+			SortGroupClause *sgc = lfirst_node(SortGroupClause, glc);
+			TargetEntry	   *te = get_sortgroupclause_tle(sgc,
+														 viewQuery->targetList);
+			Node		   *gexpr = incr_group_key_expr(viewQuery, te);
+
+			if (gexpr == NULL || IsA(gexpr, Var))
+				continue;			/* plain column — always supported */
+
+			if (!deparse_agg_shape)
+			{
+				*reason = "GROUP BY on an expression is supported only for "
+					"single-table and INNER JOIN aggregates without MIN/MAX or "
+					"self-join";
+				return false;
+			}
+			if (!incr_agg_arg_deparse_safe(gexpr))
+			{
+				*reason = "GROUP BY expression must be immutable and free of "
+					"subqueries, aggregates, and window functions to be "
+					"maintained incrementally";
+				return false;
+			}
+			if (te->resjunk || te->resname == NULL)
+			{
+				*reason = "a GROUP BY expression must appear in the SELECT list "
+					"to be maintained incrementally";
+				return false;
+			}
+		}
+	}
+
+	/*
+	 * Reserved-name guard: the engine adds hidden maintenance columns named with
+	 * the "__mv_" prefix (e.g. __mv_count__, __mv_avgsum_<col>, __mv_having_ok__).
+	 * A user output column using that prefix collides — a user "__mv_count__" is
+	 * taken for the per-group row count and corrupts the zero-count cleanup
+	 * (groups whose key value <= 0 vanish on DELETE).  Reject it.
+	 *
+	 * Exception: a restored incremental matview's stored query already carries
+	 * the hidden columns verbatim — __mv_count__ present as COUNT(*).  Detect that
+	 * exact shape and skip the guard so dump/restore is never refused.  A user
+	 * collision instead names __mv_count__ as something other than COUNT(*) (or
+	 * uses another reserved prefix with no __mv_count__ present at all).
+	 */
+	{
+		bool	already_prepared = false;
+
+		foreach(lc, viewQuery->targetList)
+		{
+			TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+			if (!te->resjunk && te->resname != NULL &&
+				strcmp(te->resname, MATVIEW_INCR_COUNT_COL) == 0 &&
+				IsA(te->expr, Aggref) &&
+				((Aggref *) te->expr)->args == NIL &&
+				strcmp(get_func_name(((Aggref *) te->expr)->aggfnoid), "count") == 0)
+			{
+				already_prepared = true;
+				break;
+			}
+		}
+
+		if (!already_prepared)
+		{
+			foreach(lc, viewQuery->targetList)
+			{
+				TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+				if (!te->resjunk && te->resname != NULL &&
+					incr_is_hidden_col(te->resname))
+				{
+					*reason = "output column name uses the reserved \"__mv_\" "
+						"prefix used by the incremental engine's hidden "
+						"maintenance columns; rename the column";
+					return false;
+				}
+			}
+		}
+	}
 
 	/* Validate SELECT list expressions */
 	foreach(lc, viewQuery->targetList)
@@ -1028,7 +1105,8 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 		{
 			/* Phase 1: aggregate with GROUP BY */
 			bool	used_deparse = !incr_has_minmax_agg(viewQuery) &&
-				(dbblue_ivm_deparse_delta || incr_aggs_need_deparse(viewQuery));
+				(dbblue_ivm_deparse_delta || incr_aggs_need_deparse(viewQuery) ||
+				 incr_group_needs_deparse(viewQuery));
 
 			if (incr_has_minmax_agg(viewQuery))
 			{
@@ -1469,7 +1547,8 @@ MatviewIncrPostRefresh(Oid mvrelid, Query *viewQuery)
 			 * same way on restore (expression-arg HAVING must use deparse — the
 			 * hand backfill can't render CASE/COALESCE/etc.). */
 			bool	used_deparse = !incr_has_minmax_agg(viewQuery) &&
-				(dbblue_ivm_deparse_delta || incr_aggs_need_deparse(viewQuery));
+				(dbblue_ivm_deparse_delta || incr_aggs_need_deparse(viewQuery) ||
+				 incr_group_needs_deparse(viewQuery));
 
 			backfill_sql = used_deparse
 				? incr_build_backfill_sql_deparse(mvrelid, viewQuery)
@@ -2257,6 +2336,60 @@ incr_aggs_need_deparse(Query *viewQuery)
 }
 
 /*
+ * incr_group_key_expr — the underlying grouping expression for a group target
+ * entry, resolving the PG17+ RTE_GROUP indirection.  Since the grouping-set
+ * refactor, a reference to a grouping key in the target list is a Var pointing
+ * at the query's RTE_GROUP, whose groupexprs hold the real expressions (a plain
+ * column is a Var there too; an expression like date_trunc(...) is the FuncExpr).
+ * Returns the resolved expression, or te->expr unchanged if it is not such a
+ * grouping Var.
+ */
+static Node *
+incr_group_key_expr(Query *q, TargetEntry *te)
+{
+	if (te != NULL && IsA(te->expr, Var))
+	{
+		Var			   *v = (Var *) te->expr;
+		RangeTblEntry  *grte;
+
+		if (v->varno >= 1 && v->varno <= list_length(q->rtable))
+		{
+			grte = rt_fetch(v->varno, q->rtable);
+			if (grte->rtekind == RTE_GROUP &&
+				v->varattno >= 1 &&
+				v->varattno <= list_length(grte->groupexprs))
+				return (Node *) list_nth(grte->groupexprs, v->varattno - 1);
+		}
+	}
+	return te ? (Node *) te->expr : NULL;
+}
+
+/*
+ * incr_group_needs_deparse — true if any GROUP BY key is a non-Var expression
+ * (e.g. GROUP BY date_trunc('month', d)).  Such shapes can only be produced by
+ * the deparse core (the hand builders resolve grouping keys to bare column
+ * names), so they must AUTO-ROUTE to deparse regardless of the GUC — which also
+ * keeps them restorable, since the restore path re-runs setup and routes the
+ * same way.  Eligibility has already confirmed the expression is safe.
+ */
+static bool
+incr_group_needs_deparse(Query *viewQuery)
+{
+	ListCell   *lc;
+
+	foreach(lc, viewQuery->groupClause)
+	{
+		SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+		TargetEntry	   *te = get_sortgroupclause_tle(sgc, viewQuery->targetList);
+		Node		   *gexpr = incr_group_key_expr(viewQuery, te);
+
+		if (gexpr != NULL && !IsA(gexpr, Var))
+			return true;
+	}
+	return false;
+}
+
+/*
  * incr_validate_expr — general expression validator.
  *
  *   allow_aggref = true  (HAVING): Aggref allowed when matched in SELECT list;
@@ -2656,26 +2789,45 @@ incr_deparse_having_cond(Node *expr, Query *viewQuery, StringInfo buf)
 	}
 	else if (IsA(expr, Var))
 	{
-		/* Group column — resolve to base column name, then find the output resname */
+		/*
+		 * A grouping key referenced in HAVING.  Since PG17 it is a Var pointing
+		 * at the query's RTE_GROUP, and the matching SELECT target entry is the
+		 * same Var (same varno/varattno); its output column is where the key's
+		 * value lives in the matview.  Bind to that output column by matching the
+		 * RTE_GROUP slot — this works whether the key is a plain column or an
+		 * expression (e.g. date_trunc('month', d), (x % n)), whose RTE_GROUP
+		 * groupexprs entry is a non-Var that has no base-column name to resolve
+		 * to.  Matching by slot also handles aliasing (GROUP BY cat → SELECT cat
+		 * AS k binds to "k").
+		 */
 		Var		   *v = (Var *) expr;
-		const char *colname = incr_resolve_var_colname(v, viewQuery->rtable, NULL);
 		ListCell   *lc;
+		RangeTblEntry *vrte = (v->varno >= 1 &&
+							   v->varno <= list_length(viewQuery->rtable))
+			? rt_fetch(v->varno, viewQuery->rtable) : NULL;
 
-		foreach(lc, viewQuery->targetList)
+		if (vrte != NULL && vrte->rtekind == RTE_GROUP)
 		{
-			TargetEntry *te = lfirst_node(TargetEntry, lc);
-
-			if (!IsA(te->expr, Var))
-				continue;
-			if (strcmp(incr_resolve_var_colname((Var *) te->expr,
-												viewQuery->rtable, NULL),
-					   colname) == 0)
+			foreach(lc, viewQuery->targetList)
 			{
-				appendStringInfoString(buf, quote_identifier(te->resname));
-				return;
+				TargetEntry *te = lfirst_node(TargetEntry, lc);
+				Var		   *tv;
+
+				if (te->resjunk || !IsA(te->expr, Var))
+					continue;
+				tv = (Var *) te->expr;
+				if (tv->varno == v->varno && tv->varattno == v->varattno)
+				{
+					appendStringInfoString(buf, quote_identifier(te->resname));
+					return;
+				}
 			}
 		}
-		appendStringInfoString(buf, quote_identifier(colname));
+
+		/* Fallback: a non-grouping Var resolves to its base column name. */
+		appendStringInfoString(buf,
+			quote_identifier(incr_resolve_var_colname(v, viewQuery->rtable,
+													  NULL)));
 	}
 	else if (IsA(expr, Const))
 	{
@@ -2739,19 +2891,59 @@ incr_deparse_having_cond(Node *expr, Query *viewQuery, StringInfo buf)
 	}
 	else if (IsA(expr, FuncExpr))
 	{
-		/* Implicit type-coercion function — emit as arg::returntype */
 		FuncExpr   *fe = (FuncExpr *) expr;
 
-		if (list_length(fe->args) == 1)
+		/*
+		 * A single-arg FuncExpr is a cast ONLY when funcformat says so; a genuine
+		 * single-argument function (abs(x), floor(x), ...) and any multi-argument
+		 * function (power(x,2), ...) must render as a call.  (Matches
+		 * incr_deparse_where_qual; treating every 1-arg FuncExpr as a cast both
+		 * dropped real functions and errored on multi-arg ones.)
+		 */
+		if (list_length(fe->args) == 1 &&
+			(fe->funcformat == COERCE_IMPLICIT_CAST ||
+			 fe->funcformat == COERCE_EXPLICIT_CAST))
 		{
 			appendStringInfoChar(buf, '(');
 			incr_deparse_having_cond(linitial(fe->args), viewQuery, buf);
 			appendStringInfo(buf, ")::%s", format_type_be(fe->funcresulttype));
 		}
 		else
-			elog(ERROR,
-				 "incr_deparse_having_cond: unsupported FuncExpr with %d args",
-				 list_length(fe->args));
+		{
+			char	   *fname = get_func_name(fe->funcid);
+			ListCell   *lc;
+			bool		first = true;
+
+			appendStringInfo(buf, "%s(", fname);
+			foreach(lc, fe->args)
+			{
+				if (!first)
+					appendStringInfoChar(buf, ',');
+				incr_deparse_having_cond(lfirst(lc), viewQuery, buf);
+				first = false;
+			}
+			appendStringInfoChar(buf, ')');
+		}
+	}
+	else if (IsA(expr, NullTest))
+	{
+		/* HAVING <expr> IS [NOT] NULL — the inner expr renders to a matview
+		 * column (group key / aggregate output) or constant. */
+		NullTest   *nt = (NullTest *) expr;
+
+		appendStringInfoChar(buf, '(');
+		incr_deparse_having_cond((Node *) nt->arg, viewQuery, buf);
+		appendStringInfoString(buf,
+			nt->nulltesttype == IS_NULL ? " IS NULL)" : " IS NOT NULL)");
+	}
+	else if (IsA(expr, RelabelType))
+	{
+		/* No-op type coercion (e.g. varchar -> text) — render arg::resulttype. */
+		RelabelType *rt = (RelabelType *) expr;
+
+		appendStringInfoChar(buf, '(');
+		incr_deparse_having_cond((Node *) rt->arg, viewQuery, buf);
+		appendStringInfo(buf, ")::%s", format_type_be(rt->resulttype));
 	}
 	else
 		elog(ERROR,

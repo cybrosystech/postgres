@@ -30,6 +30,7 @@ suite in `src/test/dbblue_ivm/` and the adversarial concurrency battery.
 | Shape | Notes |
 |---|---|
 | `GROUP BY` on plain column(s), single table | core delta path |
+| `GROUP BY` on an **expression** | e.g. `date_trunc('month', d)`, `(amt % 10)`, `CASE …`; must be IMMUTABLE and appear in the SELECT list. Maintained by the deparse core; single-table or INNER JOIN, no MIN/MAX/self-join |
 | `SUM`, `COUNT(*)`, `COUNT(col)`, `AVG` | numeric / integer; AVG kept as a (sum,count) pair |
 | `MIN`, `MAX` | delete-rescan, serialized on the matview-level lock (see 🟡 below) |
 | Multi-table **INNER JOIN** + `GROUP BY` | N-table, equi-join |
@@ -77,7 +78,8 @@ A `NOTICE` (not a `WARNING`) fires at `CREATE` for these:
 |---|---|---|
 | `COUNT(DISTINCT x)` | per-row delta can't track last-occurrence of a value | needs auxiliary state (roadmap) |
 | `agg(...) FILTER (WHERE …)` | filter not yet honored by the delta | rewrite as `agg(CASE WHEN … )` once Phase 2 lands |
-| `GROUP BY <expression>` (`date_trunc`, …) | delta keys on plain columns | add a generated/stored bucket column and group on it |
+| `GROUP BY` a **volatile** expression (`random()`, `now()`) or a STABLE one (e.g. `date_trunc` over `timestamptz`) | the same row could map to different groups across its insert- vs delete-delta → drift | use an IMMUTABLE expression (e.g. `date_trunc` over `timestamp`) or a generated/stored bucket column |
+| `GROUP BY <expression>` not in the SELECT list, or with `MIN`/`MAX` / self-join | no output column to key on / shape the deparse core does not build | add the expression to SELECT; drop MIN/MAX or the self-join |
 | `SUM`/`AVG` over `real`/`double precision` | float addition is non-associative → running total drifts | use `numeric` (exact) |
 | Subquery in `WHERE` (`IN`/`EXISTS`) | sublink not maintainable per-table | rewrite as a `JOIN` |
 | Scalar subquery in `SELECT` | sublink | rewrite as a `LEFT JOIN` + aggregate |
@@ -191,8 +193,9 @@ Prioritized by value for Odoo reporting:
 
 1. **`SUM(CASE WHEN …)` / `COALESCE` / scalar expressions** — the #1 Odoo report
    pattern; delivered as Phase 2's payoff.
-2. **`GROUP BY <expression>`** (e.g. `date_trunc('month', d)`) — time-bucketed
-   reports; the key becomes the expression.
+2. ✅ **Done — `GROUP BY <expression>`** (e.g. `date_trunc('month', d)`) —
+   time-bucketed reports; the immutable, selected expression is the key,
+   maintained by the deparse core (single-table / INNER JOIN, no MIN/MAX).
 3. **`agg(...) FILTER (WHERE …)`** — once expressions render via `ruleutils`.
 4. ✅ **Done — concurrency for outer / self / UNION ALL / MIN/MAX** — a
    matview-level serialization lock makes them consistent at every isolation

@@ -6,11 +6,53 @@ to see what is done and what is next. Companion docs:
 - Supported shapes + roadmap → `INCREMENTAL_MATVIEW_SUPPORT_AND_ROADMAP.md`
 - Phase 2 deparse-core design → `INCREMENTAL_MATVIEW_PHASE2_DESIGN.md`
 
-_Last updated: 2026-06-23 · branch `feature/ivm-incremental-refresh`_
+_Last updated: 2026-06-24 · branch `feature/ivm-incremental-refresh`_
 
 ---
 
-## Most recent work: READ COMMITTED safety for the recompute/multiset shapes
+## Most recent work: GROUP BY on an expression (e.g. `date_trunc`)
+
+Time-bucketed and derived-key reports — `GROUP BY date_trunc('month', d)`,
+`(amt % 10)`, `CASE …`, `lower(name)`, `(a + b)` — are now maintained
+incrementally. The deparse core already copies the view Query (grouping
+expressions and all) and only swaps the source RTE for the transition table, so
+ruleutils renders the same GROUP BY over the changed rows; every consumer keys on
+the matview OUTPUT column that stores the expression value. So this was mostly an
+eligibility + routing change, not new delta machinery.
+
+- **Eligibility:** a non-Var GROUP BY key is accepted iff (1) the shape is one the
+  deparse core builds (single-table or INNER JOIN, no MIN/MAX, no self-join),
+  (2) the expression is IMMUTABLE and free of subqueries/aggregates/window funcs
+  (`incr_agg_arg_deparse_safe` — a STABLE/volatile key could map a row to
+  different groups on its insert- vs delete-delta and drift), and (3) it appears
+  in the SELECT list (an output column to store + key on). `incr_group_key_expr`
+  resolves the PG17+ RTE_GROUP indirection.
+- **Routing:** `incr_group_needs_deparse` forces the deparse path for expression
+  keys regardless of the GUC (the hand builders can't render them), keeping them
+  restorable.
+- **Adversarial audit** (3 rounds, 200+ shapes vs full `REFRESH`) found and fixed
+  4 issues, all in the HAVING path / validation rather than the delta:
+  1. HAVING that references the group EXPRESSION hit an internal "non-Var in
+     groupexprs" error — now binds the HAVING group key to its matview output
+     column by RTE_GROUP slot (also fixes aliasing).
+  2. `HAVING <expr> IS [NOT] NULL` (NullTest) — added to the HAVING deparser.
+  3. `HAVING power(x,2) > 1` (multi-arg / real function) — the deparser treated
+     every 1-arg function as a cast and errored on multi-arg; now renders casts
+     vs calls correctly at any arity (mirrors the WHERE deparser).
+  4. A user output column named `__mv_count__` collided with the hidden count
+     column (zero-count cleanup dropped key-≤0 groups) — now rejected at CREATE
+     with a clear "reserved __mv_ prefix" message, while restore (which carries
+     `__mv_count__` as COUNT(*)) is still accepted.
+  The HAVING validator and deparser are now grammar-aligned (Var, Const, Aggref,
+  NullTest, OpExpr, BoolExpr, FuncExpr any-arity, RelabelType).
+- **Tests:** `group_by_expr.sql` — single-table / arithmetic / mixed plain+expr /
+  HAVING (incl. the 4 regressions) / INNER JOIN, NULL bucket, on both GUC paths,
+  all == full `REFRESH`; plus the rejections. dump/restore re-arm verified for
+  plain and HAVING expression-grouping matviews.
+
+---
+
+## READ COMMITTED safety for the recompute/multiset shapes
 
 The recompute/overwrite and multiset shapes — row-level (no GROUP BY) projections,
 UNION ALL, outer join, self-join, and MIN/MAX — now stay consistent with a full
