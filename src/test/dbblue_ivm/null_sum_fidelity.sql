@@ -65,5 +65,32 @@ BEGIN
   ELSE RAISE EXCEPTION 'JOIN all-NULL SUM: FAIL (% diff)', ndiff; END IF;
 END $$;
 DROP MATERIALIZED VIEW hi; DROP MATERIALIZED VIEW hn; DROP TABLE hp, hs CASCADE;
+
+-- MIN/MAX path: SUM must also return to NULL (not 0) when a group loses its last
+-- non-NULL value but survives.  MIN/MAX uses the rescan/delta builders (not the
+-- shared shells), so it has its own all-NULL SUM handling: SUM/AVG take the
+-- new_agg rescan value (NULL for an emptied non-NULL set) while COUNT uses delta
+-- arithmetic.  Covers single-table and INNER JOIN; DELETE and UPDATE-to-NULL.
+DROP TABLE IF EXISTS mmn CASCADE;
+CREATE TABLE mmn(id serial primary key, g int, v int);
+INSERT INTO mmn(g,v) VALUES (1,5),(1,NULL),(2,10),(2,20),(3,NULL);
+CREATE MATERIALIZED VIEW mmi WITH (incremental_refresh=true) AS
+  SELECT g, min(v) mn, max(v) mx, sum(v) s, avg(v) a, count(v) cv, count(*) c FROM mmn GROUP BY g;
+DELETE FROM mmn WHERE g=1 AND v=5;        -- g1: last non-NULL gone, NULL row remains -> s NULL
+UPDATE mmn SET v=NULL WHERE g=2 AND v=10; -- g2 still has v=20
+DELETE FROM mmn WHERE g=2 AND v=20;       -- g2: now all-NULL -> s NULL
+INSERT INTO mmn(g,v) VALUES (3,7);        -- g3: recover from all-NULL -> s=7
+CREATE MATERIALIZED VIEW mmnn AS
+  SELECT g, min(v) mn, max(v) mx, sum(v) s, avg(v) a, count(v) cv, count(*) c FROM mmn GROUP BY g;
+DO $$
+DECLARE ndiff int;
+BEGIN
+  SELECT count(*) INTO ndiff FROM (
+    (SELECT g,mn,mx,s,a,cv,c FROM mmi EXCEPT SELECT g,mn,mx,s,a,cv,c FROM mmnn)
+    UNION ALL (SELECT g,mn,mx,s,a,cv,c FROM mmnn EXCEPT SELECT g,mn,mx,s,a,cv,c FROM mmi)) d;
+  IF ndiff=0 THEN RAISE NOTICE 'MIN/MAX all-NULL SUM == REFRESH (NULL, recovers): PASS';
+  ELSE RAISE EXCEPTION 'MIN/MAX all-NULL SUM: FAIL (% diff)', ndiff; END IF;
+END $$;
+DROP MATERIALIZED VIEW mmi; DROP MATERIALIZED VIEW mmnn; DROP TABLE mmn CASCADE;
 \echo ''
 \echo '=== all-NULL SUM fidelity test complete ==='
