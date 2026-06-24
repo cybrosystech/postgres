@@ -233,5 +233,32 @@ BEGIN
   ELSE RAISE EXCEPTION 'BUGE: partial-NULL key diverged (% rows)', ndiff; END IF;
 END $$;
 DROP MATERIALIZED VIEW eki; DROP MATERIALIZED VIEW ekn; DROP TABLE ek CASCADE;
+
+-- BUGF: a MIN/MAX matview's SUM/AVG must stay correct when ONE statement both
+-- deletes and inserts on the source (e.g. a data-modifying CTE).  Such a
+-- statement fires the INSERT and DELETE statement-triggers separately, so the
+-- MIN/MAX delete path must maintain SUM/AVG by delta arithmetic (which composes
+-- with the insert delta in any firing order) rather than an absolute rescan
+-- (which, combined with the additive insert, would double-count the inserts).
+DROP TABLE IF EXISTS cf CASCADE;
+CREATE TABLE cf(g int, v int);
+INSERT INTO cf VALUES (1,10),(1,20),(1,30),(2,5);
+CREATE MATERIALIZED VIEW cfi WITH (incremental_refresh=true) AS
+  SELECT g, COUNT(*) c, MIN(v) mn, MAX(v) mx, SUM(v) sm, AVG(v) av FROM cf GROUP BY g;
+WITH d AS (DELETE FROM cf WHERE v IN (30,5) RETURNING v),
+     i AS (INSERT INTO cf VALUES (1,25),(1,100),(2,8) RETURNING v)
+SELECT (SELECT count(*) FROM d) + (SELECT count(*) FROM i);
+CREATE MATERIALIZED VIEW cfn AS
+  SELECT g, COUNT(*) c, MIN(v) mn, MAX(v) mx, SUM(v) sm, AVG(v) av FROM cf GROUP BY g;
+DO $$
+DECLARE ndiff int;
+BEGIN
+  SELECT count(*) INTO ndiff FROM (
+    (SELECT g,c,mn,mx,sm,av FROM cfi EXCEPT SELECT g,c,mn,mx,sm,av FROM cfn)
+    UNION ALL (SELECT g,c,mn,mx,sm,av FROM cfn EXCEPT SELECT g,c,mn,mx,sm,av FROM cfi)) d;
+  IF ndiff=0 THEN RAISE NOTICE 'BUGF MIN/MAX SUM/AVG correct under combined DELETE+INSERT == REFRESH: PASS';
+  ELSE RAISE EXCEPTION 'BUGF: combined DELETE+INSERT diverged (% rows)', ndiff; END IF;
+END $$;
+DROP MATERIALIZED VIEW cfi; DROP MATERIALIZED VIEW cfn; DROP TABLE cf CASCADE;
 \echo ''
 \echo '=== audit regression tests complete ==='
