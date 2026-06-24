@@ -651,6 +651,23 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 				return false;
 			}
 		}
+
+		/*
+		 * MIN/MAX over a join of 3+ base tables is not supported.  MIN/MAX uses
+		 * the hand join-delta builders (the deparse core, which fixes the
+		 * additive 3+ table case, cannot express the MIN/MAX delete-rescan).
+		 * Those builders mis-attribute a delta on a table 2+ join-hops from the
+		 * changed table once a third table is involved, silently corrupting the
+		 * result.  Single-table and two-table MIN/MAX joins are correct and
+		 * remain supported; reject 3+ cleanly rather than return wrong answers.
+		 */
+		if (incr_has_minmax_agg(viewQuery) && nbasetables >= 3)
+		{
+			*reason = "MIN/MAX over a join of three or more tables is not "
+					  "supported; use at most two tables, drop MIN/MAX, or use a "
+					  "non-incremental matview";
+			return false;
+		}
 	}
 
 	/*
