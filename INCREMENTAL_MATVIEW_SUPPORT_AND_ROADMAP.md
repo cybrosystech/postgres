@@ -120,11 +120,19 @@ A `NOTICE` (not a `WARNING`) fires at `CREATE` for these:
   this** (full NULL-group fidelity via `NULLS NOT DISTINCT` + `IS NOT DISTINCT
   FROM`), so incremental == normal matview for NULL keys too.
 - **HAVING matviews must be created `WITH DATA`** (a `WARNING` is emitted
-  otherwise); dump/restore is unaffected.
+  otherwise). A HAVING matview is stored as a user-facing view over a hidden
+  `_dbblue_<oid>_base` matview, so a **full-database** `pg_dump`/restore works
+  (both objects ship — verified by `dump_restore_consistency.sh`). A **selective,
+  object-filtered dump** (`pg_dump -t '<pattern>'`) matches the view's name but
+  not the hidden base, leaving the restored view dangling — back HAVING matviews
+  up with a full-database dump, not `pg_dump -t`. (Inherent to `-t`, which by
+  design excludes objects that don't match the pattern.)
 - **Logical-replication subscribers do not maintain** the matview (delta
   triggers fire on origin only). Physical replicas are fine (data ships via WAL).
-- **Residual:** a group whose values are *all* NULL shows `0` rather than
-  SQL-exact `NULL` for `SUM` until the group empties. Bounded; documented.
+- **All-NULL `SUM` returns SQL `NULL`** (not `0`) once a group loses its last
+  non-NULL input, and recovers to a number when one returns — for the additive
+  shapes (via a hidden non-NULL counter) and the MIN/MAX path (via the delete
+  rescan). Both verified against `REFRESH` (`null_sum_fidelity.sql`).
 
 ---
 
