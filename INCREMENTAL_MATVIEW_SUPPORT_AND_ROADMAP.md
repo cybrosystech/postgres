@@ -32,8 +32,8 @@ suite in `src/test/dbblue_ivm/` and the adversarial concurrency battery.
 | `GROUP BY` on plain column(s), single table | core delta path |
 | `GROUP BY` on an **expression** | e.g. `date_trunc('month', d)`, `(amt % 10)`, `CASE …`; must be IMMUTABLE and appear in the SELECT list. Maintained by the deparse core; single-table or INNER JOIN, no MIN/MAX/self-join |
 | `SUM`, `COUNT(*)`, `COUNT(col)`, `AVG` | numeric / integer; AVG kept as a (sum,count) pair |
-| `MIN`, `MAX` | delete-rescan, serialized on the matview-level lock (see 🟡 below) |
-| Multi-table **INNER JOIN** + `GROUP BY` | N-table, equi-join |
+| `MIN`, `MAX` | delete-rescan, serialized on the matview-level lock (see 🟡 below); N-table joins OK |
+| Multi-table **INNER JOIN** + `GROUP BY` | N-table, equi-join (additive via deparse; MIN/MAX via the hand rescan — both correct for 3+ tables) |
 | `WHERE` | column comparisons, `AND`/`OR`/`NOT`, `IN (...)`, `IS NULL`, non-volatile functions, varchar/`RelabelType` |
 | `HAVING` | hidden base matview + filtering view |
 | `DISTINCT` (full) | converted to GROUP BY on all output columns |

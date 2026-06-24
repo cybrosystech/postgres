@@ -261,48 +261,42 @@ BEGIN
 END $$;
 DROP MATERIALIZED VIEW cfi; DROP MATERIALIZED VIEW cfn; DROP TABLE cf CASCADE;
 
--- BUGG: MIN/MAX over a join of 3+ tables must be REJECTED (the hand join-delta
--- builder mis-attributes a delta on a table 2+ join-hops away, and MIN/MAX can't
--- use the deparse core that fixes this for additive aggregates).  Two-table
--- MIN/MAX joins are correct and stay supported.
+-- BUGG: MIN/MAX (and any hand-builder shape) over a join of 3+ tables stays
+-- correct == REFRESH.  The join-order builder once mis-built the FROM when the
+-- delta was a table 2+ join-hops from the leftmost leaf: the leaf (whose ON lives
+-- in another entry) was emitted as a bogus CROSS JOIN, dropping the connecting
+-- condition and cartesian-joining the delta to the far table (e.g. West pulling
+-- in East's MAX).  Now it defers the leaf until its neighbour is known.  This
+-- exercises the exact trigger: an UPDATE to the FAR table, plus a group-key
+-- rename and fact INSERT/DELETE, over a 3-table chain.
 DROP TABLE IF EXISTS gf CASCADE; DROP TABLE IF EXISTS gd CASCADE; DROP TABLE IF EXISTS gr CASCADE;
-CREATE TABLE gr(id int primary key, region text);
+CREATE TABLE gr(id int primary key, region text, note text);
 CREATE TABLE gd(id int primary key, region_id int, cat text);
 CREATE TABLE gf(id int primary key, dim_id int, amt int);
-INSERT INTO gr VALUES (1,'East'),(2,'West');
+INSERT INTO gr VALUES (1,'East','x'),(2,'West','y');
 INSERT INTO gd VALUES (10,1,'A'),(20,2,'A');
 INSERT INTO gf VALUES (1,10,5),(2,10,50),(3,20,1);
-DO $$
-DECLARE rejected bool := false;
-BEGIN
-  BEGIN
-    EXECUTE 'CREATE MATERIALIZED VIEW gg WITH (incremental_refresh=true) AS
-             SELECT r.region, d.cat, max(f.amt) mx, count(*) c FROM gf f
-             JOIN gd d ON f.dim_id=d.id JOIN gr r ON d.region_id=r.id
-             GROUP BY r.region, d.cat';
-    EXECUTE 'DROP MATERIALIZED VIEW gg';
-  EXCEPTION WHEN feature_not_supported THEN rejected := true; END;
-  IF rejected THEN RAISE NOTICE 'BUGG 3-table MIN/MAX join rejected: PASS';
-  ELSE RAISE EXCEPTION 'BUGG: 3-table MIN/MAX join was NOT rejected'; END IF;
-END $$;
--- two-table MIN/MAX join stays correct == REFRESH (incl. far-table key change)
-CREATE MATERIALIZED VIEW g2i WITH (incremental_refresh=true) AS
-  SELECT d.cat, min(f.amt) mn, max(f.amt) mx, count(*) c, sum(f.amt) s
-  FROM gf f JOIN gd d ON f.dim_id=d.id GROUP BY d.cat;
-UPDATE gd SET cat='B' WHERE id=20;        -- far-table group-key change
-INSERT INTO gf VALUES (4,20,80); DELETE FROM gf WHERE id=2;
-CREATE MATERIALIZED VIEW g2n AS
-  SELECT d.cat, min(f.amt) mn, max(f.amt) mx, count(*) c, sum(f.amt) s
-  FROM gf f JOIN gd d ON f.dim_id=d.id GROUP BY d.cat;
+CREATE MATERIALIZED VIEW gg_i WITH (incremental_refresh=true) AS
+  SELECT r.region, d.cat, min(f.amt) mn, max(f.amt) mx, count(*) c, sum(f.amt) s
+  FROM gf f JOIN gd d ON f.dim_id=d.id JOIN gr r ON d.region_id=r.id
+  GROUP BY r.region, d.cat;
+UPDATE gr SET note='z' WHERE id=2;        -- far table, irrelevant col: result unchanged
+UPDATE gr SET region='East' WHERE id=2;   -- far-table group-key rename (West -> East)
+INSERT INTO gf VALUES (4,20,80);          -- new MAX into the merged group
+DELETE FROM gf WHERE id=2;                 -- remove the old MAX=50 -> rescan
+CREATE MATERIALIZED VIEW gg_n AS
+  SELECT r.region, d.cat, min(f.amt) mn, max(f.amt) mx, count(*) c, sum(f.amt) s
+  FROM gf f JOIN gd d ON f.dim_id=d.id JOIN gr r ON d.region_id=r.id
+  GROUP BY r.region, d.cat;
 DO $$
 DECLARE ndiff int;
 BEGIN
   SELECT count(*) INTO ndiff FROM (
-    (SELECT cat,mn,mx,c,s FROM g2i EXCEPT SELECT cat,mn,mx,c,s FROM g2n)
-    UNION ALL (SELECT cat,mn,mx,c,s FROM g2n EXCEPT SELECT cat,mn,mx,c,s FROM g2i)) d;
-  IF ndiff=0 THEN RAISE NOTICE 'BUGG 2-table MIN/MAX join == REFRESH: PASS';
-  ELSE RAISE EXCEPTION 'BUGG: 2-table MIN/MAX join diverged (% rows)', ndiff; END IF;
+    (SELECT region,cat,mn,mx,c,s FROM gg_i EXCEPT SELECT region,cat,mn,mx,c,s FROM gg_n)
+    UNION ALL (SELECT region,cat,mn,mx,c,s FROM gg_n EXCEPT SELECT region,cat,mn,mx,c,s FROM gg_i)) d;
+  IF ndiff=0 THEN RAISE NOTICE 'BUGG 3-table MIN/MAX join == REFRESH (far-table UPDATE): PASS';
+  ELSE RAISE EXCEPTION 'BUGG: 3-table MIN/MAX join diverged (% rows)', ndiff; END IF;
 END $$;
-DROP MATERIALIZED VIEW g2i; DROP MATERIALIZED VIEW g2n; DROP TABLE gf, gd, gr CASCADE;
+DROP MATERIALIZED VIEW gg_i; DROP MATERIALIZED VIEW gg_n; DROP TABLE gf, gd, gr CASCADE;
 \echo ''
 \echo '=== audit regression tests complete ==='

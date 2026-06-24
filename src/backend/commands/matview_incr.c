@@ -652,22 +652,6 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 			}
 		}
 
-		/*
-		 * MIN/MAX over a join of 3+ base tables is not supported.  MIN/MAX uses
-		 * the hand join-delta builders (the deparse core, which fixes the
-		 * additive 3+ table case, cannot express the MIN/MAX delete-rescan).
-		 * Those builders mis-attribute a delta on a table 2+ join-hops from the
-		 * changed table once a third table is involved, silently corrupting the
-		 * result.  Single-table and two-table MIN/MAX joins are correct and
-		 * remain supported; reject 3+ cleanly rather than return wrong answers.
-		 */
-		if (incr_has_minmax_agg(viewQuery) && nbasetables >= 3)
-		{
-			*reason = "MIN/MAX over a join of three or more tables is not "
-					  "supported; use at most two tables, drop MIN/MAX, or use a "
-					  "non-incremental matview";
-			return false;
-		}
 	}
 
 	/*
@@ -4736,28 +4720,54 @@ incr_build_join_list_for_delta(List *all_tables, int delta_varno)
 			}
 
 			/*
-		 * If a connecting condition was found, use it (covers regular tables
-		 * and the leftmost anchor whose ON condition lives in another entry).
-		 * If no connecting condition exists AND this entry has no original ON
-		 * condition (je->quals == NULL), it is a true CROSS JOIN — include it
-		 * unconditionally with a NULL quals so incr_append_from_join emits
-		 * "CROSS JOIN".
-		 * If no connecting condition exists AND je->quals != NULL, we cannot
-		 * place this table yet; continue scanning.
-		 */
-		if (connecting_qual != NULL || je->quals == NULL)
+			 * If a connecting condition was found, use it (covers regular tables
+			 * and the leftmost anchor whose ON condition lives in another entry).
+			 *
+			 * If none was found, this table is a TRUE CROSS JOIN only when it is
+			 * referenced by NO join qual at all.  The leftmost leaf has
+			 * je->quals == NULL (its ON lives in another entry), but it IS
+			 * referenced by that ON — so when its neighbour is not known yet we
+			 * must DEFER it, not emit a bogus CROSS JOIN that drops the
+			 * connecting condition (which would cartesian-join the delta to every
+			 * row of the far table, e.g. a 3-table chain whose delta is the far
+			 * end).  Checking je->quals == NULL instead got this wrong for 3+
+			 * table joins.
+			 */
 			{
-				IncrJoinEntry *new_je = palloc(sizeof(IncrJoinEntry));
+				bool		add_it = (connecting_qual != NULL);
 
-				new_je->varno = je->varno;
-				new_je->oid = je->oid;
-				/* Use found connecting_qual; NULL only for true CROSS JOIN */
-				new_je->quals = connecting_qual;
-				result = lappend(result, new_je);
-				remaining = list_delete_cell(remaining, lc);
-				known = bms_add_member(known, je->varno);
-				progress = true;
-				break;			/* restart scan — stale pointer after delete */
+				if (!add_it)
+				{
+					bool		referenced = false;
+					ListCell   *qlc2;
+
+					foreach(qlc2, all_quals)
+					{
+						Bitmapset  *refs = NULL;
+
+						incr_qual_varnos_walker(lfirst(qlc2), &refs);
+						referenced = bms_is_member(je->varno, refs);
+						bms_free(refs);
+						if (referenced)
+							break;
+					}
+					add_it = !referenced;	/* unreferenced ⇒ genuine CROSS JOIN */
+				}
+
+				if (add_it)
+				{
+					IncrJoinEntry *new_je = palloc(sizeof(IncrJoinEntry));
+
+					new_je->varno = je->varno;
+					new_je->oid = je->oid;
+					/* Use found connecting_qual; NULL only for true CROSS JOIN */
+					new_je->quals = connecting_qual;
+					result = lappend(result, new_je);
+					remaining = list_delete_cell(remaining, lc);
+					known = bms_add_member(known, je->varno);
+					progress = true;
+					break;			/* restart scan — stale pointer after delete */
+				}
 			}
 
 			lc = lnext(remaining, lc);
