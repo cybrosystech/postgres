@@ -335,6 +335,14 @@ ExecCreateTableAs(ParseState *pstate, CreateTableAsStmt *stmt,
 				query->setOperations	  = copyObject(norm->setOperations);
 			}
 
+			/*
+			 * Rewrite agg(x) FILTER (WHERE c) -> agg(CASE WHEN c THEN x END) on
+			 * both the schema and stored view queries before eligibility, so the
+			 * deparse delta core maintains FILTER and the two queries agree.
+			 */
+			MatviewIncrRewriteAggFilters(vq);
+			MatviewIncrRewriteAggFilters(query);
+
 			if (!MatviewIncrIsEligible(vq, &reason))
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),

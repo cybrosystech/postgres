@@ -116,6 +116,14 @@ extern bool MatviewIncrIsEligible(Query *viewQuery, const char **reason);
 extern void MatviewIncrAddCountTarget(Query *q);
 
 /*
+ * Rewrite  agg(x) FILTER (WHERE c)  ->  agg(CASE WHEN c THEN x END)  (SUM/COUNT/
+ * AVG) in place, across the SELECT list and HAVING, so the deparse delta core
+ * maintains FILTER with no delta-builder changes.  Call on both the schema and
+ * view queries, before eligibility and MatviewIncrAddCountTarget.
+ */
+extern void MatviewIncrRewriteAggFilters(Query *q);
+
+/*
  * Inject "<key> IS NOT NULL" into the view query's WHERE for every nullable
  * GROUP BY / DISTINCT key, so NULL-key rows stay outside the matview (writes
  * are never blocked, and the matview stays consistent with a full REFRESH).

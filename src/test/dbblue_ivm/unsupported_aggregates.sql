@@ -3,9 +3,12 @@
 -- These shapes cannot be maintained by the per-row delta and must be refused
 -- at CREATE time with a clear error (never accepted-but-maintained-wrong, and
 -- never an internal elog):
---   * COUNT(DISTINCT x)            — needs per-value occurrence tracking
---   * agg(...) FILTER (WHERE ...)  — filter not yet honored by the delta SQL
---   * GROUP BY <expression>        — delta builders key on plain columns
+--   * COUNT(DISTINCT x)              — needs per-value occurrence tracking
+--   * MIN/MAX (...) FILTER (WHERE …) — hand MIN/MAX builder can't render the
+--                                      CASE the filter rewrites to (SUM/COUNT/AVG
+--                                      FILTER *are* supported — see filter_aggregates.sql)
+--   * GROUP BY <stable expression>  — must be IMMUTABLE (date_trunc over a date
+--                                      resolves to the STABLE timestamptz overload)
 -- Supported shapes alongside them must still be accepted.
 \set ON_ERROR_STOP off
 \echo ''
@@ -33,11 +36,10 @@ BEGIN
   IF _try('CREATE MATERIALIZED VIEW _m WITH (incremental_refresh=true) AS SELECT p, COUNT(DISTINCT mt) c FROM uagg GROUP BY p WITH DATA')
      THEN RAISE EXCEPTION 'COUNT(DISTINCT): FAIL (accepted)'; ELSE RAISE NOTICE 'COUNT(DISTINCT): PASS (rejected)'; END IF;
 
-  IF _try('CREATE MATERIALIZED VIEW _m WITH (incremental_refresh=true) AS SELECT p, COUNT(*) FILTER (WHERE mt=''out_invoice'') c FROM uagg GROUP BY p WITH DATA')
-     THEN RAISE EXCEPTION 'COUNT FILTER: FAIL (accepted)'; ELSE RAISE NOTICE 'COUNT(*) FILTER: PASS (rejected)'; END IF;
-
-  IF _try('CREATE MATERIALIZED VIEW _m WITH (incremental_refresh=true) AS SELECT p, SUM(amount) FILTER (WHERE mt=''out_invoice'') s FROM uagg GROUP BY p WITH DATA')
-     THEN RAISE EXCEPTION 'SUM FILTER: FAIL (accepted)'; ELSE RAISE NOTICE 'SUM FILTER: PASS (rejected)'; END IF;
+  -- MIN/MAX FILTER stays unsupported (hand builder can't render the CASE the
+  -- filter rewrites to); SUM/COUNT/AVG FILTER are supported (filter_aggregates.sql).
+  IF _try('CREATE MATERIALIZED VIEW _m WITH (incremental_refresh=true) AS SELECT p, MAX(amount) FILTER (WHERE mt=''out_invoice'') mx FROM uagg GROUP BY p WITH DATA')
+     THEN RAISE EXCEPTION 'MAX FILTER: FAIL (accepted)'; ELSE RAISE NOTICE 'MAX FILTER: PASS (rejected)'; END IF;
 
   IF _try('CREATE MATERIALIZED VIEW _m WITH (incremental_refresh=true) AS SELECT date_trunc(''month'',d) m, SUM(amount) s FROM uagg GROUP BY date_trunc(''month'',d) WITH DATA')
      THEN RAISE EXCEPTION 'GROUP BY expr: FAIL (accepted)'; ELSE RAISE NOTICE 'GROUP BY expression: PASS (rejected)'; END IF;

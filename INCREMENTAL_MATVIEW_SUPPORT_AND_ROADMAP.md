@@ -32,6 +32,7 @@ suite in `src/test/dbblue_ivm/` and the adversarial concurrency battery.
 | `GROUP BY` on plain column(s), single table | core delta path |
 | `GROUP BY` on an **expression** | e.g. `date_trunc('month', d)`, `(amt % 10)`, `CASE …`; must be IMMUTABLE and appear in the SELECT list. Maintained by the deparse core; single-table or INNER JOIN, no MIN/MAX/self-join |
 | `SUM`, `COUNT(*)`, `COUNT(col)`, `AVG` | numeric / integer; AVG kept as a (sum,count) pair |
+| `agg(...) FILTER (WHERE c)` | `SUM`/`COUNT`/`AVG` only; rewritten to `agg(CASE WHEN c THEN … END)` and maintained by the deparse core (MIN/MAX FILTER not supported) |
 | `MIN`, `MAX` | delete-rescan, serialized on the matview-level lock (see 🟡 below); N-table joins OK |
 | Multi-table **INNER JOIN** + `GROUP BY` | N-table, equi-join (additive via deparse; MIN/MAX via the hand rescan — both correct for 3+ tables) |
 | `WHERE` | column comparisons, `AND`/`OR`/`NOT`, `IN (...)`, `IS NULL`, non-volatile functions, varchar/`RelabelType` |
@@ -77,7 +78,7 @@ A `NOTICE` (not a `WARNING`) fires at `CREATE` for these:
 | Shape | Why rejected | What to do instead |
 |---|---|---|
 | `COUNT(DISTINCT x)` | per-row delta can't track last-occurrence of a value | needs auxiliary state (roadmap) |
-| `agg(...) FILTER (WHERE …)` | filter not yet honored by the delta | rewrite as `agg(CASE WHEN … )` once Phase 2 lands |
+| `MIN`/`MAX (...) FILTER (WHERE …)` | hand MIN/MAX builder can't render the `CASE` the filter rewrites to | use `SUM`/`COUNT`/`AVG` FILTER (supported), or a non-incremental matview |
 | `GROUP BY` a **volatile** expression (`random()`, `now()`) or a STABLE one (e.g. `date_trunc` over `timestamptz`) | the same row could map to different groups across its insert- vs delete-delta → drift | use an IMMUTABLE expression (e.g. `date_trunc` over `timestamp`) or a generated/stored bucket column |
 | `GROUP BY <expression>` not in the SELECT list, or with `MIN`/`MAX` / self-join | no output column to key on / shape the deparse core does not build | add the expression to SELECT; drop MIN/MAX or the self-join |
 | `SUM`/`AVG` over `real`/`double precision` | float addition is non-associative → running total drifts | use `numeric` (exact) |
@@ -205,7 +206,9 @@ Prioritized by value for Odoo reporting:
 2. ✅ **Done — `GROUP BY <expression>`** (e.g. `date_trunc('month', d)`) —
    time-bucketed reports; the immutable, selected expression is the key,
    maintained by the deparse core (single-table / INNER JOIN, no MIN/MAX).
-3. **`agg(...) FILTER (WHERE …)`** — once expressions render via `ruleutils`.
+3. ✅ **Done — `agg(...) FILTER (WHERE …)`** — `SUM`/`COUNT`/`AVG` rewritten to
+   `agg(CASE WHEN c THEN … END)` before eligibility, maintained by the deparse
+   core (MIN/MAX FILTER not supported — hand builder can't render CASE).
 4. ✅ **Done — concurrency for outer / self / UNION ALL / MIN/MAX** — a
    matview-level serialization lock makes them consistent at every isolation
    level (READ COMMITTED included). Possible refinement: per-group locks so

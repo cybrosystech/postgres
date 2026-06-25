@@ -1768,6 +1768,115 @@ incr_key_var_nullable(Var *v, List *rtable)
 }
 
 /*
+ * incr_rewrite_aggfilter_mutator
+ * Rewrite  agg(arg) FILTER (WHERE cond)  ->  agg(CASE WHEN cond THEN arg END),
+ * which is the exact SQL equivalence, so the existing delta machinery (the
+ * deparse core, which already maintains CASE aggregate arguments) handles
+ * FILTER with no delta-builder changes.
+ *
+ * Only SUM / COUNT / AVG are rewritten (no DISTINCT, no ordered-set): those are
+ * the aggregates the deparse path maintains.  MIN/MAX FILTER is left untouched so
+ * eligibility rejects it cleanly (the hand MIN/MAX builder cannot render CASE).
+ *   - COUNT(*) FILTER (WHERE c)  -> COUNT(CASE WHEN c THEN 1 END)  [count(any)]
+ *   - agg(x)   FILTER (WHERE c)  -> agg(CASE WHEN c THEN x END)
+ */
+static Node *
+incr_rewrite_aggfilter_mutator(Node *node, void *context)
+{
+	if (node == NULL)
+		return NULL;
+
+	if (IsA(node, Aggref))
+	{
+		/* expression_tree_mutator returns a fresh Aggref with children mutated */
+		Aggref	   *agg = (Aggref *) expression_tree_mutator(node,
+											incr_rewrite_aggfilter_mutator, context);
+		char	   *fname;
+
+		if (agg->aggfilter == NULL ||
+			agg->aggdistinct != NIL || agg->aggorder != NIL)
+			return (Node *) agg;
+
+		fname = get_func_name(agg->aggfnoid);
+		if (fname == NULL ||
+			(strcmp(fname, "sum") != 0 && strcmp(fname, "count") != 0 &&
+			 strcmp(fname, "avg") != 0))
+			return (Node *) agg;		/* MIN/MAX/other: leave for rejection */
+
+		if (agg->aggstar)
+		{
+			/* COUNT(*) FILTER -> COUNT(CASE WHEN cond THEN 1 END) */
+			CaseWhen   *w = makeNode(CaseWhen);
+			CaseExpr   *c = makeNode(CaseExpr);
+
+			w->expr = agg->aggfilter;
+			w->result = (Expr *) makeConst(INT4OID, -1, InvalidOid, sizeof(int32),
+										   Int32GetDatum(1), false, true);
+			w->location = -1;
+
+			c->casetype = INT4OID;
+			c->casecollid = InvalidOid;
+			c->arg = NULL;
+			c->args = list_make1(w);
+			c->defresult = (Expr *) makeNullConst(INT4OID, -1, InvalidOid);
+			c->location = -1;
+
+			agg->aggfnoid = 2147;		/* count("any") */
+			agg->aggstar = false;
+			agg->aggargtypes = list_make1_oid(INT4OID);
+			agg->args = list_make1(makeTargetEntry((Expr *) c, 1, NULL, false));
+		}
+		else
+		{
+			/* agg(x) FILTER -> agg(CASE WHEN cond THEN x END) */
+			TargetEntry *arg_te = linitial_node(TargetEntry, agg->args);
+			Node	   *arg = (Node *) arg_te->expr;
+			CaseWhen   *w = makeNode(CaseWhen);
+			CaseExpr   *c = makeNode(CaseExpr);
+
+			w->expr = agg->aggfilter;
+			w->result = (Expr *) arg;
+			w->location = -1;
+
+			c->casetype = exprType(arg);
+			c->casecollid = exprCollation(arg);
+			c->arg = NULL;
+			c->args = list_make1(w);
+			c->defresult = (Expr *) makeNullConst(exprType(arg), exprTypmod(arg),
+												  exprCollation(arg));
+			c->location = -1;
+
+			arg_te->expr = (Expr *) c;
+		}
+		agg->aggfilter = NULL;
+		return (Node *) agg;
+	}
+
+	return expression_tree_mutator(node, incr_rewrite_aggfilter_mutator, context);
+}
+
+/*
+ * MatviewIncrRewriteAggFilters
+ * Apply the FILTER -> CASE rewrite across the query's SELECT list and HAVING
+ * clause, in place.  Call on BOTH the schema (execution) query and the stored
+ * view query, before eligibility and MatviewIncrAddCountTarget, so the matview
+ * schema, initial population, REFRESH, and incremental deltas all agree.
+ */
+void
+MatviewIncrRewriteAggFilters(Query *q)
+{
+	ListCell   *lc;
+
+	foreach(lc, q->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+		te->expr = (Expr *) incr_rewrite_aggfilter_mutator((Node *) te->expr, NULL);
+	}
+	q->havingQual = incr_rewrite_aggfilter_mutator(q->havingQual, NULL);
+}
+
+/*
  * MatviewIncrAddNotNullKeyFilters
  *
  * A NULL value in a GROUP BY / DISTINCT key cannot be maintained incrementally.
