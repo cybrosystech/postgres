@@ -524,6 +524,77 @@ set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 	{
 		/* It's an "append relation", process accordingly */
 		set_append_rel_pathlist(root, rel, rti, rte);
+
+		/*
+		 * For partitioned tables that have at least one global partition
+		 * index, also generate IndexPaths on the parent rel directly.
+		 * The executor's nodeIndexscan.c routes each TID to the right
+		 * partition using the INCLUDE'd partition key column.
+		 */
+		if (rte->relkind == RELKIND_PARTITIONED_TABLE)
+		{
+			ListCell   *lc;
+			bool		has_global = false;
+
+			elog(DEBUG1, "GPI planner: checking %d indexes on partitioned rel %u",
+				 list_length(rel->indexlist), rte->relid);
+
+			foreach(lc, rel->indexlist)
+			{
+				IndexOptInfo *idx = lfirst(lc);
+
+				elog(DEBUG1, "GPI planner: index %u indglobal=%d amhasgettuple=%d",
+					 idx->indexoid, (int) idx->indglobal, (int) idx->amhasgettuple);
+
+				if (idx->indglobal)
+				{
+					has_global = true;
+					break;
+				}
+			}
+			if (has_global)
+			{
+				IndexOptInfo *gidx = NULL;
+				ListCell   *lc2;
+
+				foreach(lc2, rel->indexlist)
+				{
+					IndexOptInfo *idx = lfirst(lc2);
+
+					if (idx->indglobal)
+					{
+						gidx = idx;
+						break;
+					}
+				}
+				elog(DEBUG1, "GPI: pre check_index_predicates: indrestrictinfo len=%d",
+					 gidx ? list_length(gidx->indrestrictinfo) : -1);
+				/*
+				 * check_index_predicates is normally called by
+				 * set_plain_rel_pathlist, which is bypassed for partitioned
+				 * tables.  Call it here so that indrestrictinfo is populated
+				 * before create_index_paths tries to match clauses.
+				 */
+				check_index_predicates(root, rel);
+				elog(DEBUG1, "GPI: post check_index_predicates: indrestrictinfo len=%d pathlist=%d",
+					 gidx ? list_length(gidx->indrestrictinfo) : -1,
+					 list_length(rel->pathlist));
+				create_index_paths(root, rel);
+				{
+					ListCell *plc;
+
+					elog(DEBUG1, "GPI: post create_index_paths: pathlist=%d",
+						 list_length(rel->pathlist));
+					foreach(plc, rel->pathlist)
+					{
+						Path *p = lfirst(plc);
+
+						elog(DEBUG1, "GPI:   path type=%d startup=%.2f total=%.2f rows=%.0f",
+							 (int) p->pathtype, p->startup_cost, p->total_cost, p->rows);
+					}
+				}
+			}
+		}
 	}
 	else
 	{

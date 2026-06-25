@@ -1744,6 +1744,9 @@ typedef struct
  *		PscanLen		   size of parallel index scan descriptor
  * ----------------
  */
+/* Opaque state for global partition index scans — defined in nodeIndexscan.c */
+struct GlobalIndexPartState;
+
 typedef struct IndexScanState
 {
 	ScanState	ss;				/* its first field is NodeTag */
@@ -1771,6 +1774,9 @@ typedef struct IndexScanState
 	bool	   *iss_OrderByTypByVals;
 	int16	   *iss_OrderByTypLens;
 	Size		iss_PscanLen;
+
+	/* Non-NULL when scanning a global partition index */
+	struct GlobalIndexPartState *iss_GlobalState;
 } IndexScanState;
 
 /* ----------------

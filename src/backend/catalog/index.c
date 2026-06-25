@@ -26,6 +26,7 @@
 #include "access/amapi.h"
 #include "access/attmap.h"
 #include "access/heapam.h"
+#include "access/nbtree.h"
 #include "access/multixact.h"
 #include "access/relscan.h"
 #include "access/tableam.h"
@@ -67,6 +68,7 @@
 #include "postmaster/autovacuum.h"
 #include "rewrite/rewriteManip.h"
 #include "storage/bufmgr.h"
+#include "storage/bulk_write.h"
 #include "storage/lmgr.h"
 #include "storage/predicate.h"
 #include "storage/smgr.h"
@@ -120,7 +122,8 @@ static void UpdateIndexRelation(Oid indexoid, Oid heapoid,
 								bool isexclusion,
 								bool immediate,
 								bool isvalid,
-								bool isready);
+								bool isready,
+								bool isglobal);
 static void index_update_stats(Relation rel,
 							   bool hasindex,
 							   double reltuples);
@@ -572,7 +575,8 @@ UpdateIndexRelation(Oid indexoid,
 					bool isexclusion,
 					bool immediate,
 					bool isvalid,
-					bool isready)
+					bool isready,
+					bool isglobal)
 {
 	int2vector *indkey;
 	oidvector  *indcollation;
@@ -650,6 +654,7 @@ UpdateIndexRelation(Oid indexoid,
 	values[Anum_pg_index_indisready - 1] = BoolGetDatum(isready);
 	values[Anum_pg_index_indislive - 1] = BoolGetDatum(true);
 	values[Anum_pg_index_indisreplident - 1] = BoolGetDatum(false);
+	values[Anum_pg_index_indglobal - 1] = BoolGetDatum(isglobal);
 	values[Anum_pg_index_indkey - 1] = PointerGetDatum(indkey);
 	values[Anum_pg_index_indcollation - 1] = PointerGetDatum(indcollation);
 	values[Anum_pg_index_indclass - 1] = PointerGetDatum(indclass);
@@ -763,6 +768,7 @@ index_create(Relation heapRelation,
 	bool		invalid = (flags & INDEX_CREATE_INVALID) != 0;
 	bool		concurrent = (flags & INDEX_CREATE_CONCURRENT) != 0;
 	bool		partitioned = (flags & INDEX_CREATE_PARTITIONED) != 0;
+	bool		isglobal = (flags & INDEX_CREATE_GLOBAL) != 0;
 	bool		progress = (flags & INDEX_CREATE_SUPPRESS_PROGRESS) == 0;
 	char		relkind;
 	TransactionId relfrozenxid;
@@ -774,7 +780,14 @@ index_create(Relation heapRelation,
 		   ((flags & INDEX_CREATE_ADD_CONSTRAINT) != 0));
 	/* partitioned indexes must never be "built" by themselves */
 	Assert(!partitioned || (flags & INDEX_CREATE_SKIP_BUILD));
+	/* global indexes are always built lazily (no heap scan on parent) */
+	Assert(!isglobal || (flags & INDEX_CREATE_SKIP_BUILD));
 
+	/*
+	 * A global partition index is a real physical RELKIND_INDEX even though
+	 * the parent relation is a partitioned table.  It is populated
+	 * incrementally as rows are inserted into the individual partitions.
+	 */
 	relkind = partitioned ? RELKIND_PARTITIONED_INDEX : RELKIND_INDEX;
 	is_exclusion = (indexInfo->ii_ExclusionOps != NULL);
 
@@ -1053,7 +1066,8 @@ index_create(Relation heapRelation,
 						isprimary, is_exclusion,
 						(constr_flags & INDEX_CONSTR_CREATE_DEFERRABLE) == 0,
 						!concurrent && !invalid,
-						!concurrent);
+						!concurrent,
+						(flags & INDEX_CREATE_GLOBAL) != 0);
 
 	/*
 	 * Register relcache invalidation on the indexes' heap relation, to
@@ -1277,6 +1291,39 @@ index_create(Relation heapRelation,
 						   -1.0);
 		/* Make the above update visible */
 		CommandCounterIncrement();
+
+		/*
+		 * A global partition index is a real physical index (RELKIND_INDEX)
+		 * but we skip the heap scan because the partitioned parent has no
+		 * storage.  We still need to initialize the index AM's empty
+		 * structure on the MAIN_FORKNUM.
+		 *
+		 * ambuildempty() always writes to INIT_FORKNUM (used only for
+		 * unlogged-table crash recovery) — calling it here would leave the
+		 * main fork empty, causing every subsequent index_insert to fail.
+		 * Instead, write the btree meta page directly to MAIN_FORKNUM.
+		 *
+		 * This is intentionally btree-specific; only btree global indexes
+		 * are supported in this prototype.
+		 */
+		if (isglobal)
+		{
+			bool			allequalimage;
+			BulkWriteState *bulkstate;
+			BulkWriteBuffer metabuf;
+
+			if (indexRelation->rd_rel->relam != BTREE_AM_OID)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("global partition indexes are only supported for btree")));
+
+			allequalimage = _bt_allequalimage(indexRelation, false);
+			bulkstate = smgr_bulk_start_rel(indexRelation, MAIN_FORKNUM);
+			metabuf = smgr_bulk_get_buf(bulkstate);
+			_bt_initmetapage((Page) metabuf, P_NONE, 0, allequalimage);
+			smgr_bulk_write(bulkstate, BTREE_METAPAGE, metabuf, true);
+			smgr_bulk_finish(bulkstate);
+		}
 	}
 	else
 	{

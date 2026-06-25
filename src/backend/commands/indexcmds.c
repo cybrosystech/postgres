@@ -723,24 +723,105 @@ DefineIndex(ParseState *pstate,
 	 * Establish behavior for partitioned tables, and verify sanity of
 	 * parameters.
 	 *
-	 * We do not build an actual index in this case; we only create a few
-	 * catalog entries.  The actual indexes are built by recursing for each
-	 * partition.
+	 * For a regular (non-global) partitioned index we do not build an actual
+	 * index; we only create catalog entries and recurse into each partition.
+	 *
+	 * For a GLOBAL index the partitioned table itself gets a single real
+	 * physical index (RELKIND_INDEX).  It is populated incrementally as rows
+	 * are inserted into partitions, so we never recurse into partitions and
+	 * we skip the initial index build.
 	 */
 	partitioned = rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE;
 	if (partitioned)
 	{
-		/*
-		 * Note: we check 'stmt->concurrent' rather than 'concurrent', so that
-		 * the error is thrown also for temporary tables.  Seems better to be
-		 * consistent, even though we could do it on temporary table because
-		 * we're not actually doing it concurrently.
-		 */
-		if (stmt->concurrent)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("cannot create index on partitioned table \"%s\" concurrently",
-							RelationGetRelationName(rel))));
+		if (stmt->global)
+		{
+			/* GLOBAL indexes are not compatible with concurrent build */
+			if (stmt->concurrent)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("cannot create global index on partitioned table \"%s\" concurrently",
+								RelationGetRelationName(rel))));
+
+			/*
+			 * Automatically add the partition key column(s) as INCLUDE columns
+			 * so the executor can route index TIDs to the correct partition at
+			 * scan time.  Skip any column already present in the key or INCLUDE
+			 * list to avoid duplicates.
+			 */
+			{
+				PartitionKey partkey = RelationGetPartitionKey(rel);
+				TupleDesc	reldesc = RelationGetDescr(rel);
+
+				for (int pk_i = 0; pk_i < partkey->partnatts; pk_i++)
+				{
+					AttrNumber	attno = partkey->partattrs[pk_i];
+					Form_pg_attribute attr;
+					IndexElem  *ielem;
+					ListCell   *lc;
+					bool		already_present = false;
+
+					if (attno == 0)
+						ereport(ERROR,
+								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								 errmsg("global indexes on expression partition keys are not supported")));
+
+					attr = TupleDescAttr(reldesc, attno - 1);
+
+					/* Check key and include columns for duplicates */
+					foreach(lc, allIndexParams)
+					{
+						IndexElem  *ex = lfirst_node(IndexElem, lc);
+
+						if (ex->name &&
+							strcmp(ex->name, NameStr(attr->attname)) == 0)
+						{
+							already_present = true;
+							break;
+						}
+					}
+					if (already_present)
+						continue;
+
+					ielem = makeNode(IndexElem);
+					ielem->name = pstrdup(NameStr(attr->attname));
+					ielem->expr = NULL;
+					ielem->indexcolname = NULL;
+					ielem->collation = NIL;
+					ielem->opclass = NIL;
+					ielem->opclassopts = NIL;
+					ielem->ordering = SORTBY_DEFAULT;
+					ielem->nulls_ordering = SORTBY_NULLS_DEFAULT;
+
+					allIndexParams = lappend(allIndexParams, ielem);
+					numberOfAttributes++;
+				}
+
+				if (numberOfAttributes > INDEX_MAX_KEYS)
+					ereport(ERROR,
+							(errcode(ERRCODE_TOO_MANY_COLUMNS),
+							 errmsg("cannot use more than %d columns in an index",
+									INDEX_MAX_KEYS)));
+			}
+		}
+		else
+		{
+			/*
+			 * Note: we check 'stmt->concurrent' rather than 'concurrent', so
+			 * that the error is thrown also for temporary tables.
+			 */
+			if (stmt->concurrent)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("cannot create index on partitioned table \"%s\" concurrently",
+								RelationGetRelationName(rel))));
+		}
+	}
+	else if (stmt->global)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("GLOBAL is only valid for indexes on partitioned tables")));
 	}
 
 	/*
@@ -784,15 +865,20 @@ DefineIndex(ParseState *pstate,
 	if (stmt->tableSpace)
 	{
 		tablespaceId = get_tablespace_oid(stmt->tableSpace, false);
-		if (partitioned && tablespaceId == MyDatabaseTableSpace)
+		/* Global indexes are real physical indexes; no tablespace restriction */
+		if (partitioned && !stmt->global && tablespaceId == MyDatabaseTableSpace)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("cannot specify default tablespace for partitioned relations")));
 	}
 	else
 	{
+		/*
+		 * For a global index we pass partitioned=false so GetDefaultTablespace
+		 * treats it like an ordinary index.
+		 */
 		tablespaceId = GetDefaultTablespace(rel->rd_rel->relpersistence,
-											partitioned);
+											partitioned && !stmt->global);
 		/* note InvalidOid is OK in this case */
 	}
 
@@ -1221,22 +1307,28 @@ DefineIndex(ParseState *pstate,
 	flags = constr_flags = 0;
 	if (stmt->isconstraint)
 		flags |= INDEX_CREATE_ADD_CONSTRAINT;
-	if (skip_build || concurrent || partitioned)
+	/*
+	 * A global index always skips the initial build: it starts empty and is
+	 * populated incrementally during partition DML.
+	 */
+	if (skip_build || concurrent || (partitioned && !stmt->global))
 		flags |= INDEX_CREATE_SKIP_BUILD;
+	if (stmt->global)
+		flags |= INDEX_CREATE_SKIP_BUILD | INDEX_CREATE_GLOBAL;
 	if (stmt->if_not_exists)
 		flags |= INDEX_CREATE_IF_NOT_EXISTS;
 	if (concurrent)
 		flags |= INDEX_CREATE_CONCURRENT;
-	if (partitioned)
+	if (partitioned && !stmt->global)
 		flags |= INDEX_CREATE_PARTITIONED;
 	if (stmt->primary)
 		flags |= INDEX_CREATE_IS_PRIMARY;
 
 	/*
-	 * If the table is partitioned, and recursion was declined but partitions
-	 * exist, mark the index as invalid.
+	 * If the table is partitioned (non-global), and recursion was declined
+	 * but partitions exist, mark the index as invalid.
 	 */
-	if (partitioned && stmt->relation && !stmt->relation->inh)
+	if (partitioned && !stmt->global && stmt->relation && !stmt->relation->inh)
 	{
 		PartitionDesc pd = RelationGetPartitionDesc(rel, true);
 
@@ -1298,7 +1390,7 @@ DefineIndex(ParseState *pstate,
 		CreateComments(indexRelationId, RelationRelationId, 0,
 					   stmt->idxcomment);
 
-	if (partitioned)
+	if (partitioned && !stmt->global)
 	{
 		PartitionDesc partdesc;
 

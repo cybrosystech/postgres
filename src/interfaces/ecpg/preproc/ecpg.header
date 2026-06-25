@@ -581,7 +581,7 @@ update_connection(const char *newconn)
 }
 %}
 
-%expect 0
+%expect 1
 %name-prefix="base_yy"
 %locations
 

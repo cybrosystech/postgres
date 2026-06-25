@@ -107,10 +107,17 @@
 #include "postgres.h"
 
 #include "access/genam.h"
+#include "access/htup_details.h"
 #include "access/relscan.h"
+#include "access/table.h"
 #include "access/tableam.h"
 #include "access/xact.h"
 #include "catalog/index.h"
+#include "catalog/indexing.h"
+#include "catalog/partition.h"
+#include "catalog/pg_index.h"
+#include "catalog/pg_index_d.h"
+#include "utils/fmgroids.h"
 #include "executor/executor.h"
 #include "nodes/nodeFuncs.h"
 #include "storage/lmgr.h"
@@ -118,6 +125,7 @@
 #include "utils/lsyscache.h"
 #include "utils/multirangetypes.h"
 #include "utils/rangetypes.h"
+#include "utils/relcache.h"
 #include "utils/snapmgr.h"
 
 /* waitMode argument to check_exclusion_or_unique_constraint() */
@@ -513,6 +521,81 @@ ExecInsertIndexTuples(ResultRelInfo *resultRelInfo,
 			if (indexRelation->rd_index->indimmediate && specConflict)
 				*specConflict = true;
 		}
+	}
+
+	/*
+	 * Global Partition Index maintenance
+	 *
+	 * If we just inserted into a partition, check whether the parent
+	 * partitioned table has any global indexes (indglobal = true).  Such
+	 * indexes span all partitions and must be updated for every inserted row.
+	 *
+	 * The TID stored in a global index entry is the tuple's ctid inside the
+	 * partition heap, so it is globally meaningful together with the partition
+	 * OID stored in the INCLUDE columns (if any).  Callers that want to
+	 * resolve the full row must use the PK columns (also stored as INCLUDE
+	 * columns at index-creation time).
+	 */
+	if (heapRelation->rd_rel->relispartition)
+	{
+		Oid			parentOid;
+		Relation	pgidxrel;
+		SysScanDesc scan;
+		ScanKeyData key;
+		HeapTuple	htup;
+
+		parentOid = get_partition_parent(RelationGetRelid(heapRelation), false);
+
+		/* Scan pg_index directly for global indexes on the parent */
+		ScanKeyInit(&key,
+					Anum_pg_index_indrelid,
+					BTEqualStrategyNumber,
+					F_OIDEQ,
+					ObjectIdGetDatum(parentOid));
+
+		pgidxrel = table_open(IndexRelationId, AccessShareLock);
+		scan = systable_beginscan(pgidxrel, IndexIndrelidIndexId, true,
+								  NULL, 1, &key);
+
+		while (HeapTupleIsValid(htup = systable_getnext(scan)))
+		{
+			Form_pg_index idx = (Form_pg_index) GETSTRUCT(htup);
+			Oid			globalIdxOid;
+			Relation	globalIdxRel;
+			IndexInfo  *globalIdxInfo;
+			Datum		gvalues[INDEX_MAX_KEYS];
+			bool		gisnull[INDEX_MAX_KEYS];
+
+			/* Only process global partition indexes */
+			if (!idx->indglobal)
+				continue;
+
+			globalIdxOid = idx->indexrelid;
+			globalIdxRel = index_open(globalIdxOid, RowExclusiveLock);
+			globalIdxInfo = BuildIndexInfo(globalIdxRel);
+
+			if (!globalIdxInfo->ii_ReadyForInserts)
+			{
+				index_close(globalIdxRel, RowExclusiveLock);
+				continue;
+			}
+
+			FormIndexDatum(globalIdxInfo, slot, estate, gvalues, gisnull);
+
+			index_insert(globalIdxRel,
+						 gvalues,
+						 gisnull,
+						 tupleid,
+						 heapRelation,
+						 UNIQUE_CHECK_NO,
+						 false,
+						 globalIdxInfo);
+
+			index_close(globalIdxRel, RowExclusiveLock);
+		}
+
+		systable_endscan(scan);
+		table_close(pgidxrel, AccessShareLock);
 	}
 
 	return result;

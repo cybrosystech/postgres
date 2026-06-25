@@ -299,7 +299,9 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 
 			/*
 			 * We don't have an AM for partitioned indexes, so we'll just
-			 * NULLify the AM related fields for those.
+			 * NULLify the AM related fields for those.  Global partition
+			 * indexes are physical RELKIND_INDEX entries and get real AM
+			 * properties.
 			 */
 			if (indexRelation->rd_rel->relkind != RELKIND_PARTITIONED_INDEX)
 			{
@@ -312,6 +314,7 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 				info->amcanparallel = amroutine->amcanparallel;
 				info->amhasgettuple = (amroutine->amgettuple != NULL);
 				info->amhasgetbitmap = amroutine->amgetbitmap != NULL &&
+					relation->rd_tableam != NULL &&
 					relation->rd_tableam->scan_bitmap_next_tuple != NULL;
 				info->amcanmarkpos = (amroutine->ammarkpos != NULL &&
 									  amroutine->amrestrpos != NULL);
@@ -462,6 +465,19 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 			info->nullsnotdistinct = index->indnullsnotdistinct;
 			info->immediate = index->indimmediate;
 			info->hypothetical = false;
+			info->indglobal = index->indglobal;
+
+			/*
+			 * Global partition indexes always require a heap fetch to retrieve
+			 * the actual row from the correct child partition.  Index Only Scan
+			 * is therefore never safe for them — mark every column as not
+			 * returnable so the planner never generates an IOS path.
+			 */
+			if (index->indglobal)
+			{
+				for (int gi = 0; gi < info->ncolumns; gi++)
+					info->canreturn[gi] = false;
+			}
 
 			/*
 			 * Estimate the index size.  If it's not a partial index, we lock
@@ -503,7 +519,7 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 			}
 			else
 			{
-				/* Zero these out for partitioned indexes */
+				/* Zero these out for partitioned/global indexes */
 				info->pages = 0;
 				info->tuples = 0.0;
 				info->tree_height = -1;

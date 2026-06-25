@@ -1428,6 +1428,8 @@ typedef struct IndexOptInfo
 	bool		disabled;
 	/* true if index doesn't really exist */
 	bool		hypothetical;
+	/* true if this is a global partition index (spans all partitions) */
+	bool		indglobal;
 
 	/*
 	 * Remaining fields are copied from the index AM's API struct

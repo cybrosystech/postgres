@@ -8171,6 +8171,26 @@ apply_scanjoin_target_to_paths(PlannerInfo *root,
 
 		/* Build new paths for this relation by appending child paths. */
 		add_paths_to_append_rel(root, rel, live_children);
+
+		/*
+		 * If the partitioned relation has any global partition indexes,
+		 * generate IndexPaths for them so the planner can use the global
+		 * index directly instead of the Append-of-partitions path.
+		 */
+		{
+			ListCell   *lc2;
+
+			foreach(lc2, rel->indexlist)
+			{
+				IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc2);
+
+				if (idx->indglobal)
+				{
+					create_index_paths(root, rel);
+					break;
+				}
+			}
+		}
 	}
 
 	/*

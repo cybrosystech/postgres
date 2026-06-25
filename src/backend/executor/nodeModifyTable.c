@@ -1275,10 +1275,13 @@ ExecInsert(ModifyTableContext *context,
 							   0, NULL);
 
 			/* insert index entries for tuple */
-			if (resultRelInfo->ri_NumIndices > 0)
+			if (resultRelInfo->ri_NumIndices > 0 ||
+				resultRelInfo->ri_RelationDesc->rd_rel->relispartition)
+			{
 				recheckIndexes = ExecInsertIndexTuples(resultRelInfo, estate,
 													   0, slot, NIL,
 													   NULL);
+			}
 		}
 	}
 
