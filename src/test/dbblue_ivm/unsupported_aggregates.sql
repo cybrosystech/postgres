@@ -3,7 +3,9 @@
 -- These shapes cannot be maintained by the per-row delta and must be refused
 -- at CREATE time with a clear error (never accepted-but-maintained-wrong, and
 -- never an internal elog):
---   * COUNT(DISTINCT x)              — needs per-value occurrence tracking
+--   * COUNT(DISTINCT x) + HAVING     — single-table DISTINCT is supported via the
+--                                      recompute path (distinct_aggregates.sql),
+--                                      but not yet with HAVING or over a join
 --   * MIN/MAX (...) FILTER (WHERE …) — hand MIN/MAX builder can't render the
 --                                      CASE the filter rewrites to (SUM/COUNT/AVG
 --                                      FILTER *are* supported — see filter_aggregates.sql)
@@ -32,9 +34,10 @@ END $$;
 
 DO $$
 BEGIN
-  -- must be REJECTED
-  IF _try('CREATE MATERIALIZED VIEW _m WITH (incremental_refresh=true) AS SELECT p, COUNT(DISTINCT mt) c FROM uagg GROUP BY p WITH DATA')
-     THEN RAISE EXCEPTION 'COUNT(DISTINCT): FAIL (accepted)'; ELSE RAISE NOTICE 'COUNT(DISTINCT): PASS (rejected)'; END IF;
+  -- must be REJECTED.  Single-table COUNT(DISTINCT) is now supported (recompute
+  -- path, see distinct_aggregates.sql); DISTINCT with HAVING is still rejected.
+  IF _try('CREATE MATERIALIZED VIEW _m WITH (incremental_refresh=true) AS SELECT p, COUNT(DISTINCT mt) c FROM uagg GROUP BY p HAVING COUNT(DISTINCT mt) > 0 WITH DATA')
+     THEN RAISE EXCEPTION 'COUNT(DISTINCT)+HAVING: FAIL (accepted)'; ELSE RAISE NOTICE 'COUNT(DISTINCT)+HAVING: PASS (rejected)'; END IF;
 
   -- MIN/MAX FILTER stays unsupported (hand builder can't render the CASE the
   -- filter rewrites to); SUM/COUNT/AVG FILTER are supported (filter_aggregates.sql).

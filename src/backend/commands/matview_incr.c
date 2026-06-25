@@ -242,6 +242,10 @@ static char *incr_build_union_del_sql(Oid mvrelid, Query *viewQuery,
 									   List *join_list);
 static void incr_setup_union_all(Oid mvrelid, Query *viewQuery, bool mv_populated);
 static bool incr_has_minmax_agg(Query *viewQuery);
+static bool incr_has_distinct_agg(Query *viewQuery);
+static char *incr_build_recompute_apply_sql(Oid mvrelid, Query *viewQuery,
+											Oid srctable, const char *delta_table,
+											bool is_delete);
 static char *incr_build_minmax_ins_sql_gen(Oid mvrelid, Query *viewQuery,
 										   int delta_varno, const char *delta_table,
 										   List *join_list);
@@ -820,10 +824,21 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 			 */
 			if (agg->aggdistinct != NIL)
 			{
-				*reason = psprintf("incremental %s(DISTINCT ...) is not supported "
-								   "(distinct aggregates cannot be maintained by a "
-								   "per-row delta)", fname);
-				return false;
+				/*
+				 * Single-table DISTINCT aggregates are maintained by recomputing
+				 * each affected group from the live table
+				 * (incr_build_recompute_apply_sql).  Over a join, or an ordered-set
+				 * aggregate, they are not yet supported; reject cleanly.
+				 */
+				if (nbasetables != 1 || agg->aggorder != NIL ||
+					viewQuery->havingQual != NULL)
+				{
+					*reason = psprintf("incremental %s(DISTINCT ...) is supported "
+									   "only over a single table without HAVING "
+									   "(not joins, ordered-set aggregates, or HAVING)",
+									   fname);
+					return false;
+				}
 			}
 
 			/*
@@ -1106,10 +1121,25 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 		{
 			/* Phase 1: aggregate with GROUP BY */
 			bool	used_deparse = !incr_has_minmax_agg(viewQuery) &&
+				!incr_has_distinct_agg(viewQuery) &&
 				(dbblue_ivm_deparse_delta || incr_aggs_need_deparse(viewQuery) ||
 				 incr_group_needs_deparse(viewQuery));
 
-			if (incr_has_minmax_agg(viewQuery))
+			if (incr_has_distinct_agg(viewQuery))
+			{
+				/* DISTINCT aggregate (e.g. COUNT(DISTINCT x)) — maintained by
+				 * recomputing each affected group from the live table.  Correct
+				 * for every aggregate in the matview (including any MIN/MAX/SUM
+				 * alongside it); serialized on the matview-level lock like the
+				 * other recompute shapes. */
+				ins_sql = incr_build_recompute_apply_sql(mvrelid, viewQuery, srctable,
+														 MATVIEW_INCR_NEWTABLE, false);
+				del_sql = incr_build_recompute_apply_sql(mvrelid, viewQuery, srctable,
+														 MATVIEW_INCR_OLDTABLE, true);
+				incr_store_catalog(mvrelid, srctable, ins_sql, del_sql,
+								   cln_sql, hav_sql, incr_build_mv_lock_sql(mvrelid));
+			}
+			else if (incr_has_minmax_agg(viewQuery))
 			{
 				char *lock_sql;
 
@@ -1921,14 +1951,15 @@ MatviewIncrAddNotNullKeyFilters(Query *q)
 	 * NULLS NOT DISTINCT and the delta key joins use IS NOT DISTINCT FROM, so a
 	 * NULL/partial-NULL key is one arbiter row that the delta maintains exactly
 	 * like a REFRESH).  This holds for the shared-shell shapes (single-table and
-	 * INNER JOIN aggregates, DISTINCT, HAVING) and for MIN/MAX (whose rescan/delta
-	 * builders also match keys NULL-safely).  Only self-joins still need NULL keys
-	 * kept out — their recompute path matches keys with =/IN — so exclude there
-	 * (writes are still never blocked).  For all other shapes, inject nothing so
-	 * NULL keys are maintained.
+	 * INNER JOIN aggregates, full-DISTINCT, HAVING) and for MIN/MAX (whose
+	 * rescan/delta builders also match keys NULL-safely).  Self-joins and
+	 * single-table DISTINCT-aggregate matviews still need NULL keys kept out —
+	 * their recompute path matches keys with =/IN — so exclude there (writes are
+	 * still never blocked).  For all other shapes, inject nothing so NULL keys are
+	 * maintained.
 	 */
 	{
-		bool		needs_exclusion = false;
+		bool		needs_exclusion = incr_has_distinct_agg(q);
 		ListCell   *l1;
 		List	   *seen = NIL;		/* relation OIDs already seen */
 
@@ -6493,6 +6524,300 @@ matview_delta_apply(PG_FUNCTION_ARGS)
 	return PointerGetDatum(NULL);
 }
 
+/*
+ * incr_build_recompute_apply_sql — recompute-affected-groups maintenance for a
+ * single-table aggregate that contains a DISTINCT aggregate (e.g.
+ * COUNT(DISTINCT x)).  A DISTINCT aggregate cannot be maintained by a per-row
+ * delta (a +1/-1 can't know whether a value is new to, or the last of, its
+ * group), so we recompute every group the delta touches from the LIVE table —
+ * exactly what a full REFRESH would produce for those groups — and reconcile in
+ * one statement.  Correct for ANY aggregate (each is rendered, with DISTINCT
+ * where written), and idempotent: INSERT and DELETE both write the absolute
+ * recomputed value, so one statement doing both composes.
+ *
+ *   WITH _aff_ AS (SELECT DISTINCT <keys> FROM <delta_table> [WHERE wq]),
+ *        _rc_  AS (SELECT <keys>, <aggs (DISTINCT as written)>, COUNT(*) __mv_count__
+ *                  FROM <live> WHERE (<keys>) IN (SELECT <keys> FROM _aff_) [AND wq]
+ *                  GROUP BY <keys>),
+ *        _upd_ AS (UPDATE mv SET <col=_rc_.col> FROM _rc_
+ *                  WHERE <mv.key=_rc_.key> RETURNING <mv.key>)
+ *   is_delete=false: INSERT groups in _rc_ not matched by _upd_  (new groups)
+ *   is_delete=true : DELETE affected groups absent from _rc_     (vanished groups)
+ *
+ * Key matching uses =/IN, so NULL group keys are kept out of scope
+ * (MatviewIncrAddNotNullKeyFilters excludes them for this shape), consistent with
+ * the other recompute shapes; the source write is never blocked.  Serialized on
+ * the matview-level advisory lock (stored as lock_sql), like every recompute
+ * shape, so the rescan is correct under concurrent writers.
+ */
+static char *
+incr_build_recompute_apply_sql(Oid mvrelid, Query *viewQuery, Oid srctable,
+							   const char *delta_table, bool is_delete)
+{
+	StringInfoData	buf;
+	List		   *groupColNames = NIL;
+	const char	   *mvname = mv_qname(mvrelid);
+	const char	   *livename = mv_qname(srctable);
+	Node		   *wq = incr_get_where_qual(viewQuery);
+	ListCell	   *lc,
+				   *gcl;
+	bool			first;
+
+	incr_collect_group_cols(viewQuery, &groupColNames);
+	initStringInfo(&buf);
+
+	/* ---- _aff_: distinct group keys the delta touches ---- */
+	appendStringInfoString(&buf, "WITH _aff_ AS (SELECT DISTINCT ");
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry    *te = lfirst_node(TargetEntry, lc);
+		StringInfoData	ebuf;
+
+		if (te->resjunk || !IsA(te->expr, Var))
+			continue;
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		first = false;
+		initStringInfo(&ebuf);
+		incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable, -1, &ebuf);
+		appendStringInfo(&buf, "%s AS %s", ebuf.data,
+						 quote_identifier(te->resname));
+	}
+	appendStringInfo(&buf, " FROM %s", delta_table);
+	if (wq != NULL)
+	{
+		StringInfoData wbuf;
+
+		initStringInfo(&wbuf);
+		incr_deparse_where_qual(wq, viewQuery->rtable, -1, &wbuf);
+		appendStringInfo(&buf, " WHERE %s", wbuf.data);
+	}
+	appendStringInfoString(&buf, "),");
+
+	/* ---- _rc_: full recompute of the affected groups over the LIVE table ---- */
+	appendStringInfoString(&buf, " _rc_ AS (SELECT ");
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry    *te = lfirst_node(TargetEntry, lc);
+		const char	   *colq;
+		StringInfoData	ebuf;
+
+		if (te->resjunk)
+			continue;
+		colq = quote_identifier(te->resname);
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		first = false;
+
+		if (strcmp(te->resname, MATVIEW_INCR_COUNT_COL) == 0)
+			appendStringInfo(&buf, "COUNT(*) AS %s", colq);
+		else if (strcmp(te->resname, MATVIEW_INCR_HAVING_COL) == 0)
+			appendStringInfo(&buf, "true AS %s", colq);
+		else if (IsA(te->expr, Var))
+		{
+			initStringInfo(&ebuf);
+			incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable, -1, &ebuf);
+			appendStringInfo(&buf, "%s AS %s", ebuf.data, colq);
+		}
+		else if (IsA(te->expr, Aggref))
+		{
+			Aggref	   *agg = (Aggref *) te->expr;
+			char	   *fname = get_func_name(agg->aggfnoid);
+			const char *dist = (agg->aggdistinct != NIL) ? "DISTINCT " : "";
+
+			if (strcmp(fname, "count") == 0 && agg->aggstar)
+				appendStringInfo(&buf, "COUNT(*) AS %s", colq);
+			else if (agg->args != NIL)
+			{
+				TargetEntry *arg_te = linitial_node(TargetEntry, agg->args);
+
+				initStringInfo(&ebuf);
+				incr_deparse_where_qual((Node *) arg_te->expr, viewQuery->rtable,
+										-1, &ebuf);
+				appendStringInfo(&buf, "%s(%s%s) AS %s", fname, dist, ebuf.data, colq);
+			}
+			else
+				appendStringInfo(&buf, "%s(*) AS %s", fname, colq);
+		}
+		else
+			elog(ERROR, "incr_build_recompute_apply_sql: unexpected expr %d",
+				 (int) nodeTag(te->expr));
+	}
+	appendStringInfo(&buf, " FROM %s WHERE (", livename);
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry    *te = lfirst_node(TargetEntry, lc);
+		StringInfoData	ebuf;
+
+		if (te->resjunk || !IsA(te->expr, Var))
+			continue;
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		first = false;
+		initStringInfo(&ebuf);
+		incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable, -1, &ebuf);
+		appendStringInfoString(&buf, ebuf.data);
+	}
+	appendStringInfoString(&buf, ") IN (SELECT ");
+	first = true;
+	foreach(gcl, groupColNames)
+	{
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		first = false;
+		appendStringInfoString(&buf, quote_identifier(strVal(lfirst(gcl))));
+	}
+	appendStringInfoString(&buf, " FROM _aff_)");
+	if (wq != NULL)
+	{
+		StringInfoData wbuf;
+
+		initStringInfo(&wbuf);
+		incr_deparse_where_qual(wq, viewQuery->rtable, -1, &wbuf);
+		appendStringInfo(&buf, " AND %s", wbuf.data);
+	}
+	appendStringInfoString(&buf, " GROUP BY ");
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry    *te = lfirst_node(TargetEntry, lc);
+		StringInfoData	ebuf;
+
+		if (te->resjunk || !IsA(te->expr, Var))
+			continue;
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		first = false;
+		initStringInfo(&ebuf);
+		incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable, -1, &ebuf);
+		appendStringInfoString(&buf, ebuf.data);
+	}
+	appendStringInfoString(&buf, "),");
+
+	/* ---- _upd_: overwrite surviving affected groups with recomputed values ---- */
+	appendStringInfo(&buf, " _upd_ AS (UPDATE %s SET ", mvname);
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+		const char  *colq;
+
+		if (te->resjunk || IsA(te->expr, Var))
+			continue;
+		if (strcmp(te->resname, MATVIEW_INCR_HAVING_COL) == 0)
+			continue;
+		colq = quote_identifier(te->resname);
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		first = false;
+		appendStringInfo(&buf, "%s=_rc_.%s", colq, colq);
+	}
+	appendStringInfo(&buf, " FROM _rc_ WHERE ");
+	first = true;
+	foreach(gcl, groupColNames)
+	{
+		const char *colq = quote_identifier(strVal(lfirst(gcl)));
+
+		if (!first)
+			appendStringInfoString(&buf, " AND ");
+		first = false;
+		appendStringInfo(&buf, "%s.%s=_rc_.%s", mvname, colq, colq);
+	}
+	appendStringInfoString(&buf, " RETURNING ");
+	first = true;
+	foreach(gcl, groupColNames)
+	{
+		const char *colq = quote_identifier(strVal(lfirst(gcl)));
+
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		first = false;
+		appendStringInfo(&buf, "%s.%s", mvname, colq);
+	}
+	appendStringInfoString(&buf, ")");
+
+	if (is_delete)
+	{
+		appendStringInfo(&buf, " DELETE FROM %s WHERE (", mvname);
+		first = true;
+		foreach(gcl, groupColNames)
+		{
+			if (!first)
+				appendStringInfoChar(&buf, ',');
+			first = false;
+			appendStringInfo(&buf, "%s.%s", mvname,
+							 quote_identifier(strVal(lfirst(gcl))));
+		}
+		appendStringInfoString(&buf, ") IN (SELECT ");
+		first = true;
+		foreach(gcl, groupColNames)
+		{
+			if (!first)
+				appendStringInfoChar(&buf, ',');
+			first = false;
+			appendStringInfoString(&buf, quote_identifier(strVal(lfirst(gcl))));
+		}
+		appendStringInfoString(&buf, " FROM _aff_) AND NOT EXISTS (SELECT 1 FROM _rc_ WHERE ");
+		first = true;
+		foreach(gcl, groupColNames)
+		{
+			const char *colq = quote_identifier(strVal(lfirst(gcl)));
+
+			if (!first)
+				appendStringInfoString(&buf, " AND ");
+			first = false;
+			appendStringInfo(&buf, "_rc_.%s=%s.%s", colq, mvname, colq);
+		}
+		appendStringInfoString(&buf, ")");
+	}
+	else
+	{
+		appendStringInfo(&buf, " INSERT INTO %s (", mvname);
+		first = true;
+		foreach(lc, viewQuery->targetList)
+		{
+			TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+			if (te->resjunk)
+				continue;
+			if (!first)
+				appendStringInfoChar(&buf, ',');
+			first = false;
+			appendStringInfoString(&buf, quote_identifier(te->resname));
+		}
+		appendStringInfoString(&buf, ") SELECT ");
+		first = true;
+		foreach(lc, viewQuery->targetList)
+		{
+			TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+			if (te->resjunk)
+				continue;
+			if (!first)
+				appendStringInfoChar(&buf, ',');
+			first = false;
+			appendStringInfo(&buf, "_rc_.%s", quote_identifier(te->resname));
+		}
+		appendStringInfoString(&buf, " FROM _rc_ WHERE NOT EXISTS (SELECT 1 FROM _upd_ WHERE ");
+		first = true;
+		foreach(gcl, groupColNames)
+		{
+			const char *colq = quote_identifier(strVal(lfirst(gcl)));
+
+			if (!first)
+				appendStringInfoString(&buf, " AND ");
+			first = false;
+			appendStringInfo(&buf, "_upd_.%s=_rc_.%s", colq, colq);
+		}
+		appendStringInfoString(&buf, ")");
+	}
+
+	return buf.data;
+}
+
 /* ============================================================
  * Self-join + GROUP BY/DISTINCT helpers — Phase 14
  * ============================================================ */
@@ -7201,6 +7526,28 @@ incr_has_minmax_agg(Query *viewQuery)
 			if (strcmp(fname, "min") == 0 || strcmp(fname, "max") == 0)
 				return true;
 		}
+	}
+	return false;
+}
+
+/*
+ * incr_has_distinct_agg
+ * Returns true if viewQuery's target list contains any DISTINCT aggregate
+ * (e.g. COUNT(DISTINCT x)).  These can't be maintained by a per-row delta, so
+ * the matview is routed to the recompute-affected-groups path.
+ */
+static bool
+incr_has_distinct_agg(Query *viewQuery)
+{
+	ListCell *lc;
+
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+		if (!te->resjunk && IsA(te->expr, Aggref) &&
+			((Aggref *) te->expr)->aggdistinct != NIL)
+			return true;
 	}
 	return false;
 }
