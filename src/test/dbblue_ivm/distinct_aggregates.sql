@@ -73,5 +73,34 @@ BEGIN
   ELSE RAISE EXCEPTION 'DISTINCT combined DELETE+INSERT: FAIL (% diff)', ndiff; END IF;
 END $$;
 DROP MATERIALIZED VIEW da2_i; DROP MATERIALIZED VIEW da2_n; DROP TABLE da2 CASCADE;
+
+-- COUNT(DISTINCT) over an INNER JOIN — recompute per source table.  Includes a
+-- far-table group-key change (the join-order builder must keep the connecting
+-- condition), plus fact insert/delete.
+DROP TABLE IF EXISTS da_o CASCADE; DROP TABLE IF EXISTS da_l CASCADE;
+CREATE TABLE da_o(id int primary key, region text);
+CREATE TABLE da_l(id serial primary key, oid int, cust int, amt numeric);
+INSERT INTO da_o VALUES (1,'E'),(2,'W');
+INSERT INTO da_l(oid,cust,amt) VALUES (1,100,5),(1,100,8),(1,200,3),(2,300,7);
+CREATE MATERIALIZED VIEW da_ji WITH (incremental_refresh=true) AS
+  SELECT r.region, COUNT(DISTINCT l.cust) dc, COUNT(*) c, SUM(l.amt) s
+  FROM da_l l JOIN da_o r ON r.id=l.oid GROUP BY r.region;
+CREATE MATERIALIZED VIEW da_jn AS
+  SELECT r.region, COUNT(DISTINCT l.cust) dc, COUNT(*) c, SUM(l.amt) s
+  FROM da_l l JOIN da_o r ON r.id=l.oid GROUP BY r.region;
+INSERT INTO da_l(oid,cust,amt) VALUES (1,400,1),(2,300,9);  -- new cust in E; dup in W
+DELETE FROM da_l WHERE oid=1 AND cust=100 AND amt=5;        -- 100 still present in E
+UPDATE da_o SET region='E' WHERE id=2;                      -- far-table key change: W -> E
+REFRESH MATERIALIZED VIEW da_jn;
+DO $$
+DECLARE ndiff int;
+BEGIN
+  SELECT count(*) INTO ndiff FROM (
+    (SELECT region,dc,c,s FROM da_ji EXCEPT SELECT region,dc,c,s FROM da_jn)
+    UNION ALL (SELECT region,dc,c,s FROM da_jn EXCEPT SELECT region,dc,c,s FROM da_ji)) d;
+  IF ndiff=0 THEN RAISE NOTICE 'COUNT(DISTINCT) over INNER JOIN == REFRESH (far-table key change): PASS';
+  ELSE RAISE EXCEPTION 'COUNT(DISTINCT) over JOIN: FAIL (% diff)', ndiff; END IF;
+END $$;
+DROP MATERIALIZED VIEW da_ji; DROP MATERIALIZED VIEW da_jn; DROP TABLE da_l, da_o CASCADE;
 \echo ''
 \echo '=== DISTINCT aggregates test complete ==='

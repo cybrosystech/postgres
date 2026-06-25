@@ -33,7 +33,7 @@ suite in `src/test/dbblue_ivm/` and the adversarial concurrency battery.
 | `GROUP BY` on an **expression** | e.g. `date_trunc('month', d)`, `(amt % 10)`, `CASE …`; must be IMMUTABLE and appear in the SELECT list. Maintained by the deparse core; single-table or INNER JOIN, no MIN/MAX/self-join |
 | `SUM`, `COUNT(*)`, `COUNT(col)`, `AVG` | numeric / integer; AVG kept as a (sum,count) pair |
 | `agg(...) FILTER (WHERE c)` | `SUM`/`COUNT`/`AVG` only; rewritten to `agg(CASE WHEN c THEN … END)` and maintained by the deparse core (MIN/MAX FILTER not supported) |
-| `COUNT(DISTINCT x)`, `SUM(DISTINCT x)`, … | single-table only; maintained by recomputing each affected group from the live table (serialized on the matview lock; NULL keys excluded). Not yet over joins or with HAVING |
+| `COUNT(DISTINCT x)`, `SUM(DISTINCT x)`, … | single-table **or INNER JOIN**; maintained by recomputing each affected group from the live table(s) (serialized on the matview lock; NULL keys excluded). Not yet with HAVING, self-join, or outer join |
 | `MIN`, `MAX` | delete-rescan, serialized on the matview-level lock (see 🟡 below); N-table joins OK |
 | Multi-table **INNER JOIN** + `GROUP BY` | N-table, equi-join (additive via deparse; MIN/MAX via the hand rescan — both correct for 3+ tables) |
 | `WHERE` | column comparisons, `AND`/`OR`/`NOT`, `IN (...)`, `IS NULL`, non-volatile functions, varchar/`RelabelType` |
@@ -78,7 +78,7 @@ A `NOTICE` (not a `WARNING`) fires at `CREATE` for these:
 
 | Shape | Why rejected | What to do instead |
 |---|---|---|
-| `COUNT(DISTINCT x)` over a **join**, or with **HAVING** | the recompute path is single-table only so far | single-table is supported; for joins use a non-incremental matview |
+| `COUNT(DISTINCT x)` with **HAVING**, or over a **self-join / outer join** | the recompute path doesn't cover these yet | single-table & INNER JOIN are supported; otherwise use a non-incremental matview |
 | `MIN`/`MAX (...) FILTER (WHERE …)` | hand MIN/MAX builder can't render the `CASE` the filter rewrites to | use `SUM`/`COUNT`/`AVG` FILTER (supported), or a non-incremental matview |
 | `GROUP BY` a **volatile** expression (`random()`, `now()`) or a STABLE one (e.g. `date_trunc` over `timestamptz`) | the same row could map to different groups across its insert- vs delete-delta → drift | use an IMMUTABLE expression (e.g. `date_trunc` over `timestamp`) or a generated/stored bucket column |
 | `GROUP BY <expression>` not in the SELECT list, or with `MIN`/`MAX` / self-join | no output column to key on / shape the deparse core does not build | add the expression to SELECT; drop MIN/MAX or the self-join |
@@ -214,9 +214,11 @@ Prioritized by value for Odoo reporting:
    matview-level serialization lock makes them consistent at every isolation
    level (READ COMMITTED included). Possible refinement: per-group locks so
    non-overlapping groups of one such matview maintain concurrently.
-5. ✅ **Done (single-table) — `COUNT(DISTINCT)` / `SUM(DISTINCT)` / …** — maintained
-   by recomputing each affected group from the live table (no auxiliary table).
-   Remaining: extend the recompute path to joins, and allow HAVING.
+5. ✅ **Done (single-table + INNER JOIN) — `COUNT(DISTINCT)` / `SUM(DISTINCT)` / …**
+   — maintained by recomputing each affected group from the live table(s) (no
+   auxiliary table). Remaining: HAVING, self-join/outer join. Folding in
+   stddev/variance/bool_and/bool_or and CASE-arg support is best done via the
+   deparse-recompute refactor (see below).
 6. **Full NULL-group fidelity (match a normal matview)** — `NULLS NOT DISTINCT`
    index + `IS NOT DISTINCT FROM` predicates, so the NULL group is *kept and
    maintained* instead of auto-excluded. Delivered as part of Phase 2 (the

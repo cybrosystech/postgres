@@ -244,7 +244,8 @@ static void incr_setup_union_all(Oid mvrelid, Query *viewQuery, bool mv_populate
 static bool incr_has_minmax_agg(Query *viewQuery);
 static bool incr_has_distinct_agg(Query *viewQuery);
 static char *incr_build_recompute_apply_sql(Oid mvrelid, Query *viewQuery,
-											Oid srctable, const char *delta_table,
+											int delta_varno, const char *delta_table,
+											List *join_list, Oid delta_oid,
 											bool is_delete);
 static char *incr_build_minmax_ins_sql_gen(Oid mvrelid, Query *viewQuery,
 										   int delta_varno, const char *delta_table,
@@ -830,13 +831,14 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 				 * (incr_build_recompute_apply_sql).  Over a join, or an ordered-set
 				 * aggregate, they are not yet supported; reject cleanly.
 				 */
-				if (nbasetables != 1 || agg->aggorder != NIL ||
-					viewQuery->havingQual != NULL)
+				if (!(nbasetables == 1 ||
+					  incr_inner_join_deparse_shape(viewQuery, nbasetables)) ||
+					agg->aggorder != NIL || viewQuery->havingQual != NULL)
 				{
 					*reason = psprintf("incremental %s(DISTINCT ...) is supported "
-									   "only over a single table without HAVING "
-									   "(not joins, ordered-set aggregates, or HAVING)",
-									   fname);
+									   "only over a single table or INNER JOIN, "
+									   "without HAVING or ordered-set aggregates "
+									   "(not self-joins or outer joins)", fname);
 					return false;
 				}
 			}
@@ -1132,10 +1134,12 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 				 * for every aggregate in the matview (including any MIN/MAX/SUM
 				 * alongside it); serialized on the matview-level lock like the
 				 * other recompute shapes. */
-				ins_sql = incr_build_recompute_apply_sql(mvrelid, viewQuery, srctable,
-														 MATVIEW_INCR_NEWTABLE, false);
-				del_sql = incr_build_recompute_apply_sql(mvrelid, viewQuery, srctable,
-														 MATVIEW_INCR_OLDTABLE, true);
+				ins_sql = incr_build_recompute_apply_sql(mvrelid, viewQuery, -1,
+														 MATVIEW_INCR_NEWTABLE, NIL,
+														 srctable, false);
+				del_sql = incr_build_recompute_apply_sql(mvrelid, viewQuery, -1,
+														 MATVIEW_INCR_OLDTABLE, NIL,
+														 srctable, true);
 				incr_store_catalog(mvrelid, srctable, ins_sql, del_sql,
 								   cln_sql, hav_sql, incr_build_mv_lock_sql(mvrelid));
 			}
@@ -1354,9 +1358,35 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 			 * 3+ tables.  Drives both the delta SQL and the failing-group
 			 * backfill.  MIN/MAX and self-joins keep their hand builders. */
 			bool	used_deparse = !incr_has_self_join(all_tables) &&
-				!incr_has_minmax_agg(viewQuery);
+				!incr_has_minmax_agg(viewQuery) &&
+				!incr_has_distinct_agg(viewQuery);
 
-			if (incr_has_self_join(all_tables))
+			if (incr_has_distinct_agg(viewQuery))
+			{
+				/* DISTINCT aggregate over an INNER JOIN — recompute each affected
+				 * group from the live join, per source table.  Correct for every
+				 * aggregate in the matview; serialized on the matview-level lock.
+				 * (Eligibility allows DISTINCT only for single-table or INNER JOIN,
+				 * so this branch never sees a self-join or outer join.) */
+				foreach(jlc, all_tables)
+				{
+					IncrJoinEntry *delta = lfirst(jlc);
+					List		  *join_list = incr_build_join_list_for_delta(
+						all_tables, delta->varno);
+
+					ins_sql = incr_build_recompute_apply_sql(mvrelid, viewQuery,
+								delta->varno, MATVIEW_INCR_NEWTABLE, join_list,
+								delta->oid, false);
+					del_sql = incr_build_recompute_apply_sql(mvrelid, viewQuery,
+								delta->varno, MATVIEW_INCR_OLDTABLE, join_list,
+								delta->oid, true);
+					incr_store_catalog(mvrelid, delta->oid, ins_sql, del_sql,
+									   cln_sql, hav_sql,
+									   incr_build_mv_lock_sql(mvrelid));
+					incr_install_triggers(mvrelid, delta->oid);
+				}
+			}
+			else if (incr_has_self_join(all_tables))
 			{
 				/*
 				 * Self-join + GROUP BY: each self-joined OID needs both roles
@@ -6525,15 +6555,17 @@ matview_delta_apply(PG_FUNCTION_ARGS)
 }
 
 /*
- * incr_build_recompute_apply_sql — recompute-affected-groups maintenance for a
- * single-table aggregate that contains a DISTINCT aggregate (e.g.
- * COUNT(DISTINCT x)).  A DISTINCT aggregate cannot be maintained by a per-row
- * delta (a +1/-1 can't know whether a value is new to, or the last of, its
- * group), so we recompute every group the delta touches from the LIVE table —
- * exactly what a full REFRESH would produce for those groups — and reconcile in
- * one statement.  Correct for ANY aggregate (each is rendered, with DISTINCT
- * where written), and idempotent: INSERT and DELETE both write the absolute
- * recomputed value, so one statement doing both composes.
+ * incr_build_recompute_apply_sql — recompute-affected-groups maintenance for an
+ * aggregate that contains a DISTINCT aggregate (e.g. COUNT(DISTINCT x)).  Works
+ * for a single table (delta_varno = -1, join_list = NIL) or an INNER JOIN
+ * (delta_varno = the changed table, join_list = the others).  A DISTINCT
+ * aggregate cannot be maintained by a per-row delta (a +1/-1 can't know whether
+ * a value is new to, or the last of, its group), so we recompute every group the
+ * delta touches from the LIVE table(s) — exactly what a full REFRESH would
+ * produce for those groups — and reconcile in one statement.  Correct for ANY
+ * aggregate (each is rendered, with DISTINCT where written), and idempotent:
+ * INSERT and DELETE both write the absolute recomputed value, so one statement
+ * doing both composes.
  *
  *   WITH _aff_ AS (SELECT DISTINCT <keys> FROM <delta_table> [WHERE wq]),
  *        _rc_  AS (SELECT <keys>, <aggs (DISTINCT as written)>, COUNT(*) __mv_count__
@@ -6551,13 +6583,14 @@ matview_delta_apply(PG_FUNCTION_ARGS)
  * shape, so the rescan is correct under concurrent writers.
  */
 static char *
-incr_build_recompute_apply_sql(Oid mvrelid, Query *viewQuery, Oid srctable,
-							   const char *delta_table, bool is_delete)
+incr_build_recompute_apply_sql(Oid mvrelid, Query *viewQuery, int delta_varno,
+							   const char *delta_table, List *join_list,
+							   Oid delta_oid, bool is_delete)
 {
 	StringInfoData	buf;
 	List		   *groupColNames = NIL;
 	const char	   *mvname = mv_qname(mvrelid);
-	const char	   *livename = mv_qname(srctable);
+	const char	   *livename = mv_qname(delta_oid);
 	Node		   *wq = incr_get_where_qual(viewQuery);
 	ListCell	   *lc,
 				   *gcl;
@@ -6580,17 +6613,19 @@ incr_build_recompute_apply_sql(Oid mvrelid, Query *viewQuery, Oid srctable,
 			appendStringInfoChar(&buf, ',');
 		first = false;
 		initStringInfo(&ebuf);
-		incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable, -1, &ebuf);
+		incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable,
+								delta_varno, &ebuf);
 		appendStringInfo(&buf, "%s AS %s", ebuf.data,
 						 quote_identifier(te->resname));
 	}
-	appendStringInfo(&buf, " FROM %s", delta_table);
+	/* FROM the delta transition table [JOIN the other live tables] */
+	incr_append_from_join(&buf, viewQuery, delta_varno, delta_table, join_list);
 	if (wq != NULL)
 	{
 		StringInfoData wbuf;
 
 		initStringInfo(&wbuf);
-		incr_deparse_where_qual(wq, viewQuery->rtable, -1, &wbuf);
+		incr_deparse_where_qual(wq, viewQuery->rtable, delta_varno, &wbuf);
 		appendStringInfo(&buf, " WHERE %s", wbuf.data);
 	}
 	appendStringInfoString(&buf, "),");
@@ -6618,7 +6653,8 @@ incr_build_recompute_apply_sql(Oid mvrelid, Query *viewQuery, Oid srctable,
 		else if (IsA(te->expr, Var))
 		{
 			initStringInfo(&ebuf);
-			incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable, -1, &ebuf);
+			incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable,
+									delta_varno, &ebuf);
 			appendStringInfo(&buf, "%s AS %s", ebuf.data, colq);
 		}
 		else if (IsA(te->expr, Aggref))
@@ -6635,7 +6671,7 @@ incr_build_recompute_apply_sql(Oid mvrelid, Query *viewQuery, Oid srctable,
 
 				initStringInfo(&ebuf);
 				incr_deparse_where_qual((Node *) arg_te->expr, viewQuery->rtable,
-										-1, &ebuf);
+										delta_varno, &ebuf);
 				appendStringInfo(&buf, "%s(%s%s) AS %s", fname, dist, ebuf.data, colq);
 			}
 			else
@@ -6645,7 +6681,9 @@ incr_build_recompute_apply_sql(Oid mvrelid, Query *viewQuery, Oid srctable,
 			elog(ERROR, "incr_build_recompute_apply_sql: unexpected expr %d",
 				 (int) nodeTag(te->expr));
 	}
-	appendStringInfo(&buf, " FROM %s WHERE (", livename);
+	/* FROM the LIVE delta table [JOIN the other live tables] */
+	incr_append_from_join(&buf, viewQuery, delta_varno, livename, join_list);
+	appendStringInfoString(&buf, " WHERE (");
 	first = true;
 	foreach(lc, viewQuery->targetList)
 	{
@@ -6658,7 +6696,8 @@ incr_build_recompute_apply_sql(Oid mvrelid, Query *viewQuery, Oid srctable,
 			appendStringInfoChar(&buf, ',');
 		first = false;
 		initStringInfo(&ebuf);
-		incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable, -1, &ebuf);
+		incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable,
+								delta_varno, &ebuf);
 		appendStringInfoString(&buf, ebuf.data);
 	}
 	appendStringInfoString(&buf, ") IN (SELECT ");
@@ -6676,7 +6715,7 @@ incr_build_recompute_apply_sql(Oid mvrelid, Query *viewQuery, Oid srctable,
 		StringInfoData wbuf;
 
 		initStringInfo(&wbuf);
-		incr_deparse_where_qual(wq, viewQuery->rtable, -1, &wbuf);
+		incr_deparse_where_qual(wq, viewQuery->rtable, delta_varno, &wbuf);
 		appendStringInfo(&buf, " AND %s", wbuf.data);
 	}
 	appendStringInfoString(&buf, " GROUP BY ");
@@ -6692,7 +6731,8 @@ incr_build_recompute_apply_sql(Oid mvrelid, Query *viewQuery, Oid srctable,
 			appendStringInfoChar(&buf, ',');
 		first = false;
 		initStringInfo(&ebuf);
-		incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable, -1, &ebuf);
+		incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable,
+								delta_varno, &ebuf);
 		appendStringInfoString(&buf, ebuf.data);
 	}
 	appendStringInfoString(&buf, "),");
@@ -7551,6 +7591,7 @@ incr_has_distinct_agg(Query *viewQuery)
 	}
 	return false;
 }
+
 
 /*
  * incr_build_minmax_ins_sql_gen — INSERT delta for MIN/MAX views with advisory lock
