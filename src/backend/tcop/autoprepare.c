@@ -41,6 +41,7 @@
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/params.h"
+#include "nodes/queryjumble.h"
 #include "rewrite/rewriteHandler.h"
 #include "utils/array.h"
 #include "utils/guc.h"
@@ -62,6 +63,8 @@ typedef struct AutoprepareEntry
 	uint64		fingerprint;	/* hash key: Query->queryId */
 	uint32		seen_count;		/* how many times this shape has appeared */
 	bool		promoted;		/* true once plansource is built */
+	bool		declined;		/* true if this shape can't be cached -- never
+								 * re-attempt the (expensive) build */
 
 	/* NULL until promoted; lives in CacheMemoryContext via SaveCachedPlan(). */
 	CachedPlanSource *plansource;
@@ -221,7 +224,7 @@ aprep_build_mutator(Node *node, void *context)
 
 /*
  * Parameterize an analyzed query.  Returns the parameterized copy and fills
- * *types_out/*nparams_out, or NULL to decline (no constants, or too many).
+ * types_out and nparams_out, or NULL to decline (no constants, or too many).
  * LIMIT/OFFSET are temporarily detached so their literals are never folded.
  */
 static Query *
@@ -573,6 +576,7 @@ AutoprepareConsult(Query *analyzed_query, const char *query_string,
 												 HASH_ENTER, &found);
 		entry->seen_count = 1;
 		entry->promoted = false;
+		entry->declined = false;
 		entry->plansource = NULL;
 		entry->param_types = NULL;
 		entry->num_params = 0;
@@ -596,6 +600,10 @@ AutoprepareConsult(Query *analyzed_query, const char *query_string,
 		return APREP_HIT;
 	}
 
+	/* ---- known-uncacheable shape: never re-attempt the build ---- */
+	if (entry->declined)
+		return APREP_MISS;
+
 	/* ---- seen before, not yet promoted: bump and maybe promote ---- */
 	entry->seen_count++;
 	if (entry->seen_count >= autoprepare_threshold)
@@ -615,6 +623,16 @@ AutoprepareConsult(Query *analyzed_query, const char *query_string,
 			entry->param_types = ptypes;
 			entry->num_params = nparams;
 			entry->promoted = true;
+		}
+		else
+		{
+			/*
+			 * This shape can't be parameterized/cached (too many params,
+			 * rule-rewritten, etc.).  Mark it so we never pay the build cost
+			 * again -- otherwise every future execution would redo the
+			 * copyObject + QueryRewrite and leak it into AutoprepareContext.
+			 */
+			entry->declined = true;
 		}
 		MemoryContextSwitchTo(old);
 	}
@@ -655,4 +673,11 @@ AutoprepareRegisterGUCs(void)
 							NULL, NULL, NULL);
 
 	MarkGUCPrefixReserved("autoprepare");
+
+	/*
+	 * Our fingerprint is the query jumble (Query->queryId).  Force it on so
+	 * the feature works even under the default compute_query_id = auto when no
+	 * other consumer (e.g. pg_stat_statements) has requested it.
+	 */
+	EnableQueryId();
 }

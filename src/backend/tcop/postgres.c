@@ -72,6 +72,7 @@
 #include "storage/shmem_internal.h"
 #include "storage/sinval.h"
 #include "storage/standby.h"
+#include "tcop/autoprepare.h"
 #include "tcop/backend_startup.h"
 #include "tcop/fastpath.h"
 #include "tcop/pquery.h"
@@ -1118,6 +1119,9 @@ exec_simple_query(const char *query_string)
 		MemoryContext per_parsetree_context = NULL;
 		List	   *querytree_list,
 				   *plantree_list;
+		CachedPlan *aprep_cplan = NULL;
+		ResourceOwner aprep_owner = NULL;
+		ParamListInfo aprep_params = NULL;
 		Portal		portal;
 		DestReceiver *receiver;
 		int16		format;
@@ -1206,8 +1210,34 @@ exec_simple_query(const char *query_string)
 		querytree_list = pg_analyze_and_rewrite_fixedparams(parsetree, query_string,
 															NULL, 0, NULL);
 
-		plantree_list = pg_plan_queries(querytree_list, query_string,
-										CURSOR_OPT_PARALLEL_OK, NULL);
+		/*
+		 * dbblue autoprepare: if this query shape has a cached parameterized
+		 * plan, reuse it and skip planning.  We consult while the parse/plan
+		 * snapshot is still active, so GetCachedPlan() may (re)plan if needed.
+		 * The plan refcount is tracked by CurrentResourceOwner, so it is
+		 * released automatically if any step before PortalDefineQuery throws;
+		 * on the normal path we release it explicitly after PortalDrop.
+		 */
+		{
+			CachedPlanSource *aprep_src = NULL;
+
+			if (list_length(querytree_list) == 1 &&
+				AutoprepareConsult(linitial_node(Query, querytree_list),
+								   query_string,
+								   &aprep_src, &aprep_params) == APREP_HIT)
+			{
+				aprep_owner = CurrentResourceOwner;
+				aprep_cplan = GetCachedPlan(aprep_src, aprep_params,
+											aprep_owner, NULL);
+				plantree_list = aprep_cplan->stmt_list;
+			}
+			else
+			{
+				
+				plantree_list = pg_plan_queries(querytree_list, query_string,
+												CURSOR_OPT_PARALLEL_OK, NULL);
+			}
+		}
 
 		/*
 		 * Done with the snapshot used for parsing/planning.
@@ -1248,7 +1278,7 @@ exec_simple_query(const char *query_string)
 		/*
 		 * Start the portal.  No parameters here.
 		 */
-		PortalStart(portal, NULL, 0, InvalidSnapshot);
+		PortalStart(portal, aprep_params, 0, InvalidSnapshot);
 
 		/*
 		 * Select the appropriate output format: text unless we are doing a
@@ -1297,6 +1327,13 @@ exec_simple_query(const char *query_string)
 		receiver->rDestroy(receiver);
 
 		PortalDrop(portal, false);
+
+		/* dbblue: release the autoprepare cached plan, if we used one. */
+		if (aprep_cplan != NULL)
+		{
+			ReleaseCachedPlan(aprep_cplan, aprep_owner);
+			aprep_cplan = NULL;
+		}
 
 		if (lnext(parsetree_list, parsetree_item) == NULL)
 		{
@@ -4392,6 +4429,13 @@ PostgresMain(const char *dbname, const char *username)
 	}
 
 	SetProcessingMode(NormalProcessing);
+
+	/*
+	 * dbblue: register the autoprepare plan-cache GUCs for this backend, and
+	 * force query-id computation on (under compute_query_id = auto) since the
+	 * autoprepare fingerprint is the query jumble.
+	 */
+	AutoprepareRegisterGUCs();
 
 	/*
 	 * Now all GUC states are fully set up.  Report them to client if
