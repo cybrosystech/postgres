@@ -20,6 +20,7 @@
 #include "commands/prepare.h"
 #include "commands/sequence.h"
 #include "storage/lock.h"
+#include "tcop/autoprepare.h"
 #include "utils/guc.h"
 #include "utils/portal.h"
 
@@ -39,6 +40,7 @@ DiscardCommand(DiscardStmt *stmt, bool isTopLevel)
 
 		case DISCARD_PLANS:
 			ResetPlanCache();
+			AutoprepareReset();
 			break;
 
 		case DISCARD_SEQUENCES:

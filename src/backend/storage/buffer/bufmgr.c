@@ -40,9 +40,7 @@
 #include "access/tableam.h"
 #include "access/xloginsert.h"
 #include "access/xlogutils.h"
-#ifdef USE_ASSERT_CHECKING
 #include "catalog/pg_tablespace_d.h"
-#endif
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
 #include "common/hashfn.h"
