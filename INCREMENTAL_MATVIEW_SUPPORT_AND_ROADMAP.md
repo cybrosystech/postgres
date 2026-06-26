@@ -34,6 +34,8 @@ suite in `src/test/dbblue_ivm/` and the adversarial concurrency battery.
 | `SUM`, `COUNT(*)`, `COUNT(col)`, `AVG` | numeric / integer; AVG kept as a (sum,count) pair |
 | `agg(...) FILTER (WHERE c)` | `SUM`/`COUNT`/`AVG` only; rewritten to `agg(CASE WHEN c THEN … END)` and maintained by the deparse core (MIN/MAX FILTER not supported) |
 | `COUNT(DISTINCT x)`, `SUM(DISTINCT x)`, … | single-table **or INNER JOIN**; maintained by recomputing each affected group from the live table(s) (serialized on the matview lock; NULL keys excluded). Not yet with HAVING, self-join, or outer join |
+| `STDDEV`/`VARIANCE` family, `BOOL_AND`/`BOOL_OR` | single-table or INNER JOIN; same recompute path as DISTINCT |
+| **`CASE` / `COALESCE` / arithmetic** aggregate arguments | supported in **every** shape — additive (deparse), MIN/MAX, HAVING, self-join, outer join, DISTINCT, stddev/bool — as long as the expression is IMMUTABLE |
 | `MIN`, `MAX` | delete-rescan, serialized on the matview-level lock (see 🟡 below); N-table joins OK |
 | Multi-table **INNER JOIN** + `GROUP BY` | N-table, equi-join (additive via deparse; MIN/MAX via the hand rescan — both correct for 3+ tables) |
 | `WHERE` | column comparisons, `AND`/`OR`/`NOT`, `IN (...)`, `IS NULL`, non-volatile functions, varchar/`RelabelType` |
@@ -214,11 +216,13 @@ Prioritized by value for Odoo reporting:
    matview-level serialization lock makes them consistent at every isolation
    level (READ COMMITTED included). Possible refinement: per-group locks so
    non-overlapping groups of one such matview maintain concurrently.
-5. ✅ **Done (single-table + INNER JOIN) — `COUNT(DISTINCT)` / `SUM(DISTINCT)` / …**
-   — maintained by recomputing each affected group from the live table(s) (no
-   auxiliary table). Remaining: HAVING, self-join/outer join. Folding in
-   stddev/variance/bool_and/bool_or and CASE-arg support is best done via the
-   deparse-recompute refactor (see below).
+5. ✅ **Done (single-table + INNER JOIN) — `COUNT(DISTINCT)` / `SUM(DISTINCT)` / …,
+   plus `STDDEV`/`VARIANCE`/`BOOL_AND`/`BOOL_OR`** — maintained by recomputing each
+   affected group from the live table(s) (no auxiliary table). The shared
+   expression grammar now renders `CASE`/`COALESCE`, so **immutable expression
+   args work in every aggregate shape** (additive, MIN/MAX, HAVING, self-join,
+   outer join, DISTINCT, stddev/bool). Remaining: DISTINCT with HAVING /
+   self-join / outer join.
 6. **Full NULL-group fidelity (match a normal matview)** — `NULLS NOT DISTINCT`
    index + `IS NOT DISTINCT FROM` predicates, so the NULL group is *kept and
    maintained* instead of auto-excluded. Delivered as part of Phase 2 (the

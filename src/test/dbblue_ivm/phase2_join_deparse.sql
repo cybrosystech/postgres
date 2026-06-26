@@ -102,27 +102,36 @@ BEGIN
 END $$;
 DROP MATERIALIZED VIEW jcase_mv;
 
--- 3. Safety: expression args over OUTER / SELF joins must be rejected.
-CREATE OR REPLACE FUNCTION _rej(sql text) RETURNS bool LANGUAGE plpgsql AS $$
-BEGIN
-  EXECUTE 'CREATE MATERIALIZED VIEW _r WITH (incremental_refresh=true) AS '||sql;
-  EXECUTE 'DROP MATERIALIZED VIEW _r';
-  RETURN false;
-EXCEPTION WHEN OTHERS THEN RETURN true;
-END $$;
+-- 3. Expression args over OUTER / SELF joins are now SUPPORTED: those shapes use
+--    the recompute builders, which render the CASE via the shared grammar.
+--    Verify == REFRESH (previously these were rejected as "deparse not wired").
+CREATE MATERIALIZED VIEW jlo_mv WITH (incremental_refresh=true) AS
+  SELECT p.categ, SUM(CASE WHEN s.st='done' THEN s.amount ELSE 0 END) r, COUNT(*) c
+  FROM jp p LEFT JOIN js s ON p.id=s.product_id GROUP BY p.categ;
+CREATE MATERIALIZED VIEW jsj_mv WITH (incremental_refresh=true) AS
+  SELECT a.categ, SUM(CASE WHEN a.id>b.id THEN 1 ELSE 0 END) r, COUNT(*) c
+  FROM jp a JOIN jp b ON a.categ=b.categ GROUP BY a.categ;
+INSERT INTO js(product_id,st,amount) VALUES (1,'done',20),(2,'open',3);
+DELETE FROM js WHERE st='open' AND amount=5;
+UPDATE js SET st='done' WHERE amount=3;
+CREATE MATERIALIZED VIEW jlo_n AS
+  SELECT p.categ, SUM(CASE WHEN s.st='done' THEN s.amount ELSE 0 END) r, COUNT(*) c
+  FROM jp p LEFT JOIN js s ON p.id=s.product_id GROUP BY p.categ;
+CREATE MATERIALIZED VIEW jsj_n AS
+  SELECT a.categ, SUM(CASE WHEN a.id>b.id THEN 1 ELSE 0 END) r, COUNT(*) c
+  FROM jp a JOIN jp b ON a.categ=b.categ GROUP BY a.categ;
 DO $$
-DECLARE ok bool := true;
+DECLARE d1 int; d2 int;
 BEGIN
-  -- LEFT JOIN with an expression arg (deparse not wired for outer joins)
-  ok := ok AND _rej('SELECT p.categ, SUM(CASE WHEN s.st=''done'' THEN s.amount ELSE 0 END) r, COUNT(*) c
-                     FROM jp p LEFT JOIN js s ON p.id=s.product_id GROUP BY p.categ');
-  -- self-join with an expression arg
-  ok := ok AND _rej('SELECT a.categ, SUM(CASE WHEN a.id>b.id THEN 1 ELSE 0 END) r, COUNT(*) c
-                     FROM jp a JOIN jp b ON a.categ=b.categ GROUP BY a.categ');
-  IF ok THEN RAISE NOTICE 'expression args over OUTER/SELF joins rejected: PASS';
-  ELSE RAISE EXCEPTION 'an unsupported JOIN expression-arg shape was accepted: FAIL'; END IF;
+  SELECT count(*) INTO d1 FROM ((SELECT categ,r,c FROM jlo_mv EXCEPT SELECT categ,r,c FROM jlo_n)
+    UNION ALL (SELECT categ,r,c FROM jlo_n EXCEPT SELECT categ,r,c FROM jlo_mv)) z;
+  SELECT count(*) INTO d2 FROM ((SELECT categ,r,c FROM jsj_mv EXCEPT SELECT categ,r,c FROM jsj_n)
+    UNION ALL (SELECT categ,r,c FROM jsj_n EXCEPT SELECT categ,r,c FROM jsj_mv)) z;
+  IF d1=0 AND d2=0 THEN RAISE NOTICE 'CASE args over LEFT JOIN and self-join == REFRESH: PASS';
+  ELSE RAISE EXCEPTION 'CASE-arg LEFT/self join diverged (left=%, self=%)', d1, d2; END IF;
 END $$;
-DROP FUNCTION _rej(text);
+DROP MATERIALIZED VIEW jlo_mv; DROP MATERIALIZED VIEW jsj_mv;
+DROP MATERIALIZED VIEW jlo_n; DROP MATERIALIZED VIEW jsj_n;
 
 DROP TABLE jp, js CASCADE;
 \echo ''

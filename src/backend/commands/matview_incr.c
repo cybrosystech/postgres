@@ -243,6 +243,8 @@ static char *incr_build_union_del_sql(Oid mvrelid, Query *viewQuery,
 static void incr_setup_union_all(Oid mvrelid, Query *viewQuery, bool mv_populated);
 static bool incr_has_minmax_agg(Query *viewQuery);
 static bool incr_has_distinct_agg(Query *viewQuery);
+static bool incr_is_recompute_only_func(const char *fname);
+static bool incr_needs_recompute(Query *viewQuery);
 static char *incr_build_recompute_apply_sql(Oid mvrelid, Query *viewQuery,
 											int delta_varno, const char *delta_table,
 											List *join_list, Oid delta_oid,
@@ -672,6 +674,7 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 	 */
 	deparse_agg_shape = (viewQuery->groupClause != NIL &&
 						!incr_has_minmax_agg(viewQuery) &&
+						!incr_needs_recompute(viewQuery) &&
 						(nbasetables == 1 ||
 						 incr_inner_join_deparse_shape(viewQuery, nbasetables)));
 
@@ -893,8 +896,9 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 					 * deparse core).  The union never narrows what was accepted
 					 * before.
 					 */
-					bool	arg_ok = incr_validate_expr(arg, NULL, false) ||
-						(deparse_agg_shape && incr_agg_arg_deparse_safe(arg));
+					bool	arg_ok = !contain_mutable_functions(arg) &&
+						(incr_validate_expr(arg, NULL, false) ||
+						 (deparse_agg_shape && incr_agg_arg_deparse_safe(arg)));
 
 					if (!arg_ok)
 					{
@@ -908,8 +912,39 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 				continue;
 			}
 
-			*reason = psprintf("aggregate \"%s\" not supported "
-							   "(supported: SUM, COUNT, AVG, MIN, MAX)", fname);
+			if (incr_is_recompute_only_func(fname))
+			{
+				/* stddev/variance/bool_and/bool_or — maintained by recomputing each
+				 * affected group from the live table(s) (single-table or INNER JOIN,
+				 * no HAVING/ordered-set).  The recompute renders the argument with the
+				 * shared grammar (incr_deparse_where_qual). */
+				if (!(nbasetables == 1 ||
+					  incr_inner_join_deparse_shape(viewQuery, nbasetables)) ||
+					agg->aggorder != NIL || viewQuery->havingQual != NULL)
+				{
+					*reason = psprintf("incremental %s() is supported only over a "
+								   "single table or INNER JOIN, without HAVING or "
+								   "ordered-set aggregates", fname);
+					return false;
+				}
+				if (agg->args != NIL)
+				{
+					Node *arg = (Node *) linitial_node(TargetEntry, agg->args)->expr;
+
+					if (contain_mutable_functions(arg) ||
+						!incr_validate_expr(arg, NULL, false))
+					{
+						*reason = psprintf("argument of aggregate \"%s\" uses "
+									   "unsupported or non-immutable expressions", fname);
+						return false;
+					}
+				}
+				continue;
+			}
+
+			*reason = psprintf("aggregate \"%s\" not supported (supported: SUM, "
+							   "COUNT, AVG, MIN, MAX, STDDEV, VARIANCE, BOOL_AND, "
+							   "BOOL_OR; COUNT(DISTINCT))", fname);
 			return false;
 		}
 		*reason = "only column references and SUM/COUNT/AVG/MIN/MAX aggregates are allowed "
@@ -1123,11 +1158,11 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 		{
 			/* Phase 1: aggregate with GROUP BY */
 			bool	used_deparse = !incr_has_minmax_agg(viewQuery) &&
-				!incr_has_distinct_agg(viewQuery) &&
+				!incr_needs_recompute(viewQuery) &&
 				(dbblue_ivm_deparse_delta || incr_aggs_need_deparse(viewQuery) ||
 				 incr_group_needs_deparse(viewQuery));
 
-			if (incr_has_distinct_agg(viewQuery))
+			if (incr_needs_recompute(viewQuery))
 			{
 				/* DISTINCT aggregate (e.g. COUNT(DISTINCT x)) — maintained by
 				 * recomputing each affected group from the live table.  Correct
@@ -1359,9 +1394,9 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 			 * backfill.  MIN/MAX and self-joins keep their hand builders. */
 			bool	used_deparse = !incr_has_self_join(all_tables) &&
 				!incr_has_minmax_agg(viewQuery) &&
-				!incr_has_distinct_agg(viewQuery);
+				!incr_needs_recompute(viewQuery);
 
-			if (incr_has_distinct_agg(viewQuery))
+			if (incr_needs_recompute(viewQuery))
 			{
 				/* DISTINCT aggregate over an INNER JOIN — recompute each affected
 				 * group from the live join, per source table.  Correct for every
@@ -1989,7 +2024,7 @@ MatviewIncrAddNotNullKeyFilters(Query *q)
 	 * maintained.
 	 */
 	{
-		bool		needs_exclusion = incr_has_distinct_agg(q);
+		bool		needs_exclusion = incr_needs_recompute(q);
 		ListCell   *l1;
 		List	   *seen = NIL;		/* relation OIDs already seen */
 
@@ -2667,6 +2702,38 @@ incr_validate_expr(Node *expr, Query *viewQuery, bool allow_aggref)
 		return incr_validate_expr((Node *) ((RelabelType *) expr)->arg,
 								  viewQuery, allow_aggref);
 
+	/* Searched CASE: every WHEN condition / result and the ELSE must validate.
+	 * (Simple "CASE x WHEN v" — arg != NULL — uses CaseTestExpr internally and is
+	 * not handled; rewrite as a searched CASE.) */
+	if (IsA(expr, CaseExpr))
+	{
+		CaseExpr   *c = (CaseExpr *) expr;
+		ListCell   *cl;
+
+		if (c->arg != NULL)
+			return false;
+		foreach(cl, c->args)
+		{
+			CaseWhen *w = lfirst_node(CaseWhen, cl);
+
+			if (!incr_validate_expr((Node *) w->expr, viewQuery, allow_aggref) ||
+				!incr_validate_expr((Node *) w->result, viewQuery, allow_aggref))
+				return false;
+		}
+		return incr_validate_expr((Node *) c->defresult, viewQuery, allow_aggref);
+	}
+
+	/* COALESCE(a, b, …): every argument must validate. */
+	if (IsA(expr, CoalesceExpr))
+	{
+		ListCell *cl;
+
+		foreach(cl, ((CoalesceExpr *) expr)->args)
+			if (!incr_validate_expr(lfirst(cl), viewQuery, allow_aggref))
+				return false;
+		return true;
+	}
+
 	if (!allow_aggref)
 	{
 		/* WHERE-only node types (not meaningful in HAVING) */
@@ -2883,6 +2950,48 @@ incr_deparse_where_qual(Node *qual, List *rtable, int delta_varno, StringInfo bu
 		appendStringInfoChar(buf, '(');
 		incr_deparse_where_qual((Node *) rt->arg, rtable, delta_varno, buf);
 		appendStringInfo(buf, ")::%s", format_type_be(rt->resulttype));
+		return;
+	}
+
+	/* Searched CASE: CASE WHEN <cond> THEN <result> [ … ] [ELSE <def>] END */
+	if (IsA(qual, CaseExpr))
+	{
+		CaseExpr   *c = (CaseExpr *) qual;
+		ListCell   *cl;
+
+		appendStringInfoString(buf, "CASE");
+		foreach(cl, c->args)
+		{
+			CaseWhen *w = lfirst_node(CaseWhen, cl);
+
+			appendStringInfoString(buf, " WHEN ");
+			incr_deparse_where_qual((Node *) w->expr, rtable, delta_varno, buf);
+			appendStringInfoString(buf, " THEN ");
+			incr_deparse_where_qual((Node *) w->result, rtable, delta_varno, buf);
+		}
+		/* defresult is a NULL Const for an implicit ELSE; render it either way */
+		appendStringInfoString(buf, " ELSE ");
+		incr_deparse_where_qual((Node *) c->defresult, rtable, delta_varno, buf);
+		appendStringInfoString(buf, " END");
+		return;
+	}
+
+	/* COALESCE(a, b, …) */
+	if (IsA(qual, CoalesceExpr))
+	{
+		CoalesceExpr *ce = (CoalesceExpr *) qual;
+		ListCell	 *cl;
+		bool		  first = true;
+
+		appendStringInfoString(buf, "COALESCE(");
+		foreach(cl, ce->args)
+		{
+			if (!first)
+				appendStringInfoChar(buf, ',');
+			first = false;
+			incr_deparse_where_qual(lfirst(cl), rtable, delta_varno, buf);
+		}
+		appendStringInfoChar(buf, ')');
 		return;
 	}
 
@@ -7587,6 +7696,48 @@ incr_has_distinct_agg(Query *viewQuery)
 
 		if (!te->resjunk && IsA(te->expr, Aggref) &&
 			((Aggref *) te->expr)->aggdistinct != NIL)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * incr_is_recompute_only_func
+ * True for aggregates that can't be maintained additively or by a per-row delta
+ * and so must be recomputed from the live table(s): the stddev/variance family
+ * and bool_and/bool_or.  The recompute path renders fname(arg) directly, so once
+ * a matview is on that path these come for free.
+ */
+static bool
+incr_is_recompute_only_func(const char *fname)
+{
+	return (strcmp(fname, "stddev") == 0 || strcmp(fname, "stddev_samp") == 0 ||
+			strcmp(fname, "stddev_pop") == 0 || strcmp(fname, "variance") == 0 ||
+			strcmp(fname, "var_samp") == 0 || strcmp(fname, "var_pop") == 0 ||
+			strcmp(fname, "bool_and") == 0 || strcmp(fname, "bool_or") == 0 ||
+			strcmp(fname, "every") == 0);
+}
+
+/*
+ * incr_needs_recompute
+ * True if the matview must be maintained by recomputing the affected groups from
+ * the live table(s): it has a DISTINCT aggregate or a recompute-only function
+ * (stddev/variance/bool_and/bool_or).  Such a matview is routed entirely to
+ * incr_build_recompute_apply_sql.
+ */
+static bool
+incr_needs_recompute(Query *viewQuery)
+{
+	ListCell *lc;
+
+	if (incr_has_distinct_agg(viewQuery))
+		return true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+		if (!te->resjunk && IsA(te->expr, Aggref) &&
+			incr_is_recompute_only_func(get_func_name(((Aggref *) te->expr)->aggfnoid)))
 			return true;
 	}
 	return false;

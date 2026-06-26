@@ -76,17 +76,44 @@ END $$;
 DO $$
 DECLARE ok bool := true;
 BEGIN
-  -- volatile inside CASE (numeric SUM, so the float guard does not mask it)
-  ok := ok AND _rej('SELECT g, SUM(CASE WHEN random()<0.5 THEN amt ELSE 0 END) s, COUNT(*) c FROM ea GROUP BY g');
-  -- stable function (now()) inside CASE
-  ok := ok AND _rej('SELECT g, SUM(CASE WHEN ts<now() THEN amt ELSE 0 END) s, COUNT(*) c FROM ea GROUP BY g');
-  -- expression arg in a MIN/MAX shape (deparse not wired there)
-  ok := ok AND _rej('SELECT g, MIN(amt) mn, SUM(CASE WHEN amt>0 THEN amt ELSE 0 END) s, COUNT(*) c FROM ea GROUP BY g');
-  -- expression arg in a HAVING shape (deparse not wired there)
-  ok := ok AND _rej('SELECT g, SUM(CASE WHEN amt>0 THEN amt ELSE 0 END) s, COUNT(*) c FROM ea GROUP BY g HAVING COUNT(*)>1');
-  IF ok THEN RAISE NOTICE 'unsafe / non-deparse-shape expression args rejected: PASS';
-  ELSE RAISE EXCEPTION 'an unsafe expression-aggregate shape was accepted: FAIL'; END IF;
+  -- Only NON-deterministic args are rejected now: a CASE arg is rendered by the
+  -- shared grammar (incr_deparse_where_qual), so MIN/MAX, HAVING and join shapes
+  -- accept immutable CASE args (see the == REFRESH checks below).  Volatile and
+  -- STABLE functions still drift across deltas/recomputes and must be refused.
+  ok := ok AND _rej('SELECT g, SUM(CASE WHEN random()<0.5 THEN amt ELSE 0 END) s, COUNT(*) c FROM ea GROUP BY g');  -- volatile
+  ok := ok AND _rej('SELECT g, SUM(CASE WHEN ts<now() THEN amt ELSE 0 END) s, COUNT(*) c FROM ea GROUP BY g');      -- stable now()
+  IF ok THEN RAISE NOTICE 'non-deterministic (volatile/stable) expression args rejected: PASS';
+  ELSE RAISE EXCEPTION 'a non-deterministic expression-aggregate arg was accepted: FAIL'; END IF;
 END $$;
+
+-- Immutable CASE args are now SUPPORTED in MIN/MAX and HAVING shapes (the hand /
+-- deparse builders render CASE), verified == REFRESH.
+DROP TABLE IF EXISTS eax CASCADE;
+CREATE TABLE eax(id serial primary key, g int, amt numeric, st text);
+INSERT INTO eax(g,amt,st) VALUES (1,10,'done'),(1,20,'open'),(2,5,'done'),(2,8,'open');
+CREATE MATERIALIZED VIEW eax_mm WITH (incremental_refresh=true) AS
+  SELECT g, MIN(amt) mn, MAX(amt) mx, SUM(CASE WHEN st='done' THEN amt ELSE 0 END) sd, COUNT(*) c FROM eax GROUP BY g;
+CREATE MATERIALIZED VIEW eax_hv WITH (incremental_refresh=true) AS
+  SELECT g, SUM(CASE WHEN st='done' THEN amt ELSE 0 END) sd, COUNT(*) c FROM eax GROUP BY g HAVING COUNT(*) > 1;
+INSERT INTO eax(g,amt,st) VALUES (1,100,'done'),(2,3,'open');
+DELETE FROM eax WHERE g=1 AND amt=10;
+UPDATE eax SET st='done' WHERE g=2 AND amt=8;
+CREATE MATERIALIZED VIEW eax_mmn AS
+  SELECT g, MIN(amt) mn, MAX(amt) mx, SUM(CASE WHEN st='done' THEN amt ELSE 0 END) sd, COUNT(*) c FROM eax GROUP BY g;
+CREATE MATERIALIZED VIEW eax_hvn AS
+  SELECT g, SUM(CASE WHEN st='done' THEN amt ELSE 0 END) sd, COUNT(*) c FROM eax GROUP BY g HAVING COUNT(*) > 1;
+DO $$
+DECLARE d1 int; d2 int;
+BEGIN
+  SELECT count(*) INTO d1 FROM ((SELECT g,mn,mx,sd,c FROM eax_mm EXCEPT SELECT g,mn,mx,sd,c FROM eax_mmn)
+    UNION ALL (SELECT g,mn,mx,sd,c FROM eax_mmn EXCEPT SELECT g,mn,mx,sd,c FROM eax_mm)) z;
+  SELECT count(*) INTO d2 FROM ((SELECT g,sd,c FROM eax_hv EXCEPT SELECT g,sd,c FROM eax_hvn)
+    UNION ALL (SELECT g,sd,c FROM eax_hvn EXCEPT SELECT g,sd,c FROM eax_hv)) z;
+  IF d1=0 AND d2=0 THEN RAISE NOTICE 'CASE args in MIN/MAX and HAVING shapes == REFRESH: PASS';
+  ELSE RAISE EXCEPTION 'CASE-arg MIN/MAX or HAVING diverged (mm=%, hv=%)', d1, d2; END IF;
+END $$;
+DROP MATERIALIZED VIEW eax_mm; DROP VIEW eax_hv; DROP MATERIALIZED VIEW eax_mmn; DROP MATERIALIZED VIEW eax_hvn;
+DROP TABLE eax CASCADE;
 
 -- 3. Control: an immutable expression arg in a plain single-table aggregate is
 --    ACCEPTED (proves the rails reject for the right reason, not blanket).
