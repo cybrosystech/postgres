@@ -608,7 +608,20 @@ AutoprepareConsult(Query *analyzed_query, const char *query_string,
 	entry->seen_count++;
 	if (entry->seen_count >= autoprepare_threshold)
 	{
-		MemoryContext old = MemoryContextSwitchTo(AutoprepareContext);
+		/*
+		 * Build in a short-lived context so the scratch produced while
+		 * parameterizing the query (a copyObject of the whole query tree plus
+		 * the QueryRewrite output) is freed immediately.  Only two things must
+		 * outlive this block: the finished CachedPlanSource -- which
+		 * SaveCachedPlan reparents to CacheMemoryContext -- and a copy of the
+		 * parameter types, which we stash in AutoprepareContext.  Without this,
+		 * every promotion (and every promotion attempt) leaked its scratch
+		 * into the long-lived cache context.
+		 */
+		MemoryContext build_cxt = AllocSetContextCreate(CurrentMemoryContext,
+														"Autoprepare build",
+														ALLOCSET_DEFAULT_SIZES);
+		MemoryContext old = MemoryContextSwitchTo(build_cxt);
 		Oid		   *ptypes = NULL;
 		int			nparams = 0;
 		CachedPlanSource *ps;
@@ -617,11 +630,14 @@ AutoprepareConsult(Query *analyzed_query, const char *query_string,
 											&ptypes, &nparams);
 		if (ps != NULL)
 		{
-			SaveCachedPlan(ps); /* move to CacheMemoryContext + register for
-								 * invalidation callbacks */
+			SaveCachedPlan(ps); /* reparents the plan to CacheMemoryContext +
+								 * registers it for invalidation callbacks */
 			entry->plansource = ps;
-			entry->param_types = ptypes;
 			entry->num_params = nparams;
+			/* copy param types into the long-lived cache context */
+			entry->param_types = (Oid *) MemoryContextAlloc(AutoprepareContext,
+															sizeof(Oid) * nparams);
+			memcpy(entry->param_types, ptypes, sizeof(Oid) * nparams);
 			entry->promoted = true;
 		}
 		else
@@ -630,11 +646,12 @@ AutoprepareConsult(Query *analyzed_query, const char *query_string,
 			 * This shape can't be parameterized/cached (too many params,
 			 * rule-rewritten, etc.).  Mark it so we never pay the build cost
 			 * again -- otherwise every future execution would redo the
-			 * copyObject + QueryRewrite and leak it into AutoprepareContext.
+			 * copyObject + QueryRewrite.
 			 */
 			entry->declined = true;
 		}
 		MemoryContextSwitchTo(old);
+		MemoryContextDelete(build_cxt);		/* frees all build scratch */
 	}
 
 	return APREP_MISS;			/* plan normally on the promoting call */
