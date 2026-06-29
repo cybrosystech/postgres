@@ -1219,6 +1219,7 @@ exec_simple_query(const char *query_string)
 		 * on the normal path we release it explicitly after PortalDrop.
 		 */
 		{
+			elog(LOG, "---------------------------------------------------entered the dbblue autoprepare code path");
 			CachedPlanSource *aprep_src = NULL;
 
 			if (list_length(querytree_list) == 1 &&
@@ -1226,6 +1227,7 @@ exec_simple_query(const char *query_string)
 								   query_string,
 								   &aprep_src, &aprep_params) == APREP_HIT)
 			{
+				elog(LOG, "---------------------------------------------------getting cached plan");
 				aprep_owner = CurrentResourceOwner;
 				aprep_cplan = GetCachedPlan(aprep_src, aprep_params,
 											aprep_owner, NULL);
@@ -1233,7 +1235,7 @@ exec_simple_query(const char *query_string)
 			}
 			else
 			{
-				
+				elog(LOG, "-----------------------------------------------------creating new plan for the query");
 				plantree_list = pg_plan_queries(querytree_list, query_string,
 												CURSOR_OPT_PARALLEL_OK, NULL);
 			}
@@ -1334,7 +1336,7 @@ exec_simple_query(const char *query_string)
 			ReleaseCachedPlan(aprep_cplan, aprep_owner);
 			aprep_cplan = NULL;
 		}
-
+		/*dbblue code end*/
 		if (lnext(parsetree_list, parsetree_item) == NULL)
 		{
 			/*
