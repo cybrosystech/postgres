@@ -2012,35 +2012,17 @@ MatviewIncrAddNotNullKeyFilters(Query *q)
 	}
 
 	/*
-	 * NULL group keys are now maintained with full fidelity (the unique index is
-	 * NULLS NOT DISTINCT and the delta key joins use IS NOT DISTINCT FROM, so a
-	 * NULL/partial-NULL key is one arbiter row that the delta maintains exactly
-	 * like a REFRESH).  This holds for the shared-shell shapes (single-table and
-	 * INNER JOIN aggregates, full-DISTINCT, HAVING) and for MIN/MAX (whose
-	 * rescan/delta builders also match keys NULL-safely).  Self-joins and
-	 * single-table DISTINCT-aggregate matviews still need NULL keys kept out —
-	 * their recompute path matches keys with =/IN — so exclude there (writes are
-	 * still never blocked).  For all other shapes, inject nothing so NULL keys are
-	 * maintained.
+	 * NULL group keys are now maintained with full fidelity for every supported
+	 * shape: the unique index is NULLS NOT DISTINCT and all delta/rescan/recompute
+	 * builders match group keys with IS NOT DISTINCT FROM (the shared-shell
+	 * additive shapes, MIN/MAX, the DISTINCT / stddev / bool recompute path, and
+	 * self-joins).  So a NULL or partial-NULL key is one arbiter row maintained
+	 * exactly like a full REFRESH — no shape needs NULL keys excluded today.  The
+	 * key-filter injection below is retained as a hook should a future shape be
+	 * unable to match NULL-safely; set needs_exclusion for it there.
 	 */
 	{
-		bool		needs_exclusion = incr_needs_recompute(q);
-		ListCell   *l1;
-		List	   *seen = NIL;		/* relation OIDs already seen */
-
-		foreach(l1, q->rtable)
-		{
-			RangeTblEntry *rte = lfirst_node(RangeTblEntry, l1);
-
-			if (rte->rtekind != RTE_RELATION)
-				continue;
-			if (list_member_oid(seen, rte->relid))
-			{
-				needs_exclusion = true;		/* self-join */
-				break;
-			}
-			seen = lappend_oid(seen, rte->relid);
-		}
+		bool		needs_exclusion = false;
 
 		if (!needs_exclusion)
 			return NIL;
@@ -3477,6 +3459,52 @@ incr_append_from_join(StringInfo buf, Query *viewQuery,
 			incr_deparse_where_qual(je->quals, viewQuery->rtable, delta_varno, &jbuf);
 			appendStringInfo(buf, " JOIN %s _j%d_ ON (%s)",
 							 mv_qname(je->oid), je->varno, jbuf.data);
+		}
+	}
+}
+
+/*
+ * incr_append_self_delta_join
+ *
+ * Like incr_append_from_join, but renders the join partner(s) as the DELTA
+ * transition table too (not the live base table) — i.e. the delta self-joined
+ * to itself.  Used only by the self-join DELETE arm: when a whole join-key
+ * partition is removed, the group it formed no longer exists on the live side,
+ * so delta⋈live (both per-role arms) never produces that vanished group key.
+ * The rows that formed it are all in the delta, so delta⋈delta recovers the key
+ * and the DELETE-vanished reconciliation can then drop the stale matview row.
+ */
+static void
+incr_append_self_delta_join(StringInfo buf, Query *viewQuery,
+							int delta_varno,
+							const char *delta_table,
+							List *join_list)
+{
+	ListCell   *lc;
+
+	if (join_list == NIL)
+	{
+		appendStringInfo(buf, " FROM %s", delta_table);
+		return;
+	}
+
+	appendStringInfo(buf, " FROM %s %s", delta_table, INCR_DELTA_ALIAS);
+	foreach(lc, join_list)
+	{
+		IncrJoinEntry  *je = lfirst(lc);
+
+		if (je->quals == NULL)
+		{
+			appendStringInfo(buf, " CROSS JOIN %s _j%d_", delta_table, je->varno);
+		}
+		else
+		{
+			StringInfoData	jbuf;
+
+			initStringInfo(&jbuf);
+			incr_deparse_where_qual(je->quals, viewQuery->rtable, delta_varno, &jbuf);
+			appendStringInfo(buf, " JOIN %s _j%d_ ON (%s)",
+							 delta_table, je->varno, jbuf.data);
 		}
 	}
 }
@@ -6792,7 +6820,9 @@ incr_build_recompute_apply_sql(Oid mvrelid, Query *viewQuery, int delta_varno,
 	}
 	/* FROM the LIVE delta table [JOIN the other live tables] */
 	incr_append_from_join(&buf, viewQuery, delta_varno, livename, join_list);
-	appendStringInfoString(&buf, " WHERE (");
+	/* Restrict to the affected groups NULL-safely (IS NOT DISTINCT FROM, not IN),
+	 * so a NULL / partial-NULL group key is recomputed, not dropped. */
+	appendStringInfoString(&buf, " WHERE EXISTS (SELECT 1 FROM _aff_ WHERE ");
 	first = true;
 	foreach(lc, viewQuery->targetList)
 	{
@@ -6802,23 +6832,15 @@ incr_build_recompute_apply_sql(Oid mvrelid, Query *viewQuery, int delta_varno,
 		if (te->resjunk || !IsA(te->expr, Var))
 			continue;
 		if (!first)
-			appendStringInfoChar(&buf, ',');
+			appendStringInfoString(&buf, " AND ");
 		first = false;
 		initStringInfo(&ebuf);
 		incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable,
 								delta_varno, &ebuf);
-		appendStringInfoString(&buf, ebuf.data);
+		appendStringInfo(&buf, "%s IS NOT DISTINCT FROM _aff_.%s", ebuf.data,
+						 quote_identifier(te->resname));
 	}
-	appendStringInfoString(&buf, ") IN (SELECT ");
-	first = true;
-	foreach(gcl, groupColNames)
-	{
-		if (!first)
-			appendStringInfoChar(&buf, ',');
-		first = false;
-		appendStringInfoString(&buf, quote_identifier(strVal(lfirst(gcl))));
-	}
-	appendStringInfoString(&buf, " FROM _aff_)");
+	appendStringInfoChar(&buf, ')');
 	if (wq != NULL)
 	{
 		StringInfoData wbuf;
@@ -6873,7 +6895,7 @@ incr_build_recompute_apply_sql(Oid mvrelid, Query *viewQuery, int delta_varno,
 		if (!first)
 			appendStringInfoString(&buf, " AND ");
 		first = false;
-		appendStringInfo(&buf, "%s.%s=_rc_.%s", mvname, colq, colq);
+		appendStringInfo(&buf, "%s.%s IS NOT DISTINCT FROM _rc_.%s", mvname, colq, colq);
 	}
 	appendStringInfoString(&buf, " RETURNING ");
 	first = true;
@@ -6890,26 +6912,10 @@ incr_build_recompute_apply_sql(Oid mvrelid, Query *viewQuery, int delta_varno,
 
 	if (is_delete)
 	{
-		appendStringInfo(&buf, " DELETE FROM %s WHERE (", mvname);
-		first = true;
-		foreach(gcl, groupColNames)
-		{
-			if (!first)
-				appendStringInfoChar(&buf, ',');
-			first = false;
-			appendStringInfo(&buf, "%s.%s", mvname,
-							 quote_identifier(strVal(lfirst(gcl))));
-		}
-		appendStringInfoString(&buf, ") IN (SELECT ");
-		first = true;
-		foreach(gcl, groupColNames)
-		{
-			if (!first)
-				appendStringInfoChar(&buf, ',');
-			first = false;
-			appendStringInfoString(&buf, quote_identifier(strVal(lfirst(gcl))));
-		}
-		appendStringInfoString(&buf, " FROM _aff_) AND NOT EXISTS (SELECT 1 FROM _rc_ WHERE ");
+		/* affected groups (NULL-safe) that vanished from the recompute */
+		appendStringInfo(&buf,
+						 " DELETE FROM %s WHERE EXISTS (SELECT 1 FROM _aff_ WHERE ",
+						 mvname);
 		first = true;
 		foreach(gcl, groupColNames)
 		{
@@ -6918,7 +6924,18 @@ incr_build_recompute_apply_sql(Oid mvrelid, Query *viewQuery, int delta_varno,
 			if (!first)
 				appendStringInfoString(&buf, " AND ");
 			first = false;
-			appendStringInfo(&buf, "_rc_.%s=%s.%s", colq, mvname, colq);
+			appendStringInfo(&buf, "_aff_.%s IS NOT DISTINCT FROM %s.%s", colq, mvname, colq);
+		}
+		appendStringInfoString(&buf, ") AND NOT EXISTS (SELECT 1 FROM _rc_ WHERE ");
+		first = true;
+		foreach(gcl, groupColNames)
+		{
+			const char *colq = quote_identifier(strVal(lfirst(gcl)));
+
+			if (!first)
+				appendStringInfoString(&buf, " AND ");
+			first = false;
+			appendStringInfo(&buf, "_rc_.%s IS NOT DISTINCT FROM %s.%s", colq, mvname, colq);
 		}
 		appendStringInfoString(&buf, ")");
 	}
@@ -6959,7 +6976,7 @@ incr_build_recompute_apply_sql(Oid mvrelid, Query *viewQuery, int delta_varno,
 			if (!first)
 				appendStringInfoString(&buf, " AND ");
 			first = false;
-			appendStringInfo(&buf, "_upd_.%s=_rc_.%s", colq, colq);
+			appendStringInfo(&buf, "_upd_.%s IS NOT DISTINCT FROM _rc_.%s", colq, colq);
 		}
 		appendStringInfoString(&buf, ")");
 	}
@@ -7066,6 +7083,44 @@ incr_build_self_join_agg_apply_sql(Oid mvrelid, Query *viewQuery,
 			appendStringInfo(&buf, " WHERE %s", wbuf.data);
 		}
 	}
+
+	/*
+	 * Third arm (DELETE only): group keys formed entirely among delta rows.
+	 * When a whole join-key partition is removed, the per-role delta⋈live arms
+	 * above miss the group it formed (its live join partner is gone too), so the
+	 * DELETE-vanished arm would leave a stale matview row behind.  delta⋈delta
+	 * recovers that vanished key.  Inserts don't need this: the new rows are
+	 * already live, so the delta⋈live arms already cover delta⋈delta for them.
+	 */
+	if (is_delete)
+	{
+		appendStringInfoString(&buf, " UNION SELECT ");
+		first = true;
+		foreach(lc, viewQuery->targetList)
+		{
+			TargetEntry    *te = lfirst_node(TargetEntry, lc);
+			StringInfoData	ebuf;
+
+			if (te->resjunk || !IsA(te->expr, Var))
+				continue;
+			if (!first)
+				appendStringInfoChar(&buf, ',');
+			first = false;
+			initStringInfo(&ebuf);
+			incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable, v1, &ebuf);
+			appendStringInfo(&buf, "%s AS %s", ebuf.data,
+							 quote_identifier(te->resname));
+		}
+		incr_append_self_delta_join(&buf, viewQuery, v1, delta_table, jl1);
+		if (wq != NULL)
+		{
+			StringInfoData wbuf;
+
+			initStringInfo(&wbuf);
+			incr_deparse_where_qual(wq, viewQuery->rtable, v1, &wbuf);
+			appendStringInfo(&buf, " WHERE %s", wbuf.data);
+		}
+	}
 	appendStringInfoString(&buf, "),");
 
 	/* ---- _rc_: full recompute of the affected groups over the LIVE join ---- */
@@ -7119,8 +7174,8 @@ incr_build_self_join_agg_apply_sql(Oid mvrelid, Query *viewQuery,
 	}
 	/* FROM the live self-join (delta_table replaced by the live table name) */
 	incr_append_from_join(&buf, viewQuery, v1, livename, jl1);
-	/* WHERE (keys) IN (SELECT keys FROM _aff_) [AND view WHERE] */
-	appendStringInfoString(&buf, " WHERE (");
+	/* WHERE (keys) match _aff_ NULL-safely [AND view WHERE] */
+	appendStringInfoString(&buf, " WHERE EXISTS (SELECT 1 FROM _aff_ WHERE ");
 	first = true;
 	foreach(lc, viewQuery->targetList)
 	{
@@ -7130,22 +7185,14 @@ incr_build_self_join_agg_apply_sql(Oid mvrelid, Query *viewQuery,
 		if (te->resjunk || !IsA(te->expr, Var))
 			continue;
 		if (!first)
-			appendStringInfoChar(&buf, ',');
+			appendStringInfoString(&buf, " AND ");
 		first = false;
 		initStringInfo(&ebuf);
 		incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable, v1, &ebuf);
-		appendStringInfoString(&buf, ebuf.data);
+		appendStringInfo(&buf, "%s IS NOT DISTINCT FROM _aff_.%s", ebuf.data,
+						 quote_identifier(te->resname));
 	}
-	appendStringInfoString(&buf, ") IN (SELECT ");
-	first = true;
-	foreach(gcl, groupColNames)
-	{
-		if (!first)
-			appendStringInfoChar(&buf, ',');
-		first = false;
-		appendStringInfoString(&buf, quote_identifier(strVal(lfirst(gcl))));
-	}
-	appendStringInfoString(&buf, " FROM _aff_)");
+	appendStringInfoChar(&buf, ')');
 	if (wq != NULL)
 	{
 		StringInfoData wbuf;
@@ -7199,7 +7246,7 @@ incr_build_self_join_agg_apply_sql(Oid mvrelid, Query *viewQuery,
 		if (!first)
 			appendStringInfoString(&buf, " AND ");
 		first = false;
-		appendStringInfo(&buf, "%s.%s=_rc_.%s", mvname, colq, colq);
+		appendStringInfo(&buf, "%s.%s IS NOT DISTINCT FROM _rc_.%s", mvname, colq, colq);
 	}
 	appendStringInfoString(&buf, " RETURNING ");
 	first = true;
@@ -7216,26 +7263,10 @@ incr_build_self_join_agg_apply_sql(Oid mvrelid, Query *viewQuery,
 
 	if (is_delete)
 	{
-		/* groups affected but absent from the recompute have vanished */
-		appendStringInfo(&buf, " DELETE FROM %s WHERE (", mvname);
-		first = true;
-		foreach(gcl, groupColNames)
-		{
-			if (!first)
-				appendStringInfoChar(&buf, ',');
-			first = false;
-			appendStringInfo(&buf, "%s.%s", mvname, quote_identifier(strVal(lfirst(gcl))));
-		}
-		appendStringInfoString(&buf, ") IN (SELECT ");
-		first = true;
-		foreach(gcl, groupColNames)
-		{
-			if (!first)
-				appendStringInfoChar(&buf, ',');
-			first = false;
-			appendStringInfoString(&buf, quote_identifier(strVal(lfirst(gcl))));
-		}
-		appendStringInfoString(&buf, " FROM _aff_) AND NOT EXISTS (SELECT 1 FROM _rc_ WHERE ");
+		/* groups affected but absent from the recompute have vanished (NULL-safe) */
+		appendStringInfo(&buf,
+						 " DELETE FROM %s WHERE EXISTS (SELECT 1 FROM _aff_ WHERE ",
+						 mvname);
 		first = true;
 		foreach(gcl, groupColNames)
 		{
@@ -7244,7 +7275,18 @@ incr_build_self_join_agg_apply_sql(Oid mvrelid, Query *viewQuery,
 			if (!first)
 				appendStringInfoString(&buf, " AND ");
 			first = false;
-			appendStringInfo(&buf, "_rc_.%s=%s.%s", colq, mvname, colq);
+			appendStringInfo(&buf, "_aff_.%s IS NOT DISTINCT FROM %s.%s", colq, mvname, colq);
+		}
+		appendStringInfoString(&buf, ") AND NOT EXISTS (SELECT 1 FROM _rc_ WHERE ");
+		first = true;
+		foreach(gcl, groupColNames)
+		{
+			const char *colq = quote_identifier(strVal(lfirst(gcl)));
+
+			if (!first)
+				appendStringInfoString(&buf, " AND ");
+			first = false;
+			appendStringInfo(&buf, "_rc_.%s IS NOT DISTINCT FROM %s.%s", colq, mvname, colq);
 		}
 		appendStringInfoString(&buf, ")");
 	}
@@ -7286,7 +7328,7 @@ incr_build_self_join_agg_apply_sql(Oid mvrelid, Query *viewQuery,
 			if (!first)
 				appendStringInfoString(&buf, " AND ");
 			first = false;
-			appendStringInfo(&buf, "_upd_.%s=_rc_.%s", colq, colq);
+			appendStringInfo(&buf, "_upd_.%s IS NOT DISTINCT FROM _rc_.%s", colq, colq);
 		}
 		appendStringInfoString(&buf, ")");
 	}

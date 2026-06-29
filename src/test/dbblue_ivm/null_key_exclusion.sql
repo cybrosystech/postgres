@@ -1,15 +1,13 @@
 -- DBblue IVM — NULL group-key fidelity (writes are never blocked).
 --
 -- NULL (and partial-NULL, for multi-column keys) group keys are MAINTAINED with
--- full fidelity for the shared-shell shapes (single-table and INNER JOIN
--- aggregates, DISTINCT, HAVING) AND for MIN/MAX.  This works via a NULLS NOT
--- DISTINCT unique index (so a NULL key is one ON CONFLICT arbiter row) plus
--- IS NOT DISTINCT FROM delta key joins (MIN/MAX matches its rescan/affected keys
--- the same way), so the matview equals a full REFRESH including the NULL group.
---
--- Only self-joins still EXCLUDE NULL keys (their recompute path matches keys with
--- =/IN, which NULLs break) — the source write still always succeeds; those rows
--- are simply left out of the matview.
+-- full fidelity for EVERY supported shape: the shared-shell additive ones
+-- (single-table / INNER JOIN / full-DISTINCT / HAVING), MIN/MAX, the recompute
+-- path (DISTINCT / stddev / bool), and self-joins.  This works via a NULLS NOT
+-- DISTINCT unique index (a NULL key is one arbiter row) plus IS NOT DISTINCT FROM
+-- key matching in every delta/rescan/recompute builder, so the matview equals a
+-- full REFRESH including the NULL group.  Nothing is excluded; writes are never
+-- blocked.
 \set ON_ERROR_STOP on
 \echo ''
 \echo '=== DBblue IVM: NULL group-key fidelity ==='
@@ -80,11 +78,10 @@ BEGIN
 END $$;
 DROP MATERIALIZED VIEW nm_mv; DROP TABLE nm CASCADE;
 
--- 3) MIN/MAX: NULL keys are now MAINTAINED with full fidelity (== REFRESH), not
---    excluded — the rescan/delta builders match keys NULL-safely (IS NOT DISTINCT
---    FROM), and the INSERT ON CONFLICT uses the NULLS NOT DISTINCT index.  Covers
---    the rescan path: removing the NULL group's extremum, and a key moving
---    to/from NULL.  (Self-joins still exclude — separate.)
+-- 3) MIN/MAX: NULL keys are MAINTAINED with full fidelity (== REFRESH) — the
+--    rescan/delta builders match keys NULL-safely (IS NOT DISTINCT FROM) and the
+--    INSERT ON CONFLICT uses the NULLS NOT DISTINCT index.  Covers the rescan
+--    path: removing the NULL group's extremum, and a key moving to/from NULL.
 DROP TABLE IF EXISTS mmx CASCADE;
 CREATE TABLE mmx(id serial PRIMARY KEY, g int, v numeric);
 INSERT INTO mmx(g,v) VALUES (1,5),(NULL,9),(NULL,99);
@@ -122,5 +119,43 @@ DO $$ DECLARE mm int; BEGIN
   IF mm=0 THEN RAISE NOTICE 'NOT NULL key matview: PASS'; ELSE RAISE EXCEPTION 'NOT NULL key: FAIL'; END IF;
 END $$;
 DROP MATERIALIZED VIEW nn_mv; DROP TABLE nn CASCADE;
+
+-- 5) Recompute path (COUNT(DISTINCT)) and self-join now also keep the NULL group
+--    (the recompute builders match keys with IS NOT DISTINCT FROM).  == REFRESH.
+DROP TABLE IF EXISTS rc CASCADE;
+CREATE TABLE rc(id serial PRIMARY KEY, g int, v int);
+INSERT INTO rc(g,v) VALUES (1,10),(1,10),(NULL,5),(NULL,5),(NULL,9);
+CREATE MATERIALIZED VIEW rc_mv WITH (incremental_refresh=true) AS
+  SELECT g, COUNT(DISTINCT v) dv, COUNT(*) c FROM rc GROUP BY g WITH DATA;
+CREATE MATERIALIZED VIEW rc_ora AS
+  SELECT g, COUNT(DISTINCT v) dv, COUNT(*) c FROM rc GROUP BY g WITH DATA;
+INSERT INTO rc(g,v) VALUES (NULL,20); DELETE FROM rc WHERE g IS NULL AND v=5; UPDATE rc SET g=NULL WHERE id=1;
+REFRESH MATERIALIZED VIEW rc_ora;
+DO $$ DECLARE nr int; mm int; BEGIN
+  SELECT count(*) INTO nr FROM rc_mv WHERE g IS NULL;
+  SELECT count(*) INTO mm FROM ((SELECT g,dv,c FROM rc_mv EXCEPT SELECT g,dv,c FROM rc_ora)
+    UNION ALL (SELECT g,dv,c FROM rc_ora EXCEPT SELECT g,dv,c FROM rc_mv)) d;
+  IF nr=1 AND mm=0 THEN RAISE NOTICE 'recompute (COUNT DISTINCT) maintains NULL group == REFRESH: PASS';
+  ELSE RAISE EXCEPTION 'recompute NULL key: FAIL (nullrows=%, diff=%)', nr, mm; END IF;
+END $$;
+DROP MATERIALIZED VIEW rc_mv; DROP MATERIALIZED VIEW rc_ora; DROP TABLE rc CASCADE;
+
+DROP TABLE IF EXISTS sj CASCADE;
+CREATE TABLE sj(id serial PRIMARY KEY, mgr int, dept int, sal int);
+INSERT INTO sj(mgr,dept,sal) VALUES (1,NULL,10),(1,NULL,20),(2,5,30);
+CREATE MATERIALIZED VIEW sj_mv WITH (incremental_refresh=true) AS
+  SELECT m.dept, COUNT(*) c, SUM(e.sal) s FROM sj e JOIN sj m ON e.mgr=m.id GROUP BY m.dept WITH DATA;
+CREATE MATERIALIZED VIEW sj_ora AS
+  SELECT m.dept, COUNT(*) c, SUM(e.sal) s FROM sj e JOIN sj m ON e.mgr=m.id GROUP BY m.dept WITH DATA;
+INSERT INTO sj(mgr,dept,sal) VALUES (1,NULL,40); DELETE FROM sj WHERE sal=10;
+REFRESH MATERIALIZED VIEW sj_ora;
+DO $$ DECLARE nr int; mm int; BEGIN
+  SELECT count(*) INTO nr FROM sj_mv WHERE dept IS NULL;
+  SELECT count(*) INTO mm FROM ((SELECT dept,c,s FROM sj_mv EXCEPT SELECT dept,c,s FROM sj_ora)
+    UNION ALL (SELECT dept,c,s FROM sj_ora EXCEPT SELECT dept,c,s FROM sj_mv)) d;
+  IF nr=1 AND mm=0 THEN RAISE NOTICE 'self-join maintains NULL group == REFRESH: PASS';
+  ELSE RAISE EXCEPTION 'self-join NULL key: FAIL (nullrows=%, diff=%)', nr, mm; END IF;
+END $$;
+DROP MATERIALIZED VIEW sj_mv; DROP MATERIALIZED VIEW sj_ora; DROP TABLE sj CASCADE;
 \echo ''
 \echo '=== NULL group-key fidelity test complete ==='

@@ -19,7 +19,6 @@ suite in `src/test/dbblue_ivm/` and the adversarial concurrency battery.
 | ✅ **Proven** | Tested for correctness *and* concurrency (adversarial battery) and/or in production (Odoo, 266K rows); dump/restore verified. Rely on it. |
 | 🟡 **Proven, serialized** | Same correctness + concurrency guarantees as ✅ — consistent with a full `REFRESH` at every isolation level — but maintenance of this matview **serializes** under concurrent writes (it takes a matview-level lock; emits a `NOTICE` at `CREATE`). A throughput consideration, **not** a correctness caveat. |
 | ⛔ **Rejected (loud)** | Refused at `CREATE` with a clear, actionable error. Never silently wrong. |
-| 🔒 **Guarded** | Allowed, but a runtime guard raises a clear error if an unsupported *data* condition occurs (e.g. a NULL group key). No silent corruption. |
 
 ---
 
@@ -33,7 +32,7 @@ suite in `src/test/dbblue_ivm/` and the adversarial concurrency battery.
 | `GROUP BY` on an **expression** | e.g. `date_trunc('month', d)`, `(amt % 10)`, `CASE …`; must be IMMUTABLE and appear in the SELECT list. Maintained by the deparse core; single-table or INNER JOIN, no MIN/MAX/self-join |
 | `SUM`, `COUNT(*)`, `COUNT(col)`, `AVG` | numeric / integer; AVG kept as a (sum,count) pair |
 | `agg(...) FILTER (WHERE c)` | `SUM`/`COUNT`/`AVG` only; rewritten to `agg(CASE WHEN c THEN … END)` and maintained by the deparse core (MIN/MAX FILTER not supported) |
-| `COUNT(DISTINCT x)`, `SUM(DISTINCT x)`, … | single-table **or INNER JOIN**; maintained by recomputing each affected group from the live table(s) (serialized on the matview lock; NULL keys excluded). Not yet with HAVING, self-join, or outer join |
+| `COUNT(DISTINCT x)`, `SUM(DISTINCT x)`, … | single-table **or INNER JOIN**; maintained by recomputing each affected group from the live table(s) (serialized on the matview lock; **NULL group keys maintained** with full fidelity). Not yet with HAVING or outer join |
 | `STDDEV`/`VARIANCE` family, `BOOL_AND`/`BOOL_OR` | single-table or INNER JOIN; same recompute path as DISTINCT |
 | **`CASE` / `COALESCE` / arithmetic** aggregate arguments | supported in **every** shape — additive (deparse), MIN/MAX, HAVING, self-join, outer join, DISTINCT, stddev/bool — as long as the expression is IMMUTABLE |
 | `MIN`, `MAX` | delete-rescan, serialized on the matview-level lock (see 🟡 below); N-table joins OK |
@@ -107,18 +106,18 @@ A `NOTICE` (not a `WARNING`) fires at `CREATE` for these:
 
 ## 4. Data requirements & boundaries
 
-- **NULL group keys — full fidelity (incl. MIN/MAX); only self-join excludes.**
+- **NULL group keys — full fidelity, every shape (no exclusions).**
   A NULL (or partial-NULL, multi-column) GROUP BY/DISTINCT key is **maintained
   with full fidelity** — the incremental matview keeps the NULL group exactly like
-  a normal matview — for the additive shapes (single-table / INNER JOIN / DISTINCT
-  / HAVING) **and for MIN/MAX**, via a `NULLS NOT DISTINCT` unique index plus
-  `IS NOT DISTINCT FROM` delta/rescan key matching. Verified `== REFRESH` in
-  `null_key_exclusion.sql`.
-  **Residual (self-join only):** a self-join matview still **auto-excludes** NULL
-  keys — its recompute path matches keys with `=`/`IN` — so at `CREATE` the engine
-  injects `<key> IS NOT NULL` for every *nullable* key and emits a `NOTICE`. The
-  source write always succeeds; the matview omits the NULL group but stays
-  consistent with its own `REFRESH`. Bounded and announced at `CREATE`.
+  a normal matview — across **all** supported shapes: the additive ones
+  (single-table / INNER JOIN / HAVING), **MIN/MAX**, the recompute aggregates
+  (`COUNT(DISTINCT)` / `STDDEV`/`VARIANCE` / `BOOL_AND`/`BOOL_OR`), **and
+  self-joins**. The mechanism is uniform: a `NULLS NOT DISTINCT` unique index plus
+  `IS NOT DISTINCT FROM` (and `EXISTS`-based) delta/rescan key matching — no `=`/`IN`
+  key predicate anywhere, so no group is ever silently dropped. Verified
+  `== REFRESH` (incl. recompute and self-join NULL groups) in
+  `null_key_exclusion.sql`. No `NOTICE`/`<key> IS NOT NULL` injection is emitted any
+  more; the engine no longer excludes NULL keys for any shape.
 - **HAVING matviews must be created `WITH DATA`** (a `WARNING` is emitted
   otherwise). A HAVING matview is stored as a user-facing view over a hidden
   `_dbblue_<oid>_base` matview, so a **full-database** `pg_dump`/restore works
@@ -188,7 +187,7 @@ The `pg_dbblue_matview` catalog, AFTER-STATEMENT/ENR trigger mechanism + plan
 cache, `__mv_count__` counting, AVG-as-(sum,count), the matview-level
 serialization lock for recompute/multiset shapes, and all lifecycle work
 (dump/restore, TRUNCATE, teardown, DDL guards,
-float rejection, NULL-key guard). These are sound; the new delta core plugs in.
+float rejection). These are sound; the new delta core plugs in.
 
 ### What Phase 2 unlocks (nearly free once the `Query`-tree path exists)
 `SUM(CASE WHEN … )`, `COALESCE`, arbitrary scalar expressions in SELECT/WHERE,
@@ -223,11 +222,11 @@ Prioritized by value for Odoo reporting:
    args work in every aggregate shape** (additive, MIN/MAX, HAVING, self-join,
    outer join, DISTINCT, stddev/bool). Remaining: DISTINCT with HAVING /
    self-join / outer join.
-6. **Full NULL-group fidelity (match a normal matview)** — `NULLS NOT DISTINCT`
-   index + `IS NOT DISTINCT FROM` predicates, so the NULL group is *kept and
-   maintained* instead of auto-excluded. Delivered as part of Phase 2 (the
-   `Query`-tree path makes the NULL handling uniform). Until then, incremental
-   matviews exclude the NULL group (writes never blocked, self-consistent).
+6. ✅ **Done — full NULL-group fidelity (match a normal matview), every shape** —
+   `NULLS NOT DISTINCT` index + `IS NOT DISTINCT FROM` / `EXISTS` predicates, so the
+   NULL group is *kept and maintained* across all shapes including the recompute
+   aggregates and self-joins. No shape excludes NULL keys any more; no `IS NOT NULL`
+   injection or `NOTICE`. Verified `== REFRESH` in `null_key_exclusion.sql`.
 7. **Exact all-NULL `SUM` semantics** — per-column non-null counter.
 8. *(Optional)* **automatic subquery→join rewrite** for WHERE/SELECT sublinks.
 
