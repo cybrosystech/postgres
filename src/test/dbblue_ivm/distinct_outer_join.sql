@@ -153,26 +153,72 @@ DO $$DECLARE d int; BEGIN
   ELSE RAISE EXCEPTION 'NULL preserved-key: FAIL (% diff)', d; END IF; END$$;
 DROP TABLE nd, nf CASCADE;
 
--- 7. Out-of-scope outer-join shapes are rejected cleanly (never silently wrong).
+-- 7. 3-table INNER+LEFT: COUNT(DISTINCT) on optional side, GROUP BY preserved key.
+--    Deleting from the INNER-joined dimension (t3r) must vanish the affected groups;
+--    deleting from the optional side (t3c) updates the distinct count.
 DROP TABLE IF EXISTS t3p, t3r, t3c CASCADE;
 CREATE TABLE t3p(id int primary key, rid int, g int);
 CREATE TABLE t3r(id int primary key, rg text);
 CREATE TABLE t3c(id int primary key, pid int, v int);
+INSERT INTO t3r VALUES (1,'A'),(2,'B'),(3,'C');
+INSERT INTO t3p VALUES (1,1,10),(2,1,10),(3,2,20),(4,3,30);
+INSERT INTO t3c VALUES (1,1,5),(2,1,5),(3,1,7),(4,2,9),(5,2,9);
+CREATE MATERIALIZED VIEW t3_i WITH (incremental_refresh=true) AS
+  SELECT p.g, count(DISTINCT c.v) dv FROM t3p p JOIN t3r r ON p.rid=r.id
+  LEFT JOIN t3c c ON c.pid=p.id GROUP BY p.g;
+CREATE MATERIALIZED VIEW t3_o AS
+  SELECT p.g, count(DISTINCT c.v) dv FROM t3p p JOIN t3r r ON p.rid=r.id
+  LEFT JOIN t3c c ON c.pid=p.id GROUP BY p.g;
+-- optional-side changes
+INSERT INTO t3c VALUES (6,1,99),(7,3,1);
+DELETE FROM t3c WHERE v=9;
+-- inner-dim delete: delete r row 3 → p row 4 (g=30) loses its r match → group must vanish
+DELETE FROM t3r WHERE id=3;
+REFRESH MATERIALIZED VIEW t3_o;
+DO $$DECLARE d int; BEGIN
+  SELECT count(*) INTO d FROM ((SELECT g,dv FROM t3_i EXCEPT SELECT g,dv FROM t3_o)
+    UNION ALL (SELECT g,dv FROM t3_o EXCEPT SELECT g,dv FROM t3_i)) z;
+  IF d=0 THEN RAISE NOTICE '3-table INNER+LEFT COUNT(DISTINCT) == REFRESH: PASS';
+  ELSE RAISE EXCEPTION '3-table INNER+LEFT COUNT(DISTINCT): FAIL (% diff)', d; END IF;
+END$$;
+DROP TABLE t3p, t3r, t3c CASCADE;
+
+-- 8. 3-table INNER+LEFT: stddev on optional side + GROUP BY inner-dim key.
+DROP TABLE IF EXISTS s3p, s3r, s3f CASCADE;
+CREATE TABLE s3p(id int primary key, rid int);
+CREATE TABLE s3r(id int primary key, lbl text);
+CREATE TABLE s3f(id serial primary key, pid int, val numeric);
+INSERT INTO s3r VALUES (1,'X'),(2,'Y'),(3,'Z');
+INSERT INTO s3p VALUES (1,1),(2,1),(3,2),(4,3);
+INSERT INTO s3f(pid,val) VALUES (1,10),(1,20),(1,30),(3,5),(3,5);
+CREATE MATERIALIZED VIEW s3_i WITH (incremental_refresh=true) AS
+  SELECT r.lbl, stddev(f.val) sv, count(f.id) c
+  FROM s3p p JOIN s3r r ON p.rid=r.id LEFT JOIN s3f f ON f.pid=p.id GROUP BY r.lbl;
+CREATE MATERIALIZED VIEW s3_o AS
+  SELECT r.lbl, stddev(f.val) sv, count(f.id) c
+  FROM s3p p JOIN s3r r ON p.rid=r.id LEFT JOIN s3f f ON f.pid=p.id GROUP BY r.lbl;
+INSERT INTO s3f(pid,val) VALUES (2,100),(4,50);
+DELETE FROM s3f WHERE pid=1 AND val=30;
+-- delete inner-dim r row 3 → p row 4 loses its r match → group Z must vanish
+DELETE FROM s3r WHERE id=3;
+REFRESH MATERIALIZED VIEW s3_o;
+DO $$DECLARE d int; BEGIN
+  SELECT count(*) INTO d FROM ((SELECT lbl,sv,c FROM s3_i EXCEPT SELECT lbl,sv,c FROM s3_o)
+    UNION ALL (SELECT lbl,sv,c FROM s3_o EXCEPT SELECT lbl,sv,c FROM s3_i)) z;
+  IF d=0 THEN RAISE NOTICE '3-table INNER+LEFT stddev (GROUP BY inner key) == REFRESH: PASS';
+  ELSE RAISE EXCEPTION '3-table INNER+LEFT stddev: FAIL (% diff)', d; END IF;
+END$$;
+DROP TABLE s3p, s3r, s3f CASCADE;
+
+-- 9. Out-of-scope shapes still rejected cleanly.
+DROP TABLE IF EXISTS t3p, t3c CASCADE;
+CREATE TABLE t3p(id int primary key, g int);
+CREATE TABLE t3c(id int primary key, pid int, v int);
 DO $$
 DECLARE made bool;
 BEGIN
-  -- 3-table INNER+LEFT mix with a recompute aggregate over the optional side
-  BEGIN
-    made := false;
-    CREATE MATERIALIZED VIEW _t3 WITH (incremental_refresh=true) AS
-      SELECT p.g, count(DISTINCT c.v) dv FROM t3p p JOIN t3r r ON p.rid=r.id
-      LEFT JOIN t3c c ON c.pid=p.id GROUP BY p.g;
-    made := true;
-  EXCEPTION WHEN feature_not_supported THEN NULL; END;
-  IF made THEN RAISE EXCEPTION '3-table INNER+LEFT DISTINCT: FAIL (accepted)';
-  ELSE RAISE NOTICE '3-table INNER+LEFT DISTINCT: PASS (rejected cleanly)'; END IF;
-
-  -- group key on the OPTIONAL (non-preserved) side
+  -- group key on the OPTIONAL (non-preserved) side: rejected because a DELETE on
+  -- the optional side can create new NULL groups not captured by the delta path
   BEGIN
     made := false;
     CREATE MATERIALIZED VIEW _t3 WITH (incremental_refresh=true) AS
@@ -182,7 +228,7 @@ BEGIN
   IF made THEN RAISE EXCEPTION 'optional-side group key DISTINCT: FAIL (accepted)';
   ELSE RAISE NOTICE 'optional-side group-key DISTINCT: PASS (rejected cleanly)'; END IF;
 END$$;
-DROP TABLE t3p, t3r, t3c CASCADE;
+DROP TABLE t3p, t3c CASCADE;
 
 \echo ''
 \echo '=== DISTINCT / stddev over OUTER join test complete ==='
