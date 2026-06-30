@@ -836,11 +836,11 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 				 */
 				if (!(nbasetables == 1 ||
 					  incr_inner_join_deparse_shape(viewQuery, nbasetables)) ||
-					agg->aggorder != NIL || viewQuery->havingQual != NULL)
+					agg->aggorder != NIL)
 				{
 					*reason = psprintf("incremental %s(DISTINCT ...) is supported "
 									   "only over a single table or INNER JOIN, "
-									   "without HAVING or ordered-set aggregates "
+									   "without ordered-set aggregates "
 									   "(not self-joins or outer joins)", fname);
 					return false;
 				}
@@ -920,10 +920,10 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 				 * shared grammar (incr_deparse_where_qual). */
 				if (!(nbasetables == 1 ||
 					  incr_inner_join_deparse_shape(viewQuery, nbasetables)) ||
-					agg->aggorder != NIL || viewQuery->havingQual != NULL)
+					agg->aggorder != NIL)
 				{
 					*reason = psprintf("incremental %s() is supported only over a "
-								   "single table or INNER JOIN, without HAVING or "
+								   "single table or INNER JOIN, without "
 								   "ordered-set aggregates", fname);
 					return false;
 				}
@@ -4641,7 +4641,12 @@ incr_build_backfill_sql_gen(Oid mvrelid, Query *viewQuery,
 				initStringInfo(&ebuf);
 				incr_deparse_where_qual((Node *) arg_te->expr, viewQuery->rtable,
 										delta_varno, &ebuf);
-				appendStringInfo(&buf, "%s(%s)", fname, ebuf.data);
+				/* Render DISTINCT so a failing COUNT(DISTINCT ...) group is seeded
+				 * with its true value — otherwise hav_sql could later mark it
+				 * visible from a wrong (non-distinct) count. */
+				appendStringInfo(&buf, "%s(%s%s)", fname,
+								 agg->aggdistinct != NIL ? "DISTINCT " : "",
+								 ebuf.data);
 			}
 			else
 				appendStringInfo(&buf, "%s(*)", fname);

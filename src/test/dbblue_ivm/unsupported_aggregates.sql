@@ -3,9 +3,11 @@
 -- These shapes cannot be maintained by the per-row delta and must be refused
 -- at CREATE time with a clear error (never accepted-but-maintained-wrong, and
 -- never an internal elog):
---   * COUNT(DISTINCT x) + HAVING     — single-table DISTINCT is supported via the
---                                      recompute path (distinct_aggregates.sql),
---                                      but not yet with HAVING or over a join
+--   * COUNT(DISTINCT x) over a SELF-JOIN — single-table / INNER JOIN / outer-join
+--                                      DISTINCT is supported (recompute path), and
+--                                      DISTINCT + HAVING is supported, but the
+--                                      self-join combined-role builder doesn't do
+--                                      DISTINCT recompute, so it stays rejected
 --   * MIN/MAX (...) FILTER (WHERE …) — hand MIN/MAX builder can't render the
 --                                      CASE the filter rewrites to (SUM/COUNT/AVG
 --                                      FILTER *are* supported — see filter_aggregates.sql)
@@ -34,10 +36,11 @@ END $$;
 
 DO $$
 BEGIN
-  -- must be REJECTED.  Single-table COUNT(DISTINCT) is now supported (recompute
-  -- path, see distinct_aggregates.sql); DISTINCT with HAVING is still rejected.
-  IF _try('CREATE MATERIALIZED VIEW _m WITH (incremental_refresh=true) AS SELECT p, COUNT(DISTINCT mt) c FROM uagg GROUP BY p HAVING COUNT(DISTINCT mt) > 0 WITH DATA')
-     THEN RAISE EXCEPTION 'COUNT(DISTINCT)+HAVING: FAIL (accepted)'; ELSE RAISE NOTICE 'COUNT(DISTINCT)+HAVING: PASS (rejected)'; END IF;
+  -- must be REJECTED.  Single-table / INNER JOIN / outer-join COUNT(DISTINCT) and
+  -- DISTINCT+HAVING are now supported (recompute path, see distinct_aggregates.sql,
+  -- distinct_having.sql, distinct_outer_join.sql); DISTINCT over a SELF-JOIN is not.
+  IF _try('CREATE MATERIALIZED VIEW _m WITH (incremental_refresh=true) AS SELECT a.p, COUNT(DISTINCT a.mt) c FROM uagg a JOIN uagg b ON a.p=b.p GROUP BY a.p WITH DATA')
+     THEN RAISE EXCEPTION 'COUNT(DISTINCT) over self-join: FAIL (accepted)'; ELSE RAISE NOTICE 'COUNT(DISTINCT) over self-join: PASS (rejected)'; END IF;
 
   -- MIN/MAX FILTER stays unsupported (hand builder can't render the CASE the
   -- filter rewrites to); SUM/COUNT/AVG FILTER are supported (filter_aggregates.sql).
