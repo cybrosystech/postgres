@@ -153,6 +153,13 @@ extern void index_build(Relation heapRelation,
 						bool parallel,
 						bool progress);
 
+/* Backfill a newly-attached partition's rows into the parent's global indexes */
+extern void IndexGlobalAttachPartition(Relation parentRel, Relation partRel);
+/* Purge a detached/dropped partition's entries from the parent's global indexes */
+extern void IndexGlobalDetachPartition(Relation parentRel, Relation partRel);
+/* Resync a partition's global-index entries after its heap was rewritten */
+extern void IndexGlobalResyncPartition(Relation partRel);
+
 extern void validate_index(Oid heapId, Oid indexId, Snapshot snapshot);
 
 extern void index_set_state_flags(Oid indexId, IndexStateFlagsAction action);

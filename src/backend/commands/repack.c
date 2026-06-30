@@ -672,6 +672,21 @@ cluster_rel(RepackCommand cmd, Relation OldHeap, Oid indexOid,
 
 	/* rebuild_relation closes OldHeap, and index if valid */
 
+	/*
+	 * A heap rewrite assigns new TIDs to every row, so any global partition
+	 * index on this partition's parent now holds stale entries pointing at the
+	 * old TIDs.  Resync them: the table (tableOid) has just been rewritten and
+	 * is still locked.  (Early "goto out" paths never reached rebuild_relation,
+	 * so they correctly skip this; non-partition relations are a no-op.)
+	 */
+	{
+		Relation	newrel = table_open(tableOid, NoLock);
+
+		if (newrel->rd_rel->relispartition)
+			IndexGlobalResyncPartition(newrel);
+		table_close(newrel, NoLock);
+	}
+
 out:
 	/* Roll back any GUC changes executed by index functions */
 	AtEOXact_GUC(false, save_nestlevel);

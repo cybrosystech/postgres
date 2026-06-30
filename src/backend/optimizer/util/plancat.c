@@ -468,15 +468,28 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 			info->indglobal = index->indglobal;
 
 			/*
-			 * Global partition indexes always require a heap fetch to retrieve
-			 * the actual row from the correct child partition.  Index Only Scan
-			 * is therefore never safe for them — mark every column as not
-			 * returnable so the planner never generates an IOS path.
+			 * Global partition indexes only support the *serial* Index Scan
+			 * path, which routes each TID to the owning child partition and
+			 * fetches from that partition's heap (see nodeIndexscan.c).  The
+			 * other scan flavours operate on the partitioned parent, which has
+			 * no table AM / storage of its own, so they crash:
+			 *
+			 *  - Index Only Scan / parallel Index Scan dereference the parent's
+			 *    NULL rd_tableam in table_index_fetch_begin();
+			 *  - mark/restore is not implemented for the per-partition fetch
+			 *    state.
+			 *
+			 * Disable all of those here so the planner never generates them.
+			 * (canreturn=false alone is insufficient: a count(*)-style query
+			 * needs zero columns and would still get an IOS path; that case is
+			 * blocked in check_index_only().)
 			 */
 			if (index->indglobal)
 			{
 				for (int gi = 0; gi < info->ncolumns; gi++)
 					info->canreturn[gi] = false;
+				info->amcanparallel = false;
+				info->amcanmarkpos = false;
 			}
 
 			/*

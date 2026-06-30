@@ -61,6 +61,7 @@ typedef struct GIPartBounds
 	Datum		upper;			/* upper bound value (if !upperIsMax) */
 	bool		lowerIsMin;		/* lower bound is MINVALUE */
 	bool		upperIsMax;		/* upper bound is MAXVALUE */
+	bool		isDefault;		/* DEFAULT partition: catch-all, no range */
 } GIPartBounds;
 
 /*
@@ -115,11 +116,23 @@ static HeapTuple reorderqueue_pop(IndexScanState *node);
 static int
 GlobalIndexFindPartition(GlobalIndexPartState *gps, Datum pkVal)
 {
+	int			defaultIdx = -1;
+
 	for (int i = 0; i < gps->nparts; i++)
 	{
 		GIPartBounds *b = &gps->bounds[i];
 		bool		lower_ok,
 					upper_ok;
+
+		/*
+		 * The DEFAULT partition has no range; remember it and use it as the
+		 * fallback if no explicit range matches this key.
+		 */
+		if (b->isDefault)
+		{
+			defaultIdx = i;
+			continue;
+		}
 
 		/* Check lower bound: pkVal >= lower */
 		if (b->lowerIsMin)
@@ -152,7 +165,8 @@ GlobalIndexFindPartition(GlobalIndexPartState *gps, Datum pkVal)
 		if (upper_ok)
 			return i;
 	}
-	return -1;
+	/* No explicit range matched: fall back to the DEFAULT partition, if any. */
+	return defaultIdx;
 }
 
 /* ----------------------------------------------------------------
@@ -290,6 +304,27 @@ IndexNext(IndexScanState *node)
 											&all_dead);
 			if (!found)
 				continue;
+
+			/*
+			 * Recheck the scan keys against the fetched tuple.  Unlike an
+			 * ordinary index scan -- which only rechecks when the AM reports a
+			 * lossy match (xs_recheck) -- a global partition index can contain
+			 * STALE entries: nothing currently removes an entry on
+			 * DELETE/UPDATE/VACUUM, so once a child heap TID is recycled an
+			 * old entry can point at an unrelated live row.  Without a recheck
+			 * the scan would then return a row that does not match the qual
+			 * (silent wrong results).  Recheck unconditionally so a stale entry
+			 * resolving to a non-matching live tuple is dropped.
+			 */
+			if (node->indexqualorig != NULL)
+			{
+				econtext->ecxt_scantuple = slot;
+				if (!ExecQualAndReset(node->indexqualorig, econtext))
+				{
+					InstrCountFiltered2(node, 1);
+					continue;
+				}
+			}
 
 			return slot;
 		}
@@ -1264,6 +1299,21 @@ ExecInitIndexScan(IndexScan *node, EState *estate, int eflags)
 			spec = castNode(PartitionBoundSpec,
 							stringToNode(TextDatumGetCString(rawbound)));
 			ReleaseSysCache(classTup);
+
+			/*
+			 * A DEFAULT partition is the catch-all: it has no range, so its
+			 * lowerdatums/upperdatums are empty (NIL).  Mark it as the fallback
+			 * and skip the range extraction -- calling linitial_node() on the
+			 * empty lists would dereference NULL and crash.
+			 */
+			if (spec->is_default)
+			{
+				gps->bounds[i].isDefault = true;
+				gps->bounds[i].lowerIsMin = false;
+				gps->bounds[i].upperIsMax = false;
+				continue;
+			}
+			gps->bounds[i].isDefault = false;
 
 			lrd = linitial_node(PartitionRangeDatum, spec->lowerdatums);
 			urd = linitial_node(PartitionRangeDatum, spec->upperdatums);

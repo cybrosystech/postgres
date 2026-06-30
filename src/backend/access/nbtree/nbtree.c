@@ -1415,6 +1415,13 @@ btvacuumpage(BTVacState *vstate, Buffer buf)
 	IndexBulkDeleteResult *stats = vstate->stats;
 	IndexBulkDeleteCallback callback = vstate->callback;
 	void	   *callback_state = vstate->callback_state;
+	/*
+	 * For a global partition index, callback_state is a GIVacCallback and the
+	 * delete decision is routing-aware (it inspects the index tuple's
+	 * partition key), not a bare-TID test.  See genam.h.
+	 */
+	GIVacCallback *gicb = info->index->rd_index->indglobal ?
+		(GIVacCallback *) callback_state : NULL;
 	Relation	rel = info->index;
 	Relation	heaprel = info->heaprel;
 	bool		attempt_pagedel;
@@ -1557,7 +1564,7 @@ backtrack:
 		maxoff = PageGetMaxOffsetNumber(page);
 		nhtidsdead = 0;
 		nhtidslive = 0;
-		if (callback)
+		if (callback || gicb)
 		{
 			/* btbulkdelete callback tells us what to delete (or update) */
 			for (offnum = minoff;
@@ -1573,7 +1580,14 @@ backtrack:
 				if (!BTreeTupleIsPosting(itup))
 				{
 					/* Regular tuple, standard table TID representation */
-					if (callback(&itup->t_tid, callback_state))
+					bool		del;
+
+					if (gicb)
+						del = gicb->fn(gicb->arg, itup, &itup->t_tid);
+					else
+						del = callback(&itup->t_tid, callback_state);
+
+					if (del)
 					{
 						deletable[ndeletable++] = offnum;
 						nhtidsdead++;
@@ -1585,6 +1599,13 @@ backtrack:
 				{
 					BTVacuumPosting vacposting;
 					int			nremaining;
+
+					/*
+					 * Global partition indexes disable deduplication, so they
+					 * never contain posting-list tuples; the routing-aware
+					 * deletion path only has to handle plain tuples.
+					 */
+					Assert(gicb == NULL);
 
 					/* Posting list tuple */
 					vacposting = btreevacuumposting(vstate, itup, offnum,

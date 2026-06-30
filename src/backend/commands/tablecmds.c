@@ -1734,6 +1734,30 @@ RemoveRelations(DropStmt *drop)
 									   state.heap_lockmode,
 									   NULL);
 
+		/*
+		 * If this is a leaf partition being dropped, purge its entries from any
+		 * global index on its parent first, while the partition is still intact
+		 * (relpartbound set, heap present).  Otherwise the global index would
+		 * keep orphaned entries pointing at a dropped partition.  Note: DROP of
+		 * the parent itself drops the global index too, and only lists the
+		 * parent (which is not a partition), so that case correctly does
+		 * nothing here.
+		 */
+		if (state.actual_relkind == RELKIND_RELATION)
+		{
+			Relation	drel = table_open(relOid, NoLock);
+
+			if (drel->rd_rel->relispartition)
+			{
+				Oid			parentOid = get_partition_parent(relOid, false);
+				Relation	parentRel = table_open(parentOid, AccessShareLock);
+
+				IndexGlobalDetachPartition(parentRel, drel);
+				table_close(parentRel, AccessShareLock);
+			}
+			table_close(drel, NoLock);
+		}
+
 		/* OK, we're ready to delete this one */
 		obj.classId = RelationRelationId;
 		obj.objectId = relOid;
@@ -20885,6 +20909,14 @@ ATExecAttachPartition(List **wqueue, Relation rel, PartitionCmd *cmd,
 		}
 	}
 
+	/*
+	 * If the parent owns any global partition indexes, the rows that already
+	 * existed in the attached partition are not in them yet -- ATTACH only
+	 * flips catalog state and does not route those rows through the insert
+	 * path.  Backfill them now so the global index stays complete.
+	 */
+	IndexGlobalAttachPartition(rel, attachrel);
+
 	/* keep our lock until commit */
 	table_close(attachrel, NoLock);
 
@@ -21427,6 +21459,14 @@ DetachPartitionFinalize(Relation rel, Relation partRel, bool concurrent,
 				newtuple;
 	Relation	trigrel = NULL;
 	List	   *fkoids = NIL;
+
+	/*
+	 * Purge this partition's entries from any global index on the parent,
+	 * while its relpartbound is still set (we clear it further below).
+	 * Otherwise the detached partition's entries would linger in the global
+	 * index as orphans (bloat) until a REINDEX.
+	 */
+	IndexGlobalDetachPartition(rel, partRel);
 
 	if (concurrent)
 	{

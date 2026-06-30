@@ -157,6 +157,69 @@ static void ExecWithoutOverlapsNotEmpty(Relation rel, NameData attname, Datum at
 										char typtype, Oid atttypid);
 
 /* ----------------------------------------------------------------
+ *		ExecOpenGlobalIndexes
+ *
+ *		When the result relation is a partition, resolve and open the parent's
+ *		GLOBAL partition indexes once and cache them on the ResultRelInfo.
+ *		Without this, ExecInsertIndexTuples() would re-scan pg_index and reopen
+ *		the indexes for every inserted row.  Opened with RowExclusiveLock and
+ *		closed in ExecCloseIndices().  Runs in the per-query memory context (it
+ *		is called from ExecOpenIndices at executor setup), so the cache arrays
+ *		and IndexInfos live for the whole statement.
+ * ----------------------------------------------------------------
+ */
+static void
+ExecOpenGlobalIndexes(ResultRelInfo *resultRelInfo)
+{
+	Relation	resultRelation = resultRelInfo->ri_RelationDesc;
+	Oid			parentOid;
+	Relation	pgidxrel;
+	SysScanDesc scan;
+	ScanKeyData key;
+	HeapTuple	htup;
+	List	   *oids = NIL;
+	ListCell   *lc;
+	int			n;
+
+	resultRelInfo->ri_GlobalIndicesResolved = true;
+
+	parentOid = get_partition_parent(RelationGetRelid(resultRelation), false);
+
+	/* Collect the parent's global index OIDs (one pg_index scan, not per row). */
+	ScanKeyInit(&key, Anum_pg_index_indrelid, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(parentOid));
+	pgidxrel = table_open(IndexRelationId, AccessShareLock);
+	scan = systable_beginscan(pgidxrel, IndexIndrelidIndexId, true, NULL, 1, &key);
+	while (HeapTupleIsValid(htup = systable_getnext(scan)))
+	{
+		Form_pg_index idx = (Form_pg_index) GETSTRUCT(htup);
+
+		if (idx->indglobal)
+			oids = lappend_oid(oids, idx->indexrelid);
+	}
+	systable_endscan(scan);
+	table_close(pgidxrel, AccessShareLock);
+
+	n = list_length(oids);
+	if (n > 0)
+	{
+		resultRelInfo->ri_GlobalIndexRelationDescs = palloc_array(Relation, n);
+		resultRelInfo->ri_GlobalIndexRelationInfo = palloc_array(IndexInfo *, n);
+		n = 0;
+		foreach(lc, oids)
+		{
+			Relation	idxrel = index_open(lfirst_oid(lc), RowExclusiveLock);
+
+			resultRelInfo->ri_GlobalIndexRelationDescs[n] = idxrel;
+			resultRelInfo->ri_GlobalIndexRelationInfo[n] = BuildIndexInfo(idxrel);
+			n++;
+		}
+		resultRelInfo->ri_NumGlobalIndices = n;
+	}
+	list_free(oids);
+}
+
+/* ----------------------------------------------------------------
  *		ExecOpenIndices
  *
  *		Find the indices associated with a result relation, open them,
@@ -178,6 +241,16 @@ ExecOpenIndices(ResultRelInfo *resultRelInfo, bool speculative)
 	IndexInfo **indexInfoArray;
 
 	resultRelInfo->ri_NumIndices = 0;
+
+	/*
+	 * If this is a partition, resolve and open the parent's global partition
+	 * indexes once (cached on the ResultRelInfo).  Done before the "no local
+	 * indexes" fast paths below, because a partition can have global indexes
+	 * even when it has no local index of its own.
+	 */
+	if (resultRelation->rd_rel->relispartition &&
+		!resultRelInfo->ri_GlobalIndicesResolved)
+		ExecOpenGlobalIndexes(resultRelInfo);
 
 	/* fast path if no indexes */
 	if (!RelationGetForm(resultRelation)->relhasindex)
@@ -269,6 +342,18 @@ ExecCloseIndices(ResultRelInfo *resultRelInfo)
 
 		/* Mark the index as closed */
 		indexDescs[i] = NULL;
+	}
+
+	/* Close the cached global partition indexes, if any. */
+	for (i = 0; i < resultRelInfo->ri_NumGlobalIndices; i++)
+	{
+		Relation	gidx = resultRelInfo->ri_GlobalIndexRelationDescs[i];
+
+		if (gidx == NULL)
+			continue;
+		index_insert_cleanup(gidx, resultRelInfo->ri_GlobalIndexRelationInfo[i]);
+		index_close(gidx, RowExclusiveLock);
+		resultRelInfo->ri_GlobalIndexRelationDescs[i] = NULL;
 	}
 
 	/*
@@ -538,47 +623,20 @@ ExecInsertIndexTuples(ResultRelInfo *resultRelInfo,
 	 */
 	if (heapRelation->rd_rel->relispartition)
 	{
-		Oid			parentOid;
-		Relation	pgidxrel;
-		SysScanDesc scan;
-		ScanKeyData key;
-		HeapTuple	htup;
-
-		parentOid = get_partition_parent(RelationGetRelid(heapRelation), false);
-
-		/* Scan pg_index directly for global indexes on the parent */
-		ScanKeyInit(&key,
-					Anum_pg_index_indrelid,
-					BTEqualStrategyNumber,
-					F_OIDEQ,
-					ObjectIdGetDatum(parentOid));
-
-		pgidxrel = table_open(IndexRelationId, AccessShareLock);
-		scan = systable_beginscan(pgidxrel, IndexIndrelidIndexId, true,
-								  NULL, 1, &key);
-
-		while (HeapTupleIsValid(htup = systable_getnext(scan)))
+		/*
+		 * The parent's global indexes were resolved and opened once by
+		 * ExecOpenIndices() and cached on the ResultRelInfo, so here we just
+		 * insert into each -- no per-row pg_index scan or index_open.
+		 */
+		for (int gi = 0; gi < resultRelInfo->ri_NumGlobalIndices; gi++)
 		{
-			Form_pg_index idx = (Form_pg_index) GETSTRUCT(htup);
-			Oid			globalIdxOid;
-			Relation	globalIdxRel;
-			IndexInfo  *globalIdxInfo;
+			Relation	globalIdxRel = resultRelInfo->ri_GlobalIndexRelationDescs[gi];
+			IndexInfo  *globalIdxInfo = resultRelInfo->ri_GlobalIndexRelationInfo[gi];
 			Datum		gvalues[INDEX_MAX_KEYS];
 			bool		gisnull[INDEX_MAX_KEYS];
 
-			/* Only process global partition indexes */
-			if (!idx->indglobal)
-				continue;
-
-			globalIdxOid = idx->indexrelid;
-			globalIdxRel = index_open(globalIdxOid, RowExclusiveLock);
-			globalIdxInfo = BuildIndexInfo(globalIdxRel);
-
 			if (!globalIdxInfo->ii_ReadyForInserts)
-			{
-				index_close(globalIdxRel, RowExclusiveLock);
 				continue;
-			}
 
 			FormIndexDatum(globalIdxInfo, slot, estate, gvalues, gisnull);
 
@@ -590,12 +648,7 @@ ExecInsertIndexTuples(ResultRelInfo *resultRelInfo,
 						 UNIQUE_CHECK_NO,
 						 false,
 						 globalIdxInfo);
-
-			index_close(globalIdxRel, RowExclusiveLock);
 		}
-
-		systable_endscan(scan);
-		table_close(pgidxrel, AccessShareLock);
 	}
 
 	return result;
