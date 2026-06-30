@@ -1207,27 +1207,27 @@ exec_simple_query(const char *query_string)
 		else
 			oldcontext = MemoryContextSwitchTo(MessageContext);
 
-		querytree_list = pg_analyze_and_rewrite_fixedparams(parsetree, query_string,
-															NULL, 0, NULL);
-
 		/*
-		 * dbblue autoprepare: if this query shape has a cached parameterized
-		 * plan, reuse it and skip planning.  We consult while the parse/plan
-		 * snapshot is still active, so GetCachedPlan() may (re)plan if needed.
-		 * The plan refcount is tracked by CurrentResourceOwner, so it is
-		 * released automatically if any step before PortalDefineQuery throws;
-		 * on the normal path we release it explicitly after PortalDrop.
+		 * dbblue autoprepare: consult with the analyzed-but-NOT-yet-rewritten
+		 * query.  The plancache must own the rewrite so it can re-do it
+		 * correctly on invalidation; rewriting an already-rewritten query trips
+		 * Assert(querySource == QSRC_ORIGINAL) in the rewriter.  So we split
+		 * pg_analyze_and_rewrite_fixedparams() here: analyze, consult, then on a
+		 * miss rewrite + plan as usual (on a hit, reuse the cached plan and skip
+		 * both).  The plan refcount is tracked by CurrentResourceOwner, so it is
+		 * released automatically if any step before PortalDefineQuery throws; on
+		 * the normal path we release it explicitly after PortalDrop.
 		 */
 		{
-			elog(LOG, "---------------------------------------------------entered the dbblue autoprepare code path");
+			Query	   *analyzed_query;
 			CachedPlanSource *aprep_src = NULL;
 
-			if (list_length(querytree_list) == 1 &&
-				AutoprepareConsult(linitial_node(Query, querytree_list),
-								   query_string,
+			analyzed_query = parse_analyze_fixedparams(parsetree, query_string,
+													   NULL, 0, NULL);
+
+			if (AutoprepareConsult(analyzed_query, query_string,
 								   &aprep_src, &aprep_params) == APREP_HIT)
 			{
-				elog(LOG, "---------------------------------------------------getting cached plan");
 				aprep_owner = CurrentResourceOwner;
 				aprep_cplan = GetCachedPlan(aprep_src, aprep_params,
 											aprep_owner, NULL);
@@ -1235,7 +1235,7 @@ exec_simple_query(const char *query_string)
 			}
 			else
 			{
-				elog(LOG, "-----------------------------------------------------creating new plan for the query");
+				querytree_list = pg_rewrite_query(analyzed_query);
 				plantree_list = pg_plan_queries(querytree_list, query_string,
 												CURSOR_OPT_PARALLEL_OK, NULL);
 			}
