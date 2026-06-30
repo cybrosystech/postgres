@@ -32,8 +32,8 @@ suite in `src/test/dbblue_ivm/` and the adversarial concurrency battery.
 | `GROUP BY` on an **expression** | e.g. `date_trunc('month', d)`, `(amt % 10)`, `CASE …`; must be IMMUTABLE and appear in the SELECT list. Maintained by the deparse core; single-table or INNER JOIN, no MIN/MAX/self-join |
 | `SUM`, `COUNT(*)`, `COUNT(col)`, `AVG` | numeric / integer; AVG kept as a (sum,count) pair |
 | `agg(...) FILTER (WHERE c)` | `SUM`/`COUNT`/`AVG` only; rewritten to `agg(CASE WHEN c THEN … END)` and maintained by the deparse core (MIN/MAX FILTER not supported) |
-| `COUNT(DISTINCT x)`, `SUM(DISTINCT x)`, … | single-table **or INNER JOIN**, **with or without HAVING**; maintained by recomputing each affected group from the live table(s) (serialized on the matview lock; **NULL group keys maintained** with full fidelity). Not yet over a self-join |
-| `STDDEV`/`VARIANCE` family, `BOOL_AND`/`BOOL_OR` | single-table or INNER JOIN, with or without HAVING; same recompute path as DISTINCT |
+| `COUNT(DISTINCT x)`, `SUM(DISTINCT x)`, … | single-table, **INNER JOIN, or a two-table outer join (LEFT/RIGHT) keyed on the preserved side**, **with or without HAVING**; maintained by recomputing each affected group from the live table(s) (serialized on the matview lock; **NULL group keys maintained** with full fidelity; outer-join orphan groups kept with count 0 / NULL agg). Not yet over a self-join, a 3+ table outer-join mix, an optional-side group key, or a `FULL JOIN` with `GROUP BY` |
+| `STDDEV`/`VARIANCE` family, `BOOL_AND`/`BOOL_OR` | single-table, INNER JOIN, or outer join, with or without HAVING; same recompute path as DISTINCT |
 | **`CASE` / `COALESCE` / arithmetic** aggregate arguments | supported in **every** shape — additive (deparse), MIN/MAX, HAVING, self-join, outer join, DISTINCT, stddev/bool — as long as the expression is IMMUTABLE |
 | `MIN`, `MAX` | delete-rescan, serialized on the matview-level lock (see 🟡 below); N-table joins OK |
 | Multi-table **INNER JOIN** + `GROUP BY` | N-table, equi-join (additive via deparse; MIN/MAX via the hand rescan — both correct for 3+ tables) |
@@ -79,7 +79,7 @@ A `NOTICE` (not a `WARNING`) fires at `CREATE` for these:
 
 | Shape | Why rejected | What to do instead |
 |---|---|---|
-| `COUNT(DISTINCT x)` over a **self-join / outer join** | the recompute path doesn't cover these yet | single-table & INNER JOIN (with or without HAVING) are supported; otherwise use a non-incremental matview |
+| `COUNT(DISTINCT x)` over a **self-join**, a **3+ table outer-join mix**, or an **optional-side group key** | the recompute builders cover single-table, INNER JOIN, and the two-table preserved-key outer join only | single-table, INNER JOIN, and a two-table LEFT/RIGHT outer join keyed on the preserved side (with or without HAVING) are supported; otherwise use a non-incremental matview |
 | `MIN`/`MAX (...) FILTER (WHERE …)` | hand MIN/MAX builder can't render the `CASE` the filter rewrites to | use `SUM`/`COUNT`/`AVG` FILTER (supported), or a non-incremental matview |
 | `GROUP BY` a **volatile** expression (`random()`, `now()`) or a STABLE one (e.g. `date_trunc` over `timestamptz`) | the same row could map to different groups across its insert- vs delete-delta → drift | use an IMMUTABLE expression (e.g. `date_trunc` over `timestamp`) or a generated/stored bucket column |
 | `GROUP BY <expression>` not in the SELECT list, or with `MIN`/`MAX` / self-join | no output column to key on / shape the deparse core does not build | add the expression to SELECT; drop MIN/MAX or the self-join |
@@ -223,8 +223,13 @@ Prioritized by value for Odoo reporting:
    outer join, DISTINCT, stddev/bool). **DISTINCT/recompute + HAVING is now
    supported** (single-table & INNER JOIN): the recompute delta maintains every
    group and the `hav_sql` step re-derives `__mv_having_ok__`, and the
-   failing-group backfill seeds the true distinct value. Remaining: DISTINCT over
-   a self-join / outer join.
+   failing-group backfill seeds the true distinct value. **DISTINCT/recompute
+   over a two-table outer join (LEFT/RIGHT keyed on the preserved side, with or
+   without HAVING) is now supported** too: it routes to the Phase 8 outer-join
+   recompute builder, which recomputes each affected group from the live outer
+   join (orphan groups kept with count 0 / NULL agg; NULL preserved keys matched
+   `IS NOT DISTINCT FROM`). Remaining: DISTINCT over a self-join, a 3+ table
+   outer-join mix, an optional-side group key, or a `FULL JOIN` with `GROUP BY`.
 6. ✅ **Done — full NULL-group fidelity (match a normal matview), every shape** —
    `NULLS NOT DISTINCT` index + `IS NOT DISTINCT FROM` / `EXISTS` predicates, so the
    NULL group is *kept and maintained* across all shapes including the recompute

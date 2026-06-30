@@ -279,6 +279,7 @@ static const char *incr_having_agg_column(Aggref *hagg, Query *viewQuery);
 static bool incr_agg_arg_deparse_safe(Node *expr);
 static bool incr_aggs_need_deparse(Query *viewQuery);
 static bool incr_inner_join_deparse_shape(Query *viewQuery, int nbasetables);
+static bool incr_recompute_outer_shape(Query *viewQuery, int nbasetables);
 static Node *incr_group_key_expr(Query *q, TargetEntry *te);
 static bool incr_group_needs_deparse(Query *viewQuery);
 static Node *incr_get_where_qual(Query *viewQuery);
@@ -835,13 +836,14 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 				 * aggregate, they are not yet supported; reject cleanly.
 				 */
 				if (!(nbasetables == 1 ||
-					  incr_inner_join_deparse_shape(viewQuery, nbasetables)) ||
+					  incr_inner_join_deparse_shape(viewQuery, nbasetables) ||
+					  incr_recompute_outer_shape(viewQuery, nbasetables)) ||
 					agg->aggorder != NIL)
 				{
 					*reason = psprintf("incremental %s(DISTINCT ...) is supported "
-									   "only over a single table or INNER JOIN, "
-									   "without ordered-set aggregates "
-									   "(not self-joins or outer joins)", fname);
+									   "only over a single table, INNER JOIN, or "
+									   "outer join, without ordered-set aggregates "
+									   "(not self-joins)", fname);
 					return false;
 				}
 			}
@@ -919,12 +921,13 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 				 * no HAVING/ordered-set).  The recompute renders the argument with the
 				 * shared grammar (incr_deparse_where_qual). */
 				if (!(nbasetables == 1 ||
-					  incr_inner_join_deparse_shape(viewQuery, nbasetables)) ||
+					  incr_inner_join_deparse_shape(viewQuery, nbasetables) ||
+					  incr_recompute_outer_shape(viewQuery, nbasetables)) ||
 					agg->aggorder != NIL)
 				{
 					*reason = psprintf("incremental %s() is supported only over a "
-								   "single table or INNER JOIN, without "
-								   "ordered-set aggregates", fname);
+								   "single table, INNER JOIN, or outer join, "
+								   "without ordered-set aggregates", fname);
 					return false;
 				}
 				if (agg->args != NIL)
@@ -2495,6 +2498,49 @@ incr_inner_join_deparse_shape(Query *viewQuery, int nbasetables)
 		return false;
 	tabs = incr_collect_tables(viewQuery);
 	return !incr_has_outer_join(tabs) && !incr_has_self_join(tabs);
+}
+
+/*
+ * incr_recompute_outer_shape — true for a query the Phase 8 outer-join
+ * recompute builder (incr_build_outer_sql) can maintain a DISTINCT / stddev /
+ * variance / bool aggregate over: a TWO-TABLE LEFT/RIGHT outer join (one
+ * preserved + one optional side) whose GROUP BY keys all live on the preserved
+ * side.  That builder recomputes each affected group from the live outer join
+ * (rendering DISTINCT verbatim), so it is correct for the recompute aggregates
+ * too — but only for this shape: it resolves affected keys from the preserved/
+ * delta rows, so a 3+ table mix (an extra INNER-joined dimension) or a key on
+ * the optional side is not maintained correctly and must fall through to a
+ * clean rejection.  FULL OUTER JOIN + GROUP BY and outer-join + self-join are
+ * already rejected earlier in eligibility.
+ */
+static bool
+incr_recompute_outer_shape(Query *viewQuery, int nbasetables)
+{
+	List	   *tabs;
+	int			preserved_varno;
+	ListCell   *lc;
+
+	if (nbasetables != 2)
+		return false;
+	tabs = incr_collect_tables(viewQuery);
+	if (!incr_has_outer_join(tabs) || incr_has_self_join(tabs))
+		return false;
+
+	/* every GROUP BY key must resolve to the preserved (anchor) table */
+	preserved_varno = incr_outer_preserved_varno(tabs);
+	foreach(lc, viewQuery->groupClause)
+	{
+		SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+		TargetEntry	   *te  = get_sortgroupclause_tle(sgc, viewQuery->targetList);
+		int				rv;
+
+		if (!IsA(te->expr, Var))
+			return false;
+		incr_resolve_var_colname((Var *) te->expr, viewQuery->rtable, &rv);
+		if (rv != preserved_varno)
+			return false;
+	}
+	return true;
 }
 
 static bool
@@ -5421,7 +5467,7 @@ incr_build_outer_sql(Oid mvrelid, Query *viewQuery,
 
 		if (!first) appendStringInfoString(&buf, " AND ");
 		first = false;
-		appendStringInfo(&buf, "_ltp_.%s = _affected_.%s",
+		appendStringInfo(&buf, "_ltp_.%s IS NOT DISTINCT FROM _affected_.%s",
 						 quote_identifier(src_col),
 						 quote_identifier(te->resname));
 	}
@@ -5573,7 +5619,7 @@ incr_build_outer_sql(Oid mvrelid, Query *viewQuery,
 			const char      *col = quote_identifier(te->resname);
 
 			if (!first) appendStringInfoString(&buf, " AND ");
-			appendStringInfo(&buf, "_mv_.%s = _affected_.%s", col, col);
+			appendStringInfo(&buf, "_mv_.%s IS NOT DISTINCT FROM _affected_.%s", col, col);
 			first = false;
 		}
 
@@ -5592,7 +5638,7 @@ incr_build_outer_sql(Oid mvrelid, Query *viewQuery,
 				(Var *) te->expr, viewQuery->rtable, &rv);
 
 			if (!first) appendStringInfoString(&buf, " AND ");
-			appendStringInfo(&buf, "_chk_.%s = _mv_.%s",
+			appendStringInfo(&buf, "_chk_.%s IS NOT DISTINCT FROM _mv_.%s",
 							 quote_identifier(src_col),
 							 quote_identifier(te->resname));
 			first = false;
@@ -5639,7 +5685,7 @@ incr_build_outer_sql(Oid mvrelid, Query *viewQuery,
 																   viewQuery->targetList);
 
 					if (!first) appendStringInfoString(&buf, " AND ");
-					appendStringInfo(&buf, "_chk%d_.%s = _mv_.%s",
+					appendStringInfo(&buf, "_chk%d_.%s IS NOT DISTINCT FROM _mv_.%s",
 									 chk_alias,
 									 quote_identifier(fk_col),
 									 quote_identifier(te->resname));
