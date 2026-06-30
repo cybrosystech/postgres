@@ -405,6 +405,40 @@ extract_bound_params(Query *query, Oid *param_types, int num_params)
  *		plansource construction
  * ---------------------------------------------------------------- */
 
+/*
+ * Does the query (or any subquery/CTE) use a GRAPH_TABLE clause?  Our
+ * parameterization walk relies on expression_tree_mutator(), which does not
+ * handle SQL/PGQ graph-pattern node types and would elog(ERROR) on them.  Such
+ * queries must therefore be declined rather than parameterized.  We only scan
+ * range tables (GRAPH_TABLE is always a table source), avoiding any walk over
+ * the graph-pattern expression nodes themselves.
+ */
+static bool
+query_has_graph_table(Query *query)
+{
+	ListCell   *lc;
+
+	foreach(lc, query->rtable)
+	{
+		RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+
+		if (rte->rtekind == RTE_GRAPH_TABLE)
+			return true;
+		if (rte->rtekind == RTE_SUBQUERY && rte->subquery != NULL &&
+			query_has_graph_table(rte->subquery))
+			return true;
+	}
+	foreach(lc, query->cteList)
+	{
+		CommonTableExpr *cte = lfirst_node(CommonTableExpr, lc);
+
+		if (cte->ctequery != NULL && IsA(cte->ctequery, Query) &&
+			query_has_graph_table((Query *) cte->ctequery))
+			return true;
+	}
+	return false;
+}
+
 static bool
 query_is_cacheable(Query *query)
 {
@@ -417,10 +451,14 @@ query_is_cacheable(Query *query)
 		case CMD_UPDATE:
 		case CMD_DELETE:
 		case CMD_MERGE:
-			return true;
+			break;
 		default:
 			return false;
 	}
+	/* SQL/PGQ GRAPH_TABLE nodes aren't handled by our parameterization walk. */
+	if (query_has_graph_table(query))
+		return false;
+	return true;
 }
 
 static CommandTag
@@ -587,13 +625,39 @@ AutoprepareConsult(Query *analyzed_query, const char *query_string,
 	if (entry->promoted && entry->plansource != NULL)
 	{
 		ParamListInfo boundParams;
+		Query	   *ipquery;
+		Oid		   *itypes = NULL;
+		int			inparams = 0;
 
 		entry->seen_count++;
+
+		/*
+		 * Comprehensive collision guard.  Our hash key is Query->queryId (the
+		 * core jumble), which is built for pg_stat_statements *grouping*: it
+		 * ignores column aliases and normalizes out ALL constants -- including
+		 * the ones we deliberately keep literal (LIMIT/OFFSET, NULLs).  So two
+		 * genuinely different queries can share a queryId, and reusing the
+		 * cached plan for the wrong one yields wrong column names or wrong
+		 * results.  Defend against that here: re-parameterize the incoming
+		 * query and require it to be equal() to the cached parameterized query
+		 * (plansource->analyzed_parse_tree).  That holds exactly when the two
+		 * differ only in the values we bind as parameters.  equal() ignores
+		 * token locations but compares aliases and non-parameterized literals,
+		 * so it catches alias- and LIMIT-style collisions.  On any mismatch we
+		 * fall back to normal planning rather than return a wrong answer.
+		 */
+		ipquery = aprep_parameterize_build(analyzed_query, &itypes, &inparams);
+		(void) itypes;
+		(void) inparams;
+		if (ipquery == NULL ||
+			!equal(ipquery, entry->plansource->analyzed_parse_tree))
+			return APREP_MISS;	/* queryId collision -> plan normally */
+
 		boundParams = extract_bound_params(analyzed_query,
 										   entry->param_types,
 										   entry->num_params);
 		if (boundParams == NULL)
-			return APREP_MISS;	/* collision / divergence -> plan normally */
+			return APREP_MISS;	/* divergence -> plan normally */
 
 		*plansource_out = entry->plansource;
 		*boundParams_out = boundParams;
