@@ -13,8 +13,15 @@
 -- case the builder adds a second UNION arm to _affected_ (orphan detection)
 -- that captures preserved rows that changed join status, covering NULL-group
 -- births and deaths that the delta-row arm alone cannot see.
--- Still rejected: FULL OUTER JOIN + GROUP BY; outer + self-join; optional-side
--- group keys via multi-hop chains (see Case 10).
+--
+-- FULL OUTER JOIN + GROUP BY is supported for the two-table, single-side
+-- plain-column shape (every GROUP BY key is a plain column from ONE of the two
+-- joined tables).  There the builder adds a dedicated all-NULL arm for deltas
+-- on the key side, covering the other table's orphan (all-NULL) group that the
+-- delta-row arm misses (Cases 11-13).
+-- Still rejected: FULL + expression/COALESCE key, FULL + mixed-side keys, FULL
+-- via USING/NATURAL, 3+-table FULL, outer + self-join, and optional-side group
+-- keys via multi-hop chains (see Case 10).
 --
 -- Every case is checked == a full REFRESH of an identically-defined plain
 -- matview, including orphan (preserved-only) groups whose DISTINCT count is 0,
@@ -289,19 +296,56 @@ DROP TABLE ok2_p, ok2_c CASCADE;
 DO $$
 DECLARE made bool;
 BEGIN
-  -- FULL OUTER JOIN + GROUP BY: both sides can orphan rows into NULL groups;
-  -- dual-arm cannot be built simply for both directions simultaneously.
+  CREATE TABLE _tfa(id int primary key, k int, j int);
+  CREATE TABLE _tfb(id int primary key, k int, j int);
+  CREATE TABLE _tfc(id int primary key, k int);
+
+  -- FULL + COALESCE (expression) key: an orphan flip can relocate a row
+  -- between non-NULL groups; the recompute arms don't track that.
   BEGIN
     made := false;
-    CREATE TABLE _tfa(id int primary key, k int);
-    CREATE TABLE _tfb(id int primary key, k int);
     CREATE MATERIALIZED VIEW _tfmv WITH (incremental_refresh=true) AS
-      SELECT a.k FROM _tfa a FULL JOIN _tfb b ON a.k=b.k GROUP BY a.k;
+      SELECT COALESCE(a.k,b.k) k, count(*) c
+      FROM _tfa a FULL JOIN _tfb b ON a.k=b.k GROUP BY COALESCE(a.k,b.k);
     made := true;
   EXCEPTION WHEN feature_not_supported THEN NULL; END;
-  DROP TABLE IF EXISTS _tfa, _tfb CASCADE;
-  IF made THEN RAISE EXCEPTION 'FULL JOIN + GROUP BY: FAIL (accepted)';
-  ELSE RAISE NOTICE 'FULL JOIN + GROUP BY still rejected: PASS'; END IF;
+  IF made THEN DROP MATERIALIZED VIEW _tfmv; RAISE EXCEPTION 'FULL+COALESCE: FAIL (accepted)';
+  ELSE RAISE NOTICE 'FULL + COALESCE key still rejected: PASS'; END IF;
+
+  -- FULL + mixed-side keys (one key per table).
+  BEGIN
+    made := false;
+    CREATE MATERIALIZED VIEW _tfmv WITH (incremental_refresh=true) AS
+      SELECT a.k ak, b.k bk, count(*) c
+      FROM _tfa a FULL JOIN _tfb b ON a.j=b.j GROUP BY a.k, b.k;
+    made := true;
+  EXCEPTION WHEN feature_not_supported THEN NULL; END;
+  IF made THEN DROP MATERIALIZED VIEW _tfmv; RAISE EXCEPTION 'FULL+mixed-side: FAIL (accepted)';
+  ELSE RAISE NOTICE 'FULL + mixed-side keys still rejected: PASS'; END IF;
+
+  -- FULL via USING (merged column is COALESCE-like) — must reject cleanly,
+  -- not raise an internal error.
+  BEGIN
+    made := false;
+    CREATE MATERIALIZED VIEW _tfmv WITH (incremental_refresh=true) AS
+      SELECT k, count(*) c FROM _tfa a FULL JOIN _tfb b USING (k) GROUP BY k;
+    made := true;
+  EXCEPTION WHEN feature_not_supported THEN NULL; END;
+  IF made THEN DROP MATERIALIZED VIEW _tfmv; RAISE EXCEPTION 'FULL USING: FAIL (accepted)';
+  ELSE RAISE NOTICE 'FULL via USING still rejected: PASS'; END IF;
+
+  -- 3-table FULL join.
+  BEGIN
+    made := false;
+    CREATE MATERIALIZED VIEW _tfmv WITH (incremental_refresh=true) AS
+      SELECT a.k, count(*) c
+      FROM _tfa a FULL JOIN _tfb b ON a.k=b.k FULL JOIN _tfc c ON a.k=c.k GROUP BY a.k;
+    made := true;
+  EXCEPTION WHEN feature_not_supported THEN NULL; END;
+  IF made THEN DROP MATERIALIZED VIEW _tfmv; RAISE EXCEPTION '3-table FULL: FAIL (accepted)';
+  ELSE RAISE NOTICE 'FULL 3-table still rejected: PASS'; END IF;
+
+  DROP TABLE _tfa, _tfb, _tfc CASCADE;
 
   -- Outer join + self-join: dedicated self-join path; not recompute-outer shape.
   BEGIN
@@ -316,6 +360,94 @@ BEGIN
   IF made THEN RAISE EXCEPTION 'outer join + self-join: FAIL (accepted)';
   ELSE RAISE NOTICE 'outer join + self-join still rejected: PASS'; END IF;
 END$$;
+
+-- 11. FULL OUTER JOIN, single-side GROUP BY a.k: NULL-group birth (delete the
+--     last match of a b-row → it orphans) and death (insert a match for the
+--     lone orphan → NULL group vanishes), plus a delta on the non-key side.
+DROP TABLE IF EXISTS fj_a, fj_b CASCADE;
+CREATE TABLE fj_a(id int primary key, k int, v int);
+CREATE TABLE fj_b(id int primary key, k int, v int);
+INSERT INTO fj_a VALUES (1,1,10),(2,2,20);
+INSERT INTO fj_b VALUES (1,2,200),(2,3,300);      -- matched:2 ; a-orphan:1 ; b-orphan:3
+CREATE MATERIALIZED VIEW fj11_i WITH (incremental_refresh=true) AS
+  SELECT a.k gk, count(*) c, count(a.v) ca, count(b.v) cb, sum(b.v) sb
+  FROM fj_a a FULL JOIN fj_b b ON a.k=b.k GROUP BY a.k;
+CREATE MATERIALIZED VIEW fj11_o AS
+  SELECT a.k gk, count(*) c, count(a.v) ca, count(b.v) cb, sum(b.v) sb
+  FROM fj_a a FULL JOIN fj_b b ON a.k=b.k GROUP BY a.k;
+DELETE FROM fj_a WHERE k=2;         -- b(2) loses its only match → enters NULL group; group 2 vanishes
+INSERT INTO fj_a VALUES (3,3,30);   -- matches b(3): b(3) leaves NULL group → group 3 born
+INSERT INTO fj_b VALUES (3,9,900);  -- delta on non-key side: new b-orphan → NULL group (arm 1)
+DELETE FROM fj_b WHERE k=9;         -- remove that b-orphan again
+REFRESH MATERIALIZED VIEW fj11_o;
+DO $$
+DECLARE d int;
+BEGIN
+  SELECT count(*) INTO d FROM (
+    (SELECT gk,c,ca,cb,sb FROM fj11_i EXCEPT SELECT gk,c,ca,cb,sb FROM fj11_o) UNION ALL
+    (SELECT gk,c,ca,cb,sb FROM fj11_o EXCEPT SELECT gk,c,ca,cb,sb FROM fj11_i)) x;
+  IF d<>0 THEN RAISE EXCEPTION 'FULL single-side a.k: FAIL (% rows differ)', d;
+  ELSE RAISE NOTICE 'FULL JOIN single-side GROUP BY a.k == REFRESH: PASS'; END IF;
+END$$;
+DROP TABLE fj_a, fj_b CASCADE;
+
+-- 12. FULL OUTER JOIN, single-side GROUP BY b.k (symmetric; delta on b vanishes
+--     a group and orphans an a-row into the NULL group).  Reversed table order.
+DROP TABLE IF EXISTS fk_a, fk_b CASCADE;
+CREATE TABLE fk_a(id int primary key, k int, v int);
+CREATE TABLE fk_b(id int primary key, k int, v int);
+INSERT INTO fk_a VALUES (1,5,50),(2,6,60);
+INSERT INTO fk_b VALUES (1,5,500);                -- matched:5 ; a-orphan:6
+CREATE MATERIALIZED VIEW fk12_i WITH (incremental_refresh=true) AS
+  SELECT b.k gk, count(*) c, count(a.v) ca, count(b.v) cb
+  FROM fk_b b FULL JOIN fk_a a ON a.k=b.k GROUP BY b.k;   -- reversed order, key on 2nd rel
+CREATE MATERIALIZED VIEW fk12_o AS
+  SELECT b.k gk, count(*) c, count(a.v) ca, count(b.v) cb
+  FROM fk_b b FULL JOIN fk_a a ON a.k=b.k GROUP BY b.k;
+DELETE FROM fk_b WHERE k=5;         -- a(5) orphans → NULL group (b.k NULL); group 5 vanishes
+INSERT INTO fk_b VALUES (2,6,600);  -- matches a(6): a(6) leaves NULL group → group 6 born
+REFRESH MATERIALIZED VIEW fk12_o;
+DO $$
+DECLARE d int;
+BEGIN
+  SELECT count(*) INTO d FROM (
+    (SELECT gk,c,ca,cb FROM fk12_i EXCEPT SELECT gk,c,ca,cb FROM fk12_o) UNION ALL
+    (SELECT gk,c,ca,cb FROM fk12_o EXCEPT SELECT gk,c,ca,cb FROM fk12_i)) x;
+  IF d<>0 THEN RAISE EXCEPTION 'FULL single-side b.k: FAIL (% rows differ)', d;
+  ELSE RAISE NOTICE 'FULL JOIN single-side GROUP BY b.k (reversed order) == REFRESH: PASS'; END IF;
+END$$;
+DROP TABLE fk_a, fk_b CASCADE;
+
+-- 13. FULL OUTER JOIN with recompute aggregates (COUNT(DISTINCT)/stddev) AND
+--     real NULL-key rows in the data sharing the all-NULL group with orphans.
+DROP TABLE IF EXISTS fn_a, fn_b CASCADE;
+CREATE TABLE fn_a(id int primary key, k int, v int);
+CREATE TABLE fn_b(id int primary key, k int, v int);
+INSERT INTO fn_a VALUES (1,1,7),(2,1,7),(3,NULL,99);    -- real NULL-key a-row
+INSERT INTO fn_b VALUES (1,1,7),(2,1,9),(3,5,500);      -- b(5) orphan → NULL group with a(3)
+CREATE MATERIALIZED VIEW fn13_i WITH (incremental_refresh=true) AS
+  SELECT a.k gk, count(*) c, count(DISTINCT a.v) da, count(DISTINCT b.v) db,
+         stddev_pop(b.v) sdb
+  FROM fn_a a FULL JOIN fn_b b ON a.k=b.k GROUP BY a.k;
+CREATE MATERIALIZED VIEW fn13_o AS
+  SELECT a.k gk, count(*) c, count(DISTINCT a.v) da, count(DISTINCT b.v) db,
+         stddev_pop(b.v) sdb
+  FROM fn_a a FULL JOIN fn_b b ON a.k=b.k GROUP BY a.k;
+INSERT INTO fn_a VALUES (4,NULL,88);  -- another real NULL-key row into the NULL group
+DELETE FROM fn_b WHERE k=5;           -- drop the b-orphan from the NULL group
+UPDATE fn_a SET k=1 WHERE id=3;       -- move a real NULL-key row into group 1
+DELETE FROM fn_a WHERE id=1;          -- shrink group 1
+REFRESH MATERIALIZED VIEW fn13_o;
+DO $$
+DECLARE d int;
+BEGIN
+  SELECT count(*) INTO d FROM (
+    (SELECT gk,c,da,db,sdb FROM fn13_i EXCEPT SELECT gk,c,da,db,sdb FROM fn13_o) UNION ALL
+    (SELECT gk,c,da,db,sdb FROM fn13_o EXCEPT SELECT gk,c,da,db,sdb FROM fn13_i)) x;
+  IF d<>0 THEN RAISE EXCEPTION 'FULL DISTINCT/stddev + NULL-key data: FAIL (% rows differ)', d;
+  ELSE RAISE NOTICE 'FULL JOIN DISTINCT/stddev + real NULL-key rows == REFRESH: PASS'; END IF;
+END$$;
+DROP TABLE fn_a, fn_b CASCADE;
 
 \echo ''
 \echo '=== DISTINCT / stddev over OUTER join test complete ==='

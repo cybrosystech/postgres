@@ -280,6 +280,8 @@ static bool incr_agg_arg_deparse_safe(Node *expr);
 static bool incr_aggs_need_deparse(Query *viewQuery);
 static bool incr_inner_join_deparse_shape(Query *viewQuery, int nbasetables);
 static bool incr_recompute_outer_shape(Query *viewQuery, int nbasetables);
+static bool incr_full_join_single_side_keys(Query *viewQuery);
+static bool incr_try_resolve_var_to_rel(Var *v, List *rtable, int *varno_out);
 static Node *incr_group_key_expr(Query *q, TargetEntry *te);
 static bool incr_group_needs_deparse(Query *viewQuery);
 static Node *incr_get_where_qual(Query *viewQuery);
@@ -654,9 +656,29 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 			}
 			if (has_full_join && viewQuery->groupClause != NIL)
 			{
-				*reason = "FULL OUTER JOIN with GROUP BY is not supported; "
-						  "omit GROUP BY or use INNER/LEFT/RIGHT JOIN instead";
-				return false;
+				/*
+				 * FULL OUTER JOIN + GROUP BY is supported for the provably
+				 * correct subset only: exactly two joined tables where every
+				 * GROUP BY key is a plain column (Var) from a SINGLE one of
+				 * them.  In that shape the sole group arm 1 cannot see is the
+				 * all-NULL group (the other table's orphans); incr_build_outer_sql
+				 * adds a dedicated NULL arm for deltas on the key side.
+				 *
+				 * Rejected (an orphan flip can move a row BETWEEN non-NULL
+				 * groups, which the recompute arms do not track):
+				 *   • expression keys such as GROUP BY COALESCE(a.k, b.k);
+				 *   • mixed-side keys such as GROUP BY a.k, b.j;
+				 *   • FULL joins of three or more tables.
+				 */
+				if (nbasetables != 2 ||
+					!incr_full_join_single_side_keys(viewQuery))
+				{
+					*reason = "FULL OUTER JOIN with GROUP BY is supported only "
+							  "when exactly two tables are joined and every "
+							  "GROUP BY key is a plain column from a single one "
+							  "of them";
+					return false;
+				}
 			}
 		}
 
@@ -2533,11 +2555,15 @@ incr_inner_join_deparse_shape(Query *viewQuery, int nbasetables)
  * preserved rows whose join status changed (newly-orphaned or newly-matched),
  * covering the NULL group that arm 1 cannot see.
  *
+ * FULL OUTER JOIN + GROUP BY is gated separately (incr_full_join_single_side_keys
+ * at CREATE time): the two-table, single-side plain-column shape is supported and
+ * incr_build_outer_sql adds a dedicated all-NULL arm for key-side deltas; every
+ * other FULL-join shape is rejected before this function is reached.
+ *
  * Still rejected:
  *   • Optional-side group key with an INDIRECT join to preserved (multi-hop
  *     chain): arm 2 cannot be built without joining the intermediate table.
  *   • Outer-join + self-join (dedicated path).
- *   • FULL OUTER JOIN + GROUP BY (rejected before this function is called).
  */
 static bool
 incr_recompute_outer_shape(Query *viewQuery, int nbasetables)
@@ -2596,6 +2622,96 @@ incr_recompute_outer_shape(Query *viewQuery, int nbasetables)
 				return false;	/* indirect connection — cannot build arm 2 */
 			break;				/* direct connection — arm 2 handles it */
 		}
+	}
+	return true;
+}
+
+/*
+ * incr_try_resolve_var_to_rel — like incr_resolve_var_colname, but returns
+ * false instead of elog'ing when the Var resolves through a JOIN or GROUP alias
+ * that is not itself a plain Var.  A FULL JOIN USING/NATURAL column, for
+ * example, is a COALESCE(a.k, b.k) in joinaliasvars — COALESCE-like and not
+ * supported by the single-side FULL-join strategy — so callers gating shapes at
+ * CREATE time can reject cleanly rather than raise an internal error.
+ */
+static bool
+incr_try_resolve_var_to_rel(Var *v, List *rtable, int *varno_out)
+{
+	for (;;)
+	{
+		RangeTblEntry *rte = rt_fetch(v->varno, rtable);
+		Node		  *sub;
+
+		if (rte->rtekind == RTE_RELATION)
+		{
+			*varno_out = v->varno;
+			return true;
+		}
+		if (rte->rtekind == RTE_JOIN)
+		{
+			if (v->varattno < 1 ||
+				v->varattno > list_length(rte->joinaliasvars))
+				return false;
+			sub = list_nth(rte->joinaliasvars, v->varattno - 1);
+		}
+		else if (rte->rtekind == RTE_GROUP)
+		{
+			if (v->varattno < 1 ||
+				v->varattno > list_length(rte->groupexprs))
+				return false;
+			sub = list_nth(rte->groupexprs, v->varattno - 1);
+		}
+		else
+			return false;
+		if (!IsA(sub, Var))
+			return false;
+		v = (Var *) sub;
+	}
+}
+
+/*
+ * incr_full_join_single_side_keys — true iff every GROUP BY key of viewQuery
+ * is a plain column (Var) resolving to the SAME base relation.
+ *
+ * Gate for FULL OUTER JOIN + GROUP BY.  With a single-side plain-column key
+ * the recompute strategy is provably correct: an orphan flip on the delta side
+ * keeps a row's key value within its group (for keys on the surviving side) or
+ * moves it to/from the all-NULL group (for keys on the flipping side), and the
+ * dedicated NULL arm in incr_build_outer_sql covers exactly that all-NULL
+ * group.  Expression keys (e.g. COALESCE(a.k, b.k)) and mixed-side keys can
+ * relocate a row BETWEEN non-NULL groups on a flip, which the recompute arms do
+ * not track, so they are rejected.
+ */
+static bool
+incr_full_join_single_side_keys(Query *viewQuery)
+{
+	ListCell   *lc;
+	int			key_varno = -1;
+
+	if (viewQuery->groupClause == NIL)
+		return false;
+
+	foreach(lc, viewQuery->groupClause)
+	{
+		SortGroupClause *sgc   = lfirst_node(SortGroupClause, lc);
+		TargetEntry	    *te    = get_sortgroupclause_tle(sgc,
+														 viewQuery->targetList);
+		Node			*gexpr = incr_group_key_expr(viewQuery, te);
+		int				 rv;
+
+		if (gexpr == NULL || !IsA(gexpr, Var))
+			return false;			/* expression key — not supported */
+		/*
+		 * Resolve without elog: a FULL JOIN USING/NATURAL merged column is a
+		 * COALESCE in joinaliasvars, which is COALESCE-like and unsupported —
+		 * reject it cleanly here rather than crash in incr_resolve_var_colname.
+		 */
+		if (!incr_try_resolve_var_to_rel((Var *) gexpr, viewQuery->rtable, &rv))
+			return false;
+		if (key_varno == -1)
+			key_varno = rv;
+		else if (rv != key_varno)
+			return false;			/* mixed-side keys — not supported */
 	}
 	return true;
 }
@@ -5380,6 +5496,8 @@ incr_build_outer_sql(Oid mvrelid, Query *viewQuery,
 	IncrJoinEntry  *preserved_entry = NULL;
 	IncrJoinEntry  *delta_entry     = NULL;
 	bool			need_orphan_arm  = false;
+	bool			full_null_arm    = false;
+	bool			is_full_join     = false;
 	bool			actual_delete_step;
 	bool			is_del           = (strcmp(delta_table,
 											  MATVIEW_INCR_OLDTABLE) == 0);
@@ -5440,11 +5558,61 @@ incr_build_outer_sql(Oid mvrelid, Query *viewQuery,
 	}
 
 	/*
+	 * FULL OUTER JOIN NULL arm.
+	 *
+	 * A FULL JOIN preserves rows from BOTH sides, so both can spawn orphans.
+	 * CREATE-time gating (incr_full_join_single_side_keys) guarantees this is a
+	 * two-table FULL join whose GROUP BY keys are all plain Vars from ONE side
+	 * (the "key side").  The only group arm 1 cannot see is the all-NULL group:
+	 * the OTHER side's orphans, whose key-side columns are NULL.
+	 *
+	 * A delta on the KEY-side table flips the other side's orphan status:
+	 *   • delete: an other-side row that matched only the deleted key-side rows
+	 *     becomes orphaned → it enters the all-NULL group;
+	 *   • insert: a previously-orphaned other-side row that matches an inserted
+	 *     key-side row leaves the all-NULL group.
+	 * Arm 1 misses both (the flipping other-side row appears MATCHED against the
+	 * delta ENR, not as an orphan).  So for any delta on the key side we add the
+	 * all-NULL group row to _affected_ and let _new_agg_ recompute it.
+	 *
+	 * A delta on the OTHER (non-key) side is fully covered by arm 1: an orphan
+	 * row in the delta ENR surfaces as an orphan there, contributing the NULL
+	 * key directly.
+	 */
+	{
+		ListCell *flc;
+
+		foreach(flc, all_tables)
+		{
+			if (((IncrJoinEntry *) lfirst(flc))->join_type == JOIN_FULL)
+			{
+				is_full_join = true;
+				break;
+			}
+		}
+	}
+	if (is_full_join && viewQuery->groupClause != NIL)
+	{
+		SortGroupClause *sgc0 = lfirst_node(SortGroupClause,
+											list_head(viewQuery->groupClause));
+		TargetEntry	    *te0  = get_sortgroupclause_tle(sgc0,
+														viewQuery->targetList);
+		int				 key_side_varno;
+
+		/* Gate guarantees a single-side plain-Var key set. */
+		Assert(IsA(te0->expr, Var));
+		incr_resolve_var_colname((Var *) te0->expr, viewQuery->rtable,
+								 &key_side_varno);
+		full_null_arm = (delta_varno == key_side_varno);
+	}
+
+	/*
 	 * For ins_sql with arm 2: the NULL group may completely vanish (every
 	 * orphaned preserved row gained an optional match), so we need the DELETE
-	 * step even on the insert path.
+	 * step even on the insert path.  Likewise the FULL-join NULL arm can vanish
+	 * the all-NULL group on an insert that de-orphans the last orphan.
 	 */
-	actual_delete_step = include_delete_step || need_orphan_arm;
+	actual_delete_step = include_delete_step || need_orphan_arm || full_null_arm;
 
 	initStringInfo(&buf);
 
@@ -5614,6 +5782,34 @@ incr_build_outer_sql(Oid mvrelid, Query *viewQuery,
 							 delta_table, enr_cond,
 							 mv_qname(delta_entry->oid), live_cond_x,
 							 delta_table, enr_cond_jn);
+		}
+	}
+
+	/* ----------------------------------------------------------------
+	 * _affected_ CTE — FULL-join NULL arm.
+	 *
+	 * For a delta on the key side of a single-side FULL-join aggregate, add
+	 * the all-NULL group row (every key column NULL) so _new_agg_ recomputes
+	 * the other side's orphan group.  A constant SELECT (no FROM) — it is
+	 * unconditional and idempotent: if there is no all-NULL group before or
+	 * after the delta, _new_agg_ simply omits it and the DELETE step is a
+	 * no-op.  See the full_null_arm comment above for why arm 1 misses it.
+	 * ---------------------------------------------------------------- */
+	if (full_null_arm)
+	{
+		appendStringInfoString(&buf, "\n  UNION\n  SELECT ");
+		first = true;
+		foreach(lc, viewQuery->groupClause)
+		{
+			SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+			TargetEntry     *te  = get_sortgroupclause_tle(sgc,
+														   viewQuery->targetList);
+
+			if (!first) appendStringInfoString(&buf, ", ");
+			first = false;
+			appendStringInfo(&buf, "CAST(NULL AS %s) AS %s",
+							 format_type_be(((Var *) te->expr)->vartype),
+							 quote_identifier(te->resname));
 		}
 	}
 
