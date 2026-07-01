@@ -2329,6 +2329,18 @@ ExecuteTruncateGuts(List *explicit_rels,
 							 &reindex_params);
 		}
 
+		/*
+		 * If this is a leaf partition whose parent carries a global partition
+		 * index, the truncation just replaced the partition's heap with a new
+		 * empty one.  Resync the parent's global indexes: this removes the
+		 * now-dangling entries that route to this partition (otherwise a later
+		 * lookup would try to fetch a TID from the truncated heap and error
+		 * with "could not read block").  Backfill from the empty heap is a
+		 * no-op, so the net effect is to purge this partition's entries.
+		 */
+		if (rel->rd_rel->relispartition)
+			IndexGlobalResyncPartition(rel);
+
 		pgstat_count_truncate(rel);
 	}
 

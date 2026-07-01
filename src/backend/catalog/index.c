@@ -1751,6 +1751,30 @@ index_create(Relation heapRelation,
 			 */
 			write_global_index_metapage(indexRelation);
 			build_global_index(heapRelation, indexRelation, indexInfo);
+
+			/*
+			 * A new global index contributes HOT-blocking columns to every
+			 * leaf partition (see AddParentGlobalIndexHotBlockingAttrs in
+			 * relcache.c).  Invalidate the partitions' relcache entries so that
+			 * already-connected backends rebuild those bitmaps; otherwise they
+			 * would keep treating an UPDATE of the indexed column as HOT and
+			 * silently skip global-index maintenance.
+			 */
+			{
+				List	   *children;
+				ListCell   *lc;
+
+				children = find_all_inheritors(RelationGetRelid(heapRelation),
+											   NoLock, NULL);
+				foreach(lc, children)
+				{
+					Oid			childoid = lfirst_oid(lc);
+
+					if (childoid != RelationGetRelid(heapRelation))
+						CacheInvalidateRelcacheByRelid(childoid);
+				}
+				list_free(children);
+			}
 		}
 	}
 	else
