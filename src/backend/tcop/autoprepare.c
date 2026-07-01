@@ -232,24 +232,23 @@ aprep_parameterize_build(Query *analyzed, Oid **types_out, int *nparams_out)
 {
 	AprepBuildCtx ctx;
 	Query	   *mutated;
-	Node	   *save_lo = analyzed->limitOffset;
-	Node	   *save_lc = analyzed->limitCount;
 
 	ctx.next_paramid = 0;
 	ctx.too_many = false;
 
-	analyzed->limitOffset = NULL;
-	analyzed->limitCount = NULL;
+	/*
+	 * Parameterize the ENTIRE query, including LIMIT/OFFSET.  We must
+	 * parameterize these (not keep them literal) because the queryId we key on
+	 * normalizes constants away -- so "LIMIT 10" and "LIMIT 20" share a
+	 * queryId.  If the limit stayed literal, the cached plan would bake in one
+	 * limit and hand it to the other query, returning the wrong number of
+	 * rows.  Turning the limit into a $n bound fresh at execution keeps the
+	 * result correct while the shapes still share one cached plan.
+	 */
 	mutated = query_tree_mutator(analyzed, aprep_build_mutator, &ctx, 0);
-	analyzed->limitOffset = save_lo;	/* restore caller's tree */
-	analyzed->limitCount = save_lc;
 
 	if (ctx.too_many || ctx.next_paramid == 0)
 		return NULL;
-
-	/* Re-attach the original (un-parameterized) LIMIT/OFFSET literals. */
-	mutated->limitOffset = copyObject(save_lo);
-	mutated->limitCount = copyObject(save_lc);
 
 	*types_out = (Oid *) palloc(sizeof(Oid) * ctx.next_paramid);
 	memcpy(*types_out, ctx.types, sizeof(Oid) * ctx.next_paramid);
@@ -379,8 +378,6 @@ static ParamListInfo
 extract_bound_params(Query *query, Oid *param_types, int num_params)
 {
 	AprepExtractCtx ctx;
-	Node	   *save_lo = query->limitOffset;
-	Node	   *save_lc = query->limitCount;
 
 	ctx.next_paramid = 0;
 	ctx.params = makeParamList(num_params);
@@ -388,12 +385,9 @@ extract_bound_params(Query *query, Oid *param_types, int num_params)
 	ctx.nexpected = num_params;
 	ctx.mismatch = false;
 
-	/* Mirror build: hide LIMIT/OFFSET so their literals aren't counted. */
-	query->limitOffset = NULL;
-	query->limitCount = NULL;
+	/* Walk the whole query (incl. LIMIT/OFFSET) so the limit value is bound,
+	 * exactly mirroring aprep_parameterize_build. */
 	(void) query_tree_walker(query, aprep_extract_walker, &ctx, 0);
-	query->limitOffset = save_lo;
-	query->limitCount = save_lc;
 
 	if (ctx.mismatch || ctx.next_paramid != num_params)
 		return NULL;			/* fail safe -> caller plans normally */
