@@ -7,11 +7,14 @@
 -- the aggregate verbatim — including DISTINCT — so it is correct for the
 -- recompute aggregates, not just additive ones.
 --
--- SCOPE: enabled for a TWO-TABLE outer join (one preserved + one optional side)
--- whose GROUP BY keys all live on the preserved side — the shape the builder
--- maintains correctly.  3+ table outer-join mixes (an extra INNER-joined
--- dimension), keys on the optional side, FULL OUTER JOIN + GROUP BY, and
--- outer + self-join stay rejected cleanly (see the rejection cases below).
+-- SCOPE: enabled for outer-join matviews with GROUP BY keys on the preserved
+-- anchor, INNER-joined dimension tables, OR an optional (LEFT/RIGHT-joined)
+-- table that is directly connected to the preserved anchor.  For the last
+-- case the builder adds a second UNION arm to _affected_ (orphan detection)
+-- that captures preserved rows that changed join status, covering NULL-group
+-- births and deaths that the delta-row arm alone cannot see.
+-- Still rejected: FULL OUTER JOIN + GROUP BY; outer + self-join; optional-side
+-- group keys via multi-hop chains (see Case 10).
 --
 -- Every case is checked == a full REFRESH of an identically-defined plain
 -- matview, including orphan (preserved-only) groups whose DISTINCT count is 0,
@@ -210,25 +213,109 @@ DO $$DECLARE d int; BEGIN
 END$$;
 DROP TABLE s3p, s3r, s3f CASCADE;
 
--- 9. Out-of-scope shapes still rejected cleanly.
-DROP TABLE IF EXISTS t3p, t3c CASCADE;
-CREATE TABLE t3p(id int primary key, g int);
-CREATE TABLE t3c(id int primary key, pid int, v int);
+-- 9. Optional-side group key: GROUP BY c.k where c is LEFT-joined.
+--    Delete from c can orphan preserved rows → they join the NULL group.
+--    Insert into c can de-orphan preserved rows → NULL group shrinks/vanishes.
+--    The dual-arm _affected_ CTE handles both correctly.
+DROP TABLE IF EXISTS ok_p, ok_c CASCADE;
+CREATE TABLE ok_p(id int primary key, label text);
+CREATE TABLE ok_c(id int primary key, pid int, k int, v int);
+INSERT INTO ok_p VALUES (1,'a'),(2,'b'),(3,'c');
+-- p.id=3 is initially orphaned (no c match) → NULL group exists from the start
+INSERT INTO ok_c VALUES (1,1,10,100),(2,1,10,200),(3,2,20,300);
+
+CREATE MATERIALIZED VIEW ok9_i WITH (incremental_refresh=true) AS
+  SELECT c.k, count(DISTINCT c.v) dv, count(c.id) cnt
+  FROM ok_p p LEFT JOIN ok_c c ON c.pid=p.id
+  GROUP BY c.k;
+CREATE MATERIALIZED VIEW ok9_o AS
+  SELECT c.k, count(DISTINCT c.v) dv, count(c.id) cnt
+  FROM ok_p p LEFT JOIN ok_c c ON c.pid=p.id
+  GROUP BY c.k;
+
+-- Delete all c rows for p.id=2 (k=20): p.id=2 becomes orphaned → NULL group grows
+DELETE FROM ok_c WHERE pid=2;
+-- Insert a new c row for previously-orphaned p.id=3 → NULL group shrinks; k=30 appears
+INSERT INTO ok_c VALUES (4,3,30,400);
+
+REFRESH MATERIALIZED VIEW ok9_o;
+DO $$DECLARE d int; BEGIN
+  SELECT count(*) INTO d FROM (
+    (SELECT k,dv,cnt FROM ok9_i EXCEPT SELECT k,dv,cnt FROM ok9_o)
+    UNION ALL
+    (SELECT k,dv,cnt FROM ok9_o EXCEPT SELECT k,dv,cnt FROM ok9_i)
+  ) z;
+  IF d=0 THEN RAISE NOTICE 'optional-side GROUP BY key (del→orphan, ins→de-orphan) == REFRESH: PASS';
+  ELSE RAISE EXCEPTION 'optional-side GROUP BY key: FAIL (% diffs)', d; END IF;
+END$$;
+DROP TABLE ok_p, ok_c CASCADE;
+
+-- 9b. Optional-side group key with additive COUNT(*) (no DISTINCT — a
+--     different code path, but arm 2 fixes it for the same reason).
+DROP TABLE IF EXISTS ok2_p, ok2_c CASCADE;
+CREATE TABLE ok2_p(id int primary key);
+CREATE TABLE ok2_c(id int primary key, pid int, k text);
+INSERT INTO ok2_p VALUES (1),(2),(3);
+-- p.id=3 initially orphaned
+INSERT INTO ok2_c VALUES (1,1,'A'),(2,1,'A'),(3,2,'B');
+
+CREATE MATERIALIZED VIEW ok9b_i WITH (incremental_refresh=true) AS
+  SELECT c.k, count(*) cnt
+  FROM ok2_p p LEFT JOIN ok2_c c ON c.pid=p.id
+  GROUP BY c.k;
+CREATE MATERIALIZED VIEW ok9b_o AS
+  SELECT c.k, count(*) cnt
+  FROM ok2_p p LEFT JOIN ok2_c c ON c.pid=p.id
+  GROUP BY c.k;
+
+-- Delete B: p.id=2 becomes orphaned → NULL group grows from 1 to 2
+DELETE FROM ok2_c WHERE k='B';
+-- Insert C for p.id=3 (was orphaned): NULL group shrinks from 2 to 1; C appears
+INSERT INTO ok2_c VALUES (4,3,'C');
+
+REFRESH MATERIALIZED VIEW ok9b_o;
+DO $$DECLARE d int; BEGIN
+  SELECT count(*) INTO d FROM (
+    (SELECT k,cnt FROM ok9b_i EXCEPT SELECT k,cnt FROM ok9b_o)
+    UNION ALL
+    (SELECT k,cnt FROM ok9b_o EXCEPT SELECT k,cnt FROM ok9b_i)
+  ) z;
+  IF d=0 THEN RAISE NOTICE 'optional-side GROUP BY key + COUNT(*) == REFRESH: PASS';
+  ELSE RAISE EXCEPTION 'optional-side GROUP BY key + COUNT(*): FAIL (% diffs)', d; END IF;
+END$$;
+DROP TABLE ok2_p, ok2_c CASCADE;
+
+-- 10. Remaining out-of-scope shapes still rejected cleanly.
 DO $$
 DECLARE made bool;
 BEGIN
-  -- group key on the OPTIONAL (non-preserved) side: rejected because a DELETE on
-  -- the optional side can create new NULL groups not captured by the delta path
+  -- FULL OUTER JOIN + GROUP BY: both sides can orphan rows into NULL groups;
+  -- dual-arm cannot be built simply for both directions simultaneously.
   BEGIN
     made := false;
-    CREATE MATERIALIZED VIEW _t3 WITH (incremental_refresh=true) AS
-      SELECT c.v AS k, count(DISTINCT c.id) dv FROM t3p p LEFT JOIN t3c c ON c.pid=p.id GROUP BY c.v;
+    CREATE TABLE _tfa(id int primary key, k int);
+    CREATE TABLE _tfb(id int primary key, k int);
+    CREATE MATERIALIZED VIEW _tfmv WITH (incremental_refresh=true) AS
+      SELECT a.k FROM _tfa a FULL JOIN _tfb b ON a.k=b.k GROUP BY a.k;
     made := true;
   EXCEPTION WHEN feature_not_supported THEN NULL; END;
-  IF made THEN RAISE EXCEPTION 'optional-side group key DISTINCT: FAIL (accepted)';
-  ELSE RAISE NOTICE 'optional-side group-key DISTINCT: PASS (rejected cleanly)'; END IF;
+  DROP TABLE IF EXISTS _tfa, _tfb CASCADE;
+  IF made THEN RAISE EXCEPTION 'FULL JOIN + GROUP BY: FAIL (accepted)';
+  ELSE RAISE NOTICE 'FULL JOIN + GROUP BY still rejected: PASS'; END IF;
+
+  -- Outer join + self-join: dedicated self-join path; not recompute-outer shape.
+  BEGIN
+    made := false;
+    CREATE TABLE _tsa(id int primary key, pid int, v int);
+    CREATE MATERIALIZED VIEW _tsamv WITH (incremental_refresh=true) AS
+      SELECT a.v, count(DISTINCT b.v) dv
+      FROM _tsa a LEFT JOIN _tsa b ON a.pid=b.id GROUP BY a.v;
+    made := true;
+  EXCEPTION WHEN feature_not_supported THEN NULL; END;
+  DROP TABLE IF EXISTS _tsa CASCADE;
+  IF made THEN RAISE EXCEPTION 'outer join + self-join: FAIL (accepted)';
+  ELSE RAISE NOTICE 'outer join + self-join still rejected: PASS'; END IF;
 END$$;
-DROP TABLE t3p, t3c CASCADE;
 
 \echo ''
 \echo '=== DISTINCT / stddev over OUTER join test complete ==='

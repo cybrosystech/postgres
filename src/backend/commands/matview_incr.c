@@ -842,8 +842,10 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 				{
 					*reason = psprintf("incremental %s(DISTINCT ...) is supported "
 									   "only over a single table, INNER JOIN, or "
-									   "outer join (group keys on preserved or "
-									   "inner-joined tables), without ordered-set "
+									   "outer join (group keys on the preserved "
+									   "anchor, inner-joined tables, or an "
+									   "optional-side table directly joined to the "
+									   "preserved anchor), without ordered-set "
 									   "aggregates or self-joins", fname);
 					return false;
 				}
@@ -928,8 +930,10 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 				{
 					*reason = psprintf("incremental %s() is supported only over a "
 								   "single table, INNER JOIN, or outer join "
-								   "(group keys on preserved or inner-joined "
-								   "tables), without ordered-set aggregates",
+								   "(group keys on the preserved anchor, "
+								   "inner-joined tables, or an optional-side "
+								   "table directly joined to the preserved "
+								   "anchor), without ordered-set aggregates",
 								   fname);
 					return false;
 				}
@@ -1378,10 +1382,15 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 											   all_tables, false);
 				/*
 				 * Always include the DELETE step for del_sql.  The step
-				 * uses NOT EXISTS in _new_agg_ (the live recompute result),
-				 * which is harmless for optional-side deltas (groups remain)
-				 * and correct for preserved-side and inner-dim deltas
-				 * (groups that vanish are absent from _new_agg_).
+				 * uses NOT EXISTS in _new_agg_ (the live recompute result).
+				 * Correct for all shapes:
+				 *   - Preserved/inner-dim delete: vanished groups absent from
+				 *     _new_agg_ → NOT EXISTS fires.
+				 *   - Optional-side delete (preserved group key): preserved
+				 *     rows remain → _new_agg_ has all groups → no-op.
+				 *   - Optional-side delete (optional group key, arm 2 active):
+				 *     arm 2 adds NULL to _affected_; DELETE removes it from
+				 *     the MV when all orphaned rows are gone.
 				 */
 				del_sql = incr_build_outer_sql(mvrelid, viewQuery,
 											   delta->varno,
@@ -2515,14 +2524,20 @@ incr_inner_join_deparse_shape(Query *viewQuery, int nbasetables)
  * The builder uses dbblue_deparse_query to render both _affected_ (delta group
  * keys via the transition-table ENR) and _new_agg_ (live recompute from the
  * real join), so it is correct for any number of tables and any mix of INNER
- * and LEFT/RIGHT outer joins, as long as every GROUP BY key comes from the
- * preserved (anchor) side or an INNER-joined dimension table — NOT from an
- * optional (LEFT/RIGHT) side table.  Group keys on optional-side tables need
- * a broader delta path that captures new NULL groups; that shape is rejected
- * cleanly.
+ * and LEFT/RIGHT outer joins.
  *
- * Also rejected: outer-join + self-join (dedicated path) and FULL OUTER JOIN
- * + GROUP BY (rejected before this function is called).
+ * Group keys from optional (LEFT/RIGHT-joined) tables are now supported when
+ * the optional table is DIRECTLY connected to the preserved anchor (its ON
+ * condition references preserved_varno on one side).  For those shapes
+ * incr_build_outer_sql adds a second UNION arm to _affected_ that captures
+ * preserved rows whose join status changed (newly-orphaned or newly-matched),
+ * covering the NULL group that arm 1 cannot see.
+ *
+ * Still rejected:
+ *   • Optional-side group key with an INDIRECT join to preserved (multi-hop
+ *     chain): arm 2 cannot be built without joining the intermediate table.
+ *   • Outer-join + self-join (dedicated path).
+ *   • FULL OUTER JOIN + GROUP BY (rejected before this function is called).
  */
 static bool
 incr_recompute_outer_shape(Query *viewQuery, int nbasetables)
@@ -2536,12 +2551,16 @@ incr_recompute_outer_shape(Query *viewQuery, int nbasetables)
 		return false;
 
 	/*
-	 * Reject if any GROUP BY key is a Var from a truly optional (non-preserved
-	 * LEFT/RIGHT-joined) table.  Keys on the preserved anchor or on INNER-joined
-	 * dimension tables are safe: the delta's join tree captures all affected groups.
+	 * Check each GROUP BY key from a truly optional (non-preserved
+	 * LEFT/RIGHT-joined) table.  Such keys are allowed only when the optional
+	 * table is DIRECTLY connected to the preserved anchor — i.e. the ON
+	 * condition of the optional table's join step references preserved_varno
+	 * on the other side.  Multi-hop connections (e.g. p INNER d LEFT c with
+	 * GROUP BY c.k) are rejected because arm 2 would need to traverse the
+	 * intermediate table chain.
 	 *
-	 * The preserved table in a RIGHT JOIN has join_type == JOIN_RIGHT, so we
-	 * must exclude it from the "optional" test.
+	 * Note: the preserved table in a RIGHT JOIN has join_type == JOIN_RIGHT,
+	 * so we must exclude it from the "optional" test.
 	 */
 	preserved_varno = incr_outer_preserved_varno(tabs);
 	foreach(lc, viewQuery->groupClause)
@@ -2556,15 +2575,26 @@ incr_recompute_outer_shape(Query *viewQuery, int nbasetables)
 
 		incr_resolve_var_colname((Var *) te->expr, viewQuery->rtable, &rv);
 
-		/* optional if LEFT/RIGHT-joined AND not the preserved anchor */
+		/* Check if this key is from a truly optional-side table */
 		foreach(jlc, tabs)
 		{
 			IncrJoinEntry *je = lfirst(jlc);
 
-			if (je->varno == rv &&
-				je->varno != preserved_varno &&
-				(je->join_type == JOIN_LEFT || je->join_type == JOIN_RIGHT))
-				return false;	/* truly optional-side group key */
+			if (je->varno != rv)
+				continue;
+			if (je->varno == preserved_varno)
+				break;			/* preserved anchor: always safe */
+			if (je->join_type != JOIN_LEFT && je->join_type != JOIN_RIGHT)
+				break;			/* INNER-joined: always safe */
+
+			/*
+			 * Optional-side group key.  Allowed only when the optional table
+			 * is directly connected to the preserved anchor.  Detected by
+			 * checking that one side of the ON condition is preserved_varno.
+			 */
+			if (incr_qual_get_other_varno(je->quals, je->varno) != preserved_varno)
+				return false;	/* indirect connection — cannot build arm 2 */
+			break;				/* direct connection — arm 2 handles it */
 		}
 	}
 	return true;
@@ -5313,19 +5343,25 @@ qual_to_live_sql(Node *qual, List *rtable, List *all_tables, int preserved_varno
  * Instead of incrementally adding/subtracting deltas (which requires NULL
  * sentinel tracking), we use a "recompute affected groups" strategy:
  *
- *   1. Find the GROUP BY keys touched by this delta (the "affected" CTE).
+ *   1. Find the GROUP BY keys touched by this delta (_affected_ CTE).
+ *      - Arm 1: deparse the viewQuery with the delta table swapped to the
+ *        transition-table ENR.  Covers groups in the delta rows' join result.
+ *      - Arm 2 (optional-side group key only): detect preserved rows that
+ *        changed join status (newly-orphaned on del_sql; newly-matched on
+ *        ins_sql).  These rows may join/leave the NULL group which arm 1
+ *        cannot see.
  *   2. Re-run the full join query on live tables for those groups only
- *      (the "new_agg" CTE).
+ *      (_new_agg_ CTE).
  *   3. UPSERT (REPLACE semantics) those groups into the matview.
- *   4. (del_sql only, preserved-side delta) DELETE groups whose preserved
- *      side no longer has rows.
+ *   4. DELETE groups absent from _new_agg_: always for del_sql; also for
+ *      ins_sql when arm 2 is present (the NULL group can vanish when every
+ *      orphaned preserved row gains an optional match).
  *
  * delta_varno:       varno of the delta table in viewQuery->rtable.
  * delta_table:       transition table name ("__mv_newtable" / "__mv_oldtable").
  * all_tables:        flat list of IncrJoinEntry*, left-to-right join order.
- * include_delete_step: true for del_sql (any delta source); the function
- *                     then appends a CTE DELETE that removes groups absent
- *                     from _new_agg_ (harmless for optional-side deltas).
+ * include_delete_step: true for del_sql; overridden to true internally when
+ *                     arm 2 is present (ins_sql can then vanish the NULL group).
  */
 static char *
 incr_build_outer_sql(Oid mvrelid, Query *viewQuery,
@@ -5337,29 +5373,90 @@ incr_build_outer_sql(Oid mvrelid, Query *viewQuery,
 	const char	   *mvname = mv_qname(mvrelid);
 	bool			first;
 
+	/* ----------------------------------------------------------------
+	 * Pre-compute preserved/delta metadata needed for arm 2.
+	 * ---------------------------------------------------------------- */
+	int				preserved_varno;
+	IncrJoinEntry  *preserved_entry = NULL;
+	IncrJoinEntry  *delta_entry     = NULL;
+	bool			need_orphan_arm  = false;
+	bool			actual_delete_step;
+	bool			is_del           = (strcmp(delta_table,
+											  MATVIEW_INCR_OLDTABLE) == 0);
+
+	preserved_varno = incr_outer_preserved_varno(all_tables);
+
+	foreach(lc, all_tables)
+	{
+		IncrJoinEntry *je = lfirst(lc);
+
+		if (je->varno == preserved_varno)
+			preserved_entry = je;
+		if (je->varno == delta_varno)
+			delta_entry = je;
+	}
+	Assert(delta_entry != NULL && preserved_entry != NULL);
+
+	/*
+	 * Arm 2 is needed when:
+	 *   (a) the delta is an optional-side (LEFT or RIGHT joined) table,
+	 *   (b) it is DIRECTLY connected to the preserved anchor (its ON condition
+	 *       references preserved_varno on one side — multi-hop chains are not
+	 *       supported and are rejected at CREATE time by incr_recompute_outer_shape),
+	 *   (c) at least one GROUP BY key comes from the delta table (optional side),
+	 *   (d) all GROUP BY keys are plain Vars from either the preserved anchor or
+	 *       the delta table itself (no third-table or expression keys).
+	 */
+	if (delta_varno != preserved_varno &&
+		(delta_entry->join_type == JOIN_LEFT ||
+		 delta_entry->join_type == JOIN_RIGHT) &&
+		incr_qual_get_other_varno(delta_entry->quals, delta_varno) == preserved_varno)
+	{
+		bool	has_opt_key   = false;
+		bool	has_third_key = false;
+
+		foreach(lc, viewQuery->groupClause)
+		{
+			SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+			TargetEntry     *te  = get_sortgroupclause_tle(sgc,
+														   viewQuery->targetList);
+			int				 rv;
+
+			if (!IsA(te->expr, Var))
+			{
+				has_third_key = true;
+				break;
+			}
+			incr_resolve_var_colname((Var *) te->expr, viewQuery->rtable, &rv);
+			if (rv == delta_varno)
+				has_opt_key = true;
+			else if (rv != preserved_varno)
+			{
+				has_third_key = true;
+				break;
+			}
+		}
+		need_orphan_arm = has_opt_key && !has_third_key;
+	}
+
+	/*
+	 * For ins_sql with arm 2: the NULL group may completely vanish (every
+	 * orphaned preserved row gained an optional match), so we need the DELETE
+	 * step even on the insert path.
+	 */
+	actual_delete_step = include_delete_step || need_orphan_arm;
+
 	initStringInfo(&buf);
 
 	/* ----------------------------------------------------------------
-	 * _affected_ CTE: GROUP BY key combinations touched by this delta.
-	 *
-	 * Strategy: deparse the viewQuery with the delta table swapped to the
-	 * named transition-table ENR (_dg_ subquery), then SELECT DISTINCT
-	 * only the GROUP BY column names from that result.  The deparse core
-	 * handles the JOIN tree, correct join types, and any column origin —
-	 * no hand aliasing required.
+	 * _affected_ CTE — arm 1: GROUP BY key combinations touched by this
+	 * delta.  Strategy: deparse the viewQuery with the delta table swapped
+	 * to the named transition-table ENR (_dg_ subquery), then SELECT DISTINCT
+	 * only the GROUP BY column names from that result.
 	 * ---------------------------------------------------------------- */
 	{
-		IncrJoinEntry  *delta_entry = NULL;
-		Query		   *aff_dq;
-		char		   *aff_sel;
-
-		foreach(lc, all_tables)
-		{
-			IncrJoinEntry *je = lfirst(lc);
-
-			if (je->varno == delta_varno) { delta_entry = je; break; }
-		}
-		Assert(delta_entry != NULL);
+		Query  *aff_dq;
+		char   *aff_sel;
 
 		aff_dq = incr_build_delta_select_query(viewQuery, delta_entry->oid,
 											   delta_table);
@@ -5378,8 +5475,149 @@ incr_build_outer_sql(Oid mvrelid, Query *viewQuery,
 			appendStringInfoString(&buf, quote_identifier(te->resname));
 			first = false;
 		}
-		appendStringInfo(&buf, "\n  FROM (%s) _dg_\n),\n", aff_sel);
+		appendStringInfo(&buf, "\n  FROM (%s) _dg_", aff_sel);
 	}
+
+	/* ----------------------------------------------------------------
+	 * _affected_ CTE — arm 2 (orphan detection for optional-side group
+	 * keys).
+	 *
+	 * A DELETE on the optional side can BIRTH a new NULL group (preserved
+	 * rows that lost their last optional match become orphaned and join the
+	 * NULL group).  An INSERT on the optional side can SHRINK or VANISH the
+	 * NULL group (previously-orphaned preserved rows now have a match).
+	 * Arm 1 only sees the old/new key values of the delta rows themselves;
+	 * it cannot see these NULL-group changes.  Arm 2 covers them.
+	 *
+	 * del_sql arm 2:
+	 *   JOIN preserved to OLDTABLE (find which preserved rows were affected),
+	 *   then LEFT JOIN to the live optional table.  For orphaned rows the
+	 *   LEFT JOIN produces NULL — that is their new group key.  For rows
+	 *   that still have optional matches the arm produces those keys (a
+	 *   harmless superset already captured by arm 1).
+	 *
+	 * ins_sql arm 2:
+	 *   JOIN preserved to NEWTABLE (find which preserved rows gained a new
+	 *   optional match), filtered to rows that had NO other optional match
+	 *   before (= rows that were previously in the NULL group).  Detected via
+	 *   ctid: a live optional row whose ctid does not appear in NEWTABLE is
+	 *   a pre-existing row.  If no such row exists for a given preserved row,
+	 *   that preserved row was previously unmatched → its old group key was
+	 *   NULL → NULL is now in _affected_.
+	 * ---------------------------------------------------------------- */
+	if (need_orphan_arm)
+	{
+		char   *live_cond;
+		char   *enr_cond;
+
+		live_cond = qual_to_live_sql(delta_entry->quals, viewQuery->rtable,
+									 all_tables, preserved_varno);
+		/* ENR condition: same as live_cond but with the optional-table alias
+		 * replaced by _jd_ (the delta ENR alias). */
+		enr_cond = str_replace_all(live_cond,
+								   psprintf("_lt%d_", delta_varno), "_jd_");
+
+		appendStringInfoString(&buf, "\n  UNION\n  SELECT DISTINCT ");
+		first = true;
+		foreach(lc, viewQuery->groupClause)
+		{
+			SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+			TargetEntry     *te  = get_sortgroupclause_tle(sgc,
+														   viewQuery->targetList);
+			const char	   *resname;
+			int				 rv;
+			const char	   *colname;
+
+			/* need_orphan_arm guarantees all keys are plain Vars from
+			 * preserved_varno or delta_varno. */
+			Assert(IsA(te->expr, Var));
+			colname = incr_resolve_var_colname((Var *) te->expr,
+											   viewQuery->rtable, &rv);
+			resname = quote_identifier(te->resname);
+
+			if (!first) appendStringInfoString(&buf, ", ");
+			first = false;
+
+			if (rv == delta_varno)
+			{
+				if (is_del)
+					/* del_sql: read current optional value (NULL if orphaned) */
+					appendStringInfo(&buf, "_lt%d_.%s AS %s",
+									 delta_varno,
+									 quote_identifier(colname), resname);
+				else
+				{
+					/*
+					 * ins_sql: these rows were in the NULL group before the
+					 * insert.  Cast NULL to the column's actual type so that
+					 * UNION type resolution works for any column type (bare
+					 * NULL is typed as "unknown" which becomes "text" under
+					 * SELECT DISTINCT, causing a type mismatch in the UNION).
+					 */
+					appendStringInfo(&buf, "CAST(NULL AS %s) AS %s",
+									 format_type_be(((Var *) te->expr)->vartype),
+									 resname);
+				}
+			}
+			else
+			{
+				/* preserved_varno: always read from _ltp_ */
+				appendStringInfo(&buf, "_ltp_.%s AS %s",
+								 quote_identifier(colname), resname);
+			}
+		}
+
+		if (is_del)
+		{
+			/*
+			 * del_sql arm 2: for each preserved row that had a deleted optional
+			 * row, look up its CURRENT optional group key.  The LEFT JOIN
+			 * returns NULL for orphaned rows (no current optional match).
+			 */
+			appendStringInfo(&buf,
+							 "\n  FROM %s _ltp_\n"
+							 "  JOIN %s _jd_ ON (%s)\n"
+							 "  LEFT JOIN %s _lt%d_ ON (%s)",
+							 mv_qname(preserved_entry->oid),
+							 delta_table, enr_cond,
+							 mv_qname(delta_entry->oid), delta_varno, live_cond);
+		}
+		else
+		{
+			/*
+			 * ins_sql arm 2: find preserved rows that were PREVIOUSLY unmatched
+			 * (= were in the NULL group before this insert).
+			 *
+			 * A preserved row was previously unmatched iff ALL current optional
+			 * rows matching it come from NEWTABLE (no pre-existing rows).
+			 * Equivalently: COUNT(live optional matching p) = COUNT(NEWTABLE
+			 * matching p).  After the INSERT, COUNT(live) = COUNT(pre-existing)
+			 * + COUNT(NEWTABLE), so the equality holds iff COUNT(pre-existing)=0.
+			 *
+			 * Transition table ENRs do not expose system columns (ctid, oid),
+			 * so we use the COUNT comparison rather than a ctid-based filter.
+			 */
+			char *live_cond_x =
+				str_replace_all(live_cond,
+								psprintf("_lt%d_", delta_varno), "_ltx_");
+			char *enr_cond_jn =
+				str_replace_all(enr_cond, "_jd_", "_jn_");
+
+			appendStringInfo(&buf,
+							 "\n  FROM %s _ltp_\n"
+							 "  JOIN %s _jd_ ON (%s)\n"
+							 "  WHERE (SELECT COUNT(*) FROM %s _ltx_\n"
+							 "         WHERE %s)\n"
+							 "      = (SELECT COUNT(*) FROM %s _jn_\n"
+							 "         WHERE %s)",
+							 mv_qname(preserved_entry->oid),
+							 delta_table, enr_cond,
+							 mv_qname(delta_entry->oid), live_cond_x,
+							 delta_table, enr_cond_jn);
+		}
+	}
+
+	appendStringInfoString(&buf, "\n),\n");
 
 	/* ----------------------------------------------------------------
 	 * _new_agg_ CTE: recompute the full join for affected groups.
@@ -5491,23 +5729,32 @@ incr_build_outer_sql(Oid mvrelid, Query *viewQuery,
 
 	/* ----------------------------------------------------------------
 	 * Final statement.
-	 * del_sql on preserved side: also DELETE groups that vanished.
-	 * Otherwise: benign SELECT that forces _upd_ to execute.
+	 * Delete groups that were in _affected_ but no longer in _new_agg_.
+	 * Runs for del_sql always; also for ins_sql when arm 2 is present
+	 * (the NULL group can completely vanish).  Otherwise a benign SELECT
+	 * forces _upd_ to execute.
 	 * ---------------------------------------------------------------- */
-	if (include_delete_step)
+	if (actual_delete_step)
 	{
 		/*
 		 * DELETE groups that were in _affected_ but no longer appear in
 		 * _new_agg_.  Using _new_agg_ as the existence check is correct
 		 * for every outer-join shape:
 		 *
-		 *  • Preserved-side delete: the preserved row is gone, so the
-		 *    recomputed live query returns no row → NOT EXISTS fires.
+		 *  • Preserved-side delete: the preserved row is gone → no row in
+		 *    _new_agg_ → NOT EXISTS fires.
 		 *  • Inner-dim delete (3-table INNER+LEFT): _new_agg_ uses the
 		 *    viewQuery's real INNER join type, so unmatched groups produce
 		 *    no output → NOT EXISTS fires.
-		 *  • Optional-side delete: preserved rows remain → _new_agg_ still
-		 *    has all affected groups → NOT EXISTS never fires (harmless).
+		 *  • Optional-side delete with preserved group key: preserved rows
+		 *    remain → _new_agg_ has all groups → NOT EXISTS never fires
+		 *    (harmless, correct).
+		 *  • Optional-side delete with optional group key (arm 2 active):
+		 *    arm 2 adds NULL to _affected_; if _new_agg_ has no NULL group
+		 *    (no remaining orphans), NOT EXISTS fires and removes the stale
+		 *    NULL row from the matview.
+		 *  • ins_sql with arm 2: if the NULL group vanished (every orphaned
+		 *    preserved row gained a match), NOT EXISTS fires for NULL.
 		 *  • FULL JOIN: _new_agg_ covers both sides uniformly.
 		 */
 		appendStringInfo(&buf, "DELETE FROM %s _mv_\nUSING _affected_\nWHERE ",
