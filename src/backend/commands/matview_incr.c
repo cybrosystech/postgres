@@ -282,6 +282,15 @@ static bool incr_inner_join_deparse_shape(Query *viewQuery, int nbasetables);
 static bool incr_recompute_outer_shape(Query *viewQuery, int nbasetables);
 static bool incr_full_join_single_side_keys(Query *viewQuery);
 static bool incr_try_resolve_var_to_rel(Var *v, List *rtable, int *varno_out);
+static void incr_append_outer_recompute_tail(StringInfo buf, const char *mvname,
+											 Query *viewQuery, bool actual_delete_step);
+static Query *incr_build_delta_select_query_at_varno(Query *viewQuery,
+													 int target_varno,
+													 const char *enrName);
+static char *incr_build_self_outer_sql(Oid mvrelid, Query *viewQuery,
+									   int v1, int v2, const char *delta_table,
+									   List *all_tables, bool include_delete_step);
+static bool incr_self_outer_supported_shape(Query *viewQuery);
 static Node *incr_group_key_expr(Query *q, TargetEntry *te);
 static bool incr_group_needs_deparse(Query *viewQuery);
 static Node *incr_get_where_qual(Query *viewQuery);
@@ -644,14 +653,22 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 						  "in an incremental matview";
 				return false;
 			}
-			if (has_outer_join && self_join_seen)
+			if (has_outer_join && self_join_seen &&
+				!incr_self_outer_supported_shape(viewQuery))
 			{
-				/* The outer-join maintenance path registers one catalog row per
+				/*
+				 * The outer-join maintenance path registers one catalog row per
 				 * join alias keyed by (mvrelid, srctable); a self-join would
-				 * collide on that key.  Reject cleanly rather than leak an
-				 * internal unique-constraint violation at CREATE time. */
+				 * collide on that key.  The self-outer builder handles the
+				 * supported shape (two-way self LEFT/RIGHT join, GROUP BY keys
+				 * on the preserved anchor) with a single combined catalog row;
+				 * everything else (optional-side keys, FULL self join, 3+-table,
+				 * or row-level self outer join) is rejected cleanly rather than
+				 * leaking an internal unique-constraint violation at CREATE.
+				 */
 				*reason = "a self-join combined with LEFT/RIGHT/FULL OUTER JOIN "
-						  "is not supported";
+						  "is supported only as a two-table self LEFT/RIGHT join "
+						  "with GROUP BY keys on the preserved side";
 				return false;
 			}
 			if (has_full_join && viewQuery->groupClause != NIL)
@@ -1394,30 +1411,63 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 		else if (incr_has_outer_join(all_tables))
 		{
 			/* ---- Phase 8: outer join (LEFT/RIGHT/FULL) recompute strategy ---- */
+			Bitmapset  *done_oids = NULL;
+
 			foreach(jlc, all_tables)
 			{
 				IncrJoinEntry *delta = lfirst(jlc);
+				int			   v2;
 
-				ins_sql = incr_build_outer_sql(mvrelid, viewQuery,
-											   delta->varno,
-											   MATVIEW_INCR_NEWTABLE,
-											   all_tables, false);
-				/*
-				 * Always include the DELETE step for del_sql.  The step
-				 * uses NOT EXISTS in _new_agg_ (the live recompute result).
-				 * Correct for all shapes:
-				 *   - Preserved/inner-dim delete: vanished groups absent from
-				 *     _new_agg_ → NOT EXISTS fires.
-				 *   - Optional-side delete (preserved group key): preserved
-				 *     rows remain → _new_agg_ has all groups → no-op.
-				 *   - Optional-side delete (optional group key, arm 2 active):
-				 *     arm 2 adds NULL to _affected_; DELETE removes it from
-				 *     the MV when all orphaned rows are gone.
-				 */
-				del_sql = incr_build_outer_sql(mvrelid, viewQuery,
-											   delta->varno,
-											   MATVIEW_INCR_OLDTABLE,
-											   all_tables, true);
+				if (bms_is_member((int) delta->oid, done_oids))
+					continue;		/* self-joined OID already handled below */
+
+				v2 = incr_self_join_other_varno(all_tables, delta->varno,
+												delta->oid);
+				if (v2 != -1)
+				{
+					/*
+					 * Self OUTER join: the same table appears in two roles, so
+					 * a single combined statement handles both (like the INNER
+					 * self-join path) and one catalog row is stored for the OID
+					 * — registering per-varno would collide on (mvrelid,oid).
+					 * The supported shape is gated by incr_self_outer_supported_shape.
+					 */
+					int v1 = delta->varno;
+
+					if (v1 > v2) { int t = v1; v1 = v2; v2 = t; }
+					ins_sql = incr_build_self_outer_sql(mvrelid, viewQuery,
+														v1, v2,
+														MATVIEW_INCR_NEWTABLE,
+														all_tables, false);
+					del_sql = incr_build_self_outer_sql(mvrelid, viewQuery,
+														v1, v2,
+														MATVIEW_INCR_OLDTABLE,
+														all_tables, true);
+					done_oids = bms_add_member(done_oids, (int) delta->oid);
+				}
+				else
+				{
+					ins_sql = incr_build_outer_sql(mvrelid, viewQuery,
+												   delta->varno,
+												   MATVIEW_INCR_NEWTABLE,
+												   all_tables, false);
+					/*
+					 * Always include the DELETE step for del_sql.  The step
+					 * uses NOT EXISTS in _new_agg_ (the live recompute result).
+					 * Correct for all shapes:
+					 *   - Preserved/inner-dim delete: vanished groups absent from
+					 *     _new_agg_ → NOT EXISTS fires.
+					 *   - Optional-side delete (preserved group key): preserved
+					 *     rows remain → _new_agg_ has all groups → no-op.
+					 *   - Optional-side delete (optional group key, arm 2 active):
+					 *     arm 2 adds NULL to _affected_; DELETE removes it from
+					 *     the MV when all orphaned rows are gone.
+					 */
+					del_sql = incr_build_outer_sql(mvrelid, viewQuery,
+												   delta->varno,
+												   MATVIEW_INCR_OLDTABLE,
+												   all_tables, true);
+				}
 				incr_store_catalog(mvrelid, delta->oid,
 								   ins_sql, del_sql, "SELECT 1", hav_sql,
 								   incr_build_mv_lock_sql(mvrelid));
@@ -5815,6 +5865,31 @@ incr_build_outer_sql(Oid mvrelid, Query *viewQuery,
 
 	appendStringInfoString(&buf, "\n),\n");
 
+	/* _new_agg_ + _upd_ + final DELETE/SELECT — shared with the self-outer
+	 * builder; consumes the "_affected_ AS ( ... )," already appended above. */
+	incr_append_outer_recompute_tail(&buf, mvname, viewQuery, actual_delete_step);
+
+	return buf.data;
+}
+
+/*
+ * incr_append_outer_recompute_tail
+ *
+ * Append the shared recompute tail of an outer-join delta statement: the
+ * _new_agg_ CTE (live recompute of the affected groups), the _upd_ UPSERT CTE,
+ * and the final DELETE-vanished / benign-SELECT step.  buf must already hold
+ * "WITH _affected_ AS ( ... ),\n"; this appends the rest, leaving a complete
+ * statement.  Shared by incr_build_outer_sql (single delta table) and
+ * incr_build_self_outer_sql (a self-joined table in both roles), which differ
+ * only in how they build _affected_.
+ */
+static void
+incr_append_outer_recompute_tail(StringInfo buf, const char *mvname,
+								 Query *viewQuery, bool actual_delete_step)
+{
+	ListCell   *lc;
+	bool		first;
+
 	/* ----------------------------------------------------------------
 	 * _new_agg_ CTE: recompute the full join for affected groups.
 	 *
@@ -5832,7 +5907,7 @@ incr_build_outer_sql(Oid mvrelid, Query *viewQuery,
 		live_q->havingQual = NULL;
 		live_sel = dbblue_deparse_query(live_q);
 
-		appendStringInfo(&buf,
+		appendStringInfo(buf,
 						 "_new_agg_ AS (\n"
 						 "  SELECT __live__.*\n"
 						 "  FROM (%s) __live__\n"
@@ -5847,52 +5922,52 @@ incr_build_outer_sql(Oid mvrelid, Query *viewQuery,
 														   viewQuery->targetList);
 			const char      *col = quote_identifier(te->resname);
 
-			if (!first) appendStringInfoString(&buf, " AND ");
-			appendStringInfo(&buf,
+			if (!first) appendStringInfoString(buf, " AND ");
+			appendStringInfo(buf,
 							 "_affected_.%s IS NOT DISTINCT FROM __live__.%s",
 							 col, col);
 			first = false;
 		}
-		appendStringInfoString(&buf, "\n  )\n),\n");
+		appendStringInfoString(buf, "\n  )\n),\n");
 	}
 
 	/* ----------------------------------------------------------------
 	 * _upd_ CTE: UPSERT the recomputed rows into the matview.
 	 * ---------------------------------------------------------------- */
-	appendStringInfo(&buf, "_upd_ AS (\n  INSERT INTO %s (", mvname);
+	appendStringInfo(buf, "_upd_ AS (\n  INSERT INTO %s (", mvname);
 	first = true;
 	foreach(lc, viewQuery->targetList)
 	{
 		TargetEntry *te = lfirst_node(TargetEntry, lc);
 
 		if (te->resjunk) continue;
-		if (!first) appendStringInfoString(&buf, ", ");
-		appendStringInfoString(&buf, quote_identifier(te->resname));
+		if (!first) appendStringInfoString(buf, ", ");
+		appendStringInfoString(buf, quote_identifier(te->resname));
 		first = false;
 	}
-	appendStringInfoString(&buf, ")\n  SELECT ");
+	appendStringInfoString(buf, ")\n  SELECT ");
 	first = true;
 	foreach(lc, viewQuery->targetList)
 	{
 		TargetEntry *te = lfirst_node(TargetEntry, lc);
 
 		if (te->resjunk) continue;
-		if (!first) appendStringInfoString(&buf, ", ");
-		appendStringInfoString(&buf, quote_identifier(te->resname));
+		if (!first) appendStringInfoString(buf, ", ");
+		appendStringInfoString(buf, quote_identifier(te->resname));
 		first = false;
 	}
-	appendStringInfoString(&buf, " FROM _new_agg_\n  ON CONFLICT (");
+	appendStringInfoString(buf, " FROM _new_agg_\n  ON CONFLICT (");
 	first = true;
 	foreach(lc, viewQuery->groupClause)
 	{
 		SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
 		TargetEntry     *te  = get_sortgroupclause_tle(sgc, viewQuery->targetList);
 
-		if (!first) appendStringInfoString(&buf, ", ");
-		appendStringInfoString(&buf, quote_identifier(te->resname));
+		if (!first) appendStringInfoString(buf, ", ");
+		appendStringInfoString(buf, quote_identifier(te->resname));
 		first = false;
 	}
-	appendStringInfoString(&buf, ") DO UPDATE SET ");
+	appendStringInfoString(buf, ") DO UPDATE SET ");
 	first = true;
 	foreach(lc, viewQuery->targetList)
 	{
@@ -5915,13 +5990,13 @@ incr_build_outer_sql(Oid mvrelid, Query *viewQuery,
 		}
 		if (is_group_col) continue;
 
-		if (!first) appendStringInfoString(&buf, ", ");
-		appendStringInfo(&buf, "%s=EXCLUDED.%s",
+		if (!first) appendStringInfoString(buf, ", ");
+		appendStringInfo(buf, "%s=EXCLUDED.%s",
 						 quote_identifier(te->resname),
 						 quote_identifier(te->resname));
 		first = false;
 	}
-	appendStringInfoString(&buf, "\n)\n");
+	appendStringInfoString(buf, "\n)\n");
 
 	/* ----------------------------------------------------------------
 	 * Final statement.
@@ -5952,8 +6027,10 @@ incr_build_outer_sql(Oid mvrelid, Query *viewQuery,
 		 *  • ins_sql with arm 2: if the NULL group vanished (every orphaned
 		 *    preserved row gained a match), NOT EXISTS fires for NULL.
 		 *  • FULL JOIN: _new_agg_ covers both sides uniformly.
+		 *  • Self-outer: the two role arms of _affected_ cover every group a
+		 *    delta touches in either role; vanished groups fire NOT EXISTS.
 		 */
-		appendStringInfo(&buf, "DELETE FROM %s _mv_\nUSING _affected_\nWHERE ",
+		appendStringInfo(buf, "DELETE FROM %s _mv_\nUSING _affected_\nWHERE ",
 						 mvname);
 		first = true;
 		foreach(lc, viewQuery->groupClause)
@@ -5962,13 +6039,13 @@ incr_build_outer_sql(Oid mvrelid, Query *viewQuery,
 			TargetEntry     *te  = get_sortgroupclause_tle(sgc, viewQuery->targetList);
 			const char      *col = quote_identifier(te->resname);
 
-			if (!first) appendStringInfoString(&buf, " AND ");
-			appendStringInfo(&buf, "_mv_.%s IS NOT DISTINCT FROM _affected_.%s",
+			if (!first) appendStringInfoString(buf, " AND ");
+			appendStringInfo(buf, "_mv_.%s IS NOT DISTINCT FROM _affected_.%s",
 							 col, col);
 			first = false;
 		}
 
-		appendStringInfoString(&buf,
+		appendStringInfoString(buf,
 							   "\n  AND NOT EXISTS (\n"
 							   "    SELECT 1 FROM _new_agg_ WHERE ");
 		first = true;
@@ -5978,20 +6055,205 @@ incr_build_outer_sql(Oid mvrelid, Query *viewQuery,
 			TargetEntry     *te  = get_sortgroupclause_tle(sgc, viewQuery->targetList);
 			const char      *col = quote_identifier(te->resname);
 
-			if (!first) appendStringInfoString(&buf, " AND ");
-			appendStringInfo(&buf, "_new_agg_.%s IS NOT DISTINCT FROM _mv_.%s",
+			if (!first) appendStringInfoString(buf, " AND ");
+			appendStringInfo(buf, "_new_agg_.%s IS NOT DISTINCT FROM _mv_.%s",
 							 col, col);
 			first = false;
 		}
-		appendStringInfoString(&buf, "\n  )");
+		appendStringInfoString(buf, "\n  )");
 	}
 	else
 	{
 		/* DML CTEs (_upd_) always execute; this SELECT just terminates the WITH. */
-		appendStringInfoString(&buf, "SELECT 1");
+		appendStringInfoString(buf, "SELECT 1");
+	}
+}
+
+/*
+ * incr_build_delta_select_query_at_varno
+ *
+ * Like incr_build_delta_select_query, but swaps the RTE at a SPECIFIC varno
+ * (range-table position) to the transition-table ENR, rather than the first
+ * relation matching an OID.  Needed for self-joins, where the same OID appears
+ * at two varnos and each role must be swapped independently.
+ */
+static Query *
+incr_build_delta_select_query_at_varno(Query *viewQuery, int target_varno,
+									   const char *enrName)
+{
+	Query		   *q = copyObject(viewQuery);
+	RangeTblEntry  *target;
+	Relation		rel;
+	TupleDesc		tupdesc;
+	int				attno;
+
+	q->havingQual = NULL;
+
+	target = rt_fetch(target_varno, q->rtable);
+	if (target == NULL || target->rtekind != RTE_RELATION)
+		elog(ERROR,
+			 "incr_build_delta_select_query_at_varno: varno %d is not a base relation",
+			 target_varno);
+
+	rel = table_open(target->relid, AccessShareLock);
+	tupdesc = RelationGetDescr(rel);
+
+	target->rtekind = RTE_NAMEDTUPLESTORE;
+	target->enrname = pstrdup(enrName);
+	target->enrtuples = 0;
+	target->coltypes = NIL;
+	target->coltypmods = NIL;
+	target->colcollations = NIL;
+	for (attno = 1; attno <= tupdesc->natts; attno++)
+	{
+		Form_pg_attribute att = TupleDescAttr(tupdesc, attno - 1);
+
+		if (att->attisdropped)
+		{
+			target->coltypes = lappend_oid(target->coltypes, InvalidOid);
+			target->coltypmods = lappend_int(target->coltypmods, 0);
+			target->colcollations = lappend_oid(target->colcollations, InvalidOid);
+		}
+		else
+		{
+			target->coltypes = lappend_oid(target->coltypes, att->atttypid);
+			target->coltypmods = lappend_int(target->coltypmods, att->atttypmod);
+			target->colcollations = lappend_oid(target->colcollations,
+												att->attcollation);
+		}
+	}
+	table_close(rel, AccessShareLock);
+
+	target->perminfoindex = 0;
+	return q;
+}
+
+/*
+ * incr_build_self_outer_sql
+ *
+ * Recompute-strategy delta for a two-way self OUTER join (the same table joined
+ * to itself with LEFT/RIGHT JOIN), GROUP BY keys on the PRESERVED anchor role.
+ * A delta on the table affects groups where a changed row participates in
+ * EITHER role, so _affected_ is the UNION of a per-role arm (each deparses the
+ * view with that role's RTE swapped to the transition-table ENR, leaving the
+ * other occurrence live).  The shared recompute tail then recomputes those
+ * groups from the live self-join and UPSERTs / DELETEs them.
+ *
+ * Because the group keys are all on the preserved side, no orphan/NULL arm is
+ * needed: a preserved-side key is captured by its role arm regardless of the
+ * other role's match state (the LEFT/RIGHT join keeps the preserved row).  The
+ * eligibility gate (incr_self_outer_supported_shape) enforces that shape.
+ *
+ * v1, v2: the two varnos of the self-joined table.
+ */
+static char *
+incr_build_self_outer_sql(Oid mvrelid, Query *viewQuery,
+						  int v1, int v2, const char *delta_table,
+						  List *all_tables, bool include_delete_step)
+{
+	StringInfoData	buf;
+	const char	   *mvname = mv_qname(mvrelid);
+	int				roles[2];
+	int				ri;
+
+	(void) all_tables;			/* shape gated; live join comes from viewQuery */
+	roles[0] = v1;
+	roles[1] = v2;
+
+	initStringInfo(&buf);
+	appendStringInfoString(&buf, "WITH _affected_ AS (");
+
+	for (ri = 0; ri < 2; ri++)
+	{
+		Query	   *aff_dq = incr_build_delta_select_query_at_varno(viewQuery,
+																   roles[ri],
+																   delta_table);
+		char	   *aff_sel = dbblue_deparse_query(aff_dq);
+		ListCell   *lc;
+		bool		first;
+
+		if (ri == 1)
+			appendStringInfoString(&buf, "\n  UNION");
+		appendStringInfoString(&buf, "\n  SELECT DISTINCT ");
+		first = true;
+		foreach(lc, viewQuery->groupClause)
+		{
+			SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+			TargetEntry     *te  = get_sortgroupclause_tle(sgc,
+														   viewQuery->targetList);
+
+			if (!first) appendStringInfoString(&buf, ", ");
+			appendStringInfoString(&buf, quote_identifier(te->resname));
+			first = false;
+		}
+		appendStringInfo(&buf, "\n  FROM (%s) _dg_", aff_sel);
 	}
 
+	appendStringInfoString(&buf, "\n),\n");
+
+	incr_append_outer_recompute_tail(&buf, mvname, viewQuery,
+									 include_delete_step);
 	return buf.data;
+}
+
+/*
+ * incr_self_outer_supported_shape — true iff viewQuery is a self OUTER join the
+ * self-outer recompute builder can maintain: a two-way self join (exactly two
+ * base-table RTEs, both the SAME relation), joined with LEFT or RIGHT (not
+ * FULL) OUTER JOIN, with GROUP BY, and every GROUP BY key a plain column from
+ * the PRESERVED anchor role.  Optional-side keys, FULL self joins, 3+-table
+ * shapes, and non-GROUP-BY (row-level) self outer joins are not supported.
+ */
+static bool
+incr_self_outer_supported_shape(Query *viewQuery)
+{
+	List	   *tabs;
+	int			preserved_varno;
+	Oid			shared_oid;
+	ListCell   *lc;
+	bool		has_full = false;
+
+	if (viewQuery->groupClause == NIL)
+		return false;
+
+	tabs = incr_collect_tables(viewQuery);
+	if (list_length(tabs) != 2)
+		return false;
+	if (!incr_has_self_join(tabs) || !incr_has_outer_join(tabs))
+		return false;
+
+	/* Both entries must be the SAME relation (pure two-way self join). */
+	shared_oid = ((IncrJoinEntry *) linitial(tabs))->oid;
+	foreach(lc, tabs)
+	{
+		IncrJoinEntry *je = lfirst(lc);
+
+		if (je->oid != shared_oid)
+			return false;
+		if (je->join_type == JOIN_FULL)
+			has_full = true;
+	}
+	if (has_full)
+		return false;			/* FULL self join not supported */
+
+	/* Every GROUP BY key must be a plain column from the preserved anchor. */
+	preserved_varno = incr_outer_preserved_varno(tabs);
+	foreach(lc, viewQuery->groupClause)
+	{
+		SortGroupClause *sgc   = lfirst_node(SortGroupClause, lc);
+		TargetEntry	    *te    = get_sortgroupclause_tle(sgc,
+														 viewQuery->targetList);
+		Node			*gexpr = incr_group_key_expr(viewQuery, te);
+		int				 rv;
+
+		if (gexpr == NULL || !IsA(gexpr, Var))
+			return false;			/* expression key — not supported */
+		if (!incr_try_resolve_var_to_rel((Var *) gexpr, viewQuery->rtable, &rv))
+			return false;
+		if (rv != preserved_varno)
+			return false;			/* optional-side key — not supported */
+	}
+	return true;
 }
 
 /*

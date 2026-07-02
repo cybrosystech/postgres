@@ -19,9 +19,14 @@
 -- joined tables).  There the builder adds a dedicated all-NULL arm for deltas
 -- on the key side, covering the other table's orphan (all-NULL) group that the
 -- delta-row arm misses (Cases 11-13).
+-- A two-table self LEFT/RIGHT join with GROUP BY keys on the preserved anchor
+-- and additive aggregates is also supported: the same table appears in two
+-- roles, so _affected_ is the UNION of both role arms and one combined catalog
+-- row is stored (Cases 14-15).
 -- Still rejected: FULL + expression/COALESCE key, FULL + mixed-side keys, FULL
--- via USING/NATURAL, 3+-table FULL, outer + self-join, and optional-side group
--- keys via multi-hop chains (see Case 10).
+-- via USING/NATURAL, 3+-table FULL, FULL self join, self-outer with an
+-- optional-side or DISTINCT/stddev aggregate, row-level self outer join, and
+-- optional-side group keys via multi-hop chains (see Cases 10 and 15).
 --
 -- Every case is checked == a full REFRESH of an identically-defined plain
 -- matview, including orphan (preserved-only) groups whose DISTINCT count is 0,
@@ -448,6 +453,74 @@ BEGIN
   ELSE RAISE NOTICE 'FULL JOIN DISTINCT/stddev + real NULL-key rows == REFRESH: PASS'; END IF;
 END$$;
 DROP TABLE fn_a, fn_b CASCADE;
+
+-- 14. Self OUTER join (same table twice), additive aggregates, GROUP BY on the
+--     preserved anchor role.  A delta on the table touches groups in BOTH roles
+--     (as employee and as someone's manager); the dual-role _affected_ covers
+--     both.  count(DISTINCT)/stddev over a self-join stay rejected (Case 15).
+DROP TABLE IF EXISTS so_emp CASCADE;
+CREATE TABLE so_emp(id int primary key, mgr int, dept int, sal int);
+INSERT INTO so_emp VALUES
+  (1,NULL,10,1000),(2,1,10,500),(3,1,20,400),(4,2,20,300),(5,99,30,200);
+CREATE MATERIALIZED VIEW so14_i WITH (incremental_refresh=true) AS
+  SELECT e.dept gk, count(*) c, count(m.id) cm, sum(m.sal) sms, sum(e.sal) ses
+  FROM so_emp e LEFT JOIN so_emp m ON e.mgr = m.id GROUP BY e.dept;
+CREATE MATERIALIZED VIEW so14_o AS
+  SELECT e.dept gk, count(*) c, count(m.id) cm, sum(m.sal) sms, sum(e.sal) ses
+  FROM so_emp e LEFT JOIN so_emp m ON e.mgr = m.id GROUP BY e.dept;
+INSERT INTO so_emp VALUES (6,3,20,250);   -- new emp under manager 3
+DELETE FROM so_emp WHERE id=1;            -- manager of 2 and 3; also an emp in dept 10
+UPDATE so_emp SET mgr=4 WHERE id=5;       -- change a manager link (de-orphan)
+UPDATE so_emp SET dept=40 WHERE id=3;     -- move e.dept of a row that is also a manager
+DELETE FROM so_emp WHERE id=4;            -- manager of 5 and 6; emp in dept 20
+REFRESH MATERIALIZED VIEW so14_o;
+DO $$
+DECLARE d int;
+BEGIN
+  SELECT count(*) INTO d FROM (
+    (SELECT gk,c,cm,sms,ses FROM so14_i EXCEPT SELECT gk,c,cm,sms,ses FROM so14_o) UNION ALL
+    (SELECT gk,c,cm,sms,ses FROM so14_o EXCEPT SELECT gk,c,cm,sms,ses FROM so14_i)) x;
+  IF d<>0 THEN RAISE EXCEPTION 'self LEFT join preserved-key: FAIL (% rows differ)', d;
+  ELSE RAISE NOTICE 'self LEFT JOIN + GROUP BY preserved key (additive) == REFRESH: PASS'; END IF;
+END$$;
+DROP TABLE so_emp CASCADE;
+
+-- 15. Self-outer shapes still rejected: optional-side (manager) group key,
+--     FULL self join, and row-level (no GROUP BY) self outer join.
+DO $$
+DECLARE made bool;
+BEGIN
+  CREATE TABLE so_emp(id int primary key, mgr int, dept int, sal int);
+
+  made := false;
+  BEGIN
+    CREATE MATERIALIZED VIEW _r WITH (incremental_refresh=true) AS
+      SELECT m.dept gk, count(*) c FROM so_emp e LEFT JOIN so_emp m ON e.mgr=m.id GROUP BY m.dept;
+    made := true;
+  EXCEPTION WHEN feature_not_supported THEN NULL; END;
+  IF made THEN DROP MATERIALIZED VIEW _r; RAISE EXCEPTION 'self-outer optional-side key: FAIL (accepted)';
+  ELSE RAISE NOTICE 'self-outer optional-side group key still rejected: PASS'; END IF;
+
+  made := false;
+  BEGIN
+    CREATE MATERIALIZED VIEW _r WITH (incremental_refresh=true) AS
+      SELECT e.dept gk, count(*) c FROM so_emp e FULL JOIN so_emp m ON e.mgr=m.id GROUP BY e.dept;
+    made := true;
+  EXCEPTION WHEN feature_not_supported THEN NULL; END;
+  IF made THEN DROP MATERIALIZED VIEW _r; RAISE EXCEPTION 'FULL self join: FAIL (accepted)';
+  ELSE RAISE NOTICE 'FULL self join still rejected: PASS'; END IF;
+
+  made := false;
+  BEGIN
+    CREATE MATERIALIZED VIEW _r WITH (incremental_refresh=true) AS
+      SELECT e.id, m.sal FROM so_emp e LEFT JOIN so_emp m ON e.mgr=m.id;
+    made := true;
+  EXCEPTION WHEN feature_not_supported THEN NULL; END;
+  IF made THEN DROP MATERIALIZED VIEW _r; RAISE EXCEPTION 'row-level self outer: FAIL (accepted)';
+  ELSE RAISE NOTICE 'row-level self outer join still rejected: PASS'; END IF;
+
+  DROP TABLE so_emp CASCADE;
+END$$;
 
 \echo ''
 \echo '=== DISTINCT / stddev over OUTER join test complete ==='
