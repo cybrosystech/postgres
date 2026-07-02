@@ -19,14 +19,15 @@
 -- joined tables).  There the builder adds a dedicated all-NULL arm for deltas
 -- on the key side, covering the other table's orphan (all-NULL) group that the
 -- delta-row arm misses (Cases 11-13).
--- A two-table self LEFT/RIGHT join with GROUP BY keys on the preserved anchor
+-- A two-table self LEFT/RIGHT join with single-side plain-column GROUP BY keys
 -- and additive aggregates is also supported: the same table appears in two
 -- roles, so _affected_ is the UNION of both role arms and one combined catalog
--- row is stored (Cases 14-15).
+-- row is stored.  Preserved-side keys need no orphan arm (Case 14); optional-
+-- side keys add an unconditional all-NULL arm for the orphan group (Case 15).
 -- Still rejected: FULL + expression/COALESCE key, FULL + mixed-side keys, FULL
--- via USING/NATURAL, 3+-table FULL, FULL self join, self-outer with an
--- optional-side or DISTINCT/stddev aggregate, row-level self outer join, and
--- optional-side group keys via multi-hop chains (see Cases 10 and 15).
+-- via USING/NATURAL, 3+-table FULL, FULL self join, self-outer mixed-side keys,
+-- DISTINCT/stddev over any self-join, row-level self outer join, and optional-
+-- side group keys via multi-hop chains (see Cases 10 and 16).
 --
 -- Every case is checked == a full REFRESH of an identically-defined plain
 -- matview, including orphan (preserved-only) groups whose DISTINCT count is 0,
@@ -485,21 +486,43 @@ BEGIN
 END$$;
 DROP TABLE so_emp CASCADE;
 
--- 15. Self-outer shapes still rejected: optional-side (manager) group key,
---     FULL self join, and row-level (no GROUP BY) self outer join.
+-- 15. Self OUTER join, OPTIONAL-side group key: GROUP BY m.dept (the manager's
+--     dept).  Employees with no live manager fall in the all-NULL group; a delta
+--     on the table flips their orphan status.  The dual-role arms plus the
+--     unconditional all-NULL arm cover NULL-group births / deaths / vanishes.
+DROP TABLE IF EXISTS so_emp CASCADE;
+CREATE TABLE so_emp(id int primary key, mgr int, dept int, sal int);
+INSERT INTO so_emp VALUES
+  (1,NULL,10,1000),(2,1,10,500),(3,1,20,400),(4,2,20,300),(5,99,30,200);
+CREATE MATERIALIZED VIEW so15_i WITH (incremental_refresh=true) AS
+  SELECT m.dept gk, count(*) c, count(m.id) cm, sum(e.sal) ses
+  FROM so_emp e LEFT JOIN so_emp m ON e.mgr = m.id GROUP BY m.dept;
+CREATE MATERIALIZED VIEW so15_o AS
+  SELECT m.dept gk, count(*) c, count(m.id) cm, sum(e.sal) ses
+  FROM so_emp e LEFT JOIN so_emp m ON e.mgr = m.id GROUP BY m.dept;
+DELETE FROM so_emp WHERE id=1;            -- manager of 2,3 → they orphan (NULL grows)
+INSERT INTO so_emp VALUES (6,5,40,150);   -- new emp under manager 5 (dept 30)
+UPDATE so_emp SET mgr=99 WHERE id=4;      -- 4's manager → missing → 4 orphans (NULL)
+UPDATE so_emp SET dept=60 WHERE id=5;     -- manager 5 changes dept: emp 6 moves 30→60
+DELETE FROM so_emp WHERE id=5;            -- manager 5 gone → emp 6 orphans; group 60 vanishes
+REFRESH MATERIALIZED VIEW so15_o;
+DO $$
+DECLARE d int;
+BEGIN
+  SELECT count(*) INTO d FROM (
+    (SELECT gk,c,cm,ses FROM so15_i EXCEPT SELECT gk,c,cm,ses FROM so15_o) UNION ALL
+    (SELECT gk,c,cm,ses FROM so15_o EXCEPT SELECT gk,c,cm,ses FROM so15_i)) x;
+  IF d<>0 THEN RAISE EXCEPTION 'self-outer optional-side key: FAIL (% rows differ)', d;
+  ELSE RAISE NOTICE 'self LEFT JOIN optional-side GROUP BY m.dept == REFRESH: PASS'; END IF;
+END$$;
+DROP TABLE so_emp CASCADE;
+
+-- 16. Self-outer shapes still rejected: FULL self join, mixed-side keys,
+--     and row-level (no GROUP BY) self outer join.
 DO $$
 DECLARE made bool;
 BEGIN
   CREATE TABLE so_emp(id int primary key, mgr int, dept int, sal int);
-
-  made := false;
-  BEGIN
-    CREATE MATERIALIZED VIEW _r WITH (incremental_refresh=true) AS
-      SELECT m.dept gk, count(*) c FROM so_emp e LEFT JOIN so_emp m ON e.mgr=m.id GROUP BY m.dept;
-    made := true;
-  EXCEPTION WHEN feature_not_supported THEN NULL; END;
-  IF made THEN DROP MATERIALIZED VIEW _r; RAISE EXCEPTION 'self-outer optional-side key: FAIL (accepted)';
-  ELSE RAISE NOTICE 'self-outer optional-side group key still rejected: PASS'; END IF;
 
   made := false;
   BEGIN
@@ -509,6 +532,16 @@ BEGIN
   EXCEPTION WHEN feature_not_supported THEN NULL; END;
   IF made THEN DROP MATERIALIZED VIEW _r; RAISE EXCEPTION 'FULL self join: FAIL (accepted)';
   ELSE RAISE NOTICE 'FULL self join still rejected: PASS'; END IF;
+
+  made := false;
+  BEGIN
+    CREATE MATERIALIZED VIEW _r WITH (incremental_refresh=true) AS
+      SELECT e.dept ed, m.dept md, count(*) c
+      FROM so_emp e LEFT JOIN so_emp m ON e.mgr=m.id GROUP BY e.dept, m.dept;
+    made := true;
+  EXCEPTION WHEN feature_not_supported THEN NULL; END;
+  IF made THEN DROP MATERIALIZED VIEW _r; RAISE EXCEPTION 'self-outer mixed-side keys: FAIL (accepted)';
+  ELSE RAISE NOTICE 'self-outer mixed-side keys still rejected: PASS'; END IF;
 
   made := false;
   BEGIN

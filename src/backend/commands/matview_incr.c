@@ -6132,19 +6132,27 @@ incr_build_delta_select_query_at_varno(Query *viewQuery, int target_varno,
  * incr_build_self_outer_sql
  *
  * Recompute-strategy delta for a two-way self OUTER join (the same table joined
- * to itself with LEFT/RIGHT JOIN), GROUP BY keys on the PRESERVED anchor role.
- * A delta on the table affects groups where a changed row participates in
- * EITHER role, so _affected_ is the UNION of a per-role arm (each deparses the
- * view with that role's RTE swapped to the transition-table ENR, leaving the
- * other occurrence live).  The shared recompute tail then recomputes those
- * groups from the live self-join and UPSERTs / DELETEs them.
+ * to itself with LEFT/RIGHT JOIN), GROUP BY keys on a single role.  A delta on
+ * the table affects groups where a changed row participates in EITHER role, so
+ * _affected_ is the UNION of a per-role arm (each deparses the view with that
+ * role's RTE swapped to the transition-table ENR, leaving the other occurrence
+ * live).  The shared recompute tail then recomputes those groups from the live
+ * self-join and UPSERTs / DELETEs them.
  *
- * Because the group keys are all on the preserved side, no orphan/NULL arm is
- * needed: a preserved-side key is captured by its role arm regardless of the
- * other role's match state (the LEFT/RIGHT join keeps the preserved row).  The
- * eligibility gate (incr_self_outer_supported_shape) enforces that shape.
+ * If the group keys are on the PRESERVED anchor role, the two role arms are
+ * sufficient: a preserved-side key is captured by its role arm regardless of
+ * the other role's match state (the LEFT/RIGHT join keeps the preserved row).
  *
- * v1, v2: the two varnos of the self-joined table.
+ * If the group keys are on the OPTIONAL role, a delta on the table flips the
+ * preserved rows' orphan status (deleting a row orphans the rows it was the
+ * join partner of; inserting a row de-orphans previously-unmatched rows), and
+ * those rows move into / out of the all-NULL group.  As in the FULL-join case,
+ * the role arms miss that all-NULL group in the minimal case (the flipping rows
+ * appear matched against the delta ENR), so an unconditional all-NULL arm is
+ * added and the DELETE step is forced (an insert can vanish the all-NULL group).
+ *
+ * The eligibility gate (incr_self_outer_supported_shape) guarantees a single-
+ * side plain-column key set; v1, v2 are the two varnos of the self-joined table.
  */
 static char *
 incr_build_self_outer_sql(Oid mvrelid, Query *viewQuery,
@@ -6155,10 +6163,24 @@ incr_build_self_outer_sql(Oid mvrelid, Query *viewQuery,
 	const char	   *mvname = mv_qname(mvrelid);
 	int				roles[2];
 	int				ri;
+	int				preserved_varno = incr_outer_preserved_varno(all_tables);
+	int				key_side_varno;
+	bool			opt_side;
+	bool			actual_delete_step;
+	SortGroupClause *sgc0 = lfirst_node(SortGroupClause,
+										list_head(viewQuery->groupClause));
+	TargetEntry	   *te0  = get_sortgroupclause_tle(sgc0, viewQuery->targetList);
+	Node		   *gexpr0 = incr_group_key_expr(viewQuery, te0);
 
-	(void) all_tables;			/* shape gated; live join comes from viewQuery */
 	roles[0] = v1;
 	roles[1] = v2;
+
+	/* Gate guarantees single-side plain-Var keys; find which role they live on. */
+	Assert(IsA(gexpr0, Var));
+	incr_try_resolve_var_to_rel((Var *) gexpr0, viewQuery->rtable,
+								&key_side_varno);
+	opt_side = (key_side_varno != preserved_varno);
+	actual_delete_step = include_delete_step || opt_side;
 
 	initStringInfo(&buf);
 	appendStringInfoString(&buf, "WITH _affected_ AS (");
@@ -6189,10 +6211,35 @@ incr_build_self_outer_sql(Oid mvrelid, Query *viewQuery,
 		appendStringInfo(&buf, "\n  FROM (%s) _dg_", aff_sel);
 	}
 
+	/*
+	 * Optional-side key: add the all-NULL group (every key column NULL) so the
+	 * recompute covers preserved rows moving into / out of the orphan group.
+	 * Unconditional and idempotent, as for the FULL-join NULL arm.
+	 */
+	if (opt_side)
+	{
+		ListCell   *lc;
+		bool		first = true;
+
+		appendStringInfoString(&buf, "\n  UNION\n  SELECT ");
+		foreach(lc, viewQuery->groupClause)
+		{
+			SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+			TargetEntry     *te  = get_sortgroupclause_tle(sgc,
+														   viewQuery->targetList);
+
+			if (!first) appendStringInfoString(&buf, ", ");
+			first = false;
+			appendStringInfo(&buf, "CAST(NULL AS %s) AS %s",
+							 format_type_be(exprType((Node *) te->expr)),
+							 quote_identifier(te->resname));
+		}
+	}
+
 	appendStringInfoString(&buf, "\n),\n");
 
 	incr_append_outer_recompute_tail(&buf, mvname, viewQuery,
-									 include_delete_step);
+									 actual_delete_step);
 	return buf.data;
 }
 
@@ -6200,18 +6247,20 @@ incr_build_self_outer_sql(Oid mvrelid, Query *viewQuery,
  * incr_self_outer_supported_shape — true iff viewQuery is a self OUTER join the
  * self-outer recompute builder can maintain: a two-way self join (exactly two
  * base-table RTEs, both the SAME relation), joined with LEFT or RIGHT (not
- * FULL) OUTER JOIN, with GROUP BY, and every GROUP BY key a plain column from
- * the PRESERVED anchor role.  Optional-side keys, FULL self joins, 3+-table
- * shapes, and non-GROUP-BY (row-level) self outer joins are not supported.
+ * FULL) OUTER JOIN, with GROUP BY, and every GROUP BY key a plain column from a
+ * SINGLE one of the two roles (preserved anchor OR optional side).  For an
+ * optional-side key incr_build_self_outer_sql adds an all-NULL arm.  FULL self
+ * joins, 3+-table shapes, mixed-side / expression keys, and non-GROUP-BY
+ * (row-level) self outer joins are not supported.
  */
 static bool
 incr_self_outer_supported_shape(Query *viewQuery)
 {
 	List	   *tabs;
-	int			preserved_varno;
 	Oid			shared_oid;
 	ListCell   *lc;
 	bool		has_full = false;
+	int			key_varno = -1;
 
 	if (viewQuery->groupClause == NIL)
 		return false;
@@ -6236,8 +6285,12 @@ incr_self_outer_supported_shape(Query *viewQuery)
 	if (has_full)
 		return false;			/* FULL self join not supported */
 
-	/* Every GROUP BY key must be a plain column from the preserved anchor. */
-	preserved_varno = incr_outer_preserved_varno(tabs);
+	/*
+	 * Every GROUP BY key must be a plain column resolving to the SAME role
+	 * (all preserved-side or all optional-side).  Mixed-side / expression keys
+	 * can relocate a row between non-NULL groups on an orphan flip, which the
+	 * recompute arms do not track.
+	 */
 	foreach(lc, viewQuery->groupClause)
 	{
 		SortGroupClause *sgc   = lfirst_node(SortGroupClause, lc);
@@ -6250,8 +6303,10 @@ incr_self_outer_supported_shape(Query *viewQuery)
 			return false;			/* expression key — not supported */
 		if (!incr_try_resolve_var_to_rel((Var *) gexpr, viewQuery->rtable, &rv))
 			return false;
-		if (rv != preserved_varno)
-			return false;			/* optional-side key — not supported */
+		if (key_varno == -1)
+			key_varno = rv;
+		else if (rv != key_varno)
+			return false;			/* mixed-side keys — not supported */
 	}
 	return true;
 }
