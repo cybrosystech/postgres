@@ -15,6 +15,7 @@ SUBDIRS = \
 		btree_gist	\
 		citext		\
 		cube		\
+		dbblue_columnar	\
 		dblink		\
 		dict_int	\
 		dict_xsyn	\
