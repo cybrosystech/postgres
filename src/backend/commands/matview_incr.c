@@ -6151,6 +6151,18 @@ incr_build_delta_select_query_at_varno(Query *viewQuery, int target_varno,
  * appear matched against the delta ENR), so an unconditional all-NULL arm is
  * added and the DELETE step is forced (an insert can vanish the all-NULL group).
  *
+ * Optional-side DELETEs additionally need a delta⋈delta arm (both role RTEs
+ * swapped to the OLDTABLE ENR): when one statement deletes a preserved row AND
+ * its optional partner (possible only in a self-join — both live in the same
+ * table), the group they formed appears in neither role arm.  The preserved-
+ * role arm LEFT-joins the deleted row to the LIVE optional side (partner gone →
+ * NULL, not the old key) and the optional-role arm joins LIVE preserved rows
+ * (the deleted one is gone).  Same reasoning as the INNER self-join builder's
+ * third arm.  Preserved-side keys don't need it: the preserved-role arm keeps
+ * every ENR row via the LEFT join, so its key is always captured.  Inserts
+ * don't need it either: new rows are live, so the role arms already cover
+ * delta⋈delta combinations.
+ *
  * The eligibility gate (incr_self_outer_supported_shape) guarantees a single-
  * side plain-column key set; v1, v2 are the two varnos of the self-joined table.
  */
@@ -6167,6 +6179,7 @@ incr_build_self_outer_sql(Oid mvrelid, Query *viewQuery,
 	int				key_side_varno;
 	bool			opt_side;
 	bool			actual_delete_step;
+	bool			is_del = (strcmp(delta_table, MATVIEW_INCR_OLDTABLE) == 0);
 	SortGroupClause *sgc0 = lfirst_node(SortGroupClause,
 										list_head(viewQuery->groupClause));
 	TargetEntry	   *te0  = get_sortgroupclause_tle(sgc0, viewQuery->targetList);
@@ -6209,6 +6222,40 @@ incr_build_self_outer_sql(Oid mvrelid, Query *viewQuery,
 			first = false;
 		}
 		appendStringInfo(&buf, "\n  FROM (%s) _dg_", aff_sel);
+	}
+
+	/*
+	 * Optional-side DELETE: delta⋈delta arm — both roles swapped to the ENR,
+	 * capturing group keys formed entirely among deleted rows (see the function
+	 * comment).  Swapping sequentially is safe: each call copies the query and
+	 * only requires ITS target varno to still be a plain relation RTE.
+	 */
+	if (opt_side && is_del)
+	{
+		Query	   *dd_q = incr_build_delta_select_query_at_varno(viewQuery,
+																 roles[0],
+																 delta_table);
+		char	   *dd_sel;
+		ListCell   *lc;
+		bool		first;
+
+		dd_q = incr_build_delta_select_query_at_varno(dd_q, roles[1],
+													  delta_table);
+		dd_sel = dbblue_deparse_query(dd_q);
+
+		appendStringInfoString(&buf, "\n  UNION\n  SELECT DISTINCT ");
+		first = true;
+		foreach(lc, viewQuery->groupClause)
+		{
+			SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+			TargetEntry     *te  = get_sortgroupclause_tle(sgc,
+														   viewQuery->targetList);
+
+			if (!first) appendStringInfoString(&buf, ", ");
+			appendStringInfoString(&buf, quote_identifier(te->resname));
+			first = false;
+		}
+		appendStringInfo(&buf, "\n  FROM (%s) _dd_", dd_sel);
 	}
 
 	/*

@@ -505,6 +505,11 @@ INSERT INTO so_emp VALUES (6,5,40,150);   -- new emp under manager 5 (dept 30)
 UPDATE so_emp SET mgr=99 WHERE id=4;      -- 4's manager → missing → 4 orphans (NULL)
 UPDATE so_emp SET dept=60 WHERE id=5;     -- manager 5 changes dept: emp 6 moves 30→60
 DELETE FROM so_emp WHERE id=5;            -- manager 5 gone → emp 6 orphans; group 60 vanishes
+-- partition delete: one statement removes an employee AND its manager → the
+-- group they formed (dept 70) appears in neither role arm; the delta⋈delta
+-- arm must catch it or a stale row remains
+INSERT INTO so_emp VALUES (7,NULL,70,80),(8,7,75,60);  -- manager 7 (dept 70) + emp 8 under it
+DELETE FROM so_emp WHERE id IN (7,8);
 REFRESH MATERIALIZED VIEW so15_o;
 DO $$
 DECLARE d int;
