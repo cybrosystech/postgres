@@ -225,14 +225,6 @@ static char *incr_build_self_join_row_del_sql(Oid mvrelid, Query *viewQuery,
 											   int v1, int v2,
 											   const char *delta_table,
 											   List *all_tables);
-static char *incr_build_self_join_agg_ins_sql(Oid mvrelid, Query *viewQuery,
-											   int v1, int v2,
-											   const char *delta_table,
-											   List *all_tables);
-static char *incr_build_self_join_agg_del_sql(Oid mvrelid, Query *viewQuery,
-											   int v1, int v2,
-											   const char *delta_table,
-											   List *all_tables);
 static bool incr_is_pure_union_all(Node *node);
 static void incr_collect_union_branches(Query *viewQuery, List **branches);
 static char *incr_build_union_ins_sql(Oid mvrelid, Query *viewQuery,
@@ -286,7 +278,7 @@ static void incr_append_recompute_tail(StringInfo buf, const char *mvname,
 static Query *incr_build_delta_select_query_at_varno(Query *viewQuery,
 													 int target_varno,
 													 const char *enrName);
-static char *incr_build_self_outer_sql(Oid mvrelid, Query *viewQuery,
+static char *incr_build_self_recompute_sql(Oid mvrelid, Query *viewQuery,
 									   int v1, int v2, const char *delta_table,
 									   List *all_tables, bool include_delete_step);
 static bool incr_self_outer_supported_shape(Query *viewQuery);
@@ -565,7 +557,7 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 
 		hash_destroy(oid_counts);
 
-		/* self-join + GROUP BY/DISTINCT is handled by incr_build_self_join_agg_* */
+		/* self-join + GROUP BY is handled by incr_build_self_recompute_sql */
 	}
 
 	if (nbasetables == 1)
@@ -1441,11 +1433,11 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 					int v1 = delta->varno;
 
 					if (v1 > v2) { int t = v1; v1 = v2; v2 = t; }
-					ins_sql = incr_build_self_outer_sql(mvrelid, viewQuery,
+					ins_sql = incr_build_self_recompute_sql(mvrelid, viewQuery,
 														v1, v2,
 														MATVIEW_INCR_NEWTABLE,
 														all_tables, false);
-					del_sql = incr_build_self_outer_sql(mvrelid, viewQuery,
+					del_sql = incr_build_self_recompute_sql(mvrelid, viewQuery,
 														v1, v2,
 														MATVIEW_INCR_OLDTABLE,
 														all_tables, true);
@@ -1557,12 +1549,15 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 						v1 = delta->varno;
 						if (v1 > v2) { vtmp = v1; v1 = v2; v2 = vtmp; }
 
-						ins_sql = incr_build_self_join_agg_ins_sql(
+						/* Self INNER join + GROUP BY: dual-role recompute
+						 * via the shared engine (role arms + delta⋈delta arm
+						 * on deletes + generic tail). */
+						ins_sql = incr_build_self_recompute_sql(
 							mvrelid, viewQuery, v1, v2,
-							MATVIEW_INCR_NEWTABLE, all_tables);
-						del_sql = incr_build_self_join_agg_del_sql(
+							MATVIEW_INCR_NEWTABLE, all_tables, false);
+						del_sql = incr_build_self_recompute_sql(
 							mvrelid, viewQuery, v1, v2,
-							MATVIEW_INCR_OLDTABLE, all_tables);
+							MATVIEW_INCR_OLDTABLE, all_tables, true);
 					}
 					else
 					{
@@ -3743,52 +3738,6 @@ incr_append_from_join(StringInfo buf, Query *viewQuery,
 }
 
 /*
- * incr_append_self_delta_join
- *
- * Like incr_append_from_join, but renders the join partner(s) as the DELTA
- * transition table too (not the live base table) — i.e. the delta self-joined
- * to itself.  Used only by the self-join DELETE arm: when a whole join-key
- * partition is removed, the group it formed no longer exists on the live side,
- * so delta⋈live (both per-role arms) never produces that vanished group key.
- * The rows that formed it are all in the delta, so delta⋈delta recovers the key
- * and the DELETE-vanished reconciliation can then drop the stale matview row.
- */
-static void
-incr_append_self_delta_join(StringInfo buf, Query *viewQuery,
-							int delta_varno,
-							const char *delta_table,
-							List *join_list)
-{
-	ListCell   *lc;
-
-	if (join_list == NIL)
-	{
-		appendStringInfo(buf, " FROM %s", delta_table);
-		return;
-	}
-
-	appendStringInfo(buf, " FROM %s %s", delta_table, INCR_DELTA_ALIAS);
-	foreach(lc, join_list)
-	{
-		IncrJoinEntry  *je = lfirst(lc);
-
-		if (je->quals == NULL)
-		{
-			appendStringInfo(buf, " CROSS JOIN %s _j%d_", delta_table, je->varno);
-		}
-		else
-		{
-			StringInfoData	jbuf;
-
-			initStringInfo(&jbuf);
-			incr_deparse_where_qual(je->quals, viewQuery->rtable, delta_varno, &jbuf);
-			appendStringInfo(buf, " JOIN %s _j%d_ ON (%s)",
-							 delta_table, je->varno, jbuf.data);
-		}
-	}
-}
-
-/*
  * incr_warn_row_level_missing_key
  *
  * For row-level incremental matviews (no GROUP BY), the del_sql identifies
@@ -5883,7 +5832,7 @@ incr_build_affected_sql(StringInfo buf, Query *viewQuery,
  * the deparse core, so any aggregate the view contains (DISTINCT, stddev, bool,
  * additive) is recomputed exactly as a full REFRESH would.  Used for single
  * tables, INNER joins, and LEFT/RIGHT/FULL outer joins; the self-join variants
- * (incr_build_self_outer_sql, hand self-agg builders) build their own
+ * (incr_build_self_recompute_sql, hand self-agg builders) build their own
  * _affected_ but share the same tail.
  *
  * include_delete_step: true for del_sql; forced internally when an orphan or
@@ -5915,7 +5864,7 @@ incr_build_recompute_sql(Oid mvrelid, Query *viewQuery,
  * and the final DELETE-vanished / benign-SELECT step.  buf must already hold
  * "WITH _affected_ AS ( ... ),\n"; this appends the rest, leaving a complete
  * statement.  Shared by incr_build_recompute_sql (single delta table) and
- * incr_build_self_outer_sql (a self-joined table in both roles), which differ
+ * incr_build_self_recompute_sql (a self-joined table in both roles), which differ
  * only in how they build _affected_.
  */
 static void
@@ -6164,10 +6113,11 @@ incr_build_delta_select_query_at_varno(Query *viewQuery, int target_varno,
 }
 
 /*
- * incr_build_self_outer_sql
+ * incr_build_self_recompute_sql
  *
- * Recompute-strategy delta for a two-way self OUTER join (the same table joined
- * to itself with LEFT/RIGHT JOIN), GROUP BY keys on a single role.  A delta on
+ * Recompute-strategy delta for a two-way SELF join with GROUP BY — INNER (any
+ * plain-column keys, additive aggregates) or LEFT/RIGHT OUTER (single-side
+ * keys).  A delta on
  * the table affects groups where a changed row participates in EITHER role, so
  * _affected_ is the UNION of a per-role arm (each deparses the view with that
  * role's RTE swapped to the transition-table ENR, leaving the other occurrence
@@ -6202,7 +6152,7 @@ incr_build_delta_select_query_at_varno(Query *viewQuery, int target_varno,
  * side plain-column key set; v1, v2 are the two varnos of the self-joined table.
  */
 static char *
-incr_build_self_outer_sql(Oid mvrelid, Query *viewQuery,
+incr_build_self_recompute_sql(Oid mvrelid, Query *viewQuery,
 						  int v1, int v2, const char *delta_table,
 						  List *all_tables, bool include_delete_step)
 {
@@ -6223,11 +6173,21 @@ incr_build_self_outer_sql(Oid mvrelid, Query *viewQuery,
 	roles[0] = v1;
 	roles[1] = v2;
 
-	/* Gate guarantees single-side plain-Var keys; find which role they live on. */
-	Assert(IsA(gexpr0, Var));
-	incr_try_resolve_var_to_rel((Var *) gexpr0, viewQuery->rtable,
-								&key_side_varno);
-	opt_side = (key_side_varno != preserved_varno);
+	/*
+	 * Optional-side detection applies only to self OUTER joins (the gate there
+	 * guarantees single-side plain-Var keys).  A self INNER join has no
+	 * preserved/optional roles — its keys may even mix roles — and needs no
+	 * orphan machinery, only the delta⋈delta arm on deletes.
+	 */
+	if (incr_has_outer_join(all_tables))
+	{
+		Assert(IsA(gexpr0, Var));
+		incr_try_resolve_var_to_rel((Var *) gexpr0, viewQuery->rtable,
+									&key_side_varno);
+		opt_side = (key_side_varno != preserved_varno);
+	}
+	else
+		opt_side = false;
 	actual_delete_step = include_delete_step || opt_side;
 
 	initStringInfo(&buf);
@@ -6260,12 +6220,16 @@ incr_build_self_outer_sql(Oid mvrelid, Query *viewQuery,
 	}
 
 	/*
-	 * Optional-side DELETE: delta⋈delta arm — both roles swapped to the ENR,
-	 * capturing group keys formed entirely among deleted rows (see the function
-	 * comment).  Swapping sequentially is safe: each call copies the query and
-	 * only requires ITS target varno to still be a plain relation RTE.
+	 * delta⋈delta arm — both roles swapped to the ENR, capturing group keys
+	 * formed entirely among deleted rows (see the function comment).  Needed on
+	 * the delete path for optional-side keys of a self OUTER join, and for ANY
+	 * key of a self INNER join (a whole join-key partition removed in one
+	 * statement appears in neither role arm: each joins the delta to the LIVE
+	 * other role, whose partner rows are already gone).  Swapping sequentially
+	 * is safe: each call copies the query and only requires ITS target varno to
+	 * still be a plain relation RTE.
 	 */
-	if (opt_side && is_del)
+	if (is_del && (opt_side || !incr_has_outer_join(all_tables)))
 	{
 		Query	   *dd_q = incr_build_delta_select_query_at_varno(viewQuery,
 																 roles[0],
@@ -6331,7 +6295,7 @@ incr_build_self_outer_sql(Oid mvrelid, Query *viewQuery,
  * base-table RTEs, both the SAME relation), joined with LEFT or RIGHT (not
  * FULL) OUTER JOIN, with GROUP BY, and every GROUP BY key a plain column from a
  * SINGLE one of the two roles (preserved anchor OR optional side).  For an
- * optional-side key incr_build_self_outer_sql adds an all-NULL arm.  FULL self
+ * optional-side key incr_build_self_recompute_sql adds an all-NULL arm.  FULL self
  * joins, 3+-table shapes, mixed-side / expression keys, and non-GROUP-BY
  * (row-level) self outer joins are not supported.
  */
@@ -7430,388 +7394,6 @@ matview_delta_apply(PG_FUNCTION_ARGS)
 }
 
 
-/* ============================================================
- * Self-join + GROUP BY/DISTINCT helpers — Phase 14
- * ============================================================ */
-
-/*
- * incr_build_self_join_agg_apply_sql
- *
- * Maintenance for a self-join GROUP BY aggregate (count/sum/avg; MIN/MAX with a
- * self-join is rejected earlier).  Correct AND write-safe.
- *
- * The previous design ran two per-role delta arms (delta-as-v1 and delta-as-v2)
- * as INSERT ... ON CONFLICT in one statement.  That double-counted the
- * delta-joins-delta overlap (a row that joins to another changed row, e.g. a
- * self-referential row) and could abort the user's base-table write with
- * "ON CONFLICT DO UPDATE command cannot affect row a second time".
- *
- * Instead, recompute every group key the delta touches in EITHER role from the
- * LIVE tables and reconcile in a single statement (one row per key, so the
- * upsert never affects a row twice):
- *
- *   WITH _aff_ AS (<keys from delta-as-v1>  UNION  <keys from delta-as-v2>),
- *        _rc_  AS (<full view aggregate over the live self-join>
- *                  WHERE <keys> IN _aff_ GROUP BY <keys>),
- *        _upd_ AS (UPDATE mv SET <col = _rc_.col> FROM _rc_
- *                  WHERE <mv.key = _rc_.key> RETURNING <mv.key>)
- *   -- is_delete=false: INSERT groups in _rc_ not matched by _upd_ (new groups)
- *   -- is_delete=true : DELETE affected groups absent from _rc_ (vanished groups)
- */
-static char *
-incr_build_self_join_agg_apply_sql(Oid mvrelid, Query *viewQuery,
-								   int v1, int v2,
-								   const char *delta_table,
-								   List *all_tables, bool is_delete)
-{
-	StringInfoData	buf;
-	List		   *groupColNames = NIL;
-	List		   *jl1 = incr_build_join_list_for_delta(all_tables, v1);
-	List		   *jl2 = incr_build_join_list_for_delta(all_tables, v2);
-	const char	   *mvname = mv_qname(mvrelid);
-	const char	   *livename = NULL;
-	Node		   *wq = incr_get_where_qual(viewQuery);
-	ListCell	   *lc,
-				   *gcl;
-	bool			first;
-	int				roles[2];
-	int				ri;
-
-	incr_collect_group_cols(viewQuery, &groupColNames);
-	foreach(lc, all_tables)
-	{
-		IncrJoinEntry *je = lfirst(lc);
-
-		if (je->varno == v1)
-		{
-			livename = mv_qname(je->oid);
-			break;
-		}
-	}
-	roles[0] = v1;
-	roles[1] = v2;
-
-	initStringInfo(&buf);
-
-	/* ---- _aff_: distinct group keys the delta touches in either role ---- */
-	appendStringInfoString(&buf, "WITH _aff_ AS (");
-	for (ri = 0; ri < 2; ri++)
-	{
-		int		dv = roles[ri];
-		List   *jl = (ri == 0) ? jl1 : jl2;
-
-		if (ri == 1)
-			appendStringInfoString(&buf, " UNION ");
-		appendStringInfoString(&buf, "SELECT ");
-		first = true;
-		foreach(lc, viewQuery->targetList)
-		{
-			TargetEntry    *te = lfirst_node(TargetEntry, lc);
-			StringInfoData	ebuf;
-
-			if (te->resjunk || !IsA(te->expr, Var))
-				continue;
-			if (!first)
-				appendStringInfoChar(&buf, ',');
-			first = false;
-			initStringInfo(&ebuf);
-			incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable, dv, &ebuf);
-			appendStringInfo(&buf, "%s AS %s", ebuf.data,
-							 quote_identifier(te->resname));
-		}
-		incr_append_from_join(&buf, viewQuery, dv, delta_table, jl);
-		if (wq != NULL)
-		{
-			StringInfoData wbuf;
-
-			initStringInfo(&wbuf);
-			incr_deparse_where_qual(wq, viewQuery->rtable, dv, &wbuf);
-			appendStringInfo(&buf, " WHERE %s", wbuf.data);
-		}
-	}
-
-	/*
-	 * Third arm (DELETE only): group keys formed entirely among delta rows.
-	 * When a whole join-key partition is removed, the per-role delta⋈live arms
-	 * above miss the group it formed (its live join partner is gone too), so the
-	 * DELETE-vanished arm would leave a stale matview row behind.  delta⋈delta
-	 * recovers that vanished key.  Inserts don't need this: the new rows are
-	 * already live, so the delta⋈live arms already cover delta⋈delta for them.
-	 */
-	if (is_delete)
-	{
-		appendStringInfoString(&buf, " UNION SELECT ");
-		first = true;
-		foreach(lc, viewQuery->targetList)
-		{
-			TargetEntry    *te = lfirst_node(TargetEntry, lc);
-			StringInfoData	ebuf;
-
-			if (te->resjunk || !IsA(te->expr, Var))
-				continue;
-			if (!first)
-				appendStringInfoChar(&buf, ',');
-			first = false;
-			initStringInfo(&ebuf);
-			incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable, v1, &ebuf);
-			appendStringInfo(&buf, "%s AS %s", ebuf.data,
-							 quote_identifier(te->resname));
-		}
-		incr_append_self_delta_join(&buf, viewQuery, v1, delta_table, jl1);
-		if (wq != NULL)
-		{
-			StringInfoData wbuf;
-
-			initStringInfo(&wbuf);
-			incr_deparse_where_qual(wq, viewQuery->rtable, v1, &wbuf);
-			appendStringInfo(&buf, " WHERE %s", wbuf.data);
-		}
-	}
-	appendStringInfoString(&buf, "),");
-
-	/* ---- _rc_: full recompute of the affected groups over the LIVE join ---- */
-	appendStringInfoString(&buf, " _rc_ AS (SELECT ");
-	first = true;
-	foreach(lc, viewQuery->targetList)
-	{
-		TargetEntry    *te = lfirst_node(TargetEntry, lc);
-		const char	   *colq;
-		StringInfoData	ebuf;
-
-		if (te->resjunk)
-			continue;
-		colq = quote_identifier(te->resname);
-		if (!first)
-			appendStringInfoChar(&buf, ',');
-		first = false;
-
-		if (strcmp(te->resname, MATVIEW_INCR_COUNT_COL) == 0)
-			appendStringInfo(&buf, "COUNT(*) AS %s", colq);
-		else if (strcmp(te->resname, MATVIEW_INCR_HAVING_COL) == 0)
-			appendStringInfo(&buf, "true AS %s", colq);
-		else if (IsA(te->expr, Var))
-		{
-			initStringInfo(&ebuf);
-			incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable, v1, &ebuf);
-			appendStringInfo(&buf, "%s AS %s", ebuf.data, colq);
-		}
-		else if (IsA(te->expr, Aggref))
-		{
-			Aggref	   *agg = (Aggref *) te->expr;
-			char	   *fname = get_func_name(agg->aggfnoid);
-
-			if (strcmp(fname, "count") == 0 && agg->aggstar)
-				appendStringInfo(&buf, "COUNT(*) AS %s", colq);
-			else if (agg->args != NIL)
-			{
-				TargetEntry *arg_te = linitial_node(TargetEntry, agg->args);
-
-				initStringInfo(&ebuf);
-				incr_deparse_where_qual((Node *) arg_te->expr, viewQuery->rtable,
-										v1, &ebuf);
-				appendStringInfo(&buf, "%s(%s) AS %s", fname, ebuf.data, colq);
-			}
-			else
-				appendStringInfo(&buf, "%s(*) AS %s", fname, colq);
-		}
-		else
-			elog(ERROR, "incr_build_self_join_agg_apply_sql: unexpected expr %d",
-				 (int) nodeTag(te->expr));
-	}
-	/* FROM the live self-join (delta_table replaced by the live table name) */
-	incr_append_from_join(&buf, viewQuery, v1, livename, jl1);
-	/* WHERE (keys) match _aff_ NULL-safely [AND view WHERE] */
-	appendStringInfoString(&buf, " WHERE EXISTS (SELECT 1 FROM _aff_ WHERE ");
-	first = true;
-	foreach(lc, viewQuery->targetList)
-	{
-		TargetEntry    *te = lfirst_node(TargetEntry, lc);
-		StringInfoData	ebuf;
-
-		if (te->resjunk || !IsA(te->expr, Var))
-			continue;
-		if (!first)
-			appendStringInfoString(&buf, " AND ");
-		first = false;
-		initStringInfo(&ebuf);
-		incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable, v1, &ebuf);
-		appendStringInfo(&buf, "%s IS NOT DISTINCT FROM _aff_.%s", ebuf.data,
-						 quote_identifier(te->resname));
-	}
-	appendStringInfoChar(&buf, ')');
-	if (wq != NULL)
-	{
-		StringInfoData wbuf;
-
-		initStringInfo(&wbuf);
-		incr_deparse_where_qual(wq, viewQuery->rtable, v1, &wbuf);
-		appendStringInfo(&buf, " AND %s", wbuf.data);
-	}
-	appendStringInfoString(&buf, " GROUP BY ");
-	first = true;
-	foreach(lc, viewQuery->targetList)
-	{
-		TargetEntry    *te = lfirst_node(TargetEntry, lc);
-		StringInfoData	ebuf;
-
-		if (te->resjunk || !IsA(te->expr, Var))
-			continue;
-		if (!first)
-			appendStringInfoChar(&buf, ',');
-		first = false;
-		initStringInfo(&ebuf);
-		incr_deparse_where_qual((Node *) te->expr, viewQuery->rtable, v1, &ebuf);
-		appendStringInfoString(&buf, ebuf.data);
-	}
-	appendStringInfoString(&buf, "),");
-
-	/* ---- _upd_: overwrite surviving affected groups with recomputed values ---- */
-	appendStringInfo(&buf, " _upd_ AS (UPDATE %s SET ", mvname);
-	first = true;
-	foreach(lc, viewQuery->targetList)
-	{
-		TargetEntry *te = lfirst_node(TargetEntry, lc);
-		const char  *colq;
-
-		if (te->resjunk || IsA(te->expr, Var))
-			continue;
-		if (strcmp(te->resname, MATVIEW_INCR_HAVING_COL) == 0)
-			continue;
-		colq = quote_identifier(te->resname);
-		if (!first)
-			appendStringInfoChar(&buf, ',');
-		first = false;
-		appendStringInfo(&buf, "%s=_rc_.%s", colq, colq);
-	}
-	appendStringInfo(&buf, " FROM _rc_ WHERE ");
-	first = true;
-	foreach(gcl, groupColNames)
-	{
-		const char *colq = quote_identifier(strVal(lfirst(gcl)));
-
-		if (!first)
-			appendStringInfoString(&buf, " AND ");
-		first = false;
-		appendStringInfo(&buf, "%s.%s IS NOT DISTINCT FROM _rc_.%s", mvname, colq, colq);
-	}
-	appendStringInfoString(&buf, " RETURNING ");
-	first = true;
-	foreach(gcl, groupColNames)
-	{
-		const char *colq = quote_identifier(strVal(lfirst(gcl)));
-
-		if (!first)
-			appendStringInfoChar(&buf, ',');
-		first = false;
-		appendStringInfo(&buf, "%s.%s", mvname, colq);
-	}
-	appendStringInfoString(&buf, ")");
-
-	if (is_delete)
-	{
-		/* groups affected but absent from the recompute have vanished (NULL-safe) */
-		appendStringInfo(&buf,
-						 " DELETE FROM %s WHERE EXISTS (SELECT 1 FROM _aff_ WHERE ",
-						 mvname);
-		first = true;
-		foreach(gcl, groupColNames)
-		{
-			const char *colq = quote_identifier(strVal(lfirst(gcl)));
-
-			if (!first)
-				appendStringInfoString(&buf, " AND ");
-			first = false;
-			appendStringInfo(&buf, "_aff_.%s IS NOT DISTINCT FROM %s.%s", colq, mvname, colq);
-		}
-		appendStringInfoString(&buf, ") AND NOT EXISTS (SELECT 1 FROM _rc_ WHERE ");
-		first = true;
-		foreach(gcl, groupColNames)
-		{
-			const char *colq = quote_identifier(strVal(lfirst(gcl)));
-
-			if (!first)
-				appendStringInfoString(&buf, " AND ");
-			first = false;
-			appendStringInfo(&buf, "_rc_.%s IS NOT DISTINCT FROM %s.%s", colq, mvname, colq);
-		}
-		appendStringInfoString(&buf, ")");
-	}
-	else
-	{
-		/* groups in the recompute not matched by _upd_ are new */
-		appendStringInfo(&buf, " INSERT INTO %s (", mvname);
-		first = true;
-		foreach(lc, viewQuery->targetList)
-		{
-			TargetEntry *te = lfirst_node(TargetEntry, lc);
-
-			if (te->resjunk)
-				continue;
-			if (!first)
-				appendStringInfoChar(&buf, ',');
-			first = false;
-			appendStringInfoString(&buf, quote_identifier(te->resname));
-		}
-		appendStringInfoString(&buf, ") SELECT ");
-		first = true;
-		foreach(lc, viewQuery->targetList)
-		{
-			TargetEntry *te = lfirst_node(TargetEntry, lc);
-
-			if (te->resjunk)
-				continue;
-			if (!first)
-				appendStringInfoChar(&buf, ',');
-			first = false;
-			appendStringInfo(&buf, "_rc_.%s", quote_identifier(te->resname));
-		}
-		appendStringInfoString(&buf, " FROM _rc_ WHERE NOT EXISTS (SELECT 1 FROM _upd_ WHERE ");
-		first = true;
-		foreach(gcl, groupColNames)
-		{
-			const char *colq = quote_identifier(strVal(lfirst(gcl)));
-
-			if (!first)
-				appendStringInfoString(&buf, " AND ");
-			first = false;
-			appendStringInfo(&buf, "_upd_.%s IS NOT DISTINCT FROM _rc_.%s", colq, colq);
-		}
-		appendStringInfoString(&buf, ")");
-	}
-
-	return buf.data;
-}
-
-static char *
-incr_build_self_join_agg_ins_sql(Oid mvrelid, Query *viewQuery,
-								  int v1, int v2,
-								  const char *delta_table,
-								  List *all_tables)
-{
-	return incr_build_self_join_agg_apply_sql(mvrelid, viewQuery, v1, v2,
-											  delta_table, all_tables, false);
-}
-
-/*
- * incr_build_self_join_agg_del_sql
- *
- * DELETE delta for a self-join with GROUP BY.  Same CTE wrapping strategy.
- * Each arm is "WITH d AS (...) UPDATE mv SET ... FROM d WHERE ...".
- * Both are wrapped as outer CTEs with a terminal SELECT 1.
- *
- *   WITH _sj_d1_ AS ( <arm1: WITH d AS (...) UPDATE ...> ),
- *        _sj_d2_ AS ( <arm2: WITH d AS (...) UPDATE ...> )
- *   SELECT 1
- */
-static char *
-incr_build_self_join_agg_del_sql(Oid mvrelid, Query *viewQuery,
-								  int v1, int v2,
-								  const char *delta_table,
-								  List *all_tables)
-{
-	return incr_build_self_join_agg_apply_sql(mvrelid, viewQuery, v1, v2,
-											  delta_table, all_tables, true);
-}
 
 /* ============================================================
  * UNION ALL helpers — Phase 13
