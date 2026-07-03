@@ -2,7 +2,7 @@
 -- an OUTER join (LEFT / RIGHT).
 --
 -- Outer-join aggregate matviews are maintained by the Phase 8 recompute builder
--- (incr_build_outer_sql): it recomputes each affected group from the LIVE outer
+-- (incr_build_recompute_sql): it recomputes each affected group from the LIVE outer
 -- join, preserving orphan rows from the preserved side.  That builder renders
 -- the aggregate verbatim — including DISTINCT — so it is correct for the
 -- recompute aggregates, not just additive ones.

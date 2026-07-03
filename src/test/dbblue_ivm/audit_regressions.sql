@@ -75,21 +75,35 @@ BEGIN
 END $$;
 DROP MATERIALIZED VIEW j_inc; DROP MATERIALIZED VIEW j_norm; DROP TABLE j_cu,j_or,j_li CASCADE;
 
--- BUG 3: LEFT/RIGHT/FULL self-join must be rejected cleanly (it used to leak an
--- internal unique-constraint violation on the engine catalog).
+-- BUG 3 (historical): LEFT/RIGHT self-join used to leak an internal
+-- unique-constraint violation on the engine catalog and was then rejected
+-- cleanly.  The shape is now SUPPORTED (self-outer recompute path, one combined
+-- catalog row per OID), so this case asserts acceptance + correctness instead:
+-- the incremental matview must match a full REFRESH after deltas.  A FULL
+-- self-join remains rejected cleanly (checked in distinct_outer_join Case 16).
 DROP TABLE IF EXISTS emp CASCADE;
 CREATE TABLE emp(id int primary key, mgr int, sal int);
 INSERT INTO emp VALUES (1,NULL,1000),(2,1,500),(3,1,600);
+CREATE MATERIALIZED VIEW _ss WITH (incremental_refresh=true) AS
+  SELECT e.mgr mgrid, count(*) cnt
+  FROM emp e LEFT JOIN emp m ON e.mgr=m.id GROUP BY e.mgr;
+CREATE MATERIALIZED VIEW _sn AS
+  SELECT e.mgr mgrid, count(*) cnt
+  FROM emp e LEFT JOIN emp m ON e.mgr=m.id GROUP BY e.mgr;
+INSERT INTO emp VALUES (4,3,700);   -- new report under 3
+DELETE FROM emp WHERE id=2;         -- shrink group mgr=1
+UPDATE emp SET mgr=NULL WHERE id=3; -- 3 becomes top-level → moves to NULL group
+REFRESH MATERIALIZED VIEW _sn;
 DO $$
+DECLARE n int;
 BEGIN
-  EXECUTE 'CREATE MATERIALIZED VIEW _ss WITH (incremental_refresh=true) AS
-           SELECT e.mgr mgrid, count(*) cnt
-           FROM emp e LEFT JOIN emp m ON e.mgr=m.id GROUP BY e.mgr';
-  RAISE EXCEPTION 'BUG3: LEFT self-join was accepted (should be rejected)';
-EXCEPTION
-  WHEN feature_not_supported THEN RAISE NOTICE 'BUG3 LEFT self-join rejected cleanly: PASS';
-  WHEN others THEN RAISE EXCEPTION 'BUG3: wrong error % (%) — expected feature_not_supported', SQLSTATE, SQLERRM;
+  SELECT count(*) INTO n FROM (
+    (SELECT mgrid,cnt FROM _ss EXCEPT SELECT mgrid,cnt FROM _sn)
+    UNION ALL (SELECT mgrid,cnt FROM _sn EXCEPT SELECT mgrid,cnt FROM _ss)) d;
+  IF n=0 THEN RAISE NOTICE 'BUG3 self LEFT join (now supported) == REFRESH: PASS';
+  ELSE RAISE EXCEPTION 'BUG3: self LEFT join diverged from REFRESH (% rows)', n; END IF;
 END $$;
+DROP MATERIALIZED VIEW _ss; DROP MATERIALIZED VIEW _sn;
 DROP TABLE emp CASCADE;
 
 -- BUG A (audit round 2): a row-level (no GROUP BY) matview keeps duplicate rows;
