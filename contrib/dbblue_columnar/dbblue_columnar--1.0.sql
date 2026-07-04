@@ -35,3 +35,45 @@ CREATE VIEW dbblue_columnar_status AS
 	SELECT relid, attnum, auto_added, added_by, added_at
 	FROM dbblue_columnar_relations
 	ORDER BY relid, attnum;
+
+-- Build (or rebuild) the in-memory column store for a registered relation.
+-- Returns the number of columnar blocks built. Only heap-page ranges that are
+-- entirely all-visible are built; the rest stay heap-only.
+CREATE FUNCTION dbblue_columnar_populate(rel regclass)
+RETURNS integer
+AS 'MODULE_PATHNAME', 'dbblue_columnar_populate'
+LANGUAGE C VOLATILE STRICT;
+
+-- Introspection: one row per (columnar block, column chunk).
+CREATE FUNCTION dbblue_columnar_blocks(rel regclass,
+	OUT block_index integer,
+	OUT first_page bigint,
+	OUT npages integer,
+	OUT nrows bigint,
+	OUT attnum smallint,
+	OUT encoding text,
+	OUT null_count bigint,
+	OUT zone_min text,
+	OUT zone_max text,
+	OUT bytes bigint)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME', 'dbblue_columnar_blocks'
+LANGUAGE C VOLATILE STRICT;
+
+-- Free the in-memory column store for a relation (works by OID even after
+-- DROP TABLE). Returns whether an entry existed. Registrations are kept.
+CREATE FUNCTION dbblue_columnar_drop(rel regclass)
+RETURNS boolean
+AS 'MODULE_PATHNAME', 'dbblue_columnar_drop'
+LANGUAGE C VOLATILE STRICT;
+
+-- Column-store memory accounting. used_bytes is the engine's logical
+-- accounting; dsa_total_bytes is the real shared-area size including
+-- allocator overhead.
+CREATE FUNCTION dbblue_columnar_memory(
+	OUT budget_mb integer,
+	OUT used_bytes bigint,
+	OUT dsa_total_bytes bigint)
+RETURNS record
+AS 'MODULE_PATHNAME', 'dbblue_columnar_memory'
+LANGUAGE C VOLATILE;

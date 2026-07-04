@@ -3,6 +3,7 @@
 MODULE_big = dbblue_columnar
 OBJS = \
 	$(WIN32RES) \
+	columnar_store.o \
 	dbblue_columnar.o
 
 EXTENSION = dbblue_columnar

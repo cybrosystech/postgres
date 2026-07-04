@@ -5,18 +5,28 @@ preloaded module. **Standalone by design** — it depends only on core
 PostgreSQL, never on the IVM engine. (The two may later integrate at the
 matview-storage seam, but nothing here requires IVM.)
 
-## Status: Milestone 1 skeleton
+## Status: Milestone 2, step 1 — the column store exists
 
-A *loadable, buildable, do-nothing* engine to grow from. It currently:
+The in-memory column store is real: `dbblue_columnar_populate(rel)` builds
+columnar blocks (32 heap pages each) in a shared DSA for the registered
+columns, with per-page **build LSN stamps**, per-chunk **zone maps**
+(min/max/null-count), null bitmaps, and plain (encoding-ready) storage for
+fixed-width and varlena columns. Only page ranges that are entirely
+**all-visible with valid LSNs** are built; everything else stays heap-only.
+Budget-accounted (`dbblue_columnar.memory_mb`), error-safe (a canceled
+populate frees everything it built), and introspectable:
 
-- registers the `dbblue_columnar.*` GUCs;
-- registers a `CustomScan` provider that offers **no path yet**, so the planner
-  falls through to normal Seq/Index/Bitmap scans;
-- registers a background refresh worker that **idles**;
-- provides `dbblue_columnar_add(rel regclass, columns text[])`, which records
-  registrations in `dbblue_columnar_relations` (no column store is built yet).
+- `dbblue_columnar_add(rel, columns[])` — register columns (validates; rejects
+  system columns)
+- `dbblue_columnar_populate(rel)` — build/rebuild the store (rejects
+  unlogged/temp relations and non-{1,2,4,8,16}-width fixed types, loudly)
+- `dbblue_columnar_blocks(rel)` — per-(block, chunk) introspection incl. zone maps
+- `dbblue_columnar_drop(rel)` — free a relation's store (works by OID after
+  DROP TABLE); registrations are kept
+- `dbblue_columnar_memory()` — budget, logical bytes, real DSA bytes
 
-Nothing here changes query results — it is inert on purpose.
+The planner still offers **no columnar path** (that is the next step), so
+query results are unchanged. The refresh worker still idles.
 
 ## Build
 

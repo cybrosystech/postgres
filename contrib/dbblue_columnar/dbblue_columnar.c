@@ -41,13 +41,15 @@
 #include "utils/lsyscache.h"
 #include "utils/wait_event.h"
 
+#include "dbblue_columnar.h"
+
 PG_MODULE_MAGIC;
 
-/* ---- GUC variables ---- */
-static bool dbblue_columnar_enabled = false;
-static bool dbblue_columnar_enable_columnar_scan = true;
+/* ---- GUC variables (declared in dbblue_columnar.h) ---- */
+bool		dbblue_columnar_enabled = false;
+bool		dbblue_columnar_enable_columnar_scan = true;
+int			dbblue_columnar_memory_mb = 128;
 static bool dbblue_columnar_auto_columnarize = false;
-static int	dbblue_columnar_memory_mb = 128;
 
 /* ---- saved hook ---- */
 static set_rel_pathlist_hook_type prev_set_rel_pathlist_hook = NULL;
@@ -249,6 +251,7 @@ dbblue_columnar_add(PG_FUNCTION_ARGS)
 	int			nelems;
 	int			i;
 	int64		added = 0;
+	char	   *insert_sql;
 
 	if (ARR_NDIM(arr) > 1)
 		ereport(ERROR,
@@ -257,6 +260,15 @@ dbblue_columnar_add(PG_FUNCTION_ARGS)
 
 	deconstruct_array(arr, TEXTOID, -1, false, TYPALIGN_INT,
 					  &elems, &nulls, &nelems);
+
+	/*
+	 * Schema-qualify the registry, exactly like the populate-side reader:
+	 * resolving through search_path could target (or be captured by) an
+	 * unrelated same-named table.
+	 */
+	insert_sql = psprintf("INSERT INTO %s (relid, attnum) "
+						  "VALUES ($1, $2) ON CONFLICT (relid, attnum) DO NOTHING",
+						  dbbc_registry_table_name());
 
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "dbblue_columnar: SPI_connect failed");
@@ -281,13 +293,16 @@ dbblue_columnar_add(PG_FUNCTION_ARGS)
 					(errcode(ERRCODE_UNDEFINED_COLUMN),
 					 errmsg("column \"%s\" does not exist in relation \"%s\"",
 							colname, get_rel_name(relid))));
+		if (attnum < 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cannot columnarize system column \"%s\"",
+							colname)));
 
 		values[0] = ObjectIdGetDatum(relid);
 		values[1] = Int16GetDatum(attnum);
 
-		ret = SPI_execute_with_args(
-									"INSERT INTO dbblue_columnar_relations (relid, attnum) "
-									"VALUES ($1, $2) ON CONFLICT (relid, attnum) DO NOTHING",
+		ret = SPI_execute_with_args(insert_sql,
 									2, argtypes, values, NULL, false, 0);
 		if (ret != SPI_OK_INSERT)
 			elog(ERROR, "dbblue_columnar: registration insert failed (%d)", ret);
