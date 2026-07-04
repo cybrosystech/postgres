@@ -5880,39 +5880,142 @@ incr_append_recompute_tail(StringInfo buf, const char *mvname,
 	 * Strategy: deparse the viewQuery against the LIVE base tables
 	 * (no ENR swap), strip HAVING so failing groups are included (the
 	 * hav_sql step re-derives __mv_having_ok__ afterwards), then wrap
-	 * in a subquery filtered by EXISTS in _affected_.  The deparse core
+	 * in a subquery restricted to the _affected_ keys.  The deparse core
 	 * renders the correct join types (INNER/LEFT/FULL) and all column
 	 * origins automatically.
+	 *
+	 * The restriction has two forms (measured on a 1M-row table, one
+	 * affected group, index on the key):
+	 *
+	 *   FAST — CROSS JOIN LATERAL on plain equality:
+	 *     FROM (SELECT DISTINCT keys FROM _affected_) _ak_
+	 *     CROSS JOIN LATERAL (SELECT ... FROM (<live>) __live__
+	 *                         WHERE __live__.k = _ak_.k) _x_
+	 *     The = qual is pushed into the deparsed subquery down to the scan
+	 *     as a parameterized index condition (~13ms; reads only the
+	 *     affected groups' rows).  Plain = misses NULL keys, so this form
+	 *     needs a NULL-group arm (single nullable key) or provably
+	 *     NOT NULL keys (multi-key).
+	 *
+	 *   GENERAL — WHERE EXISTS (... IS NOT DISTINCT FROM ...):
+	 *     NULL-safe for any key set, but IS NOT DISTINCT FROM is not an
+	 *     indexable operator, so the base table is seq-scanned (~46ms at
+	 *     1M rows).  Fallback for multi-key sets with nullable or
+	 *     expression keys.  (A redundant indexable prefilter with
+	 *     "IN (...) OR IS NULL" measured far WORSE — 6.3s — because the
+	 *     OR forces a full index scan; do not "optimize" that way.)
 	 * ---------------------------------------------------------------- */
 	{
 		Query  *live_q = copyObject(viewQuery);
 		char   *live_sel;
+		int		nkeys = list_length(viewQuery->groupClause);
+		bool	all_notnull = (nkeys > 0);
+		bool	fast_form;
 
 		live_q->havingQual = NULL;
 		live_sel = dbblue_deparse_query(live_q);
 
-		appendStringInfo(buf,
-						 "_new_agg_ AS (\n"
-						 "  SELECT __live__.*\n"
-						 "  FROM (%s) __live__\n"
-						 "  WHERE EXISTS (\n"
-						 "    SELECT 1 FROM _affected_ WHERE ",
-						 live_sel);
-		first = true;
 		foreach(lc, viewQuery->groupClause)
 		{
 			SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
 			TargetEntry     *te  = get_sortgroupclause_tle(sgc,
 														   viewQuery->targetList);
-			const char      *col = quote_identifier(te->resname);
+			Node			*gexpr = incr_group_key_expr(viewQuery, te);
 
-			if (!first) appendStringInfoString(buf, " AND ");
-			appendStringInfo(buf,
-							 "_affected_.%s IS NOT DISTINCT FROM __live__.%s",
-							 col, col);
-			first = false;
+			if (gexpr == NULL || !IsA(gexpr, Var) ||
+				incr_key_var_nullable((Var *) gexpr, viewQuery->rtable))
+			{
+				all_notnull = false;
+				break;
+			}
 		}
-		appendStringInfoString(buf, "\n  )\n),\n");
+		/* single key: the NULL arm covers nullability; multi-key: all keys
+		 * must be provably NOT NULL for plain = to be exhaustive */
+		fast_form = (nkeys == 1) || all_notnull;
+
+		if (fast_form)
+		{
+			const char *k1 = NULL;	/* single-key resname, for the NULL arm */
+
+			appendStringInfoString(buf,
+								   "_new_agg_ AS (\n"
+								   "  SELECT _x_.*\n"
+								   "  FROM (SELECT DISTINCT ");
+			first = true;
+			foreach(lc, viewQuery->groupClause)
+			{
+				SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+				TargetEntry     *te  = get_sortgroupclause_tle(sgc,
+															   viewQuery->targetList);
+				const char      *col = quote_identifier(te->resname);
+
+				if (!first) appendStringInfoString(buf, ", ");
+				appendStringInfoString(buf, col);
+				first = false;
+				k1 = col;
+			}
+			appendStringInfoString(buf, " FROM _affected_");
+			if (nkeys == 1 && !all_notnull)
+				appendStringInfo(buf, " WHERE %s IS NOT NULL", k1);
+			appendStringInfo(buf,
+							 ") _ak_\n"
+							 "  CROSS JOIN LATERAL (\n"
+							 "    SELECT __live__.*\n"
+							 "    FROM (%s) __live__\n"
+							 "    WHERE ", live_sel);
+			first = true;
+			foreach(lc, viewQuery->groupClause)
+			{
+				SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+				TargetEntry     *te  = get_sortgroupclause_tle(sgc,
+															   viewQuery->targetList);
+				const char      *col = quote_identifier(te->resname);
+
+				if (!first) appendStringInfoString(buf, " AND ");
+				appendStringInfo(buf, "__live__.%s = _ak_.%s", col, col);
+				first = false;
+			}
+			appendStringInfoString(buf, "\n  ) _x_");
+
+			if (nkeys == 1 && !all_notnull)
+			{
+				/* NULL-group arm: executes only when NULL is in _affected_ */
+				appendStringInfo(buf,
+								 "\n  UNION ALL\n"
+								 "  SELECT __live__.*\n"
+								 "  FROM (%s) __live__\n"
+								 "  WHERE __live__.%s IS NULL\n"
+								 "    AND EXISTS (SELECT 1 FROM _affected_ "
+								 "WHERE %s IS NULL)",
+								 live_sel, k1, k1);
+			}
+			appendStringInfoString(buf, "\n),\n");
+		}
+		else
+		{
+			appendStringInfo(buf,
+							 "_new_agg_ AS (\n"
+							 "  SELECT __live__.*\n"
+							 "  FROM (%s) __live__\n"
+							 "  WHERE EXISTS (\n"
+							 "    SELECT 1 FROM _affected_ WHERE ",
+							 live_sel);
+			first = true;
+			foreach(lc, viewQuery->groupClause)
+			{
+				SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+				TargetEntry     *te  = get_sortgroupclause_tle(sgc,
+															   viewQuery->targetList);
+				const char      *col = quote_identifier(te->resname);
+
+				if (!first) appendStringInfoString(buf, " AND ");
+				appendStringInfo(buf,
+								 "_affected_.%s IS NOT DISTINCT FROM __live__.%s",
+								 col, col);
+				first = false;
+			}
+			appendStringInfoString(buf, "\n  )\n),\n");
+		}
 	}
 
 	/* ----------------------------------------------------------------
