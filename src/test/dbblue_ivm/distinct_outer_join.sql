@@ -510,6 +510,14 @@ DELETE FROM so_emp WHERE id=5;            -- manager 5 gone → emp 6 orphans; g
 -- arm must catch it or a stale row remains
 INSERT INTO so_emp VALUES (7,NULL,70,80),(8,7,75,60);  -- manager 7 (dept 70) + emp 8 under it
 DELETE FROM so_emp WHERE id IN (7,8);
+-- partition UPDATE: one statement changes BOTH partners of a pair (the manager's
+-- dept AND the employee's mgr).  LIVE holds post-update values at trigger time,
+-- so the old pair exists only in OLD⋈OLD — same delta⋈delta arm, del half of
+-- the update
+INSERT INTO so_emp VALUES (9,NULL,80,50),(10,9,85,40); -- manager 9 (dept 80) + emp 10 under it
+UPDATE so_emp SET dept = CASE WHEN id=9 THEN 90 ELSE dept END,
+                  mgr  = CASE WHEN id=10 THEN 99 ELSE mgr END
+WHERE id IN (9,10);                                     -- group 80 must vanish
 REFRESH MATERIALIZED VIEW so15_o;
 DO $$
 DECLARE d int;
