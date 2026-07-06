@@ -28,6 +28,7 @@
 #include "access/table.h"
 #include "access/tupmacs.h"
 #include "access/visibilitymap.h"
+#include "catalog/pg_am_d.h"
 #include "catalog/pg_type.h"
 #include "commands/extension.h"
 #include "executor/spi.h"
@@ -44,6 +45,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/resowner.h"
 #include "utils/tuplestore.h"
 #include "utils/typcache.h"
 
@@ -99,9 +101,23 @@ static void dbbc_init_control(void *ptr, void *arg);
 static bool dbbc_try_reserve(Size nbytes);
 static void dbbc_release_bytes(int64 nbytes);
 static int	dbbc_registered_attnums(Oid relid, int16 **attnums_out);
-static void dbbc_free_entry_contents(DbbcRelEntry *entry);
+static void dbbc_version_free(DbbcRelVersion *version);
 static dsa_pointer dbbc_copy_to_dsa(const void *src, Size len, Size *acct);
 static Datum dbbc_chunk_fetch_minmax(DbbcColumnChunk *chunk, dsa_pointer ptr);
+static void dbbc_pin_release_cb(Datum arg);
+
+/*
+ * Version pins held by this backend are registered with the current
+ * ResourceOwner so that an aborted query still unpins (EndCustomScan and
+ * normal cleanup paths are not reached on ERROR).
+ */
+static const ResourceOwnerDesc dbbc_pin_resowner_desc = {
+	.name = "dbblue_columnar version pin",
+	.release_phase = RESOURCE_RELEASE_BEFORE_LOCKS,
+	.release_priority = RELEASE_PRIO_FIRST,
+	.ReleaseResource = dbbc_pin_release_cb,
+	.DebugPrint = NULL,
+};
 
 /*
  * Attach this backend to the shared column store, creating it on first use
@@ -263,15 +279,23 @@ dbbc_registered_attnums(Oid relid, int16 **attnums_out)
 	return ncols;
 }
 
-/* append len bytes to a column's varlena blob, growing as needed */
-static void
+/*
+ * Append len bytes to a column's varlena blob at the next MAXALIGN'd offset
+ * (zero pad bytes), growing as needed. Returns the offset the value was
+ * stored at, so blob+offset is directly usable as a varlena Datum even for
+ * double-aligned types (e.g. int8range) whose internals assume the datum
+ * starts at a maximally-aligned address.
+ */
+static uint32
 dbbc_blob_append(DbbcColBuild *cb, const void *data, Size len)
 {
-	if (cb->blob_len + len > cb->blob_cap)
+	Size		aligned = MAXALIGN(cb->blob_len);
+
+	if (aligned + len > cb->blob_cap)
 	{
 		Size		newcap = Max(cb->blob_cap * 2, (Size) 65536);
 
-		while (newcap < cb->blob_len + len)
+		while (newcap < aligned + len)
 			newcap *= 2;
 		if (cb->blob == NULL)
 			cb->blob = (uint8 *) palloc(newcap);
@@ -279,8 +303,12 @@ dbbc_blob_append(DbbcColBuild *cb, const void *data, Size len)
 			cb->blob = (uint8 *) repalloc(cb->blob, newcap);
 		cb->blob_cap = newcap;
 	}
-	memcpy(cb->blob + cb->blob_len, data, len);
-	cb->blob_len += len;
+	if (aligned > cb->blob_len)
+		memset(cb->blob + cb->blob_len, 0, aligned - cb->blob_len);
+	memcpy(cb->blob + aligned, data, len);
+	cb->blob_len = aligned + len;
+
+	return (uint32) aligned;
 }
 
 /* track zone-map min/max for one non-null value */
@@ -396,39 +424,105 @@ dbbc_free_block(dsa_pointer blockptr, int ncols, Size *freed)
 	*freed += sizeof(DbbcBlock) + ncols * sizeof(DbbcColumnChunk);
 }
 
-/* free everything under a relation entry and release its accounting */
+/* free a retired version: its blocks, directory, attnums, and itself */
 static void
-dbbc_free_entry_contents(DbbcRelEntry *entry)
+dbbc_version_free(DbbcRelVersion *version)
 {
 	Size		freed = 0;
+	Size		total = version->total_bytes;
 
-	if (DsaPointerIsValid(entry->blockdir))
+	if (DsaPointerIsValid(version->blockdir))
 	{
 		dsa_pointer *dir = (dsa_pointer *)
-			dsa_get_address(dbbc_dsa, entry->blockdir);
+			dsa_get_address(dbbc_dsa, version->blockdir);
 		uint32		i;
 
-		for (i = 0; i < entry->ndirslots; i++)
+		for (i = 0; i < version->ndirslots; i++)
 		{
 			if (DsaPointerIsValid(dir[i]))
-				dbbc_free_block(dir[i], entry->ncols, &freed);
+				dbbc_free_block(dir[i], version->ncols, &freed);
 		}
-		dsa_free(dbbc_dsa, entry->blockdir);
+		dsa_free(dbbc_dsa, version->blockdir);
 	}
-	if (DsaPointerIsValid(entry->attnums))
-		dsa_free(dbbc_dsa, entry->attnums);
+	if (DsaPointerIsValid(version->attnums))
+		dsa_free(dbbc_dsa, version->attnums);
+
+	dsa_free(dbbc_dsa, version->self);
 
 	/*
-	 * Release what this entry had reserved. entry->total_bytes is
-	 * authoritative; the "freed" sum is a cross-check only.
+	 * Release what this version had reserved. total_bytes is authoritative;
+	 * the "freed" sum is a cross-check only.
 	 */
-	dbbc_release_bytes((int64) entry->total_bytes);
+	dbbc_release_bytes((int64) total);
+}
 
-	entry->blockdir = InvalidDsaPointer;
-	entry->attnums = InvalidDsaPointer;
-	entry->ndirslots = 0;
-	entry->ncols = 0;
-	entry->total_bytes = 0;
+/*
+ * Pin the current version of a relation's column store, or NULL if none.
+ * The pin keeps the version (and every block under it) alive even across a
+ * concurrent repopulate/drop; the entry lock itself is held only momentarily
+ * (dshash forbids holding one across another lookup).
+ */
+DbbcRelVersion *
+dbbc_version_pin(Oid reloid)
+{
+	DbbcRelKey	key;
+	DbbcRelEntry *entry;
+	DbbcRelVersion *version = NULL;
+
+	dbbc_store_attach();
+
+	key.dboid = MyDatabaseId;
+	key.reloid = reloid;
+	entry = (DbbcRelEntry *) dshash_find(dbbc_hash, &key, false);
+	if (entry == NULL)
+		return NULL;
+	if (DsaPointerIsValid(entry->version))
+	{
+		version = (DbbcRelVersion *)
+			dsa_get_address(dbbc_dsa, entry->version);
+		pg_atomic_add_fetch_u32(&version->pins, 1);
+	}
+	dshash_release_lock(dbbc_hash, entry);
+
+	return version;
+}
+
+/* drop a pin; whoever reaches zero frees the version */
+void
+dbbc_version_unpin(DbbcRelVersion *version)
+{
+	if (pg_atomic_sub_fetch_u32(&version->pins, 1) == 0)
+		dbbc_version_free(version);
+}
+
+static void
+dbbc_pin_release_cb(Datum arg)
+{
+	dbbc_version_unpin((DbbcRelVersion *) DatumGetPointer(arg));
+}
+
+/* pin/unpin registered with the current ResourceOwner (abort-safe) */
+DbbcRelVersion *
+dbbc_version_pin_tracked(Oid reloid)
+{
+	DbbcRelVersion *version;
+
+	ResourceOwnerEnlarge(CurrentResourceOwner);
+	version = dbbc_version_pin(reloid);
+	if (version != NULL)
+		ResourceOwnerRemember(CurrentResourceOwner,
+							  PointerGetDatum(version),
+							  &dbbc_pin_resowner_desc);
+	return version;
+}
+
+void
+dbbc_version_unpin_tracked(DbbcRelVersion *version)
+{
+	ResourceOwnerForget(CurrentResourceOwner,
+						PointerGetDatum(version),
+						&dbbc_pin_resowner_desc);
+	dbbc_version_unpin(version);
 }
 
 /*
@@ -461,9 +555,10 @@ dbblue_columnar_populate(PG_FUNCTION_ARGS)
 	 */
 	volatile Size entry_bytes = 0;	/* reconciled bytes of finished blocks */
 	volatile Size inflight_bytes = 0;	/* reservation of the block being built */
-	volatile Size meta_resv = 0;	/* directory+attnums reservation */
+	volatile Size meta_resv = 0;	/* version+directory+attnums reservation */
 	volatile dsa_pointer attnums_dsa = InvalidDsaPointer;
 	volatile dsa_pointer blockdir_dsa = InvalidDsaPointer;
+	volatile dsa_pointer version_dsa = InvalidDsaPointer;
 	volatile bool published = false;
 	volatile int blocks_built = 0;
 	bool		budget_hit = false;
@@ -507,6 +602,16 @@ dbblue_columnar_populate(PG_FUNCTION_ARGS)
 				 errmsg("cannot columnarize unlogged or temporary relation \"%s\"",
 						RelationGetRelationName(rel)),
 				 errdetail("The columnar validity check relies on page LSNs, which only permanent relations maintain.")));
+
+	/*
+	 * The raw-page walk below (line pointers, PD_ALL_VISIBLE, heap tuples)
+	 * and the scan's range-limited fallback are heap-AM-only.
+	 */
+	if (rel->rd_rel->relam != HEAP_TABLE_AM_OID)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot columnarize relation \"%s\": unsupported table access method",
+						RelationGetRelationName(rel))));
 
 	tupdesc = RelationGetDescr(rel);
 
@@ -753,13 +858,12 @@ dbblue_columnar_populate(PG_FUNCTION_ARGS)
 						 * Degrade, never error: a block whose detoasted data
 						 * won't fit the per-block ceiling stays heap-only.
 						 */
-						if (cb->blob_len + VARSIZE(v) > DBBC_MAX_BLOCK_BLOB)
+						if (MAXALIGN(cb->blob_len) + VARSIZE(v) > DBBC_MAX_BLOCK_BLOB)
 						{
 							oversize = true;
 							break;
 						}
-						cb->offsets[i] = (uint32) cb->blob_len;
-						dbbc_blob_append(cb, v, VARSIZE(v));
+						cb->offsets[i] = dbbc_blob_append(cb, v, VARSIZE(v));
 						dbbc_track_minmax(meta, cb, PointerGetDatum(v));
 					}
 				}
@@ -929,44 +1033,61 @@ dbblue_columnar_populate(PG_FUNCTION_ARGS)
 		MemoryContextDelete(blkcxt);
 
 		/*
-		 * Publish, replacing any previous population. All fallible work (the
-		 * two DSA copies, the hash insert) happens before any entry field is
-		 * assigned, so a half-initialized entry can never be observed: once
-		 * assignment starts, every remaining step is a plain store.
+		 * Publish, replacing any previous version. All fallible work (the
+		 * DSA copies, the version allocation, the hash insert) happens
+		 * before any entry field is assigned, so a half-initialized entry
+		 * can never be observed: once assignment starts, every remaining
+		 * step is a plain store. The old version is unpinned, not freed:
+		 * concurrent readers that pinned it keep it alive until their last
+		 * unpin.
 		 */
 		{
 			Size		meta_bytes = 0;
 			Size		dirsize = Max(ndirslots, 1) * sizeof(dsa_pointer);
 			Size		attsize = ncols * sizeof(int16);
+			DbbcRelVersion *version;
+			dsa_pointer oldv = InvalidDsaPointer;
 
 			/*
-			 * Directory + attnum metadata is tiny; reserve it
+			 * Version + directory + attnum metadata is tiny; reserve it
 			 * unconditionally (going a whisker over budget beats publishing
 			 * a broken entry).
 			 */
 			LWLockAcquire(&dbbc_control->lck, LW_EXCLUSIVE);
-			dbbc_control->bytes_used += (int64) (dirsize + attsize);
+			dbbc_control->bytes_used +=
+				(int64) (dirsize + attsize + sizeof(DbbcRelVersion));
 			LWLockRelease(&dbbc_control->lck);
-			meta_resv = dirsize + attsize;
+			meta_resv = dirsize + attsize + sizeof(DbbcRelVersion);
 
 			attnums_dsa = dbbc_copy_to_dsa(attnums, attsize, &meta_bytes);
 			blockdir_dsa = dbbc_copy_to_dsa(newdir, dirsize, &meta_bytes);
+			version_dsa = dsa_allocate(dbbc_dsa, sizeof(DbbcRelVersion));
+			meta_bytes += sizeof(DbbcRelVersion);
+
+			version = (DbbcRelVersion *) dsa_get_address(dbbc_dsa,
+														 version_dsa);
+			pg_atomic_init_u32(&version->pins, 1);	/* the entry's own pin */
+			version->self = version_dsa;
+			version->ncols = ncols;
+			version->attnums = attnums_dsa;
+			version->ndirslots = ndirslots;
+			version->nblocks = (uint32) blocks_built;
+			version->blockdir = blockdir_dsa;
+			version->total_bytes = entry_bytes + meta_bytes;
 
 			key.dboid = MyDatabaseId;
 			key.reloid = relid;
 			entry = (DbbcRelEntry *) dshash_find_or_insert(dbbc_hash, &key,
 														   &found);
-			if (found)
-				dbbc_free_entry_contents(entry);
-
 			/* no fallible calls below this point */
-			entry->ncols = ncols;
-			entry->attnums = attnums_dsa;
-			entry->ndirslots = ndirslots;
-			entry->blockdir = blockdir_dsa;
-			entry->total_bytes = entry_bytes + meta_bytes;
+			oldv = found ? entry->version : InvalidDsaPointer;
+			entry->version = version_dsa;
 			published = true;
 			dshash_release_lock(dbbc_hash, entry);
+
+			if (DsaPointerIsValid(oldv))
+				dbbc_version_unpin((DbbcRelVersion *)
+								   dsa_get_address(dbbc_dsa, oldv));
 		}
 	}
 	PG_CATCH();
@@ -985,6 +1106,8 @@ dbblue_columnar_populate(PG_FUNCTION_ARGS)
 				dsa_free(dbbc_dsa, attnums_dsa);
 			if (DsaPointerIsValid(blockdir_dsa))
 				dsa_free(dbbc_dsa, blockdir_dsa);
+			if (DsaPointerIsValid(version_dsa))
+				dsa_free(dbbc_dsa, version_dsa);
 			dbbc_release_bytes((int64) (entry_bytes + inflight_bytes + meta_resv));
 		}
 		PG_RE_THROW();
@@ -1008,8 +1131,7 @@ dbblue_columnar_blocks(PG_FUNCTION_ARGS)
 {
 	Oid			relid = PG_GETARG_OID(0);
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
-	DbbcRelKey	key;
-	DbbcRelEntry *entry;
+	DbbcRelVersion *version;
 	dsa_pointer *dir;
 	uint32		slot;
 
@@ -1017,22 +1139,19 @@ dbblue_columnar_blocks(PG_FUNCTION_ARGS)
 
 	dbbc_store_attach();
 
-	key.dboid = MyDatabaseId;
-	key.reloid = relid;
-	entry = (DbbcRelEntry *) dshash_find(dbbc_hash, &key, false);
-	if (entry == NULL)
+	/* pin (abort-safe): no dshash lock is held while we format output */
+	version = dbbc_version_pin_tracked(relid);
+	if (version == NULL)
 		return (Datum) 0;
-
-	/* defensive: never walk an entry without a directory */
-	if (!DsaPointerIsValid(entry->blockdir))
+	if (!DsaPointerIsValid(version->blockdir))
 	{
-		dshash_release_lock(dbbc_hash, entry);
+		dbbc_version_unpin_tracked(version);
 		return (Datum) 0;
 	}
 
-	dir = (dsa_pointer *) dsa_get_address(dbbc_dsa, entry->blockdir);
+	dir = (dsa_pointer *) dsa_get_address(dbbc_dsa, version->blockdir);
 
-	for (slot = 0; slot < entry->ndirslots; slot++)
+	for (slot = 0; slot < version->ndirslots; slot++)
 	{
 		DbbcBlock  *block;
 		DbbcColumnChunk *chunks;
@@ -1044,7 +1163,7 @@ dbblue_columnar_blocks(PG_FUNCTION_ARGS)
 		block = (DbbcBlock *) dsa_get_address(dbbc_dsa, dir[slot]);
 		chunks = (DbbcColumnChunk *) dsa_get_address(dbbc_dsa, block->chunks);
 
-		for (c = 0; c < entry->ncols; c++)
+		for (c = 0; c < version->ncols; c++)
 		{
 			DbbcColumnChunk *chunk = &chunks[c];
 			Datum		values[10];
@@ -1083,7 +1202,7 @@ dbblue_columnar_blocks(PG_FUNCTION_ARGS)
 		}
 	}
 
-	dshash_release_lock(dbbc_hash, entry);
+	dbbc_version_unpin_tracked(version);
 
 	return (Datum) 0;
 }
@@ -1104,6 +1223,7 @@ dbblue_columnar_drop(PG_FUNCTION_ARGS)
 	Oid			relid = PG_GETARG_OID(0);
 	DbbcRelKey	key;
 	DbbcRelEntry *entry;
+	dsa_pointer oldv;
 
 	dbbc_store_attach();
 
@@ -1113,8 +1233,13 @@ dbblue_columnar_drop(PG_FUNCTION_ARGS)
 	if (entry == NULL)
 		PG_RETURN_BOOL(false);
 
-	dbbc_free_entry_contents(entry);
+	oldv = entry->version;
 	dshash_delete_entry(dbbc_hash, entry);	/* releases the lock */
+
+	/* concurrent readers that pinned the version keep it alive */
+	if (DsaPointerIsValid(oldv))
+		dbbc_version_unpin((DbbcRelVersion *)
+						   dsa_get_address(dbbc_dsa, oldv));
 
 	PG_RETURN_BOOL(true);
 }

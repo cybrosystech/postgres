@@ -51,143 +51,9 @@ bool		dbblue_columnar_enable_columnar_scan = true;
 int			dbblue_columnar_memory_mb = 128;
 static bool dbblue_columnar_auto_columnarize = false;
 
-/* ---- saved hook ---- */
-static set_rel_pathlist_hook_type prev_set_rel_pathlist_hook = NULL;
-
 /* ---- forward declarations (exported entry points) ---- */
 PGDLLEXPORT void _PG_init(void);
 PGDLLEXPORT void dbblue_columnar_worker_main(Datum main_arg);
-
-/* ---- CustomScan provider callbacks ---- */
-static bool dbblue_columnar_rel_is_ready(RelOptInfo *rel, RangeTblEntry *rte);
-static void dbblue_columnar_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
-											 Index rti, RangeTblEntry *rte);
-static Plan *dbblue_columnar_plan_custom_path(PlannerInfo *root, RelOptInfo *rel,
-											  CustomPath *best_path, List *tlist,
-											  List *clauses, List *custom_plans);
-static Node *dbblue_columnar_create_scan_state(CustomScan *cscan);
-static void dbblue_columnar_begin_scan(CustomScanState *node, EState *estate,
-									   int eflags);
-static TupleTableSlot *dbblue_columnar_exec_scan(CustomScanState *node);
-static void dbblue_columnar_end_scan(CustomScanState *node);
-static void dbblue_columnar_rescan_scan(CustomScanState *node);
-
-/* ---- CustomScan provider method tables ---- */
-static const CustomPathMethods dbblue_columnar_path_methods = {
-	.CustomName = "DBBlueColumnarScan",
-	.PlanCustomPath = dbblue_columnar_plan_custom_path,
-};
-
-static const CustomScanMethods dbblue_columnar_scan_methods = {
-	.CustomName = "DBBlueColumnarScan",
-	.CreateCustomScanState = dbblue_columnar_create_scan_state,
-};
-
-static const CustomExecMethods dbblue_columnar_exec_methods = {
-	.CustomName = "DBBlueColumnarScan",
-	.BeginCustomScan = dbblue_columnar_begin_scan,
-	.ExecCustomScan = dbblue_columnar_exec_scan,
-	.EndCustomScan = dbblue_columnar_end_scan,
-	.ReScanCustomScan = dbblue_columnar_rescan_scan,
-};
-
-/*
- * Is this relation ready to be served from the column store?
- *
- * Milestone 1: nothing is columnarized yet, so this is always false and the
- * planner never sees a columnar path. This is the single growth point where
- * later milestones will check that (a) every column the scan node needs is
- * registered and populated, and (b) enough of the relation's blocks are valid
- * (visibility-map all-visible AND page LSN unchanged since build) to be worth
- * a columnar path.
- */
-static bool
-dbblue_columnar_rel_is_ready(RelOptInfo *rel, RangeTblEntry *rte)
-{
-	return false;
-}
-
-/*
- * Planner hook: offer a columnar CustomPath for eligible base relations.
- *
- * Milestone 1: because dbblue_columnar_rel_is_ready() is always false, we
- * always fall through, leaving the planner's normal paths in place. The
- * guarded block below shows exactly how the columnar path will be injected.
- */
-static void
-dbblue_columnar_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
-								 Index rti, RangeTblEntry *rte)
-{
-	if (prev_set_rel_pathlist_hook)
-		prev_set_rel_pathlist_hook(root, rel, rti, rte);
-
-	if (!dbblue_columnar_enabled || !dbblue_columnar_enable_columnar_scan)
-		return;
-
-	if (dbblue_columnar_rel_is_ready(rel, rte))
-	{
-		CustomPath *cpath = makeNode(CustomPath);
-
-		cpath->path.pathtype = T_CustomScan;
-		cpath->path.parent = rel;
-		cpath->path.pathtarget = rel->reltarget;
-		cpath->path.rows = rel->rows;
-		cpath->flags = 0;
-		cpath->methods = &dbblue_columnar_path_methods;
-
-		add_path(rel, (Path *) cpath);
-	}
-}
-
-static Plan *
-dbblue_columnar_plan_custom_path(PlannerInfo *root, RelOptInfo *rel,
-								 CustomPath *best_path, List *tlist,
-								 List *clauses, List *custom_plans)
-{
-	CustomScan *cscan = makeNode(CustomScan);
-
-	cscan->scan.plan.targetlist = tlist;
-	cscan->scan.plan.qual = NIL;
-	cscan->scan.scanrelid = rel->relid;
-	cscan->flags = best_path->flags;
-	cscan->methods = &dbblue_columnar_scan_methods;
-
-	return &cscan->scan.plan;
-}
-
-static Node *
-dbblue_columnar_create_scan_state(CustomScan *cscan)
-{
-	CustomScanState *cstate = (CustomScanState *) palloc0(sizeof(CustomScanState));
-
-	NodeSetTag(cstate, T_CustomScanState);
-	cstate->methods = &dbblue_columnar_exec_methods;
-
-	return (Node *) cstate;
-}
-
-static void
-dbblue_columnar_begin_scan(CustomScanState *node, EState *estate, int eflags)
-{
-	/* Milestone 1: no columnar scan state to initialize. */
-}
-
-static TupleTableSlot *
-dbblue_columnar_exec_scan(CustomScanState *node)
-{
-	/* Milestone 1: never reached (no columnar path is ever chosen). */
-	return NULL;
-}
-
-static void
-dbblue_columnar_end_scan(CustomScanState *node)
-{
-}
-
-static void
-dbblue_columnar_rescan_scan(CustomScanState *node)
-{
-}
 
 /*
  * Background refresh worker.
@@ -367,12 +233,8 @@ _PG_init(void)
 
 	MarkGUCPrefixReserved("dbblue_columnar");
 
-	/* register the CustomScan provider (no paths are offered yet) */
-	RegisterCustomScanMethods(&dbblue_columnar_scan_methods);
-
-	/* install the path-injection hook */
-	prev_set_rel_pathlist_hook = set_rel_pathlist_hook;
-	set_rel_pathlist_hook = dbblue_columnar_set_rel_pathlist;
+	/* planner hook + CustomScan provider (columnar_scan.c) */
+	dbbc_scan_init();
 
 	/* register the background refresh worker */
 	memset(&worker, 0, sizeof(worker));

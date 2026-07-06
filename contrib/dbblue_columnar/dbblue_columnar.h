@@ -26,9 +26,11 @@
  *     stride attlen would misalign every element after the first.
  *   - varlena types: a uint32 offset per row into a concatenated blob of
  *     fully-detoasted varlena values (self-describing, header included);
- *     NULL rows carry DBBC_VAR_NULL_OFFSET. The blob packs values with NO
- *     alignment padding: decoders must memcpy values out (or use
- *     unaligned-safe access), never cast blob+offset to an aligned struct.
+ *     NULL rows carry DBBC_VAR_NULL_OFFSET. Every value is stored at a
+ *     MAXALIGN'd offset (pad bytes are zero), so blob+offset is directly
+ *     usable as a varlena Datum on every platform, including for
+ *     double-aligned types (int8range etc.) whose internals assume a
+ *     maximally-aligned datum start.
  * NULLs are additionally tracked in a per-chunk bitmap (present only when the
  * chunk has at least one NULL). Each chunk also carries a zone map (min/max
  * for types with a btree comparator, plus a null count) used for block
@@ -47,6 +49,7 @@
 
 #include "access/xlogdefs.h"
 #include "lib/dshash.h"
+#include "port/atomics.h"
 #include "storage/block.h"
 #include "utils/dsa.h"
 
@@ -123,26 +126,37 @@ typedef struct DbbcRelKey
 } DbbcRelKey;
 
 /*
- * Per-relation entry in the shared hash. The block directory is an array of
- * dsa_pointer to DbbcBlock, one slot per DBBC_PAGES_PER_BLOCK-page range of
- * the heap as of the last populate; InvalidDsaPointer marks ranges that were
- * not built (some page was not all-visible, or the memory budget was hit).
+ * One immutable population of a relation: the block directory (an array of
+ * dsa_pointer to DbbcBlock, one slot per DBBC_PAGES_PER_BLOCK-page range as
+ * of its populate; InvalidDsaPointer marks ranges that were not built) plus
+ * the column set it was built for.
  *
- * Concurrency (Milestone 2): the dshash entry lock protects the whole entry
- * including the directory and all blocks under it. Writers (populate) hold it
- * exclusively; readers (introspection) hold it shared for the duration of
- * their read. This is acceptable while readers are short-lived; the scan
- * executor milestone must replace it with refcounted/epoch reclamation before
- * long-running readers appear.
+ * Lifetime is refcounted: `pins` is 1 while the version is the entry's
+ * current one, +1 for every active reader (scan, introspection, planner
+ * check). Publish swaps the entry to a new version and unpins the old;
+ * whoever drops the count to zero frees the version and its blocks. dshash
+ * entry locks are therefore only ever held momentarily (dshash forbids
+ * holding one across another lookup), and a reader can never observe a
+ * freed block. Readers must register their pin with a ResourceOwner (see
+ * columnar_scan.c) so aborted queries unpin too.
  */
-typedef struct DbbcRelEntry
+typedef struct DbbcRelVersion
 {
-	DbbcRelKey	key;			/* hash key: must be first */
+	pg_atomic_uint32 pins;		/* 1 while current + 1 per active reader */
+	dsa_pointer self;			/* this struct's own dsa_pointer */
 	int			ncols;
 	dsa_pointer attnums;		/* int16[ncols], ascending */
 	uint32		ndirslots;		/* directory length */
+	uint32		nblocks;		/* directory slots actually built */
 	dsa_pointer blockdir;		/* dsa_pointer[ndirslots] -> DbbcBlock */
-	Size		total_bytes;	/* accounting: all DSA bytes of this entry */
+	Size		total_bytes;	/* accounting: all DSA bytes of this version */
+} DbbcRelVersion;
+
+/* per-relation entry in the shared hash: just a pointer to the version */
+typedef struct DbbcRelEntry
+{
+	DbbcRelKey	key;			/* hash key: must be first */
+	dsa_pointer version;		/* DbbcRelVersion, Invalid if none */
 } DbbcRelEntry;
 
 /* GUCs (defined in dbblue_columnar.c) */
@@ -156,5 +170,12 @@ extern dsa_area *dbbc_store_dsa(void);
 extern dshash_table *dbbc_store_hash(void);
 extern int64 dbbc_store_bytes_used(void);
 extern char *dbbc_registry_table_name(void);
+extern DbbcRelVersion *dbbc_version_pin(Oid reloid);
+extern void dbbc_version_unpin(DbbcRelVersion *version);
+extern DbbcRelVersion *dbbc_version_pin_tracked(Oid reloid);
+extern void dbbc_version_unpin_tracked(DbbcRelVersion *version);
+
+/* columnar_scan.c */
+extern void dbbc_scan_init(void);
 
 #endif							/* DBBLUE_COLUMNAR_H */
