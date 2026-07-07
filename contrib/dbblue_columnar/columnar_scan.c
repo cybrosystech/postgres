@@ -39,11 +39,14 @@
 #include "postgres.h"
 
 #include "access/heapam.h"
+#include "access/nbtree.h"
 #include "access/relscan.h"
+#include "access/stratnum.h"
 #include "access/sysattr.h"
 #include "access/tableam.h"
 #include "access/tupmacs.h"
 #include "catalog/pg_am_d.h"
+#include "commands/defrem.h"
 #include "commands/explain.h"
 #include "commands/explain_format.h"
 #include "executor/executor.h"
@@ -57,9 +60,11 @@
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
 #include "optimizer/restrictinfo.h"
+#include "nodes/nodeFuncs.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
 #include "storage/predicate.h"
+#include "utils/array.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
@@ -76,6 +81,41 @@ typedef struct DbbcColPtrs
 	uint8	   *blob;			/* varlena blob, or NULL */
 	uint8	   *nulls;			/* null bitmap, or NULL */
 } DbbcColPtrs;
+
+/*
+ * A qual simple enough to evaluate against zone maps (block skipping) and
+ * against raw column values (the columnar pre-filter). Soundness rules: the
+ * operator must belong to the column type's default btree opfamily (the
+ * comparison proc is the opfamily's ORDER proc for the actual operand
+ * types, so cross-type quals like int4col = int8const are exact), and the
+ * qual's collation must equal the column's (zone min/max were computed
+ * under the column collation; a different qual collation orders
+ * differently). Everything not extractable stays in plan.qual, which
+ * ExecScan re-evaluates on every returned row regardless - the pre-filter
+ * can only remove rows, never admit wrong ones.
+ */
+typedef enum DbbcSkipKind
+{
+	DBBC_SKIP_OP,				/* Var <btree-strategy-op> Const */
+	DBBC_SKIP_SAOP_EQ,			/* Var = ANY (const array) */
+	DBBC_SKIP_NULLTEST,			/* Var IS [NOT] NULL */
+} DbbcSkipKind;
+
+typedef struct DbbcSkipQual
+{
+	DbbcSkipKind kind;
+	AttrNumber	attno;
+	Oid			coltype;		/* the Var's vartype: must match chunk->atttypid
+								 * before a zone map (built under that type) may
+								 * be trusted */
+	uint16		strategy;		/* BTLess..BTGreater for OP */
+	bool		nulltest_isnull;
+	Oid			collation;
+	FmgrInfo	cmp;			/* btree ORDER proc (coltype, rhs type) */
+	Datum		value;			/* OP: the Const value */
+	Datum	   *elems;			/* SAOP: non-null array elements */
+	int			nelems;
+} DbbcSkipQual;
 
 typedef struct DbbcScanState
 {
@@ -104,6 +144,11 @@ typedef struct DbbcScanState
 	DbbcColPtrs *col_ptrs;		/* resolved addresses for cur_block */
 	uint32		cur_row;
 
+	/* pushed-down simple quals (zone skipping + columnar pre-filter) */
+	DbbcSkipQual *skipquals;
+	int			nskipquals;
+	int		   *attno_to_col;	/* [natts] -> chunk index or -1 */
+
 	/* heap fallback */
 	TableScanDesc heap_scan;
 	TupleTableSlot *heap_slot;	/* table-AM slot (scan slot is virtual) */
@@ -119,8 +164,10 @@ typedef struct DbbcScanState
 
 	/* instrumentation */
 	uint64		blocks_columnar;
+	uint64		blocks_skipped;
 	uint64		ranges_heap;
 	uint64		rows_columnar;
+	uint64		rows_filtered;
 } DbbcScanState;
 
 static void dbbc_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
@@ -168,6 +215,413 @@ dbbc_scan_init(void)
 
 	prev_set_rel_pathlist_hook = set_rel_pathlist_hook;
 	set_rel_pathlist_hook = dbbc_set_rel_pathlist;
+}
+
+/*
+ * Try to turn one qual clause into a DbbcSkipQual. See the struct comment
+ * for the soundness rules; anything that doesn't fit is simply left to
+ * ExecScan's normal qual evaluation.
+ */
+static bool
+dbbc_extract_one_qual(Node *clause, Index varno, DbbcSkipQual *q)
+{
+	memset(q, 0, sizeof(DbbcSkipQual));
+
+	if (IsA(clause, OpExpr))
+	{
+		OpExpr	   *op = (OpExpr *) clause;
+		Node	   *l,
+				   *r;
+		Oid			opno = op->opno;
+		Oid			ltype,
+					rtype;
+		Var		   *var;
+		Const	   *cst;
+		Oid			opclass,
+					opfam;
+		int			strategy;
+		Oid			cmpproc;
+
+		if (list_length(op->args) != 2)
+			return false;
+		l = (Node *) linitial(op->args);
+		r = (Node *) lsecond(op->args);
+
+		/* normalize to Var op Const, commuting if needed */
+		if (IsA(r, Const) || (IsA(r, RelabelType) &&
+							  IsA(((RelabelType *) r)->arg, Const)))
+		{
+			/* keep as is */
+		}
+		else
+		{
+			Node	   *tmp;
+
+			opno = get_commutator(opno);
+			if (!OidIsValid(opno))
+				return false;
+			tmp = l;
+			l = r;
+			r = tmp;
+		}
+
+		ltype = exprType(l);
+		rtype = exprType(r);
+
+		while (IsA(l, RelabelType))
+			l = (Node *) ((RelabelType *) l)->arg;
+		while (IsA(r, RelabelType))
+			r = (Node *) ((RelabelType *) r)->arg;
+		if (!IsA(l, Var) || !IsA(r, Const))
+			return false;
+		var = (Var *) l;
+		cst = (Const *) r;
+		if (var->varno != varno || var->varlevelsup != 0 ||
+			var->varattno <= 0)
+			return false;
+		if (cst->constisnull)
+			return false;
+
+		/* qual collation must match the column's (zone-map ordering) */
+		if (op->inputcollid != var->varcollid)
+			return false;
+
+		opclass = GetDefaultOpClass(var->vartype, BTREE_AM_OID);
+		if (!OidIsValid(opclass))
+			return false;
+		opfam = get_opclass_family(opclass);
+		strategy = get_op_opfamily_strategy(opno, opfam);
+		if (strategy < BTLessStrategyNumber ||
+			strategy > BTGreaterStrategyNumber)
+			return false;
+		cmpproc = get_opfamily_proc(opfam, ltype, rtype, BTORDER_PROC);
+		if (!OidIsValid(cmpproc))
+			return false;
+
+		q->kind = DBBC_SKIP_OP;
+		q->attno = var->varattno;
+		q->coltype = var->vartype;
+		q->strategy = (uint16) strategy;
+		q->collation = op->inputcollid;
+		q->value = cst->constvalue;
+		fmgr_info(cmpproc, &q->cmp);
+		return true;
+	}
+
+	if (IsA(clause, ScalarArrayOpExpr))
+	{
+		ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) clause;
+		Node	   *l,
+				   *r;
+		Oid			ltype;
+		Var		   *var;
+		Const	   *cst;
+		ArrayType  *arr;
+		Oid			elemtype;
+		int16		elemlen;
+		bool		elembyval;
+		char		elemalign;
+		Datum	   *elems;
+		bool	   *nulls;
+		int			nelems,
+					nkeep,
+					i;
+		Oid			opclass,
+					opfam;
+		Oid			cmpproc;
+
+		if (!saop->useOr || list_length(saop->args) != 2)
+			return false;
+		l = (Node *) linitial(saop->args);
+		r = (Node *) lsecond(saop->args);
+		ltype = exprType(l);
+		while (IsA(l, RelabelType))
+			l = (Node *) ((RelabelType *) l)->arg;
+		if (!IsA(l, Var) || !IsA(r, Const))
+			return false;
+		var = (Var *) l;
+		cst = (Const *) r;
+		if (var->varno != varno || var->varlevelsup != 0 ||
+			var->varattno <= 0 || cst->constisnull)
+			return false;
+		if (saop->inputcollid != var->varcollid)
+			return false;
+
+		opclass = GetDefaultOpClass(var->vartype, BTREE_AM_OID);
+		if (!OidIsValid(opclass))
+			return false;
+		opfam = get_opclass_family(opclass);
+		if (get_op_opfamily_strategy(saop->opno, opfam) !=
+			BTEqualStrategyNumber)
+			return false;
+
+		arr = DatumGetArrayTypeP(cst->constvalue);
+		elemtype = ARR_ELEMTYPE(arr);
+		cmpproc = get_opfamily_proc(opfam, ltype, elemtype, BTORDER_PROC);
+		if (!OidIsValid(cmpproc))
+			return false;
+
+		get_typlenbyvalalign(elemtype, &elemlen, &elembyval, &elemalign);
+		deconstruct_array(arr, elemtype, elemlen, elembyval, elemalign,
+						  &elems, &nulls, &nelems);
+
+		/* NULL elements can never match '=', drop them */
+		nkeep = 0;
+		for (i = 0; i < nelems; i++)
+		{
+			if (!nulls[i])
+				elems[nkeep++] = elems[i];
+		}
+
+		q->kind = DBBC_SKIP_SAOP_EQ;
+		q->attno = var->varattno;
+		q->coltype = var->vartype;
+		q->strategy = BTEqualStrategyNumber;
+		q->collation = saop->inputcollid;
+		q->elems = elems;
+		q->nelems = nkeep;
+		fmgr_info(cmpproc, &q->cmp);
+		return true;
+	}
+
+	if (IsA(clause, NullTest))
+	{
+		NullTest   *nt = (NullTest *) clause;
+		Node	   *arg = (Node *) nt->arg;
+		Var		   *var;
+
+		if (nt->argisrow)
+			return false;
+		while (IsA(arg, RelabelType))
+			arg = (Node *) ((RelabelType *) arg)->arg;
+		if (!IsA(arg, Var))
+			return false;
+		var = (Var *) arg;
+		if (var->varno != varno || var->varlevelsup != 0 ||
+			var->varattno <= 0)
+			return false;
+
+		q->kind = DBBC_SKIP_NULLTEST;
+		q->attno = var->varattno;
+		q->nulltest_isnull = (nt->nulltesttype == IS_NULL);
+		return true;
+	}
+
+	return false;
+}
+
+/* extract all simple quals from a list of bare clause expressions */
+static int
+dbbc_extract_skip_quals(List *clauses, Index varno, DbbcSkipQual **out)
+{
+	DbbcSkipQual *quals;
+	int			n = 0;
+	ListCell   *lc;
+
+	if (clauses == NIL)
+	{
+		*out = NULL;
+		return 0;
+	}
+
+	quals = (DbbcSkipQual *)
+		palloc(list_length(clauses) * sizeof(DbbcSkipQual));
+	foreach(lc, clauses)
+	{
+		if (dbbc_extract_one_qual((Node *) lfirst(lc), varno, &quals[n]))
+			n++;
+	}
+
+	*out = quals;
+	return n;
+}
+
+/* cmp(col-side datum, qual-side datum) via the qual's btree ORDER proc */
+static inline int32
+dbbc_skip_cmp(DbbcSkipQual *q, Datum coldatum, Datum qualdatum)
+{
+	return DatumGetInt32(FunctionCall2Coll(&q->cmp, q->collation,
+										   coldatum, qualdatum));
+}
+
+/*
+ * Can this (valid!) block be skipped entirely - i.e. can we prove from the
+ * zone maps that NO row in it satisfies all the quals? A skipped block is
+ * sound because a valid block provably contains every row of its range.
+ * Only ever called on blocks that passed dbbc_block_valid: a stale block's
+ * zone maps prove nothing.
+ */
+static bool
+dbbc_zone_block_skippable(DbbcSkipQual *quals, int nquals,
+						  DbbcBlock *block, DbbcColumnChunk *chunks,
+						  int ncols)
+{
+	int			i;
+
+	for (i = 0; i < nquals; i++)
+	{
+		DbbcSkipQual *q = &quals[i];
+		DbbcColumnChunk *chunk = NULL;
+		Datum		zmin,
+					zmax;
+		int			c;
+
+		for (c = 0; c < ncols; c++)
+		{
+			if (chunks[c].attnum == q->attno)
+			{
+				chunk = &chunks[c];
+				break;
+			}
+		}
+		if (chunk == NULL)
+			continue;
+
+		if (q->kind == DBBC_SKIP_NULLTEST)
+		{
+			if (q->nulltest_isnull)
+			{
+				if (chunk->null_count == 0)
+					return true;	/* no NULLs: IS NULL matches nothing */
+			}
+			else
+			{
+				if (chunk->null_count == block->nrows)
+					return true;	/* all NULL: IS NOT NULL matches nothing */
+			}
+			continue;
+		}
+
+		/* strict operators match no all-NULL column (ordering-independent) */
+		if (chunk->null_count == block->nrows)
+			return true;
+
+		/*
+		 * The min/max are only extrema under the exact type + collation they
+		 * were built with. A non-rewriting ALTER COLUMN TYPE (binary
+		 * coercible) or COLLATE leaves heap pages / LSN / VM untouched - so
+		 * the block still passes validity - but changes the current
+		 * catalog's ordering out from under these bytes. Comparing them with
+		 * the current comparator could skip a block that actually matches
+		 * (missing rows), or hand a stale by-value datum to a wider/varlena
+		 * comparator (crash) on the plan-time estimate path. If build-time
+		 * identity and current identity disagree, treat as no zone map.
+		 */
+		if (chunk->atttypid != q->coltype ||
+			chunk->attcollation != q->collation)
+			continue;
+		if (!chunk->has_minmax)
+			continue;			/* no zone map: cannot prove anything */
+
+		zmin = dbbc_chunk_minmax_datum(chunk, false);
+		zmax = dbbc_chunk_minmax_datum(chunk, true);
+
+		if (q->kind == DBBC_SKIP_OP)
+		{
+			bool		skip = false;
+
+			switch (q->strategy)
+			{
+				case BTLessStrategyNumber:
+					skip = dbbc_skip_cmp(q, zmin, q->value) >= 0;
+					break;
+				case BTLessEqualStrategyNumber:
+					skip = dbbc_skip_cmp(q, zmin, q->value) > 0;
+					break;
+				case BTEqualStrategyNumber:
+					skip = dbbc_skip_cmp(q, zmin, q->value) > 0 ||
+						dbbc_skip_cmp(q, zmax, q->value) < 0;
+					break;
+				case BTGreaterEqualStrategyNumber:
+					skip = dbbc_skip_cmp(q, zmax, q->value) < 0;
+					break;
+				case BTGreaterStrategyNumber:
+					skip = dbbc_skip_cmp(q, zmax, q->value) <= 0;
+					break;
+			}
+			if (skip)
+				return true;
+		}
+		else					/* DBBC_SKIP_SAOP_EQ */
+		{
+			bool		any_possible = false;
+			int			e;
+
+			for (e = 0; e < q->nelems; e++)
+			{
+				if (dbbc_skip_cmp(q, zmin, q->elems[e]) <= 0 &&
+					dbbc_skip_cmp(q, zmax, q->elems[e]) >= 0)
+				{
+					any_possible = true;
+					break;
+				}
+			}
+			if (!any_possible)
+				return true;
+		}
+	}
+
+	return false;
+}
+
+/*
+ * Plan-time skip-fraction estimate: walk (a sample of) the real zone maps
+ * with the query's extractable quals. Returns the estimated fraction of
+ * BUILT blocks that will be skipped, scaled by build coverage, clamped
+ * conservatively.
+ */
+static double
+dbbc_estimate_skip_fraction(Oid relid, List *clauses, Index varno)
+{
+	DbbcSkipQual *quals;
+	int			nquals;
+	DbbcRelVersion *version;
+	dsa_pointer *dir;
+	uint32		step;
+	uint32		slot;
+	uint32		seen = 0;
+	uint32		skipped = 0;
+	double		frac;
+
+	nquals = dbbc_extract_skip_quals(clauses, varno, &quals);
+	if (nquals == 0)
+		return 0.0;
+
+	version = dbbc_version_pin_tracked(relid);
+	if (version == NULL)
+		return 0.0;
+	if (!DsaPointerIsValid(version->blockdir) || version->ndirslots == 0)
+	{
+		dbbc_version_unpin_tracked(version);
+		return 0.0;
+	}
+
+	dir = (dsa_pointer *) dsa_get_address(dbbc_store_dsa(),
+										  version->blockdir);
+	step = Max(1, version->ndirslots / 1024);
+	for (slot = 0; slot < version->ndirslots; slot += step)
+	{
+		DbbcBlock  *block;
+		DbbcColumnChunk *chunks;
+
+		if (!DsaPointerIsValid(dir[slot]))
+			continue;
+		block = (DbbcBlock *) dsa_get_address(dbbc_store_dsa(), dir[slot]);
+		chunks = (DbbcColumnChunk *) dsa_get_address(dbbc_store_dsa(),
+													 block->chunks);
+		seen++;
+		if (dbbc_zone_block_skippable(quals, nquals, block, chunks,
+									  version->ncols))
+			skipped++;
+	}
+
+	frac = (seen > 0) ? (double) skipped / seen : 0.0;
+	/* scale by how much of the relation is columnarized at all */
+	frac *= (double) version->nblocks / Max(version->ndirslots, 1);
+
+	dbbc_version_unpin_tracked(version);
+
+	return Min(frac, 0.95);
 }
 
 /*
@@ -285,6 +739,9 @@ dbbc_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 					  Index rti, RangeTblEntry *rte)
 {
 	List	   *needed = NIL;
+	List	   *clauses = NIL;
+	ListCell   *lc;
+	double		skip_frac;
 	CustomPath *cpath;
 	QualCost	qcost;
 
@@ -296,6 +753,11 @@ dbbc_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 
 	if (!dbbc_rel_ready(root, rel, rte, &needed))
 		return;
+
+	/* estimate zone-map skipping against the real block metadata */
+	foreach(lc, rel->baserestrictinfo)
+		clauses = lappend(clauses, ((RestrictInfo *) lfirst(lc))->clause);
+	skip_frac = dbbc_estimate_skip_fraction(rte->relid, clauses, rel->relid);
 
 	cpath = makeNode(CustomPath);
 	cpath->path.pathtype = T_CustomScan;
@@ -312,18 +774,20 @@ dbbc_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 	cpath->methods = &dbbc_path_methods;
 
 	/*
-	 * Milestone-2 costing: the scan still visits every heap page (validity
-	 * checks pin page headers; fallback reads pages in full), so charge full
-	 * I/O like a seqscan; the saving is per-tuple CPU on columnar-served
-	 * rows (no tuple deforming). Real costing (zone-map skip fractions)
-	 * arrives with predicate pushdown.
+	 * Costing: the scan still visits every heap page (validity checks pin
+	 * page headers; fallback reads pages in full), so charge full I/O like a
+	 * seqscan. The CPU saving has two sources: no tuple deforming on
+	 * columnar-served rows, and zone-map skipping - blocks the real zone
+	 * maps prove empty for these quals contribute no per-tuple work at all,
+	 * so the CPU terms scale by (1 - skip_frac).
 	 */
 	cost_qual_eval(&qcost, rel->baserestrictinfo, root);
 	cpath->path.disabled_nodes = 0;
 	cpath->path.startup_cost = qcost.startup;
 	cpath->path.total_cost = qcost.startup +
 		seq_page_cost * rel->pages +
-		(cpu_tuple_cost * 0.75 + qcost.per_tuple) * rel->tuples;
+		(cpu_tuple_cost * 0.75 + qcost.per_tuple) * rel->tuples *
+		(1.0 - skip_frac);
 
 	add_path(rel, (Path *) cpath);
 }
@@ -432,6 +896,8 @@ dbbc_begin_scan(CustomScanState *node, EState *estate, int eflags)
 		{
 			int16	   *reg = (int16 *) dsa_get_address(s->dsa,
 														s->version->attnums);
+			int			natts = RelationGetDescr(rel)->natts;
+			int			c;
 
 			s->dir = (dsa_pointer *) dsa_get_address(s->dsa,
 													 s->version->blockdir);
@@ -441,6 +907,21 @@ dbbc_begin_scan(CustomScanState *node, EState *estate, int eflags)
 			memcpy(s->attnums, reg, s->ncols * sizeof(int16));
 			s->col_ptrs = (DbbcColPtrs *)
 				palloc(s->ncols * sizeof(DbbcColPtrs));
+
+			s->attno_to_col = (int *) palloc(natts * sizeof(int));
+			for (c = 0; c < natts; c++)
+				s->attno_to_col[c] = -1;
+			for (c = 0; c < s->ncols; c++)
+			{
+				if (s->attnums[c] >= 1 && s->attnums[c] <= natts)
+					s->attno_to_col[s->attnums[c] - 1] = c;
+			}
+
+			/* simple quals for zone skipping + the columnar pre-filter */
+			s->nskipquals =
+				dbbc_extract_skip_quals(cscan->scan.plan.qual,
+										cscan->scan.scanrelid,
+										&s->skipquals);
 		}
 		else
 		{
@@ -517,6 +998,124 @@ dbbc_block_valid(DbbcScanState *s, Relation rel, DbbcBlock *block)
 	return true;
 }
 
+/* read one value of chunk c at row from the current block */
+static inline Datum
+dbbc_chunk_read(DbbcScanState *s, int c, uint32 row, bool *isnull)
+{
+	DbbcColumnChunk *chunk = &s->cur_chunks[c];
+	DbbcColPtrs *ptrs = &s->col_ptrs[c];
+
+	if (ptrs->nulls != NULL &&
+		(ptrs->nulls[row / 8] & (1 << (row % 8))) != 0)
+	{
+		*isnull = true;
+		return (Datum) 0;
+	}
+
+	if (chunk->attlen > 0)
+	{
+		uint8	   *ptr = ptrs->values + (Size) row * chunk->attlen;
+
+		*isnull = false;
+		if (chunk->attbyval)
+			return fetch_att(ptr, true, chunk->attlen);
+		return PointerGetDatum(ptr);
+	}
+	else
+	{
+		uint32		off = ((uint32 *) ptrs->values)[row];
+
+		if (off == DBBC_VAR_NULL_OFFSET)
+		{
+			/* defensive; the bitmap should have caught it */
+			*isnull = true;
+			return (Datum) 0;
+		}
+		*isnull = false;
+		return PointerGetDatum(ptrs->blob + off);
+	}
+}
+
+/*
+ * Columnar pre-filter: evaluate the simple quals against raw column values
+ * before paying for slot formation. Rows removed here would have been
+ * removed by ExecScan's qual anyway (same operator semantics via the btree
+ * ORDER proc); rows passed are still re-checked by ExecScan, so this can
+ * only ever remove, never wrongly admit.
+ */
+static bool
+dbbc_row_passes(DbbcScanState *s, uint32 row)
+{
+	int			i;
+
+	for (i = 0; i < s->nskipquals; i++)
+	{
+		DbbcSkipQual *q = &s->skipquals[i];
+		int			c = s->attno_to_col[q->attno - 1];
+		Datum		value;
+		bool		isnull;
+
+		if (c < 0)
+			continue;			/* not served columnar; leave to ExecScan */
+		value = dbbc_chunk_read(s, c, row, &isnull);
+
+		if (q->kind == DBBC_SKIP_NULLTEST)
+		{
+			if (isnull != q->nulltest_isnull)
+				return false;
+			continue;
+		}
+
+		if (isnull)
+			return false;		/* strict operators never pass NULL */
+
+		if (q->kind == DBBC_SKIP_OP)
+		{
+			int32		r = dbbc_skip_cmp(q, value, q->value);
+			bool		pass = false;
+
+			switch (q->strategy)
+			{
+				case BTLessStrategyNumber:
+					pass = r < 0;
+					break;
+				case BTLessEqualStrategyNumber:
+					pass = r <= 0;
+					break;
+				case BTEqualStrategyNumber:
+					pass = r == 0;
+					break;
+				case BTGreaterEqualStrategyNumber:
+					pass = r >= 0;
+					break;
+				case BTGreaterStrategyNumber:
+					pass = r > 0;
+					break;
+			}
+			if (!pass)
+				return false;
+		}
+		else					/* DBBC_SKIP_SAOP_EQ */
+		{
+			bool		any = false;
+			int			e;
+
+			for (e = 0; e < q->nelems; e++)
+			{
+				if (dbbc_skip_cmp(q, value, q->elems[e]) == 0)
+				{
+					any = true;
+					break;
+				}
+			}
+			if (!any)
+				return false;
+		}
+	}
+
+	return true;
+}
+
 /* fill the virtual scan slot from cur_block[cur_row] */
 static TupleTableSlot *
 dbbc_emit_row(DbbcScanState *s)
@@ -534,32 +1133,16 @@ dbbc_emit_row(DbbcScanState *s)
 
 	for (c = 0; c < s->ncols; c++)
 	{
-		DbbcColumnChunk *chunk = &s->cur_chunks[c];
-		DbbcColPtrs *ptrs = &s->col_ptrs[c];
-		int			attidx = chunk->attnum - 1;
+		int			attidx = s->cur_chunks[c].attnum - 1;
+		bool		isnull;
+		Datum		value;
 
-		if (ptrs->nulls != NULL &&
-			(ptrs->nulls[row / 8] & (1 << (row % 8))) != 0)
-			continue;			/* stays NULL */
-
-		if (chunk->attlen > 0)
+		value = dbbc_chunk_read(s, c, row, &isnull);
+		if (!isnull)
 		{
-			uint8	   *ptr = ptrs->values + (Size) row * chunk->attlen;
-
-			if (chunk->attbyval)
-				slot->tts_values[attidx] = fetch_att(ptr, true, chunk->attlen);
-			else
-				slot->tts_values[attidx] = PointerGetDatum(ptr);
+			slot->tts_values[attidx] = value;
+			slot->tts_isnull[attidx] = false;
 		}
-		else
-		{
-			uint32		off = ((uint32 *) ptrs->values)[row];
-
-			if (off == DBBC_VAR_NULL_OFFSET)
-				continue;		/* defensive; bitmap should have caught it */
-			slot->tts_values[attidx] = PointerGetDatum(ptrs->blob + off);
-		}
-		slot->tts_isnull[attidx] = false;
 	}
 
 	ExecStoreVirtualTuple(slot);
@@ -606,8 +1189,16 @@ dbbc_next(ScanState *ss)
 
 		if (s->cur_block != NULL)
 		{
-			if (s->cur_row < s->cur_block->nrows)
+			while (s->cur_row < s->cur_block->nrows)
+			{
+				if (s->nskipquals > 0 && !dbbc_row_passes(s, s->cur_row))
+				{
+					s->rows_filtered++;
+					s->cur_row++;
+					continue;
+				}
 				return dbbc_emit_row(s);
+			}
 			s->cur_block = NULL;
 			s->cur_slot++;
 			continue;
@@ -642,11 +1233,27 @@ dbbc_next(ScanState *ss)
 
 			if (block != NULL && dbbc_block_valid(s, rel, block))
 			{
+				DbbcColumnChunk *chunks = (DbbcColumnChunk *)
+					dsa_get_address(s->dsa, block->chunks);
 				int			c;
 
+				/*
+				 * Zone-map skip: only after the validity proof (a stale
+				 * block's zone maps prove nothing). A valid block contains
+				 * every row of its range, so proving no row can match the
+				 * quals disposes of the whole range.
+				 */
+				if (s->nskipquals > 0 &&
+					dbbc_zone_block_skippable(s->skipquals, s->nskipquals,
+											  block, chunks, s->ncols))
+				{
+					s->blocks_skipped++;
+					s->cur_slot++;
+					continue;
+				}
+
 				s->cur_block = block;
-				s->cur_chunks = (DbbcColumnChunk *)
-					dsa_get_address(s->dsa, block->chunks);
+				s->cur_chunks = chunks;
 				for (c = 0; c < s->ncols; c++)
 				{
 					DbbcColumnChunk *chunk = &s->cur_chunks[c];
@@ -737,9 +1344,13 @@ dbbc_explain_scan(CustomScanState *node, List *ancestors, ExplainState *es)
 	{
 		ExplainPropertyInteger("Columnar Blocks Served", NULL,
 							   (int64) s->blocks_columnar, es);
+		ExplainPropertyInteger("Columnar Blocks Skipped", NULL,
+							   (int64) s->blocks_skipped, es);
 		ExplainPropertyInteger("Heap Fallback Ranges", NULL,
 							   (int64) s->ranges_heap, es);
 		ExplainPropertyInteger("Columnar Rows", NULL,
 							   (int64) s->rows_columnar, es);
+		ExplainPropertyInteger("Rows Removed by Columnar Filter", NULL,
+							   (int64) s->rows_filtered, es);
 	}
 }

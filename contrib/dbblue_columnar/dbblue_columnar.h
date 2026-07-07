@@ -89,6 +89,7 @@ typedef struct DbbcColumnChunk
 {
 	int16		attnum;			/* user column number in the heap relation */
 	Oid			atttypid;
+	Oid			attcollation;	/* collation the zone min/max were built under */
 	int16		attlen;			/* pg_attribute.attlen (>0 fixed, -1 varlena) */
 	bool		attbyval;
 	uint8		encoding;		/* DbbcEncoding */
@@ -174,6 +175,7 @@ extern DbbcRelVersion *dbbc_version_pin(Oid reloid);
 extern void dbbc_version_unpin(DbbcRelVersion *version);
 extern DbbcRelVersion *dbbc_version_pin_tracked(Oid reloid);
 extern void dbbc_version_unpin_tracked(DbbcRelVersion *version);
+extern Datum dbbc_chunk_minmax_datum(DbbcColumnChunk *chunk, bool want_max);
 
 /* columnar_scan.c */
 extern void dbbc_scan_init(void);

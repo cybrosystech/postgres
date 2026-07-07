@@ -371,6 +371,15 @@ dbbc_store_minmax(DbbcColMeta *meta, Datum value, Size *acct)
 	}
 }
 
+/* rebuild a chunk's zone-map min or max as a Datum (chunk must have_minmax) */
+Datum
+dbbc_chunk_minmax_datum(DbbcColumnChunk *chunk, bool want_max)
+{
+	dbbc_store_attach();
+	return dbbc_chunk_fetch_minmax(chunk,
+								   want_max ? chunk->max_value : chunk->min_value);
+}
+
 /* rebuild a Datum from a stored min/max copy */
 static Datum
 dbbc_chunk_fetch_minmax(DbbcColumnChunk *chunk, dsa_pointer ptr)
@@ -945,6 +954,7 @@ dbblue_columnar_populate(PG_FUNCTION_ARGS)
 
 					chunk->attnum = meta->attnum;
 					chunk->atttypid = meta->atttypid;
+					chunk->attcollation = meta->attcollation;
 					chunk->attlen = meta->attlen;
 					chunk->attbyval = meta->attbyval;
 					chunk->encoding = DBBC_ENCODING_PLAIN;
