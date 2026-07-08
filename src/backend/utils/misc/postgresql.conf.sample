@@ -191,6 +191,12 @@
 #max_notify_queue_pages = 1048576       # limits the number of SLRU pages allocated
                                         # for NOTIFY / LISTEN queue
 
+#cluster_key_command = ''               # command that prints the cluster key
+                                        # (KEK) as 64 hex characters; required
+                                        # if data encryption was enabled with
+                                        # initdb --cluster-key-command
+                                        # (change requires restart or reload)
+
 # - Kernel Resources -
 
 #max_files_per_process = 1000           # min 64

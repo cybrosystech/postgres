@@ -474,6 +474,13 @@
   options => 'client_message_level_options',
 },
 
+{ name => 'cluster_key_command', type => 'string', context => 'PGC_SIGHUP', group => 'RESOURCES_DISK',
+  short_desc => 'Command to obtain the cluster key for transparent data encryption.',
+  long_desc => 'The command must print the key as 64 hexadecimal characters on standard output.',
+  variable => 'cluster_key_command',
+  boot_val => '""',
+},
+
 { name => 'cluster_name', type => 'string', context => 'PGC_POSTMASTER', group => 'PROCESS_TITLE',
   short_desc => 'Sets the name of the cluster, which is included in the process title.',
   flags => 'GUC_IS_NAME',

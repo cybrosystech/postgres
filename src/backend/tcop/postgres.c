@@ -41,6 +41,7 @@
 #include "commands/prepare.h"
 #include "commands/repack.h"
 #include "common/pg_prng.h"
+#include "crypto/kmgr.h"
 #include "jit/jit.h"
 #include "libpq/libpq.h"
 #include "libpq/pqformat.h"
@@ -4231,6 +4232,9 @@ PostgresSingleUserMain(int argc, char *argv[],
 	 * mode, but we must have these data structures anyway.)
 	 */
 	CreateSharedMemoryAndSemaphores();
+
+	/* If the cluster is encrypted, load the data encryption keys. */
+	InitializeKmgr(0);
 
 	/*
 	 * Estimate number of openable files.  This must happen after setting up

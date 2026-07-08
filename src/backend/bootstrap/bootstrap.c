@@ -29,7 +29,9 @@
 #include "catalog/pg_collation.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
+#include "common/cipher.h"
 #include "common/link-canary.h"
+#include "crypto/kmgr.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "port/pg_getopt_ctx.h"
@@ -242,6 +244,7 @@ BootstrapModeMain(int argc, char *argv[], bool check_only)
 	int			flag;
 	char	   *userDoption = NULL;
 	uint32		bootstrap_data_checksum_version = PG_DATA_CHECKSUM_OFF;
+	uint32		bootstrap_data_encryption_cipher = PG_CIPHER_NONE;
 	yyscan_t	scanner;
 
 	Assert(!IsUnderPostmaster);
@@ -258,7 +261,7 @@ BootstrapModeMain(int argc, char *argv[], bool check_only)
 	argv++;
 	argc--;
 
-	pg_getopt_start(&optctx, argc, argv, "B:c:d:D:Fkr:X:-:");
+	pg_getopt_start(&optctx, argc, argv, "B:c:d:D:FkKr:X:-:");
 	while ((flag = pg_getopt_next(&optctx)) != -1)
 	{
 		switch (flag)
@@ -327,6 +330,9 @@ BootstrapModeMain(int argc, char *argv[], bool check_only)
 			case 'k':
 				bootstrap_data_checksum_version = PG_DATA_CHECKSUM_VERSION;
 				break;
+			case 'K':
+				bootstrap_data_encryption_cipher = PG_CIPHER_AES256_XTS;
+				break;
 			case 'r':
 				strlcpy(OutputFileName, optctx.optarg, MAXPGPATH);
 				break;
@@ -380,6 +386,13 @@ BootstrapModeMain(int argc, char *argv[], bool check_only)
 	CreateSharedMemoryAndSemaphores();
 
 	/*
+	 * Load the data encryption keys before any relation IO happens.  The
+	 * control file does not exist yet, so the cipher comes from the -K
+	 * command line flag rather than from pg_control.
+	 */
+	InitializeKmgr(bootstrap_data_encryption_cipher);
+
+	/*
 	 * Estimate number of openable files.  This is essential too in --check
 	 * mode, because on some platforms semaphores count as open files.
 	 */
@@ -405,7 +418,8 @@ BootstrapModeMain(int argc, char *argv[], bool check_only)
 	BaseInit();
 
 	bootstrap_signals();
-	BootStrapXLOG(bootstrap_data_checksum_version);
+	BootStrapXLOG(bootstrap_data_checksum_version,
+				  bootstrap_data_encryption_cipher);
 
 	/*
 	 * To ensure that src/common/link-canary.c is linked into the backend, we

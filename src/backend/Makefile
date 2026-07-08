@@ -22,6 +22,7 @@ SUBDIRS = \
 	backup \
 	bootstrap \
 	catalog \
+	crypto \
 	parser \
 	commands \
 	executor \

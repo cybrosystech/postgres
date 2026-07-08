@@ -28,11 +28,14 @@
 
 #include "access/xlogutils.h"
 #include "commands/tablespace.h"
+#include "common/cipher.h"
 #include "common/file_utils.h"
+#include "crypto/kmgr.h"
 #include "miscadmin.h"
 #include "pg_trace.h"
 #include "pgstat.h"
 #include "storage/aio.h"
+#include "storage/aio_internal.h"
 #include "storage/bufmgr.h"
 #include "storage/fd.h"
 #include "storage/md.h"
@@ -96,6 +99,69 @@ typedef struct _MdfdVec
 } MdfdVec;
 
 static MemoryContext MdCxt;		/* context for all MdfdVec objects */
+
+/*
+ * Transparent data encryption support.
+ *
+ * When the cluster is encrypted, pages are encrypted with AES-256-XTS on
+ * their way to disk (mdwritev/mdextend) and decrypted on their way back in
+ * (mdreadv and the AIO completion callback md_readv_complete).  Everything
+ * above the smgr layer, including shared buffers, sees only plaintext, so
+ * page checksums are computed on (and verified against) plaintext.
+ *
+ * The XTS tweak is derived from the relfilenumber and block number, but
+ * deliberately NOT the fork number or database/tablespace OIDs: several
+ * code paths copy relation files byte-for-byte while preserving the
+ * relfilenumber and block offsets (unlogged relation init-fork resets,
+ * CREATE DATABASE ... STRATEGY=FILE_COPY, ALTER DATABASE ... SET
+ * TABLESPACE, base backups), and the tweak must remain valid across those
+ * copies.
+ *
+ * All-zero pages are passed through unmodified in both directions.  This
+ * is required because mdzeroextend() can extend a relation with literal
+ * zeros via posix_fallocate() without going through this layer, and it is
+ * safe because the ciphertext of a real page is never all zeros.
+ */
+static PGIOAlignedBlock tde_buf[PG_IOV_MAX];
+
+static PgCipherCtx *tde_cipher_ctx = NULL;
+
+/*
+ * Encrypt or decrypt one BLCKSZ page.  In-place operation (in == out) is
+ * allowed.  May be called in a critical section (AIO completion), where
+ * the resulting elog(ERROR) on failure escalates to PANIC; a cipher
+ * failure on an encrypted cluster is not recoverable anyway.
+ */
+static void
+tde_crypt_block(bool encrypt, const char *in, char *out,
+				RelFileNumber relNumber, BlockNumber blocknum)
+{
+	unsigned char tweak[PG_XTS_TWEAK_LEN] = {0};
+
+	if (pg_memory_is_all_zeros(in, BLCKSZ))
+	{
+		if (in != out)
+			memcpy(out, in, BLCKSZ);
+		return;
+	}
+
+	if (tde_cipher_ctx == NULL)
+	{
+		tde_cipher_ctx = pg_cipher_ctx_create();
+		if (tde_cipher_ctx == NULL)
+			elog(ERROR, "could not create cipher context");
+	}
+
+	memcpy(tweak, &relNumber, sizeof(RelFileNumber));
+	memcpy(tweak + sizeof(RelFileNumber), &blocknum, sizeof(BlockNumber));
+
+	if (!pg_cipher_xts_crypt(tde_cipher_ctx, encrypt,
+							 KmgrGetRelationKey(), tweak,
+							 (const unsigned char *) in,
+							 (unsigned char *) out, BLCKSZ))
+		elog(ERROR, "could not %s block %u of relation %u",
+			 encrypt ? "encrypt" : "decrypt", blocknum, relNumber);
+}
 
 
 /* Populate a file tag describing an md.c segment file. */
@@ -519,6 +585,13 @@ mdextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	seekpos = (pgoff_t) BLCKSZ * (blocknum % ((BlockNumber) RELSEG_SIZE));
 
 	Assert(seekpos < (pgoff_t) BLCKSZ * RELSEG_SIZE);
+
+	if (DataEncryptionEnabled())
+	{
+		tde_crypt_block(true, (const char *) buffer, tde_buf[0].data,
+						reln->smgr_rlocator.locator.relNumber, blocknum);
+		buffer = tde_buf[0].data;
+	}
 
 	if ((nbytes = FileWrite(v->mdfd_vfd, buffer, BLCKSZ, seekpos, WAIT_EVENT_DATA_FILE_EXTEND)) != BLCKSZ)
 	{
@@ -984,6 +1057,20 @@ mdreadv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 			iovcnt = compute_remaining_iovec(iov, iov, iovcnt, nbytes);
 		}
 
+		/*
+		 * Decrypt the pages in place, so callers see plaintext.  All-zero
+		 * pages (from the EOF-zero-fill path above or never-written blocks)
+		 * pass through unchanged.
+		 */
+		if (DataEncryptionEnabled())
+		{
+			for (BlockNumber i = 0; i < nblocks_this_segment; i++)
+				tde_crypt_block(false, (const char *) buffers[i],
+								(char *) buffers[i],
+								reln->smgr_rlocator.locator.relNumber,
+								blocknum + i);
+		}
+
 		nblocks -= nblocks_this_segment;
 		buffers += nblocks_this_segment;
 		blocknum += nblocks_this_segment;
@@ -1086,6 +1173,8 @@ mdwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		BlockNumber nblocks_this_segment;
 		size_t		transferred_this_segment;
 		size_t		size_this_segment;
+		const void *enc_buffers[PG_IOV_MAX];
+		const void **iovsrc;
 
 		v = _mdfd_getseg(reln, forknum, blocknum, skipFsync,
 						 EXTENSION_FAIL | EXTENSION_CREATE_RECOVERY);
@@ -1102,7 +1191,27 @@ mdwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		if (nblocks_this_segment != nblocks)
 			elog(ERROR, "write crosses segment boundary");
 
-		iovcnt = buffers_to_iovec(iov, (void **) buffers, nblocks_this_segment);
+		/*
+		 * When the cluster is encrypted, encrypt the pages into the static
+		 * TDE buffer and write from there, leaving the callers' buffers
+		 * (typically shared buffers) as plaintext.
+		 */
+		if (DataEncryptionEnabled())
+		{
+			for (int i = 0; i < nblocks_this_segment; i++)
+			{
+				tde_crypt_block(true, (const char *) buffers[i],
+								tde_buf[i].data,
+								reln->smgr_rlocator.locator.relNumber,
+								blocknum + i);
+				enc_buffers[i] = tde_buf[i].data;
+			}
+			iovsrc = enc_buffers;
+		}
+		else
+			iovsrc = buffers;
+
+		iovcnt = buffers_to_iovec(iov, (void **) iovsrc, nblocks_this_segment);
 		size_this_segment = nblocks_this_segment * BLCKSZ;
 		transferred_this_segment = 0;
 
@@ -2041,6 +2150,41 @@ md_readv_complete(PgAioHandle *ioh, PgAioResult prior_result, uint8 cb_data)
 		/* partial reads should be retried at upper level */
 		result.status = PGAIO_RS_PARTIAL;
 		result.id = PGAIO_HCB_MD_READV;
+	}
+
+	/*
+	 * Decrypt the blocks that were read, in place.  This runs before
+	 * bufmgr's completion callback (callbacks are called innermost-first),
+	 * so page verification there sees plaintext.  On a partial read only
+	 * the complete blocks are decrypted; the remainder is re-read by the
+	 * caller as a separate IO.  Note that this can run in whichever
+	 * process completes the IO (e.g. an IO worker); the keys live in
+	 * shared memory, so they are accessible here.
+	 */
+	if (DataEncryptionEnabled())
+	{
+		struct iovec *iov;
+		int			blocks_read = result.result;
+		BlockNumber blkno = td->smgr.blockNum;
+
+		pgaio_io_get_iovec_length(ioh, &iov);
+
+		while (blocks_read > 0)
+		{
+			char	   *p = (char *) iov->iov_base;
+			size_t		remaining = iov->iov_len;
+
+			while (remaining >= BLCKSZ && blocks_read > 0)
+			{
+				tde_crypt_block(false, p, p,
+								td->smgr.rlocator.relNumber, blkno);
+				p += BLCKSZ;
+				remaining -= BLCKSZ;
+				blkno++;
+				blocks_read--;
+			}
+			iov++;
+		}
 	}
 
 	return result;

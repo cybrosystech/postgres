@@ -71,6 +71,7 @@
 #include "catalog/pg_database_d.h"
 #include "common/file_perm.h"
 #include "common/file_utils.h"
+#include "common/kmgr_utils.h"
 #include "common/logging.h"
 #include "common/pg_prng.h"
 #include "common/restricted_token.h"
@@ -165,6 +166,7 @@ static bool do_sync = true;
 static bool sync_only = false;
 static bool show_setting = false;
 static bool data_checksums = true;
+static char *cluster_key_cmd = NULL;
 static char *xlog_dir = NULL;
 static int	wal_segment_size_mb = (DEFAULT_XLOG_SEG_SIZE) / (1024 * 1024);
 static DataDirSyncMethod sync_method = DATA_DIR_SYNC_METHOD_FSYNC;
@@ -274,6 +276,7 @@ static int	get_encoding_id(const char *encoding_name);
 static void set_input(char **dest, const char *filename);
 static void check_input(char *path);
 static void write_version_file(const char *extrapath);
+static void write_kmgr_file(void);
 static void set_null_conf(void);
 static void test_config_settings(void);
 static bool test_specific_config_settings(int test_conns, int test_av_slots,
@@ -1056,6 +1059,59 @@ write_version_file(const char *extrapath)
 }
 
 /*
+ * Generate the data encryption keys, wrap them with the cluster key
+ * obtained from the user-supplied command, and write out the key manager
+ * file for the bootstrap backend (and later the server) to use.
+ */
+static void
+write_kmgr_file(void)
+{
+	KmgrFileData filedata;
+	unsigned char relkey[KMGR_DATA_KEY_LEN];
+	unsigned char walkey[KMGR_DATA_KEY_LEN];
+	unsigned char kek[KMGR_CLUSTER_KEY_LEN];
+	char		errstr[512];
+	char	   *path;
+	FILE	   *kmgr_file;
+
+	printf(_("setting up data encryption keys ... "));
+	fflush(stdout);
+
+	if (!pg_strong_random(relkey, sizeof(relkey)) ||
+		!pg_strong_random(walkey, sizeof(walkey)))
+		pg_fatal("could not generate data encryption keys");
+
+	if (!kmgr_run_cluster_key_command(cluster_key_cmd, kek,
+									  errstr, sizeof(errstr)))
+		pg_fatal("%s", errstr);
+
+	memset(&filedata, 0, sizeof(filedata));
+	filedata.magic = KMGR_FILE_MAGIC;
+	filedata.version = KMGR_FILE_VERSION;
+	filedata.cipher = PG_CIPHER_AES256_XTS;
+
+	if (!kmgr_wrap_key(kek, relkey, &filedata.relkey) ||
+		!kmgr_wrap_key(kek, walkey, &filedata.walkey))
+		pg_fatal("could not wrap data encryption keys (the server must be built with OpenSSL support)");
+
+	kmgr_compute_file_crc(&filedata);
+
+	path = psprintf("%s/%s", pg_data, KMGR_FILE_NAME);
+	if ((kmgr_file = fopen(path, PG_BINARY_W)) == NULL)
+		pg_fatal("could not open file \"%s\" for writing: %m", path);
+	if (fwrite(&filedata, sizeof(filedata), 1, kmgr_file) != 1 ||
+		fclose(kmgr_file))
+		pg_fatal("could not write file \"%s\": %m", path);
+	free(path);
+
+	explicit_bzero(relkey, sizeof(relkey));
+	explicit_bzero(walkey, sizeof(walkey));
+	explicit_bzero(kek, sizeof(kek));
+
+	check_ok();
+}
+
+/*
  * set up an empty config file so we can check config settings by launching
  * a test backend
  */
@@ -1327,6 +1383,10 @@ setup_config(void)
 				 n_buffers * (BLCKSZ / 1024));
 	conflines = replace_guc_value(conflines, "shared_buffers",
 								  repltok, false);
+
+	if (cluster_key_cmd)
+		conflines = replace_guc_value(conflines, "cluster_key_command",
+									  cluster_key_cmd, false);
 
 	conflines = replace_guc_value(conflines, "lc_messages",
 								  lc_messages, false);
@@ -1636,6 +1696,11 @@ bootstrap_template1(void)
 	appendPQExpBuffer(&cmd, " -X %d", wal_segment_size_mb * (1024 * 1024));
 	if (data_checksums)
 		appendPQExpBufferStr(&cmd, " -k");
+	if (cluster_key_cmd)
+	{
+		appendPQExpBufferStr(&cmd, " -K -c cluster_key_command=");
+		appendShellString(&cmd, cluster_key_cmd);
+	}
 	if (debug)
 		appendPQExpBufferStr(&cmd, " -d 5");
 
@@ -2552,6 +2617,9 @@ usage(const char *progname)
 	printf(_("      --icu-locale=LOCALE   set ICU locale ID for new databases\n"));
 	printf(_("      --icu-rules=RULES     set additional ICU collation rules for new databases\n"));
 	printf(_("  -k, --data-checksums      use data page checksums\n"));
+	printf(_("  -K, --cluster-key-command=COMMAND\n"
+			 "                            enable transparent data encryption; COMMAND must\n"
+			 "                            print the cluster key as 64 hexadecimal characters\n"));
 	printf(_("      --locale=LOCALE       set default locale for new databases\n"));
 	printf(_("      --lc-collate=, --lc-ctype=, --lc-messages=LOCALE\n"
 			 "      --lc-monetary=, --lc-numeric=, --lc-time=LOCALE\n"
@@ -3108,6 +3176,13 @@ initialize_data_directory(void)
 
 	check_ok();
 
+	/*
+	 * Set up the data encryption keys before running the bootstrap backend,
+	 * which reads them via the key manager.
+	 */
+	if (cluster_key_cmd)
+		write_kmgr_file();
+
 	/* Top level PG_VERSION is checked by bootstrapper, so make it first */
 	write_version_file(NULL);
 
@@ -3214,6 +3289,7 @@ main(int argc, char *argv[])
 		{"waldir", required_argument, NULL, 'X'},
 		{"wal-segsize", required_argument, NULL, 12},
 		{"data-checksums", no_argument, NULL, 'k'},
+		{"cluster-key-command", required_argument, NULL, 'K'},
 		{"allow-group-access", no_argument, NULL, 'g'},
 		{"discard-caches", no_argument, NULL, 14},
 		{"locale-provider", required_argument, NULL, 15},
@@ -3264,7 +3340,7 @@ main(int argc, char *argv[])
 
 	/* process command-line options */
 
-	while ((c = getopt_long(argc, argv, "A:c:dD:E:gkL:nNsST:U:WX:",
+	while ((c = getopt_long(argc, argv, "A:c:dD:E:gkK:L:nNsST:U:WX:",
 							long_options, &option_index)) != -1)
 	{
 		switch (c)
@@ -3334,6 +3410,9 @@ main(int argc, char *argv[])
 				break;
 			case 'k':
 				data_checksums = true;
+				break;
+			case 'K':
+				cluster_key_cmd = pg_strdup(optarg);
 				break;
 			case 'L':
 				share_path = pg_strdup(optarg);
@@ -3522,6 +3601,9 @@ main(int argc, char *argv[])
 		printf(_("Data page checksums are enabled.\n"));
 	else
 		printf(_("Data page checksums are disabled.\n"));
+
+	if (cluster_key_cmd)
+		printf(_("Transparent data encryption is enabled.\n"));
 
 	if (pwprompt || pwfilename)
 		get_su_pwd();

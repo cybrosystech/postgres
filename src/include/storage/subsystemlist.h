@@ -30,6 +30,12 @@ PG_SHMEM_SUBSYSTEM(LWLockCallbacks)
 PG_SHMEM_SUBSYSTEM(dsm_shmem_callbacks)
 PG_SHMEM_SUBSYSTEM(DSMRegistryShmemCallbacks)
 
+/*
+ * Key manager for transparent data encryption.  The keys are loaded
+ * explicitly via InitializeKmgr() before any relation IO is possible.
+ */
+PG_SHMEM_SUBSYSTEM(KmgrShmemCallbacks)
+
 /* xlog, clog, and buffers */
 PG_SHMEM_SUBSYSTEM(VarsupShmemCallbacks)
 PG_SHMEM_SUBSYSTEM(XLOGShmemCallbacks)

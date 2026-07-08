@@ -1,0 +1,5 @@
+# pg_tde_utils extension
+comment = 'utility functions for transparent data encryption'
+default_version = '1.0'
+module_pathname = '$libdir/pg_tde_utils'
+relocatable = true

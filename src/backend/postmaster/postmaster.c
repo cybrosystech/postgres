@@ -94,6 +94,7 @@
 #include "access/xlogrecovery.h"
 #include "common/file_perm.h"
 #include "common/pg_prng.h"
+#include "crypto/kmgr.h"
 #include "lib/ilist.h"
 #include "libpq/libpq.h"
 #include "libpq/pqsignal.h"
@@ -1016,6 +1017,13 @@ PostmasterMain(int argc, char *argv[])
 	 * clean up dead IPC objects if the postmaster crashes and is restarted.
 	 */
 	CreateSharedMemoryAndSemaphores();
+
+	/*
+	 * If the cluster is encrypted, obtain the cluster key and load the data
+	 * encryption keys into shared memory before any child process that
+	 * performs relation IO is launched.
+	 */
+	InitializeKmgr(0);
 
 	/*
 	 * Estimate number of openable files.  This must happen after setting up
@@ -3258,6 +3266,9 @@ PostmasterStateMachine(void)
 		ResetShmemAllocator();
 		ShmemCallRequestCallbacks();
 		CreateSharedMemoryAndSemaphores();
+
+		/* reload the data encryption keys into the fresh shared memory */
+		InitializeKmgr(0);
 
 		UpdatePMState(PM_STARTUP);
 

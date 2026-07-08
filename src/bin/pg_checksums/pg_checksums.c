@@ -585,6 +585,9 @@ main(int argc, char *argv[])
 		ControlFile->state != DB_SHUTDOWNED_IN_RECOVERY)
 		pg_fatal("cluster must be shut down");
 
+	if (ControlFile->data_encryption_cipher != 0)
+		pg_fatal("cluster is encrypted; page checksums cannot be operated on directly");
+
 	if (ControlFile->data_checksum_version != PG_DATA_CHECKSUM_VERSION &&
 		mode == PG_MODE_CHECK)
 		pg_fatal("data checksums are not enabled in cluster");

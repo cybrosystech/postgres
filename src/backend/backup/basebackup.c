@@ -1617,7 +1617,12 @@ sendFile(bbsink *sink, const char *readfilename, const char *tarfilename,
 	 * or disabled as that might change, thus we check at each point where we
 	 * could be validating a checksum.
 	 */
-	if (!noverify_checksums && RelFileNumberIsValid(relfilenumber))
+	/*
+	 * On an encrypted cluster the files on disk contain ciphertext, so the
+	 * plaintext checksums cannot be verified here.
+	 */
+	if (!noverify_checksums && RelFileNumberIsValid(relfilenumber) &&
+		GetDataEncryptionCipher() == 0)
 		verify_checksum = true;
 
 	/*

@@ -722,7 +722,8 @@ static void ValidateXLOGDirectoryStructure(void);
 static void CleanupBackupHistory(void);
 static void UpdateMinRecoveryPoint(XLogRecPtr lsn, bool force);
 static bool PerformRecoveryXLogAction(void);
-static void InitControlFile(uint64 sysidentifier, uint32 data_checksum_version);
+static void InitControlFile(uint64 sysidentifier, uint32 data_checksum_version,
+							uint32 data_encryption_cipher);
 static void WriteControlFile(void);
 static void ReadControlFile(void);
 static void UpdateControlFile(void);
@@ -4256,7 +4257,8 @@ CleanupBackupHistory(void)
  */
 
 static void
-InitControlFile(uint64 sysidentifier, uint32 data_checksum_version)
+InitControlFile(uint64 sysidentifier, uint32 data_checksum_version,
+				uint32 data_encryption_cipher)
 {
 	char		mock_auth_nonce[MOCK_AUTH_NONCE_LEN];
 
@@ -4288,6 +4290,7 @@ InitControlFile(uint64 sysidentifier, uint32 data_checksum_version)
 	ControlFile->wal_log_hints = wal_log_hints;
 	ControlFile->track_commit_timestamp = track_commit_timestamp;
 	ControlFile->data_checksum_version = data_checksum_version;
+	ControlFile->data_encryption_cipher = data_encryption_cipher;
 
 	/*
 	 * Set the data_checksum_version value into XLogCtl, which is where all
@@ -4658,6 +4661,17 @@ GetMockAuthenticationNonce(void)
 {
 	Assert(ControlFile != NULL);
 	return ControlFile->mock_authentication_nonce;
+}
+
+/*
+ * Returns the data encryption cipher (PG_CIPHER_*) recorded in the control
+ * file, or zero if the cluster is not encrypted.
+ */
+uint32
+GetDataEncryptionCipher(void)
+{
+	Assert(ControlFile != NULL);
+	return ControlFile->data_encryption_cipher;
 }
 
 /*
@@ -5451,7 +5465,7 @@ XLOGShmemAttach(void *arg)
  * and the initial XLOG segment.
  */
 void
-BootStrapXLOG(uint32 data_checksum_version)
+BootStrapXLOG(uint32 data_checksum_version, uint32 data_encryption_cipher)
 {
 	CheckPoint	checkPoint;
 	PGAlignedXLogBlock buffer;
@@ -5593,7 +5607,8 @@ BootStrapXLOG(uint32 data_checksum_version)
 	openLogFile = -1;
 
 	/* Now create pg_control */
-	InitControlFile(sysidentifier, data_checksum_version);
+	InitControlFile(sysidentifier, data_checksum_version,
+					data_encryption_cipher);
 	ControlFile->time = checkPoint.time;
 	ControlFile->checkPoint = checkPoint.redo;
 	ControlFile->checkPointCopy = checkPoint;
