@@ -38,6 +38,7 @@
  */
 #include "postgres.h"
 
+#include "access/cmptype.h"
 #include "access/heapam.h"
 #include "access/nbtree.h"
 #include "access/relscan.h"
@@ -45,6 +46,7 @@
 #include "access/sysattr.h"
 #include "access/tableam.h"
 #include "access/tupmacs.h"
+#include "catalog/pg_aggregate.h"
 #include "catalog/pg_aggregate_d.h"
 #include "catalog/pg_am_d.h"
 #include "commands/defrem.h"
@@ -69,10 +71,12 @@
 #include "storage/bufpage.h"
 #include "storage/predicate.h"
 #include "utils/array.h"
+#include "utils/datum.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+#include "utils/syscache.h"
 
 #include "dbblue_columnar.h"
 
@@ -657,6 +661,16 @@ dbbc_rel_ready(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 	if (rte->relkind != RELKIND_RELATION && rte->relkind != RELKIND_MATVIEW)
 		return false;
 	if (rte->tablesample != NULL)
+		return false;
+
+	/*
+	 * Inheritance/partition parent (rte->inh): this baserel stands for an
+	 * Append over children; a columnar scan of the parent's own heap would
+	 * drop the child rows. Leave it to the normal Append. (Children are
+	 * RELOPT_OTHER_MEMBER_REL, already excluded above; per-partition columnar
+	 * acceleration is future work.)
+	 */
+	if (rte->inh)
 		return false;
 
 	/*
@@ -1394,12 +1408,32 @@ typedef enum DbbcAggKind
 {
 	DBBC_AGG_COUNT_STAR,
 	DBBC_AGG_COUNT_COL,
+	DBBC_AGG_MIN,
+	DBBC_AGG_MAX,
 } DbbcAggKind;
 
 typedef struct DbbcAggItem
 {
 	DbbcAggKind kind;
-	AttrNumber	attno;			/* COUNT_COL: the counted column */
+	AttrNumber	attno;			/* COUNT_COL / MIN / MAX: the column */
+
+	/*
+	 * MIN/MAX comparison identity. A block's zone extremum may be trusted
+	 * only when the chunk's build-time type and collation match these (same
+	 * soundness rule as zone-map skipping); otherwise that block is read
+	 * from the heap. cmpproc is the aggsortop opclass's btree ORDER proc.
+	 */
+	Oid			collation;
+	Oid			opcintype;
+	Oid			cmpproc;
+
+	/* MIN/MAX runtime accumulator */
+	FmgrInfo	cmp;
+	int16		typlen;
+	bool		typbyval;
+	Datum		result;
+	bool		result_isnull;
+	bool		has_result;
 } DbbcAggItem;
 
 /*
@@ -1421,10 +1455,26 @@ typedef struct DbbcAggScanState
 	bool		executed;		/* emitted the single result row yet? */
 	int			naggs;
 	DbbcAggItem *aggs;
-	int64	   *counts;			/* per-agg accumulator */
+	int64	   *counts;			/* per-agg accumulator (COUNT kinds) */
+	MemoryContext aggctx;		/* durable home for MIN/MAX result datums */
 	Relation	rel;
 	bool		rel_opened;
 } DbbcAggScanState;
+
+/* pg_aggregate.aggsortop for aggfnoid, or InvalidOid (mirrors planagg.c) */
+static Oid
+dbbc_agg_sort_op(Oid aggfnoid)
+{
+	HeapTuple	tup;
+	Oid			sortop;
+
+	tup = SearchSysCache1(AGGFNOID, ObjectIdGetDatum(aggfnoid));
+	if (!HeapTupleIsValid(tup))
+		return InvalidOid;
+	sortop = ((Form_pg_aggregate) GETSTRUCT(tup))->aggsortop;
+	ReleaseSysCache(tup);
+	return sortop;
+}
 
 static Node *dbbc_agg_create_scan_state(CustomScan *cscan);
 static void dbbc_agg_begin(CustomScanState *node, EState *estate, int eflags);
@@ -1469,6 +1519,7 @@ dbbc_agg_classify(Node *expr, Index relid, DbbcAggItem *item, List **needcols)
 {
 	Aggref	   *agg;
 
+	memset(item, 0, sizeof(*item));
 	if (!IsA(expr, Aggref))
 		return false;
 	agg = (Aggref *) expr;
@@ -1505,6 +1556,51 @@ dbbc_agg_classify(Node *expr, Index relid, DbbcAggItem *item, List **needcols)
 				*needcols = list_append_unique_int(*needcols, var->varattno);
 				return true;
 			}
+		}
+	}
+
+	/* MIN(col) / MAX(col): recognized exactly as the planner does, via
+	 * aggsortop, and served from block zone maps. */
+	if (list_length(agg->args) == 1)
+	{
+		Oid			sortop = dbbc_agg_sort_op(agg->aggfnoid);
+		TargetEntry *tle = (TargetEntry *) linitial(agg->args);
+		Node	   *arg = (Node *) tle->expr;
+
+		if (!OidIsValid(sortop))
+			return false;
+		while (IsA(arg, RelabelType))
+			arg = (Node *) ((RelabelType *) arg)->arg;
+		if (IsA(arg, Var))
+		{
+			Var		   *var = (Var *) arg;
+			Oid			opfamily;
+			Oid			opcintype;
+			CompareType cmptype;
+			Oid			cmpproc;
+
+			if (var->varno != relid || var->varlevelsup != 0 ||
+				var->varattno <= 0)
+				return false;
+			if (!get_ordering_op_properties(sortop, &opfamily, &opcintype,
+											&cmptype))
+				return false;
+			cmpproc = get_opfamily_proc(opfamily, opcintype, opcintype,
+										BTORDER_PROC);
+			if (!OidIsValid(cmpproc))
+				return false;
+			if (cmptype == COMPARE_LT)
+				item->kind = DBBC_AGG_MIN;
+			else if (cmptype == COMPARE_GT)
+				item->kind = DBBC_AGG_MAX;
+			else
+				return false;
+			item->attno = var->varattno;
+			item->collation = agg->inputcollid;
+			item->opcintype = opcintype;
+			item->cmpproc = cmpproc;
+			*needcols = list_append_unique_int(*needcols, var->varattno);
+			return true;
 		}
 	}
 
@@ -1560,6 +1656,14 @@ dbbc_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 		return;
 	if (rte->relkind != RELKIND_RELATION && rte->relkind != RELKIND_MATVIEW)
 		return;
+	/*
+	 * Inheritance/partition parent: the grouping input is this one baserel
+	 * but the scan is really an Append over children. Counting only the
+	 * parent's own heap would miss child rows - bail (rte->inh is set only
+	 * when children exist, so plain tables and FROM ONLY are unaffected).
+	 */
+	if (rte->inh)
+		return;
 	if (get_rel_relam(rte->relid) != HEAP_TABLE_AM_OID)
 		return;
 
@@ -1570,8 +1674,11 @@ dbbc_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 
 		if (!dbbc_agg_classify((Node *) lfirst(lc), relid, &item, &needcols))
 			return;
-		items = lappend(items, list_make2(makeInteger((int) item.kind),
-										  makeInteger((int) item.attno)));
+		items = lappend(items, list_make5(makeInteger((int) item.kind),
+										  makeInteger((int) item.attno),
+										  makeInteger((int) item.collation),
+										  makeInteger((int) item.opcintype),
+										  makeInteger((int) item.cmpproc)));
 	}
 	if (items == NIL)
 		return;
@@ -1681,55 +1788,159 @@ dbbc_agg_begin(CustomScanState *node, EState *estate, int eflags)
 	int			i;
 
 	as->naggs = list_length(items);
-	as->aggs = (DbbcAggItem *) palloc(as->naggs * sizeof(DbbcAggItem));
+	as->aggs = (DbbcAggItem *) palloc0(as->naggs * sizeof(DbbcAggItem));
 	as->counts = (int64 *) palloc0(as->naggs * sizeof(int64));
 	i = 0;
 	foreach(lc, items)
 	{
 		List	   *it = (List *) lfirst(lc);
+		DbbcAggItem *ai = &as->aggs[i++];
 
-		as->aggs[i].kind = (DbbcAggKind) intVal(linitial(it));
-		as->aggs[i].attno = (AttrNumber) intVal(lsecond(it));
-		i++;
+		ai->kind = (DbbcAggKind) intVal(linitial(it));
+		ai->attno = (AttrNumber) intVal(lsecond(it));
+		ai->collation = (Oid) intVal(lthird(it));
+		ai->opcintype = (Oid) intVal(lfourth(it));
+		ai->cmpproc = (Oid) intVal(list_nth(it, 4));
+		ai->result_isnull = true;
+		ai->has_result = false;
+		if (ai->kind == DBBC_AGG_MIN || ai->kind == DBBC_AGG_MAX)
+		{
+			fmgr_info(ai->cmpproc, &ai->cmp);
+			get_typlenbyval(ai->opcintype, &ai->typlen, &ai->typbyval);
+		}
 	}
 	as->executed = false;
 
 	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
 		return;
 
+	/* durable home for MIN/MAX result datums (survives per-tuple resets) */
+	as->aggctx = AllocSetContextCreate(CurrentMemoryContext,
+									   "dbblue_columnar agg result",
+									   ALLOCSET_SMALL_SIZES);
+
 	/* the executor already holds the range-table lock on this relation */
 	as->rel = table_open(reloid, NoLock);
 	as->rel_opened = true;
 }
 
-/* count a heap page range [start, start+nblocks) with the query snapshot */
+/*
+ * Fold one non-null candidate value into a MIN/MAX item (copied durably).
+ *
+ * On a tie (cmp == 0) the current accumulator is kept. When a type has values
+ * that compare equal yet are distinguishable (numeric 4.0 vs 4.00, float -0.0
+ * vs 0.0), WHICH representation MIN/MAX returns is unspecified by SQL, and
+ * PostgreSQL's own answer already varies by plan (seqscan Agg vs index vs
+ * parallel). So the returned value is always equal-by-ordering to the true
+ * extremum; only the display form of an equal value may differ from a given
+ * heap plan. This is an accepted, spec-permitted nuance, not a wrong result.
+ */
 static void
-dbbc_agg_count_heap_range(DbbcAggScanState *as, DbbcScanState *s,
-						  BlockNumber start, BlockNumber nblocks)
+dbbc_minmax_combine(DbbcAggScanState *as, DbbcAggItem *item, Datum cand)
+{
+	if (!item->has_result)
+	{
+		MemoryContext old = MemoryContextSwitchTo(as->aggctx);
+
+		item->result = datumCopy(cand, item->typbyval, item->typlen);
+		MemoryContextSwitchTo(old);
+		item->has_result = true;
+		item->result_isnull = false;
+		return;
+	}
+	{
+		int32		c = DatumGetInt32(FunctionCall2Coll(&item->cmp,
+														item->collation,
+														cand, item->result));
+		bool		replace = (item->kind == DBBC_AGG_MIN) ? (c < 0) : (c > 0);
+
+		if (replace)
+		{
+			MemoryContext old = MemoryContextSwitchTo(as->aggctx);
+
+			item->result = datumCopy(cand, item->typbyval, item->typlen);
+			MemoryContextSwitchTo(old);
+		}
+	}
+}
+
+/*
+ * Process a heap page range for ALL aggregates (always type-safe: current
+ * catalog values via slot_getattr, combined with the current comparator).
+ * With limited=false the whole relation is scanned with a plain, AM-generic
+ * table scan - heap_setscanlimits is heap-only and must not be applied to a
+ * non-heap scan descriptor (whole_rel_mode is entered exactly when the AM is
+ * not heap, among other cases).
+ */
+static void
+dbbc_agg_apply_heap_range(DbbcAggScanState *as, DbbcScanState *s,
+						  BlockNumber start, BlockNumber nblocks, bool limited)
 {
 	TableScanDesc scan;
 
-	scan = table_beginscan_strat(as->rel, s->snapshot, 0, NULL, true, false);
-	heap_setscanlimits(scan, start, nblocks);
+	if (limited)
+	{
+		scan = table_beginscan_strat(as->rel, s->snapshot, 0, NULL, true, false);
+		heap_setscanlimits(scan, start, nblocks);
+	}
+	else
+		scan = table_beginscan(as->rel, s->snapshot, 0, NULL, 0);
 	while (table_scan_getnextslot(scan, ForwardScanDirection, s->heap_slot))
 	{
 		int			a;
 
 		for (a = 0; a < as->naggs; a++)
 		{
-			if (as->aggs[a].kind == DBBC_AGG_COUNT_STAR)
+			DbbcAggItem *item = &as->aggs[a];
+			bool		isnull;
+			Datum		v;
+
+			if (item->kind == DBBC_AGG_COUNT_STAR)
+			{
+				as->counts[a]++;
+				continue;
+			}
+			v = slot_getattr(s->heap_slot, item->attno, &isnull);
+			if (isnull)
+				continue;
+			if (item->kind == DBBC_AGG_COUNT_COL)
 				as->counts[a]++;
 			else
-			{
-				bool		isnull;
-
-				(void) slot_getattr(s->heap_slot, as->aggs[a].attno, &isnull);
-				if (!isnull)
-					as->counts[a]++;
-			}
+				dbbc_minmax_combine(as, item, v);
 		}
 	}
 	table_endscan(scan);
+}
+
+/* can every MIN/MAX item's zone map be trusted for this block? (COUNT is
+ * always metadata-safe; MIN/MAX need build-time type+collation to match) */
+static bool
+dbbc_agg_block_metadata_ok(DbbcAggScanState *as, DbbcColumnChunk *chunks,
+						   int ncols)
+{
+	int			a;
+
+	for (a = 0; a < as->naggs; a++)
+	{
+		DbbcAggItem *item = &as->aggs[a];
+		DbbcColumnChunk *chunk = NULL;
+		int			c;
+
+		if (item->kind != DBBC_AGG_MIN && item->kind != DBBC_AGG_MAX)
+			continue;
+		for (c = 0; c < ncols; c++)
+			if (chunks[c].attnum == item->attno)
+			{
+				chunk = &chunks[c];
+				break;
+			}
+		if (chunk == NULL)
+			return false;
+		if (chunk->atttypid != item->opcintype ||
+			chunk->attcollation != item->collation)
+			return false;
+	}
+	return true;
 }
 
 static TupleTableSlot *
@@ -1748,12 +1959,12 @@ dbbc_agg_exec(CustomScanState *node)
 	as->executed = true;
 
 	/*
-	 * Counted columns must be covered by the current version, else metadata
-	 * null_count is unavailable; pass them so a stale plan (version changed
-	 * since planning) degrades to whole-relation heap counting.
+	 * Columns feeding COUNT(col)/MIN/MAX must be covered by the current
+	 * version, else their metadata is unavailable; pass them so a stale plan
+	 * (version changed since planning) degrades to whole-relation heap scan.
 	 */
 	for (a = 0; a < as->naggs; a++)
-		if (as->aggs[a].kind == DBBC_AGG_COUNT_COL)
+		if (as->aggs[a].kind != DBBC_AGG_COUNT_STAR)
 			needed = list_append_unique_int(needed, as->aggs[a].attno);
 
 	/* reuse the standard scan setup for version pin, dir, heap slot, etc. */
@@ -1763,38 +1974,56 @@ dbbc_agg_exec(CustomScanState *node)
 
 	if (scratch.whole_rel_mode)
 	{
-		/* no usable version (stale plan): count the whole relation */
-		dbbc_agg_count_heap_range(as, &scratch, 0, scratch.heap_nblocks);
+		/*
+		 * No usable version (stale plan, or non-heap AM): scan the whole
+		 * relation with a plain AM-generic scan (no heap_setscanlimits).
+		 */
+		dbbc_agg_apply_heap_range(as, &scratch, 0, scratch.heap_nblocks, false);
 	}
 	else
 	{
 		for (cur = 0; cur < scratch.total_slots; cur++)
 		{
 			DbbcBlock  *block = dbbc_slot_block(&scratch, cur);
+			DbbcColumnChunk *chunks = NULL;
 
 			CHECK_FOR_INTERRUPTS();
 
 			if (block != NULL && dbbc_block_valid(&scratch, as->rel, block))
-			{
-				DbbcColumnChunk *chunks = (DbbcColumnChunk *)
+				chunks = (DbbcColumnChunk *)
 					dsa_get_address(scratch.dsa, block->chunks);
 
+			/*
+			 * Use block metadata only when the block is valid AND every
+			 * MIN/MAX item's zone map is type/collation-consistent; else read
+			 * the whole range from the heap (always type-safe).
+			 */
+			if (chunks != NULL &&
+				dbbc_agg_block_metadata_ok(as, chunks, scratch.ncols))
+			{
 				for (a = 0; a < as->naggs; a++)
 				{
-					if (as->aggs[a].kind == DBBC_AGG_COUNT_STAR)
-						as->counts[a] += block->nrows;
-					else
-					{
-						int			c;
+					DbbcAggItem *item = &as->aggs[a];
+					int			c;
 
-						for (c = 0; c < scratch.ncols; c++)
-							if (chunks[c].attnum == as->aggs[a].attno)
-							{
-								as->counts[a] += block->nrows -
-									chunks[c].null_count;
-								break;
-							}
+					if (item->kind == DBBC_AGG_COUNT_STAR)
+					{
+						as->counts[a] += block->nrows;
+						continue;
 					}
+					for (c = 0; c < scratch.ncols; c++)
+						if (chunks[c].attnum == item->attno)
+						{
+							DbbcColumnChunk *ck = &chunks[c];
+
+							if (item->kind == DBBC_AGG_COUNT_COL)
+								as->counts[a] += block->nrows - ck->null_count;
+							else if (ck->has_minmax)	/* MIN/MAX */
+								dbbc_minmax_combine(as, item,
+													dbbc_chunk_minmax_datum(ck,
+																			item->kind == DBBC_AGG_MAX));
+							break;
+						}
 				}
 			}
 			else
@@ -1803,7 +2032,8 @@ dbbc_agg_exec(CustomScanState *node)
 				BlockNumber nblk = Min((BlockNumber) DBBC_PAGES_PER_BLOCK,
 									   scratch.heap_nblocks - start);
 
-				dbbc_agg_count_heap_range(as, &scratch, start, nblk);
+				/* limited: reached only with a valid heap version */
+				dbbc_agg_apply_heap_range(as, &scratch, start, nblk, true);
 			}
 		}
 	}
@@ -1811,12 +2041,22 @@ dbbc_agg_exec(CustomScanState *node)
 	if (scratch.version != NULL)
 		dbbc_version_unpin_tracked(scratch.version);
 
-	/* emit one row: the counts, in output order */
+	/* emit the single result row, in output order */
 	ExecClearTuple(slot);
 	for (a = 0; a < as->naggs; a++)
 	{
-		slot->tts_values[a] = Int64GetDatum(as->counts[a]);
-		slot->tts_isnull[a] = false;
+		DbbcAggItem *item = &as->aggs[a];
+
+		if (item->kind == DBBC_AGG_MIN || item->kind == DBBC_AGG_MAX)
+		{
+			slot->tts_values[a] = item->has_result ? item->result : (Datum) 0;
+			slot->tts_isnull[a] = !item->has_result;
+		}
+		else
+		{
+			slot->tts_values[a] = Int64GetDatum(as->counts[a]);
+			slot->tts_isnull[a] = false;
+		}
 	}
 	ExecStoreVirtualTuple(slot);
 	return slot;
@@ -1832,22 +2072,35 @@ dbbc_agg_end(CustomScanState *node)
 		table_close(as->rel, NoLock);
 		as->rel_opened = false;
 	}
+	if (as->aggctx != NULL)
+	{
+		MemoryContextDelete(as->aggctx);
+		as->aggctx = NULL;
+	}
 }
 
 static void
 dbbc_agg_rescan(CustomScanState *node)
 {
 	DbbcAggScanState *as = (DbbcAggScanState *) node;
+	int			a;
 
 	as->executed = false;
 	if (as->counts)
 		memset(as->counts, 0, as->naggs * sizeof(int64));
+	for (a = 0; a < as->naggs; a++)
+	{
+		as->aggs[a].has_result = false;
+		as->aggs[a].result_isnull = true;
+	}
+	if (as->aggctx != NULL)
+		MemoryContextReset(as->aggctx);
 }
 
 static void
 dbbc_agg_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 {
-	ExplainPropertyText("Columnar Aggregate", "count (metadata)", es);
+	ExplainPropertyText("Columnar Aggregate", "metadata (count/min/max)", es);
 }
 
 static void

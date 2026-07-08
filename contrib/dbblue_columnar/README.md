@@ -28,6 +28,27 @@ populate frees everything it built), and introspectable:
 The planner still offers **no columnar path** (that is the next step), so
 query results are unchanged. The refresh worker still idles.
 
+## Aggregate pushdown (Milestone 2 step 4)
+
+Scalar `count(*)` / `count(col)` / `min(col)` / `max(col)` (no `GROUP BY`,
+`HAVING`, or `WHERE`) over a populated columnar relation are answered by a
+`Custom Scan (DBBlueColumnarAgg)` upper node **from block metadata** — a valid
+block contributes `nrows` (count(\*)), `nrows − null_count` (count(col)), or its
+zone-map min/max — with no value reads. Invalid / unbuilt / type-changed ranges
+are read from the heap with the query snapshot.
+
+Notes:
+- **`SUM`/`AVG` are intentionally not pushed** into this node. Their transition
+  functions require a real `AggState`; and they already run fast on the normal
+  `Agg → DBBlueColumnarScan` plan (zone-skip + no heap deform). The custom node
+  is only for aggregates a normal Agg can't answer without scanning.
+- **`MIN`/`MAX` tie representation:** for types with equal-but-distinguishable
+  values (numeric `4.0`/`4.00`, float `-0.0`/`0.0`), which representation is
+  returned is unspecified by SQL and varies across PostgreSQL plans anyway. The
+  value is always equal-by-ordering to the true extremum.
+- Inheritance/partition parents are left to the normal Append (no per-partition
+  columnar acceleration yet).
+
 ## Build
 
 Built in-tree as a contrib module:
