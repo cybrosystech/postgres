@@ -45,6 +45,7 @@
 #include "access/sysattr.h"
 #include "access/tableam.h"
 #include "access/tupmacs.h"
+#include "catalog/pg_aggregate_d.h"
 #include "catalog/pg_am_d.h"
 #include "commands/defrem.h"
 #include "commands/explain.h"
@@ -59,12 +60,16 @@
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
+#include "optimizer/planner.h"
 #include "optimizer/restrictinfo.h"
+#include "optimizer/tlist.h"
 #include "nodes/nodeFuncs.h"
+#include "nodes/value.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
 #include "storage/predicate.h"
 #include "utils/array.h"
+#include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
@@ -208,6 +213,8 @@ static const CustomExecMethods dbbc_exec_methods = {
 	.ExplainCustomScan = dbbc_explain_scan,
 };
 
+static void dbbc_agg_init(void);
+
 void
 dbbc_scan_init(void)
 {
@@ -215,6 +222,8 @@ dbbc_scan_init(void)
 
 	prev_set_rel_pathlist_hook = set_rel_pathlist_hook;
 	set_rel_pathlist_hook = dbbc_set_rel_pathlist;
+
+	dbbc_agg_init();
 }
 
 /*
@@ -821,17 +830,9 @@ dbbc_create_scan_state(CustomScan *cscan)
 }
 
 static void
-dbbc_begin_scan(CustomScanState *node, EState *estate, int eflags)
+dbbc_scan_setup(DbbcScanState *s, Relation rel, EState *estate,
+				List *needed_attnos, List *qual_clauses, Index qual_varno)
 {
-	DbbcScanState *s = (DbbcScanState *) node;
-	CustomScan *cscan = castNode(CustomScan, node->ss.ps.plan);
-	Relation	rel = node->ss.ss_currentRelation;
-
-	s->needed_attnos = (List *) linitial(cscan->custom_private);
-
-	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
-		return;
-
 	s->initialized = true;
 	s->snapshot = estate->es_snapshot;
 
@@ -870,7 +871,7 @@ dbbc_begin_scan(CustomScanState *node, EState *estate, int eflags)
 														s->version->attnums);
 			ListCell   *lc;
 
-			foreach(lc, s->needed_attnos)
+			foreach(lc, needed_attnos)
 			{
 				int			attno = lfirst_int(lc);
 				bool		found = false;
@@ -919,8 +920,7 @@ dbbc_begin_scan(CustomScanState *node, EState *estate, int eflags)
 
 			/* simple quals for zone skipping + the columnar pre-filter */
 			s->nskipquals =
-				dbbc_extract_skip_quals(cscan->scan.plan.qual,
-										cscan->scan.scanrelid,
+				dbbc_extract_skip_quals(qual_clauses, qual_varno,
 										&s->skipquals);
 		}
 		else
@@ -940,6 +940,22 @@ dbbc_begin_scan(CustomScanState *node, EState *estate, int eflags)
 
 	/* heap-fallback rows need the table AM's slot type, not our virtual one */
 	s->heap_slot = table_slot_create(rel, &estate->es_tupleTable);
+}
+
+static void
+dbbc_begin_scan(CustomScanState *node, EState *estate, int eflags)
+{
+	DbbcScanState *s = (DbbcScanState *) node;
+	CustomScan *cscan = castNode(CustomScan, node->ss.ps.plan);
+	Relation	rel = node->ss.ss_currentRelation;
+
+	s->needed_attnos = (List *) linitial(cscan->custom_private);
+
+	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
+		return;
+
+	dbbc_scan_setup(s, rel, estate, s->needed_attnos,
+					cscan->scan.plan.qual, cscan->scan.scanrelid);
 }
 
 /* the columnar block for a range, or NULL if absent / store unusable */
@@ -1353,4 +1369,491 @@ dbbc_explain_scan(CustomScanState *node, List *ancestors, ExplainState *es)
 		ExplainPropertyInteger("Rows Removed by Columnar Filter", NULL,
 							   (int64) s->rows_filtered, es);
 	}
+}
+
+/*-------------------------------------------------------------------------
+ * Scalar aggregate pushdown (Milestone 2 step 4a)
+ *
+ * At UPPERREL_GROUP_AGG, for a query of the exact shape
+ *     SELECT count(*) [, count(col) ...] FROM t
+ * (scalar - no GROUP BY, no HAVING, no WHERE, no DISTINCT/FILTER/ORDER in the
+ * aggregate) over a single columnar-eligible heap relation, we add a custom
+ * path that answers entirely from block metadata: a valid block contributes
+ * block->nrows to COUNT(*) and block->nrows - chunk->null_count to COUNT(col),
+ * with no value reads at all. Invalid / unbuilt / grown ranges are counted
+ * from the heap with the query snapshot. Anything outside this shape adds no
+ * path, so the normal Agg-over-columnar-scan plan runs unchanged.
+ *
+ * Filters and SUM/MIN/MAX/AVG (transition functions + full qual evaluation)
+ * are step 4b; this step is deliberately just counting, to prove the
+ * upper-path plumbing with the smallest possible correctness surface.
+ *-------------------------------------------------------------------------
+ */
+
+typedef enum DbbcAggKind
+{
+	DBBC_AGG_COUNT_STAR,
+	DBBC_AGG_COUNT_COL,
+} DbbcAggKind;
+
+typedef struct DbbcAggItem
+{
+	DbbcAggKind kind;
+	AttrNumber	attno;			/* COUNT_COL: the counted column */
+} DbbcAggItem;
+
+/*
+ * custom_private layout (all copyObject-safe Node lists):
+ *   linitial : Integer holding the base relation OID (absolute; an RT index
+ *              would be wrong - custom_private is opaque to setrefs, so it
+ *              never receives the rtoffset applied to subquery/CTE/view
+ *              range tables). Bit-preserved through int; read back with (Oid).
+ *   lsecond  : List of {Integer kind, Integer attno} per output column
+ *   lthird   : physical output tlist (List of TargetEntry)
+ */
+#define DBBC_AGG_PRIV_RELOID(cp)	((Oid) intVal(linitial(cp)))
+#define DBBC_AGG_PRIV_ITEMS(cp)		((List *) lsecond(cp))
+#define DBBC_AGG_PRIV_TLIST(cp)		((List *) lthird(cp))
+
+typedef struct DbbcAggScanState
+{
+	CustomScanState css;
+	bool		executed;		/* emitted the single result row yet? */
+	int			naggs;
+	DbbcAggItem *aggs;
+	int64	   *counts;			/* per-agg accumulator */
+	Relation	rel;
+	bool		rel_opened;
+} DbbcAggScanState;
+
+static Node *dbbc_agg_create_scan_state(CustomScan *cscan);
+static void dbbc_agg_begin(CustomScanState *node, EState *estate, int eflags);
+static TupleTableSlot *dbbc_agg_exec(CustomScanState *node);
+static void dbbc_agg_end(CustomScanState *node);
+static void dbbc_agg_rescan(CustomScanState *node);
+static void dbbc_agg_explain(CustomScanState *node, List *ancestors,
+							 ExplainState *es);
+
+static const CustomScanMethods dbbc_agg_scan_methods = {
+	.CustomName = "DBBlueColumnarAgg",
+	.CreateCustomScanState = dbbc_agg_create_scan_state,
+};
+
+static const CustomExecMethods dbbc_agg_exec_methods = {
+	.CustomName = "DBBlueColumnarAgg",
+	.BeginCustomScan = dbbc_agg_begin,
+	.ExecCustomScan = dbbc_agg_exec,
+	.EndCustomScan = dbbc_agg_end,
+	.ReScanCustomScan = dbbc_agg_rescan,
+	.ExplainCustomScan = dbbc_agg_explain,
+};
+
+static Plan *dbbc_agg_plan_custom_path(PlannerInfo *root, RelOptInfo *rel,
+									   CustomPath *best_path, List *tlist,
+									   List *clauses, List *custom_plans);
+
+static const CustomPathMethods dbbc_agg_path_methods = {
+	.CustomName = "DBBlueColumnarAgg",
+	.PlanCustomPath = dbbc_agg_plan_custom_path,
+};
+
+static create_upper_paths_hook_type prev_create_upper_paths_hook = NULL;
+
+/*
+ * Classify one aggregated-target expression. Returns true and fills *item if
+ * it is a bare COUNT(*) or COUNT(col) with no DISTINCT/FILTER/ORDER; the
+ * counted column (if any) is added to *needcols.
+ */
+static bool
+dbbc_agg_classify(Node *expr, Index relid, DbbcAggItem *item, List **needcols)
+{
+	Aggref	   *agg;
+
+	if (!IsA(expr, Aggref))
+		return false;
+	agg = (Aggref *) expr;
+
+	if (agg->aggdistinct != NIL || agg->aggfilter != NULL ||
+		agg->aggorder != NIL || agg->aggkind != AGGKIND_NORMAL ||
+		agg->aggsplit != AGGSPLIT_SIMPLE)
+		return false;
+
+	if (agg->aggfnoid == F_COUNT_)
+	{
+		/* count(*) */
+		item->kind = DBBC_AGG_COUNT_STAR;
+		item->attno = InvalidAttrNumber;
+		return true;
+	}
+
+	if (agg->aggfnoid == F_COUNT_ANY && list_length(agg->args) == 1)
+	{
+		TargetEntry *tle = (TargetEntry *) linitial(agg->args);
+		Node	   *arg = (Node *) tle->expr;
+
+		while (IsA(arg, RelabelType))
+			arg = (Node *) ((RelabelType *) arg)->arg;
+		if (IsA(arg, Var))
+		{
+			Var		   *var = (Var *) arg;
+
+			if (var->varno == relid && var->varlevelsup == 0 &&
+				var->varattno > 0)
+			{
+				item->kind = DBBC_AGG_COUNT_COL;
+				item->attno = var->varattno;
+				*needcols = list_append_unique_int(*needcols, var->varattno);
+				return true;
+			}
+		}
+	}
+
+	return false;
+}
+
+static void
+dbbc_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
+						RelOptInfo *input_rel, RelOptInfo *output_rel,
+						void *extra)
+{
+	Query	   *parse = root->parse;
+	GroupPathExtraData *gextra = (GroupPathExtraData *) extra;
+	RelOptInfo *base_rel;
+	RangeTblEntry *rte;
+	int			relid;
+	List	   *tlist;
+	List	   *items = NIL;
+	List	   *needcols = NIL;
+	DbbcRelVersion *version;
+	ListCell   *lc;
+	CustomPath *cpath;
+	int16	   *reg;
+	bool		ok = true;
+
+	if (prev_create_upper_paths_hook)
+		prev_create_upper_paths_hook(root, stage, input_rel, output_rel, extra);
+
+	if (stage != UPPERREL_GROUP_AGG)
+		return;
+	if (!dbblue_columnar_enabled || !dbblue_columnar_enable_columnar_scan)
+		return;
+
+	/* scalar aggregation only: no GROUP BY, no grouping sets, no HAVING */
+	if (parse->groupClause != NIL || parse->groupingSets != NIL ||
+		!parse->hasAggs || parse->havingQual != NULL ||
+		(gextra != NULL && gextra->havingQual != NULL))
+		return;
+
+	/* 4a: no WHERE - counting with filters is step 4b */
+	if (input_rel->baserestrictinfo != NIL)
+		return;
+
+	/* single plain heap base relation */
+	if (bms_membership(input_rel->relids) != BMS_SINGLETON)
+		return;
+	relid = bms_singleton_member(input_rel->relids);
+	if (relid <= 0 || relid > root->simple_rel_array_size)
+		return;
+	base_rel = root->simple_rel_array[relid];
+	rte = root->simple_rte_array[relid];
+	if (base_rel == NULL || rte->rtekind != RTE_RELATION)
+		return;
+	if (rte->relkind != RELKIND_RELATION && rte->relkind != RELKIND_MATVIEW)
+		return;
+	if (get_rel_relam(rte->relid) != HEAP_TABLE_AM_OID)
+		return;
+
+	/* every aggregated-target expr must be a bare COUNT(*) / COUNT(col) */
+	foreach(lc, output_rel->reltarget->exprs)
+	{
+		DbbcAggItem item;
+
+		if (!dbbc_agg_classify((Node *) lfirst(lc), relid, &item, &needcols))
+			return;
+		items = lappend(items, list_make2(makeInteger((int) item.kind),
+										  makeInteger((int) item.attno)));
+	}
+	if (items == NIL)
+		return;
+
+	/* a populated version must cover every counted column */
+	version = dbbc_version_pin(rte->relid);
+	if (version == NULL)
+		return;
+	if (!DsaPointerIsValid(version->blockdir) || version->nblocks == 0)
+	{
+		dbbc_version_unpin(version);
+		return;
+	}
+	reg = (int16 *) dsa_get_address(dbbc_store_dsa(), version->attnums);
+	foreach(lc, needcols)
+	{
+		int			attno = lfirst_int(lc);
+		bool		found = false;
+		int			c;
+
+		for (c = 0; c < version->ncols; c++)
+			if (reg[c] == attno)
+			{
+				found = true;
+				break;
+			}
+		if (!found)
+		{
+			ok = false;
+			break;
+		}
+	}
+	dbbc_version_unpin(version);
+	if (!ok)
+		return;
+
+	/* physical output tlist = the aggregated target exprs themselves */
+	tlist = make_tlist_from_pathtarget(output_rel->reltarget);
+	apply_pathtarget_labeling_to_tlist(tlist, output_rel->reltarget);
+
+	cpath = makeNode(CustomPath);
+	cpath->path.pathtype = T_CustomScan;
+	cpath->path.parent = output_rel;
+	cpath->path.pathtarget = output_rel->reltarget;
+	cpath->path.param_info = NULL;
+	cpath->path.parallel_aware = false;
+	cpath->path.parallel_safe = false;
+	cpath->path.parallel_workers = 0;
+	cpath->path.rows = 1;
+	cpath->path.pathkeys = NIL;
+	cpath->flags = 0;
+	cpath->custom_paths = NIL;
+	/* store the absolute relation OID (not the RT index; see macro comment) */
+	cpath->custom_private = list_make3(makeInteger((int) rte->relid),
+									   items, tlist);
+	cpath->methods = &dbbc_agg_path_methods;
+
+	/*
+	 * Metadata-only: near-zero cost so it wins for count() over a populated
+	 * relation (the normal Agg-over-scan path remains as the fallback).
+	 */
+	cpath->path.startup_cost = 0.0;
+	cpath->path.total_cost = 1.0 + cpu_operator_cost * base_rel->pages;
+	cpath->path.disabled_nodes = 0;
+
+	add_path(output_rel, (Path *) cpath);
+}
+
+static Plan *
+dbbc_agg_plan_custom_path(PlannerInfo *root, RelOptInfo *rel,
+						  CustomPath *best_path, List *tlist,
+						  List *clauses, List *custom_plans)
+{
+	CustomScan *cscan = makeNode(CustomScan);
+	List	   *phys_tlist = (List *) lthird(best_path->custom_private);
+
+	cscan->scan.plan.targetlist = tlist;
+	cscan->scan.plan.qual = NIL;
+	cscan->scan.scanrelid = 0;	/* upper node: not a base-rel scan */
+	cscan->flags = best_path->flags;
+	cscan->custom_scan_tlist = phys_tlist;	/* describes emitted columns */
+	cscan->custom_private = best_path->custom_private;
+	cscan->methods = &dbbc_agg_scan_methods;
+
+	return &cscan->scan.plan;
+}
+
+static Node *
+dbbc_agg_create_scan_state(CustomScan *cscan)
+{
+	DbbcAggScanState *as = (DbbcAggScanState *) palloc0(sizeof(DbbcAggScanState));
+
+	NodeSetTag(as, T_CustomScanState);
+	as->css.methods = &dbbc_agg_exec_methods;
+	return (Node *) as;
+}
+
+static void
+dbbc_agg_begin(CustomScanState *node, EState *estate, int eflags)
+{
+	DbbcAggScanState *as = (DbbcAggScanState *) node;
+	CustomScan *cscan = castNode(CustomScan, node->ss.ps.plan);
+	List	   *cp = cscan->custom_private;
+	List	   *items = DBBC_AGG_PRIV_ITEMS(cp);
+	Oid			reloid = DBBC_AGG_PRIV_RELOID(cp);
+	ListCell   *lc;
+	int			i;
+
+	as->naggs = list_length(items);
+	as->aggs = (DbbcAggItem *) palloc(as->naggs * sizeof(DbbcAggItem));
+	as->counts = (int64 *) palloc0(as->naggs * sizeof(int64));
+	i = 0;
+	foreach(lc, items)
+	{
+		List	   *it = (List *) lfirst(lc);
+
+		as->aggs[i].kind = (DbbcAggKind) intVal(linitial(it));
+		as->aggs[i].attno = (AttrNumber) intVal(lsecond(it));
+		i++;
+	}
+	as->executed = false;
+
+	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
+		return;
+
+	/* the executor already holds the range-table lock on this relation */
+	as->rel = table_open(reloid, NoLock);
+	as->rel_opened = true;
+}
+
+/* count a heap page range [start, start+nblocks) with the query snapshot */
+static void
+dbbc_agg_count_heap_range(DbbcAggScanState *as, DbbcScanState *s,
+						  BlockNumber start, BlockNumber nblocks)
+{
+	TableScanDesc scan;
+
+	scan = table_beginscan_strat(as->rel, s->snapshot, 0, NULL, true, false);
+	heap_setscanlimits(scan, start, nblocks);
+	while (table_scan_getnextslot(scan, ForwardScanDirection, s->heap_slot))
+	{
+		int			a;
+
+		for (a = 0; a < as->naggs; a++)
+		{
+			if (as->aggs[a].kind == DBBC_AGG_COUNT_STAR)
+				as->counts[a]++;
+			else
+			{
+				bool		isnull;
+
+				(void) slot_getattr(s->heap_slot, as->aggs[a].attno, &isnull);
+				if (!isnull)
+					as->counts[a]++;
+			}
+		}
+	}
+	table_endscan(scan);
+}
+
+static TupleTableSlot *
+dbbc_agg_exec(CustomScanState *node)
+{
+	DbbcAggScanState *as = (DbbcAggScanState *) node;
+	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
+	DbbcScanState scratch;
+	uint32		cur;
+	int			a;
+
+	List	   *needed = NIL;
+
+	if (as->executed)
+		return NULL;
+	as->executed = true;
+
+	/*
+	 * Counted columns must be covered by the current version, else metadata
+	 * null_count is unavailable; pass them so a stale plan (version changed
+	 * since planning) degrades to whole-relation heap counting.
+	 */
+	for (a = 0; a < as->naggs; a++)
+		if (as->aggs[a].kind == DBBC_AGG_COUNT_COL)
+			needed = list_append_unique_int(needed, as->aggs[a].attno);
+
+	/* reuse the standard scan setup for version pin, dir, heap slot, etc. */
+	memset(&scratch, 0, sizeof(scratch));
+	scratch.css.ss.ss_currentRelation = as->rel;
+	dbbc_scan_setup(&scratch, as->rel, node->ss.ps.state, needed, NIL, 0);
+
+	if (scratch.whole_rel_mode)
+	{
+		/* no usable version (stale plan): count the whole relation */
+		dbbc_agg_count_heap_range(as, &scratch, 0, scratch.heap_nblocks);
+	}
+	else
+	{
+		for (cur = 0; cur < scratch.total_slots; cur++)
+		{
+			DbbcBlock  *block = dbbc_slot_block(&scratch, cur);
+
+			CHECK_FOR_INTERRUPTS();
+
+			if (block != NULL && dbbc_block_valid(&scratch, as->rel, block))
+			{
+				DbbcColumnChunk *chunks = (DbbcColumnChunk *)
+					dsa_get_address(scratch.dsa, block->chunks);
+
+				for (a = 0; a < as->naggs; a++)
+				{
+					if (as->aggs[a].kind == DBBC_AGG_COUNT_STAR)
+						as->counts[a] += block->nrows;
+					else
+					{
+						int			c;
+
+						for (c = 0; c < scratch.ncols; c++)
+							if (chunks[c].attnum == as->aggs[a].attno)
+							{
+								as->counts[a] += block->nrows -
+									chunks[c].null_count;
+								break;
+							}
+					}
+				}
+			}
+			else
+			{
+				BlockNumber start = cur * DBBC_PAGES_PER_BLOCK;
+				BlockNumber nblk = Min((BlockNumber) DBBC_PAGES_PER_BLOCK,
+									   scratch.heap_nblocks - start);
+
+				dbbc_agg_count_heap_range(as, &scratch, start, nblk);
+			}
+		}
+	}
+
+	if (scratch.version != NULL)
+		dbbc_version_unpin_tracked(scratch.version);
+
+	/* emit one row: the counts, in output order */
+	ExecClearTuple(slot);
+	for (a = 0; a < as->naggs; a++)
+	{
+		slot->tts_values[a] = Int64GetDatum(as->counts[a]);
+		slot->tts_isnull[a] = false;
+	}
+	ExecStoreVirtualTuple(slot);
+	return slot;
+}
+
+static void
+dbbc_agg_end(CustomScanState *node)
+{
+	DbbcAggScanState *as = (DbbcAggScanState *) node;
+
+	if (as->rel_opened)
+	{
+		table_close(as->rel, NoLock);
+		as->rel_opened = false;
+	}
+}
+
+static void
+dbbc_agg_rescan(CustomScanState *node)
+{
+	DbbcAggScanState *as = (DbbcAggScanState *) node;
+
+	as->executed = false;
+	if (as->counts)
+		memset(as->counts, 0, as->naggs * sizeof(int64));
+}
+
+static void
+dbbc_agg_explain(CustomScanState *node, List *ancestors, ExplainState *es)
+{
+	ExplainPropertyText("Columnar Aggregate", "count (metadata)", es);
+}
+
+static void
+dbbc_agg_init(void)
+{
+	RegisterCustomScanMethods(&dbbc_agg_scan_methods);
+	prev_create_upper_paths_hook = create_upper_paths_hook;
+	create_upper_paths_hook = dbbc_create_upper_paths;
 }
