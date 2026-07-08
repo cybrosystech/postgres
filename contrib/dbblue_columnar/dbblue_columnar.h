@@ -174,6 +174,7 @@ extern char *dbbc_registry_table_name(void);
 extern DbbcRelVersion *dbbc_version_pin(Oid reloid);
 extern void dbbc_version_unpin(DbbcRelVersion *version);
 extern DbbcRelVersion *dbbc_version_pin_tracked(Oid reloid);
+extern DbbcRelVersion *dbbc_version_attach_tracked(dsa_pointer vp);
 extern void dbbc_version_unpin_tracked(DbbcRelVersion *version);
 extern Datum dbbc_chunk_minmax_datum(DbbcColumnChunk *chunk, bool want_max);
 

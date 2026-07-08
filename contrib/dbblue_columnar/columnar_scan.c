@@ -41,6 +41,7 @@
 #include "access/cmptype.h"
 #include "access/heapam.h"
 #include "access/nbtree.h"
+#include "access/parallel.h"
 #include "access/relscan.h"
 #include "access/stratnum.h"
 #include "access/sysattr.h"
@@ -70,6 +71,7 @@
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
 #include "storage/predicate.h"
+#include "storage/shm_toc.h"
 #include "utils/array.h"
 #include "utils/datum.h"
 #include "utils/fmgroids.h"
@@ -126,6 +128,22 @@ typedef struct DbbcSkipQual
 	int			nelems;
 } DbbcSkipQual;
 
+/*
+ * Shared state for a parallel columnar scan, in the scan's DSM segment. All
+ * participants (leader + workers) claim block-directory slots from one atomic
+ * cursor, and pin the SAME immutable store version (identified by version_dp,
+ * published by the leader) so a concurrent repopulate cannot split them.
+ * heap_nblocks/total_slots are the leader's, shared so the per-slot range math
+ * and the "block covers the range's full extent" validity check agree exactly.
+ */
+typedef struct DbbcParallelState
+{
+	pg_atomic_uint32 next_slot;
+	dsa_pointer version_dp;		/* leader's pinned version, or Invalid */
+	BlockNumber heap_nblocks;
+	uint32		total_slots;
+} DbbcParallelState;
+
 typedef struct DbbcScanState
 {
 	CustomScanState css;
@@ -133,6 +151,7 @@ typedef struct DbbcScanState
 	bool		initialized;	/* false under EXPLAIN (no ANALYZE) */
 	Snapshot	snapshot;
 	List	   *needed_attnos;	/* from custom_private */
+	DbbcParallelState *pstate;	/* NULL unless parallel-aware execution */
 
 	/* pinned store version (refcount held from Begin to End) */
 	DbbcRelVersion *version;	/* NULL -> pure heap mode */
@@ -208,12 +227,21 @@ static const CustomScanMethods dbbc_scan_methods = {
 	.CreateCustomScanState = dbbc_create_scan_state,
 };
 
+static Size dbbc_scan_estimate_dsm(CustomScanState *node, ParallelContext *pcxt);
+static void dbbc_scan_initialize_dsm(CustomScanState *node, ParallelContext *pcxt, void *coordinate);
+static void dbbc_scan_reinitialize_dsm(CustomScanState *node, ParallelContext *pcxt, void *coordinate);
+static void dbbc_scan_initialize_worker(CustomScanState *node, shm_toc *toc, void *coordinate);
+
 static const CustomExecMethods dbbc_exec_methods = {
 	.CustomName = "DBBlueColumnarScan",
 	.BeginCustomScan = dbbc_begin_scan,
 	.ExecCustomScan = dbbc_exec_scan,
 	.EndCustomScan = dbbc_end_scan,
 	.ReScanCustomScan = dbbc_rescan_scan,
+	.EstimateDSMCustomScan = dbbc_scan_estimate_dsm,
+	.InitializeDSMCustomScan = dbbc_scan_initialize_dsm,
+	.ReInitializeDSMCustomScan = dbbc_scan_reinitialize_dsm,
+	.InitializeWorkerCustomScan = dbbc_scan_initialize_worker,
 	.ExplainCustomScan = dbbc_explain_scan,
 };
 
@@ -813,6 +841,46 @@ dbbc_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 		(1.0 - skip_frac);
 
 	add_path(rel, (Path *) cpath);
+
+	/*
+	 * Parallel variant: workers claim block-directory slots from a shared
+	 * atomic cursor, each doing the same validity + zone-skip + no-deform
+	 * emit (or per-slot heap fallback) over its slice, combined under Gather.
+	 * This lets columnar keep its per-tuple CPU edge AND parallelize, so it
+	 * competes with (and beats) a Parallel Seq Scan on scan-heavy aggregates.
+	 */
+	if (rel->consider_parallel && bms_is_empty(rel->lateral_relids))
+	{
+		int			workers = compute_parallel_worker(rel, rel->pages, -1,
+													  max_parallel_workers_per_gather);
+
+		if (workers > 0)
+		{
+			CustomPath *ppath = makeNode(CustomPath);
+			double		divisor = (double) workers;
+
+			ppath->path.pathtype = T_CustomScan;
+			ppath->path.parent = rel;
+			ppath->path.pathtarget = rel->reltarget;
+			ppath->path.param_info = NULL;
+			ppath->path.parallel_aware = true;
+			ppath->path.parallel_safe = true;
+			ppath->path.parallel_workers = workers;
+			ppath->path.rows = clamp_row_est(rel->rows / divisor);
+			ppath->path.pathkeys = NIL;
+			ppath->flags = 0;
+			ppath->custom_private = list_make1(needed);
+			ppath->methods = &dbbc_path_methods;
+			ppath->path.disabled_nodes = 0;
+			ppath->path.startup_cost = qcost.startup;
+			ppath->path.total_cost = qcost.startup +
+				(seq_page_cost * rel->pages +
+				 (cpu_tuple_cost * 0.75 + qcost.per_tuple) * rel->tuples *
+				 (1.0 - skip_frac)) / divisor;
+
+			add_partial_path(rel, (Path *) ppath);
+		}
+	}
 }
 
 static Plan *
@@ -844,8 +912,7 @@ dbbc_create_scan_state(CustomScan *cscan)
 }
 
 static void
-dbbc_scan_setup(DbbcScanState *s, Relation rel, EState *estate,
-				List *needed_attnos, List *qual_clauses, Index qual_varno)
+dbbc_scan_common(DbbcScanState *s, Relation rel, EState *estate)
 {
 	s->initialized = true;
 	s->snapshot = estate->es_snapshot;
@@ -860,91 +927,17 @@ dbbc_scan_setup(DbbcScanState *s, Relation rel, EState *estate,
 
 	dbbc_store_attach();
 	s->dsa = dbbc_store_dsa();
+	s->version = NULL;
 
 	/*
-	 * Pin the current store version for the scan's whole lifetime
-	 * (abort-safe via the ResourceOwner). Re-validate coverage: the store
-	 * may have been repopulated with different columns since this plan was
-	 * made; if it no longer covers the scan, run entirely from the heap -
-	 * degrade, never error, never wrong. A non-heap table AM (possible via
-	 * ALTER TABLE ... SET ACCESS METHOD under a cached plan) also degrades:
-	 * the block format and heap_setscanlimits are heap-only.
+	 * whole_rel_mode is ONLY for a non-heap table AM (possible via ALTER
+	 * TABLE ... SET ACCESS METHOD under a cached plan): the block format and
+	 * heap_setscanlimits are heap-only, so we fall back to one plain,
+	 * AM-generic full scan. A heap relation with no usable version instead
+	 * uses the normal per-slot loop with every slot read from the heap
+	 * (dbbc_slot_block returns NULL when version is NULL), which parallelizes.
 	 */
-	if (rel->rd_rel->relam == HEAP_TABLE_AM_OID)
-		s->version = dbbc_version_pin_tracked(RelationGetRelid(rel));
-	else
-		s->version = NULL;
-	if (s->version != NULL)
-	{
-		bool		usable = DsaPointerIsValid(s->version->blockdir) &&
-			s->version->nblocks > 0;
-
-		if (usable)
-		{
-			int16	   *reg = (int16 *) dsa_get_address(s->dsa,
-														s->version->attnums);
-			ListCell   *lc;
-
-			foreach(lc, needed_attnos)
-			{
-				int			attno = lfirst_int(lc);
-				bool		found = false;
-				int			c;
-
-				for (c = 0; c < s->version->ncols; c++)
-				{
-					if (reg[c] == attno)
-					{
-						found = true;
-						break;
-					}
-				}
-				if (!found)
-				{
-					usable = false;
-					break;
-				}
-			}
-		}
-
-		if (usable)
-		{
-			int16	   *reg = (int16 *) dsa_get_address(s->dsa,
-														s->version->attnums);
-			int			natts = RelationGetDescr(rel)->natts;
-			int			c;
-
-			s->dir = (dsa_pointer *) dsa_get_address(s->dsa,
-													 s->version->blockdir);
-			s->ndirslots = s->version->ndirslots;
-			s->ncols = s->version->ncols;
-			s->attnums = (int16 *) palloc(s->ncols * sizeof(int16));
-			memcpy(s->attnums, reg, s->ncols * sizeof(int16));
-			s->col_ptrs = (DbbcColPtrs *)
-				palloc(s->ncols * sizeof(DbbcColPtrs));
-
-			s->attno_to_col = (int *) palloc(natts * sizeof(int));
-			for (c = 0; c < natts; c++)
-				s->attno_to_col[c] = -1;
-			for (c = 0; c < s->ncols; c++)
-			{
-				if (s->attnums[c] >= 1 && s->attnums[c] <= natts)
-					s->attno_to_col[s->attnums[c] - 1] = c;
-			}
-
-			/* simple quals for zone skipping + the columnar pre-filter */
-			s->nskipquals =
-				dbbc_extract_skip_quals(qual_clauses, qual_varno,
-										&s->skipquals);
-		}
-		else
-		{
-			dbbc_version_unpin_tracked(s->version);
-			s->version = NULL;
-		}
-	}
-
-	s->whole_rel_mode = (s->version == NULL);
+	s->whole_rel_mode = (rel->rd_rel->relam != HEAP_TABLE_AM_OID);
 	s->whole_rel_done = false;
 
 	s->heap_nblocks = RelationGetNumberOfBlocks(rel);
@@ -956,6 +949,94 @@ dbbc_scan_setup(DbbcScanState *s, Relation rel, EState *estate,
 	s->heap_slot = table_slot_create(rel, &estate->es_tupleTable);
 }
 
+/*
+ * Bind an already-pinned store version (or NULL) to the scan: re-validate
+ * that it still covers the needed columns and, if so, resolve the directory
+ * and per-column layout; otherwise unpin it and run heap-only. Separated from
+ * dbbc_scan_common so a parallel worker can bind the leader's exact version
+ * (attached in InitializeWorkerCustomScan) rather than the current one.
+ */
+static void
+dbbc_scan_bind_version(DbbcScanState *s, Relation rel, List *needed_attnos,
+					   List *qual_clauses, Index qual_varno,
+					   DbbcRelVersion *version)
+{
+	bool		usable;
+
+	s->version = version;
+	if (version == NULL)
+		return;
+
+	usable = DsaPointerIsValid(version->blockdir) && version->nblocks > 0;
+	if (usable)
+	{
+		int16	   *reg = (int16 *) dsa_get_address(s->dsa, version->attnums);
+		ListCell   *lc;
+
+		foreach(lc, needed_attnos)
+		{
+			int			attno = lfirst_int(lc);
+			bool		found = false;
+			int			c;
+
+			for (c = 0; c < version->ncols; c++)
+			{
+				if (reg[c] == attno)
+				{
+					found = true;
+					break;
+				}
+			}
+			if (!found)
+			{
+				usable = false;
+				break;
+			}
+		}
+	}
+
+	if (usable)
+	{
+		int16	   *reg = (int16 *) dsa_get_address(s->dsa, version->attnums);
+		int			natts = RelationGetDescr(rel)->natts;
+		int			c;
+
+		s->dir = (dsa_pointer *) dsa_get_address(s->dsa, version->blockdir);
+		s->ndirslots = version->ndirslots;
+		s->ncols = version->ncols;
+		s->attnums = (int16 *) palloc(s->ncols * sizeof(int16));
+		memcpy(s->attnums, reg, s->ncols * sizeof(int16));
+		s->col_ptrs = (DbbcColPtrs *) palloc(s->ncols * sizeof(DbbcColPtrs));
+
+		s->attno_to_col = (int *) palloc(natts * sizeof(int));
+		for (c = 0; c < natts; c++)
+			s->attno_to_col[c] = -1;
+		for (c = 0; c < s->ncols; c++)
+		{
+			if (s->attnums[c] >= 1 && s->attnums[c] <= natts)
+				s->attno_to_col[s->attnums[c] - 1] = c;
+		}
+
+		/* simple quals for zone skipping + the columnar pre-filter */
+		s->nskipquals = dbbc_extract_skip_quals(qual_clauses, qual_varno,
+												&s->skipquals);
+	}
+	else
+	{
+		dbbc_version_unpin_tracked(version);
+		s->version = NULL;
+	}
+}
+
+/* claim the next block-directory slot: shared atomic cursor when parallel */
+static inline uint32
+dbbc_claim_slot(DbbcScanState *s)
+{
+	if (s->pstate != NULL)
+		return pg_atomic_fetch_add_u32(&s->pstate->next_slot, 1);
+	return s->cur_slot++;
+}
+
 static void
 dbbc_begin_scan(CustomScanState *node, EState *estate, int eflags)
 {
@@ -964,12 +1045,80 @@ dbbc_begin_scan(CustomScanState *node, EState *estate, int eflags)
 	Relation	rel = node->ss.ss_currentRelation;
 
 	s->needed_attnos = (List *) linitial(cscan->custom_private);
+	s->pstate = NULL;
 
 	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
 		return;
 
-	dbbc_scan_setup(s, rel, estate, s->needed_attnos,
-					cscan->scan.plan.qual, cscan->scan.scanrelid);
+	dbbc_scan_common(s, rel, estate);
+
+	/*
+	 * A parallel worker defers version binding to InitializeWorkerCustomScan
+	 * so it pins the SAME version the leader published in DSM (a concurrent
+	 * repopulate must not split participants across versions). The leader and
+	 * any non-parallel execution bind the current version now.
+	 */
+	if (!IsParallelWorker())
+	{
+		DbbcRelVersion *v = (rel->rd_rel->relam == HEAP_TABLE_AM_OID)
+			? dbbc_version_pin_tracked(RelationGetRelid(rel)) : NULL;
+
+		dbbc_scan_bind_version(s, rel, s->needed_attnos,
+							   cscan->scan.plan.qual, cscan->scan.scanrelid, v);
+	}
+}
+
+/* --- parallel DSM callbacks --- */
+
+static Size
+dbbc_scan_estimate_dsm(CustomScanState *node, ParallelContext *pcxt)
+{
+	return sizeof(DbbcParallelState);
+}
+
+static void
+dbbc_scan_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
+						 void *coordinate)
+{
+	DbbcScanState *s = (DbbcScanState *) node;
+	DbbcParallelState *p = (DbbcParallelState *) coordinate;
+
+	pg_atomic_init_u32(&p->next_slot, 0);
+	/* publish the leader's pinned version + range so workers match exactly */
+	p->version_dp = (s->version != NULL) ? s->version->self : InvalidDsaPointer;
+	p->heap_nblocks = s->heap_nblocks;
+	p->total_slots = s->total_slots;
+	s->pstate = p;
+}
+
+static void
+dbbc_scan_reinitialize_dsm(CustomScanState *node, ParallelContext *pcxt,
+						   void *coordinate)
+{
+	DbbcParallelState *p = (DbbcParallelState *) coordinate;
+
+	/* rescan: only the shared cursor resets; version/range are stable */
+	pg_atomic_write_u32(&p->next_slot, 0);
+}
+
+static void
+dbbc_scan_initialize_worker(CustomScanState *node, shm_toc *toc,
+							void *coordinate)
+{
+	DbbcScanState *s = (DbbcScanState *) node;
+	CustomScan *cscan = castNode(CustomScan, node->ss.ps.plan);
+	Relation	rel = node->ss.ss_currentRelation;
+	DbbcParallelState *p = (DbbcParallelState *) coordinate;
+	DbbcRelVersion *v;
+
+	s->pstate = p;
+	/* use the leader's range so validity/extent checks agree exactly */
+	s->heap_nblocks = p->heap_nblocks;
+	s->total_slots = p->total_slots;
+
+	v = dbbc_version_attach_tracked(p->version_dp);
+	dbbc_scan_bind_version(s, rel, s->needed_attnos,
+						   cscan->scan.plan.qual, cscan->scan.scanrelid, v);
 }
 
 /* the columnar block for a range, or NULL if absent / store unusable */
@@ -1197,8 +1346,13 @@ dbbc_next(ScanState *ss)
 		CHECK_FOR_INTERRUPTS();
 
 		/*
-		 * Degraded mode: one plain, AM-agnostic scan of the whole relation
-		 * (no heap_setscanlimits - the AM may not be heap).
+		 * Degraded mode (non-heap AM): one plain, AM-agnostic scan of the
+		 * whole relation - heap_setscanlimits can't range-limit a non-heap
+		 * scan, so this can't be block-partitioned. Under parallelism only
+		 * the leader scans (workers produce nothing) to avoid each
+		 * participant re-scanning the whole relation. This path is a rare
+		 * defensive fallback (a cached plan whose AM changed); a fresh plan
+		 * over a non-heap AM never offers a columnar path.
 		 */
 		if (s->whole_rel_mode)
 		{
@@ -1206,6 +1360,21 @@ dbbc_next(ScanState *ss)
 			{
 				if (s->whole_rel_done)
 					return NULL;
+
+				/*
+				 * Non-heap AM: the range can't be block-partitioned, so
+				 * exactly one participant does the single full scan. Elect it
+				 * via the shared cursor (whoever claims slot 0), NOT "the
+				 * leader" - with parallel_leader_participation=off the leader
+				 * may never run this node, and assuming it does would lose
+				 * every row. Serial execution (pstate == NULL) always scans.
+				 */
+				if (s->pstate != NULL &&
+					pg_atomic_fetch_add_u32(&s->pstate->next_slot, 1) != 0)
+				{
+					s->whole_rel_done = true;
+					return NULL;
+				}
 				s->heap_scan = table_beginscan(rel, s->snapshot, 0, NULL, 0);
 			}
 			if (table_scan_getnextslot(s->heap_scan, ForwardScanDirection,
@@ -1230,7 +1399,6 @@ dbbc_next(ScanState *ss)
 				return dbbc_emit_row(s);
 			}
 			s->cur_block = NULL;
-			s->cur_slot++;
 			continue;
 		}
 
@@ -1250,16 +1418,17 @@ dbbc_next(ScanState *ss)
 			}
 			table_endscan(s->heap_scan);
 			s->heap_scan = NULL;
-			s->cur_slot++;
 			continue;
 		}
 
-		if (s->cur_slot >= s->total_slots)
-			return NULL;
-
-		/* decide how to serve the next range */
+		/* claim the next block-directory slot (shared cursor when parallel) */
 		{
-			DbbcBlock  *block = dbbc_slot_block(s, s->cur_slot);
+			uint32		slot = dbbc_claim_slot(s);
+			DbbcBlock  *block;
+
+			if (slot >= s->total_slots)
+				return NULL;
+			block = dbbc_slot_block(s, slot);
 
 			if (block != NULL && dbbc_block_valid(s, rel, block))
 			{
@@ -1278,7 +1447,6 @@ dbbc_next(ScanState *ss)
 											  block, chunks, s->ncols))
 				{
 					s->blocks_skipped++;
-					s->cur_slot++;
 					continue;
 				}
 
@@ -1302,7 +1470,7 @@ dbbc_next(ScanState *ss)
 			}
 			else
 			{
-				BlockNumber start = s->cur_slot * DBBC_PAGES_PER_BLOCK;
+				BlockNumber start = slot * DBBC_PAGES_PER_BLOCK;
 				BlockNumber nblocks = Min((BlockNumber) DBBC_PAGES_PER_BLOCK,
 										  s->heap_nblocks - start);
 
@@ -1967,10 +2135,17 @@ dbbc_agg_exec(CustomScanState *node)
 		if (as->aggs[a].kind != DBBC_AGG_COUNT_STAR)
 			needed = list_append_unique_int(needed, as->aggs[a].attno);
 
-	/* reuse the standard scan setup for version pin, dir, heap slot, etc. */
+	/* reuse the standard scan setup for version pin, dir, heap slot, etc.
+	 * (the aggregate node is never parallel: pin the current version here) */
 	memset(&scratch, 0, sizeof(scratch));
 	scratch.css.ss.ss_currentRelation = as->rel;
-	dbbc_scan_setup(&scratch, as->rel, node->ss.ps.state, needed, NIL, 0);
+	dbbc_scan_common(&scratch, as->rel, node->ss.ps.state);
+	{
+		DbbcRelVersion *v = (as->rel->rd_rel->relam == HEAP_TABLE_AM_OID)
+			? dbbc_version_pin_tracked(RelationGetRelid(as->rel)) : NULL;
+
+		dbbc_scan_bind_version(&scratch, as->rel, needed, NIL, 0, v);
+	}
 
 	if (scratch.whole_rel_mode)
 	{

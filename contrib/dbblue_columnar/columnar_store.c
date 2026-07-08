@@ -525,6 +525,31 @@ dbbc_version_pin_tracked(Oid reloid)
 	return version;
 }
 
+/*
+ * Attach to a SPECIFIC version by its dsa_pointer and pin it (tracked). Used
+ * by parallel workers: the leader publishes its pinned version's dsa_pointer
+ * into the scan's DSM so every participant pins the exact same immutable
+ * version, even if a concurrent repopulate swapped the relation's current
+ * version in between. The pin keeps it alive regardless.
+ */
+DbbcRelVersion *
+dbbc_version_attach_tracked(dsa_pointer vp)
+{
+	DbbcRelVersion *version;
+
+	if (!DsaPointerIsValid(vp))
+		return NULL;
+	dbbc_store_attach();
+	version = (DbbcRelVersion *) dsa_get_address(dbbc_dsa, vp);
+
+	ResourceOwnerEnlarge(CurrentResourceOwner);
+	pg_atomic_add_fetch_u32(&version->pins, 1);
+	ResourceOwnerRemember(CurrentResourceOwner,
+						  PointerGetDatum(version),
+						  &dbbc_pin_resowner_desc);
+	return version;
+}
+
 void
 dbbc_version_unpin_tracked(DbbcRelVersion *version)
 {
