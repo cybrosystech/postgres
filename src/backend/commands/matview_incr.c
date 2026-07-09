@@ -2642,15 +2642,23 @@ incr_recompute_outer_shape(Query *viewQuery, int nbasetables)
 	preserved_varno = incr_outer_preserved_varno(tabs);
 	foreach(lc, viewQuery->groupClause)
 	{
-		SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
-		TargetEntry	   *te  = get_sortgroupclause_tle(sgc, viewQuery->targetList);
+		SortGroupClause *sgc   = lfirst_node(SortGroupClause, lc);
+		TargetEntry	   *te    = get_sortgroupclause_tle(sgc, viewQuery->targetList);
+		Node		   *gexpr = incr_group_key_expr(viewQuery, te);
 		int				rv;
 		ListCell	   *jlc;
 
-		if (!IsA(te->expr, Var))
-			continue;			/* expression key — deparse handles it */
-
-		incr_resolve_var_colname((Var *) te->expr, viewQuery->rtable, &rv);
+		/*
+		 * Expression keys (e.g. to_char(date,…), COALESCE(…)) are not our
+		 * concern here — the expression-key / COALESCE gates handle them.  Skip
+		 * without resolving (incr_resolve_var_colname would elog on the non-Var
+		 * groupexpr behind the RTE_GROUP indirection).  Resolve plain-column
+		 * keys with the elog-safe resolver.
+		 */
+		if (gexpr == NULL || !IsA(gexpr, Var))
+			continue;
+		if (!incr_try_resolve_var_to_rel((Var *) gexpr, viewQuery->rtable, &rv))
+			continue;
 
 		/* Check if this key is from a truly optional-side table */
 		foreach(jlc, tabs)
