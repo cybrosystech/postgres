@@ -2,12 +2,14 @@
 --
 -- These shapes cannot be maintained and must be refused at CREATE time with a
 -- clear error (never accepted-but-maintained-wrong, and never an internal elog):
---   * GROUP BY <stable expression>  — must be IMMUTABLE (date_trunc over a date
---                                      resolves to the STABLE timestamptz overload)
--- (M2 widened the recompute engine: COUNT(DISTINCT) over a two-way self join and
--- MIN/MAX ... FILTER are now SUPPORTED via recompute, and are checked for
--- acceptance below instead of rejection.)
--- Supported shapes alongside them must still be accepted.
+--   * GROUP BY <VOLATILE expression>  — its value can differ between a row's
+--                                       insert- and delete-delta
+-- Widened over time (now checked for ACCEPTANCE below, not rejection): COUNT(
+-- DISTINCT) over a two-way self join; MIN/MAX … FILTER; and STABLE expression
+-- keys such as date_trunc('month', <date>) / to_char(d,'mon') — the recompute
+-- path re-derives each affected group from live, so a STABLE (not necessarily
+-- IMMUTABLE) key is maintained correctly (it can only drift from a full REFRESH
+-- for untouched groups if lc_time/TimeZone later changes — a documented caveat).
 \set ON_ERROR_STOP off
 \echo ''
 \echo '=== DBblue IVM: unsupported aggregate/grouping rejection ==='
@@ -30,11 +32,15 @@ END $$;
 
 DO $$
 BEGIN
-  -- GROUP BY <stable expression> must be REJECTED (date_trunc over date is STABLE,
-  -- not IMMUTABLE — a stable/volatile key could map a row to different groups on
-  -- its insert- vs delete-delta and corrupt the totals).
+  -- GROUP BY <VOLATILE expression> must be REJECTED (a volatile key can map a
+  -- row to different groups on its insert- vs delete-delta and corrupt totals).
+  IF _try('CREATE MATERIALIZED VIEW _m WITH (incremental_refresh=true) AS SELECT (random()*10)::int r, SUM(amount) s FROM uagg GROUP BY (random()*10)::int WITH DATA')
+     THEN RAISE EXCEPTION 'GROUP BY volatile expr: FAIL (accepted)'; ELSE RAISE NOTICE 'GROUP BY volatile expression: PASS (rejected)'; END IF;
+
+  -- GROUP BY <STABLE expression> (date_trunc/to_char month bucket) is now
+  -- SUPPORTED via the recompute path (documented lc_time/TimeZone caveat).
   IF _try('CREATE MATERIALIZED VIEW _m WITH (incremental_refresh=true) AS SELECT date_trunc(''month'',d) m, SUM(amount) s FROM uagg GROUP BY date_trunc(''month'',d) WITH DATA')
-     THEN RAISE EXCEPTION 'GROUP BY expr: FAIL (accepted)'; ELSE RAISE NOTICE 'GROUP BY expression: PASS (rejected)'; END IF;
+     THEN RAISE NOTICE 'GROUP BY stable date bucket: PASS (accepted)'; ELSE RAISE EXCEPTION 'GROUP BY stable date bucket: FAIL (rejected)'; END IF;
 
   -- must be ACCEPTED
   IF _try('CREATE MATERIALIZED VIEW _m WITH (incremental_refresh=true) AS SELECT p, SUM(amount) s, COUNT(*) c, AVG(amount) a, MIN(amount) mn, MAX(amount) mx FROM uagg GROUP BY p WITH DATA')

@@ -269,6 +269,10 @@ static Query *incr_normalize_query_body(Query *q);
 static bool incr_validate_expr(Node *expr, Query *viewQuery, bool allow_aggref);
 static const char *incr_having_agg_column(Aggref *hagg, Query *viewQuery);
 static bool incr_agg_arg_deparse_safe(Node *expr);
+static bool incr_agg_arg_unsafe_walker(Node *node, void *ctx);
+static bool incr_expr_all_preserved_or_inner(Node *gexpr, Query *viewQuery,
+											 List *all_tables);
+static bool incr_has_stable_group_key(Query *viewQuery);
 static bool incr_aggs_need_deparse(Query *viewQuery);
 static bool incr_inner_join_deparse_shape(Query *viewQuery, int nbasetables);
 static bool incr_recompute_outer_shape(Query *viewQuery, int nbasetables);
@@ -771,31 +775,61 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 				continue;			/* plain column — always supported */
 
 			/*
-			 * COALESCE(<left key>, <right key>) of a FULL join's equi-key is an
-			 * expression key over an outer join, but it is orphan-flip invariant
-			 * (incr_is_coalesce_of_join_keys) so the recompute path maintains it
-			 * correctly — allow it past the single-table/INNER-only restriction.
+			 * Expression group key (e.g. GROUP BY to_char(invoice_date,'mon') or
+			 * date_trunc('month', d) — the ubiquitous report month/year bucket).
+			 * Maintained by the recompute path, which re-derives each affected
+			 * group from live: so the key may be STABLE (locale/timezone-
+			 * dependent, e.g. to_char), not only IMMUTABLE — a touched group
+			 * always matches a current REFRESH.  (A STABLE key can still diverge
+			 * from a full REFRESH for UNtouched groups if lc_time/TimeZone is
+			 * later changed; a REFRESH re-syncs.  Documented caveat.)
 			 */
-			if (!deparse_agg_shape &&
-				!incr_is_coalesce_of_join_keys(gexpr, viewQuery))
-			{
-				*reason = "GROUP BY on an expression is supported only for "
-					"single-table and INNER JOIN aggregates without MIN/MAX or "
-					"self-join (or COALESCE of a FULL join's keys)";
-				return false;
-			}
-			if (!incr_agg_arg_deparse_safe(gexpr))
-			{
-				*reason = "GROUP BY expression must be immutable and free of "
-					"subqueries, aggregates, and window functions to be "
-					"maintained incrementally";
-				return false;
-			}
 			if (te->resjunk || te->resname == NULL)
 			{
 				*reason = "a GROUP BY expression must appear in the SELECT list "
 					"to be maintained incrementally";
 				return false;
+			}
+			if (contain_volatile_functions(gexpr))
+			{
+				*reason = "GROUP BY on a VOLATILE expression cannot be maintained "
+					"incrementally (its value can change between the insert and "
+					"delete of the same row)";
+				return false;
+			}
+			if (incr_agg_arg_unsafe_walker(gexpr, NULL))
+			{
+				*reason = "GROUP BY expression must be free of subqueries, "
+					"aggregates, and window functions to be maintained "
+					"incrementally";
+				return false;
+			}
+			{
+				List	   *tabs = incr_collect_tables(viewQuery);
+				bool		place_ok;
+
+				if (incr_is_coalesce_of_join_keys(gexpr, viewQuery))
+					place_ok = true;			/* FULL join key-merge idiom */
+				else if (incr_has_minmax_agg(viewQuery))
+					place_ok = false;			/* MIN/MAX builder can't render it */
+				else if (nbasetables == 1 ||
+						 incr_inner_join_deparse_shape(viewQuery, nbasetables))
+					place_ok = true;			/* single table / INNER JOIN */
+				else if (incr_has_outer_join(tabs) && !incr_has_self_join(tabs) &&
+						 incr_expr_all_preserved_or_inner(gexpr, viewQuery, tabs))
+					place_ok = true;			/* outer join, preserved/inner-side */
+				else
+					place_ok = false;
+
+				if (!place_ok)
+				{
+					*reason = "GROUP BY on an expression is supported over a single "
+						"table or INNER JOIN, over an outer join when the expression "
+						"references only the preserved anchor / inner-joined tables, "
+						"or as COALESCE of a FULL join's keys — and not alongside "
+						"MIN/MAX or a self-join";
+					return false;
+				}
 			}
 		}
 	}
@@ -2562,6 +2596,94 @@ incr_agg_arg_deparse_safe(Node *expr)
 	if (contain_mutable_functions(expr))
 		return false;
 	return true;
+}
+
+/*
+ * incr_expr_all_preserved_or_inner — true if every Var in expr resolves to the
+ * preserved anchor or an inner-joined table (i.e. NONE come from an optional
+ * LEFT/RIGHT/FULL side).  A GROUP BY expression key over an outer join is only
+ * maintainable when it can never turn NULL from a non-match — the general
+ * orphan arm can NULL a whole Var key but not re-evaluate an arbitrary
+ * expression on an orphaned row, so expression keys that reference an optional
+ * table are rejected.
+ */
+typedef struct
+{
+	List	   *rtable;
+	List	   *all_tables;
+	int			preserved_varno;
+	bool		ok;
+} IncrExprPlaceCtx;
+
+static bool
+incr_expr_place_walker(Node *node, IncrExprPlaceCtx *cx)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Var))
+	{
+		int			rv;
+		ListCell   *lc;
+
+		if (!incr_try_resolve_var_to_rel((Var *) node, cx->rtable, &rv))
+		{
+			cx->ok = false;
+			return true;
+		}
+		foreach(lc, cx->all_tables)
+		{
+			IncrJoinEntry *je = lfirst(lc);
+
+			if (je->varno != rv)
+				continue;
+			if (rv != cx->preserved_varno &&
+				(je->join_type == JOIN_LEFT || je->join_type == JOIN_RIGHT ||
+				 je->join_type == JOIN_FULL))
+				cx->ok = false;		/* optional-side Var — not allowed */
+			break;
+		}
+		return cx->ok ? false : true;
+	}
+	return expression_tree_walker(node, incr_expr_place_walker, cx);
+}
+
+static bool
+incr_expr_all_preserved_or_inner(Node *gexpr, Query *viewQuery, List *all_tables)
+{
+	IncrExprPlaceCtx cx;
+
+	cx.rtable = viewQuery->rtable;
+	cx.all_tables = all_tables;
+	cx.preserved_varno = incr_outer_preserved_varno(all_tables);
+	cx.ok = true;
+	incr_expr_place_walker(gexpr, &cx);
+	return cx.ok;
+}
+
+/*
+ * incr_has_stable_group_key — true if any GROUP BY key is a non-Var expression
+ * that is not IMMUTABLE (i.e. STABLE, e.g. to_char(date,'mon')).  Such a matview
+ * is routed to the recompute path: the additive delta path keys a running total
+ * by the expression's value and would drift if that value ever changed for
+ * existing rows, whereas recompute re-derives each affected group from live and
+ * self-heals every touched group.  (Volatile keys are rejected outright.)
+ */
+static bool
+incr_has_stable_group_key(Query *viewQuery)
+{
+	ListCell   *lc;
+
+	foreach(lc, viewQuery->groupClause)
+	{
+		SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+		TargetEntry	   *te  = get_sortgroupclause_tle(sgc, viewQuery->targetList);
+		Node		   *ge  = incr_group_key_expr(viewQuery, te);
+
+		if (ge != NULL && !IsA(ge, Var) &&
+			!contain_volatile_functions(ge) && contain_mutable_functions(ge))
+			return true;
+	}
+	return false;
 }
 
 /*
@@ -8080,6 +8202,15 @@ incr_needs_recompute(Query *viewQuery)
 	ListCell *lc;
 
 	if (incr_has_distinct_agg(viewQuery))
+		return true;
+	/*
+	 * A STABLE (non-immutable) expression group key — e.g. to_char(d,'mon') —
+	 * is maintained by recompute, not the additive delta path: recompute
+	 * re-derives each affected group from live and self-heals it, whereas an
+	 * additive running total keyed by the expression value would drift if that
+	 * value ever changed for existing rows.
+	 */
+	if (incr_has_stable_group_key(viewQuery))
 		return true;
 	foreach(lc, viewQuery->targetList)
 	{
