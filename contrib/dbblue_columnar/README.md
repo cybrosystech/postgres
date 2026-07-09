@@ -49,6 +49,32 @@ Notes:
 - Inheritance/partition parents are left to the normal Append (no per-partition
   columnar acceleration yet).
 
+## Background auto-refresh (Milestone 4)
+
+A background worker keeps the store fresh with no manual `populate`. Enable it
+per database:
+
+```
+# postgresql.conf (autorefresh_database is read once at startup)
+dbblue_columnar.autorefresh_database = 'mydb'
+dbblue_columnar.naptime = 60             # seconds between passes
+dbblue_columnar.refresh_threshold = 20   # percent of coverage drift to trigger a rebuild
+```
+
+Each pass builds registered-but-unbuilt relations and rebuilds stale ones
+(staleness = the gap between currently all-visible pages and the pages the
+version covers). Concurrent `populate` of the same relation is serialized with
+`ShareUpdateExclusiveLock` (never blocks readers).
+
+Known v1 limitations:
+- **One database per worker** (fixed at startup); a cluster-wide launcher is
+  future work.
+- **Full rebuild**, not incremental block reuse.
+- Staleness is visibility-map based, so blocks that were modified *and then
+  re-vacuumed* (all-visible again but with a newer page LSN) are still served
+  correctly from the heap but are not eagerly re-columnarized until the relation
+  next grows/changes or you run `dbblue_columnar_populate()` manually.
+
 ## Build
 
 Built in-tree as a contrib module:
