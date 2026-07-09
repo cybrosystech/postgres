@@ -456,6 +456,7 @@ dbbc_version_free(DbbcRelVersion *version)
 	if (DsaPointerIsValid(version->attnums))
 		dsa_free(dbbc_dsa, version->attnums);
 
+	version->magic = DBBC_VERSION_POISON;
 	dsa_free(dbbc_dsa, version->self);
 
 	/*
@@ -489,7 +490,23 @@ dbbc_version_pin(Oid reloid)
 	{
 		version = (DbbcRelVersion *)
 			dsa_get_address(dbbc_dsa, entry->version);
-		pg_atomic_add_fetch_u32(&version->pins, 1);
+		/*
+		 * Liveness guard: a live version carries DBBC_VERSION_MAGIC (set at
+		 * publish, cleared to POISON at free). Reading + bumping happen under
+		 * the entry's dshash lock, and publish swaps entry->version under the
+		 * same lock's exclusive mode, so entry->version always references a
+		 * live version - this should never trip. It is kept as cheap
+		 * defense-in-depth for a shared, refcounted, droppable cache: if it
+		 * ever did, degrade to a heap scan rather than dereference freed DSA.
+		 */
+		if (unlikely(version->magic != DBBC_VERSION_MAGIC))
+		{
+			elog(DEBUG1, "dbblue_columnar: skipping non-live version (magic=0x%08x)",
+				 version->magic);
+			version = NULL;
+		}
+		else
+			pg_atomic_add_fetch_u32(&version->pins, 1);
 	}
 	dshash_release_lock(dbbc_hash, entry);
 
@@ -572,7 +589,17 @@ PG_FUNCTION_INFO_V1(dbblue_columnar_populate);
 Datum
 dbblue_columnar_populate(PG_FUNCTION_ARGS)
 {
-	Oid			relid = PG_GETARG_OID(0);
+	PG_RETURN_INT32(dbbc_populate_relation(PG_GETARG_OID(0)));
+}
+
+/*
+ * Build (or rebuild) the in-memory column store for one relation; returns the
+ * number of columnar blocks built. Callable from the SQL function above and
+ * from the background auto-refresh worker.
+ */
+int
+dbbc_populate_relation(Oid relid)
+{
 	Relation	rel;
 	TupleDesc	tupdesc;
 	int16	   *attnums;
@@ -595,6 +622,7 @@ dbblue_columnar_populate(PG_FUNCTION_ARGS)
 	volatile dsa_pointer version_dsa = InvalidDsaPointer;
 	volatile bool published = false;
 	volatile int blocks_built = 0;
+	volatile uint32 built_pages = 0;
 	bool		budget_hit = false;
 	Buffer		vmbuf = InvalidBuffer;
 	MemoryContext blkcxt;
@@ -615,7 +643,15 @@ dbblue_columnar_populate(PG_FUNCTION_ARGS)
 						get_rel_name(relid)),
 				 errhint("Register columns with dbblue_columnar_add first.")));
 
-	rel = table_open(relid, AccessShareLock);
+	/*
+	 * ShareUpdateExclusiveLock, not AccessShareLock: it is self-conflicting,
+	 * so two populates of the same relation (e.g. the auto-refresh worker and
+	 * a manual call, or two manual calls) serialize instead of racing to
+	 * build+publish+free versions concurrently. It does not conflict with
+	 * readers (AccessShareLock), so queries are unaffected; it does serialize
+	 * with VACUUM, which is desirable - populate then sees a stable heap.
+	 */
+	rel = table_open(relid, ShareUpdateExclusiveLock);
 
 	if (rel->rd_rel->relkind != RELKIND_RELATION &&
 		rel->rd_rel->relkind != RELKIND_MATVIEW)
@@ -1057,6 +1093,7 @@ dbblue_columnar_populate(PG_FUNCTION_ARGS)
 				entry_bytes += acct;
 				inflight_bytes = 0;
 				blocks_built++;
+				built_pages += npages;
 			}
 
 			MemoryContextSwitchTo(oldcxt);
@@ -1101,12 +1138,14 @@ dbblue_columnar_populate(PG_FUNCTION_ARGS)
 
 			version = (DbbcRelVersion *) dsa_get_address(dbbc_dsa,
 														 version_dsa);
+			version->magic = DBBC_VERSION_MAGIC;
 			pg_atomic_init_u32(&version->pins, 1);	/* the entry's own pin */
 			version->self = version_dsa;
 			version->ncols = ncols;
 			version->attnums = attnums_dsa;
 			version->ndirslots = ndirslots;
 			version->nblocks = (uint32) blocks_built;
+			version->built_pages = built_pages;
 			version->blockdir = blockdir_dsa;
 			version->total_bytes = entry_bytes + meta_bytes;
 
@@ -1149,9 +1188,118 @@ dbblue_columnar_populate(PG_FUNCTION_ARGS)
 	}
 	PG_END_TRY();
 
-	table_close(rel, AccessShareLock);
+	table_close(rel, ShareUpdateExclusiveLock);
 
-	PG_RETURN_INT32(blocks_built);
+	return (int) blocks_built;
+}
+
+/*
+ * Distinct relation OIDs currently registered for columnarization in this
+ * database. Returns NIL (not an error) if the extension isn't installed here.
+ * Used by the background auto-refresh worker.
+ */
+List *
+dbbc_registered_relids(void)
+{
+	List	   *result = NIL;
+	MemoryContext caller = CurrentMemoryContext;
+	char	   *sql;
+	int			ret;
+	uint64		i;
+
+	if (!OidIsValid(get_extension_oid("dbblue_columnar", true)))
+		return NIL;
+
+	sql = psprintf("SELECT DISTINCT relid FROM %s", dbbc_registry_table_name());
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "dbblue_columnar: SPI_connect failed");
+	ret = SPI_execute(sql, true, 0);
+	if (ret != SPI_OK_SELECT)
+		elog(ERROR, "dbblue_columnar: registered-relid query failed (%d)", ret);
+
+	for (i = 0; i < SPI_processed; i++)
+	{
+		bool		isnull;
+		Datum		d = SPI_getbinval(SPI_tuptable->vals[i],
+									  SPI_tuptable->tupdesc, 1, &isnull);
+
+		if (!isnull)
+		{
+			MemoryContext old = MemoryContextSwitchTo(caller);
+
+			result = lappend_oid(result, DatumGetObjectId(d));
+			MemoryContextSwitchTo(old);
+		}
+	}
+
+	SPI_finish();
+	return result;
+}
+
+/*
+ * Cheap staleness test for the auto-refresh worker: should this relation's
+ * column store be (re)built?
+ *
+ * The signal is the gap between the pages that are all-visible NOW
+ * (visibilitymap_count - VM fork reads only, no heap page reads) and the
+ * pages the current version actually covers (built_pages). A large gap means
+ * either un-columnarized all-visible data has appeared (growth, or pages that
+ * were not yet all-visible when the version was built - including a version
+ * built when NOTHING was all-visible, nblocks == 0) or columnarized pages
+ * have been modified (their VM bit cleared). Either way a rebuild helps.
+ *
+ * Refresh when the gap reaches max(one block, threshold_pct of coverage): the
+ * one-block floor bootstraps a zero-coverage version and absorbs a single
+ * partial trailing range without thrashing. Approximation is fine because
+ * staleness only affects performance - the serve path always falls back to
+ * the heap for any block failing the exact VM+LSN check at query time.
+ * Non-heap / non-permanent / wrong-relkind relations never need refresh
+ * (populate would reject them).
+ */
+bool
+dbbc_relation_needs_refresh(Oid relid, int threshold_pct)
+{
+	DbbcRelVersion *version;
+	Relation	rel;
+	BlockNumber all_visible = 0;
+	BlockNumber all_frozen = 0;
+	int64		covered;
+	int64		gap;
+	int64		floor_pages;
+	bool		needs;
+
+	version = dbbc_version_pin_tracked(relid);
+	if (version == NULL)
+		return true;			/* registered but not built yet */
+
+	rel = table_open(relid, AccessShareLock);
+
+	if (rel->rd_rel->relam != HEAP_TABLE_AM_OID ||
+		rel->rd_rel->relpersistence != RELPERSISTENCE_PERMANENT ||
+		(rel->rd_rel->relkind != RELKIND_RELATION &&
+		 rel->rd_rel->relkind != RELKIND_MATVIEW))
+	{
+		table_close(rel, AccessShareLock);
+		dbbc_version_unpin_tracked(version);
+		return false;
+	}
+
+	visibilitymap_count(rel, &all_visible, &all_frozen);
+	covered = (int64) version->built_pages;
+	gap = (int64) all_visible - covered;
+	if (gap < 0)
+		gap = -gap;
+
+	floor_pages = covered * threshold_pct / 100;
+	if (floor_pages < DBBC_PAGES_PER_BLOCK)
+		floor_pages = DBBC_PAGES_PER_BLOCK;
+
+	needs = (gap >= floor_pages);
+
+	table_close(rel, AccessShareLock);
+	dbbc_version_unpin_tracked(version);
+	return needs;
 }
 
 /*

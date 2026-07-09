@@ -49,6 +49,7 @@
 
 #include "access/xlogdefs.h"
 #include "lib/dshash.h"
+#include "nodes/pg_list.h"
 #include "port/atomics.h"
 #include "storage/block.h"
 #include "utils/dsa.h"
@@ -141,14 +142,19 @@ typedef struct DbbcRelKey
  * freed block. Readers must register their pin with a ResourceOwner (see
  * columnar_scan.c) so aborted queries unpin too.
  */
+#define DBBC_VERSION_MAGIC		0xDB10C0DEu
+#define DBBC_VERSION_POISON		0xDEADBEEFu
+
 typedef struct DbbcRelVersion
 {
+	uint32		magic;			/* DBBC_VERSION_MAGIC live / POISON freed */
 	pg_atomic_uint32 pins;		/* 1 while current + 1 per active reader */
 	dsa_pointer self;			/* this struct's own dsa_pointer */
 	int			ncols;
 	dsa_pointer attnums;		/* int16[ncols], ascending */
 	uint32		ndirslots;		/* directory length */
 	uint32		nblocks;		/* directory slots actually built */
+	uint32		built_pages;	/* heap pages covered by built blocks (exact) */
 	dsa_pointer blockdir;		/* dsa_pointer[ndirslots] -> DbbcBlock */
 	Size		total_bytes;	/* accounting: all DSA bytes of this version */
 } DbbcRelVersion;
@@ -176,6 +182,11 @@ extern void dbbc_version_unpin(DbbcRelVersion *version);
 extern DbbcRelVersion *dbbc_version_pin_tracked(Oid reloid);
 extern DbbcRelVersion *dbbc_version_attach_tracked(dsa_pointer vp);
 extern void dbbc_version_unpin_tracked(DbbcRelVersion *version);
+
+/* populate / auto-refresh (columnar_store.c) */
+extern int	dbbc_populate_relation(Oid relid);
+extern List *dbbc_registered_relids(void);
+extern bool dbbc_relation_needs_refresh(Oid relid, int threshold_pct);
 extern Datum dbbc_chunk_minmax_datum(DbbcColumnChunk *chunk, bool want_max);
 
 /* columnar_scan.c */

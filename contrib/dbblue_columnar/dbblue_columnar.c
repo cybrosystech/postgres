@@ -22,6 +22,7 @@
 #include "fmgr.h"
 #include "miscadmin.h"
 
+#include "access/xact.h"
 #include "catalog/pg_type.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
@@ -31,6 +32,7 @@
 #include "nodes/plannodes.h"
 #include "optimizer/paths.h"
 #include "optimizer/pathnode.h"
+#include "pgstat.h"
 #include "postmaster/bgworker.h"
 #include "postmaster/interrupt.h"
 #include "storage/ipc.h"
@@ -39,6 +41,7 @@
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
+#include "utils/snapmgr.h"
 #include "utils/wait_event.h"
 
 #include "dbblue_columnar.h"
@@ -51,6 +54,11 @@ bool		dbblue_columnar_enable_columnar_scan = true;
 int			dbblue_columnar_memory_mb = 128;
 static bool dbblue_columnar_auto_columnarize = false;
 
+/* auto-refresh worker settings */
+static char *dbblue_columnar_autorefresh_database = NULL;
+static int	dbblue_columnar_naptime = 60;		/* seconds */
+static int	dbblue_columnar_refresh_threshold = 20; /* percent invalid blocks */
+
 /* ---- forward declarations (exported entry points) ---- */
 PGDLLEXPORT void _PG_init(void);
 PGDLLEXPORT void dbblue_columnar_worker_main(Datum main_arg);
@@ -62,6 +70,61 @@ PGDLLEXPORT void dbblue_columnar_worker_main(Datum main_arg);
  * invalid column blocks (visibility-map bit cleared or page LSN advanced past
  * the block's build LSN) and rebuild them from the heap.
  */
+/*
+ * One auto-refresh pass over this database's registered relations: build the
+ * ones with no version yet and rebuild the stale ones. Each relation runs in
+ * its own subtransaction so a failure (dropped/locked/altered relation)
+ * only skips that relation, never aborts the whole pass.
+ */
+static void
+dbbc_refresh_cycle(void)
+{
+	List	   *relids;
+	ListCell   *lc;
+
+	SetCurrentStatementStartTimestamp();
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	pgstat_report_activity(STATE_RUNNING, "dbblue_columnar auto-refresh");
+
+	relids = dbbc_registered_relids();	/* NIL if extension absent here */
+
+	foreach(lc, relids)
+	{
+		Oid			relid = lfirst_oid(lc);
+		MemoryContext oldcxt = CurrentMemoryContext;
+
+		BeginInternalSubTransaction(NULL);
+		PG_TRY();
+		{
+			if (dbbc_relation_needs_refresh(relid,
+											dbblue_columnar_refresh_threshold))
+				(void) dbbc_populate_relation(relid);
+			ReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(oldcxt);
+		}
+		PG_CATCH();
+		{
+			ErrorData  *edata;
+
+			MemoryContextSwitchTo(oldcxt);
+			edata = CopyErrorData();
+			FlushErrorState();
+			RollbackAndReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(oldcxt);
+			ereport(LOG,
+					(errmsg("dbblue_columnar auto-refresh skipped relation %u: %s",
+							relid, edata->message)));
+			FreeErrorData(edata);
+		}
+		PG_END_TRY();
+	}
+
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+	pgstat_report_activity(STATE_IDLE, NULL);
+}
+
 void
 dbblue_columnar_worker_main(Datum main_arg)
 {
@@ -69,8 +132,43 @@ dbblue_columnar_worker_main(Datum main_arg)
 	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
 	BackgroundWorkerUnblockSignals();
 
+	/*
+	 * The worker services ONE database (fixed at connect time). If none is
+	 * configured, it idles - a restart is needed to enable it, since the
+	 * database connection cannot change. (Cluster-wide coverage via a
+	 * per-database launcher is future work.)
+	 */
+	if (dbblue_columnar_autorefresh_database == NULL ||
+		dbblue_columnar_autorefresh_database[0] == '\0')
+	{
+		ereport(LOG,
+				(errmsg("dbblue_columnar auto-refresh is off"),
+				 errhint("Set dbblue_columnar.autorefresh_database and restart to enable it.")));
+		for (;;)
+		{
+			int			rc;
+
+			if (ShutdownRequestPending)
+				proc_exit(0);
+			if (ConfigReloadPending)
+			{
+				ConfigReloadPending = false;
+				ProcessConfigFile(PGC_SIGHUP);
+			}
+			rc = WaitLatch(MyLatch,
+						   WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						   60000L, PG_WAIT_EXTENSION);
+			ResetLatch(MyLatch);
+			if (rc & WL_LATCH_SET)
+				CHECK_FOR_INTERRUPTS();
+		}
+	}
+
+	BackgroundWorkerInitializeConnection(dbblue_columnar_autorefresh_database,
+										 NULL, 0);
 	ereport(LOG,
-			(errmsg("dbblue_columnar refresh worker started")));
+			(errmsg("dbblue_columnar auto-refresh worker connected to database \"%s\"",
+					dbblue_columnar_autorefresh_database)));
 
 	for (;;)
 	{
@@ -78,21 +176,39 @@ dbblue_columnar_worker_main(Datum main_arg)
 
 		if (ShutdownRequestPending)
 			proc_exit(0);
-
 		if (ConfigReloadPending)
 		{
 			ConfigReloadPending = false;
 			ProcessConfigFile(PGC_SIGHUP);
 		}
 
-		/* Milestone 1: nothing to refresh yet. */
+		if (dbblue_columnar_enabled)
+		{
+			/*
+			 * Do a whole cycle under one error boundary: a per-relation
+			 * failure is already handled inside, but a failure in the
+			 * surrounding transaction machinery must not kill the worker.
+			 */
+			PG_TRY();
+			{
+				dbbc_refresh_cycle();
+			}
+			PG_CATCH();
+			{
+				HOLD_INTERRUPTS();
+				EmitErrorReport();
+				FlushErrorState();
+				AbortOutOfAnyTransaction();
+				pgstat_report_activity(STATE_IDLE, NULL);
+				RESUME_INTERRUPTS();
+			}
+			PG_END_TRY();
+		}
 
 		rc = WaitLatch(MyLatch,
 					   WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-					   60000L,
-					   PG_WAIT_EXTENSION);
+					   dbblue_columnar_naptime * 1000L, PG_WAIT_EXTENSION);
 		ResetLatch(MyLatch);
-
 		if (rc & WL_LATCH_SET)
 			CHECK_FOR_INTERRUPTS();
 	}
@@ -231,6 +347,33 @@ _PG_init(void)
 							GUC_UNIT_MB,
 							NULL, NULL, NULL);
 
+	DefineCustomStringVariable("dbblue_columnar.autorefresh_database",
+							   "Database the auto-refresh worker services (empty = off).",
+							   "The worker connects to one database, fixed at startup; changing this requires a restart.",
+							   &dbblue_columnar_autorefresh_database,
+							   "",
+							   PGC_POSTMASTER,
+							   0,
+							   NULL, NULL, NULL);
+
+	DefineCustomIntVariable("dbblue_columnar.naptime",
+							"Seconds between auto-refresh passes.",
+							NULL,
+							&dbblue_columnar_naptime,
+							60, 1, 86400,
+							PGC_SIGHUP,
+							GUC_UNIT_S,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("dbblue_columnar.refresh_threshold",
+							"Percent of a relation's columnar blocks that must be invalid before an auto-refresh rebuilds it.",
+							NULL,
+							&dbblue_columnar_refresh_threshold,
+							20, 1, 100,
+							PGC_SIGHUP,
+							0,
+							NULL, NULL, NULL);
+
 	MarkGUCPrefixReserved("dbblue_columnar");
 
 	/* planner hook + CustomScan provider (columnar_scan.c) */
@@ -238,7 +381,8 @@ _PG_init(void)
 
 	/* register the background refresh worker */
 	memset(&worker, 0, sizeof(worker));
-	worker.bgw_flags = BGWORKER_SHMEM_ACCESS;
+	worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
+		BGWORKER_BACKEND_DATABASE_CONNECTION;
 	worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
 	worker.bgw_restart_time = 10;
 	snprintf(worker.bgw_name, BGW_MAXLEN, "dbblue_columnar refresh worker");
