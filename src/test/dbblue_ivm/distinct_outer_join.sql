@@ -613,5 +613,44 @@ BEGIN
   DROP TABLE so_emp CASCADE;
 END$$;
 
+-- 19. Multi-hop optional GROUP BY key must be REJECTED for EVERY aggregate
+--     (additive included) — the affected-set arms can't detect an orphan of a
+--     fact row whose optional key is reached through a CHAIN of optional joins
+--     (arm 1 over-capture misses the all-orphaned-at-once case; there is no
+--     arm 2 for indirect connections).  A direct-optional key is still accepted.
+DO $$
+DECLARE made bool;
+BEGIN
+  CREATE TABLE mh_sl(id int primary key, order_id int, amt int);
+  CREATE TABLE mh_so(id int primary key, partner_id int);
+  CREATE TABLE mh_pa(id int primary key, country_id int);
+
+  -- additive, multi-hop optional key (country via partner via order) — REJECT
+  made := false;
+  BEGIN
+    CREATE MATERIALIZED VIEW _r WITH (incremental_refresh=true) AS
+      SELECT pa.country_id gk, count(*) c, sum(sl.amt) s
+      FROM mh_sl sl LEFT JOIN mh_so so ON sl.order_id=so.id
+                    LEFT JOIN mh_pa pa ON so.partner_id=pa.id
+      GROUP BY pa.country_id;
+    made := true;
+  EXCEPTION WHEN feature_not_supported THEN NULL; END;
+  IF made THEN DROP MATERIALIZED VIEW _r; RAISE EXCEPTION 'multi-hop optional key (additive): FAIL (accepted)';
+  ELSE RAISE NOTICE 'multi-hop optional key (additive) rejected: PASS'; END IF;
+
+  -- direct-optional key over the same chain (order is directly joined to fact) — ACCEPT
+  made := false;
+  BEGIN
+    CREATE MATERIALIZED VIEW _r WITH (incremental_refresh=true) AS
+      SELECT so.partner_id gk, count(*) c
+      FROM mh_sl sl LEFT JOIN mh_so so ON sl.order_id=so.id GROUP BY so.partner_id;
+    made := true;
+  EXCEPTION WHEN feature_not_supported THEN NULL; END;
+  IF made THEN DROP MATERIALIZED VIEW _r; RAISE NOTICE 'direct-optional key still accepted: PASS';
+  ELSE RAISE EXCEPTION 'direct-optional key: FAIL (rejected)'; END IF;
+
+  DROP TABLE mh_sl, mh_so, mh_pa CASCADE;
+END$$;
+
 \echo ''
 \echo '=== DISTINCT / stddev over OUTER join test complete ==='

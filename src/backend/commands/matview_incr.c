@@ -693,6 +693,32 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 					return false;
 				}
 			}
+
+			/*
+			 * Affected-set gate for LEFT/RIGHT outer-join GROUP BY matviews —
+			 * applies to EVERY aggregate, additive included.  The affected-group
+			 * discovery maintains a group key only when it is on the preserved
+			 * anchor, an inner-joined table, or an optional table DIRECTLY joined
+			 * to the preserved anchor (where arm 2 detects orphan births/deaths).
+			 * A MULTI-HOP optional key — reached through a chain of optional joins
+			 * (e.g. GROUP BY partner.country_id over sale_line LEFT JOIN
+			 * sale_order LEFT JOIN partner) — has no arm 2, and arm 1's
+			 * over-capture misses the NULL group when a chain-table delta orphans
+			 * every matching fact row at once.  Reject it for additive aggregates
+			 * too, else it is silently wrong.  FULL joins (gated above) and self
+			 * joins (their own recompute path) are excluded here.
+			 */
+			if (has_outer_join && !has_full_join && !self_join_seen &&
+				viewQuery->groupClause != NIL &&
+				!incr_recompute_outer_shape(viewQuery, nbasetables))
+			{
+				*reason = "an outer-join GROUP BY key must be on the preserved "
+						  "anchor, an inner-joined table, or an optional table "
+						  "directly joined to the preserved anchor; a group key "
+						  "reached through a chain of optional joins is not yet "
+						  "supported";
+				return false;
+			}
 		}
 
 	}
