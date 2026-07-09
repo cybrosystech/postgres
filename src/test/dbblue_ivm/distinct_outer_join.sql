@@ -613,44 +613,43 @@ BEGIN
   DROP TABLE so_emp CASCADE;
 END$$;
 
--- 19. Multi-hop optional GROUP BY key must be REJECTED for EVERY aggregate
---     (additive included) — the affected-set arms can't detect an orphan of a
---     fact row whose optional key is reached through a CHAIN of optional joins
---     (arm 1 over-capture misses the all-orphaned-at-once case; there is no
---     arm 2 for indirect connections).  A direct-optional key is still accepted.
+-- 19. Multi-hop optional GROUP BY key (country via partner via order) — the
+--     general orphan arm handles an optional key reached through a chain of
+--     optional joins.  A chain-table delta that orphans every matching fact row
+--     at once (the minimal case) must move them into the NULL group == REFRESH.
+DROP TABLE IF EXISTS mh_sl, mh_so, mh_pa CASCADE;
+CREATE TABLE mh_pa(id int primary key, country_id int);
+CREATE TABLE mh_so(id int primary key, partner_id int);
+CREATE TABLE mh_sl(id int primary key, order_id int, amt int);
+INSERT INTO mh_pa VALUES (10,1),(11,2);
+INSERT INTO mh_so VALUES (1000,10),(1001,11),(1002,NULL);
+INSERT INTO mh_sl VALUES (1,1000,5),(2,1000,7),(3,1001,3),(4,1002,9),(5,NULL,1);
+CREATE MATERIALIZED VIEW mh_i WITH (incremental_refresh=true) AS
+  SELECT pa.country_id gk, count(*) c, count(pa.id) cp, sum(sl.amt) s
+  FROM mh_sl sl LEFT JOIN mh_so so ON sl.order_id=so.id
+                LEFT JOIN mh_pa pa ON so.partner_id=pa.id
+  GROUP BY pa.country_id;
+CREATE MATERIALIZED VIEW mh_o AS
+  SELECT pa.country_id gk, count(*) c, count(pa.id) cp, sum(sl.amt) s
+  FROM mh_sl sl LEFT JOIN mh_so so ON sl.order_id=so.id
+                LEFT JOIN mh_pa pa ON so.partner_id=pa.id
+  GROUP BY pa.country_id;
+DELETE FROM mh_pa WHERE id=10;          -- orphans sl 1,2 (all via partner 10) → NULL country group
+UPDATE mh_so SET partner_id=11 WHERE id=1000;  -- re-routes... (partner 10 gone) → country 2
+INSERT INTO mh_pa VALUES (12,3);
+UPDATE mh_so SET partner_id=12 WHERE id=1002;  -- de-orphans sl 4 → country 3
+DELETE FROM mh_so WHERE id=1001;        -- orphans sl 3 → NULL
+REFRESH MATERIALIZED VIEW mh_o;
 DO $$
-DECLARE made bool;
+DECLARE d int;
 BEGIN
-  CREATE TABLE mh_sl(id int primary key, order_id int, amt int);
-  CREATE TABLE mh_so(id int primary key, partner_id int);
-  CREATE TABLE mh_pa(id int primary key, country_id int);
-
-  -- additive, multi-hop optional key (country via partner via order) — REJECT
-  made := false;
-  BEGIN
-    CREATE MATERIALIZED VIEW _r WITH (incremental_refresh=true) AS
-      SELECT pa.country_id gk, count(*) c, sum(sl.amt) s
-      FROM mh_sl sl LEFT JOIN mh_so so ON sl.order_id=so.id
-                    LEFT JOIN mh_pa pa ON so.partner_id=pa.id
-      GROUP BY pa.country_id;
-    made := true;
-  EXCEPTION WHEN feature_not_supported THEN NULL; END;
-  IF made THEN DROP MATERIALIZED VIEW _r; RAISE EXCEPTION 'multi-hop optional key (additive): FAIL (accepted)';
-  ELSE RAISE NOTICE 'multi-hop optional key (additive) rejected: PASS'; END IF;
-
-  -- direct-optional key over the same chain (order is directly joined to fact) — ACCEPT
-  made := false;
-  BEGIN
-    CREATE MATERIALIZED VIEW _r WITH (incremental_refresh=true) AS
-      SELECT so.partner_id gk, count(*) c
-      FROM mh_sl sl LEFT JOIN mh_so so ON sl.order_id=so.id GROUP BY so.partner_id;
-    made := true;
-  EXCEPTION WHEN feature_not_supported THEN NULL; END;
-  IF made THEN DROP MATERIALIZED VIEW _r; RAISE NOTICE 'direct-optional key still accepted: PASS';
-  ELSE RAISE EXCEPTION 'direct-optional key: FAIL (rejected)'; END IF;
-
-  DROP TABLE mh_sl, mh_so, mh_pa CASCADE;
+  SELECT count(*) INTO d FROM (
+    (SELECT gk,c,cp,s FROM mh_i EXCEPT SELECT gk,c,cp,s FROM mh_o) UNION ALL
+    (SELECT gk,c,cp,s FROM mh_o EXCEPT SELECT gk,c,cp,s FROM mh_i)) z;
+  IF d=0 THEN RAISE NOTICE 'multi-hop optional GROUP BY key (chain) == REFRESH: PASS';
+  ELSE RAISE EXCEPTION 'multi-hop optional key: FAIL (% rows differ)', d; END IF;
 END$$;
+DROP TABLE mh_sl, mh_so, mh_pa CASCADE;
 
 \echo ''
 \echo '=== DISTINCT / stddev over OUTER join test complete ==='
