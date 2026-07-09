@@ -273,6 +273,8 @@ static bool incr_aggs_need_deparse(Query *viewQuery);
 static bool incr_inner_join_deparse_shape(Query *viewQuery, int nbasetables);
 static bool incr_recompute_outer_shape(Query *viewQuery, int nbasetables);
 static bool incr_full_join_single_side_keys(Query *viewQuery);
+static bool incr_full_join_coalesce_keys(Query *viewQuery);
+static bool incr_is_coalesce_of_join_keys(Node *gexpr, Query *viewQuery);
 static bool incr_try_resolve_var_to_rel(Var *v, List *rtable, int *varno_out);
 static void incr_append_recompute_tail(StringInfo buf, const char *mvname,
 											 Query *viewQuery, bool actual_delete_step);
@@ -681,12 +683,13 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 				 *   • FULL joins of three or more tables.
 				 */
 				if (nbasetables != 2 ||
-					!incr_full_join_single_side_keys(viewQuery))
+					!(incr_full_join_single_side_keys(viewQuery) ||
+					  incr_full_join_coalesce_keys(viewQuery)))
 				{
 					*reason = "FULL OUTER JOIN with GROUP BY is supported only "
-							  "when exactly two tables are joined and every "
-							  "GROUP BY key is a plain column from a single one "
-							  "of them";
+							  "when exactly two tables are joined and every GROUP BY "
+							  "key is either a plain column from a single one of them "
+							  "or COALESCE(<left key>, <right key>) of the join keys";
 					return false;
 				}
 			}
@@ -741,11 +744,18 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 			if (gexpr == NULL || IsA(gexpr, Var))
 				continue;			/* plain column — always supported */
 
-			if (!deparse_agg_shape)
+			/*
+			 * COALESCE(<left key>, <right key>) of a FULL join's equi-key is an
+			 * expression key over an outer join, but it is orphan-flip invariant
+			 * (incr_is_coalesce_of_join_keys) so the recompute path maintains it
+			 * correctly — allow it past the single-table/INNER-only restriction.
+			 */
+			if (!deparse_agg_shape &&
+				!incr_is_coalesce_of_join_keys(gexpr, viewQuery))
 			{
 				*reason = "GROUP BY on an expression is supported only for "
 					"single-table and INNER JOIN aggregates without MIN/MAX or "
-					"self-join";
+					"self-join (or COALESCE of a FULL join's keys)";
 				return false;
 			}
 			if (!incr_agg_arg_deparse_safe(gexpr))
@@ -2682,6 +2692,120 @@ incr_try_resolve_var_to_rel(Var *v, List *rtable, int *varno_out)
 			return false;
 		v = (Var *) sub;
 	}
+}
+
+/*
+ * incr_eqjoin_matches_vars — true if qual is (or AND-contains) an equality
+ * OpExpr whose two Var operands are exactly v1 and v2 (in either order, matched
+ * by varno + varattno).  Used to confirm a COALESCE's two arguments are the two
+ * sides of the join's equi-key.
+ */
+static bool
+incr_eqjoin_matches_vars(Node *qual, Var *v1, Var *v2)
+{
+	if (qual == NULL)
+		return false;
+	if (IsA(qual, BoolExpr))
+	{
+		BoolExpr   *b = (BoolExpr *) qual;
+		ListCell   *l;
+
+		if (b->boolop != AND_EXPR)
+			return false;
+		foreach(l, b->args)
+			if (incr_eqjoin_matches_vars((Node *) lfirst(l), v1, v2))
+				return true;
+		return false;
+	}
+	if (IsA(qual, OpExpr))
+	{
+		OpExpr	   *op = (OpExpr *) qual;
+		Node	   *l,
+				   *r;
+		Var		   *lv,
+				   *rv;
+		char	   *opname;
+
+		if (list_length(op->args) != 2)
+			return false;
+		l = linitial(op->args);
+		r = lsecond(op->args);
+		if (!IsA(l, Var) || !IsA(r, Var))
+			return false;
+		opname = get_opname(op->opno);
+		if (opname == NULL || strcmp(opname, "=") != 0)
+			return false;			/* only equi-joins give v1 = v2 on a match */
+		lv = (Var *) l;
+		rv = (Var *) r;
+		return ((lv->varno == v1->varno && lv->varattno == v1->varattno &&
+				 rv->varno == v2->varno && rv->varattno == v2->varattno) ||
+				(lv->varno == v2->varno && lv->varattno == v2->varattno &&
+				 rv->varno == v1->varno && rv->varattno == v1->varattno));
+	}
+	return false;
+}
+
+/*
+ * incr_is_coalesce_of_join_keys — true if gexpr is COALESCE(x, y) where {x, y}
+ * are exactly the two sides of an equi-join condition in the query (the FULL-
+ * join key-merge idiom, e.g. GROUP BY COALESCE(a.k, b.k) over a FULL JOIN ON
+ * a.k = b.k).  Such a key is INVARIANT under an orphan flip: on a matched row
+ * x = y so COALESCE is the shared value, and on either orphan the surviving
+ * side still holds that value.  So the row never moves between groups and never
+ * enters an all-NULL group — the plain recompute arms (no NULL arm) are correct.
+ */
+static bool
+incr_is_coalesce_of_join_keys(Node *gexpr, Query *viewQuery)
+{
+	CoalesceExpr *c;
+	Var		   *v1,
+			   *v2;
+	List	   *tabs;
+	ListCell   *lc;
+
+	if (gexpr == NULL || !IsA(gexpr, CoalesceExpr))
+		return false;
+	c = (CoalesceExpr *) gexpr;
+	if (list_length(c->args) != 2 ||
+		!IsA(linitial(c->args), Var) || !IsA(lsecond(c->args), Var))
+		return false;
+	v1 = (Var *) linitial(c->args);
+	v2 = (Var *) lsecond(c->args);
+
+	tabs = incr_collect_tables(viewQuery);
+	foreach(lc, tabs)
+	{
+		IncrJoinEntry *je = lfirst(lc);
+
+		if (incr_eqjoin_matches_vars(je->quals, v1, v2))
+			return true;
+	}
+	return false;
+}
+
+/*
+ * incr_full_join_coalesce_keys — true iff every GROUP BY key is a
+ * COALESCE-of-join-keys expression (see incr_is_coalesce_of_join_keys).  The
+ * secondary supported FULL-join shape: no NULL group, no relocation, so arm 1
+ * of the recompute is sufficient.
+ */
+static bool
+incr_full_join_coalesce_keys(Query *viewQuery)
+{
+	ListCell   *lc;
+
+	if (viewQuery->groupClause == NIL)
+		return false;
+	foreach(lc, viewQuery->groupClause)
+	{
+		SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+		TargetEntry	   *te  = get_sortgroupclause_tle(sgc, viewQuery->targetList);
+
+		if (!incr_is_coalesce_of_join_keys(incr_group_key_expr(viewQuery, te),
+										   viewQuery))
+			return false;
+	}
+	return true;
 }
 
 /*
@@ -5568,13 +5692,22 @@ incr_build_affected_sql(StringInfo buf, Query *viewQuery,
 											list_head(viewQuery->groupClause));
 		TargetEntry	    *te0  = get_sortgroupclause_tle(sgc0,
 														viewQuery->targetList);
+		Node			*g0   = incr_group_key_expr(viewQuery, te0);
 		int				 key_side_varno;
 
-		/* Gate guarantees a single-side plain-Var key set. */
-		Assert(IsA(te0->expr, Var));
-		incr_resolve_var_colname((Var *) te0->expr, viewQuery->rtable,
-								 &key_side_varno);
-		full_null_arm = (delta_varno == key_side_varno);
+		/*
+		 * Single-side plain-Var keys have an all-NULL group (the other side's
+		 * orphans) that needs the NULL arm on key-side deltas.  COALESCE-of-
+		 * join-keys keys have NO all-NULL group (invariant under orphan flip),
+		 * so no NULL arm — arm 1 alone is correct.  The gate admits only these
+		 * two FULL shapes.
+		 */
+		if (g0 != NULL && IsA(g0, Var))
+		{
+			incr_resolve_var_colname((Var *) g0, viewQuery->rtable,
+									 &key_side_varno);
+			full_null_arm = (delta_varno == key_side_varno);
+		}
 	}
 
 	/* ----------------------------------------------------------------

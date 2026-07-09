@@ -306,17 +306,18 @@ BEGIN
   CREATE TABLE _tfb(id int primary key, k int, j int);
   CREATE TABLE _tfc(id int primary key, k int);
 
-  -- FULL + COALESCE (expression) key: an orphan flip can relocate a row
-  -- between non-NULL groups; the recompute arms don't track that.
+  -- FULL + COALESCE of NON-join columns: an orphan flip CAN relocate a row
+  -- between non-NULL groups (a.v ≠ b.v on a match), so this stays rejected.
+  -- (COALESCE of the JOIN keys is supported — Case 18.)
   BEGIN
     made := false;
     CREATE MATERIALIZED VIEW _tfmv WITH (incremental_refresh=true) AS
-      SELECT COALESCE(a.k,b.k) k, count(*) c
-      FROM _tfa a FULL JOIN _tfb b ON a.k=b.k GROUP BY COALESCE(a.k,b.k);
+      SELECT COALESCE(a.j,b.j) k, count(*) c
+      FROM _tfa a FULL JOIN _tfb b ON a.k=b.k GROUP BY COALESCE(a.j,b.j);
     made := true;
   EXCEPTION WHEN feature_not_supported THEN NULL; END;
-  IF made THEN DROP MATERIALIZED VIEW _tfmv; RAISE EXCEPTION 'FULL+COALESCE: FAIL (accepted)';
-  ELSE RAISE NOTICE 'FULL + COALESCE key still rejected: PASS'; END IF;
+  IF made THEN DROP MATERIALIZED VIEW _tfmv; RAISE EXCEPTION 'FULL+COALESCE(non-key): FAIL (accepted)';
+  ELSE RAISE NOTICE 'FULL + COALESCE(non-join cols) still rejected: PASS'; END IF;
 
   -- FULL + mixed-side keys (one key per table).
   BEGIN
@@ -379,6 +380,37 @@ BEGIN
   ELSE RAISE EXCEPTION 'DISTINCT self-outer: FAIL (% rows differ)', d; END IF;
 END$$;
 DROP TABLE sd_emp CASCADE;
+
+-- 18. FULL OUTER JOIN + GROUP BY COALESCE(a.k, b.k) — the key-merge idiom.  The
+--     COALESCE of the join keys is invariant under an orphan flip (on a match
+--     a.k=b.k), so no NULL group and no relocation; arm 1 of the recompute
+--     suffices.  Deltas on both sides, incl. orphan births/deaths.
+DROP TABLE IF EXISTS cj_a, cj_b CASCADE;
+CREATE TABLE cj_a(id int primary key, k int, v int);
+CREATE TABLE cj_b(id int primary key, k int, v int);
+INSERT INTO cj_a VALUES (1,1,10),(2,2,20);
+INSERT INTO cj_b VALUES (1,2,200),(2,3,300);   -- matched:2 ; a-orphan:1 ; b-orphan:3
+CREATE MATERIALIZED VIEW cj_i WITH (incremental_refresh=true) AS
+  SELECT COALESCE(a.k,b.k) k, count(*) c, count(a.v) ca, count(b.v) cb, sum(a.v) sa
+  FROM cj_a a FULL JOIN cj_b b ON a.k=b.k GROUP BY COALESCE(a.k,b.k);
+CREATE MATERIALIZED VIEW cj_o AS
+  SELECT COALESCE(a.k,b.k) k, count(*) c, count(a.v) ca, count(b.v) cb, sum(a.v) sa
+  FROM cj_a a FULL JOIN cj_b b ON a.k=b.k GROUP BY COALESCE(a.k,b.k);
+INSERT INTO cj_a VALUES (3,3,30);   -- de-orphans b(k=3): row stays in group 3 (COALESCE invariant)
+DELETE FROM cj_b WHERE k=2;         -- a(k=2) orphans: stays in group 2
+INSERT INTO cj_b VALUES (3,9,900);  -- new b-orphan → group 9
+UPDATE cj_a SET k=5 WHERE id=1;     -- move group 1 → 5
+REFRESH MATERIALIZED VIEW cj_o;
+DO $$
+DECLARE d int;
+BEGIN
+  SELECT count(*) INTO d FROM (
+    (SELECT k,c,ca,cb,sa FROM cj_i EXCEPT SELECT k,c,ca,cb,sa FROM cj_o) UNION ALL
+    (SELECT k,c,ca,cb,sa FROM cj_o EXCEPT SELECT k,c,ca,cb,sa FROM cj_i)) z;
+  IF d=0 THEN RAISE NOTICE 'FULL JOIN GROUP BY COALESCE(join keys) == REFRESH: PASS';
+  ELSE RAISE EXCEPTION 'FULL+COALESCE: FAIL (% rows differ)', d; END IF;
+END$$;
+DROP TABLE cj_a, cj_b CASCADE;
 
 -- 11. FULL OUTER JOIN, single-side GROUP BY a.k: NULL-group birth (delete the
 --     last match of a b-row → it orphans) and death (insert a match for the
