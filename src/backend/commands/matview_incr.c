@@ -283,6 +283,7 @@ static char *incr_build_self_recompute_sql(Oid mvrelid, Query *viewQuery,
 									   int v1, int v2, const char *delta_table,
 									   List *all_tables, bool include_delete_step);
 static bool incr_self_outer_supported_shape(Query *viewQuery);
+static bool incr_self_recompute_shape(Query *viewQuery);
 static Node *incr_group_key_expr(Query *q, TargetEntry *te);
 static bool incr_group_needs_deparse(Query *viewQuery);
 static Node *incr_get_where_qual(Query *viewQuery);
@@ -850,123 +851,50 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 		{
 			Aggref	   *agg = (Aggref *) te->expr;
 			char	   *fname = get_func_name(agg->aggfnoid);
+			bool		is_additive =
+				(strcmp(fname, "sum") == 0 || strcmp(fname, "count") == 0 ||
+				 strcmp(fname, "avg") == 0 || strcmp(fname, "min") == 0 ||
+				 strcmp(fname, "max") == 0);
+			bool		is_float_sumavg =
+				(strcmp(fname, "sum") == 0 || strcmp(fname, "avg") == 0) &&
+				(agg->aggtype == FLOAT4OID || agg->aggtype == FLOAT8OID);
+			bool		needs_rc =
+				agg->aggdistinct != NIL || agg->aggfilter != NULL ||
+				incr_is_recompute_only_func(fname) || is_float_sumavg;
 
-			/*
-			 * DISTINCT aggregates (e.g. COUNT(DISTINCT x)) cannot be maintained
-			 * by the simple per-row delta: a deleted row only removes a value
-			 * if it was the last occurrence in the group, which the ±1 delta
-			 * cannot know without tracking per-value occurrence counts.
-			 * Rejected rather than maintained incorrectly.
-			 */
-			if (agg->aggdistinct != NIL)
+			if (!is_additive && !incr_is_recompute_only_func(fname))
 			{
-				/*
-				 * DISTINCT aggregates are maintained by recomputing each
-				 * affected group from the live table(s) via the deparse-based
-				 * recompute engine (incr_build_recompute_sql).  Ordered-set
-				 * aggregates and self-joins are not yet supported; reject
-				 * cleanly.
-				 */
-				if (!(nbasetables == 1 ||
-					  incr_inner_join_deparse_shape(viewQuery, nbasetables) ||
-					  incr_recompute_outer_shape(viewQuery, nbasetables)) ||
-					agg->aggorder != NIL)
-				{
-					*reason = psprintf("incremental %s(DISTINCT ...) is supported "
-									   "only over a single table, INNER JOIN, or "
-									   "outer join (group keys on the preserved "
-									   "anchor, inner-joined tables, or an "
-									   "optional-side table directly joined to the "
-									   "preserved anchor), without ordered-set "
-									   "aggregates or self-joins", fname);
-					return false;
-				}
-			}
-
-			/*
-			 * FILTER (WHERE ...) on an aggregate is not yet honored by the
-			 * delta builders, so the filter would be silently ignored.  Reject
-			 * until proper support lands.
-			 */
-			if (agg->aggfilter != NULL)
-			{
-				*reason = psprintf("incremental %s(...) FILTER (WHERE ...) is not "
-								   "supported", fname);
+				*reason = psprintf("aggregate \"%s\" not supported (supported: SUM, "
+								   "COUNT, AVG, MIN, MAX, STDDEV, VARIANCE, BOOL_AND, "
+								   "BOOL_OR, STRING_AGG, ARRAY_AGG, JSON(B)_AGG; "
+								   "COUNT(DISTINCT); any with FILTER)", fname);
 				return false;
 			}
 
-			if (strcmp(fname, "sum") == 0 || strcmp(fname, "count") == 0 ||
-				strcmp(fname, "avg") == 0 || strcmp(fname, "min") == 0 ||
-				strcmp(fname, "max") == 0)
+			if (needs_rc)
 			{
 				/*
-				 * Reject SUM/AVG over floating-point (real/double precision).
-				 * They are maintained by adding and subtracting deltas from a
-				 * running total, and floating-point addition is not
-				 * associative — the running total accumulates rounding error
-				 * and drifts away from a true recompute over many deltas.
-				 * MIN/MAX (comparison only) and COUNT are unaffected, and
-				 * numeric/integer SUM/AVG are exact, so only float SUM/AVG is
-				 * blocked.  (agg->aggtype is the result type, so this also
-				 * catches SUM(<float expression>).)
+				 * Recompute path: DISTINCT, stddev/variance/bool, collect
+				 * aggregates (string_agg/array_agg/json(b)_agg), FILTERed
+				 * aggregates, and float SUM/AVG (recompute avoids running-total
+				 * rounding drift).  All are maintained by recomputing each
+				 * affected group from the live table(s) via the deparse engine,
+				 * which renders the aggregate — DISTINCT, FILTER, and all — verbatim.
+				 * Supported over a single table, INNER JOIN, or a supported outer
+				 * join; ordered-set aggregates (aggorder) and self-joins are not
+				 * yet supported.
 				 */
-				if ((strcmp(fname, "sum") == 0 || strcmp(fname, "avg") == 0) &&
-					(agg->aggtype == FLOAT4OID || agg->aggtype == FLOAT8OID))
-				{
-					*reason = psprintf("incremental %s() over floating-point "
-									   "(real/double precision) is not supported: "
-									   "running-total maintenance accumulates "
-									   "rounding error. Use numeric for exact "
-									   "incremental aggregation.", fname);
-					return false;
-				}
-
-				if (agg->args != NIL)
-				{
-					TargetEntry *arg_te = linitial_node(TargetEntry, agg->args);
-					Node	   *arg = (Node *) arg_te->expr;
-
-					/*
-					 * Accept the hand grammar always; for the plain single-table
-					 * aggregate shape also accept any deterministic deparse-able
-					 * expression (the delta SQL is then auto-routed to the
-					 * deparse core).  The union never narrows what was accepted
-					 * before.
-					 */
-					bool	arg_ok = !contain_mutable_functions(arg) &&
-						(incr_validate_expr(arg, NULL, false) ||
-						 (deparse_agg_shape && incr_agg_arg_deparse_safe(arg)));
-
-					if (!arg_ok)
-					{
-						*reason = psprintf("argument of aggregate \"%s\" uses "
-										   "unsupported expressions; only column "
-										   "references, constants, and arithmetic "
-										   "operators are allowed", fname);
-						return false;
-					}
-				}
-				continue;
-			}
-
-			if (incr_is_recompute_only_func(fname))
-			{
-				/* stddev/variance/bool_and/bool_or — maintained by recomputing each
-				 * affected group from the live table(s) (single-table or INNER JOIN,
-				 * no HAVING/ordered-set).  The recompute renders the argument with the
-				 * shared grammar (incr_deparse_where_qual). */
 				if (!(nbasetables == 1 ||
 					  incr_inner_join_deparse_shape(viewQuery, nbasetables) ||
-					  incr_recompute_outer_shape(viewQuery, nbasetables)) ||
+					  incr_recompute_outer_shape(viewQuery, nbasetables) ||
+					  incr_self_recompute_shape(viewQuery)) ||
 					agg->aggorder != NIL)
 				{
-					*reason = psprintf("incremental %s() is supported only over a "
-								   "single table, INNER JOIN, or outer join "
-								   "(group keys on the preserved anchor, "
-								   "inner-joined tables, or an optional-side "
-								   "table directly joined to the preserved "
-								   "anchor), without ordered-set aggregates",
-								   fname);
+					*reason = psprintf("incremental %s(...) with DISTINCT / FILTER / "
+									   "stddev / collect / float is supported only over "
+									   "a single table, INNER JOIN, a supported outer "
+									   "join, or a two-way self join, without "
+									   "ordered-set aggregates", fname);
 					return false;
 				}
 				if (agg->args != NIL)
@@ -974,20 +902,48 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 					Node *arg = (Node *) linitial_node(TargetEntry, agg->args)->expr;
 
 					if (contain_mutable_functions(arg) ||
-						!incr_validate_expr(arg, NULL, false))
+						!(incr_validate_expr(arg, NULL, false) ||
+						  incr_agg_arg_deparse_safe(arg)))
 					{
 						*reason = psprintf("argument of aggregate \"%s\" uses "
 									   "unsupported or non-immutable expressions", fname);
 						return false;
 					}
 				}
+				if (agg->aggfilter != NULL &&
+					!incr_agg_arg_deparse_safe((Node *) agg->aggfilter))
+				{
+					*reason = psprintf("FILTER condition of aggregate \"%s\" must be "
+								   "immutable and free of subqueries, aggregates, and "
+								   "window functions", fname);
+					return false;
+				}
 				continue;
 			}
 
-			*reason = psprintf("aggregate \"%s\" not supported (supported: SUM, "
-							   "COUNT, AVG, MIN, MAX, STDDEV, VARIANCE, BOOL_AND, "
-							   "BOOL_OR; COUNT(DISTINCT))", fname);
-			return false;
+			/*
+			 * Additive path: exact SUM/COUNT/AVG/MIN/MAX maintained by per-row
+			 * delta.  Accept the hand grammar always; for the plain single-table
+			 * shape also accept any deterministic deparse-able expression.
+			 */
+			if (agg->args != NIL)
+			{
+				TargetEntry *arg_te = linitial_node(TargetEntry, agg->args);
+				Node	   *arg = (Node *) arg_te->expr;
+				bool	arg_ok = !contain_mutable_functions(arg) &&
+					(incr_validate_expr(arg, NULL, false) ||
+					 (deparse_agg_shape && incr_agg_arg_deparse_safe(arg)));
+
+				if (!arg_ok)
+				{
+					*reason = psprintf("argument of aggregate \"%s\" uses "
+									   "unsupported expressions; only column "
+									   "references, constants, and arithmetic "
+									   "operators are allowed", fname);
+					return false;
+				}
+			}
+			continue;
 		}
 		*reason = "only column references and SUM/COUNT/AVG/MIN/MAX aggregates are allowed "
 			"in GROUP BY matviews";
@@ -1486,13 +1442,16 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 				!incr_has_minmax_agg(viewQuery) &&
 				!incr_needs_recompute(viewQuery);
 
-			if (incr_needs_recompute(viewQuery))
+			if (incr_needs_recompute(viewQuery) &&
+				!incr_has_self_join(all_tables))
 			{
 				/* DISTINCT / stddev / bool aggregate over an INNER JOIN —
 				 * recompute each affected group from the live join, per source
 				 * table, via the shared deparse-based recompute engine
 				 * (incr_build_recompute_sql degenerates to arm-1 + tail here: the
-				 * orphan/NULL arms never fire for INNER joins).  Correct for
+				 * orphan/NULL arms never fire for INNER joins).  Self INNER joins
+				 * are handled by the self-join branch below (one combined catalog
+				 * row, dual-role recompute).  Correct for
 				 * every aggregate in the matview; serialized on the
 				 * matview-level lock.  (Eligibility allows these only for
 				 * single-table or INNER JOIN, so this branch never sees a
@@ -6598,6 +6557,36 @@ incr_self_outer_supported_shape(Query *viewQuery)
 }
 
 /*
+ * incr_self_recompute_shape — true for a two-way self join (both RTEs the same
+ * relation) with GROUP BY that the self recompute builder can maintain for a
+ * recompute aggregate (DISTINCT / stddev / collect / FILTER / float): self INNER
+ * join (any plain-column keys), or self LEFT/RIGHT join meeting the single-side
+ * shape (incr_self_outer_supported_shape).  Used to widen the recompute-shape
+ * gate to self joins, which incr_recompute_outer_shape and
+ * incr_inner_join_deparse_shape both exclude.
+ */
+static bool
+incr_self_recompute_shape(Query *viewQuery)
+{
+	List	   *tabs;
+	Oid			shared;
+	ListCell   *lc;
+
+	if (viewQuery->groupClause == NIL)
+		return false;
+	tabs = incr_collect_tables(viewQuery);
+	if (list_length(tabs) != 2 || !incr_has_self_join(tabs))
+		return false;
+	shared = ((IncrJoinEntry *) linitial(tabs))->oid;
+	foreach(lc, tabs)
+		if (((IncrJoinEntry *) lfirst(lc))->oid != shared)
+			return false;
+	if (incr_has_outer_join(tabs))
+		return incr_self_outer_supported_shape(viewQuery);	/* single-side keys */
+	return true;										/* self INNER: any keys */
+}
+
+/*
  * incr_qual_get_colname_for_varno
  * Given a join qual (typically an equality OpExpr), return the source
  * column name for the Var belonging to the requested varno.
@@ -8025,7 +8014,13 @@ incr_is_recompute_only_func(const char *fname)
 			strcmp(fname, "stddev_pop") == 0 || strcmp(fname, "variance") == 0 ||
 			strcmp(fname, "var_samp") == 0 || strcmp(fname, "var_pop") == 0 ||
 			strcmp(fname, "bool_and") == 0 || strcmp(fname, "bool_or") == 0 ||
-			strcmp(fname, "every") == 0);
+			strcmp(fname, "every") == 0 ||
+			/* collect aggregates — no additive delta; recomputed verbatim.  The
+			 * unordered result's multiset matches a full REFRESH (element order
+			 * is unspecified, as SQL allows).  Ordered variants (aggorder) are
+			 * rejected by the recompute-shape gate. */
+			strcmp(fname, "string_agg") == 0 || strcmp(fname, "array_agg") == 0 ||
+			strcmp(fname, "json_agg") == 0 || strcmp(fname, "jsonb_agg") == 0);
 }
 
 /*
@@ -8045,9 +8040,23 @@ incr_needs_recompute(Query *viewQuery)
 	foreach(lc, viewQuery->targetList)
 	{
 		TargetEntry *te = lfirst_node(TargetEntry, lc);
+		Aggref	   *agg;
+		char	   *fname;
 
-		if (!te->resjunk && IsA(te->expr, Aggref) &&
-			incr_is_recompute_only_func(get_func_name(((Aggref *) te->expr)->aggfnoid)))
+		if (te->resjunk || !IsA(te->expr, Aggref))
+			continue;
+		agg = (Aggref *) te->expr;
+		fname = get_func_name(agg->aggfnoid);
+
+		/* recompute-only funcs (stddev/bool/collect), FILTERed aggregates, and
+		 * float SUM/AVG (recompute avoids running-total rounding drift) all use
+		 * the recompute engine rather than an additive delta. */
+		if (incr_is_recompute_only_func(fname))
+			return true;
+		if (agg->aggfilter != NULL)
+			return true;
+		if ((strcmp(fname, "sum") == 0 || strcmp(fname, "avg") == 0) &&
+			(agg->aggtype == FLOAT4OID || agg->aggtype == FLOAT8OID))
 			return true;
 	}
 	return false;

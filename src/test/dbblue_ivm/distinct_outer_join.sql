@@ -352,20 +352,33 @@ BEGIN
   ELSE RAISE NOTICE 'FULL 3-table still rejected: PASS'; END IF;
 
   DROP TABLE _tfa, _tfb, _tfc CASCADE;
-
-  -- Outer join + self-join: dedicated self-join path; not recompute-outer shape.
-  BEGIN
-    made := false;
-    CREATE TABLE _tsa(id int primary key, pid int, v int);
-    CREATE MATERIALIZED VIEW _tsamv WITH (incremental_refresh=true) AS
-      SELECT a.v, count(DISTINCT b.v) dv
-      FROM _tsa a LEFT JOIN _tsa b ON a.pid=b.id GROUP BY a.v;
-    made := true;
-  EXCEPTION WHEN feature_not_supported THEN NULL; END;
-  DROP TABLE IF EXISTS _tsa CASCADE;
-  IF made THEN RAISE EXCEPTION 'outer join + self-join: FAIL (accepted)';
-  ELSE RAISE NOTICE 'outer join + self-join still rejected: PASS'; END IF;
 END$$;
+
+-- 17. M2: DISTINCT over a self LEFT join (preserved-side key) is now SUPPORTED
+--     via the self recompute builder — assert acceptance + equality with REFRESH.
+DROP TABLE IF EXISTS sd_emp CASCADE;
+CREATE TABLE sd_emp(id int primary key, mgr int, v int);
+INSERT INTO sd_emp VALUES (1,NULL,10),(2,1,20),(3,1,20),(4,2,30);
+CREATE MATERIALIZED VIEW sd_i WITH (incremental_refresh=true) AS
+  SELECT e.v gk, count(DISTINCT m.v) dv, count(m.id) cm
+  FROM sd_emp e LEFT JOIN sd_emp m ON e.mgr=m.id GROUP BY e.v;
+CREATE MATERIALIZED VIEW sd_o AS
+  SELECT e.v gk, count(DISTINCT m.v) dv, count(m.id) cm
+  FROM sd_emp e LEFT JOIN sd_emp m ON e.mgr=m.id GROUP BY e.v;
+INSERT INTO sd_emp VALUES (5,3,40),(6,1,10);
+DELETE FROM sd_emp WHERE id=2;
+UPDATE sd_emp SET mgr=NULL WHERE id=3;   -- 3 orphaned → NULL manager group
+REFRESH MATERIALIZED VIEW sd_o;
+DO $$
+DECLARE d int;
+BEGIN
+  SELECT count(*) INTO d FROM (
+    (SELECT gk,dv,cm FROM sd_i EXCEPT SELECT gk,dv,cm FROM sd_o) UNION ALL
+    (SELECT gk,dv,cm FROM sd_o EXCEPT SELECT gk,dv,cm FROM sd_i)) z;
+  IF d=0 THEN RAISE NOTICE 'DISTINCT over self LEFT join (preserved key) == REFRESH: PASS';
+  ELSE RAISE EXCEPTION 'DISTINCT self-outer: FAIL (% rows differ)', d; END IF;
+END$$;
+DROP TABLE sd_emp CASCADE;
 
 -- 11. FULL OUTER JOIN, single-side GROUP BY a.k: NULL-group birth (delete the
 --     last match of a b-row → it orphans) and death (insert a match for the

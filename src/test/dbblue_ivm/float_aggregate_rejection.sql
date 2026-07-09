@@ -1,51 +1,57 @@
--- DBblue IVM — float SUM/AVG rejection.
+-- DBblue IVM — float SUM/AVG via recompute (M2).
 --
--- Incremental SUM/AVG maintain a running total by adding/subtracting deltas.
--- Floating-point addition is not associative, so a float running total drifts
--- from a true recompute over many deltas.  SUM/AVG over real/double precision
--- must therefore be rejected at CREATE time.  MIN/MAX (comparison only) and
--- COUNT over floats are fine, and numeric/integer SUM/AVG are exact.
-\set ON_ERROR_STOP off
+-- Additive SUM/AVG maintain a running total; floating-point addition is not
+-- associative, so a float running total would drift from a true recompute over
+-- many deltas.  Rather than reject, float SUM/AVG are now routed to the
+-- recompute engine (incr_needs_recompute), which recomputes each affected group
+-- from scratch — no accumulation, no drift, always == a full REFRESH.  MIN/MAX
+-- (comparison only) and COUNT over floats, and numeric/integer SUM/AVG, remain
+-- on the exact additive path.
+\set ON_ERROR_STOP on
 \echo ''
-\echo '=== DBblue IVM: float aggregate rejection ==='
+\echo '=== DBblue IVM: float aggregate via recompute ==='
 \echo ''
 
 DROP TABLE IF EXISTS fagg CASCADE;
-CREATE TABLE fagg(id serial, g int, r4 real, r8 double precision, n numeric, i int);
+CREATE TABLE fagg(id serial primary key, g int, r4 real, r8 double precision, n numeric, i int);
 INSERT INTO fagg(g,r4,r8,n,i) SELECT g%3, g*1.1, g*1.1, g*1.1, g FROM generate_series(1,30) g;
 
-\echo '--- must be REJECTED ---'
-CREATE MATERIALIZED VIEW f_reject1 WITH (incremental_refresh=true) AS
-  SELECT g, SUM(r4) FROM fagg GROUP BY g WITH DATA;
-CREATE MATERIALIZED VIEW f_reject2 WITH (incremental_refresh=true) AS
-  SELECT g, AVG(r8) FROM fagg GROUP BY g WITH DATA;
-CREATE MATERIALIZED VIEW f_reject3 WITH (incremental_refresh=true) AS
-  SELECT g, SUM(r8 * 2) FROM fagg GROUP BY g WITH DATA;   -- float expression
+CREATE MATERIALIZED VIEW f_i WITH (incremental_refresh=true) AS
+  SELECT g, sum(r4) s4, avg(r8) a8, sum(r8*2) se, min(r8) mn, max(r4) mx,
+         sum(n) sn, avg(i) ai, count(*) c
+  FROM fagg GROUP BY g;
+CREATE MATERIALIZED VIEW f_o AS
+  SELECT g, sum(r4) s4, avg(r8) a8, sum(r8*2) se, min(r8) mn, max(r4) mx,
+         sum(n) sn, avg(i) ai, count(*) c
+  FROM fagg GROUP BY g;
 
-\echo ''
-\echo '--- must be ALLOWED ---'
-\set ON_ERROR_STOP on
-CREATE MATERIALIZED VIEW f_ok_minmax WITH (incremental_refresh=true) AS
-  SELECT g, MIN(r8) mn, MAX(r4) mx, COUNT(*) c FROM fagg GROUP BY g WITH DATA;
-CREATE MATERIALIZED VIEW f_ok_numeric WITH (incremental_refresh=true) AS
-  SELECT g, SUM(n) s, AVG(n) a FROM fagg GROUP BY g WITH DATA;
-CREATE MATERIALIZED VIEW f_ok_int WITH (incremental_refresh=true) AS
-  SELECT g, SUM(i) s, AVG(i) a FROM fagg GROUP BY g WITH DATA;
+-- churn: inserts, deletes, updates that move rows between groups
+INSERT INTO fagg(g,r4,r8,n,i) VALUES (0,5.5,5.5,5.5,5),(1,9.9,9.9,9.9,9);
+DELETE FROM fagg WHERE id IN (3,6,9);
+UPDATE fagg SET g = (g+1)%3, r8 = r8 + 0.25 WHERE id IN (12,15,18);
+REFRESH MATERIALIZED VIEW f_o;
 
 DO $$
-DECLARE nrej int; nok int;
+DECLARE d int;
 BEGIN
-    SELECT count(*) INTO nrej FROM pg_class WHERE relname LIKE 'f\_reject%';
-    SELECT count(*) INTO nok  FROM pg_class WHERE relname LIKE 'f\_ok\_%';
-    IF nrej = 0 THEN RAISE NOTICE 'float SUM/AVG rejected: PASS (0 created)';
-    ELSE RAISE EXCEPTION 'float SUM/AVG rejected: FAIL (% slipped through)', nrej; END IF;
-    IF nok = 3 THEN RAISE NOTICE 'float MIN/MAX/COUNT + numeric/int SUM/AVG allowed: PASS';
-    ELSE RAISE EXCEPTION 'allowed-aggregate check: FAIL (% of 3 created)', nok; END IF;
+  -- float columns compared at 6-digit precision (recompute == refresh, both
+  -- single-pass aggregations over the same rows)
+  SELECT count(*) INTO d FROM (
+    (SELECT g, round(s4::numeric,6), round(a8::numeric,6), round(se::numeric,6),
+            round(mn::numeric,6), round(mx::numeric,6), sn, round(ai::numeric,6), c FROM f_i
+     EXCEPT
+     SELECT g, round(s4::numeric,6), round(a8::numeric,6), round(se::numeric,6),
+            round(mn::numeric,6), round(mx::numeric,6), sn, round(ai::numeric,6), c FROM f_o)
+    UNION ALL
+    (SELECT g, round(s4::numeric,6), round(a8::numeric,6), round(se::numeric,6),
+            round(mn::numeric,6), round(mx::numeric,6), sn, round(ai::numeric,6), c FROM f_o
+     EXCEPT
+     SELECT g, round(s4::numeric,6), round(a8::numeric,6), round(se::numeric,6),
+            round(mn::numeric,6), round(mx::numeric,6), sn, round(ai::numeric,6), c FROM f_i)) z;
+  IF d = 0 THEN RAISE NOTICE 'float SUM/AVG via recompute == REFRESH: PASS';
+  ELSE RAISE EXCEPTION 'float aggregate recompute: FAIL (% rows differ)', d; END IF;
 END $$;
 
-DROP MATERIALIZED VIEW f_ok_minmax;
-DROP MATERIALIZED VIEW f_ok_numeric;
-DROP MATERIALIZED VIEW f_ok_int;
 DROP TABLE fagg CASCADE;
 \echo ''
-\echo '=== float aggregate rejection test complete ==='
+\echo '=== float aggregate recompute test complete ==='
