@@ -46,10 +46,13 @@
 #include "access/stratnum.h"
 #include "access/sysattr.h"
 #include "access/tableam.h"
+#include "access/transam.h"
 #include "access/tupmacs.h"
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_aggregate_d.h"
 #include "catalog/pg_am_d.h"
+#include "catalog/pg_proc.h"
+#include "catalog/pg_type_d.h"
 #include "commands/defrem.h"
 #include "commands/explain.h"
 #include "commands/explain_format.h"
@@ -68,15 +71,23 @@
 #include "optimizer/tlist.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/value.h"
+#include "parser/parse_agg.h"
+#include "parser/parse_coerce.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
 #include "storage/predicate.h"
 #include "storage/shm_toc.h"
+#include "utils/acl.h"
 #include "utils/array.h"
+#include "utils/builtins.h"
 #include "utils/datum.h"
+#include "utils/expandeddatum.h"
 #include "utils/fmgroids.h"
+#include "utils/hsearch.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/selfuncs.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
@@ -1554,21 +1565,39 @@ dbbc_explain_scan(CustomScanState *node, List *ancestors, ExplainState *es)
 }
 
 /*-------------------------------------------------------------------------
- * Scalar aggregate pushdown (Milestone 2 step 4a)
+ * Aggregate pushdown (Milestone 2 step 4a: metadata; Milestone 5: grouped)
  *
- * At UPPERREL_GROUP_AGG, for a query of the exact shape
- *     SELECT count(*) [, count(col) ...] FROM t
- * (scalar - no GROUP BY, no HAVING, no WHERE, no DISTINCT/FILTER/ORDER in the
- * aggregate) over a single columnar-eligible heap relation, we add a custom
- * path that answers entirely from block metadata: a valid block contributes
- * block->nrows to COUNT(*) and block->nrows - chunk->null_count to COUNT(col),
- * with no value reads at all. Invalid / unbuilt / grown ranges are counted
- * from the heap with the query snapshot. Anything outside this shape adds no
- * path, so the normal Agg-over-columnar-scan plan runs unchanged.
+ * At UPPERREL_GROUP_AGG this node replaces the whole Agg-over-scan stack for
+ * two query shapes over a single columnar-eligible heap relation:
  *
- * Filters and SUM/MIN/MAX/AVG (transition functions + full qual evaluation)
- * are step 4b; this step is deliberately just counting, to prove the
- * upper-path plumbing with the smallest possible correctness surface.
+ * METADATA mode (M2s4a):
+ *     SELECT count(*) [, count(col), min(col), max(col) ...] FROM t
+ * (scalar - no GROUP BY, no HAVING, no WHERE): answered entirely from block
+ * metadata - a valid block contributes block->nrows to COUNT(*),
+ * nrows - null_count to COUNT(col), and its zone extrema to MIN/MAX, with no
+ * value reads at all.
+ *
+ * GROUPED mode (M5):
+ *     SELECT keys..., agg(col)... FROM t [WHERE extractable-quals]
+ *     [GROUP BY keys]
+ * computed with PostgreSQL's own aggregate transition/final functions,
+ * advanced directly over packed chunk values (no per-row slot emission, no
+ * parent Agg node). Group keys are hashed in a dynahash keyed on raw Datums,
+ * which is why keys are restricted to fixed-width by-value types whose bit
+ * equality IS SQL equality (floats excluded: -0.0 = +0.0, NaN). Because this
+ * node has NO ExecScan parent to recheck anything, the path is offered only
+ * when EVERY WHERE clause is extractable by the pre-filter machinery, and a
+ * block's chunks are used only if their build-time atttypid matches the
+ * column's current type (same staleness rule as zone-map skipping; mismatched
+ * or invalid blocks fall back to a range-limited heap scan with the query
+ * snapshot). Transition-call semantics mirror nodeAgg exactly: strict-transfn
+ * NULL-input skip, first-input state initialization for strict aggregates
+ * with a NULL initcond, and the pass-by-ref state copy/free dance; the
+ * fabricated AggState satisfies AggCheckCallContext(), which is the entire
+ * documented context ABI for plain transition functions (fmgr/README).
+ *
+ * Anything outside these shapes adds no path, so the normal
+ * Agg-over-columnar-scan plan runs unchanged.
  *-------------------------------------------------------------------------
  */
 
@@ -1604,29 +1633,123 @@ typedef struct DbbcAggItem
 	bool		has_result;
 } DbbcAggItem;
 
+/* ---- grouped mode (M5) ---- */
+
+/* group keys are hashed on raw Datum bits: bounded count, byval types only */
+#define DBBC_GRP_MAX_KEYS		4
+/* plan-time dNumGroups gate: the group hash has no spill path */
+#define DBBC_GRP_MAX_GROUPS		100000
+
+/* one aggregate computed by real transition functions */
+typedef struct DbbcAggTrans
+{
+	Aggref	   *aggref;			/* the planner's Aggref (AGGSPLIT_SIMPLE) */
+	AttrNumber	input_attno;	/* single Var argument, or Invalid (count(*)) */
+	int			numTransInputs; /* 0 for count(*), else 1 */
+	Oid			transtype;
+	int16		transtypeLen;
+	bool		transtypeByVal;
+	int16		resulttypeLen;
+	bool		resulttypeByVal;
+	Datum		initValue;		/* from pg_aggregate.agginitval */
+	bool		initValueIsNull;
+	FmgrInfo	transfn;
+	FmgrInfo	finalfn;		/* valid iff finalfn_oid is */
+	Oid			finalfn_oid;
+	int			numFinalArgs;
+	FunctionCallInfo trans_fcinfo;	/* context = the fabricated AggState */
+} DbbcAggTrans;
+
+/* per-group per-aggregate running state (mirrors AggStatePerGroupData) */
+typedef struct DbbcTransState
+{
+	Datum		transValue;
+	bool		transValueIsNull;
+	bool		noTransValue;	/* strict+NULL-initcond: awaiting first input */
+} DbbcTransState;
+
+/* dynahash key: raw group-key Datums; unused slots stay zeroed (memcmp key) */
+typedef struct DbbcGroupKey
+{
+	Datum		vals[DBBC_GRP_MAX_KEYS];
+	uint32		nullmask;		/* bit k set = key k IS NULL (val zeroed) */
+} DbbcGroupKey;
+
+typedef struct DbbcGroupEntry
+{
+	DbbcGroupKey key;			/* hash key: must be first */
+	DbbcTransState states[FLEXIBLE_ARRAY_MEMBER];	/* [ntrans] */
+} DbbcGroupEntry;
+
 /*
  * custom_private layout (all copyObject-safe Node lists):
- *   linitial : Integer holding the base relation OID (absolute; an RT index
- *              would be wrong - custom_private is opaque to setrefs, so it
- *              never receives the rtoffset applied to subquery/CTE/view
- *              range tables). Bit-preserved through int; read back with (Oid).
- *   lsecond  : List of {Integer kind, Integer attno} per output column
- *   lthird   : physical output tlist (List of TargetEntry)
+ *   [0] Integer holding the base relation OID (absolute; an RT index
+ *       would be wrong - custom_private is opaque to setrefs, so it
+ *       never receives the rtoffset applied to subquery/CTE/view
+ *       range tables). Bit-preserved through int; read back with (Oid).
+ *   [1] Integer mode: 0 = metadata (M2s4a), 1 = grouped (M5)
+ *   [2] payload:
+ *       metadata: List of list_make5(kind, attno, collation, opcintype,
+ *                 cmpproc) per output column
+ *       grouped : list_make5(key attnos       IntList,
+ *                            output map       IntList (>=0: key index,
+ *                                             <0: -(agg index)-1),
+ *                            aggrefs          List of Aggref,
+ *                            pushed quals     List of bare clause exprs,
+ *                            Integer qual varno (pre-setrefs, matches the
+ *                            Vars inside the quals - both live in
+ *                            custom_private, so both miss the rtoffset
+ *                            consistently))
+ *   [3] physical output tlist (List of TargetEntry)
  */
 #define DBBC_AGG_PRIV_RELOID(cp)	((Oid) intVal(linitial(cp)))
-#define DBBC_AGG_PRIV_ITEMS(cp)		((List *) lsecond(cp))
-#define DBBC_AGG_PRIV_TLIST(cp)		((List *) lthird(cp))
+#define DBBC_AGG_PRIV_MODE(cp)		((int) intVal(lsecond(cp)))
+#define DBBC_AGG_PRIV_PAYLOAD(cp)	((List *) lthird(cp))
+#define DBBC_AGG_PRIV_TLIST(cp)		((List *) lfourth(cp))
 
 typedef struct DbbcAggScanState
 {
 	CustomScanState css;
-	bool		executed;		/* emitted the single result row yet? */
+	bool		executed;		/* metadata: single row emitted?
+								 * grouped: input consumed, hash built? */
+	Relation	rel;
+	bool		rel_opened;
+
+	/* metadata mode */
 	int			naggs;
 	DbbcAggItem *aggs;
 	int64	   *counts;			/* per-agg accumulator (COUNT kinds) */
 	MemoryContext aggctx;		/* durable home for MIN/MAX result datums */
-	Relation	rel;
-	bool		rel_opened;
+
+	/* grouped mode */
+	bool		grouped;
+	int			nkeys;
+	AttrNumber	key_attnos[DBBC_GRP_MAX_KEYS];
+	int			ntrans;
+	DbbcAggTrans *trans;
+	Datum	   *in_vals;		/* per-trans current-row input */
+	bool	   *in_nulls;
+	int			noutcols;
+	int		   *outmap;			/* per output column: key idx or -(agg)-1 */
+	List	   *qual_clauses;	/* pushed quals (this node has no recheck) */
+	Index		qual_varno;
+	DbbcSkipQual *skipquals;	/* extracted from qual_clauses at Begin */
+	int			nskipquals;
+	int			nused;			/* distinct referenced columns... */
+	AttrNumber *used_attnos;
+	Oid		   *used_types;		/* ...and their CURRENT catalog types */
+	HTAB	   *groups;
+	MemoryContext groupctx;		/* group hash + transition states */
+	MemoryContext tmpctx;		/* per-row transfn call scratch */
+	AggState   *fake_aggstate;	/* satisfies AggCheckCallContext */
+	HASH_SEQ_STATUS seq;		/* emission cursor over the hash */
+	bool		seq_active;
+
+	/* grouped-mode instrumentation (EXPLAIN ANALYZE) */
+	int64		grp_blocks_served;
+	int64		grp_blocks_skipped;
+	int64		grp_ranges_heap;
+	int64		grp_rows;
 } DbbcAggScanState;
 
 /* pg_aggregate.aggsortop for aggfnoid, or InvalidOid (mirrors planagg.c) */
@@ -1775,6 +1898,215 @@ dbbc_agg_classify(Node *expr, Index relid, DbbcAggItem *item, List **needcols)
 	return false;
 }
 
+/*
+ * Group keys are hashed on their raw Datum bits, so only types whose bit
+ * equality IS SQL equality qualify. Floats are excluded on purpose: their
+ * comparison treats -0.0 = +0.0 and groups NaNs together, neither of which
+ * holds for bit equality.
+ */
+static bool
+dbbc_grp_key_type_ok(Oid typid)
+{
+	switch (typid)
+	{
+		case BOOLOID:
+		case CHAROID:
+		case INT2OID:
+		case INT4OID:
+		case INT8OID:
+		case OIDOID:
+		case DATEOID:
+		case TIMEOID:
+		case TIMESTAMPOID:
+		case TIMESTAMPTZOID:
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Is this Aggref computable by our transition-function machinery? Builtin
+ * (trusted to use only AggCheckCallContext - the ordered-set family, the one
+ * exception, is excluded by aggkind), plain, unsplit, and its argument (if
+ * any) a bare Var of this relation. The strict-transfn/NULL-initcond
+ * binary-coercibility rule is checked here so the path is simply not offered
+ * for an aggregate the executor setup would reject.
+ */
+static bool
+dbbc_agg_trans_ok(Aggref *agg, Index relid, List **needcols)
+{
+	HeapTuple	aggTuple;
+	Form_pg_aggregate aggform;
+	bool		initValueIsNull;
+	bool		ok = true;
+	Var		   *var = NULL;
+
+	if (agg->aggdistinct != NIL || agg->aggfilter != NULL ||
+		agg->aggorder != NIL || agg->aggkind != AGGKIND_NORMAL ||
+		agg->aggsplit != AGGSPLIT_SIMPLE)
+		return false;
+	if (agg->aggfnoid >= FirstNormalObjectId)
+		return false;			/* builtin aggregates only */
+	if (!OidIsValid(agg->aggtranstype))
+		return false;
+
+	if (list_length(agg->args) == 1)
+	{
+		Node	   *arg = (Node *) ((TargetEntry *) linitial(agg->args))->expr;
+
+		while (IsA(arg, RelabelType))
+			arg = (Node *) ((RelabelType *) arg)->arg;
+		if (!IsA(arg, Var))
+			return false;
+		var = (Var *) arg;
+		if (var->varno != relid || var->varlevelsup != 0 || var->varattno <= 0)
+			return false;
+	}
+	else if (!(agg->args == NIL && agg->aggstar))
+		return false;			/* count(*) is the only 0-arg shape */
+
+	aggTuple = SearchSysCache1(AGGFNOID, ObjectIdGetDatum(agg->aggfnoid));
+	if (!HeapTupleIsValid(aggTuple))
+		return false;
+	aggform = (Form_pg_aggregate) GETSTRUCT(aggTuple);
+	(void) SysCacheGetAttr(AGGFNOID, aggTuple, Anum_pg_aggregate_agginitval,
+						   &initValueIsNull);
+	if (func_strict(aggform->aggtransfn) && initValueIsNull)
+	{
+		Oid			inputTypes[FUNC_MAX_ARGS];
+		int			numArgs = get_aggregate_argtypes(agg, inputTypes);
+
+		if (numArgs < 1 ||
+			!IsBinaryCoercible(inputTypes[0], agg->aggtranstype))
+			ok = false;
+	}
+	ReleaseSysCache(aggTuple);
+	if (!ok)
+		return false;
+
+	if (var != NULL)
+		*needcols = list_append_unique_int(*needcols, var->varattno);
+	return true;
+}
+
+/*
+ * Classify the whole query for grouped pushdown. Fills the path payload
+ * pieces and the needed-column list; returns false (offer no path) on the
+ * first unsupported construct.
+ */
+static bool
+dbbc_agg_grouped_classify(PlannerInfo *root, RelOptInfo *input_rel,
+						  RelOptInfo *output_rel, Index relid,
+						  List **keyattnos_out, List **outmap_out,
+						  List **aggrefs_out, List **quals_out,
+						  List **needcols, double *ngroups_out)
+{
+	List	   *keyattnos = NIL;
+	List	   *keyexprs = NIL;
+	List	   *outmap = NIL;
+	List	   *aggrefs = NIL;
+	List	   *quals = NIL;
+	ListCell   *lc;
+
+	/*
+	 * Every WHERE clause must be evaluable by the pre-filter machinery: this
+	 * node replaces the scan AND the Agg, so there is no ExecScan above it to
+	 * re-check anything.
+	 */
+	foreach(lc, input_rel->baserestrictinfo)
+	{
+		RestrictInfo *ri = lfirst_node(RestrictInfo, lc);
+		DbbcSkipQual probe;
+
+		if (!dbbc_extract_one_qual((Node *) ri->clause, relid, &probe))
+			return false;
+		quals = lappend(quals, ri->clause);
+		*needcols = list_append_unique_int(*needcols, probe.attno);
+	}
+
+	/* group keys: bare Vars of bit-equality-safe by-value types */
+	foreach(lc, root->processed_groupClause)
+	{
+		SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+		Node	   *expr = get_sortgroupclause_expr(sgc,
+													root->parse->targetList);
+		Var		   *var;
+
+		if (!IsA(expr, Var))
+			return false;
+		var = (Var *) expr;
+		if (var->varno != relid || var->varlevelsup != 0 || var->varattno <= 0)
+			return false;
+		if (!dbbc_grp_key_type_ok(var->vartype))
+			return false;
+		if (!list_member_int(keyattnos, var->varattno))
+		{
+			if (list_length(keyattnos) >= DBBC_GRP_MAX_KEYS)
+				return false;
+			keyattnos = lappend_int(keyattnos, var->varattno);
+			keyexprs = lappend(keyexprs, var);
+		}
+		*needcols = list_append_unique_int(*needcols, var->varattno);
+	}
+
+	/* every output expr: a group-key Var, or a supported bare Aggref */
+	foreach(lc, output_rel->reltarget->exprs)
+	{
+		Node	   *expr = (Node *) lfirst(lc);
+
+		if (IsA(expr, Var))
+		{
+			Var		   *var = (Var *) expr;
+			int			k = 0;
+			bool		found = false;
+			ListCell   *lk;
+
+			if (var->varno != relid || var->varlevelsup != 0)
+				return false;
+			foreach(lk, keyattnos)
+			{
+				if ((AttrNumber) lfirst_int(lk) == var->varattno)
+				{
+					found = true;
+					break;
+				}
+				k++;
+			}
+			if (!found)
+				return false;	/* not a group key (e.g. FD on a PK) */
+			outmap = lappend_int(outmap, k);
+		}
+		else if (IsA(expr, Aggref))
+		{
+			if (!dbbc_agg_trans_ok((Aggref *) expr, relid, needcols))
+				return false;
+			outmap = lappend_int(outmap, -(list_length(aggrefs)) - 1);
+			aggrefs = lappend(aggrefs, expr);
+		}
+		else
+			return false;
+	}
+	if (outmap == NIL)
+		return false;
+
+	/* bounded group count: the group hash has no spill path */
+	if (keyexprs == NIL)
+		*ngroups_out = 1.0;
+	else
+	{
+		*ngroups_out = estimate_num_groups(root, keyexprs,
+										   input_rel->rows, NULL, NULL);
+		if (*ngroups_out > (double) DBBC_GRP_MAX_GROUPS)
+			return false;
+	}
+
+	*keyattnos_out = keyattnos;
+	*outmap_out = outmap;
+	*aggrefs_out = aggrefs;
+	*quals_out = quals;
+	return true;
+}
+
 static void
 dbbc_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 						RelOptInfo *input_rel, RelOptInfo *output_rel,
@@ -1793,6 +2125,12 @@ dbbc_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	CustomPath *cpath;
 	int16	   *reg;
 	bool		ok = true;
+	bool		grouped;
+	List	   *keyattnos = NIL;
+	List	   *outmap = NIL;
+	List	   *aggrefs = NIL;
+	List	   *quals = NIL;
+	double		ngroups = 1.0;
 
 	if (prev_create_upper_paths_hook)
 		prev_create_upper_paths_hook(root, stage, input_rel, output_rel, extra);
@@ -1802,14 +2140,11 @@ dbbc_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	if (!dbblue_columnar_enabled || !dbblue_columnar_enable_columnar_scan)
 		return;
 
-	/* scalar aggregation only: no GROUP BY, no grouping sets, no HAVING */
-	if (parse->groupClause != NIL || parse->groupingSets != NIL ||
-		!parse->hasAggs || parse->havingQual != NULL ||
+	/* no grouping sets, no HAVING (the planner may have moved it to gextra) */
+	if (parse->groupingSets != NIL || parse->havingQual != NULL ||
 		(gextra != NULL && gextra->havingQual != NULL))
 		return;
-
-	/* 4a: no WHERE - counting with filters is step 4b */
-	if (input_rel->baserestrictinfo != NIL)
+	if (!parse->hasAggs && parse->groupClause == NIL)
 		return;
 
 	/* single plain heap base relation */
@@ -1835,21 +2170,43 @@ dbbc_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	if (get_rel_relam(rte->relid) != HEAP_TABLE_AM_OID)
 		return;
 
-	/* every aggregated-target expr must be a bare COUNT(*) / COUNT(col) */
-	foreach(lc, output_rel->reltarget->exprs)
+	/*
+	 * Prefer the metadata mode when it applies (scalar, no WHERE, all
+	 * COUNT/MIN/MAX: pure block metadata, no value reads); otherwise try the
+	 * grouped transition-pushdown mode.
+	 */
+	grouped = (parse->groupClause != NIL ||
+			   input_rel->baserestrictinfo != NIL);
+	if (!grouped)
 	{
-		DbbcAggItem item;
+		foreach(lc, output_rel->reltarget->exprs)
+		{
+			DbbcAggItem item;
 
-		if (!dbbc_agg_classify((Node *) lfirst(lc), relid, &item, &needcols))
+			if (!dbbc_agg_classify((Node *) lfirst(lc), relid, &item,
+								   &needcols))
+			{
+				items = NIL;
+				grouped = true; /* e.g. sum()/avg(): needs transition fns */
+				break;
+			}
+			items = lappend(items, list_make5(makeInteger((int) item.kind),
+											  makeInteger((int) item.attno),
+											  makeInteger((int) item.collation),
+											  makeInteger((int) item.opcintype),
+											  makeInteger((int) item.cmpproc)));
+		}
+		if (!grouped && items == NIL)
 			return;
-		items = lappend(items, list_make5(makeInteger((int) item.kind),
-										  makeInteger((int) item.attno),
-										  makeInteger((int) item.collation),
-										  makeInteger((int) item.opcintype),
-										  makeInteger((int) item.cmpproc)));
 	}
-	if (items == NIL)
-		return;
+	if (grouped)
+	{
+		needcols = NIL;			/* a failed metadata walk may have added some */
+		if (!dbbc_agg_grouped_classify(root, input_rel, output_rel, relid,
+									   &keyattnos, &outmap, &aggrefs, &quals,
+									   &needcols, &ngroups))
+			return;
+	}
 
 	/*
 	 * A populated version must cover every counted column. Tracked pin:
@@ -1899,21 +2256,52 @@ dbbc_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	cpath->path.parallel_aware = false;
 	cpath->path.parallel_safe = false;
 	cpath->path.parallel_workers = 0;
-	cpath->path.rows = 1;
+	cpath->path.rows = grouped ? clamp_row_est(ngroups) : 1;
 	cpath->path.pathkeys = NIL;
 	cpath->flags = 0;
 	cpath->custom_paths = NIL;
 	/* store the absolute relation OID (not the RT index; see macro comment) */
-	cpath->custom_private = list_make3(makeInteger((int) rte->relid),
-									   items, tlist);
+	cpath->custom_private =
+		list_make4(makeInteger((int) rte->relid),
+				   makeInteger(grouped ? 1 : 0),
+				   grouped ? list_make5(keyattnos, outmap, aggrefs, quals,
+										makeInteger((int) relid))
+				   : items,
+				   tlist);
 	cpath->methods = &dbbc_agg_path_methods;
 
-	/*
-	 * Metadata-only: near-zero cost so it wins for count() over a populated
-	 * relation (the normal Agg-over-scan path remains as the fallback).
-	 */
-	cpath->path.startup_cost = 0.0;
-	cpath->path.total_cost = 1.0 + cpu_operator_cost * base_rel->pages;
+	if (grouped)
+	{
+		/*
+		 * Grouped: real per-row work. Full I/O (the fallback bound), per-page
+		 * validity checks, then per-surviving-row qual + transition calls,
+		 * and one output tuple per group. Cheaper than Agg-over-scan mainly
+		 * by the absent per-row slot emission (cpu_tuple_cost), which is the
+		 * honest advantage.
+		 */
+		double		input_rows = clamp_row_est(base_rel->rows);
+		double		skip_frac = 0.0;
+		Cost		run;
+
+		if (quals != NIL)
+			skip_frac = dbbc_estimate_skip_fraction(rte->relid, quals, relid);
+		run = seq_page_cost * base_rel->pages
+			+ cpu_operator_cost * base_rel->pages
+			+ (1.0 - skip_frac) * input_rows * cpu_operator_cost *
+			(list_length(quals) + list_length(aggrefs) + 1);
+		cpath->path.startup_cost = run;
+		cpath->path.total_cost = run + cpu_tuple_cost * clamp_row_est(ngroups);
+	}
+	else
+	{
+		/*
+		 * Metadata-only: near-zero cost so it wins for count() over a
+		 * populated relation (the normal Agg-over-scan path remains as the
+		 * fallback).
+		 */
+		cpath->path.startup_cost = 0.0;
+		cpath->path.total_cost = 1.0 + cpu_operator_cost * base_rel->pages;
+	}
 	cpath->path.disabled_nodes = 0;
 
 	add_path(output_rel, (Path *) cpath);
@@ -1925,7 +2313,7 @@ dbbc_agg_plan_custom_path(PlannerInfo *root, RelOptInfo *rel,
 						  List *clauses, List *custom_plans)
 {
 	CustomScan *cscan = makeNode(CustomScan);
-	List	   *phys_tlist = (List *) lthird(best_path->custom_private);
+	List	   *phys_tlist = DBBC_AGG_PRIV_TLIST(best_path->custom_private);
 
 	cscan->scan.plan.targetlist = tlist;
 	cscan->scan.plan.qual = NIL;
@@ -1948,16 +2336,259 @@ dbbc_agg_create_scan_state(CustomScan *cscan)
 	return (Node *) as;
 }
 
+/*
+ * Grouped-mode executor setup: parse the payload, fabricate the AggState,
+ * and mirror ExecInitAgg's per-aggregate catalog setup (transition/final
+ * FmgrInfos, initcond, ACL checks). The relation is already open (caller).
+ */
+static void
+dbbc_grp_begin(DbbcAggScanState *as, List *payload, EState *estate, int eflags)
+{
+	List	   *keyattnos = (List *) linitial(payload);
+	List	   *outmap = (List *) lsecond(payload);
+	List	   *aggrefs = (List *) lthird(payload);
+	ListCell   *lc;
+	int			i;
+	ExprContext *fakeecxt;
+
+	as->grouped = true;
+	as->qual_clauses = (List *) lfourth(payload);
+	as->qual_varno = (Index) intVal(list_nth(payload, 4));
+
+	as->nkeys = list_length(keyattnos);
+	Assert(as->nkeys <= DBBC_GRP_MAX_KEYS);
+	i = 0;
+	foreach(lc, keyattnos)
+		as->key_attnos[i++] = (AttrNumber) lfirst_int(lc);
+
+	as->noutcols = list_length(outmap);
+	as->outmap = (int *) palloc(as->noutcols * sizeof(int));
+	i = 0;
+	foreach(lc, outmap)
+		as->outmap[i++] = lfirst_int(lc);
+
+	as->ntrans = list_length(aggrefs);
+	as->trans = (DbbcAggTrans *) palloc0(Max(as->ntrans, 1) *
+										 sizeof(DbbcAggTrans));
+	as->in_vals = (Datum *) palloc0(Max(as->ntrans, 1) * sizeof(Datum));
+	as->in_nulls = (bool *) palloc0(Max(as->ntrans, 1) * sizeof(bool));
+
+	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
+		return;
+
+	as->groupctx = AllocSetContextCreate(CurrentMemoryContext,
+										 "dbblue_columnar group states",
+										 ALLOCSET_DEFAULT_SIZES);
+	as->tmpctx = AllocSetContextCreate(CurrentMemoryContext,
+									   "dbblue_columnar agg transition",
+									   ALLOCSET_SMALL_SIZES);
+
+	/*
+	 * Fabricated AggState: plain transition/final functions reach their
+	 * state memory exclusively through AggCheckCallContext(), which reads
+	 * only context->curaggcontext->ecxt_per_tuple_memory (the documented
+	 * contract in src/backend/utils/fmgr/README). Point that at the
+	 * per-group state context; everything else stays zeroed.
+	 */
+	as->fake_aggstate = makeNode(AggState);
+	fakeecxt = makeNode(ExprContext);
+	fakeecxt->ecxt_per_tuple_memory = as->groupctx;
+	as->fake_aggstate->curaggcontext = fakeecxt;
+
+	/* per-aggregate catalog setup, mirroring ExecInitAgg */
+	i = 0;
+	foreach(lc, aggrefs)
+	{
+		Aggref	   *aggref = lfirst_node(Aggref, lc);
+		DbbcAggTrans *t = &as->trans[i++];
+		HeapTuple	aggTuple;
+		HeapTuple	procTuple;
+		Form_pg_aggregate aggform;
+		Oid			transfn_oid;
+		Oid			aggOwner;
+		Datum		textInitVal;
+		Oid			inputTypes[FUNC_MAX_ARGS];
+		int			numArgs;
+		Expr	   *transfnexpr = NULL;
+		Expr	   *finalfnexpr = NULL;
+		AclResult	aclresult;
+
+		t->aggref = aggref;
+		t->input_attno = InvalidAttrNumber;
+		t->numTransInputs = 0;
+		if (list_length(aggref->args) == 1)
+		{
+			Node	   *arg = (Node *)
+				((TargetEntry *) linitial(aggref->args))->expr;
+
+			while (IsA(arg, RelabelType))
+				arg = (Node *) ((RelabelType *) arg)->arg;
+			t->input_attno = ((Var *) arg)->varattno;
+			t->numTransInputs = 1;
+		}
+
+		/* the aggregate as the calling user, its fns as the owner */
+		aclresult = object_aclcheck(ProcedureRelationId, aggref->aggfnoid,
+									GetUserId(), ACL_EXECUTE);
+		if (aclresult != ACLCHECK_OK)
+			aclcheck_error(aclresult, OBJECT_AGGREGATE,
+						   get_func_name(aggref->aggfnoid));
+
+		aggTuple = SearchSysCache1(AGGFNOID,
+								   ObjectIdGetDatum(aggref->aggfnoid));
+		if (!HeapTupleIsValid(aggTuple))
+			elog(ERROR, "cache lookup failed for aggregate %u",
+				 aggref->aggfnoid);
+		aggform = (Form_pg_aggregate) GETSTRUCT(aggTuple);
+		transfn_oid = aggform->aggtransfn;
+		t->finalfn_oid = aggform->aggfinalfn;
+
+		procTuple = SearchSysCache1(PROCOID,
+									ObjectIdGetDatum(aggref->aggfnoid));
+		if (!HeapTupleIsValid(procTuple))
+			elog(ERROR, "cache lookup failed for function %u",
+				 aggref->aggfnoid);
+		aggOwner = ((Form_pg_proc) GETSTRUCT(procTuple))->proowner;
+		ReleaseSysCache(procTuple);
+
+		aclresult = object_aclcheck(ProcedureRelationId, transfn_oid,
+									aggOwner, ACL_EXECUTE);
+		if (aclresult != ACLCHECK_OK)
+			aclcheck_error(aclresult, OBJECT_FUNCTION,
+						   get_func_name(transfn_oid));
+		if (OidIsValid(t->finalfn_oid))
+		{
+			aclresult = object_aclcheck(ProcedureRelationId, t->finalfn_oid,
+										aggOwner, ACL_EXECUTE);
+			if (aclresult != ACLCHECK_OK)
+				aclcheck_error(aclresult, OBJECT_FUNCTION,
+							   get_func_name(t->finalfn_oid));
+		}
+
+		numArgs = get_aggregate_argtypes(aggref, inputTypes);
+		t->transtype = aggref->aggtranstype;
+		get_typlenbyval(t->transtype, &t->transtypeLen, &t->transtypeByVal);
+		get_typlenbyval(aggref->aggtype, &t->resulttypeLen,
+						&t->resulttypeByVal);
+
+		textInitVal = SysCacheGetAttr(AGGFNOID, aggTuple,
+									  Anum_pg_aggregate_agginitval,
+									  &t->initValueIsNull);
+		if (t->initValueIsNull)
+			t->initValue = (Datum) 0;
+		else
+		{
+			Oid			typinput;
+			Oid			typioparam;
+			char	   *strInitVal;
+
+			getTypeInputInfo(t->transtype, &typinput, &typioparam);
+			strInitVal = TextDatumGetCString(textInitVal);
+			t->initValue = OidInputFunctionCall(typinput, strInitVal,
+												typioparam, -1);
+			pfree(strInitVal);
+		}
+
+		build_aggregate_transfn_expr(inputTypes, numArgs, 0,
+									 aggref->aggvariadic,
+									 t->transtype, aggref->inputcollid,
+									 transfn_oid, InvalidOid,
+									 &transfnexpr, NULL);
+		fmgr_info(transfn_oid, &t->transfn);
+		fmgr_info_set_expr((Node *) transfnexpr, &t->transfn);
+		t->trans_fcinfo = (FunctionCallInfo)
+			palloc0(SizeForFunctionCallInfo(t->numTransInputs + 1));
+		InitFunctionCallInfoData(*t->trans_fcinfo, &t->transfn,
+								 t->numTransInputs + 1, aggref->inputcollid,
+								 (Node *) as->fake_aggstate, NULL);
+
+		/* nodeAgg's strict-transfn/NULL-initcond compatibility rule */
+		if (t->transfn.fn_strict && t->initValueIsNull &&
+			(t->numTransInputs < 1 ||
+			 !IsBinaryCoercible(inputTypes[0], t->transtype)))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
+					 errmsg("aggregate %u needs to have compatible input type and transition type",
+							aggref->aggfnoid)));
+
+		if (OidIsValid(t->finalfn_oid))
+		{
+			t->numFinalArgs = aggform->aggfinalextra ? numArgs + 1 : 1;
+			build_aggregate_finalfn_expr(inputTypes, t->numFinalArgs,
+										 t->transtype, aggref->aggtype,
+										 aggref->inputcollid,
+										 t->finalfn_oid, &finalfnexpr);
+			fmgr_info(t->finalfn_oid, &t->finalfn);
+			fmgr_info_set_expr((Node *) finalfnexpr, &t->finalfn);
+		}
+		ReleaseSysCache(aggTuple);
+	}
+
+	/* re-extract the pushed quals for our own per-row tests */
+	if (as->qual_clauses != NIL)
+		as->nskipquals = dbbc_extract_skip_quals(as->qual_clauses,
+												 as->qual_varno,
+												 &as->skipquals);
+
+	/*
+	 * Distinct referenced columns and their CURRENT catalog types: a block's
+	 * chunk is used only if built under the same atttypid (the same
+	 * staleness rule as zone-map skipping; a no-rewrite ALTER COLUMN TYPE
+	 * leaves page LSNs unchanged, so the LSN proof alone cannot catch it).
+	 */
+	{
+		List	   *used = NIL;
+		int			k;
+		int			a;
+		int			u;
+
+		for (k = 0; k < as->nkeys; k++)
+			used = list_append_unique_int(used, as->key_attnos[k]);
+		for (a = 0; a < as->ntrans; a++)
+			if (as->trans[a].numTransInputs == 1)
+				used = list_append_unique_int(used, as->trans[a].input_attno);
+		for (a = 0; a < as->nskipquals; a++)
+			used = list_append_unique_int(used, as->skipquals[a].attno);
+
+		as->nused = list_length(used);
+		as->used_attnos = (AttrNumber *)
+			palloc(Max(as->nused, 1) * sizeof(AttrNumber));
+		as->used_types = (Oid *) palloc(Max(as->nused, 1) * sizeof(Oid));
+		u = 0;
+		foreach(lc, used)
+		{
+			AttrNumber	attno = (AttrNumber) lfirst_int(lc);
+
+			as->used_attnos[u] = attno;
+			as->used_types[u] =
+				TupleDescAttr(RelationGetDescr(as->rel), attno - 1)->atttypid;
+			u++;
+		}
+	}
+}
+
 static void
 dbbc_agg_begin(CustomScanState *node, EState *estate, int eflags)
 {
 	DbbcAggScanState *as = (DbbcAggScanState *) node;
 	CustomScan *cscan = castNode(CustomScan, node->ss.ps.plan);
 	List	   *cp = cscan->custom_private;
-	List	   *items = DBBC_AGG_PRIV_ITEMS(cp);
+	List	   *items = DBBC_AGG_PRIV_PAYLOAD(cp);
 	Oid			reloid = DBBC_AGG_PRIV_RELOID(cp);
 	ListCell   *lc;
 	int			i;
+
+	if (DBBC_AGG_PRIV_MODE(cp) == 1)
+	{
+		/* grouped mode; the executor holds the range-table lock already */
+		if (!(eflags & EXEC_FLAG_EXPLAIN_ONLY))
+		{
+			as->rel = table_open(reloid, NoLock);
+			as->rel_opened = true;
+		}
+		dbbc_grp_begin(as, items, estate, eflags);
+		return;
+	}
 
 	as->naggs = list_length(items);
 	as->aggs = (DbbcAggItem *) palloc0(as->naggs * sizeof(DbbcAggItem));
@@ -2115,6 +2746,512 @@ dbbc_agg_block_metadata_ok(DbbcAggScanState *as, DbbcColumnChunk *chunks,
 	return true;
 }
 
+/* ---------------- grouped mode (M5) executor ---------------- */
+
+/* evaluate one extracted qual against a fetched value (both row sources) */
+static bool
+dbbc_skipqual_test(DbbcSkipQual *q, Datum value, bool isnull)
+{
+	if (q->kind == DBBC_SKIP_NULLTEST)
+		return isnull == q->nulltest_isnull;
+	if (isnull)
+		return false;			/* strict operators never pass NULL */
+	if (q->kind == DBBC_SKIP_OP)
+	{
+		int32		r = dbbc_skip_cmp(q, value, q->value);
+
+		switch (q->strategy)
+		{
+			case BTLessStrategyNumber:
+				return r < 0;
+			case BTLessEqualStrategyNumber:
+				return r <= 0;
+			case BTEqualStrategyNumber:
+				return r == 0;
+			case BTGreaterEqualStrategyNumber:
+				return r >= 0;
+			case BTGreaterStrategyNumber:
+				return r > 0;
+		}
+		return false;
+	}
+	else						/* DBBC_SKIP_SAOP_EQ */
+	{
+		int			e;
+
+		for (e = 0; e < q->nelems; e++)
+			if (dbbc_skip_cmp(q, value, q->elems[e]) == 0)
+				return true;
+		return false;
+	}
+}
+
+/* find-or-create the group for the current row's key values */
+static DbbcGroupEntry *
+dbbc_grp_lookup(DbbcAggScanState *as, Datum *keyvals, bool *keynulls)
+{
+	DbbcGroupKey key;
+	DbbcGroupEntry *entry;
+	bool		found;
+	int			k;
+	int			a;
+
+	memset(&key, 0, sizeof(key));
+	for (k = 0; k < as->nkeys; k++)
+	{
+		if (keynulls[k])
+			key.nullmask |= ((uint32) 1) << k;
+		else
+			key.vals[k] = keyvals[k];
+	}
+	entry = (DbbcGroupEntry *) hash_search(as->groups, &key,
+										   HASH_ENTER, &found);
+	if (!found)
+	{
+		/* initialize per-agg states, mirroring initialize_aggregate */
+		for (a = 0; a < as->ntrans; a++)
+		{
+			DbbcAggTrans *t = &as->trans[a];
+			DbbcTransState *st = &entry->states[a];
+
+			if (t->initValueIsNull)
+				st->transValue = (Datum) 0;
+			else if (t->transtypeByVal)
+				st->transValue = t->initValue;
+			else
+			{
+				/* byref initcond: each group needs its own freeable copy */
+				MemoryContext old = MemoryContextSwitchTo(as->groupctx);
+
+				st->transValue = datumCopy(t->initValue, false,
+										   t->transtypeLen);
+				MemoryContextSwitchTo(old);
+			}
+			st->transValueIsNull = t->initValueIsNull;
+			st->noTransValue = t->initValueIsNull;
+		}
+	}
+	return entry;
+}
+
+/*
+ * Advance every aggregate's transition state for the current row (inputs in
+ * as->in_vals/in_nulls). Mirrors the EEOP_AGG_PLAIN_TRANS* interpreter steps:
+ * strict transfns skip NULL inputs and NULL states; strict aggregates with a
+ * NULL initcond adopt the first non-NULL input as their state (min/max); a
+ * pass-by-ref transfn result that differs from the old state is copied into
+ * the group context and the old state freed. internal-transtype aggregates
+ * (avg/sum over numeric or bigint) report as by-value pointers here and
+ * manage their own state memory via AggCheckCallContext -> groupctx.
+ */
+static void
+dbbc_grp_advance(DbbcAggScanState *as, DbbcGroupEntry *grp)
+{
+	int			a;
+
+	for (a = 0; a < as->ntrans; a++)
+	{
+		DbbcAggTrans *t = &as->trans[a];
+		DbbcTransState *st = &grp->states[a];
+		FunctionCallInfo fcinfo = t->trans_fcinfo;
+		MemoryContext oldctx;
+		Datum		newVal;
+
+		if (t->numTransInputs == 1)
+		{
+			if (t->transfn.fn_strict)
+			{
+				if (as->in_nulls[a])
+					continue;	/* strict transfn skips NULL inputs */
+				if (st->noTransValue)
+				{
+					/*
+					 * First non-NULL input becomes the state, copied into
+					 * the group context (ExecAggInitGroup; the input type is
+					 * binary-coercible to the transtype, checked at Begin).
+					 */
+					oldctx = MemoryContextSwitchTo(as->groupctx);
+					st->transValue = datumCopy(as->in_vals[a],
+											   t->transtypeByVal,
+											   t->transtypeLen);
+					MemoryContextSwitchTo(oldctx);
+					st->transValueIsNull = false;
+					st->noTransValue = false;
+					continue;
+				}
+			}
+			fcinfo->args[1].value = as->in_vals[a];
+			fcinfo->args[1].isnull = as->in_nulls[a];
+		}
+
+		/* a strict transfn is never called with a NULL state */
+		if (t->transfn.fn_strict && st->transValueIsNull)
+			continue;
+
+		oldctx = MemoryContextSwitchTo(as->tmpctx);
+		fcinfo->args[0].value = st->transValue;
+		fcinfo->args[0].isnull = st->transValueIsNull;
+		fcinfo->isnull = false; /* just in case the transfn doesn't set it */
+		newVal = FunctionCallInvoke(fcinfo);
+
+		/*
+		 * Pass-by-ref state: if the transfn returned a new datum, copy it
+		 * into the group context and free the old one (mirrors
+		 * ExecAggPlainTransByRef / ExecAggCopyTransValue; datumCopy flattens
+		 * expanded datums, and builtin plain aggregates never hand back a
+		 * R/W expanded object).
+		 */
+		if (!t->transtypeByVal &&
+			DatumGetPointer(newVal) != DatumGetPointer(st->transValue))
+		{
+			if (!fcinfo->isnull)
+			{
+				MemoryContextSwitchTo(as->groupctx);
+				newVal = datumCopy(newVal, false, t->transtypeLen);
+			}
+			else
+				newVal = (Datum) 0;
+			if (!st->transValueIsNull)
+				pfree(DatumGetPointer(st->transValue));
+		}
+		st->transValue = newVal;
+		st->transValueIsNull = fcinfo->isnull;
+		MemoryContextSwitchTo(oldctx);
+	}
+}
+
+/* may this valid block's chunks feed keys/inputs/quals? (type identity) */
+static bool
+dbbc_grp_chunks_usable(DbbcAggScanState *as, DbbcScanState *s,
+					   DbbcColumnChunk *chunks)
+{
+	int			u;
+
+	for (u = 0; u < as->nused; u++)
+	{
+		int			c = s->attno_to_col[as->used_attnos[u] - 1];
+
+		if (c < 0 || chunks[c].atttypid != as->used_types[u])
+			return false;
+	}
+	return true;
+}
+
+/* aggregate every qualifying row of one servable columnar block */
+static void
+dbbc_grp_consume_block(DbbcAggScanState *as, DbbcScanState *s,
+					   DbbcBlock *block, DbbcColumnChunk *chunks)
+{
+	uint32		row;
+	int			c;
+
+	s->cur_block = block;
+	s->cur_chunks = chunks;
+	for (c = 0; c < s->ncols; c++)
+	{
+		DbbcColumnChunk *chunk = &s->cur_chunks[c];
+
+		s->col_ptrs[c].values = (uint8 *)
+			dsa_get_address(s->dsa, chunk->values);
+		s->col_ptrs[c].blob =
+			DsaPointerIsValid(chunk->varblob) ? (uint8 *)
+			dsa_get_address(s->dsa, chunk->varblob) : NULL;
+		s->col_ptrs[c].nulls =
+			DsaPointerIsValid(chunk->nulls) ? (uint8 *)
+			dsa_get_address(s->dsa, chunk->nulls) : NULL;
+	}
+
+	for (row = 0; row < block->nrows; row++)
+	{
+		Datum		keyvals[DBBC_GRP_MAX_KEYS];
+		bool		keynulls[DBBC_GRP_MAX_KEYS];
+		bool		pass = true;
+		int			i;
+		int			k;
+		int			a;
+
+		CHECK_FOR_INTERRUPTS();
+
+		for (i = 0; i < as->nskipquals; i++)
+		{
+			DbbcSkipQual *q = &as->skipquals[i];
+			int			qc = s->attno_to_col[q->attno - 1];
+			bool		isnull;
+			Datum		v;
+
+			v = dbbc_chunk_read(s, qc, row, &isnull);
+			if (!dbbc_skipqual_test(q, v, isnull))
+			{
+				pass = false;
+				break;
+			}
+		}
+		if (!pass)
+			continue;
+
+		MemoryContextReset(as->tmpctx);
+		for (k = 0; k < as->nkeys; k++)
+		{
+			int			kc = s->attno_to_col[as->key_attnos[k] - 1];
+
+			keyvals[k] = dbbc_chunk_read(s, kc, row, &keynulls[k]);
+		}
+		for (a = 0; a < as->ntrans; a++)
+			if (as->trans[a].numTransInputs == 1)
+			{
+				int			ac = s->attno_to_col[as->trans[a].input_attno - 1];
+
+				as->in_vals[a] = dbbc_chunk_read(s, ac, row, &as->in_nulls[a]);
+			}
+		dbbc_grp_advance(as, dbbc_grp_lookup(as, keyvals, keynulls));
+		as->grp_rows++;
+	}
+}
+
+/*
+ * Aggregate a heap page range (invalid/unbuilt/grown ranges, chunks built
+ * under a different column type, or - with limited=false - the whole
+ * relation when no usable version exists / the AM is not heap). All quals
+ * are evaluated here too: this node has no parent recheck.
+ */
+static void
+dbbc_grp_consume_heap_range(DbbcAggScanState *as, DbbcScanState *s,
+							BlockNumber start, BlockNumber nblocks,
+							bool limited)
+{
+	TableScanDesc scan;
+
+	if (limited)
+	{
+		scan = table_beginscan_strat(as->rel, s->snapshot, 0, NULL,
+									 true, false);
+		heap_setscanlimits(scan, start, nblocks);
+	}
+	else
+		scan = table_beginscan(as->rel, s->snapshot, 0, NULL, 0);
+	while (table_scan_getnextslot(scan, ForwardScanDirection, s->heap_slot))
+	{
+		Datum		keyvals[DBBC_GRP_MAX_KEYS];
+		bool		keynulls[DBBC_GRP_MAX_KEYS];
+		bool		pass = true;
+		int			i;
+		int			k;
+		int			a;
+
+		CHECK_FOR_INTERRUPTS();
+
+		for (i = 0; i < as->nskipquals; i++)
+		{
+			DbbcSkipQual *q = &as->skipquals[i];
+			bool		isnull;
+			Datum		v;
+
+			v = slot_getattr(s->heap_slot, q->attno, &isnull);
+			if (!dbbc_skipqual_test(q, v, isnull))
+			{
+				pass = false;
+				break;
+			}
+		}
+		if (!pass)
+			continue;
+
+		MemoryContextReset(as->tmpctx);
+		for (k = 0; k < as->nkeys; k++)
+			keyvals[k] = slot_getattr(s->heap_slot, as->key_attnos[k],
+									  &keynulls[k]);
+		for (a = 0; a < as->ntrans; a++)
+			if (as->trans[a].numTransInputs == 1)
+				as->in_vals[a] = slot_getattr(s->heap_slot,
+											  as->trans[a].input_attno,
+											  &as->in_nulls[a]);
+		dbbc_grp_advance(as, dbbc_grp_lookup(as, keyvals, keynulls));
+		as->grp_rows++;
+	}
+	table_endscan(scan);
+	as->grp_ranges_heap++;
+}
+
+/* the single input pass: build the group hash from all sources */
+static void
+dbbc_grp_build(DbbcAggScanState *as, EState *estate)
+{
+	DbbcScanState scratch;
+	List	   *needed = NIL;
+	uint32		cur;
+	int			u;
+
+	if (as->groups == NULL)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = sizeof(DbbcGroupKey);
+		ctl.entrysize = offsetof(DbbcGroupEntry, states) +
+			as->ntrans * sizeof(DbbcTransState);
+		ctl.hcxt = as->groupctx;
+		as->groups = hash_create("dbblue_columnar groups", 256, &ctl,
+								 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+
+	for (u = 0; u < as->nused; u++)
+		needed = lappend_int(needed, as->used_attnos[u]);
+
+	/* reuse the standard scan setup for version pin, dir, heap slot, etc.
+	 * (this node is never parallel: pin the current version here) */
+	memset(&scratch, 0, sizeof(scratch));
+	scratch.css.ss.ss_currentRelation = as->rel;
+	dbbc_scan_common(&scratch, as->rel, estate);
+	{
+		DbbcRelVersion *v = (as->rel->rd_rel->relam == HEAP_TABLE_AM_OID)
+			? dbbc_version_pin_tracked(RelationGetRelid(as->rel)) : NULL;
+
+		dbbc_scan_bind_version(&scratch, as->rel, needed, as->qual_clauses,
+							   as->qual_varno, v);
+	}
+
+	if (scratch.whole_rel_mode)
+		dbbc_grp_consume_heap_range(as, &scratch, 0, scratch.heap_nblocks,
+									false);
+	else
+	{
+		for (cur = 0; cur < scratch.total_slots; cur++)
+		{
+			DbbcBlock  *block = dbbc_slot_block(&scratch, cur);
+			DbbcColumnChunk *chunks = NULL;
+
+			CHECK_FOR_INTERRUPTS();
+
+			if (block != NULL && dbbc_block_valid(&scratch, as->rel, block))
+				chunks = (DbbcColumnChunk *)
+					dsa_get_address(scratch.dsa, block->chunks);
+
+			if (chunks != NULL && dbbc_grp_chunks_usable(as, &scratch, chunks))
+			{
+				/*
+				 * Zone-map skip: a valid block provably containing no
+				 * qual-matching row contributes nothing to any group.
+				 */
+				if (scratch.nskipquals > 0 &&
+					dbbc_zone_block_skippable(scratch.skipquals,
+											  scratch.nskipquals,
+											  block, chunks, scratch.ncols))
+				{
+					as->grp_blocks_skipped++;
+					continue;
+				}
+				dbbc_grp_consume_block(as, &scratch, block, chunks);
+				as->grp_blocks_served++;
+			}
+			else
+			{
+				BlockNumber start = cur * DBBC_PAGES_PER_BLOCK;
+				BlockNumber nblk = Min((BlockNumber) DBBC_PAGES_PER_BLOCK,
+									   scratch.heap_nblocks - start);
+
+				/* limited: reached only with a valid heap version */
+				dbbc_grp_consume_heap_range(as, &scratch, start, nblk, true);
+			}
+		}
+	}
+
+	if (scratch.version != NULL)
+		dbbc_version_unpin_tracked(scratch.version);
+
+	/* scalar aggregation over zero rows still yields one output row */
+	if (as->nkeys == 0 && hash_get_num_entries(as->groups) == 0)
+	{
+		Datum		dummyv[1];
+		bool		dummyn[1];
+
+		(void) dbbc_grp_lookup(as, dummyv, dummyn);
+	}
+}
+
+/* finalize and emit one group, mirroring finalize_aggregate */
+static TupleTableSlot *
+dbbc_grp_emit_group(DbbcAggScanState *as, DbbcGroupEntry *grp)
+{
+	TupleTableSlot *slot = as->css.ss.ss_ScanTupleSlot;
+	ExprContext *econtext = as->css.ss.ps.ps_ExprContext;
+	MemoryContext oldctx;
+	int			i;
+
+	/* finalfns run (and byref results live) in the output-tuple context */
+	ResetExprContext(econtext);
+	oldctx = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
+
+	ExecClearTuple(slot);
+	for (i = 0; i < as->noutcols; i++)
+	{
+		if (as->outmap[i] >= 0)
+		{
+			int			k = as->outmap[i];
+
+			slot->tts_values[i] = grp->key.vals[k];
+			slot->tts_isnull[i] =
+				(grp->key.nullmask & (((uint32) 1) << k)) != 0;
+		}
+		else
+		{
+			int			a = -as->outmap[i] - 1;
+			DbbcAggTrans *t = &as->trans[a];
+			DbbcTransState *st = &grp->states[a];
+
+			if (OidIsValid(t->finalfn_oid))
+			{
+				LOCAL_FCINFO(fcinfo, FUNC_MAX_ARGS);
+				bool		anynull = st->transValueIsNull;
+				int			narg;
+
+				InitFunctionCallInfoData(*fcinfo, &t->finalfn,
+										 t->numFinalArgs,
+										 t->aggref->inputcollid,
+										 (Node *) as->fake_aggstate, NULL);
+				fcinfo->args[0].value =
+					MakeExpandedObjectReadOnly(st->transValue,
+											   st->transValueIsNull,
+											   t->transtypeLen);
+				fcinfo->args[0].isnull = st->transValueIsNull;
+				for (narg = 1; narg < t->numFinalArgs; narg++)
+				{
+					/* aggfinalextra positions are NULL dummies */
+					fcinfo->args[narg].value = (Datum) 0;
+					fcinfo->args[narg].isnull = true;
+					anynull = true;
+				}
+				if (t->finalfn.fn_strict && anynull)
+				{
+					slot->tts_values[i] = (Datum) 0;
+					slot->tts_isnull[i] = true;
+				}
+				else
+				{
+					fcinfo->isnull = false;
+					slot->tts_values[i] = FunctionCallInvoke(fcinfo);
+					slot->tts_isnull[i] = fcinfo->isnull;
+					slot->tts_values[i] =
+						MakeExpandedObjectReadOnly(slot->tts_values[i],
+												   slot->tts_isnull[i],
+												   t->resulttypeLen);
+				}
+			}
+			else
+			{
+				/* no finalfn: the result IS the state (may alias groupctx,
+				 * which outlives every emitted tuple) */
+				slot->tts_values[i] =
+					MakeExpandedObjectReadOnly(st->transValue,
+											   st->transValueIsNull,
+											   t->transtypeLen);
+				slot->tts_isnull[i] = st->transValueIsNull;
+			}
+		}
+	}
+	MemoryContextSwitchTo(oldctx);
+	ExecStoreVirtualTuple(slot);
+	return slot;
+}
+
 static TupleTableSlot *
 dbbc_agg_exec(CustomScanState *node)
 {
@@ -2125,6 +3262,28 @@ dbbc_agg_exec(CustomScanState *node)
 	int			a;
 
 	List	   *needed = NIL;
+
+	if (as->grouped)
+	{
+		DbbcGroupEntry *grp;
+
+		if (!as->executed)
+		{
+			dbbc_grp_build(as, node->ss.ps.state);
+			hash_seq_init(&as->seq, as->groups);
+			as->seq_active = true;
+			as->executed = true;
+		}
+		if (!as->seq_active)
+			return NULL;
+		grp = (DbbcGroupEntry *) hash_seq_search(&as->seq);
+		if (grp == NULL)
+		{
+			as->seq_active = false;
+			return NULL;
+		}
+		return dbbc_grp_emit_group(as, grp);
+	}
 
 	if (as->executed)
 		return NULL;
@@ -2246,6 +3405,26 @@ dbbc_agg_end(CustomScanState *node)
 {
 	DbbcAggScanState *as = (DbbcAggScanState *) node;
 
+	if (as->seq_active)
+	{
+		hash_seq_term(&as->seq);
+		as->seq_active = false;
+	}
+	if (as->groups != NULL)
+	{
+		hash_destroy(as->groups);
+		as->groups = NULL;
+	}
+	if (as->groupctx != NULL)
+	{
+		MemoryContextDelete(as->groupctx);
+		as->groupctx = NULL;
+	}
+	if (as->tmpctx != NULL)
+	{
+		MemoryContextDelete(as->tmpctx);
+		as->tmpctx = NULL;
+	}
 	if (as->rel_opened)
 	{
 		table_close(as->rel, NoLock);
@@ -2265,6 +3444,28 @@ dbbc_agg_rescan(CustomScanState *node)
 	int			a;
 
 	as->executed = false;
+	if (as->grouped)
+	{
+		if (as->seq_active)
+		{
+			hash_seq_term(&as->seq);
+			as->seq_active = false;
+		}
+		if (as->groups != NULL)
+		{
+			hash_destroy(as->groups);
+			as->groups = NULL;	/* recreated lazily by the next build */
+		}
+		if (as->groupctx != NULL)
+			MemoryContextReset(as->groupctx);
+		if (as->tmpctx != NULL)
+			MemoryContextReset(as->tmpctx);
+		as->grp_blocks_served = 0;
+		as->grp_blocks_skipped = 0;
+		as->grp_ranges_heap = 0;
+		as->grp_rows = 0;
+		return;
+	}
 	if (as->counts)
 		memset(as->counts, 0, as->naggs * sizeof(int64));
 	for (a = 0; a < as->naggs; a++)
@@ -2279,7 +3480,30 @@ dbbc_agg_rescan(CustomScanState *node)
 static void
 dbbc_agg_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 {
-	ExplainPropertyText("Columnar Aggregate", "metadata (count/min/max)", es);
+	DbbcAggScanState *as = (DbbcAggScanState *) node;
+
+	if (!as->grouped)
+	{
+		ExplainPropertyText("Columnar Aggregate", "metadata (count/min/max)",
+							es);
+		return;
+	}
+
+	ExplainPropertyText("Columnar Aggregate", "grouped (transition pushdown)",
+						es);
+	if (es->analyze)
+	{
+		ExplainPropertyInteger("Columnar Agg Blocks Served", NULL,
+							   as->grp_blocks_served, es);
+		ExplainPropertyInteger("Columnar Agg Blocks Skipped", NULL,
+							   as->grp_blocks_skipped, es);
+		ExplainPropertyInteger("Columnar Agg Heap Ranges", NULL,
+							   as->grp_ranges_heap, es);
+		ExplainPropertyInteger("Columnar Agg Rows", NULL, as->grp_rows, es);
+		if (as->groups != NULL)
+			ExplainPropertyInteger("Columnar Agg Groups", NULL,
+								   hash_get_num_entries(as->groups), es);
+	}
 }
 
 static void

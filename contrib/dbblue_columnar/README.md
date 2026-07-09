@@ -38,16 +38,46 @@ zone-map min/max — with no value reads. Invalid / unbuilt / type-changed range
 are read from the heap with the query snapshot.
 
 Notes:
-- **`SUM`/`AVG` are intentionally not pushed** into this node. Their transition
-  functions require a real `AggState`; and they already run fast on the normal
-  `Agg → DBBlueColumnarScan` plan (zone-skip + no heap deform). The custom node
-  is only for aggregates a normal Agg can't answer without scanning.
 - **`MIN`/`MAX` tie representation:** for types with equal-but-distinguishable
   values (numeric `4.0`/`4.00`, float `-0.0`/`0.0`), which representation is
   returned is unspecified by SQL and varies across PostgreSQL plans anyway. The
   value is always equal-by-ordering to the true extremum.
 - Inheritance/partition parents are left to the normal Append (no per-partition
   columnar acceleration yet).
+
+## Grouped aggregate pushdown (Milestone 5)
+
+The same `DBBlueColumnarAgg` node also replaces the whole
+`HashAggregate → scan` stack for the reporting shape that dominates Odoo
+(trial balance, GL, pivot):
+
+```
+SELECT keys..., sum(col), count(*), avg(col), min(col), max(col)...
+FROM t [WHERE extractable-quals] [GROUP BY keys]
+```
+
+It aggregates with **PostgreSQL's own transition/final functions** (so
+`sum(numeric)` etc. are bit-exact), advanced directly over packed chunk
+values — no per-row slot emission into a parent Agg, which profiling showed
+is the dominant scan cost (see `PROFILING.md`). Measured on the 2M-row Odoo
+benchmark (serial): group-by-sum 1.4×→3.3×, trial balance 2.6×→4.8× vs heap.
+
+v1 gates (anything outside them = path not offered, normal plan runs):
+- every `WHERE` clause must be pre-filter-extractable (`Var op Const`,
+  `= ANY(array)`, `IS [NOT] NULL`) — this node has no parent to recheck quals;
+- group keys: bare columns of by-value, bit-equality-safe types (int2/4/8,
+  oid, bool, "char", date, time, timestamp[tz]; floats excluded by design),
+  at most 4, estimated groups ≤ 100k (the group hash has no spill path);
+- aggregates: builtin, plain, un-DISTINCTed/FILTERed/ORDERed, 0- or 1-column
+  argument; no HAVING, no grouping sets;
+- blocks whose chunks were built under a different column type fall back to a
+  range-limited heap scan (same staleness rule as zone-map skipping).
+
+The node stays serial in v1; with free parallel workers the planner may still
+prefer a parallel `HashAgg → parallel columnar scan` plan — that's genuine
+cost competition, and on a busy server (no free workers, the common Odoo
+case) the pushdown wins. A parallel partial-aggregate variant is the natural
+M5.2.
 
 ## Background auto-refresh (Milestone 4)
 
