@@ -154,7 +154,12 @@ typedef struct DbbcRelVersion
 	dsa_pointer attnums;		/* int16[ncols], ascending */
 	uint32		ndirslots;		/* directory length */
 	uint32		nblocks;		/* directory slots actually built */
-	uint32		built_pages;	/* heap pages covered by built blocks (exact) */
+	uint32		av_at_build;	/* visibilitymap all-visible page count when
+								 * this version was built - the auto-refresh
+								 * staleness baseline (compared to the current
+								 * count, same page granularity, so a relation
+								 * that cannot be fully columnarized still
+								 * reaches a stable no-refresh state) */
 	dsa_pointer blockdir;		/* dsa_pointer[ndirslots] -> DbbcBlock */
 	Size		total_bytes;	/* accounting: all DSA bytes of this version */
 } DbbcRelVersion;

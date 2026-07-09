@@ -622,7 +622,6 @@ dbbc_populate_relation(Oid relid)
 	volatile dsa_pointer version_dsa = InvalidDsaPointer;
 	volatile bool published = false;
 	volatile int blocks_built = 0;
-	volatile uint32 built_pages = 0;
 	bool		budget_hit = false;
 	Buffer		vmbuf = InvalidBuffer;
 	MemoryContext blkcxt;
@@ -1093,7 +1092,6 @@ dbbc_populate_relation(Oid relid)
 				entry_bytes += acct;
 				inflight_bytes = 0;
 				blocks_built++;
-				built_pages += npages;
 			}
 
 			MemoryContextSwitchTo(oldcxt);
@@ -1119,6 +1117,7 @@ dbbc_populate_relation(Oid relid)
 			Size		attsize = ncols * sizeof(int16);
 			DbbcRelVersion *version;
 			dsa_pointer oldv = InvalidDsaPointer;
+			DbbcRelVersion *oldver = NULL;
 
 			/*
 			 * Version + directory + attnum metadata is tiny; reserve it
@@ -1145,7 +1144,14 @@ dbbc_populate_relation(Oid relid)
 			version->attnums = attnums_dsa;
 			version->ndirslots = ndirslots;
 			version->nblocks = (uint32) blocks_built;
-			version->built_pages = built_pages;
+			{
+				BlockNumber av = 0;
+				BlockNumber af = 0;
+
+				/* all-visible page count now = the staleness baseline */
+				visibilitymap_count(rel, &av, &af);
+				version->av_at_build = av;
+			}
 			version->blockdir = blockdir_dsa;
 			version->total_bytes = entry_bytes + meta_bytes;
 
@@ -1153,15 +1159,25 @@ dbbc_populate_relation(Oid relid)
 			key.reloid = relid;
 			entry = (DbbcRelEntry *) dshash_find_or_insert(dbbc_hash, &key,
 														   &found);
-			/* no fallible calls below this point */
 			oldv = found ? entry->version : InvalidDsaPointer;
+			/*
+			 * Resolve the old version's address BEFORE the swap:
+			 * dsa_get_address can attach a segment and error, and after we
+			 * flip published=true the PG_CATCH must do nothing, so no
+			 * fallible call may run past this point. On error here we are
+			 * still !published (entry untouched, still points to the old
+			 * version) and the CATCH frees the new version.
+			 */
+			oldver = DsaPointerIsValid(oldv)
+				? (DbbcRelVersion *) dsa_get_address(dbbc_dsa, oldv) : NULL;
+
+			/* no fallible calls below this point */
 			entry->version = version_dsa;
 			published = true;
 			dshash_release_lock(dbbc_hash, entry);
 
-			if (DsaPointerIsValid(oldv))
-				dbbc_version_unpin((DbbcRelVersion *)
-								   dsa_get_address(dbbc_dsa, oldv));
+			if (oldver != NULL)
+				dbbc_version_unpin(oldver);
 		}
 	}
 	PG_CATCH();
@@ -1264,34 +1280,50 @@ dbbc_relation_needs_refresh(Oid relid, int threshold_pct)
 	Relation	rel;
 	BlockNumber all_visible = 0;
 	BlockNumber all_frozen = 0;
-	int64		covered;
+	int64		baseline;
 	int64		gap;
 	int64		floor_pages;
 	bool		needs;
 
-	version = dbbc_version_pin_tracked(relid);
-	if (version == NULL)
-		return true;			/* registered but not built yet */
-
+	/*
+	 * Guard FIRST, before touching the version: an unbuildable-but-registered
+	 * relation (unlogged/temp, non-heap AM, wrong relkind) never has and never
+	 * will have a version, so it must return false here - otherwise the
+	 * version==NULL path below would say "needs build" every cycle and the
+	 * worker would call populate (which rejects it) forever.
+	 */
 	rel = table_open(relid, AccessShareLock);
-
 	if (rel->rd_rel->relam != HEAP_TABLE_AM_OID ||
 		rel->rd_rel->relpersistence != RELPERSISTENCE_PERMANENT ||
 		(rel->rd_rel->relkind != RELKIND_RELATION &&
 		 rel->rd_rel->relkind != RELKIND_MATVIEW))
 	{
 		table_close(rel, AccessShareLock);
-		dbbc_version_unpin_tracked(version);
 		return false;
 	}
 
+	version = dbbc_version_pin_tracked(relid);
+	if (version == NULL)
+	{
+		table_close(rel, AccessShareLock);
+		return true;			/* buildable but not built yet */
+	}
+
+	/*
+	 * Compare current all-visible page count to the count when the version
+	 * was built (same page granularity - NOT built_pages, which is
+	 * block-granular and would make a relation with a hot page in every
+	 * 32-page range refresh forever). After a (re)populate the baseline is
+	 * reset to the then-current count, so any relation converges to a stable
+	 * no-refresh state until its all-visibility actually moves.
+	 */
 	visibilitymap_count(rel, &all_visible, &all_frozen);
-	covered = (int64) version->built_pages;
-	gap = (int64) all_visible - covered;
+	baseline = (int64) version->av_at_build;
+	gap = (int64) all_visible - baseline;
 	if (gap < 0)
 		gap = -gap;
 
-	floor_pages = covered * threshold_pct / 100;
+	floor_pages = baseline * threshold_pct / 100;
 	if (floor_pages < DBBC_PAGES_PER_BLOCK)
 		floor_pages = DBBC_PAGES_PER_BLOCK;
 

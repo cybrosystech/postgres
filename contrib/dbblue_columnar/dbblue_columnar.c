@@ -281,6 +281,26 @@ dbblue_columnar_add(PG_FUNCTION_ARGS)
 					 errmsg("cannot columnarize system column \"%s\"",
 							colname)));
 
+		/*
+		 * Reject unsupported column widths at registration (same rule the
+		 * builder enforces): a fixed width other than 1/2/4/8/16 can't be
+		 * packed at natural alignment, and cstring-like (-2) is unsupported.
+		 * Catching it here means an unbuildable relation never gets a
+		 * registration, so the auto-refresh worker can't retry+fail it every
+		 * cycle. (varlena, -1, is fine.)
+		 */
+		{
+			int16		typlen = get_typlen(get_atttype(relid, attnum));
+
+			if (typlen == -2 ||
+				(typlen > 0 && typlen != 1 && typlen != 2 && typlen != 4 &&
+				 typlen != 8 && typlen != 16))
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("column \"%s\" has an unsupported width (%d) for columnarization",
+								colname, typlen)));
+		}
+
 		values[0] = ObjectIdGetDatum(relid);
 		values[1] = Int16GetDatum(attnum);
 

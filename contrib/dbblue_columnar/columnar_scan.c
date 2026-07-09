@@ -1851,13 +1851,17 @@ dbbc_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	if (items == NIL)
 		return;
 
-	/* a populated version must cover every counted column */
-	version = dbbc_version_pin(rte->relid);
+	/*
+	 * A populated version must cover every counted column. Tracked pin:
+	 * dsa_get_address just below can error on segment attach, and an untracked
+	 * pin would leak the version forever (matches dbbc_rel_ready).
+	 */
+	version = dbbc_version_pin_tracked(rte->relid);
 	if (version == NULL)
 		return;
 	if (!DsaPointerIsValid(version->blockdir) || version->nblocks == 0)
 	{
-		dbbc_version_unpin(version);
+		dbbc_version_unpin_tracked(version);
 		return;
 	}
 	reg = (int16 *) dsa_get_address(dbbc_store_dsa(), version->attnums);
@@ -1879,7 +1883,7 @@ dbbc_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 			break;
 		}
 	}
-	dbbc_version_unpin(version);
+	dbbc_version_unpin_tracked(version);
 	if (!ok)
 		return;
 
