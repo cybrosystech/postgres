@@ -162,6 +162,9 @@ typedef struct DbbcScanState
 	bool		initialized;	/* false under EXPLAIN (no ANALYZE) */
 	Snapshot	snapshot;
 	List	   *needed_attnos;	/* from custom_private */
+	bool		prefilter_unsafe;	/* RLS/security qual present: skip the
+									 * pre-filter + zone-skip, leave all quals
+									 * to ExecScan's security-ordered ExecQual */
 	DbbcParallelState *pstate;	/* NULL unless parallel-aware execution */
 
 	/* pinned store version (refcount held from Begin to End) */
@@ -806,6 +809,7 @@ dbbc_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 	double		skip_frac;
 	CustomPath *cpath;
 	QualCost	qcost;
+	bool		prefilter_unsafe = false;
 
 	if (prev_set_rel_pathlist_hook)
 		prev_set_rel_pathlist_hook(root, rel, rti, rte);
@@ -816,10 +820,27 @@ dbbc_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 	if (!dbbc_rel_ready(root, rel, rte, &needed))
 		return;
 
-	/* estimate zone-map skipping against the real block metadata */
+	/*
+	 * If any qual carries a non-zero security_level (RLS policy,
+	 * security-barrier view), the pre-filter and zone-map skip must be
+	 * disabled: they would evaluate an extractable, possibly-leaky higher-
+	 * security qual on rows a lower-security qual excludes, ahead of
+	 * ExecScan's security-ordered ExecQual (order_qual_clauses). The columnar
+	 * scan still serves blocks (no deform); ExecScan applies ALL quals in the
+	 * correct order, so results stay correct and nothing leaks.
+	 */
 	foreach(lc, rel->baserestrictinfo)
-		clauses = lappend(clauses, ((RestrictInfo *) lfirst(lc))->clause);
-	skip_frac = dbbc_estimate_skip_fraction(rte->relid, clauses, rel->relid);
+	{
+		RestrictInfo *ri = lfirst_node(RestrictInfo, lc);
+
+		if (ri->security_level > 0)
+			prefilter_unsafe = true;
+		clauses = lappend(clauses, ri->clause);
+	}
+
+	/* estimate zone-map skipping against the real block metadata */
+	skip_frac = prefilter_unsafe ? 0.0 :
+		dbbc_estimate_skip_fraction(rte->relid, clauses, rel->relid);
 
 	cpath = makeNode(CustomPath);
 	cpath->path.pathtype = T_CustomScan;
@@ -832,7 +853,8 @@ dbbc_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 	cpath->path.rows = rel->rows;
 	cpath->path.pathkeys = NIL;
 	cpath->flags = 0;
-	cpath->custom_private = list_make1(needed);
+	cpath->custom_private = list_make2(needed,
+									   makeInteger(prefilter_unsafe ? 1 : 0));
 	cpath->methods = &dbbc_path_methods;
 
 	/*
@@ -880,7 +902,8 @@ dbbc_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 			ppath->path.rows = clamp_row_est(rel->rows / divisor);
 			ppath->path.pathkeys = NIL;
 			ppath->flags = 0;
-			ppath->custom_private = list_make1(needed);
+			ppath->custom_private =
+				list_make2(needed, makeInteger(prefilter_unsafe ? 1 : 0));
 			ppath->methods = &dbbc_path_methods;
 			ppath->path.disabled_nodes = 0;
 			ppath->path.startup_cost = qcost.startup;
@@ -1056,6 +1079,7 @@ dbbc_begin_scan(CustomScanState *node, EState *estate, int eflags)
 	Relation	rel = node->ss.ss_currentRelation;
 
 	s->needed_attnos = (List *) linitial(cscan->custom_private);
+	s->prefilter_unsafe = intVal(lsecond(cscan->custom_private)) != 0;
 	s->pstate = NULL;
 
 	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
@@ -1075,7 +1099,9 @@ dbbc_begin_scan(CustomScanState *node, EState *estate, int eflags)
 			? dbbc_version_pin_tracked(RelationGetRelid(rel)) : NULL;
 
 		dbbc_scan_bind_version(s, rel, s->needed_attnos,
-							   cscan->scan.plan.qual, cscan->scan.scanrelid, v);
+							   s->prefilter_unsafe ? NIL : cscan->scan.plan.qual,
+							   s->prefilter_unsafe ? 0 : cscan->scan.scanrelid,
+							   v);
 	}
 }
 
@@ -1129,7 +1155,8 @@ dbbc_scan_initialize_worker(CustomScanState *node, shm_toc *toc,
 
 	v = dbbc_version_attach_tracked(p->version_dp);
 	dbbc_scan_bind_version(s, rel, s->needed_attnos,
-						   cscan->scan.plan.qual, cscan->scan.scanrelid, v);
+						   s->prefilter_unsafe ? NIL : cscan->scan.plan.qual,
+						   s->prefilter_unsafe ? 0 : cscan->scan.scanrelid, v);
 }
 
 /* the columnar block for a range, or NULL if absent / store unusable */
