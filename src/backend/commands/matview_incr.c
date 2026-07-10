@@ -170,7 +170,17 @@ static char *qual_to_live_sql(Node *qual, List *rtable, List *all_tables,
 							   int preserved_varno);
 static bool incr_build_affected_sql(StringInfo buf, Query *viewQuery,
 									int delta_varno, const char *delta_table,
-									List *all_tables);
+									List *all_tables, const char *anchor_col);
+static bool incr_find_equality_hop(Node *qual, List *rtable,
+								   int child_varno, int parent_varno,
+								   const char **child_col, const char **parent_col);
+static List *incr_build_dep_path(Query *viewQuery, List *all_tables,
+								 int delta_varno, int anchor_varno);
+static bool incr_plan_anchor_restrict(Query *viewQuery, List *all_tables,
+									  int delta_varno, const char *delta_table,
+									  bool is_full_join,
+									  StringInfo anchor_cte_body,
+									  char **anchor_col_out);
 static char *incr_build_recompute_sql(Oid mvrelid, Query *viewQuery,
 								   int delta_varno, const char *delta_table,
 								   List *all_tables, bool include_delete_step);
@@ -5694,6 +5704,267 @@ incr_table_at_or_below(List *all_tables, int k_varno, int d_varno)
 }
 
 /*
+ * IncrPathHop — one hop of a join-ancestry path, walking from a delta table up
+ * toward the join tree's anchor.  varno/oid identify THIS hop's own table;
+ * col_self is the column ON that table used by the qual connecting it to its
+ * parent (parent_varno); col_parent is the column ON the PARENT's table in that
+ * same qual.  Built by incr_build_dep_path, consumed by incr_plan_anchor_restrict.
+ */
+typedef struct IncrPathHop
+{
+	int			varno;
+	Oid			oid;
+	const char *col_self;
+	const char *col_parent;
+	int			parent_varno;
+} IncrPathHop;
+
+/*
+ * incr_find_equality_hop — find the AND-conjunct of qual that is a plain "="
+ * equality between a Var of child_varno and a Var of parent_varno (either
+ * side), and return each side's column name.  Deliberately narrow: neither
+ * incr_qual_get_other_varno nor incr_qual_get_colname_for_varno checks the
+ * operator, so a non-equality (e.g. "<>", "<") or OR-connected qual could
+ * otherwise be mistaken for a safe join edge.  Both column names are resolved
+ * from the SAME matching conjunct (not two independent walks), so a composite
+ * AND-of-several-equalities qual can never pair a column from one conjunct with
+ * a column from another.  Returns false — causing the caller to abandon the
+ * anchor-restriction optimization and keep the current, always-correct,
+ * unrestricted scan — for OR, non-equality operators, or no match.
+ */
+static bool
+incr_find_equality_hop(Node *qual, List *rtable, int child_varno, int parent_varno,
+					   const char **child_col, const char **parent_col)
+{
+	if (qual == NULL)
+		return false;
+
+	if (IsA(qual, OpExpr))
+	{
+		OpExpr *op = (OpExpr *) qual;
+
+		if (list_length(op->args) == 2)
+		{
+			Node *lhs = linitial(op->args);
+			Node *rhs = lsecond(op->args);
+
+			if (IsA(lhs, Var) && IsA(rhs, Var))
+			{
+				Var *lv = (Var *) lhs;
+				Var *rv = (Var *) rhs;
+				Var *cv = NULL;
+				Var *pv = NULL;
+
+				if (lv->varno == child_varno && rv->varno == parent_varno)
+					{ cv = lv; pv = rv; }
+				else if (rv->varno == child_varno && lv->varno == parent_varno)
+					{ cv = rv; pv = lv; }
+
+				if (cv != NULL)
+				{
+					char *opname = get_opname(op->opno);
+
+					if (opname != NULL && strcmp(opname, "=") == 0)
+					{
+						int rv_unused;
+
+						*child_col = incr_resolve_var_colname(cv, rtable, &rv_unused);
+						*parent_col = incr_resolve_var_colname(pv, rtable, &rv_unused);
+						return true;
+					}
+				}
+			}
+		}
+		return false;
+	}
+
+	if (IsA(qual, BoolExpr))
+	{
+		BoolExpr *b = (BoolExpr *) qual;
+		ListCell *lc;
+
+		if (b->boolop != AND_EXPR)
+			return false;			/* OR (or NOT) — ambiguous, abort */
+		foreach(lc, b->args)
+			if (incr_find_equality_hop(lfirst(lc), rtable, child_varno, parent_varno,
+									   child_col, parent_col))
+				return true;
+		return false;
+	}
+
+	return false;
+}
+
+/*
+ * incr_build_dep_path — walk the join-ancestry chain from delta_varno up to
+ * anchor_varno, validating every hop is a clean "=" equality
+ * (incr_find_equality_hop) and collecting the ordered path as a List of
+ * IncrPathHop* (nearest-to-delta first).  Same traversal shape as
+ * incr_table_at_or_below (walking parent pointers via
+ * incr_qual_get_other_varno), reified into a path instead of a boolean so the
+ * caller can build a restriction from it.
+ *
+ * Returns NIL on ANY failure: dead end before reaching the anchor, an
+ * ambiguous/OR/non-equality hop, or exceeding the table count (should not
+ * happen for a valid tree).  The caller must treat NIL as "no safe
+ * restriction, fall back to the current unrestricted (always correct) form" —
+ * this is the ONLY sanctioned failure behavior; there is no partial/best-effort
+ * path.
+ */
+static List *
+incr_build_dep_path(Query *viewQuery, List *all_tables, int delta_varno,
+					int anchor_varno)
+{
+	List	   *hops = NIL;
+	int			cur = delta_varno;
+	int			steps = 0;
+	int			n = list_length(all_tables);
+
+	while (steps++ <= n)
+	{
+		IncrJoinEntry *e = NULL;
+		ListCell   *lc;
+		int			next;
+		const char *child_col;
+		const char *parent_col;
+		IncrPathHop *hop;
+
+		if (cur == anchor_varno)
+			return hops;
+
+		foreach(lc, all_tables)
+		{
+			IncrJoinEntry *je = lfirst(lc);
+
+			if (je->varno == cur)
+			{
+				e = je;
+				break;
+			}
+		}
+		if (e == NULL || e->quals == NULL)
+			return NIL;				/* dead end before reaching the anchor */
+
+		next = incr_qual_get_other_varno(e->quals, cur);
+		if (next == -1)
+			return NIL;
+
+		if (!incr_find_equality_hop(e->quals, viewQuery->rtable, cur, next,
+									&child_col, &parent_col))
+			return NIL;				/* ambiguous / OR / non-equality — abort */
+
+		hop = palloc(sizeof(IncrPathHop));
+		hop->varno = cur;
+		hop->oid = e->oid;
+		hop->col_self = child_col;
+		hop->col_parent = parent_col;
+		hop->parent_varno = next;
+		hops = lappend(hops, hop);
+
+		cur = next;
+	}
+	return NIL;						/* exceeded table count — malformed tree */
+}
+
+/*
+ * incr_plan_anchor_restrict
+ *
+ * Decide whether a delta on delta_varno can restrict arm 1's scan to only the
+ * anchor rows reachable from the delta ENR, and if so, build the restriction.
+ *
+ * Skips (returns false, no behavior change) when:
+ *   - is_full_join: FULL's own all-NULL-arm logic is untouched by this
+ *     optimization — a separate, already-delicate path.
+ *   - delta_varno == preserved_varno: arm 1 is already anchor-first in this
+ *     case (the swapped ENR IS the FROM-clause anchor), already fast — this
+ *     restriction would be a no-op.
+ *   - incr_build_dep_path fails: dead end, OR/non-equality/ambiguous hop, or
+ *     any other unsupported shape.  ALWAYS falls back to the current,
+ *     unrestricted, always-correct scan — never a partial/best-effort result.
+ *
+ * On success, appends the restriction's CTE BODY (no "_aff_anchor_ AS (" or
+ * outer parens — the caller wraps it) to anchor_cte_body, and returns (via
+ * anchor_col_out) the column name ON preserved_varno that the caller should
+ * restrict with "<preserved_varno>.<anchor_col> IN (SELECT ak FROM _aff_anchor_)".
+ *
+ * The restriction is a nested chain of single-column IN-subqueries, walking
+ * FROM the delta ENR UP through each intermediate table to the anchor's own
+ * join column — e.g. for bf LEFT JOIN bp LEFT JOIN bt (delta on bt):
+ *   SELECT DISTINCT c AS ak
+ *   FROM (SELECT _anc1_.id AS c FROM bp _anc1_
+ *         WHERE _anc1_.tmpl IN (SELECT id AS c FROM __mv_newtable _anc0_)
+ *        ) _anc_top_
+ * restricting "bf.pid IN (SELECT ak FROM _aff_anchor_)".
+ *
+ * SAFETY: this is always a SUPERSET filter, never a substitute for the real
+ * join.  It is later AND'ed onto arm 1's existing quals (which still apply the
+ * complete, original join conditions in full) — so even if a hop's ON-clause
+ * carries extra conjuncts this restriction does not replicate (e.g. an AND'd
+ * non-join filter), or a composite key resolves to just one column, the result
+ * can only be too LOOSE (a few extra candidate anchor rows, pruned back by the
+ * real downstream join), never too TIGHT.  The one property that must hold
+ * exactly (not approximately) is that each hop's operator really is "=", which
+ * incr_find_equality_hop verifies explicitly.
+ */
+static bool
+incr_plan_anchor_restrict(Query *viewQuery, List *all_tables, int delta_varno,
+						  const char *delta_table, bool is_full_join,
+						  StringInfo anchor_cte_body, char **anchor_col_out)
+{
+	int			preserved_varno = incr_outer_preserved_varno(all_tables);
+	List	   *hops;
+	ListCell   *lc;
+	StringInfoData sql;
+	IncrPathHop *prev_hop;
+	IncrPathHop *last_hop;
+	int			idx;
+	bool		first_hop;
+
+	if (is_full_join || delta_varno == preserved_varno)
+		return false;
+
+	hops = incr_build_dep_path(viewQuery, all_tables, delta_varno, preserved_varno);
+	if (hops == NIL)
+		return false;
+
+	prev_hop = (IncrPathHop *) linitial(hops);
+	initStringInfo(&sql);
+	appendStringInfo(&sql, "SELECT %s AS c FROM %s _anc0_",
+					 quote_identifier(prev_hop->col_self), delta_table);
+
+	idx = 1;
+	first_hop = true;
+	foreach(lc, hops)
+	{
+		IncrPathHop *hop = lfirst(lc);
+		StringInfoData next;
+
+		if (first_hop)
+		{
+			first_hop = false;
+			continue;				/* hop 0 already consumed as the base */
+		}
+
+		initStringInfo(&next);
+		appendStringInfo(&next,
+						 "SELECT _anc%d_.%s AS c FROM %s _anc%d_ WHERE _anc%d_.%s IN (%s)",
+						 idx, quote_identifier(hop->col_self),
+						 mv_qname(hop->oid), idx,
+						 idx, quote_identifier(prev_hop->col_parent),
+						 sql.data);
+		sql = next;
+		prev_hop = hop;
+		idx++;
+	}
+	last_hop = prev_hop;
+
+	appendStringInfo(anchor_cte_body, "SELECT DISTINCT c AS ak FROM (%s) _anc_top_",
+					 sql.data);
+	*anchor_col_out = pstrdup(last_hop->col_parent);
+	return true;
+}
+
+/*
  * incr_build_affected_sql
  *
  * Append the _affected_ CTE arms for one delta source: the GROUP BY key tuples
@@ -5728,7 +5999,7 @@ incr_table_at_or_below(List *all_tables, int k_varno, int d_varno)
 static bool
 incr_build_affected_sql(StringInfo buf, Query *viewQuery,
 						int delta_varno, const char *delta_table,
-						List *all_tables)
+						List *all_tables, const char *anchor_col)
 {
 	ListCell	   *lc;
 	bool			first;
@@ -5856,6 +6127,105 @@ incr_build_affected_sql(StringInfo buf, Query *viewQuery,
 	aff_dq = incr_build_delta_select_query(viewQuery, delta_entry->oid,
 										   delta_table);
 	aff_dq->havingQual = NULL;
+
+	/*
+	 * Anchor restriction (M5 perf): restrict arm 1's (and, since they share
+	 * aff_sel, the orphan arm's) scan to only the anchor rows reachable from
+	 * the delta ENR — see incr_plan_anchor_restrict for the full rationale and
+	 * safety argument.  anchor_col is non-NULL only when the caller
+	 * (incr_build_recompute_sql) already built and emitted the matching
+	 * "_aff_anchor_" CTE that this SubLink references.
+	 */
+	if (anchor_col != NULL)
+	{
+		RangeTblEntry *anchor_rte = rt_fetch(preserved_varno, aff_dq->rtable);
+		AttrNumber	   anchor_attnum = get_attnum(anchor_rte->relid, anchor_col);
+		Oid			   anchor_type;
+		int32		   anchor_typmod;
+		Oid			   anchor_coll;
+		Var			   *anchor_var;
+		RangeTblEntry  *cte;
+		RangeTblRef	   *rtr;
+		Query		   *sub;
+		Var			   *subvar;
+		SubLink		   *sl;
+		OpExpr		   *op;
+		Param		   *prm;
+		Oid			   eqop;
+
+		Assert(anchor_attnum != InvalidAttrNumber);
+		get_atttypetypmodcoll(anchor_rte->relid, anchor_attnum,
+							  &anchor_type, &anchor_typmod, &anchor_coll);
+		eqop = lookup_type_cache(anchor_type, TYPECACHE_EQ_OPR)->eq_opr;
+
+		if (OidIsValid(eqop))
+		{
+			anchor_var = makeVar(preserved_varno, anchor_attnum, anchor_type,
+								 anchor_typmod, anchor_coll, 0);
+
+			/* RTE_CTE forward-reference to "_aff_anchor_" (same pattern as
+			 * incr_inject_affected_filter's "_affected_" reference: the CTE
+			 * text lives in the enclosing statement, not in this Query). */
+			cte = makeNode(RangeTblEntry);
+			cte->rtekind = RTE_CTE;
+			cte->ctename = pstrdup("_aff_anchor_");
+			cte->ctelevelsup = 1;
+			cte->self_reference = false;
+			cte->coltypes = list_make1_oid(anchor_type);
+			cte->coltypmods = list_make1_int(anchor_typmod);
+			cte->colcollations = list_make1_oid(anchor_coll);
+			cte->alias = NULL;
+			cte->eref = makeAlias("_aff_anchor_", list_make1(makeString("ak")));
+			cte->lateral = false;
+			cte->inFromCl = true;
+
+			subvar = makeVar(1, 1, anchor_type, anchor_typmod, anchor_coll, 0);
+
+			rtr = makeNode(RangeTblRef);
+			rtr->rtindex = 1;
+
+			sub = makeNode(Query);
+			sub->commandType = CMD_SELECT;
+			sub->canSetTag = false;
+			sub->rtable = list_make1(cte);
+			sub->jointree = makeFromExpr(list_make1(rtr), NULL);
+			sub->targetList = list_make1(makeTargetEntry((Expr *) subvar, 1,
+														 pstrdup("ak"), false));
+
+			prm = makeNode(Param);
+			prm->paramkind = PARAM_SUBLINK;
+			prm->paramid = 1;
+			prm->paramtype = anchor_type;
+			prm->paramtypmod = anchor_typmod;
+			prm->paramcollid = anchor_coll;
+			prm->location = -1;
+
+			op = makeNode(OpExpr);
+			op->opno = eqop;
+			op->opfuncid = get_opcode(eqop);
+			op->opresulttype = BOOLOID;
+			op->opretset = false;
+			op->opcollid = InvalidOid;
+			op->inputcollid = anchor_coll;
+			op->args = list_make2(anchor_var, prm);
+			op->location = -1;
+
+			sl = makeNode(SubLink);
+			sl->subLinkType = ANY_SUBLINK;
+			sl->subLinkId = 0;
+			sl->testexpr = (Node *) op;
+			sl->operName = NIL;
+			sl->subselect = (Node *) sub;
+			sl->location = -1;
+
+			aff_dq->jointree->quals = (aff_dq->jointree->quals != NULL)
+				? (Node *) makeBoolExpr(AND_EXPR,
+										list_make2(aff_dq->jointree->quals, sl), -1)
+				: (Node *) sl;
+			aff_dq->hasSubLinks = true;
+		}
+	}
+
 	aff_sel = dbblue_deparse_query(aff_dq);
 
 	appendStringInfoString(buf, "\n  SELECT DISTINCT ");
@@ -5971,11 +6341,26 @@ incr_build_recompute_sql(Oid mvrelid, Query *viewQuery,
 {
 	StringInfoData	buf;
 	bool			force_delete;
+	bool			is_full_join = false;
+	char		   *anchor_col = NULL;
+	StringInfoData	anchor_body;
+	ListCell	   *lc;
 
+	foreach(lc, all_tables)
+		if (((IncrJoinEntry *) lfirst(lc))->join_type == JOIN_FULL)
+			is_full_join = true;
+
+	initStringInfo(&anchor_body);
 	initStringInfo(&buf);
-	appendStringInfoString(&buf, "WITH _affected_ AS (");
+	if (incr_plan_anchor_restrict(viewQuery, all_tables, delta_varno, delta_table,
+								  is_full_join, &anchor_body, &anchor_col))
+		appendStringInfo(&buf, "WITH _aff_anchor_ AS (\n%s\n),\n_affected_ AS (",
+						 anchor_body.data);
+	else
+		appendStringInfoString(&buf, "WITH _affected_ AS (");
+
 	force_delete = incr_build_affected_sql(&buf, viewQuery, delta_varno,
-										   delta_table, all_tables);
+										   delta_table, all_tables, anchor_col);
 	appendStringInfoString(&buf, "\n),\n");
 	incr_append_recompute_tail(&buf, mv_qname(mvrelid), viewQuery,
 							   include_delete_step || force_delete);
