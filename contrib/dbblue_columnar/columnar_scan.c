@@ -1742,6 +1742,8 @@ typedef struct DbbcAggScanState
 	MemoryContext groupctx;		/* group hash + transition states */
 	MemoryContext tmpctx;		/* per-row transfn call scratch */
 	AggState   *fake_aggstate;	/* satisfies AggCheckCallContext */
+	Size		grp_mem_limit;	/* hard runtime cap on groupctx (no spill) */
+	uint64		grp_since_memcheck; /* new groups since the last memory probe */
 	HASH_SEQ_STATUS seq;		/* emission cursor over the hash */
 	bool		seq_active;
 
@@ -2012,12 +2014,21 @@ dbbc_agg_grouped_classify(PlannerInfo *root, RelOptInfo *input_rel,
 	 * Every WHERE clause must be evaluable by the pre-filter machinery: this
 	 * node replaces the scan AND the Agg, so there is no ExecScan above it to
 	 * re-check anything.
+	 *
+	 * We also refuse any clause with a non-zero security_level (RLS policies,
+	 * security-barrier views). Core orders such quals (order_qual_clauses) so
+	 * that a lower-security qual is applied before a higher-security,
+	 * possibly-leaky one; this node evaluates all quals itself in list order
+	 * and would break that contract - so leave those queries to the normal
+	 * plan, which enforces the ordering.
 	 */
 	foreach(lc, input_rel->baserestrictinfo)
 	{
 		RestrictInfo *ri = lfirst_node(RestrictInfo, lc);
 		DbbcSkipQual probe;
 
+		if (ri->security_level > 0 || ri->pseudoconstant)
+			return false;
 		if (!dbbc_extract_one_qual((Node *) ri->clause, relid, &probe))
 			return false;
 		quals = lappend(quals, ri->clause);
@@ -2089,14 +2100,28 @@ dbbc_agg_grouped_classify(PlannerInfo *root, RelOptInfo *input_rel,
 	if (outmap == NIL)
 		return false;
 
-	/* bounded group count: the group hash has no spill path */
+	/*
+	 * Bounded group count: the group hash has no spill path (unlike stock
+	 * HashAgg, which spills since v13), so a wrong low estimate would build
+	 * an unbounded in-memory hash. Refuse when the estimate exceeds the cap,
+	 * AND when the estimate is a DEFAULT fallback (no statistics) on a table
+	 * big enough to blow the cap - that is exactly when estimate_num_groups
+	 * is least trustworthy (it returns 200 for an unanalyzed column). A hard
+	 * runtime backstop in dbbc_grp_lookup catches the rest.
+	 */
 	if (keyexprs == NIL)
 		*ngroups_out = 1.0;
 	else
 	{
+		EstimationInfo estinfo;
+
+		memset(&estinfo, 0, sizeof(estinfo));
 		*ngroups_out = estimate_num_groups(root, keyexprs,
-										   input_rel->rows, NULL, NULL);
+										   input_rel->rows, NULL, &estinfo);
 		if (*ngroups_out > (double) DBBC_GRP_MAX_GROUPS)
+			return false;
+		if ((estinfo.flags & SELFLAG_USED_DEFAULT) &&
+			input_rel->rows > (double) DBBC_GRP_MAX_GROUPS)
 			return false;
 	}
 
@@ -2395,6 +2420,17 @@ dbbc_grp_begin(DbbcAggScanState *as, List *payload, EState *estate, int eflags)
 	fakeecxt->ecxt_per_tuple_memory = as->groupctx;
 	as->fake_aggstate->curaggcontext = fakeecxt;
 
+	/*
+	 * Runtime memory backstop: this node cannot spill, so bound the group
+	 * hash by the same budget HashAgg would use (hash_mem_multiplier *
+	 * work_mem). The plan-time estimate gate is the primary defense; this
+	 * catches estimate errors (stale/correlated stats) before they OOM the
+	 * backend - failing one query with a clear hint beats crashing the
+	 * cluster into recovery.
+	 */
+	as->grp_mem_limit = get_hash_memory_limit();
+	as->grp_since_memcheck = 0;
+
 	/* per-aggregate catalog setup, mirroring ExecInitAgg */
 	i = 0;
 	foreach(lc, aggrefs)
@@ -2524,11 +2560,26 @@ dbbc_grp_begin(DbbcAggScanState *as, List *payload, EState *estate, int eflags)
 		ReleaseSysCache(aggTuple);
 	}
 
-	/* re-extract the pushed quals for our own per-row tests */
+	/*
+	 * Re-extract the pushed quals for our own per-row tests. Every clause was
+	 * proven extractable at plan time; if catalog changes under a cached plan
+	 * (e.g. a column type's default btree opclass was replaced - opclass
+	 * membership does not invalidate the plan) make one no longer extractable,
+	 * dbbc_extract_skip_quals would silently return fewer, and this node -
+	 * having no parent recheck - would aggregate UNFILTERED rows. Refuse to
+	 * run instead: a clear error beats a silently wrong total.
+	 */
 	if (as->qual_clauses != NIL)
+	{
 		as->nskipquals = dbbc_extract_skip_quals(as->qual_clauses,
 												 as->qual_varno,
 												 &as->skipquals);
+		if (as->nskipquals != list_length(as->qual_clauses))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("dbblue_columnar: a pushed-down filter is no longer extractable"),
+					 errhint("The plan is stale after a catalog change; re-plan the query (DISCARD PLANS) or SET dbblue_columnar.enable_columnar_scan = off.")));
+	}
 
 	/*
 	 * Distinct referenced columns and their CURRENT catalog types: a block's
@@ -2830,6 +2881,22 @@ dbbc_grp_lookup(DbbcAggScanState *as, Datum *keyvals, bool *keynulls)
 			st->transValueIsNull = t->initValueIsNull;
 			st->noTransValue = t->initValueIsNull;
 		}
+
+		/*
+		 * Runtime memory backstop (no spill path). Probe the group context
+		 * periodically - MemoryContextMemAllocated recurses, so amortize it -
+		 * and refuse rather than grow unboundedly toward an OOM.
+		 */
+		if (++as->grp_since_memcheck >= 1024)
+		{
+			as->grp_since_memcheck = 0;
+			if (MemoryContextMemAllocated(as->groupctx, true) >
+				as->grp_mem_limit)
+				ereport(ERROR,
+						(errcode(ERRCODE_OUT_OF_MEMORY),
+						 errmsg("dbblue_columnar: grouped aggregate exceeded the hash memory limit"),
+						 errhint("Too many groups for the in-node aggregate (it does not spill). ANALYZE the table, raise hash_mem_multiplier/work_mem, or SET dbblue_columnar.enable_columnar_scan = off.")));
+		}
 	}
 	return entry;
 }
@@ -2965,12 +3032,23 @@ dbbc_grp_consume_block(DbbcAggScanState *as, DbbcScanState *s,
 	{
 		Datum		keyvals[DBBC_GRP_MAX_KEYS];
 		bool		keynulls[DBBC_GRP_MAX_KEYS];
+		MemoryContext oldctx;
 		bool		pass = true;
 		int			i;
 		int			k;
 		int			a;
 
 		CHECK_FOR_INTERRUPTS();
+
+		/*
+		 * Do the whole per-row evaluation in tmpctx: qual comparisons and
+		 * transition-function calls can detoast/allocate (bttextcmp,
+		 * numeric_*), and without this those allocations would accumulate in
+		 * the query context for the entire input pass. Transition STATE is
+		 * written to groupctx by the callees, so it survives the reset.
+		 */
+		MemoryContextReset(as->tmpctx);
+		oldctx = MemoryContextSwitchTo(as->tmpctx);
 
 		for (i = 0; i < as->nskipquals; i++)
 		{
@@ -2986,25 +3064,26 @@ dbbc_grp_consume_block(DbbcAggScanState *as, DbbcScanState *s,
 				break;
 			}
 		}
-		if (!pass)
-			continue;
-
-		MemoryContextReset(as->tmpctx);
-		for (k = 0; k < as->nkeys; k++)
+		if (pass)
 		{
-			int			kc = s->attno_to_col[as->key_attnos[k] - 1];
-
-			keyvals[k] = dbbc_chunk_read(s, kc, row, &keynulls[k]);
-		}
-		for (a = 0; a < as->ntrans; a++)
-			if (as->trans[a].numTransInputs == 1)
+			for (k = 0; k < as->nkeys; k++)
 			{
-				int			ac = s->attno_to_col[as->trans[a].input_attno - 1];
+				int			kc = s->attno_to_col[as->key_attnos[k] - 1];
 
-				as->in_vals[a] = dbbc_chunk_read(s, ac, row, &as->in_nulls[a]);
+				keyvals[k] = dbbc_chunk_read(s, kc, row, &keynulls[k]);
 			}
-		dbbc_grp_advance(as, dbbc_grp_lookup(as, keyvals, keynulls));
-		as->grp_rows++;
+			for (a = 0; a < as->ntrans; a++)
+				if (as->trans[a].numTransInputs == 1)
+				{
+					int			ac = s->attno_to_col[as->trans[a].input_attno - 1];
+
+					as->in_vals[a] = dbbc_chunk_read(s, ac, row,
+													 &as->in_nulls[a]);
+				}
+			dbbc_grp_advance(as, dbbc_grp_lookup(as, keyvals, keynulls));
+			as->grp_rows++;
+		}
+		MemoryContextSwitchTo(oldctx);
 	}
 }
 
@@ -3033,12 +3112,18 @@ dbbc_grp_consume_heap_range(DbbcAggScanState *as, DbbcScanState *s,
 	{
 		Datum		keyvals[DBBC_GRP_MAX_KEYS];
 		bool		keynulls[DBBC_GRP_MAX_KEYS];
+		MemoryContext oldctx;
 		bool		pass = true;
 		int			i;
 		int			k;
 		int			a;
 
 		CHECK_FOR_INTERRUPTS();
+
+		/* per-row scratch in tmpctx; state goes to groupctx (see the block
+		 * consumer for the rationale) */
+		MemoryContextReset(as->tmpctx);
+		oldctx = MemoryContextSwitchTo(as->tmpctx);
 
 		for (i = 0; i < as->nskipquals; i++)
 		{
@@ -3053,20 +3138,20 @@ dbbc_grp_consume_heap_range(DbbcAggScanState *as, DbbcScanState *s,
 				break;
 			}
 		}
-		if (!pass)
-			continue;
-
-		MemoryContextReset(as->tmpctx);
-		for (k = 0; k < as->nkeys; k++)
-			keyvals[k] = slot_getattr(s->heap_slot, as->key_attnos[k],
-									  &keynulls[k]);
-		for (a = 0; a < as->ntrans; a++)
-			if (as->trans[a].numTransInputs == 1)
-				as->in_vals[a] = slot_getattr(s->heap_slot,
-											  as->trans[a].input_attno,
-											  &as->in_nulls[a]);
-		dbbc_grp_advance(as, dbbc_grp_lookup(as, keyvals, keynulls));
-		as->grp_rows++;
+		if (pass)
+		{
+			for (k = 0; k < as->nkeys; k++)
+				keyvals[k] = slot_getattr(s->heap_slot, as->key_attnos[k],
+										  &keynulls[k]);
+			for (a = 0; a < as->ntrans; a++)
+				if (as->trans[a].numTransInputs == 1)
+					as->in_vals[a] = slot_getattr(s->heap_slot,
+												  as->trans[a].input_attno,
+												  &as->in_nulls[a]);
+			dbbc_grp_advance(as, dbbc_grp_lookup(as, keyvals, keynulls));
+			as->grp_rows++;
+		}
+		MemoryContextSwitchTo(oldctx);
 	}
 	table_endscan(scan);
 	as->grp_ranges_heap++;
@@ -3443,29 +3528,30 @@ dbbc_agg_rescan(CustomScanState *node)
 	DbbcAggScanState *as = (DbbcAggScanState *) node;
 	int			a;
 
-	as->executed = false;
 	if (as->grouped)
 	{
+		/*
+		 * The grouped node's output depends on no parameter (only Const
+		 * quals, plain-column keys/inputs), so a rescan yields identical
+		 * groups. Keep the built hash and just rewind the emission cursor
+		 * rather than rebuilding (like Material). Rebuilding would re-pin the
+		 * version and register a fresh heap slot in es_tupleTable on every
+		 * rescan - an unbounded leak under an unmaterialized nestloop inner.
+		 */
 		if (as->seq_active)
 		{
 			hash_seq_term(&as->seq);
 			as->seq_active = false;
 		}
-		if (as->groups != NULL)
+		if (as->executed && as->groups != NULL)
 		{
-			hash_destroy(as->groups);
-			as->groups = NULL;	/* recreated lazily by the next build */
+			hash_seq_init(&as->seq, as->groups);
+			as->seq_active = true;
 		}
-		if (as->groupctx != NULL)
-			MemoryContextReset(as->groupctx);
-		if (as->tmpctx != NULL)
-			MemoryContextReset(as->tmpctx);
-		as->grp_blocks_served = 0;
-		as->grp_blocks_skipped = 0;
-		as->grp_ranges_heap = 0;
-		as->grp_rows = 0;
 		return;
 	}
+
+	as->executed = false;
 	if (as->counts)
 		memset(as->counts, 0, as->naggs * sizeof(int64));
 	for (a = 0; a < as->naggs; a++)
