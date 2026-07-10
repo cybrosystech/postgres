@@ -79,9 +79,11 @@
 #include "utils/fmgroids.h"
 #include "utils/hsearch.h"
 #include "utils/lsyscache.h"
+#include "utils/queryenvironment.h"
 #include "utils/rel.h"
 #include "utils/ruleutils.h"
 #include "utils/syscache.h"
+#include "utils/tuplestore.h"
 #include "utils/typcache.h"
 
 /* ----------
@@ -181,6 +183,9 @@ static bool incr_plan_anchor_restrict(Query *viewQuery, List *all_tables,
 									  bool is_full_join,
 									  StringInfo anchor_cte_body,
 									  char **anchor_col_out);
+static List *incr_collect_delta_join_cols(List *all_tables, List *rtable,
+										  int delta_varno);
+static void incr_register_empty_enr(const char *name, Relation rel);
 static char *incr_build_recompute_sql(Oid mvrelid, Query *viewQuery,
 								   int delta_varno, const char *delta_table,
 								   List *all_tables, bool include_delete_step);
@@ -5796,6 +5801,157 @@ incr_find_equality_hop(Node *qual, List *rtable, int child_varno, int parent_var
 }
 
 /*
+ * refs_varno_walker / incr_expr_refs_varno — does any Var of `varno` appear
+ * anywhere in the expression?  Used by incr_collect_delta_join_cols to decide
+ * whether a qual is "relevant" to the delta table.
+ */
+typedef struct RefsVarnoCtx { int varno; bool found; } RefsVarnoCtx;
+
+static bool
+refs_varno_walker(Node *node, RefsVarnoCtx *ctx)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Var))
+	{
+		if (((Var *) node)->varno == ctx->varno)
+			ctx->found = true;
+		return ctx->found;
+	}
+	return expression_tree_walker(node, refs_varno_walker, ctx);
+}
+
+static bool
+incr_expr_refs_varno(Node *node, int varno)
+{
+	RefsVarnoCtx ctx;
+
+	ctx.varno = varno;
+	ctx.found = false;
+	refs_varno_walker(node, &ctx);
+	return ctx.found;
+}
+
+/*
+ * collect_join_cols_walk — recursive core of incr_collect_delta_join_cols.
+ *
+ * Returns false ("unclean") if any part of `node` that references delta_varno
+ * is not a plain "=" equality between two Vars inside a pure AND-tree; on
+ * success appends the delta-side column name of every such equality to *cols
+ * (deduplicated by name).  A sub-expression that does NOT reference delta_varno
+ * is irrelevant and always clean.  Mirrors incr_find_equality_hop's narrowness:
+ * OR/NOT, non-equality operators, or expression operands that touch the delta
+ * table all force a false return, so the caller falls back to the current,
+ * always-correct, unconditional orphan arm.
+ */
+static bool
+collect_join_cols_walk(Node *node, List *rtable, int delta_varno, List **cols)
+{
+	if (node == NULL)
+		return true;
+
+	if (IsA(node, OpExpr))
+	{
+		OpExpr *op = (OpExpr *) node;
+
+		if (!incr_expr_refs_varno(node, delta_varno))
+			return true;			/* equality/predicate not on the delta */
+
+		if (list_length(op->args) == 2)
+		{
+			Node *lhs = linitial(op->args);
+			Node *rhs = lsecond(op->args);
+
+			if (IsA(lhs, Var) && IsA(rhs, Var))
+			{
+				Var  *lv = (Var *) lhs;
+				Var  *rv = (Var *) rhs;
+				Var  *dv = NULL;
+				char *opname = get_opname(op->opno);
+
+				if (opname != NULL && strcmp(opname, "=") == 0)
+				{
+					if (lv->varno == delta_varno)
+						dv = lv;
+					else if (rv->varno == delta_varno)
+						dv = rv;
+
+					if (dv != NULL)
+					{
+						int			rv_unused;
+						const char *c = incr_resolve_var_colname(dv, rtable,
+																 &rv_unused);
+
+						if (c != NULL)
+						{
+							ListCell *lc;
+							bool	  dup = false;
+
+							foreach(lc, *cols)
+								if (strcmp((char *) lfirst(lc), c) == 0)
+								{ dup = true; break; }
+							if (!dup)
+								*cols = lappend(*cols, (char *) c);
+							return true;
+						}
+					}
+				}
+			}
+		}
+		return false;				/* delta ref inside a non-plain-eq operator */
+	}
+
+	if (IsA(node, BoolExpr))
+	{
+		BoolExpr *b = (BoolExpr *) node;
+		ListCell *lc;
+
+		if (b->boolop != AND_EXPR)
+			return !incr_expr_refs_varno(node, delta_varno);	/* OR/NOT */
+		foreach(lc, b->args)
+			if (!collect_join_cols_walk(lfirst(lc), rtable, delta_varno, cols))
+				return false;
+		return true;
+	}
+
+	/* any other node kind is clean only if it does not touch the delta */
+	return !incr_expr_refs_varno(node, delta_varno);
+}
+
+/*
+ * incr_collect_delta_join_cols — the set of columns of the delta table that
+ * participate in a join equality anywhere in the view's join tree (as either
+ * side of a plain "=").  A delta whose transition images agree on every one of
+ * these columns cannot have changed any fact row's reachability through the
+ * delta table, so no orphan/de-orphan transition is possible — that is exactly
+ * what the NULL-transition gate needs.
+ *
+ * Scans every IncrJoinEntry's ON condition (the delta table's own column
+ * appears in its own entry AND in any child's entry), collecting delta-side
+ * equality columns.  Returns NIL — meaning "no safe gate, keep the
+ * unconditional orphan arm" — if any qual that references the delta table is
+ * not a clean AND-tree of plain Var=Var equalities, or if no join column is
+ * found.
+ */
+static List *
+incr_collect_delta_join_cols(List *all_tables, List *rtable, int delta_varno)
+{
+	List	   *cols = NIL;
+	ListCell   *lc;
+
+	foreach(lc, all_tables)
+	{
+		IncrJoinEntry *je = lfirst(lc);
+
+		if (je->quals == NULL)
+			continue;
+		if (!collect_join_cols_walk(je->quals, rtable, delta_varno, &cols))
+			return NIL;				/* unclean qual → abandon the gate */
+	}
+	return cols;					/* possibly NIL (no join col found) */
+}
+
+/*
  * incr_build_dep_path — walk the join-ancestry chain from delta_varno up to
  * anchor_varno, validating every hop is a clean "=" equality
  * (incr_find_equality_hop) and collecting the ordered path as a List of
@@ -6280,6 +6436,62 @@ incr_build_affected_sql(StringInfo buf, Query *viewQuery,
 				appendStringInfo(buf, "_og_.%s AS %s", resname, resname);
 		}
 		appendStringInfo(buf, "\n  FROM (%s) _og_", aff_sel);
+
+		/*
+		 * NULL-transition gate (perf).  The orphan arm exists to catch fact
+		 * rows whose orphan status FLIPS because of this delta.  A delta that
+		 * changed no join column of the delta table cannot flip any fact row's
+		 * reachability through it — e.g. a plain rename of a dimension's label
+		 * column — yet the arm would still emit a NULL group key, forcing the
+		 * (unrestricted, O(fact)) NULL arm in _new_agg_ to run for nothing.
+		 *
+		 * Guard the arm with EXISTS over the symmetric multiset difference of
+		 * the delta table's join columns between its two transition images: it
+		 * is empty exactly when every join-column tuple is unchanged (EXCEPT
+		 * ALL treats NULLs as not distinct, which is right — an unchanged NULL
+		 * join key is no transition).  When empty the arm emits no row, so no
+		 * NULL reaches _affected_ and the NULL arm's uncorrelated EXISTS gate is
+		 * false — its full-table scan is skipped entirely.  For a pure
+		 * INSERT/DELETE one image is the empty ENR, so the difference is the
+		 * whole delta and the arm always fires (a real transition may exist).
+		 *
+		 * Applied only when every join qual touching the delta table is a clean
+		 * AND-tree of plain Var=Var equalities (incr_collect_delta_join_cols
+		 * returns the delta-side columns); otherwise the arm stays
+		 * unconditional — the current, always-correct behavior.
+		 */
+		{
+			List *jcols = incr_collect_delta_join_cols(all_tables,
+													   viewQuery->rtable,
+													   delta_varno);
+
+			if (jcols != NIL)
+			{
+				StringInfoData collist;
+				ListCell	  *jc;
+				bool		   jfirst = true;
+
+				initStringInfo(&collist);
+				foreach(jc, jcols)
+				{
+					if (!jfirst) appendStringInfoString(&collist, ", ");
+					jfirst = false;
+					appendStringInfoString(&collist,
+										   quote_identifier((char *) lfirst(jc)));
+				}
+
+				appendStringInfo(buf,
+					"\n  WHERE EXISTS (\n"
+					"    (SELECT %s FROM %s EXCEPT ALL SELECT %s FROM %s)\n"
+					"    UNION ALL\n"
+					"    (SELECT %s FROM %s EXCEPT ALL SELECT %s FROM %s))",
+					collist.data, MATVIEW_INCR_OLDTABLE,
+					collist.data, MATVIEW_INCR_NEWTABLE,
+					collist.data, MATVIEW_INCR_NEWTABLE,
+					collist.data, MATVIEW_INCR_OLDTABLE);
+				pfree(collist.data);
+			}
+		}
 	}
 
 	/* ----------------------------------------------------------------
@@ -7916,6 +8128,40 @@ incr_fetch_sql(Oid mvrelid, Oid srctable, int plan_type)
 	return sql;
 }
 
+/*
+ * incr_register_empty_enr — register `name` as an EMPTY ephemeral relation with
+ * the source relation's rowtype.
+ *
+ * The NULL-transition gate (incr_build_affected_sql orphan arm) references BOTH
+ * transition tables so it can tell a plain rename from a real orphan flip.  But
+ * a pure INSERT registers only __mv_newtable and a pure DELETE only
+ * __mv_oldtable (four per-event triggers, each declaring just its own side).
+ * Registering the missing complement as an empty ENR makes the gate's
+ * cross-table EXCEPT ALL well-defined for single-sided deltas — it correctly
+ * reports "everything changed" (a non-empty side EXCEPT an empty side is the
+ * non-empty side), so pure inserts/deletes always fire the orphan arm.  An
+ * unreferenced empty ENR is harmless to every other shape's SQL.
+ *
+ * Same metadata shape SPI_register_trigger_data uses for the real transition
+ * tables (reliddesc = source rel, tupdesc = NULL, ENR_NAMED_TUPLESTORE); the
+ * reldata tuplestore is empty, so scanning it yields no rows.
+ */
+static void
+incr_register_empty_enr(const char *name, Relation rel)
+{
+	EphemeralNamedRelation enr = palloc_object(EphemeralNamedRelationData);
+
+	enr->md.name = pstrdup(name);
+	enr->md.reliddesc = RelationGetRelid(rel);
+	enr->md.tupdesc = NULL;
+	enr->md.enrtype = ENR_NAMED_TUPLESTORE;
+	enr->md.enrtuples = 0;
+	enr->reldata = tuplestore_begin_heap(false, false, work_mem);
+
+	/* ignore a duplicate registration defensively (should not occur) */
+	(void) SPI_register_relation(enr);
+}
+
 PG_FUNCTION_INFO_V1(matview_delta_apply);
 
 /*
@@ -8018,6 +8264,17 @@ matview_delta_apply(PG_FUNCTION_ARGS)
 
 	/* Register __mv_newtable / __mv_oldtable as ENRs visible to SPI queries */
 	SPI_register_trigger_data(trigdata);
+
+	/*
+	 * Register the ABSENT transition table as an empty ENR so the NULL-
+	 * transition gate (incr_build_affected_sql) can reference both sides in a
+	 * single-sided delta.  A pure INSERT has no __mv_oldtable; a pure DELETE no
+	 * __mv_newtable (an UPDATE always carries both).  See incr_register_empty_enr.
+	 */
+	if (trigdata->tg_oldtable == NULL)
+		incr_register_empty_enr(MATVIEW_INCR_OLDTABLE, trigdata->tg_relation);
+	if (trigdata->tg_newtable == NULL)
+		incr_register_empty_enr(MATVIEW_INCR_NEWTABLE, trigdata->tg_relation);
 
 	/* Allow DML on the matview during delta application */
 	OpenMatViewIncrementalMaintenance();
