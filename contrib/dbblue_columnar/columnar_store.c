@@ -395,50 +395,65 @@ dbbc_chunk_fetch_minmax(DbbcColumnChunk *chunk, dsa_pointer ptr)
 	return PointerGetDatum(addr);
 }
 
-/* free one block's DSA allocations, adding freed bytes to *freed */
+/*
+ * Drop one reference to a block. If this was the last reference, free all of
+ * its DSA allocations and release its bytes to the memory budget; otherwise
+ * (the block is still reachable through another version, e.g. an incremental
+ * refresh that reused it) leave it untouched. Every version referencing a
+ * block holds exactly one ref, taken at build (new block) or reuse
+ * (dbbc_block_ref), so the block outlives every version that points at it.
+ */
 static void
-dbbc_free_block(dsa_pointer blockptr, int ncols, Size *freed)
+dbbc_block_unref(dsa_pointer blockptr, int ncols)
 {
 	DbbcBlock  *block = (DbbcBlock *) dsa_get_address(dbbc_dsa, blockptr);
 	DbbcColumnChunk *chunks;
 	int			c;
 
+	if (pg_atomic_sub_fetch_u32(&block->refs, 1) != 0)
+		return;					/* still referenced by another version */
+
 	/* a block abandoned before its chunk array was allocated */
-	if (!DsaPointerIsValid(block->chunks))
+	if (DsaPointerIsValid(block->chunks))
 	{
-		dsa_free(dbbc_dsa, blockptr);
-		*freed += sizeof(DbbcBlock);
-		return;
+		chunks = (DbbcColumnChunk *) dsa_get_address(dbbc_dsa, block->chunks);
+		for (c = 0; c < ncols; c++)
+		{
+			DbbcColumnChunk *chunk = &chunks[c];
+
+			if (DsaPointerIsValid(chunk->values))
+				dsa_free(dbbc_dsa, chunk->values);
+			if (DsaPointerIsValid(chunk->nulls))
+				dsa_free(dbbc_dsa, chunk->nulls);
+			if (DsaPointerIsValid(chunk->varblob))
+				dsa_free(dbbc_dsa, chunk->varblob);
+			if (DsaPointerIsValid(chunk->min_value))
+				dsa_free(dbbc_dsa, chunk->min_value);
+			if (DsaPointerIsValid(chunk->max_value))
+				dsa_free(dbbc_dsa, chunk->max_value);
+		}
+		dsa_free(dbbc_dsa, block->chunks);
 	}
 
-	chunks = (DbbcColumnChunk *) dsa_get_address(dbbc_dsa, block->chunks);
-	for (c = 0; c < ncols; c++)
-	{
-		DbbcColumnChunk *chunk = &chunks[c];
-
-		if (DsaPointerIsValid(chunk->values))
-			dsa_free(dbbc_dsa, chunk->values);
-		if (DsaPointerIsValid(chunk->nulls))
-			dsa_free(dbbc_dsa, chunk->nulls);
-		if (DsaPointerIsValid(chunk->varblob))
-			dsa_free(dbbc_dsa, chunk->varblob);
-		if (DsaPointerIsValid(chunk->min_value))
-			dsa_free(dbbc_dsa, chunk->min_value);
-		if (DsaPointerIsValid(chunk->max_value))
-			dsa_free(dbbc_dsa, chunk->max_value);
-		*freed += chunk->total_bytes;
-	}
-	dsa_free(dbbc_dsa, block->chunks);
+	/* release this block's whole reservation exactly once, at physical free */
+	dbbc_release_bytes((int64) block->block_bytes);
 	dsa_free(dbbc_dsa, blockptr);
-	*freed += sizeof(DbbcBlock) + ncols * sizeof(DbbcColumnChunk);
+}
+
+/* take a reference to an existing block (incremental refresh block reuse) */
+static inline void
+dbbc_block_ref(dsa_pointer blockptr)
+{
+	DbbcBlock  *block = (DbbcBlock *) dsa_get_address(dbbc_dsa, blockptr);
+
+	pg_atomic_add_fetch_u32(&block->refs, 1);
 }
 
 /* free a retired version: its blocks, directory, attnums, and itself */
 static void
 dbbc_version_free(DbbcRelVersion *version)
 {
-	Size		freed = 0;
-	Size		total = version->total_bytes;
+	Size		meta = version->total_bytes;
 
 	if (DsaPointerIsValid(version->blockdir))
 	{
@@ -446,10 +461,15 @@ dbbc_version_free(DbbcRelVersion *version)
 			dsa_get_address(dbbc_dsa, version->blockdir);
 		uint32		i;
 
+		/*
+		 * Drop this version's reference to each block; a block shared with a
+		 * live version (incremental reuse) survives, and only the block whose
+		 * last reference this is gets freed - releasing its own bytes.
+		 */
 		for (i = 0; i < version->ndirslots; i++)
 		{
 			if (DsaPointerIsValid(dir[i]))
-				dbbc_free_block(dir[i], version->ncols, &freed);
+				dbbc_block_unref(dir[i], version->ncols);
 		}
 		dsa_free(dbbc_dsa, version->blockdir);
 	}
@@ -460,10 +480,11 @@ dbbc_version_free(DbbcRelVersion *version)
 	dsa_free(dbbc_dsa, version->self);
 
 	/*
-	 * Release what this version had reserved. total_bytes is authoritative;
-	 * the "freed" sum is a cross-check only.
+	 * Release only this version's own metadata bytes (directory + attnums +
+	 * the version struct). Block bytes are released per block in
+	 * dbbc_block_unref, so shared blocks are accounted exactly once.
 	 */
-	dbbc_release_bytes((int64) total);
+	dbbc_release_bytes((int64) meta);
 }
 
 /*
@@ -614,7 +635,6 @@ dbbc_populate_relation(Oid relid)
 	 * State shared with the PG_CATCH cleanup: what has been reserved and
 	 * allocated but not yet published (volatile per setjmp rules).
 	 */
-	volatile Size entry_bytes = 0;	/* reconciled bytes of finished blocks */
 	volatile Size inflight_bytes = 0;	/* reservation of the block being built */
 	volatile Size meta_resv = 0;	/* version+directory+attnums reservation */
 	volatile dsa_pointer attnums_dsa = InvalidDsaPointer;
@@ -994,10 +1014,22 @@ dbbc_populate_relation(Oid relid)
 				block->first_page = first_page;
 				block->npages = npages;
 				block->nrows = (uint32) ntuples;
+				pg_atomic_init_u32(&block->refs, 1);	/* this version's ref */
 				memset(block->stamps, 0, sizeof(block->stamps));
 				memcpy(block->stamps, stamps, npages * sizeof(DbbcPageStamp));
 				block->chunks = InvalidDsaPointer;
+				/*
+				 * The block now owns the coarse reservation and is reachable
+				 * through newdir[slot], so it self-accounts: hand block_total
+				 * to block_bytes and clear inflight_bytes. The CATCH path frees
+				 * reachable blocks via dbbc_block_unref (which releases
+				 * block_bytes), so counting it in inflight too would
+				 * double-release. block_bytes is refined to the exact acct once
+				 * the block is fully built (below).
+				 */
+				block->block_bytes = block_total;
 				newdir[slot] = blockptr;
+				inflight_bytes = 0;
 
 				block->chunks = dsa_allocate0(dbbc_dsa,
 											  ncols * sizeof(DbbcColumnChunk));
@@ -1061,19 +1093,21 @@ dbbc_populate_relation(Oid relid)
 
 				/*
 				 * Reconcile the coarse reservation with the exact allocation
-				 * so the shared counter tracks reality.
+				 * so the shared counter tracks reality. The block already holds
+				 * block_total via block_bytes (and is out of inflight); adjust
+				 * the reservation and block_bytes to the exact acct.
 				 */
 				if (acct > block_total)
 				{
 					if (!dbbc_try_reserve(acct - block_total))
 					{
-						/* over the line after exact sizing: undo the block */
-						Size		freed = 0;
-
-						dbbc_free_block(blockptr, ncols, &freed);
+						/*
+						 * Over the line after exact sizing: undo the block. It
+						 * still carries block_bytes == block_total, so unref
+						 * releases exactly the reservation we hold.
+						 */
+						dbbc_block_unref(blockptr, ncols);
 						newdir[slot] = InvalidDsaPointer;
-						dbbc_release_bytes((int64) block_total);
-						inflight_bytes = 0;
 						budget_hit = true;
 						MemoryContextSwitchTo(oldcxt);
 						ereport(NOTICE,
@@ -1081,16 +1115,11 @@ dbbc_populate_relation(Oid relid)
 										dbblue_columnar_memory_mb, blocks_built)));
 						break;
 					}
-					inflight_bytes = acct;
 				}
 				else if (acct < block_total)
-				{
 					dbbc_release_bytes((int64) (block_total - acct));
-					inflight_bytes = acct;
-				}
 
-				entry_bytes += acct;
-				inflight_bytes = 0;
+				block->block_bytes = acct;	/* exact; released once at unref */
 				blocks_built++;
 			}
 
@@ -1153,7 +1182,13 @@ dbbc_populate_relation(Oid relid)
 				version->av_at_build = av;
 			}
 			version->blockdir = blockdir_dsa;
-			version->total_bytes = entry_bytes + meta_bytes;
+			/*
+			 * Only the version's own metadata bytes; each block's bytes are
+			 * owned by the block and released in dbbc_block_unref, so a block
+			 * shared with another version is never double-counted or freed
+			 * early. (entry_bytes is retained for the budget NOTICE only.)
+			 */
+			version->total_bytes = meta_bytes;
 
 			key.dboid = MyDatabaseId;
 			key.reloid = relid;
@@ -1184,13 +1219,22 @@ dbbc_populate_relation(Oid relid)
 	{
 		if (!published)
 		{
-			Size		freed = 0;
 			uint32		ci;
 
+			/*
+			 * Unref every block reachable through newdir. A freshly built
+			 * block (refs==1) is freed and its block_bytes released; a block
+			 * reused from the prior version (incremental refresh, refs>1) is
+			 * merely un-referenced, undoing the ref we took - never freed and
+			 * its bytes never released (they belong to the surviving version).
+			 * So only the not-yet-tracked inflight reservation (a block
+			 * reserved but not yet reachable through newdir) and the version
+			 * metadata reservation remain to release here.
+			 */
 			for (ci = 0; ci < ndirslots; ci++)
 			{
 				if (DsaPointerIsValid(newdir[ci]))
-					dbbc_free_block(newdir[ci], ncols, &freed);
+					dbbc_block_unref(newdir[ci], ncols);
 			}
 			if (DsaPointerIsValid(attnums_dsa))
 				dsa_free(dbbc_dsa, attnums_dsa);
@@ -1198,7 +1242,7 @@ dbbc_populate_relation(Oid relid)
 				dsa_free(dbbc_dsa, blockdir_dsa);
 			if (DsaPointerIsValid(version_dsa))
 				dsa_free(dbbc_dsa, version_dsa);
-			dbbc_release_bytes((int64) (entry_bytes + inflight_bytes + meta_resv));
+			dbbc_release_bytes((int64) (inflight_bytes + meta_resv));
 		}
 		PG_RE_THROW();
 	}

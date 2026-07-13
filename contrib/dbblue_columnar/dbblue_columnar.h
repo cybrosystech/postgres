@@ -116,6 +116,16 @@ typedef struct DbbcBlock
 	BlockNumber first_page;		/* heap range [first_page, first_page+npages) */
 	uint16		npages;
 	uint32		nrows;			/* total live rows captured */
+	/*
+	 * Refcount: how many published (or in-flight) versions reference this
+	 * block. A block is shared when an incremental refresh reuses it from the
+	 * prior version, so it is freed only when the LAST referencing version is
+	 * freed - not with any single version. dbbc_block_unref decrements and
+	 * frees (releasing block_bytes to the memory budget) at zero.
+	 */
+	pg_atomic_uint32 refs;
+	Size		block_bytes;	/* this block's total DSA bytes, released once
+								 * at the free that drops refs to zero */
 	DbbcPageStamp stamps[DBBC_PAGES_PER_BLOCK];
 	dsa_pointer chunks;			/* DbbcColumnChunk[ncols] (rel entry order) */
 } DbbcBlock;

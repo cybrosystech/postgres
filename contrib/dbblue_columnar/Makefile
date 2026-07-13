@@ -28,3 +28,12 @@ top_builddir = ../..
 include $(top_builddir)/src/Makefile.global
 include $(top_srcdir)/contrib/contrib-global.mk
 endif
+
+# This build has autodepend off, so a change to the shared struct definitions
+# in dbblue_columnar.h would otherwise NOT recompile the objects - leaving a
+# stale object linked against an old struct layout that reads fields at the
+# wrong offsets (silent memory corruption, e.g. a dsa_pointer read from the
+# wrong offset -> "could not attach to a segment that has been freed"). Force
+# every object to depend on the header. Placed after the PGXS include so $(OBJS)
+# and the built-in %.o rules are already defined.
+$(OBJS): dbblue_columnar.h
