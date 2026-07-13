@@ -172,7 +172,8 @@ static char *qual_to_live_sql(Node *qual, List *rtable, List *all_tables,
 							   int preserved_varno);
 static bool incr_build_affected_sql(StringInfo buf, Query *viewQuery,
 									int delta_varno, const char *delta_table,
-									List *all_tables, const char *anchor_col);
+									List *all_tables, const char *anchor_col,
+									int anchor_restrict_varno);
 static bool incr_find_equality_hop(Node *qual, List *rtable,
 								   int child_varno, int parent_varno,
 								   const char **child_col, const char **parent_col);
@@ -182,7 +183,8 @@ static bool incr_plan_anchor_restrict(Query *viewQuery, List *all_tables,
 									  int delta_varno, const char *delta_table,
 									  bool is_full_join,
 									  StringInfo anchor_cte_body,
-									  char **anchor_col_out);
+									  char **anchor_col_out,
+									  int *restrict_varno_out);
 static List *incr_collect_delta_join_cols(List *all_tables, List *rtable,
 										  int delta_varno);
 static void incr_register_empty_enr(const char *name, Relation rel);
@@ -6139,7 +6141,8 @@ incr_build_dep_path(Query *viewQuery, List *all_tables, int delta_varno,
 static bool
 incr_plan_anchor_restrict(Query *viewQuery, List *all_tables, int delta_varno,
 						  const char *delta_table, bool is_full_join,
-						  StringInfo anchor_cte_body, char **anchor_col_out)
+						  StringInfo anchor_cte_body, char **anchor_col_out,
+						  int *restrict_varno_out)
 {
 	int			preserved_varno = incr_outer_preserved_varno(all_tables);
 	List	   *hops;
@@ -6148,7 +6151,8 @@ incr_plan_anchor_restrict(Query *viewQuery, List *all_tables, int delta_varno,
 	IncrPathHop *prev_hop;
 	IncrPathHop *last_hop;
 	int			idx;
-	bool		first_hop;
+	int			n;
+	int			i;
 
 	if (is_full_join || delta_varno == preserved_varno)
 		return false;
@@ -6157,23 +6161,45 @@ incr_plan_anchor_restrict(Query *viewQuery, List *all_tables, int delta_varno,
 	if (hops == NIL)
 		return false;
 
+	/*
+	 * LINE-LEVEL restriction: build the chain up to, but NOT including, the LAST
+	 * hop (the one that joins into the anchor), and restrict THAT hop's own table
+	 * — the anchor's child, i.e. the fact grain — on its delta-facing FK, rather
+	 * than restricting the anchor itself.
+	 *
+	 * The last hop is a child→anchor join; restricting the anchor (its parent)
+	 * and then re-joining in arm 1 drags EVERY sibling child row back in — e.g.
+	 * for am(move) JOIN aml(line) LEFT JOIN pp LEFT JOIN pt, a delta on pt
+	 * restricting am.id pulls in all lines of every move that merely CONTAINS a
+	 * pt-connected line (~25x over-capture, and those siblings span the whole
+	 * never-NULL-key domain, defeating the recompute restriction).  Stopping one
+	 * hop earlier restricts aml.product_id directly — exactly the pt-connected
+	 * lines, index-driven via aml(product_id).
+	 *
+	 * A single-hop path (delta joins the anchor directly, e.g. fact LEFT JOIN
+	 * dim) has no hop to drop: the loop wraps nothing, prev_hop stays at hop0,
+	 * and we restrict hop0->parent_varno = the anchor (= the fact grain here) on
+	 * hop0->col_parent — identical to the previous behavior.  Always a SUPERSET
+	 * filter on a table that is in arm 1's join, so the full join downstream
+	 * re-applies every real condition; never too tight.
+	 */
+	n = list_length(hops);
 	prev_hop = (IncrPathHop *) linitial(hops);
 	initStringInfo(&sql);
 	appendStringInfo(&sql, "SELECT %s AS c FROM %s _anc0_",
 					 quote_identifier(prev_hop->col_self), delta_table);
 
 	idx = 1;
-	first_hop = true;
+	i = 0;
 	foreach(lc, hops)
 	{
 		IncrPathHop *hop = lfirst(lc);
 		StringInfoData next;
 
-		if (first_hop)
-		{
-			first_hop = false;
+		if (i++ == 0)
 			continue;				/* hop 0 already consumed as the base */
-		}
+		if (i - 1 == n - 1)
+			break;					/* drop the anchor-joining hop (line-level) */
 
 		initStringInfo(&next);
 		appendStringInfo(&next,
@@ -6186,11 +6212,12 @@ incr_plan_anchor_restrict(Query *viewQuery, List *all_tables, int delta_varno,
 		prev_hop = hop;
 		idx++;
 	}
-	last_hop = prev_hop;
+	last_hop = prev_hop;			/* last hop actually placed in the chain */
 
 	appendStringInfo(anchor_cte_body, "SELECT DISTINCT c AS ak FROM (%s) _anc_top_",
 					 sql.data);
 	*anchor_col_out = pstrdup(last_hop->col_parent);
+	*restrict_varno_out = last_hop->parent_varno;
 	return true;
 }
 
@@ -6229,7 +6256,8 @@ incr_plan_anchor_restrict(Query *viewQuery, List *all_tables, int delta_varno,
 static bool
 incr_build_affected_sql(StringInfo buf, Query *viewQuery,
 						int delta_varno, const char *delta_table,
-						List *all_tables, const char *anchor_col)
+						List *all_tables, const char *anchor_col,
+						int anchor_restrict_varno)
 {
 	ListCell	   *lc;
 	bool			first;
@@ -6368,7 +6396,7 @@ incr_build_affected_sql(StringInfo buf, Query *viewQuery,
 	 */
 	if (anchor_col != NULL)
 	{
-		RangeTblEntry *anchor_rte = rt_fetch(preserved_varno, aff_dq->rtable);
+		RangeTblEntry *anchor_rte = rt_fetch(anchor_restrict_varno, aff_dq->rtable);
 		AttrNumber	   anchor_attnum = get_attnum(anchor_rte->relid, anchor_col);
 		Oid			   anchor_type;
 		int32		   anchor_typmod;
@@ -6390,7 +6418,7 @@ incr_build_affected_sql(StringInfo buf, Query *viewQuery,
 
 		if (OidIsValid(eqop))
 		{
-			anchor_var = makeVar(preserved_varno, anchor_attnum, anchor_type,
+			anchor_var = makeVar(anchor_restrict_varno, anchor_attnum, anchor_type,
 								 anchor_typmod, anchor_coll, 0);
 
 			/* RTE_CTE forward-reference to "_aff_anchor_" (same pattern as
@@ -6629,6 +6657,7 @@ incr_build_recompute_sql(Oid mvrelid, Query *viewQuery,
 	bool			force_delete;
 	bool			is_full_join = false;
 	char		   *anchor_col = NULL;
+	int				anchor_restrict_varno = 0;
 	StringInfoData	anchor_body;
 	ListCell	   *lc;
 
@@ -6639,14 +6668,16 @@ incr_build_recompute_sql(Oid mvrelid, Query *viewQuery,
 	initStringInfo(&anchor_body);
 	initStringInfo(&buf);
 	if (incr_plan_anchor_restrict(viewQuery, all_tables, delta_varno, delta_table,
-								  is_full_join, &anchor_body, &anchor_col))
+								  is_full_join, &anchor_body, &anchor_col,
+								  &anchor_restrict_varno))
 		appendStringInfo(&buf, "WITH _aff_anchor_ AS (\n%s\n),\n_affected_ AS (",
 						 anchor_body.data);
 	else
 		appendStringInfoString(&buf, "WITH _affected_ AS (");
 
 	force_delete = incr_build_affected_sql(&buf, viewQuery, delta_varno,
-										   delta_table, all_tables, anchor_col);
+										   delta_table, all_tables, anchor_col,
+										   anchor_restrict_varno);
 	appendStringInfoString(&buf, "\n),\n");
 	incr_append_recompute_tail(&buf, mv_qname(mvrelid), viewQuery, all_tables,
 							   include_delete_step || force_delete);

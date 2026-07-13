@@ -133,5 +133,47 @@ BEGIN
 END$$;
 DROP TABLE ar_f3, ar_d3 CASCADE;
 
+-- 4. LINE-LEVEL anchor: a move/line parent-child fact side (ar_m(move) JOIN
+--    ar_l(line) LEFT JOIN dim), where the aggregate is at LINE grain.  The
+--    anchor restriction must key on the LINE table's FK (ar_l.pid), not the
+--    move (ar_m.id) — restricting the move would drag in every SIBLING line of
+--    a move that merely contains a dim-connected line.  Correctness is the same
+--    either way (superset), so this case pins that a dim delta touching only
+--    SOME lines of a move — with orphaned sibling lines present — stays ==
+--    REFRESH.  (The tighter line-level scan is the perf win; == REFRESH is the
+--    guardrail.)
+DROP TABLE IF EXISTS ar_m, ar_l, ar_dim CASCADE;
+CREATE TABLE ar_dim(id int primary key, code text);
+CREATE TABLE ar_m(id int primary key, d int NOT NULL);
+CREATE TABLE ar_l(id int primary key, move_id int NOT NULL, pid int, amt numeric NOT NULL);
+INSERT INTO ar_dim VALUES (1,'A'),(2,'B'),(3,'C');
+INSERT INTO ar_m VALUES (100,1),(101,1),(102,2);
+-- move 100 mixes a dim-1 line, a dim-2 line, and an ORPHAN line (pid=9 dangling)
+INSERT INTO ar_l VALUES (1,100,1,10),(2,100,2,20),(3,100,9,30),
+                        (4,101,1,40),(5,102,3,50),(6,102,NULL,60);
+CREATE MATERIALIZED VIEW ar4_i WITH (incremental_refresh=true) AS
+  SELECT ar_m.d, ar_dim.code gk, sum(ar_l.amt) s, count(*) c
+  FROM ar_m JOIN ar_l ON ar_l.move_id=ar_m.id LEFT JOIN ar_dim ON ar_l.pid=ar_dim.id
+  GROUP BY ar_m.d, ar_dim.code;
+CREATE MATERIALIZED VIEW ar4_o AS
+  SELECT ar_m.d, ar_dim.code gk, sum(ar_l.amt) s, count(*) c
+  FROM ar_m JOIN ar_l ON ar_l.move_id=ar_m.id LEFT JOIN ar_dim ON ar_l.pid=ar_dim.id
+  GROUP BY ar_m.d, ar_dim.code;
+UPDATE ar_dim SET code='A2' WHERE id=1;    -- rename: touches lines 1 & 4 only (not sibling 2,3)
+DELETE FROM ar_dim WHERE id=2;             -- orphans line 2 (a sibling of dim-1 line 1 in move 100)
+INSERT INTO ar_dim VALUES (9,'I');         -- de-orphans line 3 (pid=9)
+UPDATE ar_l SET pid=3 WHERE id=6;          -- connect a previously-NULL line
+REFRESH MATERIALIZED VIEW ar4_o;
+DO $$
+DECLARE ndiff int;
+BEGIN
+  SELECT count(*) INTO ndiff FROM (
+    (SELECT d,gk,s,c FROM ar4_i EXCEPT SELECT d,gk,s,c FROM ar4_o) UNION ALL
+    (SELECT d,gk,s,c FROM ar4_o EXCEPT SELECT d,gk,s,c FROM ar4_i)) z;
+  IF ndiff=0 THEN RAISE NOTICE 'line-level anchor (move/line grain, sibling+orphan lines) == REFRESH: PASS';
+  ELSE RAISE EXCEPTION 'line-level anchor: FAIL (% rows differ)', ndiff; END IF;
+END$$;
+DROP TABLE ar_m, ar_l, ar_dim CASCADE;
+
 \echo ''
 \echo '=== M5 anchor-restriction test complete ==='
