@@ -6783,7 +6783,6 @@ incr_append_recompute_tail(StringInfo buf, const char *mvname,
 		char   *live_sel;
 		int		nkeys = list_length(viewQuery->groupClause);
 		bool	all_notnull = (nkeys > 0);
-		bool	fast_form;
 		bool	injected = false;
 
 		live_q->havingQual = NULL;
@@ -6803,17 +6802,19 @@ incr_append_recompute_tail(StringInfo buf, const char *mvname,
 				break;
 			}
 		}
-		/* single key: the NULL arm covers nullability; multi-key: all keys
-		 * must be provably NOT NULL for the non-NULL arm to be exhaustive */
-		fast_form = (nkeys == 1) || all_notnull;
-
-		if (fast_form)
+		/*
+		 * Non-NULL arm: recompute the affected groups with a per-key
+		 * "<key> IN (SELECT col FROM _affected_ WHERE col IS NOT NULL)" injected
+		 * into the aggregate's OWN where-clause, so the base scan is index-driven
+		 * and the affected-key restriction is a hashable semi-join pushed BEFORE
+		 * grouping (never a post-aggregation Nested Loop over all groups).  This
+		 * is attempted for EVERY key set — single-key, all-not-null multi-key,
+		 * AND nullable multi-key — because per-key IN only ever produces groups
+		 * whose keys are ALL non-NULL (IN never matches NULL), which is a correct
+		 * SUPERSET of the affected all-non-NULL groups.  The partial-NULL groups
+		 * it necessarily drops are recovered by the generalized NULL arm below.
+		 */
 		{
-			/*
-			 * Non-NULL arm: recompute restricted to the affected groups with
-			 * the key filter injected into the aggregate's own WHERE, so the
-			 * scan is index-driven (see incr_inject_affected_filter).
-			 */
 			Query  *inj_q = copyObject(viewQuery);
 
 			inj_q->havingQual = NULL;
@@ -6824,31 +6825,81 @@ incr_append_recompute_tail(StringInfo buf, const char *mvname,
 
 				appendStringInfo(buf, "_new_agg_ AS (\n  %s", inj_sel);
 
-				if (nkeys == 1 && !all_notnull)
+				/*
+				 * Generalized NULL arm.  When some group key is nullable, the
+				 * non-NULL arm cannot see any group that has a NULL in one of its
+				 * keys (an orphan/de-orphan group).  Recover exactly those: from
+				 * the FULL live aggregate keep the rows whose key tuple (a) has at
+				 * least one NULL — so it never overlaps the non-NULL arm — and (b)
+				 * NULL-safe-matches an affected tuple.  The whole arm is guarded
+				 * by an UNCORRELATED "EXISTS (_affected_ with any key NULL)"
+				 * one-time filter, so its full-table aggregate is skipped at
+				 * runtime unless a partial-NULL group is actually affected (the
+				 * orphan-transition case) — the common deltas never pay for it.
+				 * Reduces to the historical single-key NULL arm when nkeys==1.
+				 */
+				if (!all_notnull)
 				{
-					const char *k1 =
-						quote_identifier(get_sortgroupclause_tle(
-							linitial_node(SortGroupClause, viewQuery->groupClause),
-							viewQuery->targetList)->resname);
-
-					/* NULL-group arm: executes only when NULL is in _affected_ */
 					appendStringInfo(buf,
 									 "\n  UNION ALL\n"
 									 "  SELECT __live__.*\n"
 									 "  FROM (%s) __live__\n"
-									 "  WHERE __live__.%s IS NULL\n"
-									 "    AND EXISTS (SELECT 1 FROM _affected_ "
-									 "WHERE %s IS NULL)",
-									 live_sel, k1, k1);
+									 "  WHERE (", live_sel);
+					/* (a) __live__ tuple has >= 1 NULL key */
+					first = true;
+					foreach(lc, viewQuery->groupClause)
+					{
+						SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+						TargetEntry     *te  = get_sortgroupclause_tle(sgc,
+																	   viewQuery->targetList);
+						const char      *col = quote_identifier(te->resname);
+
+						if (!first) appendStringInfoString(buf, " OR ");
+						appendStringInfo(buf, "__live__.%s IS NULL", col);
+						first = false;
+					}
+					/* uncorrelated gate: some affected tuple has >= 1 NULL key */
+					appendStringInfoString(buf,
+										   ")\n    AND EXISTS (SELECT 1 FROM _affected_ WHERE ");
+					first = true;
+					foreach(lc, viewQuery->groupClause)
+					{
+						SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+						TargetEntry     *te  = get_sortgroupclause_tle(sgc,
+																	   viewQuery->targetList);
+						const char      *col = quote_identifier(te->resname);
+
+						if (!first) appendStringInfoString(buf, " OR ");
+						appendStringInfo(buf, "%s IS NULL", col);
+						first = false;
+					}
+					/* (b) __live__ tuple NULL-safe-matches an affected tuple */
+					appendStringInfoString(buf,
+										   ")\n    AND EXISTS (SELECT 1 FROM _affected_ _an_ WHERE ");
+					first = true;
+					foreach(lc, viewQuery->groupClause)
+					{
+						SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+						TargetEntry     *te  = get_sortgroupclause_tle(sgc,
+																	   viewQuery->targetList);
+						const char      *col = quote_identifier(te->resname);
+
+						if (!first) appendStringInfoString(buf, " AND ");
+						appendStringInfo(buf,
+										 "_an_.%s IS NOT DISTINCT FROM __live__.%s",
+										 col, col);
+						first = false;
+					}
+					appendStringInfoString(buf, ")");
 				}
 				appendStringInfoString(buf, "\n),\n");
 			}
 		}
 
 		/*
-		 * Fallback (multi-key with nullable/expression keys, or a key type
-		 * without a default equality operator): NULL-safe EXISTS.  Correct for
-		 * any key set; not index-driven (see the comment above).
+		 * Fallback (only when a key type lacks a default equality operator, so
+		 * the per-key IN cannot be built): NULL-safe EXISTS.  Correct for any key
+		 * set; not index-driven (see the comment above).
 		 */
 		if (!injected)
 		{
@@ -6942,77 +6993,132 @@ incr_append_recompute_tail(StringInfo buf, const char *mvname,
 						 quote_identifier(te->resname));
 		first = false;
 	}
-	appendStringInfoString(buf, "\n)\n");
+	if (!actual_delete_step)
+	{
+		/* No group can vanish; a benign SELECT terminates the WITH (_upd_ runs). */
+		appendStringInfoString(buf, "\n)\nSELECT 1");
+		return;
+	}
 
 	/* ----------------------------------------------------------------
-	 * Final statement.
-	 * Delete groups that were in _affected_ but no longer in _new_agg_.
-	 * Runs for del_sql always; also for ins_sql when arm 2 is present
-	 * (the NULL group can completely vanish).  Otherwise a benign SELECT
-	 * forces _upd_ to execute.
+	 * Deletion of vanished groups — index-driven.
+	 *
+	 * A group present in _affected_ but absent from _new_agg_ has vanished and
+	 * must be removed.  The old form —
+	 *     DELETE FROM mv _mv_ USING _affected_
+	 *     WHERE _mv_.k IS NOT DISTINCT FROM _affected_.k AND NOT EXISTS(_new_agg_)
+	 * — forced a Nested Loop over the WHOLE matview, because IS NOT DISTINCT FROM
+	 * is not an indexable/hashable operator: O(matview × affected), which is
+	 * catastrophic for a dimension delta with a large affected set (measured
+	 * co-dominant with the recompute on a 300k-group matview).
+	 *
+	 * Split by NULL pattern so the common bulk is served by the matview's unique
+	 * group-key index:
+	 *   • _vanished_ : the (small) affected groups no longer in _new_agg_.
+	 *   • the FINAL statement removes the all-non-NULL vanished groups with a
+	 *     row-value "(k1,…,kn) IN (SELECT … FROM _vanished_ WHERE <all non-NULL>)",
+	 *     which the unique index serves as O(vanished · log matview).
+	 *   • _delnull_ (a data-modifying CTE) removes the vanished groups that carry
+	 *     a NULL key, NULL-safe.  Those are orphan groups: few, and EMPTY for the
+	 *     common deltas (renames, non-orphaning changes — _vanished_ has no NULL
+	 *     row), so its unavoidable non-indexable match is bounded to near-nothing.
+	 *
+	 * _upd_ (upsert of _new_agg_) and both deletes touch DISJOINT matview rows —
+	 * present-in-_new_agg_ vs vanished, and non-NULL- vs NULL-keyed — so the three
+	 * modifications of the matview in one statement never hit the same row twice.
+	 *
+	 * Correctness of "absent from _new_agg_ ⇒ vanished" is unchanged from the old
+	 * form and holds for every shape (preserved/inner/optional/ FULL/self): a
+	 * group the delta removed produces no _new_agg_ row, so it is in _vanished_;
+	 * a group that merely changed value is in _new_agg_, so it is not.
 	 * ---------------------------------------------------------------- */
-	if (actual_delete_step)
+	appendStringInfoString(buf, "\n),\n_vanished_ AS (\n  SELECT ");
+	first = true;
+	foreach(lc, viewQuery->groupClause)
 	{
-		/*
-		 * DELETE groups that were in _affected_ but no longer appear in
-		 * _new_agg_.  Using _new_agg_ as the existence check is correct
-		 * for every outer-join shape:
-		 *
-		 *  • Preserved-side delete: the preserved row is gone → no row in
-		 *    _new_agg_ → NOT EXISTS fires.
-		 *  • Inner-dim delete (3-table INNER+LEFT): _new_agg_ uses the
-		 *    viewQuery's real INNER join type, so unmatched groups produce
-		 *    no output → NOT EXISTS fires.
-		 *  • Optional-side delete with preserved group key: preserved rows
-		 *    remain → _new_agg_ has all groups → NOT EXISTS never fires
-		 *    (harmless, correct).
-		 *  • Optional-side delete with optional group key (arm 2 active):
-		 *    arm 2 adds NULL to _affected_; if _new_agg_ has no NULL group
-		 *    (no remaining orphans), NOT EXISTS fires and removes the stale
-		 *    NULL row from the matview.
-		 *  • ins_sql with arm 2: if the NULL group vanished (every orphaned
-		 *    preserved row gained a match), NOT EXISTS fires for NULL.
-		 *  • FULL JOIN: _new_agg_ covers both sides uniformly.
-		 *  • Self-outer: the two role arms of _affected_ cover every group a
-		 *    delta touches in either role; vanished groups fire NOT EXISTS.
-		 */
-		appendStringInfo(buf, "DELETE FROM %s _mv_\nUSING _affected_\nWHERE ",
-						 mvname);
-		first = true;
-		foreach(lc, viewQuery->groupClause)
-		{
-			SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
-			TargetEntry     *te  = get_sortgroupclause_tle(sgc, viewQuery->targetList);
-			const char      *col = quote_identifier(te->resname);
+		SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+		TargetEntry     *te  = get_sortgroupclause_tle(sgc, viewQuery->targetList);
 
-			if (!first) appendStringInfoString(buf, " AND ");
-			appendStringInfo(buf, "_mv_.%s IS NOT DISTINCT FROM _affected_.%s",
-							 col, col);
-			first = false;
-		}
-
-		appendStringInfoString(buf,
-							   "\n  AND NOT EXISTS (\n"
-							   "    SELECT 1 FROM _new_agg_ WHERE ");
-		first = true;
-		foreach(lc, viewQuery->groupClause)
-		{
-			SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
-			TargetEntry     *te  = get_sortgroupclause_tle(sgc, viewQuery->targetList);
-			const char      *col = quote_identifier(te->resname);
-
-			if (!first) appendStringInfoString(buf, " AND ");
-			appendStringInfo(buf, "_new_agg_.%s IS NOT DISTINCT FROM _mv_.%s",
-							 col, col);
-			first = false;
-		}
-		appendStringInfoString(buf, "\n  )");
+		if (!first) appendStringInfoString(buf, ", ");
+		appendStringInfo(buf, "a.%s", quote_identifier(te->resname));
+		first = false;
 	}
-	else
+	appendStringInfoString(buf,
+						   "\n  FROM _affected_ a\n"
+						   "  WHERE NOT EXISTS (SELECT 1 FROM _new_agg_ n WHERE ");
+	first = true;
+	foreach(lc, viewQuery->groupClause)
 	{
-		/* DML CTEs (_upd_) always execute; this SELECT just terminates the WITH. */
-		appendStringInfoString(buf, "SELECT 1");
+		SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+		TargetEntry     *te  = get_sortgroupclause_tle(sgc, viewQuery->targetList);
+		const char      *col = quote_identifier(te->resname);
+
+		if (!first) appendStringInfoString(buf, " AND ");
+		appendStringInfo(buf, "n.%s IS NOT DISTINCT FROM a.%s", col, col);
+		first = false;
 	}
+	appendStringInfoString(buf, ")\n),\n");
+
+	/* _delnull_: vanished groups carrying a NULL key (orphan groups; usually none). */
+	appendStringInfo(buf,
+					 "_delnull_ AS (\n  DELETE FROM %s _mv_ USING _vanished_ v\n  WHERE (",
+					 mvname);
+	first = true;
+	foreach(lc, viewQuery->groupClause)
+	{
+		SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+		TargetEntry     *te  = get_sortgroupclause_tle(sgc, viewQuery->targetList);
+
+		if (!first) appendStringInfoString(buf, " OR ");
+		appendStringInfo(buf, "v.%s IS NULL", quote_identifier(te->resname));
+		first = false;
+	}
+	appendStringInfoString(buf, ")");
+	foreach(lc, viewQuery->groupClause)
+	{
+		SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+		TargetEntry     *te  = get_sortgroupclause_tle(sgc, viewQuery->targetList);
+		const char      *col = quote_identifier(te->resname);
+
+		appendStringInfo(buf, "\n    AND _mv_.%s IS NOT DISTINCT FROM v.%s", col, col);
+	}
+	appendStringInfoString(buf, "\n  RETURNING 1\n)\n");
+
+	/* FINAL: all-non-NULL vanished groups, via the matview's unique group-key index. */
+	appendStringInfo(buf, "DELETE FROM %s _mv_\n  WHERE (", mvname);
+	first = true;
+	foreach(lc, viewQuery->groupClause)
+	{
+		SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+		TargetEntry     *te  = get_sortgroupclause_tle(sgc, viewQuery->targetList);
+
+		if (!first) appendStringInfoString(buf, ", ");
+		appendStringInfo(buf, "_mv_.%s", quote_identifier(te->resname));
+		first = false;
+	}
+	appendStringInfoString(buf, ") IN (\n    SELECT ");
+	first = true;
+	foreach(lc, viewQuery->groupClause)
+	{
+		SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+		TargetEntry     *te  = get_sortgroupclause_tle(sgc, viewQuery->targetList);
+
+		if (!first) appendStringInfoString(buf, ", ");
+		appendStringInfoString(buf, quote_identifier(te->resname));
+		first = false;
+	}
+	appendStringInfoString(buf, "\n    FROM _vanished_\n    WHERE ");
+	first = true;
+	foreach(lc, viewQuery->groupClause)
+	{
+		SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+		TargetEntry     *te  = get_sortgroupclause_tle(sgc, viewQuery->targetList);
+
+		if (!first) appendStringInfoString(buf, " AND ");
+		appendStringInfo(buf, "%s IS NOT NULL", quote_identifier(te->resname));
+		first = false;
+	}
+	appendStringInfoString(buf, ")");
 }
 
 /*
