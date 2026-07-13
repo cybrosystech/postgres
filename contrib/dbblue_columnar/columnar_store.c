@@ -449,6 +449,41 @@ dbbc_block_ref(dsa_pointer blockptr)
 	pg_atomic_add_fetch_u32(&block->refs, 1);
 }
 
+/*
+ * Is a prior version's block still a byte-for-byte accurate columnarization of
+ * its heap range - so an incremental refresh can reuse it instead of rebuilding
+ * it? True iff the block covers exactly this slot's current range AND every
+ * page is still all-visible with the same LSN recorded when the block was built
+ * (both checked under a share lock). This is the same proof the serve path uses
+ * (dbbc_block_valid): identical VM+LSN means the page bytes are unchanged, so
+ * the columnar data still matches the heap.
+ */
+static bool
+dbbc_block_still_valid(DbbcBlock *block, Relation rel,
+					   BlockNumber first_page, uint16 npages)
+{
+	uint16		p;
+
+	if (block->first_page != first_page || block->npages != npages)
+		return false;
+
+	for (p = 0; p < npages; p++)
+	{
+		Buffer		buf = ReadBuffer(rel, first_page + p);
+		Page		page;
+		bool		ok;
+
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		ok = PageIsAllVisible(page) &&
+			BufferGetLSNAtomic(buf) == block->stamps[p].lsn;
+		UnlockReleaseBuffer(buf);
+		if (!ok)
+			return false;
+	}
+	return true;
+}
+
 /* free a retired version: its blocks, directory, attnums, and itself */
 static void
 dbbc_version_free(DbbcRelVersion *version)
@@ -642,6 +677,7 @@ dbbc_populate_relation(Oid relid)
 	volatile dsa_pointer version_dsa = InvalidDsaPointer;
 	volatile bool published = false;
 	volatile int blocks_built = 0;
+	volatile int blocks_reused = 0; /* of blocks_built, reused from prior ver */
 	bool		budget_hit = false;
 	Buffer		vmbuf = InvalidBuffer;
 	MemoryContext blkcxt;
@@ -649,6 +685,15 @@ dbbc_populate_relation(Oid relid)
 	DbbcRelKey	key;
 	DbbcRelEntry *entry;
 	bool		found;
+	/*
+	 * Incremental refresh: the prior published version, whose still-valid
+	 * blocks this build reuses instead of rebuilding. Pinned across the build
+	 * (tracked, so an abort unpins), unpinned after publish. NULL if there is
+	 * no prior version.
+	 */
+	DbbcRelVersion *reuse_src;
+	dsa_pointer *olddir = NULL;
+	bool		reuse_cols_ok = false;
 	uint32		slot;
 	int			c;
 
@@ -767,6 +812,17 @@ dbbc_populate_relation(Oid relid)
 								   ALLOCSET_DEFAULT_SIZES);
 
 	/*
+	 * Pin the prior version (if any) so its blocks stay alive while we decide,
+	 * range by range, which are still valid to reuse. Tracked: an abort during
+	 * the build unpins it. Pinned before PG_TRY so its value is stable across
+	 * the setjmp; the fallible reads of its directory/attnums happen inside.
+	 * ShareUpdateExclusiveLock already bars a concurrent populate, so the entry
+	 * cannot swap under us; the pin additionally guards against a concurrent
+	 * drop.
+	 */
+	reuse_src = dbbc_version_pin_tracked(relid);
+
+	/*
 	 * From here to the end of the publish, an ERROR (cancel, timeout, OOM,
 	 * detoast failure) must not strand anything: blocks are reachable only
 	 * through the backend-local newdir until the entry is published, and the
@@ -777,6 +833,25 @@ dbbc_populate_relation(Oid relid)
 	 */
 	PG_TRY();
 	{
+		/*
+		 * Reuse is possible only when the prior version covers the SAME column
+		 * set in the same order (else its blocks' chunks do not match what this
+		 * build must produce). Resolve its directory and compare attnums once.
+		 */
+		if (reuse_src != NULL && DsaPointerIsValid(reuse_src->blockdir) &&
+			reuse_src->ncols == ncols)
+		{
+			int16	   *oldatt = (int16 *) dsa_get_address(dbbc_dsa,
+														   reuse_src->attnums);
+
+			if (memcmp(oldatt, attnums, ncols * sizeof(int16)) == 0)
+			{
+				olddir = (dsa_pointer *) dsa_get_address(dbbc_dsa,
+														 reuse_src->blockdir);
+				reuse_cols_ok = true;
+			}
+		}
+
 		for (slot = 0; slot < ndirslots && !budget_hit; slot++)
 		{
 			BlockNumber first_page = slot * DBBC_PAGES_PER_BLOCK;
@@ -809,6 +884,31 @@ dbbc_populate_relation(Oid relid)
 			}
 			if (!usable)
 				continue;
+
+			/*
+			 * Incremental refresh: if the prior version has a block for this
+			 * range that is still byte-for-byte valid (same range, every page
+			 * all-visible with an unchanged LSN), reuse it - take a reference
+			 * and skip the rebuild entirely. This is the whole point of the
+			 * refresh being incremental: an append-mostly table re-scans only
+			 * its changed tail, not every cold block. The reused block's bytes
+			 * are already reserved, so no budget accounting happens here.
+			 */
+			if (reuse_cols_ok && slot < reuse_src->ndirslots &&
+				DsaPointerIsValid(olddir[slot]))
+			{
+				DbbcBlock  *oldblk = (DbbcBlock *)
+					dsa_get_address(dbbc_dsa, olddir[slot]);
+
+				if (dbbc_block_still_valid(oldblk, rel, first_page, npages))
+				{
+					dbbc_block_ref(olddir[slot]);
+					newdir[slot] = olddir[slot];
+					blocks_built++;
+					blocks_reused++;
+					continue;
+				}
+			}
 
 			MemoryContextReset(blkcxt);
 			oldcxt = MemoryContextSwitchTo(blkcxt);
@@ -1185,8 +1285,8 @@ dbbc_populate_relation(Oid relid)
 			/*
 			 * Only the version's own metadata bytes; each block's bytes are
 			 * owned by the block and released in dbbc_block_unref, so a block
-			 * shared with another version is never double-counted or freed
-			 * early. (entry_bytes is retained for the budget NOTICE only.)
+			 * shared with another version (incremental reuse) is never
+			 * double-counted or freed early.
 			 */
 			version->total_bytes = meta_bytes;
 
@@ -1247,6 +1347,20 @@ dbbc_populate_relation(Oid relid)
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+
+	/*
+	 * Drop our build-time pin on the prior version. Its own blocks that we did
+	 * NOT reuse are freed when its last reference goes (here, or a lingering
+	 * reader's unpin); blocks we reused survive because the just-published
+	 * version now holds a reference to each. (Only on the success path - an
+	 * abort released this tracked pin already.)
+	 */
+	if (reuse_src != NULL)
+		dbbc_version_unpin_tracked(reuse_src);
+
+	elog(DEBUG1, "dbblue_columnar: populated \"%s\": %d blocks (%d reused, %d rebuilt)",
+		 RelationGetRelationName(rel), blocks_built, blocks_reused,
+		 blocks_built - blocks_reused);
 
 	table_close(rel, ShareUpdateExclusiveLock);
 
