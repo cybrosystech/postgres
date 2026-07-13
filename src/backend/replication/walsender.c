@@ -56,6 +56,7 @@
 #include "access/twophase.h"
 #include "access/xact.h"
 #include "access/xlog_internal.h"
+#include "access/xlogencrypt.h"
 #include "access/xlogreader.h"
 #include "access/xlogrecovery.h"
 #include "access/xlogutils.h"
@@ -1122,6 +1123,14 @@ logical_read_xlog_page(XLogReaderState *state, XLogRecPtr targetPagePtr, int req
 								 * is needed. */
 				 &errinfo))
 		WALReadRaiseError(&errinfo);
+
+	/*
+	 * Logical decoding needs to inspect record contents, so decrypt the page
+	 * if the WAL is encrypted.  (Physical walsenders forward WAL verbatim and
+	 * never reach this logical read callback.)
+	 */
+	if (WALEncryptionEnabled())
+		XLogDecryptPage(cur_page);
 
 	/*
 	 * After reading into the buffer, check that what we read was valid. We do

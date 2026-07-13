@@ -30,6 +30,7 @@ OBJS = \
 	xlog.o \
 	xlogarchive.o \
 	xlogbackup.o \
+	xlogencrypt.o \
 	xlogfuncs.o \
 	xloginsert.o \
 	xlogprefetcher.o \

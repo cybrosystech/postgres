@@ -13,6 +13,7 @@
 #include "postgres.h"
 
 #include <dirent.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
 #include <sys/stat.h>
@@ -20,12 +21,14 @@
 
 #include "access/transam.h"
 #include "access/xlog_internal.h"
+#include "access/xlogencrypt.h"
 #include "access/xlogreader.h"
 #include "access/xlogrecord.h"
 #include "access/xlogstats.h"
 #include "common/fe_memutils.h"
 #include "common/file_perm.h"
 #include "common/file_utils.h"
+#include "common/kmgr_utils.h"
 #include "common/logging.h"
 #include "common/relpath.h"
 #include "getopt_long.h"
@@ -41,6 +44,13 @@
 static const char *progname;
 
 static volatile sig_atomic_t time_to_stop = false;
+
+/*
+ * WAL encryption support.  When --cluster-key-command is given, we unwrap the
+ * cluster's WAL key so that encrypted pages can be decrypted as they are read.
+ */
+static bool have_walkey = false;
+static unsigned char waldump_walkey[KMGR_DATA_KEY_LEN];
 
 static XLogReaderState *xlogreader_state_cleanup = NULL;
 
@@ -405,6 +415,45 @@ WALDumpCloseSegment(XLogReaderState *state)
 	state->seg.ws_file = -1;
 }
 
+/*
+ * Load and unwrap the cluster's WAL key so that encrypted WAL can be
+ * decrypted while dumping.  'waldir' is the pg_wal directory; the key manager
+ * file lives in the data directory's global/ subdirectory alongside it.
+ */
+static void
+load_wal_key(const char *waldir, const char *keycmd)
+{
+	char	   *path;
+	int			fd;
+	KmgrFileData filedata;
+	unsigned char kek[KMGR_CLUSTER_KEY_LEN];
+	char		errstr[512];
+
+	path = psprintf("%s/../%s", waldir, KMGR_FILE_NAME);
+
+	fd = open(path, O_RDONLY | PG_BINARY, 0);
+	if (fd < 0)
+		pg_fatal("could not open key manager file \"%s\": %m", path);
+	if (read(fd, &filedata, sizeof(filedata)) != (ssize_t) sizeof(filedata))
+		pg_fatal("could not read key manager file \"%s\": %m", path);
+	close(fd);
+
+	if (filedata.magic != KMGR_FILE_MAGIC ||
+		filedata.version != KMGR_FILE_VERSION ||
+		!kmgr_verify_file_crc(&filedata))
+		pg_fatal("key manager file \"%s\" is corrupted", path);
+
+	if (!kmgr_run_cluster_key_command(keycmd, kek, errstr, sizeof(errstr)))
+		pg_fatal("%s", errstr);
+
+	if (!kmgr_unwrap_key(kek, &filedata.walkey, waldump_walkey))
+		pg_fatal("cluster key verification failed: the key returned by the command does not match this cluster");
+
+	have_walkey = true;
+	explicit_bzero(kek, sizeof(kek));
+	pfree(path);
+}
+
 /* pg_waldump's XLogReaderRoutine->page_read callback */
 static int
 WALDumpReadPage(XLogReaderState *state, XLogRecPtr targetPagePtr, int reqLen,
@@ -438,6 +487,14 @@ WALDumpReadPage(XLogReaderState *state, XLogRecPtr targetPagePtr, int reqLen,
 					 fname, errinfo.wre_off, errinfo.wre_read,
 					 errinfo.wre_req);
 	}
+
+	/*
+	 * If we were given the cluster key, decrypt the page so the reader sees
+	 * plaintext.  Without a key, encrypted pages are left as-is and the
+	 * reader reports them as such.
+	 */
+	if (have_walkey)
+		XLogDecryptPageWithKey(readBuff, waldump_walkey);
 
 	return count;
 }
@@ -920,6 +977,9 @@ usage(void)
 	printf(_("  -z, --stats[=record]   show statistics instead of records\n"
 			 "                         (optionally, show per-record statistics)\n"));
 	printf(_("  --save-fullpage=DIR    save full page images to DIR\n"));
+	printf(_("  --cluster-key-command=COMMAND\n"
+			 "                         command returning the cluster key, to decrypt\n"
+			 "                         encrypted WAL\n"));
 	printf(_("  -?, --help             show this help, then exit\n"));
 	printf(_("\nReport bugs to <%s>.\n"), PACKAGE_BUGREPORT);
 	printf(_("%s home page: <%s>\n"), PACKAGE_NAME, PACKAGE_URL);
@@ -937,6 +997,7 @@ main(int argc, char **argv)
 	XLogRecord *record;
 	XLogRecPtr	first_record;
 	char	   *waldir = NULL;
+	char	   *cluster_key_command = NULL;
 	char	   *errormsg;
 	pg_compress_algorithm compression = PG_COMPRESSION_NONE;
 
@@ -959,6 +1020,7 @@ main(int argc, char **argv)
 		{"version", no_argument, NULL, 'V'},
 		{"stats", optional_argument, NULL, 'z'},
 		{"save-fullpage", required_argument, NULL, 1},
+		{"cluster-key-command", required_argument, NULL, 2},
 		{NULL, 0, NULL, 0}
 	};
 
@@ -1219,6 +1281,9 @@ main(int argc, char **argv)
 			case 1:
 				config.save_fullpage_path = pg_strdup(optarg);
 				break;
+			case 2:
+				cluster_key_command = pg_strdup(optarg);
+				break;
 			default:
 				goto bad_argument;
 		}
@@ -1369,6 +1434,17 @@ main(int argc, char **argv)
 	{
 		pg_log_error("--follow is not supported when reading from a tar archive");
 		goto bad_argument;
+	}
+
+	/*
+	 * If the cluster key command was given, unwrap the WAL key so encrypted
+	 * WAL pages can be decrypted as they are read.
+	 */
+	if (cluster_key_command != NULL)
+	{
+		if (private.archive_name)
+			pg_fatal("--cluster-key-command is not supported when reading from a tar archive");
+		load_wal_key(waldir, cluster_key_command);
 	}
 
 	/* done with argument parsing, do the actual work */

@@ -236,6 +236,18 @@ KmgrGetRelationKey(void)
 }
 
 /*
+ * Return the key used for WAL encryption.  WAL uses AES-256-CTR, which needs
+ * a single AES-256 key, so we use the first PG_AES256_KEY_LEN bytes of the
+ * (double-length) WAL data key.
+ */
+const unsigned char *
+KmgrGetWALKey(void)
+{
+	Assert(DataEncryptionEnabled());
+	return KmgrShmem->walkey;
+}
+
+/*
  * Re-read and validate the on-disk key manager file against the keys
  * currently in shared memory.  Returns true if the file is intact and
  * its keys unwrap correctly with the current KEK.

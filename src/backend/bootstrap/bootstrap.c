@@ -245,6 +245,7 @@ BootstrapModeMain(int argc, char *argv[], bool check_only)
 	char	   *userDoption = NULL;
 	uint32		bootstrap_data_checksum_version = PG_DATA_CHECKSUM_OFF;
 	uint32		bootstrap_data_encryption_cipher = PG_CIPHER_NONE;
+	uint32		bootstrap_wal_encryption_cipher = PG_CIPHER_NONE;
 	yyscan_t	scanner;
 
 	Assert(!IsUnderPostmaster);
@@ -332,6 +333,7 @@ BootstrapModeMain(int argc, char *argv[], bool check_only)
 				break;
 			case 'K':
 				bootstrap_data_encryption_cipher = PG_CIPHER_AES256_XTS;
+				bootstrap_wal_encryption_cipher = PG_CIPHER_AES256_CTR;
 				break;
 			case 'r':
 				strlcpy(OutputFileName, optctx.optarg, MAXPGPATH);
@@ -419,7 +421,8 @@ BootstrapModeMain(int argc, char *argv[], bool check_only)
 
 	bootstrap_signals();
 	BootStrapXLOG(bootstrap_data_checksum_version,
-				  bootstrap_data_encryption_cipher);
+				  bootstrap_data_encryption_cipher,
+				  bootstrap_wal_encryption_cipher);
 
 	/*
 	 * To ensure that src/common/link-canary.c is linked into the backend, we

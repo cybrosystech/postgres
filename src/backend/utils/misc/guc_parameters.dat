@@ -477,6 +477,7 @@
 { name => 'cluster_key_command', type => 'string', context => 'PGC_SIGHUP', group => 'RESOURCES_DISK',
   short_desc => 'Command to obtain the cluster key for transparent data encryption.',
   long_desc => 'The command must print the key as 64 hexadecimal characters on standard output.',
+  flags => 'GUC_SUPERUSER_ONLY',
   variable => 'cluster_key_command',
   boot_val => '""',
 },

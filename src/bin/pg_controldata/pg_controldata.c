@@ -349,6 +349,8 @@ main(int argc, char *argv[])
 		   ControlFile->data_checksum_version);
 	printf(_("Data encryption cipher:               %s\n"),
 		   (ControlFile->data_encryption_cipher == 0 ? _("none") : "aes-256-xts"));
+	printf(_("WAL encryption cipher:                %s\n"),
+		   (ControlFile->wal_encryption_cipher == 0 ? _("none") : "aes-256-ctr"));
 	printf(_("Default char data signedness:         %s\n"),
 		   (ControlFile->default_char_signedness ? _("signed") : _("unsigned")));
 	printf(_("Mock authentication nonce:            %s\n"),

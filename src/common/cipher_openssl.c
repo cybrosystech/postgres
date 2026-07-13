@@ -92,6 +92,42 @@ pg_cipher_xts_crypt(PgCipherCtx *ctx, bool encrypt,
 }
 
 /*
+ * Encrypt or decrypt 'len' bytes from 'in' into 'out' with AES-256-CTR.
+ * CTR is a stream cipher (XOR with a keystream), so the same call both
+ * encrypts and decrypts.  'key' is PG_AES256_KEY_LEN bytes and 'iv' is the
+ * 16-byte initial counter block.  In-place operation (in == out) is allowed.
+ * Used for WAL encryption, where the data is a byte stream rather than
+ * fixed-size blocks.  Returns false on failure.
+ */
+bool
+pg_cipher_ctr_crypt(PgCipherCtx *ctx,
+					const unsigned char *key,
+					const unsigned char *iv,
+					const unsigned char *in,
+					unsigned char *out,
+					int len)
+{
+	int			outlen,
+				finallen;
+
+	if (ctx == NULL)
+		return false;
+
+	/* The direction argument is ignored for CTR, but must be provided. */
+	if (EVP_CipherInit_ex(ctx->evpctx, EVP_aes_256_ctr(), NULL,
+						  key, iv, 1) != 1)
+		return false;
+
+	if (EVP_CipherUpdate(ctx->evpctx, out, &outlen, in, len) != 1)
+		return false;
+
+	if (EVP_CipherFinal_ex(ctx->evpctx, out + outlen, &finallen) != 1)
+		return false;
+
+	return (outlen + finallen == len);
+}
+
+/*
  * Encrypt 'inlen' bytes of key material with AES-256-GCM, producing
  * ciphertext of the same length in 'out' and a PG_GCM_TAG_LEN-byte
  * authentication tag in 'tag'.  'key' is PG_AES256_KEY_LEN bytes and

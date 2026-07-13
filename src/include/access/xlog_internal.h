@@ -77,8 +77,10 @@ typedef XLogLongPageHeaderData *XLogLongPageHeader;
 #define XLP_LONG_HEADER				0x0002
 /* Replaces a missing contrecord; see CreateOverwriteContrecordRecord */
 #define XLP_FIRST_IS_OVERWRITE_CONTRECORD 0x0004
+/* This page's body (everything after the header) is encrypted; see xlogencrypt.c */
+#define XLP_ENCRYPTED				0x0008
 /* All defined flag bits in xlp_info (used for validity checking of header) */
-#define XLP_ALL_FLAGS				0x0007
+#define XLP_ALL_FLAGS				0x000F
 
 #define XLogPageHeaderSize(hdr)		\
 	(((hdr)->xlp_info & XLP_LONG_HEADER) ? SizeOfXLogLongPHD : SizeOfXLogShortPHD)

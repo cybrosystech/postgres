@@ -17,6 +17,7 @@ OBJS = \
 	compat.o \
 	pg_waldump.o \
 	rmgrdesc.o \
+	xlogencrypt.o \
 	xlogreader.o \
 	xlogstats.o
 
@@ -31,6 +32,9 @@ all: pg_waldump
 
 pg_waldump: $(OBJS) | submake-libpgport
 	$(CC) $(CFLAGS) $^ $(LDFLAGS) $(LDFLAGS_EX) $(LIBS) -o $@$(X)
+
+xlogencrypt.c: % : $(top_srcdir)/src/backend/access/transam/%
+	rm -f $@ && $(LN_S) $< .
 
 xlogreader.c: % : $(top_srcdir)/src/backend/access/transam/%
 	rm -f $@ && $(LN_S) $< .
@@ -51,7 +55,7 @@ uninstall:
 	rm -f '$(DESTDIR)$(bindir)/pg_waldump$(X)'
 
 clean distclean:
-	rm -f pg_waldump$(X) $(OBJS) $(RMGRDESCSOURCES) xlogreader.c xlogstats.c
+	rm -f pg_waldump$(X) $(OBJS) $(RMGRDESCSOURCES) xlogencrypt.c xlogreader.c xlogstats.c
 	rm -rf tmp_check
 
 check:

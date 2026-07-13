@@ -1260,6 +1260,28 @@ XLogReaderValidatePageHeader(XLogReaderState *state, XLogRecPtr recptr,
 		return false;
 	}
 
+	/*
+	 * A page still carrying XLP_ENCRYPTED here has not been decrypted.  In
+	 * the backend the recovery read path decrypts (and clears the flag)
+	 * before validation, so reaching this point means the reader has no way
+	 * to decrypt the WAL: either a frontend tool (pg_waldump) with no access
+	 * to the keys, or a read path that does not yet support encrypted WAL.
+	 * Fail with a clear message rather than reporting spurious corruption.
+	 */
+	if ((hdr->xlp_info & XLP_ENCRYPTED) != 0)
+	{
+		char		fname[MAXFNAMELEN];
+
+		XLogFileName(fname, state->seg.ws_tli, segno, state->segcxt.ws_segsize);
+
+		report_invalid_record(state,
+							  "WAL segment %s, LSN %X/%08X, offset %u is encrypted and cannot be decrypted in this context",
+							  fname,
+							  LSN_FORMAT_ARGS(recptr),
+							  offset);
+		return false;
+	}
+
 	if ((hdr->xlp_info & ~XLP_ALL_FLAGS) != 0)
 	{
 		char		fname[MAXFNAMELEN];

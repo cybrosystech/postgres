@@ -24,6 +24,7 @@ extern void InitializeKmgr(uint32 bootstrap_cipher);
 extern bool DataEncryptionEnabled(void);
 extern uint32 GetDataEncryptionCipherInUse(void);
 extern const unsigned char *KmgrGetRelationKey(void);
+extern const unsigned char *KmgrGetWALKey(void);
 extern bool KmgrCheckFile(void);
 extern void KmgrRotateClusterKey(void);
 

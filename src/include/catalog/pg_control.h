@@ -22,7 +22,7 @@
 
 
 /* Version identifier for this pg_control format */
-#define PG_CONTROL_VERSION	1903
+#define PG_CONTROL_VERSION	1904
 
 /* Nonce key length, see below */
 #define MOCK_AUTH_NONCE_LEN		32
@@ -236,6 +236,13 @@ typedef struct ControlFileData
 	 * PG_CIPHER_* value (see common/cipher.h).
 	 */
 	uint32		data_encryption_cipher;
+
+	/*
+	 * Is the WAL transparently encrypted?  Zero if not, otherwise a
+	 * PG_CIPHER_* value (PG_CIPHER_AES256_CTR).  Set at initdb time when data
+	 * encryption is enabled.
+	 */
+	uint32		wal_encryption_cipher;
 
 	/*
 	 * True if the default signedness of char is "signed" on a platform where

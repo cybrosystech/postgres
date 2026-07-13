@@ -9,6 +9,7 @@ pg_waldump_sources = files(
 
 pg_waldump_sources += rmgr_desc_sources
 pg_waldump_sources += xlogreader_sources
+pg_waldump_sources += files('../../backend/access/transam/xlogencrypt.c')
 pg_waldump_sources += files('../../backend/access/transam/xlogstats.c')
 
 if host_system == 'windows'

@@ -22,6 +22,7 @@
 #include "access/timeline.h"
 #include "access/xlogrecovery.h"
 #include "access/xlog_internal.h"
+#include "access/xlogencrypt.h"
 #include "access/xlogutils.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
@@ -998,6 +999,15 @@ read_local_xlog_page_guts(XLogReaderState *state, XLogRecPtr targetPagePtr,
 	if (!WALRead(state, cur_page, targetPagePtr, count, tli,
 				 &errinfo))
 		WALReadRaiseError(&errinfo);
+
+	/*
+	 * If the WAL is encrypted, decrypt the page so that callers of this read
+	 * routine (logical decoding, pg_walinspect, etc.) see plaintext.  This
+	 * runs in a backend that holds the WAL key in shared memory.  Physical
+	 * walsenders do not use this callback; they forward WAL verbatim.
+	 */
+	if (WALEncryptionEnabled())
+		XLogDecryptPage(cur_page);
 
 	/* number of valid bytes in the buffer */
 	return count;

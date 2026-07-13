@@ -35,6 +35,7 @@
 #include "access/xact.h"
 #include "access/xlog_internal.h"
 #include "access/xlogarchive.h"
+#include "access/xlogencrypt.h"
 #include "access/xlogprefetcher.h"
 #include "access/xlogreader.h"
 #include "access/xlogrecovery.h"
@@ -3416,6 +3417,14 @@ retry:
 	Assert(targetSegNo == readSegNo);
 	Assert(targetPageOff == readOff);
 	Assert(reqLen <= readLen);
+
+	/*
+	 * If the WAL is encrypted, decrypt the page we just read so that the rest
+	 * of recovery sees plaintext.  Pages without the XLP_ENCRYPTED flag (old
+	 * plaintext WAL, or the zeroed tail of a segment) are left untouched.
+	 */
+	if (WALEncryptionEnabled())
+		XLogDecryptPage(readBuf);
 
 	xlogreader->seg.ws_tli = curFileTLI;
 

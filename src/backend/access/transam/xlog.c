@@ -58,6 +58,7 @@
 #include "access/xact.h"
 #include "access/xlog_internal.h"
 #include "access/xlogarchive.h"
+#include "access/xlogencrypt.h"
 #include "access/xloginsert.h"
 #include "access/xlogreader.h"
 #include "access/xlogrecovery.h"
@@ -67,6 +68,7 @@
 #include "catalog/catversion.h"
 #include "catalog/pg_control.h"
 #include "catalog/pg_database.h"
+#include "common/cipher.h"
 #include "common/controldata_utils.h"
 #include "common/file_utils.h"
 #include "executor/instrument.h"
@@ -101,6 +103,7 @@
 #include "utils/guc_hooks.h"
 #include "utils/guc_tables.h"
 #include "utils/injection_point.h"
+#include "utils/memutils.h"
 #include "utils/pgstat_internal.h"
 #include "utils/ps_status.h"
 #include "utils/relmapper.h"
@@ -181,7 +184,8 @@ const struct config_enum_entry wal_sync_method_options[] = {
 	{"fsync_writethrough", WAL_SYNC_METHOD_FSYNC_WRITETHROUGH, false},
 #endif
 	{"fdatasync", WAL_SYNC_METHOD_FDATASYNC, false},
-#ifdef O_SYNC
+#ifdef O_SYNC	#include "utils/memutils.h"
+
 	{"open_sync", WAL_SYNC_METHOD_OPEN, false},
 #endif
 #ifdef O_DSYNC
@@ -723,7 +727,8 @@ static void CleanupBackupHistory(void);
 static void UpdateMinRecoveryPoint(XLogRecPtr lsn, bool force);
 static bool PerformRecoveryXLogAction(void);
 static void InitControlFile(uint64 sysidentifier, uint32 data_checksum_version,
-							uint32 data_encryption_cipher);
+							uint32 data_encryption_cipher,
+							uint32 wal_encryption_cipher);
 static void WriteControlFile(void);
 static void ReadControlFile(void);
 static void UpdateControlFile(void);
@@ -2322,6 +2327,21 @@ XLogCheckpointNeeded(XLogSegNo new_segno)
  * must be called before grabbing the lock, to make sure the data is ready to
  * write.
  */
+
+/*
+ * Backend-local bounce buffer holding the encrypted copy of the pages to be
+ * written, when WAL encryption is enabled.  The plaintext pages in the WAL
+ * buffers are left untouched (partially-filled pages are appended to and
+ * rewritten later, so they must stay plaintext).  Grown on demand.
+ *
+ * XLogWrite() runs inside a critical section, where palloc is not allowed,
+ * so this uses plain malloc.  walEncryptBufRaw is the pointer to free;
+ * walEncryptBuf is aligned to PG_IO_ALIGN_SIZE for (possibly direct) IO.
+ */
+static char *walEncryptBuf = NULL;
+static char *walEncryptBufRaw = NULL;
+static Size walEncryptBufSize = 0;
+
 static void
 XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible)
 {
@@ -2443,6 +2463,36 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible)
 			from = XLogCtl->pages + startidx * (Size) XLOG_BLCKSZ;
 			nbytes = npages * (Size) XLOG_BLCKSZ;
 			nleft = nbytes;
+
+			/*
+			 * When WAL encryption is enabled, encrypt the pages into the
+			 * backend-local bounce buffer and write from there, leaving the
+			 * plaintext WAL buffers untouched.
+			 */
+			if (GetWALEncryptionCipher() != PG_CIPHER_NONE)
+			{
+				if (walEncryptBufSize < nbytes)
+				{
+					if (walEncryptBufRaw != NULL)
+						free(walEncryptBufRaw);
+					walEncryptBufRaw = malloc(nbytes + PG_IO_ALIGN_SIZE);
+					if (walEncryptBufRaw == NULL)
+						ereport(PANIC,
+								(errcode(ERRCODE_OUT_OF_MEMORY),
+								 errmsg("out of memory"),
+								 errdetail("Failed while allocating the WAL encryption buffer.")));
+					walEncryptBuf = (char *) TYPEALIGN(PG_IO_ALIGN_SIZE,
+													   walEncryptBufRaw);
+					walEncryptBufSize = nbytes;
+				}
+
+				for (int i = 0; i < npages; i++)
+					XLogEncryptPage(from + i * (Size) XLOG_BLCKSZ,
+									walEncryptBuf + i * (Size) XLOG_BLCKSZ);
+
+				from = walEncryptBuf;
+			}
+
 			do
 			{
 				errno = 0;
@@ -4258,7 +4308,7 @@ CleanupBackupHistory(void)
 
 static void
 InitControlFile(uint64 sysidentifier, uint32 data_checksum_version,
-				uint32 data_encryption_cipher)
+				uint32 data_encryption_cipher, uint32 wal_encryption_cipher)
 {
 	char		mock_auth_nonce[MOCK_AUTH_NONCE_LEN];
 
@@ -4291,6 +4341,7 @@ InitControlFile(uint64 sysidentifier, uint32 data_checksum_version,
 	ControlFile->track_commit_timestamp = track_commit_timestamp;
 	ControlFile->data_checksum_version = data_checksum_version;
 	ControlFile->data_encryption_cipher = data_encryption_cipher;
+	ControlFile->wal_encryption_cipher = wal_encryption_cipher;
 
 	/*
 	 * Set the data_checksum_version value into XLogCtl, which is where all
@@ -4672,6 +4723,17 @@ GetDataEncryptionCipher(void)
 {
 	Assert(ControlFile != NULL);
 	return ControlFile->data_encryption_cipher;
+}
+
+/*
+ * Returns the WAL encryption cipher (PG_CIPHER_*) recorded in the control
+ * file, or zero if the WAL is not encrypted.
+ */
+uint32
+GetWALEncryptionCipher(void)
+{
+	Assert(ControlFile != NULL);
+	return ControlFile->wal_encryption_cipher;
 }
 
 /*
@@ -5465,10 +5527,13 @@ XLOGShmemAttach(void *arg)
  * and the initial XLOG segment.
  */
 void
-BootStrapXLOG(uint32 data_checksum_version, uint32 data_encryption_cipher)
+BootStrapXLOG(uint32 data_checksum_version, uint32 data_encryption_cipher,
+			  uint32 wal_encryption_cipher)
 {
 	CheckPoint	checkPoint;
 	PGAlignedXLogBlock buffer;
+	PGAlignedXLogBlock encbuffer;
+	char	   *writebuf;
 	XLogPageHeader page;
 	XLogLongPageHeader longpage;
 	XLogRecord *record;
@@ -5578,10 +5643,21 @@ BootStrapXLOG(uint32 data_checksum_version, uint32 data_encryption_cipher)
 	 * close the file again in a moment.
 	 */
 
-	/* Write the first page with the initial record */
+	/*
+	 * Write the first page with the initial record.  If the WAL is
+	 * encrypted, write the encrypted copy instead of the plaintext buffer.
+	 */
+	if (wal_encryption_cipher != PG_CIPHER_NONE)
+	{
+		XLogEncryptPage(buffer.data, encbuffer.data);
+		writebuf = encbuffer.data;
+	}
+	else
+		writebuf = buffer.data;
+
 	errno = 0;
 	pgstat_report_wait_start(WAIT_EVENT_WAL_BOOTSTRAP_WRITE);
-	if (write(openLogFile, &buffer, XLOG_BLCKSZ) != XLOG_BLCKSZ)
+	if (write(openLogFile, writebuf, XLOG_BLCKSZ) != XLOG_BLCKSZ)
 	{
 		/* if write didn't set errno, assume problem is no disk space */
 		if (errno == 0)
@@ -5608,7 +5684,7 @@ BootStrapXLOG(uint32 data_checksum_version, uint32 data_encryption_cipher)
 
 	/* Now create pg_control */
 	InitControlFile(sysidentifier, data_checksum_version,
-					data_encryption_cipher);
+					data_encryption_cipher, wal_encryption_cipher);
 	ControlFile->time = checkPoint.time;
 	ControlFile->checkPoint = checkPoint.redo;
 	ControlFile->checkPointCopy = checkPoint;

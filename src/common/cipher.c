@@ -45,6 +45,17 @@ pg_cipher_xts_crypt(PgCipherCtx *ctx, bool encrypt,
 }
 
 bool
+pg_cipher_ctr_crypt(PgCipherCtx *ctx,
+					const unsigned char *key,
+					const unsigned char *iv,
+					const unsigned char *in,
+					unsigned char *out,
+					int len)
+{
+	return false;
+}
+
+bool
 pg_cipher_gcm_wrap(const unsigned char *key,
 				   const unsigned char *iv,
 				   const unsigned char *in, int inlen,

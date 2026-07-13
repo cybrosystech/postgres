@@ -248,6 +248,7 @@ extern XLogRecPtr GetXLogWriteRecPtr(void);
 extern uint64 GetSystemIdentifier(void);
 extern char *GetMockAuthenticationNonce(void);
 extern uint32 GetDataEncryptionCipher(void);
+extern uint32 GetWALEncryptionCipher(void);
 extern bool DataChecksumsNeedWrite(void);
 extern bool DataChecksumsNeedVerify(void);
 extern bool DataChecksumsInProgressOn(void);
@@ -261,7 +262,8 @@ extern void SetLocalDataChecksumState(uint32 data_checksum_version);
 extern bool GetDefaultCharSignedness(void);
 extern XLogRecPtr GetFakeLSNForUnloggedRel(void);
 extern void BootStrapXLOG(uint32 data_checksum_version,
-						  uint32 data_encryption_cipher);
+						  uint32 data_encryption_cipher,
+						  uint32 wal_encryption_cipher);
 extern void InitializeWalConsistencyChecking(void);
 extern void LocalProcessControlFile(bool reset);
 extern WalLevel GetActiveWalLevelOnStandby(void);
