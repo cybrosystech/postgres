@@ -296,7 +296,8 @@ static bool incr_full_join_coalesce_keys(Query *viewQuery);
 static bool incr_is_coalesce_of_join_keys(Node *gexpr, Query *viewQuery);
 static bool incr_try_resolve_var_to_rel(Var *v, List *rtable, int *varno_out);
 static void incr_append_recompute_tail(StringInfo buf, const char *mvname,
-											 Query *viewQuery, bool actual_delete_step);
+											 Query *viewQuery, List *all_tables,
+											 bool actual_delete_step);
 static Query *incr_build_delta_select_query_at_varno(Query *viewQuery,
 													 int target_varno,
 													 const char *enrName);
@@ -2001,6 +2002,79 @@ incr_key_var_nullable(Var *v, List *rtable)
 		else
 			return true;
 	}
+}
+
+/*
+ * incr_key_never_null — true if a GROUP BY key expression can be PROVEN never
+ * NULL in any output row (orphan or not).  Every Var must be a NOT NULL base
+ * column that no outer join can NULL-extend (!incr_key_var_nullable, which reads
+ * both attnotnull and varnullingrels); every Const non-NULL; and every function
+ * or operator applied must be STRICT, so it cannot manufacture a NULL from
+ * non-NULL inputs.  Value-preserving casts are transparent.  Anything that could
+ * introduce a NULL from non-NULL inputs — CASE (T_CaseExpr), COALESCE
+ * (T_CoalesceExpr), NULLIF (T_NullIfExpr), a non-strict function, or any node
+ * kind not explicitly whitelisted — yields false (conservative).
+ *
+ * Used by incr_inject_affected_filter's present_only mode to pick the keys the
+ * NULL arm may safely restrict on: "k IN (…)" drops rows where k is NULL, which
+ * is correct ONLY when no group can have k = NULL.
+ */
+typedef struct { List *rtable; bool ok; } IncrNeverNullCtx;
+
+static bool
+incr_never_null_walker(Node *node, IncrNeverNullCtx *cx)
+{
+	if (node == NULL)
+		return false;
+	switch (nodeTag(node))
+	{
+		case T_Var:
+			if (incr_key_var_nullable((Var *) node, cx->rtable))
+				cx->ok = false;
+			return false;			/* Var has no children to walk */
+		case T_Const:
+			if (((Const *) node)->constisnull)
+				cx->ok = false;
+			return false;
+		case T_FuncExpr:
+			if (!func_strict(((FuncExpr *) node)->funcid))
+			{ cx->ok = false; return false; }
+			break;
+		case T_OpExpr:
+			{
+				OpExpr *op = (OpExpr *) node;
+				Oid		f = OidIsValid(op->opfuncid) ? op->opfuncid
+													  : get_opcode(op->opno);
+
+				if (!func_strict(f))
+				{ cx->ok = false; return false; }
+				break;
+			}
+		case T_RelabelType:
+		case T_CoerceViaIO:
+		case T_ArrayCoerceExpr:
+		case T_CoerceToDomain:
+			break;					/* value-preserving cast of non-NULL → non-NULL */
+		default:
+			cx->ok = false;			/* CASE/COALESCE/NULLIF/… may yield NULL */
+			return false;
+	}
+	if (!cx->ok)
+		return false;
+	return expression_tree_walker(node, incr_never_null_walker, cx);
+}
+
+static bool
+incr_key_never_null(Node *gexpr, List *rtable)
+{
+	IncrNeverNullCtx cx;
+
+	cx.rtable = rtable;
+	cx.ok = true;
+	if (gexpr == NULL)
+		return false;
+	incr_never_null_walker(gexpr, &cx);
+	return cx.ok;
 }
 
 /*
@@ -6574,7 +6648,7 @@ incr_build_recompute_sql(Oid mvrelid, Query *viewQuery,
 	force_delete = incr_build_affected_sql(&buf, viewQuery, delta_varno,
 										   delta_table, all_tables, anchor_col);
 	appendStringInfoString(&buf, "\n),\n");
-	incr_append_recompute_tail(&buf, mv_qname(mvrelid), viewQuery,
+	incr_append_recompute_tail(&buf, mv_qname(mvrelid), viewQuery, all_tables,
 							   include_delete_step || force_delete);
 	return buf.data;
 }
@@ -6599,14 +6673,22 @@ incr_build_recompute_sql(Oid mvrelid, Query *viewQuery,
  * only non-NULL groups — the caller pairs it with the existing NULL-group arm
  * (single nullable key) exactly as the old fast form did.
  *
- * Returns true on success; false (leaving live_q unchanged) if a key lacks a
- * default equality operator, so the caller can fall back to the NULL-safe
- * EXISTS form.  Applied only where the caller's fast_form holds: a single key,
- * or a multi-key set all provably NOT NULL — so a partial-NULL multi-key group
- * (which per-key IN would wrongly drop) never reaches here.
+ * Two modes:
+ *   • present_only == false (the non-NULL arm): inject EVERY key.  Returns false
+ *     (leaving live_q unchanged) if any key lacks a default equality operator, so
+ *     the caller can fall back to the NULL-safe EXISTS form.
+ *   • present_only == true (the NULL arm): inject ONLY keys that are always
+ *     present — i.e. reference only the preserved anchor / inner-joined tables
+ *     (incr_expr_all_preserved_or_inner), so they are never NULL in ANY group,
+ *     orphan or not.  Restricting on them is index-driven and NULL-safe (orphan
+ *     groups keep their non-NULL present keys, so they survive the IN), while the
+ *     optional keys — which CAN be NULL in an orphan group — are left free.  Keys
+ *     lacking an equality operator are simply skipped (not fatal).  Requires
+ *     all_tables; returns true iff at least one key was injected (else the caller
+ *     keeps the unrestricted live aggregate).
  */
 static bool
-incr_inject_affected_filter(Query *live_q)
+incr_inject_affected_filter(Query *live_q, List *all_tables, bool present_only)
 {
 	List	   *newquals = NIL;
 	List	   *keytypes = NIL;
@@ -6653,7 +6735,16 @@ incr_inject_affected_filter(Query *live_q)
 		OpExpr		    *op;
 		Param		    *prm;
 
-		if (!OidIsValid(eqop))
+		if (present_only)
+		{
+			/* NULL arm: restrict only on keys proven never NULL; skip the rest. */
+			if (!incr_key_never_null(ge, live_q->rtable) || !OidIsValid(eqop))
+			{
+				attno++;
+				continue;
+			}
+		}
+		else if (!OidIsValid(eqop))
 			return false;
 
 		/* RTE_CTE describing _affected_ (all group-key columns). */
@@ -6720,6 +6811,9 @@ incr_inject_affected_filter(Query *live_q)
 		attno++;
 	}
 
+	if (newquals == NIL)
+		return false;			/* present_only: no always-present key qualified */
+
 	if (live_q->jointree->quals != NULL)
 		newquals = lcons(live_q->jointree->quals, newquals);
 	live_q->jointree->quals = (list_length(newquals) == 1)
@@ -6742,7 +6836,8 @@ incr_inject_affected_filter(Query *live_q)
  */
 static void
 incr_append_recompute_tail(StringInfo buf, const char *mvname,
-								 Query *viewQuery, bool actual_delete_step)
+								 Query *viewQuery, List *all_tables,
+								 bool actual_delete_step)
 {
 	ListCell   *lc;
 	bool		first;
@@ -6818,7 +6913,7 @@ incr_append_recompute_tail(StringInfo buf, const char *mvname,
 			Query  *inj_q = copyObject(viewQuery);
 
 			inj_q->havingQual = NULL;
-			injected = incr_inject_affected_filter(inj_q);
+			injected = incr_inject_affected_filter(inj_q, all_tables, false);
 			if (injected)
 			{
 				const char *inj_sel = dbblue_deparse_query(inj_q);
@@ -6840,11 +6935,32 @@ incr_append_recompute_tail(StringInfo buf, const char *mvname,
 				 */
 				if (!all_notnull)
 				{
+					/*
+					 * Restrict the NULL arm's own live aggregate the same way,
+					 * but only on the ALWAYS-PRESENT keys (preserved/inner —
+					 * incr_inject_affected_filter present_only mode).  An orphan
+					 * group keeps its present keys non-NULL and equal to the
+					 * affected tuple's, so it survives that IN; its optional keys
+					 * (the ones that go NULL) are left unrestricted.  This turns
+					 * the NULL arm from a FULL recompute of every orphan group in
+					 * the matview into an index-driven recompute of just the
+					 * affected region.  Falls back to the full aggregate (live_sel)
+					 * when no present key qualifies (e.g. all keys optional, or
+					 * self-join builder passing all_tables == NIL).
+					 */
+					Query	   *null_q = copyObject(viewQuery);
+					const char *null_sel;
+
+					null_q->havingQual = NULL;
+					null_sel = incr_inject_affected_filter(null_q, all_tables, true)
+						? dbblue_deparse_query(null_q)
+						: live_sel;
+
 					appendStringInfo(buf,
 									 "\n  UNION ALL\n"
 									 "  SELECT __live__.*\n"
 									 "  FROM (%s) __live__\n"
-									 "  WHERE (", live_sel);
+									 "  WHERE (", null_sel);
 					/* (a) __live__ tuple has >= 1 NULL key */
 					first = true;
 					foreach(lc, viewQuery->groupClause)
@@ -7352,7 +7468,12 @@ incr_build_self_recompute_sql(Oid mvrelid, Query *viewQuery,
 
 	appendStringInfoString(&buf, "\n),\n");
 
-	incr_append_recompute_tail(&buf, mvname, viewQuery,
+	/*
+	 * Self-join builder: no plain all_tables list to classify keys as
+	 * preserved/inner, so pass NIL — the NULL arm keeps its unrestricted (full)
+	 * aggregate here (correct; just not index-restricted for self-outer shapes).
+	 */
+	incr_append_recompute_tail(&buf, mvname, viewQuery, NIL,
 									 actual_delete_step);
 	return buf.data;
 }
