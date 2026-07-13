@@ -349,6 +349,193 @@ mv_qname(Oid relid)
  */
 
 /*
+ * incr_validate_group_aggref — validate one aggregate appearing in a GROUP BY
+ * matview's target list, either as a bare output column or nested inside a
+ * projection expression.  Sets *reason and returns false when the aggregate, its
+ * argument, or its FILTER is unsupported.  Factored out of MatviewIncrIsEligible
+ * so incr_validate_projection can reuse it for each aggregate leaf.
+ */
+static bool
+incr_validate_group_aggref(Aggref *agg, Query *viewQuery, int nbasetables,
+						   bool deparse_agg_shape, const char **reason)
+{
+	char	   *fname = get_func_name(agg->aggfnoid);
+	bool		is_additive =
+		(strcmp(fname, "sum") == 0 || strcmp(fname, "count") == 0 ||
+		 strcmp(fname, "avg") == 0 || strcmp(fname, "min") == 0 ||
+		 strcmp(fname, "max") == 0);
+	bool		is_float_sumavg =
+		(strcmp(fname, "sum") == 0 || strcmp(fname, "avg") == 0) &&
+		(agg->aggtype == FLOAT4OID || agg->aggtype == FLOAT8OID);
+	bool		needs_rc =
+		agg->aggdistinct != NIL || agg->aggfilter != NULL ||
+		incr_is_recompute_only_func(fname) || is_float_sumavg;
+
+	if (!is_additive && !incr_is_recompute_only_func(fname))
+	{
+		*reason = psprintf("aggregate \"%s\" not supported (supported: SUM, "
+						   "COUNT, AVG, MIN, MAX, STDDEV, VARIANCE, BOOL_AND, "
+						   "BOOL_OR, STRING_AGG, ARRAY_AGG, JSON(B)_AGG; "
+						   "COUNT(DISTINCT); any with FILTER)", fname);
+		return false;
+	}
+
+	if (needs_rc)
+	{
+		/*
+		 * Recompute path: DISTINCT, stddev/variance/bool, collect aggregates
+		 * (string_agg/array_agg/json(b)_agg), FILTERed aggregates, and float
+		 * SUM/AVG (recompute avoids running-total rounding drift).  All are
+		 * maintained by recomputing each affected group from the live table(s)
+		 * via the deparse engine, which renders the aggregate — DISTINCT, FILTER,
+		 * and all — verbatim.  Supported over a single table, INNER JOIN, or a
+		 * supported outer join; ordered-set aggregates (aggorder) and self-joins
+		 * are not yet supported.
+		 */
+		if (!(nbasetables == 1 ||
+			  incr_inner_join_deparse_shape(viewQuery, nbasetables) ||
+			  incr_recompute_outer_shape(viewQuery, nbasetables) ||
+			  incr_self_recompute_shape(viewQuery)) ||
+			agg->aggorder != NIL)
+		{
+			*reason = psprintf("incremental %s(...) with DISTINCT / FILTER / "
+							   "stddev / collect / float is supported only over "
+							   "a single table, INNER JOIN, a supported outer "
+							   "join, or a two-way self join, without "
+							   "ordered-set aggregates", fname);
+			return false;
+		}
+		if (agg->args != NIL)
+		{
+			Node *arg = (Node *) linitial_node(TargetEntry, agg->args)->expr;
+
+			if (contain_mutable_functions(arg) ||
+				!(incr_validate_expr(arg, NULL, false) ||
+				  incr_agg_arg_deparse_safe(arg)))
+			{
+				*reason = psprintf("argument of aggregate \"%s\" uses "
+							   "unsupported or non-immutable expressions", fname);
+				return false;
+			}
+		}
+		if (agg->aggfilter != NULL &&
+			!incr_agg_arg_deparse_safe((Node *) agg->aggfilter))
+		{
+			*reason = psprintf("FILTER condition of aggregate \"%s\" must be "
+						   "immutable and free of subqueries, aggregates, and "
+						   "window functions", fname);
+			return false;
+		}
+		return true;
+	}
+
+	/*
+	 * Additive path: exact SUM/COUNT/AVG/MIN/MAX maintained by per-row delta.
+	 * Accept the hand grammar always; for the plain single-table shape also
+	 * accept any deterministic deparse-able expression.
+	 */
+	if (agg->args != NIL)
+	{
+		TargetEntry *arg_te = linitial_node(TargetEntry, agg->args);
+		Node	   *arg = (Node *) arg_te->expr;
+		bool	arg_ok = !contain_mutable_functions(arg) &&
+			(incr_validate_expr(arg, NULL, false) ||
+			 (deparse_agg_shape && incr_agg_arg_deparse_safe(arg)));
+
+		if (!arg_ok)
+		{
+			*reason = psprintf("argument of aggregate \"%s\" uses "
+							   "unsupported expressions; only column "
+							   "references, constants, and arithmetic "
+							   "operators are allowed", fname);
+			return false;
+		}
+	}
+	return true;
+}
+
+/*
+ * incr_projection_validate_walker / incr_validate_projection
+ *
+ * Accept a GROUP BY matview target that is an immutable PROJECTION over group
+ * keys and supported aggregates — e.g. COALESCE(SUM(a),0)+SUM(b),
+ * sum(x)/count(*), pt.a || pt.b, jsonb ->> 'k', CASE over aggregates.  These are
+ * maintained by the recompute path, which re-derives the entire target list
+ * verbatim from the live tables, so any expression that is a DETERMINISTIC
+ * function of the group's keys and aggregate values matches a full REFRESH
+ * exactly.  incr_needs_recompute forces such a view onto the recompute path
+ * (the additive delta path maintains per-aggregate running totals and cannot
+ * distribute a nonlinear expression over the delta).
+ *
+ * Rejects volatile/stable expressions (now(), CURRENT_DATE, concat()): those
+ * are NOT a function of the group and would drift from a full REFRESH (touched
+ * groups get a fresh value, untouched groups keep the old) — they belong in a
+ * plain view layered over the matview.  Subqueries and window functions are
+ * already rejected globally before this point; set-returning functions are
+ * refused here.  Every aggregate leaf is validated by incr_validate_group_aggref.
+ * (A bare Var target is handled earlier; any Var reachable here is, by SQL's
+ * grouping rules, a group-key reference.)
+ */
+typedef struct IncrProjValidateCtx
+{
+	Query	   *viewQuery;
+	int			nbasetables;
+	bool		deparse_agg_shape;
+	const char **reason;
+} IncrProjValidateCtx;
+
+static bool
+incr_projection_validate_walker(Node *node, IncrProjValidateCtx *cx)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Aggref))
+	{
+		/* validate the aggregate leaf; do not descend into its internals */
+		if (!incr_validate_group_aggref((Aggref *) node, cx->viewQuery,
+										cx->nbasetables, cx->deparse_agg_shape,
+										cx->reason))
+			return true;			/* abort — *reason set by the helper */
+		return false;
+	}
+	if (IsA(node, SubLink) || IsA(node, WindowFunc) || IsA(node, GroupingFunc))
+	{
+		*cx->reason = "SELECT expression may not contain a subquery, window "
+			"function, or GROUPING() in a GROUP BY incremental matview";
+		return true;
+	}
+	if (IsA(node, FuncExpr) && ((FuncExpr *) node)->funcretset)
+	{
+		*cx->reason = "set-returning functions are not supported in a GROUP BY "
+			"incremental matview target expression";
+		return true;
+	}
+	return expression_tree_walker(node, incr_projection_validate_walker, cx);
+}
+
+static bool
+incr_validate_projection(Node *expr, Query *viewQuery, int nbasetables,
+						 bool deparse_agg_shape, const char **reason)
+{
+	IncrProjValidateCtx cx;
+
+	if (contain_mutable_functions(expr))
+	{
+		*reason = "SELECT expression must be immutable — a deterministic function "
+			"of the group's keys and aggregates; move now()/CURRENT_DATE and other "
+			"volatile or stable expressions into a plain view over the matview";
+		return false;
+	}
+	cx.viewQuery = viewQuery;
+	cx.nbasetables = nbasetables;
+	cx.deparse_agg_shape = deparse_agg_shape;
+	cx.reason = reason;
+	if (incr_projection_validate_walker(expr, &cx))
+		return false;			/* an aggregate/construct leaf failed; *reason set */
+	return true;
+}
+
+/*
  * MatviewIncrIsEligible
  * Returns true if the query can be maintained incrementally (Phase 1 or 2).
  * Sets *reason on failure.
@@ -934,108 +1121,49 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 			continue;
 		}
 
-		/* GROUP BY view: only Var or supported Aggref */
+		/*
+		 * GROUP BY view target: a bare group-key Var (accepted above), a
+		 * supported aggregate, or an immutable PROJECTION over group keys and
+		 * aggregates (e.g. COALESCE(SUM(a),0)+SUM(b), a || b, jsonb ->> 'k',
+		 * CASE over aggregates).  A projection is maintained by the recompute
+		 * path — incr_needs_recompute forces it there.
+		 */
 		if (IsA(te->expr, Aggref))
 		{
-			Aggref	   *agg = (Aggref *) te->expr;
-			char	   *fname = get_func_name(agg->aggfnoid);
-			bool		is_additive =
-				(strcmp(fname, "sum") == 0 || strcmp(fname, "count") == 0 ||
-				 strcmp(fname, "avg") == 0 || strcmp(fname, "min") == 0 ||
-				 strcmp(fname, "max") == 0);
-			bool		is_float_sumavg =
-				(strcmp(fname, "sum") == 0 || strcmp(fname, "avg") == 0) &&
-				(agg->aggtype == FLOAT4OID || agg->aggtype == FLOAT8OID);
-			bool		needs_rc =
-				agg->aggdistinct != NIL || agg->aggfilter != NULL ||
-				incr_is_recompute_only_func(fname) || is_float_sumavg;
-
-			if (!is_additive && !incr_is_recompute_only_func(fname))
-			{
-				*reason = psprintf("aggregate \"%s\" not supported (supported: SUM, "
-								   "COUNT, AVG, MIN, MAX, STDDEV, VARIANCE, BOOL_AND, "
-								   "BOOL_OR, STRING_AGG, ARRAY_AGG, JSON(B)_AGG; "
-								   "COUNT(DISTINCT); any with FILTER)", fname);
+			if (!incr_validate_group_aggref((Aggref *) te->expr, viewQuery,
+											nbasetables, deparse_agg_shape, reason))
 				return false;
-			}
-
-			if (needs_rc)
-			{
-				/*
-				 * Recompute path: DISTINCT, stddev/variance/bool, collect
-				 * aggregates (string_agg/array_agg/json(b)_agg), FILTERed
-				 * aggregates, and float SUM/AVG (recompute avoids running-total
-				 * rounding drift).  All are maintained by recomputing each
-				 * affected group from the live table(s) via the deparse engine,
-				 * which renders the aggregate — DISTINCT, FILTER, and all — verbatim.
-				 * Supported over a single table, INNER JOIN, or a supported outer
-				 * join; ordered-set aggregates (aggorder) and self-joins are not
-				 * yet supported.
-				 */
-				if (!(nbasetables == 1 ||
-					  incr_inner_join_deparse_shape(viewQuery, nbasetables) ||
-					  incr_recompute_outer_shape(viewQuery, nbasetables) ||
-					  incr_self_recompute_shape(viewQuery)) ||
-					agg->aggorder != NIL)
-				{
-					*reason = psprintf("incremental %s(...) with DISTINCT / FILTER / "
-									   "stddev / collect / float is supported only over "
-									   "a single table, INNER JOIN, a supported outer "
-									   "join, or a two-way self join, without "
-									   "ordered-set aggregates", fname);
-					return false;
-				}
-				if (agg->args != NIL)
-				{
-					Node *arg = (Node *) linitial_node(TargetEntry, agg->args)->expr;
-
-					if (contain_mutable_functions(arg) ||
-						!(incr_validate_expr(arg, NULL, false) ||
-						  incr_agg_arg_deparse_safe(arg)))
-					{
-						*reason = psprintf("argument of aggregate \"%s\" uses "
-									   "unsupported or non-immutable expressions", fname);
-						return false;
-					}
-				}
-				if (agg->aggfilter != NULL &&
-					!incr_agg_arg_deparse_safe((Node *) agg->aggfilter))
-				{
-					*reason = psprintf("FILTER condition of aggregate \"%s\" must be "
-								   "immutable and free of subqueries, aggregates, and "
-								   "window functions", fname);
-					return false;
-				}
-				continue;
-			}
-
-			/*
-			 * Additive path: exact SUM/COUNT/AVG/MIN/MAX maintained by per-row
-			 * delta.  Accept the hand grammar always; for the plain single-table
-			 * shape also accept any deterministic deparse-able expression.
-			 */
-			if (agg->args != NIL)
-			{
-				TargetEntry *arg_te = linitial_node(TargetEntry, agg->args);
-				Node	   *arg = (Node *) arg_te->expr;
-				bool	arg_ok = !contain_mutable_functions(arg) &&
-					(incr_validate_expr(arg, NULL, false) ||
-					 (deparse_agg_shape && incr_agg_arg_deparse_safe(arg)));
-
-				if (!arg_ok)
-				{
-					*reason = psprintf("argument of aggregate \"%s\" uses "
-									   "unsupported expressions; only column "
-									   "references, constants, and arithmetic "
-									   "operators are allowed", fname);
-					return false;
-				}
-			}
 			continue;
 		}
-		*reason = "only column references and SUM/COUNT/AVG/MIN/MAX aggregates are allowed "
-			"in GROUP BY matviews";
-		return false;
+		if (incr_validate_projection((Node *) te->expr, viewQuery,
+									 nbasetables, deparse_agg_shape, reason))
+			continue;
+		return false;			/* incr_validate_projection set *reason */
+	}
+
+	/*
+	 * Every GROUP BY key must also be a visible output column.  The engine keys
+	 * the matview on the group columns (unique index, UPSERT conflict target,
+	 * delete), so a key grouped on but referenced only inside an expression —
+	 * which the parser carries as a resjunk grouping target with no output name
+	 * (e.g. GROUP BY a,b while selecting only a||b) — has no matview column to
+	 * key on and cannot be maintained.  Reject cleanly (previously this reached
+	 * incr_collect_group_cols with a NULL resname).  Expose the key in the SELECT
+	 * list, or move the wrapping expression into a plain view over the matview.
+	 */
+	foreach(lc, viewQuery->groupClause)
+	{
+		SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+		TargetEntry	   *gte = get_sortgroupclause_tle(sgc, viewQuery->targetList);
+
+		if (gte == NULL || gte->resjunk || gte->resname == NULL)
+		{
+			*reason = "every GROUP BY key must also be a SELECT output column; a "
+				"key referenced only inside an expression (not selected on its "
+				"own) cannot be maintained — add it to the SELECT list, or move "
+				"the wrapping expression into a plain view over the matview";
+			return false;
+		}
 	}
 
 	/* Validate WHERE clause if present (Phase 5) */
@@ -9117,6 +9245,17 @@ incr_needs_recompute(Query *viewQuery)
 		TargetEntry *te = lfirst_node(TargetEntry, lc);
 		Aggref	   *agg;
 		char	   *fname;
+
+		/*
+		 * A projection target — an expression over group keys and aggregates
+		 * that is neither a bare group-key Var nor a bare Aggref (e.g.
+		 * COALESCE(SUM(a),0)+SUM(b)) — cannot be maintained by the additive
+		 * per-aggregate delta path (a nonlinear expression does not distribute
+		 * over the delta merge), so it must be recomputed.
+		 */
+		if (!te->resjunk && !incr_is_hidden_col(te->resname) &&
+			!IsA(te->expr, Var) && !IsA(te->expr, Aggref))
+			return true;
 
 		if (te->resjunk || !IsA(te->expr, Aggref))
 			continue;
