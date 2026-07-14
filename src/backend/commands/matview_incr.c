@@ -1441,7 +1441,10 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 
 			if (hasHaving && mv_populated)
 			{
-				char *backfill_sql = used_deparse
+				/* Recompute views (incl. projection-column views) must use the
+				 * ruleutils backfill — the hand renderer can't render projection
+				 * expressions (COALESCE/CASE/arith over aggregates). */
+				char *backfill_sql = (used_deparse || incr_needs_recompute(viewQuery))
 					? incr_build_backfill_sql_deparse(mvrelid, viewQuery)
 					: incr_build_backfill_sql_gen(mvrelid, viewQuery, -1,
 												  mv_qname(srctable), NIL);
@@ -1816,7 +1819,7 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 				IncrJoinEntry *first_je  = linitial(all_tables);
 				List		  *join_list = incr_build_join_list_for_delta(
 					all_tables, first_je->varno);
-				char		  *backfill_sql = used_deparse
+				char		  *backfill_sql = (used_deparse || incr_needs_recompute(viewQuery))
 					? incr_build_backfill_sql_deparse(mvrelid, viewQuery)
 					: incr_build_backfill_sql_gen(
 						mvrelid, viewQuery,
@@ -1918,7 +1921,7 @@ MatviewIncrPostRefresh(Oid mvrelid, Query *viewQuery)
 				(dbblue_ivm_deparse_delta || incr_aggs_need_deparse(viewQuery) ||
 				 incr_group_needs_deparse(viewQuery));
 
-			backfill_sql = used_deparse
+			backfill_sql = (used_deparse || incr_needs_recompute(viewQuery))
 				? incr_build_backfill_sql_deparse(mvrelid, viewQuery)
 				: incr_build_backfill_sql_gen(mvrelid, viewQuery, -1,
 											  mv_qname(srctable), NIL);
@@ -1934,7 +1937,7 @@ MatviewIncrPostRefresh(Oid mvrelid, Query *viewQuery)
 				!incr_has_outer_join(all_tables) &&
 				!incr_has_minmax_agg(viewQuery);
 
-			backfill_sql = used_deparse
+			backfill_sql = (used_deparse || incr_needs_recompute(viewQuery))
 				? incr_build_backfill_sql_deparse(mvrelid, viewQuery)
 				: incr_build_backfill_sql_gen(
 					mvrelid, viewQuery, first_je->varno,
@@ -3304,6 +3307,39 @@ incr_having_agg_column(Aggref *hagg, Query *viewQuery)
 	return NULL;
 }
 
+/*
+ * incr_having_expr_column — the stored matview column whose value equals a
+ * HAVING SUB-EXPRESSION `expr`, or NULL.  Generalizes incr_having_agg_column
+ * (which binds only a bare top-level SELECT aggregate) to bind a whole
+ * projection sub-expression to its output column: e.g.
+ *   SELECT COALESCE(SUM(a),0) AS x … HAVING COALESCE(SUM(a),0) > 0
+ * binds the COALESCE to x, so the hav_sql UPDATE evaluates "(x > 0)" from the
+ * stored, already-maintained projection column.  Excludes bare Var/Aggref/Const
+ * (those keep their existing specialized binding / literal rendering), so this
+ * only ADDS projection-expression binding — used by both the eligibility gate
+ * (incr_validate_expr) and the deparser (incr_deparse_having_cond) so the two
+ * never disagree.
+ */
+static const char *
+incr_having_expr_column(Node *expr, Query *viewQuery)
+{
+	ListCell   *lc;
+
+	if (expr == NULL || IsA(expr, Var) || IsA(expr, Aggref) || IsA(expr, Const))
+		return NULL;
+
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+		if (te->resjunk || te->resname == NULL || incr_is_hidden_col(te->resname))
+			continue;
+		if (equal(te->expr, expr))
+			return te->resname;
+	}
+	return NULL;
+}
+
 static bool
 incr_validate_expr(Node *expr, Query *viewQuery, bool allow_aggref)
 {
@@ -3313,6 +3349,16 @@ incr_validate_expr(Node *expr, Query *viewQuery, bool allow_aggref)
 		return true;
 
 	if (IsA(expr, Var) || IsA(expr, Const))
+		return true;
+
+	/*
+	 * HAVING (allow_aggref) may reference a whole stored PROJECTION column: if
+	 * this sub-expression equals an output column, it is maintained there and
+	 * the deparser renders it as that column (incr_having_expr_column), so it is
+	 * valid without drilling into its — possibly unbound — aggregate leaves.
+	 */
+	if (allow_aggref && viewQuery != NULL &&
+		incr_having_expr_column(expr, viewQuery) != NULL)
 		return true;
 
 	if (IsA(expr, Aggref))
@@ -3717,8 +3763,21 @@ incr_resolve_var_colname(Var *v, List *rtable, int *resolved_varno_out)
 static void
 incr_deparse_having_cond(Node *expr, Query *viewQuery, StringInfo buf)
 {
+	const char *pcol;
+
 	if (expr == NULL)
 		return;
+
+	/* A whole sub-expression stored as an output (projection) column renders as
+	 * that column — see incr_having_expr_column.  Checked first so a stored
+	 * COALESCE/CASE/arith-over-aggregates binds to its column rather than being
+	 * re-rendered (and rather than drilling into a possibly-unbound aggregate). */
+	pcol = incr_having_expr_column(expr, viewQuery);
+	if (pcol != NULL)
+	{
+		appendStringInfoString(buf, quote_identifier(pcol));
+		return;
+	}
 
 	if (IsA(expr, Aggref))
 	{
@@ -3889,6 +3948,49 @@ incr_deparse_having_cond(Node *expr, Query *viewQuery, StringInfo buf)
 		appendStringInfoChar(buf, '(');
 		incr_deparse_having_cond((Node *) rt->arg, viewQuery, buf);
 		appendStringInfo(buf, ")::%s", format_type_be(rt->resulttype));
+	}
+	else if (IsA(expr, CoalesceExpr))
+	{
+		/* COALESCE(a, b, …) over aggregate/group-key columns and constants. */
+		CoalesceExpr *ce = (CoalesceExpr *) expr;
+		ListCell   *lc;
+		bool		first = true;
+
+		appendStringInfoString(buf, "COALESCE(");
+		foreach(lc, ce->args)
+		{
+			if (!first)
+				appendStringInfoChar(buf, ',');
+			incr_deparse_having_cond((Node *) lfirst(lc), viewQuery, buf);
+			first = false;
+		}
+		appendStringInfoChar(buf, ')');
+	}
+	else if (IsA(expr, CaseExpr))
+	{
+		/* Searched CASE only (simple CASE with ->arg set is rejected by the
+		 * eligibility gate's incr_validate_expr, so it never reaches here). */
+		CaseExpr   *ce = (CaseExpr *) expr;
+		ListCell   *lc;
+
+		if (ce->arg != NULL)
+			elog(ERROR, "incr_deparse_having_cond: simple CASE not supported");
+		appendStringInfoString(buf, "(CASE");
+		foreach(lc, ce->args)
+		{
+			CaseWhen   *w = lfirst_node(CaseWhen, lc);
+
+			appendStringInfoString(buf, " WHEN ");
+			incr_deparse_having_cond((Node *) w->expr, viewQuery, buf);
+			appendStringInfoString(buf, " THEN ");
+			incr_deparse_having_cond((Node *) w->result, viewQuery, buf);
+		}
+		if (ce->defresult != NULL)
+		{
+			appendStringInfoString(buf, " ELSE ");
+			incr_deparse_having_cond((Node *) ce->defresult, viewQuery, buf);
+		}
+		appendStringInfoString(buf, " END)");
 	}
 	else
 		elog(ERROR,
