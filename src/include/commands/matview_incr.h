@@ -21,6 +21,7 @@
  * proven equivalent by the dbblue_ivm suite run with this on and off.
  */
 extern PGDLLIMPORT bool dbblue_ivm_deparse_delta;
+extern PGDLLIMPORT double dbblue_ivm_refresh_threshold;
 
 /*
  * Hidden column names / prefixes used by the incremental refresh engine.

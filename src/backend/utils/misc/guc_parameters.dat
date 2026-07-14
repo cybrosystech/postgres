@@ -630,6 +630,15 @@
   boot_val => 'true',
 },
 
+{ name => 'dbblue_ivm_refresh_threshold', type => 'real', context => 'PGC_USERSET', group => 'DEVELOPER_OPTIONS',
+  short_desc => 'DBblue: rebuild an incremental matview with a full REFRESH when the rows a statement changes exceed this fraction of the source table estimated live tuples (0 disables the fallback).',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'dbblue_ivm_refresh_threshold',
+  boot_val => '0.5',
+  min => '0.0',
+  max => '1e12',
+},
+
 # This is PGC_SUSET to prevent hiding from log_lock_waits.
 { name => 'deadlock_timeout', type => 'int', context => 'PGC_SUSET', group => 'LOCK_MANAGEMENT',
   short_desc => 'Sets the time to wait on a lock before checking for deadlock.',

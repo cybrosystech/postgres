@@ -131,6 +131,15 @@ static HTAB *incr_plan_cache = NULL;
 bool		dbblue_ivm_deparse_delta = true;
 
 /*
+ * Cost router (matview_delta_apply): when a single statement's affected row
+ * count exceeds this fraction of the source table's estimated live tuples, apply
+ * the delta by a full REFRESH instead of incrementally — a bulk DML can cost
+ * more to maintain incrementally than to rebuild.  0 (or negative) disables the
+ * router (always incremental).
+ */
+double		dbblue_ivm_refresh_threshold = 0.5;
+
+/*
  * Alias for the delta (transition) table in Phase 2+ SQL.
  * Non-delta join tables get per-varno aliases "_j<varno>_" built at runtime.
  */
@@ -8748,6 +8757,52 @@ matview_delta_apply(PG_FUNCTION_ARGS)
 		pfree(refresh_sql.data);
 		SPI_finish();
 		return PointerGetDatum(NULL);
+	}
+
+	/*
+	 * ----- cost router: bulk delta -> full REFRESH -----
+	 *
+	 * A statement that changes a large fraction of the source table can cost
+	 * more to apply incrementally (per-row/per-group delta work plus the CTE
+	 * machinery) than to rebuild the matview once.  When the affected row count
+	 * exceeds dbblue_ivm_refresh_threshold × the source's estimated live tuples,
+	 * fall back to a full REFRESH.  Skipped when the estimate is unknown or empty
+	 * (reltuples < 1) — never rebuild on a guess — and when the GUC is <= 0.
+	 * REFRESH rebuilds every column (visible and hidden) from current source
+	 * contents and re-enters no trigger, so the result is identical to what
+	 * incremental maintenance would have produced.
+	 */
+	if (dbblue_ivm_refresh_threshold > 0)
+	{
+		double	newc = trigdata->tg_newtable
+			? (double) tuplestore_tuple_count(trigdata->tg_newtable) : 0;
+		double	oldc = trigdata->tg_oldtable
+			? (double) tuplestore_tuple_count(trigdata->tg_oldtable) : 0;
+		double	delta_rows = Max(newc, oldc);		/* UPDATE counts once, not twice */
+		double	src_rows = trigdata->tg_relation->rd_rel->reltuples;
+
+		if (src_rows >= 1 &&
+			delta_rows > dbblue_ivm_refresh_threshold * src_rows)
+		{
+			char	   *relname = get_rel_name(mvrelid);
+
+			if (relname != NULL)		/* skip if matview dropped in this txn */
+			{
+				StringInfoData	refresh_sql;
+				char		   *nspname = get_namespace_name(get_rel_namespace(mvrelid));
+
+				initStringInfo(&refresh_sql);
+				appendStringInfo(&refresh_sql, "REFRESH MATERIALIZED VIEW %s",
+								 quote_qualified_identifier(nspname, relname));
+				ret = SPI_execute(refresh_sql.data, false, 0);
+				if (ret != SPI_OK_UTILITY)
+					elog(ERROR, "matview_delta_apply: cost-router refresh failed: %s",
+						 SPI_result_code_string(ret));
+				pfree(refresh_sql.data);
+			}
+			SPI_finish();
+			return PointerGetDatum(NULL);
+		}
 	}
 
 	/* Register __mv_newtable / __mv_oldtable as ENRs visible to SPI queries */
