@@ -455,38 +455,56 @@ dbbc_block_ref(dsa_pointer blockptr)
  * still ALL_VISIBLE and the VM page's LSN still equals the stamp captured at
  * build (see the DbbcBlock.vm_lsn contract in dbblue_columnar.h). Returns
  * false when the proof cannot be made this cheaply (bit cleared, VM LSN
- * moved - possibly by a neighbor's re-set - or the block carries no stamp);
- * the caller then falls back to the per-heap-page LSN proof, which remains
- * the authority. *vmbuf is a visibilitymap_get_status-style pinned buffer
- * the caller owns and must eventually release.
+ * moved, VM page absent, or the block carries no stamp); the caller then
+ * falls back to the per-heap-page LSN proof, which remains the authority.
+ * *vmbuf is a caller-owned pinned VM buffer (get_status-style) released later.
  *
- * Order matters: bits are checked BEFORE the LSN. A concurrent clear between
- * the two reads leaves the LSN unmoved and we may serve the block - sound,
- * because the modifying transaction is concurrent with the caller's snapshot
- * and thus invisible to it (the same tolerance the per-page proof has after
- * its locks are released).
+ * The bit(s) and the LSN MUST be read atomically with respect to bit setters,
+ * so both reads happen under a SHARE lock on the VM buffer. Every setter holds
+ * the VM buffer EXCLUSIVE across the whole [set bit ... XLogInsert ...
+ * PageSetLSN] sequence (vacuumlazy.c, pruneheap.c log_heap_prune_and_freeze,
+ * heapam redo). Reading bit and LSN lock-free would expose the setter's middle
+ * state - a just-re-set bit with the not-yet-bumped LSN still equal to our
+ * stamp - and serve a block whose heap range HAS changed (e.g. a vacuum that
+ * just removed a deleted row), resurrecting it. The SHARE lock excludes that
+ * window: we observe either the pre-set state (bit clear, or LSN below stamp)
+ * or the fully post-set state (LSN past the stamp) - never the middle.
  */
 bool
 dbbc_block_vm_valid(DbbcBlock *block, Relation rel, Buffer *vmbuf)
 {
 	uint16		p;
+	bool		valid = true;
 
 	if (XLogRecPtrIsInvalid(block->vm_lsn))
 		return false;			/* no stamp: fast path ineligible */
 
+	/*
+	 * Establish the pin on the covering VM page. A stamp only exists when the
+	 * whole range shares one VM page (enforced at build), so this one page
+	 * covers every heap page we check and get_status never re-pins below.
+	 * get_status (not visibilitymap_pin) so a missing VM page is reported, not
+	 * created.
+	 */
+	(void) visibilitymap_get_status(rel, block->first_page, vmbuf);
+	if (!BufferIsValid(*vmbuf))
+		return false;
+
+	LockBuffer(*vmbuf, BUFFER_LOCK_SHARE);
 	for (p = 0; p < block->npages; p++)
 	{
 		if (!(visibilitymap_get_status(rel, block->first_page + p, vmbuf) &
 			  VISIBILITYMAP_ALL_VISIBLE))
-			return false;
+		{
+			valid = false;
+			break;
+		}
 	}
-	/*
-	 * A stamp only exists when the whole range shares one VM page (enforced
-	 * at build), so after the loop *vmbuf covers exactly that page.
-	 */
-	if (!BufferIsValid(*vmbuf))
-		return false;
-	return BufferGetLSNAtomic(*vmbuf) == block->vm_lsn;
+	if (valid)
+		valid = (BufferGetLSNAtomic(*vmbuf) == block->vm_lsn);
+	LockBuffer(*vmbuf, BUFFER_LOCK_UNLOCK);
+
+	return valid;
 }
 
 /*

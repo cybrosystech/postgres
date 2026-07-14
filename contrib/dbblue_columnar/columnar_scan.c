@@ -48,6 +48,7 @@
 #include "access/tableam.h"
 #include "access/transam.h"
 #include "access/tupmacs.h"
+#include "access/visibilitymap.h"
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_aggregate_d.h"
 #include "catalog/pg_am_d.h"
@@ -666,7 +667,14 @@ dbbc_estimate_serve_fractions(Relation rel, List *clauses, Index varno,
 
 	dir = (dsa_pointer *) dsa_get_address(dbbc_store_dsa(),
 										  version->blockdir);
-	step = Max(1, version->ndirslots / 1024);
+	/*
+	 * Bounded sample. This is a plan-time COST estimate, so the VM probe is
+	 * done lock-free (unlike the authoritative dbbc_block_vm_valid, which
+	 * SHARE-locks) - a racy bit/LSN read only mis-estimates a fraction, never
+	 * affects correctness, and avoids taking up to 256 buffer content locks
+	 * on every plan of a query against a registered table.
+	 */
+	step = Max(1, version->ndirslots / 256);
 	for (slot = 0; slot < version->ndirslots; slot += step)
 	{
 		DbbcBlock  *block;
@@ -682,8 +690,23 @@ dbbc_estimate_serve_fractions(Relation rel, List *clauses, Index varno,
 			dbbc_zone_block_skippable(quals, nquals, block, chunks,
 									  version->ncols))
 			skipped++;
-		if (dbbc_block_vm_valid(block, rel, &vmbuf))
-			vmvalid++;
+		/* lock-free approximation of the VM fast-path eligibility */
+		if (!XLogRecPtrIsInvalid(block->vm_lsn))
+		{
+			bool		av = true;
+			uint16		p;
+
+			for (p = 0; p < block->npages; p++)
+				if (!(visibilitymap_get_status(rel, block->first_page + p,
+											   &vmbuf) & VISIBILITYMAP_ALL_VISIBLE))
+				{
+					av = false;
+					break;
+				}
+			if (av && BufferIsValid(vmbuf) &&
+				BufferGetLSNAtomic(vmbuf) == block->vm_lsn)
+				vmvalid++;
+		}
 	}
 	if (BufferIsValid(vmbuf))
 		ReleaseBuffer(vmbuf);
@@ -2386,9 +2409,10 @@ dbbc_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 		 * per group. Cheaper than Agg-over-scan by the absent per-row slot
 		 * emission AND the spared heap IO.
 		 */
-		double		input_rows = clamp_row_est(base_rel->rows);
+		double		surviving = clamp_row_est(base_rel->rows);
 		double		skip_frac = 0.0;
 		double		vm_frac = 0.0;
+		double		decoded;
 		Cost		run;
 
 		{
@@ -2398,11 +2422,26 @@ dbbc_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 										  &skip_frac, &vm_frac);
 			table_close(prel, NoLock);
 		}
+
+		/*
+		 * Decode + qual evaluation happen on EVERY row of every non-zone-
+		 * skipped block (all decoded rows), not just the rows that survive the
+		 * quals - charge on base_rel->tuples * (1 - skip_frac). Charging the
+		 * qual term on the surviving-row estimate instead would under-price a
+		 * selective qual on a scattered (non-zone-skippable) column by orders
+		 * of magnitude and let columnar wrongly displace an index scan. Only
+		 * the transition-function calls run on surviving rows.
+		 */
+		decoded = clamp_row_est(base_rel->tuples * (1.0 - skip_frac));
 		run = seq_page_cost * base_rel->pages * (1.0 - vm_frac)
 			+ cpu_operator_cost *
 			(base_rel->pages / DBBC_PAGES_PER_BLOCK + 1) * 2.0
-			+ (1.0 - skip_frac) * input_rows * cpu_operator_cost *
-			(list_length(quals) + list_length(aggrefs) + 1);
+			/* decode every served row (per-tuple work, like the scan path's
+			 * cpu_tuple_cost*0.75) + evaluate its quals; only survivors reach
+			 * the transition calls */
+			+ decoded * (cpu_tuple_cost * 0.75
+						 + cpu_operator_cost * list_length(quals))
+			+ surviving * cpu_operator_cost * (list_length(aggrefs) + 1);
 		cpath->path.startup_cost = run;
 		cpath->path.total_cost = run + cpu_tuple_cost * clamp_row_est(ngroups);
 	}

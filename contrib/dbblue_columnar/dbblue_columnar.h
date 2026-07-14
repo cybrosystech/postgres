@@ -131,10 +131,15 @@ typedef struct DbbcBlock
 	 * (pruneheap.c log_heap_prune_and_freeze; heapam_xlog.c redo), moving it
 	 * past the stamp (caught by the LSN check). Capturing the stamp before
 	 * the copies makes any set during the build move the LSN past it -
-	 * conservative fallback, never false validity. InvalidXLogRecPtr means
-	 * the fast path must not be used for this block (range crosses a VM page
-	 * boundary, or the VM page had no LSN at build); the per-heap-page
-	 * LSN proof below remains the fallback and the authority.
+	 * conservative fallback, never false validity. CRITICAL: the bit and the
+	 * LSN must be read together under a SHARE lock on the VM buffer, because
+	 * a setter holds the buffer EXCLUSIVE across [set bit ... PageSetLSN] and
+	 * a lock-free reader could otherwise catch the middle - a re-set bit with
+	 * the not-yet-bumped LSN still equal to the stamp - and serve a stale
+	 * block (see dbbc_block_vm_valid). InvalidXLogRecPtr means the fast path
+	 * must not be used for this block (range crosses a VM page boundary, or
+	 * the VM page had no LSN at build); the per-heap-page LSN proof below
+	 * remains the fallback and the authority.
 	 */
 	XLogRecPtr	vm_lsn;
 	/*
