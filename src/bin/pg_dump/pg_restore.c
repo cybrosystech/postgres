@@ -507,6 +507,14 @@ main(int argc, char **argv)
 	if (opts->tocFile)
 		SortTocFromFile(AH);
 
+	if (numWorkers <= 1)
+   {
+       numWorkers = (int) sysconf(_SC_NPROCESSORS_ONLN);
+   }
+
+   pg_log_warning("restoring database \"%s\" to target server using %d parallel workers",
+                  opts->cparams.dbname,
+                  numWorkers);
 	AH->numWorkers = numWorkers;
 
 	if (opts->tocSummary)
