@@ -62,3 +62,25 @@ single prerequisite for the "22 s → 3 s" class of result on real hardware.
 Caveats to resolve in M6 implementation: WAL-skip / empty-page
 `visibilitymap_set` paths (heapam.c:2455) and build-time stamping order; both
 have conservative fallbacks (treat as invalid → per-page proof).
+
+## Post-M6 re-run (same rig, same suite, 2026-07-14)
+
+| report | columnar OFF | columnar ON | speedup |
+|---|--:|--:|--:|
+| R1 Trial Balance | 3 568 ms | 790 ms | **4.5×** |
+| R2 General Ledger | 729 ms | 195 ms | **3.7×** |
+| R3 Profit & Loss | 636 ms | 210 ms | **3.0×** |
+| R4 Aged Receivable | 595 ms | 218 ms | **2.7×** |
+| R5 Inventory Valuation | 295 ms | 185 ms | **1.6×** |
+| R6 Pivot company×account | 2 550 ms | 798 ms | **3.2×** |
+
+Complete inversion: 0.11–0.73× → **1.6–4.5×, winning every report.** The
+P&L probe shows the mechanism: ~176 buffer touches instead of 1.05 M — the
+query never reads the heap (27 568 of 36 760 blocks zone-skipped without
+being read, the rest served from the store, 0 heap ranges). The planner now
+chooses columnar on its own (vm_frac-discounted costing). Staleness
+protocol verified: UPDATE → affected blocks fall back (results exact);
+VACUUM re-set moves the VM LSN → per-page proof rejects (exact); refresh →
+fast path restored. OFF baseline is partially OS-cached on this rig; on
+colder/bigger heaps the OFF side grows with table size while ON stays
+~flat, so the gap widens with scale.

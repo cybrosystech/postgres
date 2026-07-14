@@ -195,6 +195,9 @@ typedef struct DbbcScanState
 	TableScanDesc heap_scan;
 	TupleTableSlot *heap_slot;	/* table-AM slot (scan slot is virtual) */
 
+	/* pinned VM buffer for the M6 fast validity proof (released at End) */
+	Buffer		vm_check_buf;
+
 	/*
 	 * Degraded mode: no usable store version (stale cached plan after a
 	 * repopulate/drop, or a non-heap table AM after ALTER TABLE ... SET
@@ -210,6 +213,7 @@ typedef struct DbbcScanState
 	uint64		ranges_heap;
 	uint64		rows_columnar;
 	uint64		rows_filtered;
+	uint64		blocks_vm_validated;	/* validity proven from the VM alone */
 } DbbcScanState;
 
 static void dbbc_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
@@ -621,12 +625,18 @@ dbbc_zone_block_skippable(DbbcSkipQual *quals, int nquals,
 
 /*
  * Plan-time skip-fraction estimate: walk (a sample of) the real zone maps
- * with the query's extractable quals. Returns the estimated fraction of
- * BUILT blocks that will be skipped, scaled by build coverage, clamped
- * conservatively.
+ * with the query's extractable quals, and how much of the heap the M6
+ * VM-fork validity proof will spare from being read at all. One sampled walk
+ * fills both:
+ *   *skip_frac - estimated fraction of blocks zone-map-skipped (CPU saving),
+ *   *vm_frac   - estimated fraction of the heap whose blocks validate from
+ *                the VM alone (IO saving: those heap pages are never read).
+ * Both scaled by build coverage and clamped conservatively. rel is the
+ * already-locked relation (the planner holds a lock; we only read its VM).
  */
-static double
-dbbc_estimate_skip_fraction(Oid relid, List *clauses, Index varno)
+static void
+dbbc_estimate_serve_fractions(Relation rel, List *clauses, Index varno,
+							  double *skip_frac, double *vm_frac)
 {
 	DbbcSkipQual *quals;
 	int			nquals;
@@ -636,19 +646,22 @@ dbbc_estimate_skip_fraction(Oid relid, List *clauses, Index varno)
 	uint32		slot;
 	uint32		seen = 0;
 	uint32		skipped = 0;
-	double		frac;
+	uint32		vmvalid = 0;
+	double		coverage;
+	Buffer		vmbuf = InvalidBuffer;
+
+	*skip_frac = 0.0;
+	*vm_frac = 0.0;
 
 	nquals = dbbc_extract_skip_quals(clauses, varno, &quals);
-	if (nquals == 0)
-		return 0.0;
 
-	version = dbbc_version_pin_tracked(relid);
+	version = dbbc_version_pin_tracked(RelationGetRelid(rel));
 	if (version == NULL)
-		return 0.0;
+		return;
 	if (!DsaPointerIsValid(version->blockdir) || version->ndirslots == 0)
 	{
 		dbbc_version_unpin_tracked(version);
-		return 0.0;
+		return;
 	}
 
 	dir = (dsa_pointer *) dsa_get_address(dbbc_store_dsa(),
@@ -665,18 +678,25 @@ dbbc_estimate_skip_fraction(Oid relid, List *clauses, Index varno)
 		chunks = (DbbcColumnChunk *) dsa_get_address(dbbc_store_dsa(),
 													 block->chunks);
 		seen++;
-		if (dbbc_zone_block_skippable(quals, nquals, block, chunks,
+		if (nquals > 0 &&
+			dbbc_zone_block_skippable(quals, nquals, block, chunks,
 									  version->ncols))
 			skipped++;
+		if (dbbc_block_vm_valid(block, rel, &vmbuf))
+			vmvalid++;
+	}
+	if (BufferIsValid(vmbuf))
+		ReleaseBuffer(vmbuf);
+
+	/* scale by how much of the relation is columnarized at all */
+	coverage = (double) version->nblocks / Max(version->ndirslots, 1);
+	if (seen > 0)
+	{
+		*skip_frac = Min(((double) skipped / seen) * coverage, 0.95);
+		*vm_frac = Min(((double) vmvalid / seen) * coverage, 0.98);
 	}
 
-	frac = (seen > 0) ? (double) skipped / seen : 0.0;
-	/* scale by how much of the relation is columnarized at all */
-	frac *= (double) version->nblocks / Max(version->ndirslots, 1);
-
 	dbbc_version_unpin_tracked(version);
-
-	return Min(frac, 0.95);
 }
 
 /*
@@ -807,6 +827,7 @@ dbbc_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 	List	   *clauses = NIL;
 	ListCell   *lc;
 	double		skip_frac;
+	double		vm_frac;
 	CustomPath *cpath;
 	QualCost	qcost;
 	bool		prefilter_unsafe = false;
@@ -838,9 +859,21 @@ dbbc_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 		clauses = lappend(clauses, ri->clause);
 	}
 
-	/* estimate zone-map skipping against the real block metadata */
-	skip_frac = prefilter_unsafe ? 0.0 :
-		dbbc_estimate_skip_fraction(rte->relid, clauses, rel->relid);
+	/*
+	 * Estimate zone-map skipping (CPU saving) and VM-provable validity (IO
+	 * saving) against the real block metadata. The planner already holds a
+	 * lock on the relation; we open it only to read its VM fork. Under a
+	 * security qual the pre-filter/zone-skip are disabled (NIL clauses), but
+	 * the VM IO discount still applies - it's qual-independent.
+	 */
+	{
+		Relation	prel = table_open(rte->relid, NoLock);
+
+		dbbc_estimate_serve_fractions(prel,
+									  prefilter_unsafe ? NIL : clauses,
+									  rel->relid, &skip_frac, &vm_frac);
+		table_close(prel, NoLock);
+	}
 
 	cpath = makeNode(CustomPath);
 	cpath->path.pathtype = T_CustomScan;
@@ -858,18 +891,18 @@ dbbc_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 	cpath->methods = &dbbc_path_methods;
 
 	/*
-	 * Costing: the scan still visits every heap page (validity checks pin
-	 * page headers; fallback reads pages in full), so charge full I/O like a
-	 * seqscan. The CPU saving has two sources: no tuple deforming on
-	 * columnar-served rows, and zone-map skipping - blocks the real zone
-	 * maps prove empty for these quals contribute no per-tuple work at all,
-	 * so the CPU terms scale by (1 - skip_frac).
+	 * Costing. IO: blocks the VM-fork proof validates (vm_frac) are served
+	 * with NO heap page reads - only the remaining fraction pays seq IO,
+	 * plus a tiny per-block VM-check term. CPU: no tuple deforming on
+	 * columnar-served rows, and zone-map-skipped blocks contribute no
+	 * per-tuple work at all, so the CPU terms scale by (1 - skip_frac).
 	 */
 	cost_qual_eval(&qcost, rel->baserestrictinfo, root);
 	cpath->path.disabled_nodes = 0;
 	cpath->path.startup_cost = qcost.startup;
 	cpath->path.total_cost = qcost.startup +
-		seq_page_cost * rel->pages +
+		seq_page_cost * rel->pages * (1.0 - vm_frac) +
+		cpu_operator_cost * (rel->pages / DBBC_PAGES_PER_BLOCK + 1) * 2.0 +
 		(cpu_tuple_cost * 0.75 + qcost.per_tuple) * rel->tuples *
 		(1.0 - skip_frac);
 
@@ -908,7 +941,9 @@ dbbc_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 			ppath->path.disabled_nodes = 0;
 			ppath->path.startup_cost = qcost.startup;
 			ppath->path.total_cost = qcost.startup +
-				(seq_page_cost * rel->pages +
+				(seq_page_cost * rel->pages * (1.0 - vm_frac) +
+				 cpu_operator_cost *
+				 (rel->pages / DBBC_PAGES_PER_BLOCK + 1) * 2.0 +
 				 (cpu_tuple_cost * 0.75 + qcost.per_tuple) * rel->tuples *
 				 (1.0 - skip_frac)) / divisor;
 
@@ -1195,6 +1230,19 @@ dbbc_block_valid(DbbcScanState *s, Relation rel, DbbcBlock *block)
 					s->heap_nblocks);
 	if ((BlockNumber) block->first_page + block->npages != range_end)
 		return false;
+
+	/*
+	 * M6 fast path: prove validity from the visibility-map fork alone - the
+	 * VM is 2 bits per heap page, so this replaces up to 32 heap page reads
+	 * with a couple of (hot, tiny) VM buffer reads. When the proof can't be
+	 * made cheaply, fall back to the per-heap-page LSN proof below, which
+	 * remains the authority.
+	 */
+	if (dbbc_block_vm_valid(block, rel, &s->vm_check_buf))
+	{
+		s->blocks_vm_validated++;
+		return true;
+	}
 
 	for (p = 0; p < block->npages; p++)
 	{
@@ -1547,6 +1595,11 @@ dbbc_end_scan(CustomScanState *node)
 		table_endscan(s->heap_scan);
 		s->heap_scan = NULL;
 	}
+	if (BufferIsValid(s->vm_check_buf))
+	{
+		ReleaseBuffer(s->vm_check_buf);
+		s->vm_check_buf = InvalidBuffer;
+	}
 	if (s->version != NULL)
 	{
 		dbbc_version_unpin_tracked(s->version);
@@ -1582,6 +1635,8 @@ dbbc_explain_scan(CustomScanState *node, List *ancestors, ExplainState *es)
 							   (int64) s->blocks_columnar, es);
 		ExplainPropertyInteger("Columnar Blocks Skipped", NULL,
 							   (int64) s->blocks_skipped, es);
+		ExplainPropertyInteger("Columnar VM-Validated Blocks", NULL,
+							   (int64) s->blocks_vm_validated, es);
 		ExplainPropertyInteger("Heap Fallback Ranges", NULL,
 							   (int64) s->ranges_heap, es);
 		ExplainPropertyInteger("Columnar Rows", NULL,
@@ -2325,20 +2380,27 @@ dbbc_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	if (grouped)
 	{
 		/*
-		 * Grouped: real per-row work. Full I/O (the fallback bound), per-page
-		 * validity checks, then per-surviving-row qual + transition calls,
-		 * and one output tuple per group. Cheaper than Agg-over-scan mainly
-		 * by the absent per-row slot emission (cpu_tuple_cost), which is the
-		 * honest advantage.
+		 * Grouped: real per-row work. IO only for the heap fraction the
+		 * VM-fork proof cannot spare (M6), a small validity-walk term, then
+		 * per-surviving-row qual + transition calls, and one output tuple
+		 * per group. Cheaper than Agg-over-scan by the absent per-row slot
+		 * emission AND the spared heap IO.
 		 */
 		double		input_rows = clamp_row_est(base_rel->rows);
 		double		skip_frac = 0.0;
+		double		vm_frac = 0.0;
 		Cost		run;
 
-		if (quals != NIL)
-			skip_frac = dbbc_estimate_skip_fraction(rte->relid, quals, relid);
-		run = seq_page_cost * base_rel->pages
-			+ cpu_operator_cost * base_rel->pages
+		{
+			Relation	prel = table_open(rte->relid, NoLock);
+
+			dbbc_estimate_serve_fractions(prel, quals, relid,
+										  &skip_frac, &vm_frac);
+			table_close(prel, NoLock);
+		}
+		run = seq_page_cost * base_rel->pages * (1.0 - vm_frac)
+			+ cpu_operator_cost *
+			(base_rel->pages / DBBC_PAGES_PER_BLOCK + 1) * 2.0
 			+ (1.0 - skip_frac) * input_rows * cpu_operator_cost *
 			(list_length(quals) + list_length(aggrefs) + 1);
 		cpath->path.startup_cost = run;
@@ -3266,6 +3328,8 @@ dbbc_grp_build(DbbcAggScanState *as, EState *estate)
 		}
 	}
 
+	if (BufferIsValid(scratch.vm_check_buf))
+		ReleaseBuffer(scratch.vm_check_buf);
 	if (scratch.version != NULL)
 		dbbc_version_unpin_tracked(scratch.version);
 
@@ -3488,6 +3552,8 @@ dbbc_agg_exec(CustomScanState *node)
 		}
 	}
 
+	if (BufferIsValid(scratch.vm_check_buf))
+		ReleaseBuffer(scratch.vm_check_buf);
 	if (scratch.version != NULL)
 		dbbc_version_unpin_tracked(scratch.version);
 

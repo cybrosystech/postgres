@@ -450,22 +450,64 @@ dbbc_block_ref(dsa_pointer blockptr)
 }
 
 /*
+ * M6 fast validity proof, from the visibility-map fork alone - NO heap page
+ * reads. A block is proven byte-for-byte valid when every covered VM bit is
+ * still ALL_VISIBLE and the VM page's LSN still equals the stamp captured at
+ * build (see the DbbcBlock.vm_lsn contract in dbblue_columnar.h). Returns
+ * false when the proof cannot be made this cheaply (bit cleared, VM LSN
+ * moved - possibly by a neighbor's re-set - or the block carries no stamp);
+ * the caller then falls back to the per-heap-page LSN proof, which remains
+ * the authority. *vmbuf is a visibilitymap_get_status-style pinned buffer
+ * the caller owns and must eventually release.
+ *
+ * Order matters: bits are checked BEFORE the LSN. A concurrent clear between
+ * the two reads leaves the LSN unmoved and we may serve the block - sound,
+ * because the modifying transaction is concurrent with the caller's snapshot
+ * and thus invisible to it (the same tolerance the per-page proof has after
+ * its locks are released).
+ */
+bool
+dbbc_block_vm_valid(DbbcBlock *block, Relation rel, Buffer *vmbuf)
+{
+	uint16		p;
+
+	if (XLogRecPtrIsInvalid(block->vm_lsn))
+		return false;			/* no stamp: fast path ineligible */
+
+	for (p = 0; p < block->npages; p++)
+	{
+		if (!(visibilitymap_get_status(rel, block->first_page + p, vmbuf) &
+			  VISIBILITYMAP_ALL_VISIBLE))
+			return false;
+	}
+	/*
+	 * A stamp only exists when the whole range shares one VM page (enforced
+	 * at build), so after the loop *vmbuf covers exactly that page.
+	 */
+	if (!BufferIsValid(*vmbuf))
+		return false;
+	return BufferGetLSNAtomic(*vmbuf) == block->vm_lsn;
+}
+
+/*
  * Is a prior version's block still a byte-for-byte accurate columnarization of
  * its heap range - so an incremental refresh can reuse it instead of rebuilding
- * it? True iff the block covers exactly this slot's current range AND every
- * page is still all-visible with the same LSN recorded when the block was built
- * (both checked under a share lock). This is the same proof the serve path uses
- * (dbbc_block_valid): identical VM+LSN means the page bytes are unchanged, so
- * the columnar data still matches the heap.
+ * it? True iff the block covers exactly this slot's current range AND is
+ * proven unchanged: first by the cheap VM-fork proof, else by the per-page
+ * proof (every page still all-visible with the build-time LSN, under a share
+ * lock) - the same proofs the serve path uses.
  */
 static bool
 dbbc_block_still_valid(DbbcBlock *block, Relation rel,
-					   BlockNumber first_page, uint16 npages)
+					   BlockNumber first_page, uint16 npages, Buffer *vmbuf)
 {
 	uint16		p;
 
 	if (block->first_page != first_page || block->npages != npages)
 		return false;
+
+	if (dbbc_block_vm_valid(block, rel, vmbuf))
+		return true;
 
 	for (p = 0; p < npages; p++)
 	{
@@ -869,10 +911,21 @@ dbbc_populate_relation(Oid relid)
 			dsa_pointer blockptr;
 			DbbcBlock  *block;
 			DbbcColumnChunk *chunks;
+			XLogRecPtr	vm_lsn;
+			BlockNumber vm_first_mapblk;
 
 			CHECK_FOR_INTERRUPTS();
 
-			/* cheap pre-check: every page all-visible in the VM? */
+			/*
+			 * Cheap pre-check: every page all-visible in the VM? Also capture
+			 * the VM page's LSN for the M6 fast-path stamp - BEFORE any heap
+			 * page is copied, so any later visibilitymap_set (which bumps the
+			 * VM page LSN) moves it past our stamp and the serve fast path
+			 * conservatively falls back. A range whose VM bits span two VM
+			 * pages gets no stamp (fast path ineligible; ~0.1% of blocks).
+			 */
+			vm_lsn = InvalidXLogRecPtr;
+			vm_first_mapblk = InvalidBlockNumber;
 			for (p = 0; p < npages; p++)
 			{
 				if (!(visibilitymap_get_status(rel, first_page + p, &vmbuf) &
@@ -881,6 +934,13 @@ dbbc_populate_relation(Oid relid)
 					usable = false;
 					break;
 				}
+				if (p == 0)
+				{
+					vm_first_mapblk = BufferGetBlockNumber(vmbuf);
+					vm_lsn = BufferGetLSNAtomic(vmbuf);
+				}
+				else if (BufferGetBlockNumber(vmbuf) != vm_first_mapblk)
+					vm_lsn = InvalidXLogRecPtr;	/* crosses a VM page */
 			}
 			if (!usable)
 				continue;
@@ -900,7 +960,8 @@ dbbc_populate_relation(Oid relid)
 				DbbcBlock  *oldblk = (DbbcBlock *)
 					dsa_get_address(dbbc_dsa, olddir[slot]);
 
-				if (dbbc_block_still_valid(oldblk, rel, first_page, npages))
+				if (dbbc_block_still_valid(oldblk, rel, first_page, npages,
+										   &vmbuf))
 				{
 					dbbc_block_ref(olddir[slot]);
 					newdir[slot] = olddir[slot];
@@ -1114,6 +1175,7 @@ dbbc_populate_relation(Oid relid)
 				block->first_page = first_page;
 				block->npages = npages;
 				block->nrows = (uint32) ntuples;
+				block->vm_lsn = vm_lsn; /* captured before the copies */
 				pg_atomic_init_u32(&block->refs, 1);	/* this version's ref */
 				memset(block->stamps, 0, sizeof(block->stamps));
 				memcpy(block->stamps, stamps, npages * sizeof(DbbcPageStamp));

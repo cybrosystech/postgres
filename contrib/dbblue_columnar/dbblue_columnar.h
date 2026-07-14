@@ -52,7 +52,9 @@
 #include "nodes/pg_list.h"
 #include "port/atomics.h"
 #include "storage/block.h"
+#include "storage/buf.h"
 #include "utils/dsa.h"
+#include "utils/relcache.h"
 
 /* heap pages per columnar block */
 #define DBBC_PAGES_PER_BLOCK	32
@@ -116,6 +118,25 @@ typedef struct DbbcBlock
 	BlockNumber first_page;		/* heap range [first_page, first_page+npages) */
 	uint16		npages;
 	uint32		nrows;			/* total live rows captured */
+
+	/*
+	 * VM-fork validity stamp (M6): the LSN of the visibility-map page
+	 * covering this block's heap range, captured at build BEFORE any heap
+	 * page was copied. Serve-time fast path: if every covered VM bit is
+	 * still ALL_VISIBLE and the VM page's current LSN equals this stamp, the
+	 * block is valid with NO heap page reads. Soundness: modifying an
+	 * all-visible heap page must first clear its VM bit (caught by the bit
+	 * check - the clear itself is the evidence), and every later re-set goes
+	 * through visibilitymap_set, whose callers PageSetLSN the VM page
+	 * (pruneheap.c log_heap_prune_and_freeze; heapam_xlog.c redo), moving it
+	 * past the stamp (caught by the LSN check). Capturing the stamp before
+	 * the copies makes any set during the build move the LSN past it -
+	 * conservative fallback, never false validity. InvalidXLogRecPtr means
+	 * the fast path must not be used for this block (range crosses a VM page
+	 * boundary, or the VM page had no LSN at build); the per-heap-page
+	 * LSN proof below remains the fallback and the authority.
+	 */
+	XLogRecPtr	vm_lsn;
 	/*
 	 * Refcount: how many published (or in-flight) versions reference this
 	 * block. A block is shared when an incremental refresh reuses it from the
@@ -203,6 +224,8 @@ extern int	dbbc_populate_relation(Oid relid);
 extern List *dbbc_registered_relids(void);
 extern bool dbbc_relation_needs_refresh(Oid relid, int threshold_pct);
 extern Datum dbbc_chunk_minmax_datum(DbbcColumnChunk *chunk, bool want_max);
+extern bool dbbc_block_vm_valid(DbbcBlock *block, Relation rel,
+								Buffer *vmbuf);
 
 /* columnar_scan.c */
 extern void dbbc_scan_init(void);
