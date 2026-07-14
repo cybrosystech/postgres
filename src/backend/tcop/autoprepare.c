@@ -250,6 +250,27 @@ aprep_parameterize_build(Query *analyzed, Oid **types_out, int *nparams_out)
 	if (ctx.too_many || ctx.next_paramid == 0)
 		return NULL;
 
+	/*
+	 * Detach the source-text bounds of the promoting statement.  This
+	 * parameterized query is cached once and then reused across many different
+	 * literal statements that share its shape (e.g. Odoo's varying-length IN
+	 * lists, or the same query written with a shorter literal).  Those source
+	 * strings differ in length, but query_tree_mutator() copied the promoter's
+	 * stmt_location/stmt_len onto this tree -- and those bounds flow into every
+	 * PlannedStmt derived from the cached plan.  At reuse time
+	 * pg_stat_statements / the query jumbler feed (current source string, the
+	 * cached stmt_location/stmt_len) into CleanQuerytext(); if the cached
+	 * stmt_len exceeds the length of a shorter current statement, CleanQuerytext
+	 * reads past end-of-string -- an assertion failure ("query_len <=
+	 * strlen(query)") on assert builds and an out-of-bounds read otherwise.
+	 *
+	 * Odoo (and exec_simple_query in general for our hook) runs one statement
+	 * per query, so 0 location / 0 length ("the whole current source string is
+	 * the statement") is always the correct, safe bound for the reused plan.
+	 */
+	mutated->stmt_location = 0;
+	mutated->stmt_len = 0;
+
 	*types_out = (Oid *) palloc(sizeof(Oid) * ctx.next_paramid);
 	memcpy(*types_out, ctx.types, sizeof(Oid) * ctx.next_paramid);
 	*nparams_out = ctx.next_paramid;
