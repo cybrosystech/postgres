@@ -622,6 +622,18 @@
   check_hook => 'check_datestyle',
   assign_hook => 'assign_datestyle',
 },
+{name => 'dbblue_audit_enabled', type => 'bool', context => 'PGC_USERSET', group => 'CUSTOM_OPTIONS',
+  short_desc => 'Allow the dbblue specific dedicated audit log functionality',
+  long_desc => 'Can be set to off for environments where global configuration changes should be made using a different method.',
+  variable => 'dbblue_audit_enabled',
+  boot_val => 'true',
+},
+{ name => 'dbblue_audit_tables', type => 'string', context => 'PGC_USERSET', group => 'CUSTOM_OPTIONS',
+  short_desc => 'Specifies the table names for the audit purposes',
+  flags => 'GUC_LIST_INPUT | GUC_LIST_QUOTE',
+  variable => 'dbblue_audit_tables',
+  boot_val => '""',
+},
 
 # This is PGC_SUSET to prevent hiding from log_lock_waits.
 { name => 'deadlock_timeout', type => 'int', context => 'PGC_SUSET', group => 'LOCK_MANAGEMENT',
@@ -2298,7 +2310,6 @@
   variable => 'oauth_validator_libraries_string',
   boot_val => '""',
 },
-
 # this is undocumented because not exposed in a standard build
 { name => 'optimize_bounded_sort', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
   short_desc => 'Enables bounded sorting using heap sort.',
