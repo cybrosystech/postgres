@@ -284,6 +284,12 @@ dbblue_fillfactor_lookup(const char *tablename)
        rebuild_hash_table(dbblue_fillfactor_map);
    }
 
+   /* safety check: if map is empty, hash table will be NULL */
+   if (!dbblue_ff_htab)
+   {
+       ereport(DEBUG2, (errmsg("lookup: no fillfactor map configured")));
+       return -1;
+   }
 
    memset(normname, 0, sizeof(normname));
    normalize_name(tablename, normname, sizeof(normname));
