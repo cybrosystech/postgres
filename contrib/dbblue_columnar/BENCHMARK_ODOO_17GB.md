@@ -84,3 +84,24 @@ VACUUM re-set moves the VM LSN → per-page proof rejects (exact); refresh →
 fast path restored. OFF baseline is partially OS-cached on this rig; on
 colder/bigger heaps the OFF side grows with table size while ON stays
 ~flat, so the gap widens with scale.
+
+## Phase 5 — concurrency + stability (bounded 10 min, post-M6-review)
+
+Concurrent workload on the 17 GB DB: 4 writers posting invoices (INSERT +
+draft→posted UPDATE), VACUUM churning VM bits every 12 s, background
+incremental refresh every 25 s (20 cycles), 3 readers running reports
+columnar-ON, and a correctness checker comparing columnar ON vs OFF **inside
+one REPEATABLE READ snapshot** (so a mismatch is a real bug, not a race
+between two queries) every 8 s.
+
+Results: **1.13 M rows posted; 58/58 snapshot-stable correctness checks = ok
+(0 mismatches); 20 refreshes; 0 crashes / assertions / DSA errors; 0 query
+errors; columnar store 4796→4884 MB (stable, no leak).** This stresses exactly
+the concurrent VACUUM-VM-set window the M6 review fixed; the SHARE-lock proof
+held under churn.
+
+Caveats (honest): 10 minutes, not the 24–72 h soak a v1.0 claim wants; on a
+14 GB box the store grows with new data toward the 6 GB budget, after which
+new blocks stay heap-served (correct, coverage degrades) until incremental
+refresh + block reclaim catch up — sustained-growth behavior over days is
+still unmeasured; and this is a synthetic dataset, not a customer dump.
