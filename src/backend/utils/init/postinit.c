@@ -70,7 +70,7 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/timeout.h"
-#include "utils/pg_fillfactor.h"
+#include "utils/dbblue_fillfactor.h"
 
 /* has this backend called EmitConnectionWarnings()? */
 static bool ConnectionWarningsEmitted;
@@ -1266,9 +1266,9 @@ InitPostgres(const char *in_dbname, Oid dboid,
 
 	/* send any WARNINGs we've accumulated during initialization */
 	EmitConnectionWarnings();
-	if(odoo_fillfactor_map)
+	if(dbblue_fillfactor_map)
 	{
-		odoo_fillfactor_init(); 
+		dbblue_fillfactor_init();
 	}
 }
 

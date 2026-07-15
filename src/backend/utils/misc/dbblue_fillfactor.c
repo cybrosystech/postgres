@@ -1,14 +1,14 @@
 /*-------------------------------------------------------------------------
-* odoo_fillfactor.c
+* dbblue_fillfactor.c
 *
-* Parses the GUC  odoo_fillfactor_map  and answers lookup queries
+* Parses the GUC  dbblue_fillfactor_map  and answers lookup queries
 * from the CREATE TABLE path.
 *
 * GUC format:
-*   odoo_fillfactor_map = 'res.partner:70, stock.move:75,
-*                          account.move.line:80'
+*   dbblue_fillfactor_map = 'res.partner:70, stock.move:75,
+*                           account.move.line:80'
 *
-* Both dot-notation (Odoo model name) and underscore form (PG table name)
+* Both dot-notation (dbblue model name) and underscore form (PG table name)
 * are accepted — they are normalised to underscores in the hash key.
 *-------------------------------------------------------------------------
 */
@@ -23,29 +23,29 @@
 #include "utils/guc.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
-#include "utils/pg_fillfactor.h"
+#include "utils/dbblue_fillfactor.h"
 #include "miscadmin.h"
 /* ----------------------------------------------------------------
 *  GUC variable (the raw string from postgresql.conf / SET)
 * ---------------------------------------------------------------- */
-char *odoo_fillfactor_map = NULL;
+char *dbblue_fillfactor_map = NULL;
 
 
 /* ----------------------------------------------------------------
 *  Internal hash table
 * ---------------------------------------------------------------- */
-#define ODOO_FF_KEYLEN  128          /* max table-name length */
+#define DBBLUE_FF_KEYLEN  128          /* max table-name length */
 
 
 typedef struct
 {
-   char key[ODOO_FF_KEYLEN];        /* normalised table name  */
+   char key[DBBLUE_FF_KEYLEN];        /* normalised table name  */
    int  fillfactor;
-} OdooFFEntry;
+} DbblueFFEntry;
 
 
-static HTAB            *odoo_ff_htab   = NULL;
-static MemoryContext    odoo_ff_mcxt   = NULL;
+static HTAB            *dbblue_ff_htab   = NULL;
+static MemoryContext    dbblue_ff_mcxt   = NULL;
 
 
 /* ----------------------------------------------------------------
@@ -79,27 +79,26 @@ rebuild_hash_table(const char *mapstr)
 {
 
 
-    ereport(LOG,
+    ereport(DEBUG2,
            (errmsg("rebuild_hash_table called: mapstr=\"%s\", "
                    "current htab=%p",
                    mapstr ? mapstr : "(NULL)",
-                   (void *) odoo_ff_htab)));
+                   (void *) dbblue_ff_htab)));
 
 
-   // ereport(LOG,errmsg("rebuild hash table function part 1"));
    HASHCTL  ctl;
    char    *buf, *token, *saveptr;
 
 
-   if (odoo_ff_htab)
+   if (dbblue_ff_htab)
    {
-       hash_destroy(odoo_ff_htab);
-       odoo_ff_htab = NULL;
+       hash_destroy(dbblue_ff_htab);
+       dbblue_ff_htab = NULL;
    }
-   if (odoo_ff_mcxt)
+   if (dbblue_ff_mcxt)
    {
-       MemoryContextDelete(odoo_ff_mcxt);
-       odoo_ff_mcxt = NULL;
+       MemoryContextDelete(dbblue_ff_mcxt);
+       dbblue_ff_mcxt = NULL;
    }
 
 
@@ -107,22 +106,22 @@ rebuild_hash_table(const char *mapstr)
        return;
 
 
-   odoo_ff_mcxt = AllocSetContextCreate(TopMemoryContext,
-                                        "OdooFillfactorMap",
+   dbblue_ff_mcxt = AllocSetContextCreate(TopMemoryContext,
+                                        "DbblueFillfactorMap",
                                         ALLOCSET_SMALL_SIZES);
 
 
    memset(&ctl, 0, sizeof(ctl));
-   ctl.keysize   = ODOO_FF_KEYLEN;
-   ctl.entrysize = sizeof(OdooFFEntry);
-   ctl.hcxt      = odoo_ff_mcxt;
+   ctl.keysize   = DBBLUE_FF_KEYLEN;
+   ctl.entrysize = sizeof(DbblueFFEntry);
+   ctl.hcxt      = dbblue_ff_mcxt;
 
 
-   odoo_ff_htab = hash_create("OdooFillfactorMap", 32, &ctl,
+   dbblue_ff_htab = hash_create("DbblueFillfactorMap", 32, &ctl,
                               HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 
 
-   buf = MemoryContextStrdup(odoo_ff_mcxt, mapstr);
+   buf = MemoryContextStrdup(dbblue_ff_mcxt, mapstr);
 
 
   for (token = strtok_r(buf, ",", &saveptr);
@@ -132,16 +131,16 @@ rebuild_hash_table(const char *mapstr)
    /* ALL declarations at the top - C90 rule */
    char         *colon;
    char         *ffstart;
-   char          rawname[ODOO_FF_KEYLEN];
-   char          normname[ODOO_FF_KEYLEN];
+   char          rawname[DBBLUE_FF_KEYLEN];
+   char          normname[DBBLUE_FF_KEYLEN];
    long          ff;
    char         *endptr;
    int           namelen;
    bool          found;
-   OdooFFEntry  *entry;
+   DbblueFFEntry  *entry;
 
 
-   ereport(LOG, (errmsg("inside for loop")));
+   ereport(DEBUG2, (errmsg("inside for loop")));
 
 
    /* Trim leading whitespace from token */
@@ -155,7 +154,7 @@ rebuild_hash_table(const char *mapstr)
        if (!colon)
        {
            ereport(WARNING,
-                   (errmsg("odoo_fillfactor_map: ignoring malformed entry \"%s\","
+                   (errmsg("dbblue_fillfactor_map: ignoring malformed entry \"%s\","
                            " expected \"tablename:fillfactor\"", token)));
            continue;
        }
@@ -167,10 +166,10 @@ rebuild_hash_table(const char *mapstr)
            namelen--;
 
 
-       if (namelen == 0 || namelen >= ODOO_FF_KEYLEN)
+       if (namelen == 0 || namelen >= DBBLUE_FF_KEYLEN)
        {
            ereport(WARNING,
-                   (errmsg("odoo_fillfactor_map: skipping entry with "
+                   (errmsg("dbblue_fillfactor_map: skipping entry with "
                            "empty or too-long table name")));
            continue;
        }
@@ -198,7 +197,7 @@ rebuild_hash_table(const char *mapstr)
        if (ffstart == endptr || (endptr && *endptr != '\0'))
        {
            ereport(WARNING,
-                   (errmsg("odoo_fillfactor_map: invalid fillfactor value "
+                   (errmsg("dbblue_fillfactor_map: invalid fillfactor value "
                            "for table \"%s\", skipping", rawname)));
            continue;
        }
@@ -207,31 +206,30 @@ rebuild_hash_table(const char *mapstr)
        if (ff < 10 || ff > 100)
        {
            ereport(WARNING,
-                   (errmsg("odoo_fillfactor_map: fillfactor %ld for \"%s\" "
+                   (errmsg("dbblue_fillfactor_map: fillfactor %ld for \"%s\" "
                            "out of range [10,100], skipping", ff, rawname)));
            continue;
        }
 
 
-       // normalize_name(rawname, normname, sizeof(normname));
        memset(normname, 0, sizeof(normname));
        normalize_name(rawname, normname, sizeof(normname));
 
 
-       entry = (OdooFFEntry *) hash_search(odoo_ff_htab, normname,
+       entry = (DbblueFFEntry *) hash_search(dbblue_ff_htab, normname,
                                            HASH_ENTER, &found);
        if (found)
            ereport(DEBUG1,
-                   (errmsg("odoo_fillfactor_map: duplicate \"%s\", overwriting",
+                   (errmsg("dbblue_fillfactor_map: duplicate \"%s\", overwriting",
                            normname)));
 
 
        entry->fillfactor = (int) ff;
 
 
-       ereport(LOG,
-               (errmsg("odoo_fillfactor_map: registered \"%s\" → fillfactor=%d",
-                       normname, (int) ff)));  /* LOG not DEBUG2 so you can see it */
+       ereport(DEBUG2,
+               (errmsg("dbblue_fillfactor_map: registered \"%s\" → fillfactor=%d",
+                       normname, (int) ff)));
    }
 }
 /* ================================================================
@@ -240,73 +238,72 @@ rebuild_hash_table(const char *mapstr)
 
 
 /*
-* odoo_fillfactor_init
+* dbblue_fillfactor_init
 * Called once from InitializeGUCOptions() or PostmasterMain.
 */
 void
-odoo_fillfactor_init(void)
+dbblue_fillfactor_init(void)
 {
    /* The GUC value may already be set from postgresql.conf at this point */
-   rebuild_hash_table(odoo_fillfactor_map);
+   rebuild_hash_table(dbblue_fillfactor_map);
 }
 
 
 /*
-* odoo_fillfactor_rebuild
-* GUC assign hook — called whenever odoo_fillfactor_map changes.
+* dbblue_fillfactor_rebuild
+* GUC assign hook — called whenever dbblue_fillfactor_map changes.
 */
 void
-odoo_fillfactor_rebuild(void)
+dbblue_fillfactor_rebuild(void)
 {
-   rebuild_hash_table(odoo_fillfactor_map);
+   rebuild_hash_table(dbblue_fillfactor_map);
 }
 
 
 
 
 int
-odoo_fillfactor_lookup(const char *tablename)
+dbblue_fillfactor_lookup(const char *tablename)
 {
-   char         normname[ODOO_FF_KEYLEN];
-   OdooFFEntry *entry;
+   char         normname[DBBLUE_FF_KEYLEN];
+   DbblueFFEntry *entry;
 
 
    if (!tablename)
        return -1;
 
 
-   // rebuild if hash is NULL OR empty */
-   if (!odoo_ff_htab || hash_get_num_entries(odoo_ff_htab) == 0)
+   /* rebuild if hash is NULL OR empty */
+   if (!dbblue_ff_htab || hash_get_num_entries(dbblue_ff_htab) == 0)
    {
-       ereport(LOG,
+       ereport(DEBUG2,
                (errmsg("lookup: rebuilding hash in PID %d (htab=%p)",
-                       MyProcPid, (void *) odoo_ff_htab)));
+                       MyProcPid, (void *) dbblue_ff_htab)));
 
 
-       rebuild_hash_table(odoo_fillfactor_map);
+       rebuild_hash_table(dbblue_fillfactor_map);
    }
 
 
-   // normalize_name(tablename, normname, sizeof(normname));
    memset(normname, 0, sizeof(normname));
-normalize_name(tablename, normname, sizeof(normname));
+   normalize_name(tablename, normname, sizeof(normname));
 
 
-   ereport(LOG, (errmsg("lookup: searching key = %s", normname)));
+   ereport(DEBUG2, (errmsg("lookup: searching key = %s", normname)));
 
 
-   entry = (OdooFFEntry *) hash_search(odoo_ff_htab, normname,
+   entry = (DbblueFFEntry *) hash_search(dbblue_ff_htab, normname,
                                        HASH_FIND, NULL);
 
 
    if (!entry)
    {
-       ereport(LOG, (errmsg("lookup: entry NOT FOUND")));
+       ereport(DEBUG2, (errmsg("lookup: entry NOT FOUND")));
        return -1;
    }
 
 
-   ereport(LOG,
+   ereport(DEBUG2,
            (errmsg("lookup: found fillfactor = %d", entry->fillfactor)));
 
 
@@ -315,14 +312,14 @@ normalize_name(tablename, normname, sizeof(normname));
 
 
 /*
-* odoo_fillfactor_assign_hook
+* dbblue_fillfactor_assign_hook
 *
 * GUC assign hook - called by GUC machinery whenever
-* odoo_fillfactor_map is changed via SET or postgresql.conf reload.
+* dbblue_fillfactor_map is changed via SET or postgresql.conf reload.
 * Signature must match GucStringAssignHook exactly.
 */
 void
-odoo_fillfactor_assign_hook(const char *newval, void *extra)
+dbblue_fillfactor_assign_hook(const char *newval, void *extra)
 {
    rebuild_hash_table(newval);
 }
