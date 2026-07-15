@@ -743,6 +743,8 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 	int			npreparedxacts;
 	CreateDBStrategy dbstrategy = CREATEDB_WAL_LOG;
 	createdb_failure_params fparms;
+	bool		use_builtin_default = false;
+	char	   *collate_str;
 
 	/* Report error if name has \n or \r character. */
 	if (strpbrk(dbname, "\n\r"))
@@ -1004,15 +1006,52 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 	 * UTF8 encoding.  Use template0 as the source so the encoding/locale
 	 * compatibility checks below are bypassed regardless of template1's
 	 * settings.
+	 *
+	 * Also apply the same defaults when the Odoo pattern is detected:
+	 * explicit LC_COLLATE='C' with ENCODING='utf8' and TEMPLATE='template0',
+	 * but no other locale options. This is an upgrade from the legacy libc
+	 * approach to builtin C.UTF-8.
+	 *
+	 * Skip this for template databases being created during initdb.
 	 */
-	if (templateEl == NULL && encodingEl == NULL &&
-		localeEl == NULL && builtinlocaleEl == NULL && iculocaleEl == NULL &&
-		collateEl == NULL && ctypeEl == NULL && locproviderEl == NULL)
+	if (strcmp(dbname, "template0") != 0 && strcmp(dbname, "template1") != 0 &&
+		strcmp(dbname, "postgres") != 0)
+	{
+		if (templateEl == NULL && encodingEl == NULL &&
+			localeEl == NULL && builtinlocaleEl == NULL && iculocaleEl == NULL &&
+			collateEl == NULL && ctypeEl == NULL && locproviderEl == NULL)
+		{
+			use_builtin_default = true;
+		}
+		/* Odoo pattern: LC_COLLATE='C' with optional ENCODING='utf8' and TEMPLATE='template0' */
+		else if (localeEl == NULL && builtinlocaleEl == NULL && iculocaleEl == NULL &&
+				 ctypeEl == NULL && locproviderEl == NULL &&
+				 collateEl && collateEl->arg)
+		{
+			collate_str = defGetString(collateEl);
+			if (pg_strcasecmp(collate_str, "C") == 0)
+			{
+				/* Check if template is template0 (or NULL) and encoding is utf8 (or NULL) */
+				bool template_ok = (templateEl == NULL ||
+									 (templateEl->arg &&
+									  pg_strcasecmp(defGetString(templateEl), "template0") == 0));
+				bool encoding_ok = (encodingEl == NULL || encoding == PG_UTF8);
+
+				if (template_ok && encoding_ok)
+					use_builtin_default = true;
+			}
+		}
+	}
+
+	if (use_builtin_default)
 	{
 		dbtemplate = "template0";
 		encoding = PG_UTF8;
 		dblocprovider = COLLPROVIDER_BUILTIN;
 		dblocale = "C.UTF-8";
+		/* Clear the collateEl so it doesn't override our defaults */
+		collateEl = NULL;
+		dbcollate = NULL;
 	}
 
 	if (!dbtemplate)
