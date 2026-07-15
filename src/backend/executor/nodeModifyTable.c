@@ -71,6 +71,7 @@
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/injection_point.h"
+#include "utils/pg_audit.h"
 #include "utils/rangetypes.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
@@ -1815,6 +1816,18 @@ ExecDeleteEpilogue(ModifyTableContext *context, ResultRelInfo *resultRelInfo,
 	/* AFTER ROW DELETE Triggers */
 	ExecARDeleteTriggers(estate, resultRelInfo, tupleid, oldtuple,
 						 ar_delete_trig_tcs, changingPart);
+
+	/*
+	 * dbblue dedicated audit log: record this row's pre-image.  Runs once per
+	 * deleted row.  For a regular delete oldtuple is NULL, so the capture
+	 * routine re-fetches the row by its TID (SnapshotAny).
+	 *
+	 * Skip the delete half of a cross-partition update (changingPart): that
+	 * row is being moved, not deleted, and logging it as a DELETE would be
+	 * misleading.
+	 */
+	if (!changingPart)
+		dbblue_audit_capture_delete(resultRelInfo, tupleid, oldtuple);
 }
 
 /* ----------------------------------------------------------------
@@ -2641,6 +2654,14 @@ ExecUpdateEpilogue(ModifyTableContext *context, UpdateContext *updateCxt,
 	if (resultRelInfo->ri_WithCheckOptions != NIL)
 		ExecWithCheckOptions(WCO_VIEW_CHECK, resultRelInfo,
 							 slot, context->estate);
+
+	/*
+	 * dbblue dedicated audit log: record this row's old/new image.  Runs
+	 * once per updated row, so every affected row is captured.  ri_oldTupleSlot
+	 * holds the pre-image the executor fetched before applying the update.
+	 */
+	dbblue_audit_capture_update(resultRelInfo,
+								resultRelInfo->ri_oldTupleSlot, slot);
 }
 
 /*
