@@ -635,6 +635,13 @@
   boot_val => '""',
 },
 
+{name => 'dbblue_fillfactor_map', type => 'string', context => 'PGC_USERSET', group => 'CUSTOM_OPTIONS',
+  short_desc => 'Specifies the fillfactor setting for specific models in dbblue',
+  flags => '0',
+  variable => 'dbblue_fillfactor_map',
+  boot_val => '""',
+  assign_hook => 'dbblue_fillfactor_assign_hook',
+},
 # This is PGC_SUSET to prevent hiding from log_lock_waits.
 { name => 'deadlock_timeout', type => 'int', context => 'PGC_SUSET', group => 'LOCK_MANAGEMENT',
   short_desc => 'Sets the time to wait on a lock before checking for deadlock.',

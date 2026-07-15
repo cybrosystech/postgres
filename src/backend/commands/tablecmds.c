@@ -112,6 +112,7 @@
 #include "utils/timestamp.h"
 #include "utils/typcache.h"
 #include "utils/usercontext.h"
+#include "utils/dbblue_fillfactor.h"
 
 /*
  * ON COMMIT action list
@@ -983,7 +984,46 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 
 	/*
 	 * Parse and validate reloptions, if any.
-	 */
+	 */	
+   if (relkind == RELKIND_RELATION)
+   {
+       ereport(DEBUG2,errmsg("DefineRelation: looking up fillfactor for table \"%s\"", stmt->relation->relname));
+       int ff = dbblue_fillfactor_lookup(stmt->relation->relname);
+        ereport(DEBUG2,
+                       (errmsg("dbblue_fillfactor: injecting fillfactor=%d "
+                               "for table \"%s\"",
+                               ff, stmt->relation->relname)));
+       if (ff > 0)
+       {
+           bool found_existing = false;
+           ListCell *lc;
+
+
+           foreach(lc, stmt->options)
+           {
+               DefElem *opt = (DefElem *) lfirst(lc);
+               if (pg_strcasecmp(opt->defname, "fillfactor") == 0)
+               {
+                   found_existing = true;
+                   break;
+               }
+           }
+
+
+           if (!found_existing)
+           {
+               DefElem *ff_elem = makeDefElem("fillfactor",
+                                              (Node *) makeInteger(ff),
+                                              -1);
+               stmt->options = lappend(stmt->options, ff_elem);
+               ereport(DEBUG2,
+                       (errmsg("dbblue_fillfactor: injecting fillfactor=%d "
+                               "for table \"%s\"",
+                               ff, stmt->relation->relname)));
+           }
+       }
+   }
+
 	reloptions = transformRelOptions((Datum) 0, stmt->options, NULL, validnsps,
 									 true, false);
 

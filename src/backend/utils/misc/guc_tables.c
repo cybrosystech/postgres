@@ -105,6 +105,7 @@
 #include "utils/rls.h"
 #include "utils/xml.h"
 #include "utils/pg_audit.h"
+#include "utils/dbblue_fillfactor.h"
 
 #ifdef TRACE_SYNCSCAN
 #include "access/syncscan.h"
