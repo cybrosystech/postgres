@@ -44,6 +44,7 @@
 #include "nodes/queryjumble.h"
 #include "rewrite/rewriteHandler.h"
 #include "utils/array.h"
+#include "utils/fmgroids.h"
 #include "utils/guc.h"
 #include "utils/hsearch.h"
 #include "utils/lsyscache.h"
@@ -146,6 +147,44 @@ make_extern_param(int paramid, Oid type, int32 typmod, Oid collid)
 	return p;
 }
 
+/*
+ * A few SQL constructs are represented internally as ordinary function calls
+ * whose *deparse* (get_func_sql_syntax() in ruleutils.c) requires a particular
+ * argument to remain a bare literal Const -- the field name of
+ * EXTRACT('epoch' FROM x), and the form argument of NORMALIZE(x, NFC) /
+ * x IS NFC NORMALIZED.  If we fold that literal into a $n Param, deparsing any
+ * plan derived from the cached shape (auto_explain, EXPLAIN VERBOSE,
+ * pg_get_viewdef, a stored view, ...) casts the Param to Const and trips an
+ * Assert on assert builds -- or reads a bad pointer in TextDatumGetCString()
+ * on production builds -- crashing the backend and restarting the cluster.
+ *
+ * So these particular arguments must be left literal.  Returns the 0-based
+ * index of the argument that must stay Const, or -1 if this function imposes
+ * no such requirement.
+ *
+ * MUST be kept in sync with the Const-asserting cases of get_func_sql_syntax()
+ * in src/backend/utils/adt/ruleutils.c.
+ */
+static int
+aprep_literal_only_argno(Oid funcid)
+{
+	switch (funcid)
+	{
+		case F_EXTRACT_TEXT_DATE:
+		case F_EXTRACT_TEXT_TIME:
+		case F_EXTRACT_TEXT_TIMETZ:
+		case F_EXTRACT_TEXT_TIMESTAMP:
+		case F_EXTRACT_TEXT_TIMESTAMPTZ:
+		case F_EXTRACT_TEXT_INTERVAL:
+			return 0;			/* EXTRACT(field FROM x) -- the field name */
+		case F_IS_NORMALIZED:
+		case F_NORMALIZE:
+			return 1;			/* NORMALIZE(x, form) / x IS form NORMALIZED */
+		default:
+			return -1;
+	}
+}
+
 
 /* ----------------------------------------------------------------
  *		shape transform: BUILD (Const -> Param, collect types)
@@ -216,6 +255,36 @@ aprep_build_mutator(Node *node, void *context)
 			ns = copyObject(s);
 			ns->args = list_make2(newleft, p);
 			return (Node *) ns;		/* do NOT recurse into array elements */
+		}
+	}
+
+	if (IsA(node, FuncExpr))
+	{
+		FuncExpr   *f = (FuncExpr *) node;
+		int			litarg = aprep_literal_only_argno(f->funcid);
+
+		if (litarg >= 0)
+		{
+			FuncExpr   *nf = copyObject(f);
+			ListCell   *lc;
+			int			i = 0;
+
+			/*
+			 * Parameterize the value arguments but leave the literal-only
+			 * argument (e.g. EXTRACT's field name) exactly as its original
+			 * Const -- see aprep_literal_only_argno().
+			 */
+			foreach(lc, nf->args)
+			{
+				if (i != litarg)
+				{
+					lfirst(lc) = aprep_build_mutator((Node *) lfirst(lc), ctx);
+					if (ctx->too_many)
+						return node;
+				}
+				i++;
+			}
+			return (Node *) nf;
 		}
 	}
 
@@ -384,6 +453,28 @@ aprep_extract_walker(Node *node, void *context)
 			set_param(ctx->params, id - 1, arr->array_typeid,
 					  build_array_datum(arr), false);
 			return false;		/* do NOT walk into array elements */
+		}
+	}
+
+	if (IsA(node, FuncExpr))
+	{
+		FuncExpr   *f = (FuncExpr *) node;
+		int			litarg = aprep_literal_only_argno(f->funcid);
+
+		if (litarg >= 0)
+		{
+			ListCell   *lc;
+			int			i = 0;
+
+			/* Mirror aprep_build_mutator: skip the literal-only argument. */
+			foreach(lc, f->args)
+			{
+				if (i != litarg &&
+					aprep_extract_walker((Node *) lfirst(lc), ctx))
+					return true;
+				i++;
+			}
+			return false;
 		}
 	}
 
