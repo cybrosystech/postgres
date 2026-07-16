@@ -323,6 +323,7 @@ ExecCreateTableAs(ParseState *pstate, CreateTableAsStmt *stmt,
 				vq						  = norm;
 				/* Sync execution-query structure so the matview schema matches */
 				query->rtable			  = copyObject(norm->rtable);
+				query->rteperminfos		  = copyObject(norm->rteperminfos);
 				query->jointree			  = copyObject(norm->jointree);
 				query->targetList		  = copyObject(norm->targetList);
 				query->groupClause		  = copyObject(norm->groupClause);
@@ -331,6 +332,7 @@ ExecCreateTableAs(ParseState *pstate, CreateTableAsStmt *stmt,
 				query->hasAggs			  = norm->hasAggs;
 				query->hasSubLinks		  = norm->hasSubLinks;
 				query->hasWindowFuncs	  = norm->hasWindowFuncs;
+				query->hasGroupRTE		  = norm->hasGroupRTE;
 				query->cteList			  = NIL;
 				query->setOperations	  = copyObject(norm->setOperations);
 			}

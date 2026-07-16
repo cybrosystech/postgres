@@ -74,6 +74,7 @@
 #include "nodes/primnodes.h"
 #include "optimizer/optimizer.h"
 #include "parser/parsetree.h"
+#include "rewrite/rewriteManip.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
@@ -10727,7 +10728,13 @@ incr_find_cte_varno(Query *q, const char *ctename)
 }
 
 /* Single base table, no GROUP BY, no aggregates, no DISTINCT,
- * no set ops, no window funcs, no CTEs, no sublinks. */
+ * no set ops, no window funcs, no CTEs, no sublinks, no volatile projection.
+ *
+ * The volatility check is load-bearing: T1 inlines the subquery's target
+ * expressions into the outer query, and a volatile projection (now(), random(),
+ * …) cannot be maintained incrementally — a full REFRESH re-evaluates it, the
+ * delta path does not.  Rejecting here keeps the un-normalizable subquery an
+ * RTE_SUBQUERY, which the unchanged eligibility gate then rejects cleanly. */
 static bool
 incr_q_is_filter_proj(Query *q)
 {
@@ -10738,6 +10745,8 @@ incr_q_is_filter_proj(Query *q)
 	if (q->limitCount || q->limitOffset)
 		return false;
 	if (q->hasWindowFuncs || q->cteList != NIL || q->hasSubLinks)
+		return false;
+	if (contain_volatile_functions((Node *) q->targetList))
 		return false;
 	return (incr_single_base_varno(q) > 0);
 }
@@ -10798,6 +10807,213 @@ incr_outer_sole_source_is(Query *outer, int src_varno)
 }
 
 
+/* True if n is a left-deep tree of INNER JoinExprs whose every leaf is a
+ * RangeTblRef — the exact shape incr_collect_tables_recurse consumes (rarg must
+ * be a RangeTblRef leaf; larg descends). */
+static bool
+incr_jointree_left_deep_inner(Node *n)
+{
+	if (n == NULL)
+		return false;
+	if (IsA(n, RangeTblRef))
+		return true;
+	if (IsA(n, JoinExpr))
+	{
+		JoinExpr   *je = (JoinExpr *) n;
+
+		if (je->jointype != JOIN_INNER)
+			return false;
+		if (!IsA(je->rarg, RangeTblRef))
+			return false;
+		return incr_jointree_left_deep_inner(je->larg);
+	}
+	return false;
+}
+
+/* Multi-table analogue of incr_q_is_filter_proj: a filter/projection over one
+ * or more base relations joined only by INNER joins (left-deep), the body a
+ * varno-offset pull-up can splice.  Same no-agg/distinct/setop/window/CTE/
+ * sublink/volatile rules; every source must be a plain RTE_RELATION (or the
+ * RTE_JOIN bookkeeping nodes); the jointree must be a single left-deep
+ * INNER-join tree of RangeTblRef leaves.  (Inner outer joins are deferred: they
+ * would carry varnullingrels the splice must reason about.) */
+static bool
+incr_q_is_filter_proj_multi(Query *q)
+{
+	ListCell   *lc;
+	FromExpr   *fe;
+
+	if (q->groupClause != NIL || q->hasAggs)
+		return false;
+	if (q->distinctClause != NIL || q->setOperations)
+		return false;
+	if (q->limitCount || q->limitOffset)
+		return false;
+	if (q->hasWindowFuncs || q->cteList != NIL || q->hasSubLinks)
+		return false;
+	if (contain_volatile_functions((Node *) q->targetList))
+		return false;
+
+	foreach(lc, q->rtable)
+	{
+		RangeTblEntry *r = lfirst_node(RangeTblEntry, lc);
+
+		if (r->rtekind == RTE_RELATION || r->rtekind == RTE_JOIN)
+			continue;
+		return false;			/* subquery/CTE/function/values/result/group */
+	}
+
+	if (!IsA(q->jointree, FromExpr))
+		return false;
+	fe = (FromExpr *) q->jointree;
+	if (list_length(fe->fromlist) != 1)
+		return false;
+	return incr_jointree_left_deep_inner((Node *) linitial(fe->fromlist));
+}
+
+/* Replace the RangeTblRef(target_varno) node reachable on the left spine of
+ * *child (descending larg) with repl.  For the v1 sole-source case *child is
+ * that RangeTblRef directly; the larg descent is kept for the future joined
+ * case. */
+static bool
+incr_splice_left_spine(Node **child, int target_varno, Node *repl)
+{
+	if (*child == NULL)
+		return false;
+	if (IsA(*child, RangeTblRef) &&
+		((RangeTblRef *) *child)->rtindex == target_varno)
+	{
+		*child = repl;
+		return true;
+	}
+	if (IsA(*child, JoinExpr))
+		return incr_splice_left_spine(&((JoinExpr *) *child)->larg,
+									  target_varno, repl);
+	return false;
+}
+
+/* ----------------------------------------------------------------
+ * T1-multi: pull up a simple multi-table FROM-subquery / CTE by splicing its
+ * inner INNER-join base tables directly into the outer join tree — the
+ * canonical semantics-preserving pull-up (mirrors pull_up_simple_subquery minus
+ * PlaceHolderVar/AppendRelInfo, which the restricted shape never needs).  A full
+ * REFRESH runs the ORIGINAL query through the same planner pull-up, so the
+ * flattened query is equivalent and byte-identity is inherited, not re-proven.
+ *
+ * Restricted to: inner body a left-deep INNER-join filter/projection over base
+ * relations (incr_q_is_filter_proj_multi), placed on the outer's preserved,
+ * non-nullable LEFT SPINE (incr_subq_left_spine_ok) so the result stays
+ * left-deep and the pulled-up tables are never NULL-extended.  Anything else is
+ * left as an RTE_SUBQUERY and rejected cleanly by the unchanged eligibility gate.
+ * ---------------------------------------------------------------- */
+static bool
+incr_try_inline_filter_multi(Query *outer, Query *srcq, int src_varno)
+{
+	Query			 *subq;
+	FromExpr		 *outer_fe;
+	Node			 *inner_top;
+	Node			 *inner_quals;
+	int				  rtoffset;
+	IncrSubstMergeCtx subst;
+	RangeTblEntry	 *dead;
+	Node			**rootpp;
+	ListCell		 *lc;
+
+	if (!incr_q_is_filter_proj_multi(srcq))
+		return false;
+
+	/* Outer must be a single-entry jointree (no implicit comma join). */
+	if (!IsA(outer->jointree, FromExpr))
+		return false;
+	outer_fe = (FromExpr *) outer->jointree;
+	if (list_length(outer_fe->fromlist) != 1)
+		return false;
+
+	/*
+	 * v1 restriction: the subquery must be the outer query's SOLE source.  When
+	 * it is instead JOINed to other tables, the pre-existing outer JOIN RTE's
+	 * joinaliasvars would have to reference the pulled-up inner tables — but the
+	 * splice appends those AFTER the join RTE, and a join RTE's alias vars must
+	 * reference EARLIER rangetable entries (rewriteHandler.c).  That joined-
+	 * dimension shape needs rangetable renumbering and is deferred to a later
+	 * increment; here we require the subquery to sit directly in the fromlist.
+	 */
+	{
+		Node	   *top = (Node *) linitial(outer_fe->fromlist);
+
+		if (!(IsA(top, RangeTblRef) &&
+			  ((RangeTblRef *) top)->rtindex == src_varno))
+			return false;
+	}
+
+	/* --- commit: from here the transform is guaranteed to succeed --- */
+	subq	 = copyObject(srcq);
+	rtoffset = list_length(outer->rtable);
+
+	/* Offset every rangetable reference in the inner query so its Vars /
+	 * RangeTblRefs / JoinExprs / varnullingrels point at the appended slots. */
+	OffsetVarNodes((Node *) subq, rtoffset, 0);
+
+	inner_top	= (Node *) linitial(((FromExpr *) subq->jointree)->fromlist);
+	inner_quals = ((FromExpr *) subq->jointree)->quals;
+
+	/* Append the inner rangetable + permission infos (fixes perminfoindex). */
+	CombineRangeTables(&outer->rtable, &outer->rteperminfos,
+					   subq->rtable, subq->rteperminfos);
+
+	/* Splice the inner join subtree in place of the subquery RangeTblRef. */
+	rootpp = (Node **) &lfirst(list_head(outer_fe->fromlist));
+	if (!incr_splice_left_spine(rootpp, src_varno, inner_top))
+		elog(ERROR, "DBblue: left-spine splice failed after precheck");
+
+	/* Merge the inner WHERE into the outer WHERE (join ON clauses travel inside
+	 * inner_top).  inner_quals already references the appended varnos. */
+	if (inner_quals != NULL)
+	{
+		if (outer_fe->quals == NULL)
+			outer_fe->quals = inner_quals;
+		else
+			outer_fe->quals = (Node *)
+				makeBoolExpr(AND_EXPR,
+							 list_make2(outer_fe->quals, inner_quals), -1);
+	}
+
+	/* Rewrite outer Var(src_varno, K) -> the K-th inner target expr (already
+	 * offset) in the target list, jointree, HAVING and GROUP RTE groupexprs. */
+	subst.src_varno = src_varno;
+	subst.src_tlist = subq->targetList;
+	outer->targetList = (List *)
+		incr_subst_merge_mutator((Node *) outer->targetList, &subst);
+	outer->jointree = (FromExpr *)
+		incr_subst_merge_mutator((Node *) outer->jointree, &subst);
+	if (outer->havingQual)
+		outer->havingQual = incr_subst_merge_mutator(outer->havingQual, &subst);
+	foreach(lc, outer->rtable)
+	{
+		RangeTblEntry *r = lfirst_node(RangeTblEntry, lc);
+
+		/* GROUP RTE keys and JOIN alias-var lists can also reference the
+		 * subquery's output columns; after neutralizing the slot to RTE_RESULT
+		 * (no columns) any surviving Var(src_varno, K) would dangle. */
+		if (r->rtekind == RTE_GROUP && r->groupexprs != NIL)
+			r->groupexprs = (List *)
+				incr_subst_merge_mutator((Node *) r->groupexprs, &subst);
+		else if (r->rtekind == RTE_JOIN && r->joinaliasvars != NIL)
+			r->joinaliasvars = (List *)
+				incr_subst_merge_mutator((Node *) r->joinaliasvars, &subst);
+	}
+
+	/* Neutralize the now-unreferenced subquery slot: a dummy RTE_RESULT, which
+	 * the eligibility gate and rangetable walkers skip. */
+	dead = makeNode(RangeTblEntry);
+	dead->rtekind = RTE_RESULT;
+	dead->eref = makeAlias("*RESULT*", NIL);
+	lfirst(list_nth_cell(outer->rtable, src_varno - 1)) = dead;
+
+	return true;
+}
+
+
 /* ----------------------------------------------------------------
  * T1: Inline a filter/projection CTE or FROM-subquery.
  *
@@ -10816,7 +11032,7 @@ incr_try_inline_filter(Query *outer, Query *srcq, int src_varno)
 	IncrSubstColCtx subst;
 
 	if (!incr_q_is_filter_proj(srcq))
-		return false;
+		return incr_try_inline_filter_multi(outer, srcq, src_varno);
 
 	base_vno = incr_single_base_varno(srcq);
 	if (base_vno < 0)
