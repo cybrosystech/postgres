@@ -20,5 +20,8 @@
 Datum
 pgsql_version(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_TEXT_P(cstring_to_text(PG_VERSION_STR));
+	/* Modified to return DBblue version string */
+	const char *version_str =
+		"DBblue 19beta2 on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0, 64-bit";
+	PG_RETURN_TEXT_P(cstring_to_text(version_str));
 }
