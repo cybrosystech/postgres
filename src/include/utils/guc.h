@@ -290,6 +290,9 @@ extern PGDLLIMPORT char *event_source;
 extern PGDLLIMPORT bool check_function_bodies;
 extern PGDLLIMPORT bool current_role_is_superuser;
 
+extern PGDLLIMPORT char *dbblue_brin_database;
+extern PGDLLIMPORT bool dbblue_create_brin;
+
 extern PGDLLIMPORT bool AllowAlterSystem;
 extern PGDLLIMPORT bool log_duration;
 extern PGDLLIMPORT int log_parameter_max_length;

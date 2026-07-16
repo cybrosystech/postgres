@@ -27,6 +27,7 @@ OBJS = \
 	copyfromparse.o \
 	copyto.o \
 	createas.o \
+	dbblue_brin_worker.o \
 	dbcommands.o \
 	define.o \
 	discard.o \
