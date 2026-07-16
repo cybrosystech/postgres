@@ -102,8 +102,17 @@ run_brin_scan(void)
 	tables = palloc(nrows * sizeof(char *));
 	for (i = 0; i < nrows; i++)
 	{
-		schemas[i] = pstrdup(SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1));
-		tables[i] = pstrdup(SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2));
+		char	   *schema_val = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1);
+		char	   *table_val = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2);
+
+		if (schema_val == NULL || table_val == NULL)
+		{
+			ereport(WARNING, (errmsg("dbblue BRIN: NULL value in pg_stats result, skipping")));
+			continue;
+		}
+
+		schemas[i] = pstrdup(schema_val);
+		tables[i] = pstrdup(table_val);
 	}
 	MemoryContextSwitchTo(oldctx);
 
@@ -128,6 +137,7 @@ run_brin_scan(void)
 		{
 			PopActiveSnapshot();
 			CommitTransactionCommand();
+			pfree(indexname);
 			continue;
 		}
 
@@ -142,7 +152,14 @@ run_brin_scan(void)
 
 		check_ret = SPI_execute(check_sql, true, 1);
 
-		if (check_ret == SPI_OK_SELECT && SPI_processed == 0)
+		if (check_ret != SPI_OK_SELECT)
+		{
+			/* Query failed — explicit error logging */
+			ereport(WARNING,
+					(errmsg("dbblue BRIN: failed to check existing indexes for %s.%s (SPI ret=%d)",
+							schemaname, tablename, check_ret)));
+		}
+		else if (SPI_processed == 0)
 		{
 			/* No BRIN index yet — create one */
 			create_sql = psprintf(
@@ -169,6 +186,7 @@ run_brin_scan(void)
 		}
 		else
 		{
+			/* Index exists — skip */
 			ereport(DEBUG1,
 					(errmsg("dbblue BRIN: index already exists for %s.%s, skipping",
 							schemaname, tablename)));
@@ -245,6 +263,15 @@ DBBlueBrinWorkerRegister(void)
 
 	if (!dbblue_create_brin)
 		return;
+
+	/* Validate database name is configured */
+	if (dbblue_brin_database == NULL || dbblue_brin_database[0] == '\0')
+	{
+		ereport(WARNING,
+				(errmsg("dbblue_create_brin is enabled but dbblue_brin_database is not set"),
+				 errhint("Set dbblue_brin_database in postgresql.conf, then restart PostgreSQL")));
+		return;
+	}
 
 	memset(&worker, 0, sizeof(worker));
 	worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
