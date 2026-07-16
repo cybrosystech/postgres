@@ -545,6 +545,56 @@ incr_validate_projection(Node *expr, Query *viewQuery, int nbasetables,
 }
 
 /*
+ * incr_var_outerjoin_nullable_walker — true if any Var in the expression can be
+ * NULL-extended by an outer join (varnullingrels non-empty).  This is stronger
+ * than a plain nullable base column: it fires only when an outer join above the
+ * Var can substitute NULL for it in an unmatched (orphan) row.
+ */
+static bool
+incr_var_outerjoin_nullable_walker(Node *node, void *ctx)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Var))
+		return !bms_is_empty(((Var *) node)->varnullingrels);
+	return expression_tree_walker(node, incr_var_outerjoin_nullable_walker, ctx);
+}
+
+/*
+ * incr_where_orphan_nulltest_walker — true if the WHERE contains an "x IS NULL"
+ * test whose argument references an outer-join optional-side column.  Such a
+ * predicate is TRUE for the NULL-extended (orphan) image of a row, so it ADMITS
+ * orphans into the result.  The recompute path evaluates the WHERE against the
+ * MATCHED (pre-orphan) image of a delta row, so a row that transitions INTO the
+ * orphan set (e.g. its dimension row is deleted) is filtered out of the affected
+ * set and the NULL-extended group is never recomputed — the matview then
+ * silently diverges from a full REFRESH.  Null-REJECTING predicates on the same
+ * column (IS NOT NULL, equality/comparison) are FALSE for the orphan image, so
+ * they exclude orphans and are safe; only orphan-admitting IS NULL is caught.
+ */
+static bool
+incr_where_orphan_nulltest_walker(Node *node, void *ctx)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, NullTest))
+	{
+		NullTest   *nt = (NullTest *) node;
+
+		if (nt->nulltesttype == IS_NULL &&
+			incr_var_outerjoin_nullable_walker((Node *) nt->arg, NULL))
+			return true;			/* orphan-admitting — stop and report */
+	}
+	return expression_tree_walker(node, incr_where_orphan_nulltest_walker, ctx);
+}
+
+static bool
+incr_where_admits_orphans(Node *where_qual)
+{
+	return incr_where_orphan_nulltest_walker(where_qual, NULL);
+}
+
+/*
  * MatviewIncrIsEligible
  * Returns true if the query can be maintained incrementally (Phase 1 or 2).
  * Sets *reason on failure.
@@ -1184,6 +1234,24 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 			*reason = "WHERE clause uses unsupported expressions; "
 				"only column references, constants, comparisons, "
 				"boolean operators, and IN lists are allowed";
+			return false;
+		}
+
+		/*
+		 * Safety gate (byte-identity with a full REFRESH): an "IS NULL" test on
+		 * a column an outer join can NULL-extend admits orphan (NULL-extended)
+		 * rows into the result.  The recompute path applies the WHERE to the
+		 * matched image of a delta row, so a row that transitions into the
+		 * NULL-extended set is dropped from the affected set and its NULL group
+		 * is never recomputed — silently diverging from REFRESH.  Reject cleanly.
+		 */
+		if (where_qual != NULL && incr_where_admits_orphans(where_qual))
+		{
+			*reason = "WHERE tests an outer-join optional-side column with IS "
+				"NULL, which cannot be maintained incrementally (a row moving "
+				"into the NULL-extended set would be missed) — move the test into "
+				"a plain view over the matview, or filter that column with IS NOT "
+				"NULL / an equality or comparison instead";
 			return false;
 		}
 	}

@@ -77,7 +77,10 @@ histogram.
 - **Full `DISTINCT`** (`SELECT DISTINCT a, b …`) — treated as `GROUP BY` on all
   output columns.
 - **`WHERE`** filters: column refs, constants, comparisons, boolean ops, `IN`
-  lists.
+  lists. Over an **outer join**, a predicate on an **optional-side** column must be
+  **null-rejecting** (`IS NOT NULL`, equality, comparison — FALSE for the
+  NULL-extended orphan image); an **orphan-admitting** `IS NULL` on such a column
+  is rejected (see below).
 - **`UNION ALL`** of row-level branches.
 - **`ORDER BY`** (ignored for maintenance, as in any matview).
 
@@ -104,6 +107,7 @@ histogram.
 | Unbound HAVING aggregate | `HAVING uses unsupported expressions; only maintained aggregates …` | select the aggregate |
 | A table appearing 3+ times (diamond self-join) | `table "…" appears more than twice; diamond join patterns are not supported` | — |
 | Niche FULL-join shapes (3-table FULL, FULL self-join) | rejected | — |
+| `IS NULL` in `WHERE` on an **outer-join optional-side** column (orphan-admitting) | `WHERE tests an outer-join optional-side column with IS NULL, which cannot be maintained incrementally …` | `IS NOT NULL` / equality, or a top view |
 
 > **`ROLLUP` / `GROUPING SETS` / `CUBE`** are *accepted* by the gate and pass a
 > basic differential, but are **not yet in the permanent regression suite** —
