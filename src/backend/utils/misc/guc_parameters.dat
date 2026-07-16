@@ -634,14 +634,6 @@
   variable => 'dbblue_audit_tables',
   boot_val => '""',
 },
-
-{name => 'dbblue_fillfactor_map', type => 'string', context => 'PGC_USERSET', group => 'CUSTOM_OPTIONS',
-  short_desc => 'Specifies the fillfactor setting for specific models in dbblue',
-  flags => '0',
-  variable => 'dbblue_fillfactor_map',
-  boot_val => '""',
-  assign_hook => 'dbblue_fillfactor_assign_hook',
-},
 { name => 'dbblue_brin_database', type => 'string', context => 'PGC_POSTMASTER', group => 'RESOURCES_WORKER_PROCESSES',
   short_desc => 'Database name for automatic BRIN index creation.',
   long_desc => 'The background worker created by dbblue_create_brin will connect to this database to create BRIN indexes.',
@@ -654,6 +646,14 @@
   long_desc => 'When enabled, a background worker periodically checks pg_stats and creates BRIN indexes on create_date columns with high correlation (>0.9).',
   variable => 'dbblue_create_brin',
   boot_val => 'false',
+},
+
+{name => 'dbblue_fillfactor_map', type => 'string', context => 'PGC_USERSET', group => 'CUSTOM_OPTIONS',
+  short_desc => 'Specifies the fillfactor setting for specific models in dbblue',
+  flags => '0',
+  variable => 'dbblue_fillfactor_map',
+  boot_val => '""',
+  assign_hook => 'dbblue_fillfactor_assign_hook',
 },
 
 # This is PGC_SUSET to prevent hiding from log_lock_waits.
