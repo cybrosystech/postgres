@@ -697,6 +697,39 @@ SELECT * FROM clstr_expression WHERE -a = -3 ORDER BY -a, b;
 (4 rows)
 
 COMMIT;
+-- verify some error cases
+CREATE TABLE clstr_table_one (id int, val text);
+CREATE TABLE clstr_table_two (id int, val text);
+CREATE INDEX clstr_idx_b ON clstr_table_two (id);
+CLUSTER clstr_table_one USING clstr_idx_b;
+ERROR:  "clstr_idx_b" is not an index for table "clstr_table_one"
+CLUSTER clstr_table_one USING nonexistant;
+ERROR:  index "nonexistant" for table "clstr_table_one" does not exist
+CREATE INDEX clstr_hash_idx ON clstr_table_one USING hash (id);
+CLUSTER clstr_table_one USING clstr_hash_idx;
+ERROR:  cannot cluster on index "clstr_hash_idx" because access method does not support clustering
+CREATE INDEX clstr_partial_idx ON clstr_table_one (id) WHERE id > 0;
+CLUSTER clstr_table_one USING clstr_partial_idx;
+ERROR:  cannot cluster on partial index "clstr_partial_idx"
+REPACK pg_class USING INDEX pg_class_oid_index;
+ERROR:  permission denied: "pg_class" is a system catalog
+DETAIL:  System catalogs can only be clustered by the index they're already clustered on, if any, unless "allow_system_table_mods" is enabled.
+DROP TABLE clstr_table_one, clstr_table_two;
+-- verify that CLUSTER/REPACK don't touch a NO DATA matview
+CREATE MATERIALIZED VIEW clstr_matview AS
+    SELECT i FROM generate_series(1, 5) i
+    WITH NO DATA;
+CREATE INDEX clstr_matview_idx ON clstr_matview (i);
+SELECT relfilenode FROM pg_class WHERE oid = 'clstr_matview'::regclass \gset
+CLUSTER clstr_matview USING clstr_matview_idx;
+REPACK clstr_matview USING INDEX clstr_matview_idx;
+SELECT relfilenode = :relfilenode FROM pg_class WHERE oid = 'clstr_matview'::regclass;
+ ?column? 
+----------
+ t
+(1 row)
+
+DROP MATERIALIZED VIEW clstr_matview;
 ----------------------------------------------------------------------
 --
 -- REPACK
@@ -796,14 +829,6 @@ ORDER BY o.relname;
  clstr_3
 (2 rows)
 
--- concurrently disallowed in catalogs
-REPACK (CONCURRENTLY) pg_class;
-ERROR:  cannot repack relation "pg_class"
-HINT:  REPACK CONCURRENTLY is not supported for catalog relations.
--- CONCURRENTLY doesn't like partitioned tables
-REPACK (CONCURRENTLY) clstrpart;
-ERROR:  REPACK (CONCURRENTLY) is not supported for partitioned tables
-HINT:  Consider running the command on individual partitions.
 -- clean up
 DROP TABLE clustertest;
 DROP TABLE clstr_1;

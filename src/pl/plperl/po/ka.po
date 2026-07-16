@@ -1,11 +1,11 @@
 # Georgian message translation file for plperl
 # Copyright (C) 2022 PostgreSQL Global Development Group
 # This file is distributed under the same license as the plperl (PostgreSQL) package.
-# Temuri Doghonadze <temuri.doghonadze@gmail.com>, 2022.
+# Temuri Doghonadze <temuri.doghonadze@gmail.com>, 2022-2026.
 #
 msgid ""
 msgstr ""
-"Project-Id-Version: plperl (PostgreSQL) 17\n"
+"Project-Id-Version: plperl (PostgreSQL) 19\n"
 "Report-Msgid-Bugs-To: pgsql-bugs@lists.postgresql.org\n"
 "POT-Creation-Date: 2024-02-11 09:39+0000\n"
 "PO-Revision-Date: 2024-02-11 16:27+0100\n"
@@ -226,6 +226,3 @@ msgstr "\"PL/Perl\" ფუნქციის \"%s\" კომპილაცი�
 msgid "PL/Perl anonymous code block"
 msgstr "PL/Perl ანონიმური კოდის ბლოკი"
 
-#, c-format
-#~ msgid "number of array dimensions (%d) exceeds the maximum allowed (%d)"
-#~ msgstr "მასივის ზომების რაოდენობა (%d) მაქსიმუმ დასაშვებზე (%d) დიდია"

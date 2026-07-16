@@ -724,6 +724,7 @@ SELECT JSON_ARRAY(JSON_ARRAY('{ "a" : 123 }' FORMAT JSON RETURNING text) FORMAT 
  [[{ "a" : 123 }]]
 (1 row)
 
+-- JSON_ARRAY(subquery)
 SELECT JSON_ARRAY(SELECT i FROM (VALUES (1), (2), (NULL), (4)) foo(i));
  json_array 
 ------------
@@ -755,6 +756,50 @@ SELECT JSON_ARRAY(WITH x AS (SELECT 1) VALUES (TRUE));
  json_array 
 ------------
  [true]
+(1 row)
+
+-- JSON_ARRAY(subquery) with empty result set
+SELECT JSON_ARRAY(SELECT 1 WHERE FALSE);
+ json_array 
+------------
+ []
+(1 row)
+
+SELECT JSON_ARRAY(SELECT i FROM (VALUES (1), (2), (NULL), (4)) foo(i) WHERE i > 4);
+ json_array 
+------------
+ []
+(1 row)
+
+-- JSON_ARRAY(subquery) with a correlated subquery in the WHERE clause
+SELECT * FROM (VALUES (1), (2), (NULL), (4)) t1(a)
+WHERE JSON_ARRAY(
+    SELECT b FROM (VALUES (1), (2), (3)) t2(b) WHERE b = t1.a
+    RETURNING jsonb
+) = '[]'::jsonb;
+ a 
+---
+  
+ 4
+(2 rows)
+
+-- JSON_ARRAY(subquery) RETURNING with a length-restricted output type
+-- Should fail
+SELECT JSON_ARRAY(SELECT 1 RETURNING varchar(1));
+ERROR:  value too long for type character varying(1)
+SELECT JSON_ARRAY(SELECT 1 WHERE FALSE RETURNING varchar(1));
+ERROR:  value too long for type character varying(1)
+-- Should work
+SELECT JSON_ARRAY(SELECT 1 RETURNING varchar(3));
+ json_array 
+------------
+ [1]
+(1 row)
+
+SELECT JSON_ARRAY(SELECT 1 WHERE FALSE RETURNING varchar(2));
+ json_array 
+------------
+ []
 (1 row)
 
 -- Should fail
@@ -1093,7 +1138,7 @@ SELECT JSON_ARRAY(SELECT i FROM (VALUES (1), (2), (NULL), (4)) foo(i) RETURNING 
                              QUERY PLAN                              
 ---------------------------------------------------------------------
  Result
-   Output: (InitPlan expr_1).col1
+   Output: COALESCE((InitPlan expr_1).col1, '[]'::jsonb)
    InitPlan expr_1
      ->  Aggregate
            Output: JSON_ARRAYAGG("*VALUES*".column1 RETURNING jsonb)
@@ -1105,9 +1150,88 @@ CREATE VIEW json_array_subquery_view AS
 SELECT JSON_ARRAY(SELECT i FROM (VALUES (1), (2), (NULL), (4)) foo(i) RETURNING jsonb);
 \sv json_array_subquery_view
 CREATE OR REPLACE VIEW public.json_array_subquery_view AS
- SELECT ( SELECT JSON_ARRAYAGG(q.a RETURNING jsonb) AS "json_arrayagg"
-           FROM ( SELECT foo.i
-                   FROM ( VALUES (1), (2), (NULL::integer), (4)) foo(i)) q(a)) AS "json_array"
+ SELECT JSON_ARRAY( SELECT foo.i
+           FROM ( VALUES (1), (2), (NULL::integer), (4)) foo(i) RETURNING jsonb) AS "json_array"
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT JSON_ARRAY(SELECT i FROM (VALUES (1), (2), (NULL), (4)) foo(i) ORDER BY i LIMIT 3 RETURNING jsonb);
+                             QUERY PLAN                              
+---------------------------------------------------------------------
+ Result
+   Output: COALESCE((InitPlan expr_1).col1, '[]'::jsonb)
+   InitPlan expr_1
+     ->  Aggregate
+           Output: JSON_ARRAYAGG("*VALUES*".column1 RETURNING jsonb)
+           ->  Limit
+                 Output: "*VALUES*".column1
+                 ->  Sort
+                       Output: "*VALUES*".column1
+                       Sort Key: "*VALUES*".column1
+                       ->  Values Scan on "*VALUES*"
+                             Output: "*VALUES*".column1
+(12 rows)
+
+CREATE OR REPLACE VIEW json_array_subquery_view AS
+SELECT JSON_ARRAY(SELECT i FROM (VALUES (1), (2), (NULL), (4)) foo(i) ORDER BY i LIMIT 3 RETURNING jsonb);
+\sv json_array_subquery_view
+CREATE OR REPLACE VIEW public.json_array_subquery_view AS
+ SELECT JSON_ARRAY( SELECT foo.i
+           FROM ( VALUES (1), (2), (NULL::integer), (4)) foo(i)
+          ORDER BY foo.i
+         LIMIT 3 RETURNING jsonb) AS "json_array"
+DROP VIEW json_array_subquery_view;
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT * FROM (VALUES (1), (2), (NULL), (4)) t1(a)
+WHERE JSON_ARRAY(
+    SELECT b FROM (VALUES (1), (2), (3)) t2(b) WHERE b = t1.a
+    RETURNING jsonb
+) = '[]'::jsonb;
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Values Scan on "*VALUES*"
+   Output: "*VALUES*".column1
+   Filter: (COALESCE((SubPlan expr_1), '[]'::jsonb) = '[]'::jsonb)
+   SubPlan expr_1
+     ->  Aggregate
+           Output: JSON_ARRAYAGG("*VALUES*_1".column1 RETURNING jsonb)
+           ->  Values Scan on "*VALUES*_1"
+                 Output: "*VALUES*_1".column1
+                 Filter: ("*VALUES*_1".column1 = "*VALUES*".column1)
+(9 rows)
+
+CREATE VIEW json_array_subquery_view AS
+SELECT * FROM (VALUES (1), (2), (NULL), (4)) t1(a)
+WHERE JSON_ARRAY(
+    SELECT b FROM (VALUES (1), (2), (3)) t2(b) WHERE b = t1.a
+    RETURNING jsonb
+) = '[]'::jsonb;
+\sv json_array_subquery_view
+CREATE OR REPLACE VIEW public.json_array_subquery_view AS
+ SELECT a
+   FROM ( VALUES (1), (2), (NULL::integer), (4)) t1(a)
+  WHERE JSON_ARRAY( SELECT t2.b
+           FROM ( VALUES (1), (2), (3)) t2(b)
+          WHERE t2.b = t1.a RETURNING jsonb) = '[]'::jsonb
+DROP VIEW json_array_subquery_view;
+-- JSON_ARRAY(subquery) with RETURNING text
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT JSON_ARRAY(SELECT i FROM (VALUES (1), (2), (NULL), (4)) foo(i) RETURNING text);
+                             QUERY PLAN                             
+--------------------------------------------------------------------
+ Result
+   Output: COALESCE((InitPlan expr_1).col1, '[]'::text)
+   InitPlan expr_1
+     ->  Aggregate
+           Output: JSON_ARRAYAGG("*VALUES*".column1 RETURNING text)
+           ->  Values Scan on "*VALUES*"
+                 Output: "*VALUES*".column1
+(7 rows)
+
+CREATE VIEW json_array_subquery_view AS
+SELECT JSON_ARRAY(SELECT i FROM (VALUES (1), (2), (NULL), (4)) foo(i) RETURNING text);
+\sv json_array_subquery_view
+CREATE OR REPLACE VIEW public.json_array_subquery_view AS
+ SELECT JSON_ARRAY( SELECT foo.i
+           FROM ( VALUES (1), (2), (NULL::integer), (4)) foo(i) RETURNING text) AS "json_array"
 DROP VIEW json_array_subquery_view;
 -- Test mutability of JSON_OBJECTAGG, JSON_ARRAYAGG, JSON_ARRAY, JSON_OBJECT
 create type comp1 as (a int, b date);
@@ -1346,6 +1470,44 @@ LINE 1: SELECT NULL::jd5 IS JSON WITH UNIQUE KEYS;
 -- domain constraint violation during cast
 SELECT a::jd2 IS JSON WITH UNIQUE KEYS as col1 FROM (VALUES('{"a": 1, "a": 2}')) s(a); -- error
 ERROR:  value for domain jd2 violates check constraint "jd2_check"
+-- A user-defined string-category type with no implicit cast to text must
+-- produce a clean error rather than crash for IS JSON / JSON() input
+-- (per bug #19491).
+CREATE FUNCTION sqljson_mystr_in(cstring) RETURNS sqljson_mystr
+	AS 'textin' LANGUAGE internal IMMUTABLE STRICT;
+NOTICE:  type "sqljson_mystr" is not yet defined
+DETAIL:  Creating a shell type definition.
+CREATE FUNCTION sqljson_mystr_out(sqljson_mystr) RETURNS cstring
+	AS 'textout' LANGUAGE internal IMMUTABLE STRICT;
+NOTICE:  argument type sqljson_mystr is only a shell
+LINE 1: CREATE FUNCTION sqljson_mystr_out(sqljson_mystr) RETURNS cst...
+                                          ^
+CREATE TYPE sqljson_mystr (
+	INPUT = sqljson_mystr_in,
+	OUTPUT = sqljson_mystr_out,
+	LIKE = text,
+	CATEGORY = 'S'
+);
+SELECT '{"a":1}'::sqljson_mystr IS JSON;                -- error
+ERROR:  cannot cast type sqljson_mystr to text
+LINE 1: SELECT '{"a":1}'::sqljson_mystr IS JSON;
+               ^
+SELECT JSON('{"a":1}'::sqljson_mystr WITH UNIQUE KEYS); -- error
+ERROR:  cannot cast type sqljson_mystr to text
+LINE 1: SELECT JSON('{"a":1}'::sqljson_mystr WITH UNIQUE KEYS);
+                    ^
+-- An implicit cast to text lets the same query work normally.
+CREATE CAST (sqljson_mystr AS text) WITHOUT FUNCTION AS IMPLICIT;
+SELECT '{"a":1}'::sqljson_mystr IS JSON;
+ ?column? 
+----------
+ t
+(1 row)
+
+\set VERBOSITY terse
+DROP TYPE sqljson_mystr CASCADE;
+NOTICE:  drop cascades to 3 other objects
+\set VERBOSITY default
 -- view creation and deparsing with domain IS JSON
 CREATE VIEW domain_isjson AS
 WITH cte(a) AS (VALUES('{"a": 1, "a": 2}'))
@@ -1595,3 +1757,104 @@ SELECT JSON_OBJECT('a': JSON_OBJECTAGG('b': 1 RETURNING text) FORMAT JSON);
 (1 row)
 
 DROP FUNCTION volatile_one, stable_one;
+-- Test deparsing of JSON aggregates that are computed below a WindowAgg
+-- node.
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT i % 2 AS g,
+	JSON_ARRAYAGG(i ORDER BY i RETURNING jsonb) AS ja,
+	JSON_ARRAYAGG(i ORDER BY i RETURNING text) AS ja_text,
+	JSON_ARRAYAGG(i ORDER BY i NULL ON NULL RETURNING jsonb) AS ja_null,
+	JSON_OBJECTAGG(i: i ABSENT ON NULL RETURNING jsonb) AS jo_absent,
+	JSON_OBJECTAGG(i: i WITH UNIQUE RETURNING jsonb) AS jo_unique,
+	row_number() OVER (ORDER BY i % 2) AS rn
+FROM generate_series(1, 3) i
+GROUP BY i % 2;
+                                                                                                                                                 QUERY PLAN                                                                                                                                                 
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ WindowAgg
+   Output: ((i % 2)), JSON_ARRAYAGG(i ORDER BY i RETURNING jsonb), JSON_ARRAYAGG(i ORDER BY i RETURNING text), JSON_ARRAYAGG(i ORDER BY i NULL ON NULL RETURNING jsonb), JSON_OBJECTAGG(i : i ABSENT ON NULL RETURNING jsonb), JSON_OBJECTAGG(i : i WITH UNIQUE KEYS RETURNING jsonb), row_number() OVER w1
+   Window: w1 AS (ORDER BY ((i.i % 2)) ROWS UNBOUNDED PRECEDING)
+   ->  GroupAggregate
+         Output: ((i % 2)), jsonb_agg_strict(i ORDER BY i), json_agg_strict(i ORDER BY i), jsonb_agg(i ORDER BY i), jsonb_object_agg_strict(i, i), jsonb_object_agg_unique(i, i)
+         Group Key: ((i.i % 2))
+         ->  Sort
+               Output: ((i % 2)), i
+               Sort Key: ((i.i % 2)), i.i
+               ->  Function Scan on pg_catalog.generate_series i
+                     Output: (i % 2), i
+                     Function Call: generate_series(1, 3)
+(12 rows)
+
+SELECT i % 2 AS g,
+	JSON_ARRAYAGG(i ORDER BY i RETURNING jsonb) AS ja,
+	JSON_ARRAYAGG(i ORDER BY i RETURNING text) AS ja_text,
+	JSON_ARRAYAGG(i ORDER BY i NULL ON NULL RETURNING jsonb) AS ja_null,
+	JSON_OBJECTAGG(i: i ABSENT ON NULL RETURNING jsonb) AS jo_absent,
+	JSON_OBJECTAGG(i: i WITH UNIQUE RETURNING jsonb) AS jo_unique,
+	row_number() OVER (ORDER BY i % 2) AS rn
+FROM generate_series(1, 3) i
+GROUP BY i % 2;
+ g |   ja   | ja_text | ja_null |    jo_absent     |    jo_unique     | rn 
+---+--------+---------+---------+------------------+------------------+----
+ 0 | [2]    | [2]     | [2]     | {"2": 2}         | {"2": 2}         |  1
+ 1 | [1, 3] | [1, 3]  | [1, 3]  | {"1": 1, "3": 3} | {"1": 1, "3": 3} |  2
+(2 rows)
+
+-- The same, but with the JSON aggregate used as a window function that is
+-- computed below another WindowAgg node.
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT JSON_ARRAYAGG(i NULL ON NULL RETURNING jsonb) OVER (ORDER BY i DESC) AS ja,
+	row_number() OVER (ORDER BY i) AS rn
+FROM generate_series(1, 3) i;
+                                        QUERY PLAN                                        
+------------------------------------------------------------------------------------------
+ WindowAgg
+   Output: JSON_ARRAYAGG(i NULL ON NULL RETURNING jsonb) OVER w1, row_number() OVER w2, i
+   Window: w2 AS (ORDER BY i.i ROWS UNBOUNDED PRECEDING)
+   ->  Sort
+         Output: i, (jsonb_agg(i) OVER w1)
+         Sort Key: i.i
+         ->  WindowAgg
+               Output: i, jsonb_agg(i) OVER w1
+               Window: w1 AS (ORDER BY i.i)
+               ->  Sort
+                     Output: i
+                     Sort Key: i.i DESC
+                     ->  Function Scan on pg_catalog.generate_series i
+                           Output: i
+                           Function Call: generate_series(1, 3)
+(15 rows)
+
+SELECT JSON_ARRAYAGG(i NULL ON NULL RETURNING jsonb) OVER (ORDER BY i DESC) AS ja,
+	row_number() OVER (ORDER BY i) AS rn
+FROM generate_series(1, 3) i;
+    ja     | rn 
+-----------+----
+ [3, 2, 1] |  1
+ [3, 2]    |  2
+ [3]       |  3
+(3 rows)
+
+-- The same, but with the expression containing the JSON aggregate postponed
+-- to above the final sort due to being volatile.
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT i % 2 AS g,
+	   JSON_ARRAYAGG(i RETURNING text) || random()::text AS ja
+FROM generate_series(1, 3) i
+GROUP BY i % 2
+ORDER BY count(*);
+                                       QUERY PLAN                                       
+----------------------------------------------------------------------------------------
+ Result
+   Output: ((i % 2)), (JSON_ARRAYAGG(i RETURNING text) || (random())::text), (count(*))
+   ->  Sort
+         Output: ((i % 2)), (count(*)), (json_agg_strict(i))
+         Sort Key: (count(*))
+         ->  HashAggregate
+               Output: ((i % 2)), count(*), json_agg_strict(i)
+               Group Key: (i.i % 2)
+               ->  Function Scan on pg_catalog.generate_series i
+                     Output: (i % 2), i
+                     Function Call: generate_series(1, 3)
+(11 rows)
+

@@ -40,6 +40,7 @@
 #include "access/toast_internals.h"
 #include "access/transam.h"
 #include "access/xact.h"
+#include "access/xlog.h"
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
 #include "catalog/heap.h"
@@ -47,6 +48,7 @@
 #include "catalog/namespace.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_am.h"
+#include "catalog/pg_attrdef.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/toasting.h"
@@ -61,8 +63,11 @@
 #include "libpq/pqmq.h"
 #include "miscadmin.h"
 #include "optimizer/optimizer.h"
+#include "parser/parse_relation.h"
 #include "pgstat.h"
+#include "replication/logicalrelation.h"
 #include "storage/bufmgr.h"
+#include "storage/ipc.h"
 #include "storage/lmgr.h"
 #include "storage/predicate.h"
 #include "storage/proc.h"
@@ -116,6 +121,9 @@ typedef struct ChangeContext
 	Relation	cc_ident_index;
 	ScanKey		cc_ident_key;
 	int			cc_ident_key_nentries;
+
+	/* The latest column we need to deform to have the tuple identity */
+	AttrNumber	cc_last_key_attno;
 
 	/* Sequential number of the file containing the changes. */
 	int			cc_file_seq;
@@ -181,6 +189,9 @@ static void adjust_toast_pointers(Relation relation, TupleTableSlot *dest,
 static bool find_target_tuple(Relation rel, ChangeContext *chgcxt,
 							  TupleTableSlot *locator,
 							  TupleTableSlot *retrieved);
+static bool identity_key_equal(ChangeContext *chgcxt,
+							   TupleTableSlot *locator,
+							   TupleTableSlot *candidate);
 static void process_concurrent_changes(XLogRecPtr end_of_wal,
 									   ChangeContext *chgcxt,
 									   bool done);
@@ -195,6 +206,7 @@ static void rebuild_relation_finish_concurrent(Relation NewHeap, Relation OldHea
 static List *build_new_indexes(Relation NewHeap, Relation OldHeap, List *OldIndexes);
 static void copy_index_constraints(Relation old_index, Oid new_index_id,
 								   Oid new_heap_id);
+static void copy_attribute_defaults(Oid old_heap_oid, Oid new_heap_oid);
 static Relation process_single_relation(RepackStmt *stmt,
 										LOCKMODE lockmode,
 										bool isTopLevel,
@@ -204,6 +216,7 @@ static Oid	determine_clustered_index(Relation rel, bool usingindex,
 
 static void start_repack_decoding_worker(Oid relid);
 static void stop_repack_decoding_worker(void);
+static void stop_repack_decoding_worker_cb(int code, Datum arg);
 static Snapshot get_initial_snapshot(DecodingWorker *worker);
 
 static void ProcessRepackMessage(StringInfo msg);
@@ -241,24 +254,26 @@ ExecRepack(ParseState *pstate, RepackStmt *stmt, bool isTopLevel)
 	MemoryContext repack_context;
 	LOCKMODE	lockmode;
 	List	   *rtcs;
+	bool		verbose = false;
+	bool		analyze = false;
+	bool		concurrently = false;
 
 	/* Parse option list */
 	foreach_node(DefElem, opt, stmt->params)
 	{
 		if (strcmp(opt->defname, "verbose") == 0)
-			params.options |= defGetBoolean(opt) ? CLUOPT_VERBOSE : 0;
+			verbose = defGetBoolean(opt);
 		else if (strcmp(opt->defname, "analyze") == 0 ||
 				 strcmp(opt->defname, "analyse") == 0)
-			params.options |= defGetBoolean(opt) ? CLUOPT_ANALYZE : 0;
-		else if (strcmp(opt->defname, "concurrently") == 0 &&
-				 defGetBoolean(opt))
+			analyze = defGetBoolean(opt);
+		else if (strcmp(opt->defname, "concurrently") == 0)
 		{
 			if (stmt->command != REPACK_COMMAND_REPACK)
 				ereport(ERROR,
 						errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("CONCURRENTLY option not supported for %s",
 							   RepackCommandAsString(stmt->command)));
-			params.options |= CLUOPT_CONCURRENT;
+			concurrently = defGetBoolean(opt);
 		}
 		else
 			ereport(ERROR,
@@ -268,6 +283,11 @@ ExecRepack(ParseState *pstate, RepackStmt *stmt, bool isTopLevel)
 						   opt->defname),
 					parser_errposition(pstate, opt->location));
 	}
+
+	params.options |=
+		(verbose ? CLUOPT_VERBOSE : 0) |
+		(analyze ? CLUOPT_ANALYZE : 0) |
+		(concurrently ? CLUOPT_CONCURRENT : 0);
 
 	/* Determine the lock mode to use. */
 	lockmode = RepackLockLevel((params.options & CLUOPT_CONCURRENT) != 0);
@@ -321,13 +341,15 @@ ExecRepack(ParseState *pstate, RepackStmt *stmt, bool isTopLevel)
 			Assert(rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE);
 			ereport(ERROR,
 					errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					errmsg("REPACK (CONCURRENTLY) is not supported for partitioned tables"),
+					errmsg("%s is not supported for partitioned tables",
+						   "REPACK (CONCURRENTLY)"),
 					errhint("Consider running the command on individual partitions."));
 		}
 		else
 			ereport(ERROR,
 					errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					errmsg("REPACK (CONCURRENTLY) requires an explicit table name"));
+					errmsg("%s requires an explicit table name",
+						   "REPACK (CONCURRENTLY)"));
 	}
 
 	/*
@@ -353,7 +375,8 @@ ExecRepack(ParseState *pstate, RepackStmt *stmt, bool isTopLevel)
 	/*
 	 * If we don't have a relation yet, determine a relation list.  If we do,
 	 * then it must be a partitioned table, and we want to process its
-	 * partitions.
+	 * partitions.  Note that we don't acquire any locks on these tables, so
+	 * the returned list must be treated with suspicion.
 	 */
 	if (rel == NULL)
 	{
@@ -430,12 +453,19 @@ ExecRepack(ParseState *pstate, RepackStmt *stmt, bool isTopLevel)
 		StartTransactionCommand();
 
 		/*
-		 * Open the target table, coping with the case where it has been
-		 * dropped.
+		 * Open the target table.  It may have been dropped or replaced with
+		 * something different, in which case silently skip it.
 		 */
-		rel = try_table_open(rtc->tableOid, lockmode);
+		rel = try_relation_open(rtc->tableOid, lockmode);
 		if (rel == NULL)
 		{
+			CommitTransactionCommand();
+			continue;
+		}
+		if (rel->rd_rel->relkind != RELKIND_RELATION &&
+			rel->rd_rel->relkind != RELKIND_MATVIEW)
+		{
+			relation_close(rel, lockmode);
 			CommitTransactionCommand();
 			continue;
 		}
@@ -650,27 +680,26 @@ cluster_rel(RepackCommand cmd, Relation OldHeap, Oid indexOid,
 	if (!concurrent)
 		TransferPredicateLocksToHeapRelation(OldHeap);
 
-	/* rebuild_relation does all the dirty work */
-	PG_TRY();
+	/*
+	 * rebuild_relation does all the dirty work, and closes OldHeap and index,
+	 * if valid.
+	 *
+	 * In concurrent mode, make sure the worker terminates; normally it does
+	 * so by itself, but a PG_ENSURE_ERROR_CLEANUP callback ensures that this
+	 * happens even in case this backend dies early on a FATAL exit.  Normal
+	 * mode doesn't need that overhead.
+	 */
+	if (concurrent)
 	{
-		rebuild_relation(OldHeap, index, verbose, ident_idx);
-	}
-	PG_FINALLY();
-	{
-		if (concurrent)
+		PG_ENSURE_ERROR_CLEANUP(stop_repack_decoding_worker_cb, 0);
 		{
-			/*
-			 * Since during normal operation the worker was already asked to
-			 * exit, stopping it explicitly is especially important on ERROR.
-			 * However it still seems a good practice to make sure that the
-			 * worker never survives the REPACK command.
-			 */
-			stop_repack_decoding_worker();
+			rebuild_relation(OldHeap, index, verbose, ident_idx);
 		}
+		PG_END_ENSURE_ERROR_CLEANUP(stop_repack_decoding_worker_cb, 0);
+		stop_repack_decoding_worker();
 	}
-	PG_END_TRY();
-
-	/* rebuild_relation closes OldHeap, and index if valid */
+	else
+		rebuild_relation(OldHeap, index, verbose, ident_idx);
 
 out:
 	/* Roll back any GUC changes executed by index functions */
@@ -691,6 +720,8 @@ cluster_rel_recheck(RepackCommand cmd, Relation OldHeap, Oid indexOid,
 					Oid userid, LOCKMODE lmode, int options)
 {
 	Oid			tableOid = RelationGetRelid(OldHeap);
+
+	Assert(CheckRelationLockedByMe(OldHeap, lmode, false));
 
 	/* Check that the user still has privileges for the relation */
 	if (!repack_is_permitted_for_relation(cmd, tableOid, userid))
@@ -880,13 +911,22 @@ check_concurrent_repack_requirements(Relation rel, Oid *ident_idx_p)
 				replident;
 	Oid			ident_idx;
 
+	if (wal_level < WAL_LEVEL_REPLICA)
+		ereport(ERROR,
+				errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				errmsg("cannot execute %s in this configuration",
+					   "REPACK (CONCURRENTLY)"),
+				errdetail("%s requires \"wal_level\" to be set to \"replica\" or higher.",
+						  "REPACK (CONCURRENTLY)"));
+
 	/* Data changes in system relations are not logically decoded. */
 	if (IsCatalogRelation(rel))
 		ereport(ERROR,
 				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				errmsg("cannot repack relation \"%s\"",
-					   RelationGetRelationName(rel)),
-				errhint("REPACK CONCURRENTLY is not supported for catalog relations."));
+				errmsg("cannot execute %s on relation \"%s\"",
+					   "REPACK (CONCURRENTLY)", RelationGetRelationName(rel)),
+				errhint("%s is not supported for catalog relations.",
+						"REPACK (CONCURRENTLY)"));
 
 	/*
 	 * reorderbuffer.c does not seem to handle processing of TOAST relation
@@ -895,45 +935,64 @@ check_concurrent_repack_requirements(Relation rel, Oid *ident_idx_p)
 	if (IsToastRelation(rel))
 		ereport(ERROR,
 				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				errmsg("cannot repack relation \"%s\"",
-					   RelationGetRelationName(rel)),
-				errhint("REPACK CONCURRENTLY is not supported for TOAST relations"));
+				errmsg("cannot execute %s on relation \"%s\"",
+					   "REPACK (CONCURRENTLY)", RelationGetRelationName(rel)),
+				errhint("%s is not supported for TOAST relations.",
+						"REPACK (CONCURRENTLY)"));
 
 	relpersistence = rel->rd_rel->relpersistence;
 	if (relpersistence != RELPERSISTENCE_PERMANENT)
 		ereport(ERROR,
 				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				errmsg("cannot repack relation \"%s\"",
-					   RelationGetRelationName(rel)),
-				errhint("REPACK CONCURRENTLY is only allowed for permanent relations."));
+				errmsg("cannot execute %s on relation \"%s\"",
+					   "REPACK (CONCURRENTLY)", RelationGetRelationName(rel)),
+				errhint("%s is only allowed for permanent relations.",
+						"REPACK (CONCURRENTLY)"));
 
-	/* With NOTHING, WAL does not contain the old tuple. */
+	/*
+	 * With NOTHING, WAL does not contain the old tuple; FULL is not yet
+	 * supported.
+	 */
 	replident = rel->rd_rel->relreplident;
-	if (replident == REPLICA_IDENTITY_NOTHING)
+	if (replident == REPLICA_IDENTITY_NOTHING ||
+		replident == REPLICA_IDENTITY_FULL)
 		ereport(ERROR,
 				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				errmsg("cannot repack relation \"%s\"",
-					   RelationGetRelationName(rel)),
-				errhint("Relation \"%s\" has insufficient replication identity.",
-						RelationGetRelationName(rel)));
+				errmsg("cannot execute %s on relation \"%s\"",
+					   "REPACK (CONCURRENTLY)", RelationGetRelationName(rel)),
+				errdetail("%s does not support tables with %s.",
+						  "REPACK (CONCURRENTLY)",
+						  replident == REPLICA_IDENTITY_NOTHING ?
+						  "REPLICA IDENTITY NOTHING" : "REPLICA IDENTITY FULL"));
 
 	/*
 	 * Obtain the replica identity index -- either one that has been set
-	 * explicitly, or the primary key.  If none of these cases apply, the
-	 * table cannot be repacked concurrently.  It might be possible to have
-	 * repack work with a FULL replica identity; however that requires more
-	 * work and is not implemented yet.
+	 * explicitly, or a non-deferrable primary key.  If none of these cases
+	 * apply, the table cannot be repacked concurrently.  It might be possible
+	 * to have repack work with a FULL replica identity; however that requires
+	 * more work and is not implemented yet.
 	 */
-	ident_idx = RelationGetReplicaIndex(rel);
-	if (!OidIsValid(ident_idx) && OidIsValid(rel->rd_pkindex))
-		ident_idx = rel->rd_pkindex;
+	ident_idx = GetRelationIdentityOrPK(rel);
 	if (!OidIsValid(ident_idx))
+	{
+		/* This special case warrants its own error message */
+		if (OidIsValid(rel->rd_pkindex) && rel->rd_ispkdeferrable)
+			ereport(ERROR,
+					errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("cannot execute %s on relation \"%s\"",
+						   "REPACK (CONCURRENTLY)",
+						   RelationGetRelationName(rel)),
+					errdetail("%s does not support deferrable primary keys.",
+							  "REPACK (CONCURRENTLY)"),
+					errhint("Use ALTER TABLE ... REPLICA IDENTITY USING INDEX to designate another index as replica identity."));
+
 		ereport(ERROR,
 				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				errmsg("cannot process relation \"%s\"",
-					   RelationGetRelationName(rel)),
+				errmsg("cannot execute %s on relation \"%s\"",
+					   "REPACK (CONCURRENTLY)", RelationGetRelationName(rel)),
 				errhint("Relation \"%s\" has no identity index.",
 						RelationGetRelationName(rel)));
+	}
 
 	*ident_idx_p = ident_idx;
 }
@@ -1036,6 +1095,13 @@ rebuild_relation(Relation OldHeap, Relation index, bool verbose,
 							   NoLock);
 	Assert(CheckRelationOidLockedByMe(OIDNewHeap, AccessExclusiveLock, false));
 	NewHeap = table_open(OIDNewHeap, NoLock);
+
+	/*
+	 * In concurrent mode, create a copy of the attribute defaults on the temp
+	 * table, which the executor needs when replaying concurrent data changes.
+	 */
+	if (concurrent)
+		copy_attribute_defaults(tableOid, OIDNewHeap);
 
 	/* Copy the heap data into the new table in the desired order */
 	copy_table_data(NewHeap, OldHeap, index, snapshot, verbose,
@@ -2096,6 +2162,10 @@ get_tables_to_repack(RepackCommand cmd, bool usingindex, MemoryContext permcxt)
 
 		/*
 		 * For USING INDEX, scan pg_index to find those with indisclustered.
+		 *
+		 * Note we don't obtain lock of any kind on the index, which means the
+		 * index or its owning table could be gone or change at any point.  We
+		 * have to be extra careful when examining catalog state for them.
 		 */
 		catalog = table_open(IndexRelationId, AccessShareLock);
 		ScanKeyInit(&entry,
@@ -2107,33 +2177,29 @@ get_tables_to_repack(RepackCommand cmd, bool usingindex, MemoryContext permcxt)
 		{
 			RelToCluster *rtc;
 			Form_pg_index index;
+			HeapTuple	classtup;
+			Oid			relnamespace;
+			char		relpersistence;
 			MemoryContext oldcxt;
 
 			index = (Form_pg_index) GETSTRUCT(tuple);
 
-			/*
-			 * Try to obtain a light lock on the index's table, to ensure it
-			 * doesn't go away while we collect the list.  If we cannot, just
-			 * disregard it.  Be sure to release this if we ultimately decide
-			 * not to process the table!
-			 */
-			if (!ConditionalLockRelationOid(index->indrelid, AccessShareLock))
+			classtup = SearchSysCache1(RELOID, ObjectIdGetDatum(index->indrelid));
+			if (!HeapTupleIsValid(classtup))
 				continue;
+			relnamespace = ((Form_pg_class) GETSTRUCT(classtup))->relnamespace;
+			relpersistence = ((Form_pg_class) GETSTRUCT(classtup))->relpersistence;
+			ReleaseSysCache(classtup);
 
-			/* Verify that the table still exists; skip if not */
-			if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(index->indrelid)))
-			{
-				UnlockRelationOid(index->indrelid, AccessShareLock);
+			/* Skip temp relations belonging to other sessions */
+			if (relpersistence == RELPERSISTENCE_TEMP &&
+				!isTempOrTempToastNamespace(relnamespace))
 				continue;
-			}
 
 			/* noisily skip rels which the user can't process */
 			if (!repack_is_permitted_for_relation(cmd, index->indrelid,
 												  GetUserId()))
-			{
-				UnlockRelationOid(index->indrelid, AccessShareLock);
 				continue;
-			}
 
 			/* Use a permanent memory context for the result list */
 			oldcxt = MemoryContextSwitchTo(permcxt);
@@ -2157,37 +2223,20 @@ get_tables_to_repack(RepackCommand cmd, bool usingindex, MemoryContext permcxt)
 
 			class = (Form_pg_class) GETSTRUCT(tuple);
 
-			/*
-			 * Try to obtain a light lock on the table, to ensure it doesn't
-			 * go away while we collect the list.  If we cannot, just
-			 * disregard the table.  Be sure to release this if we ultimately
-			 * decide not to process the table!
-			 */
-			if (!ConditionalLockRelationOid(class->oid, AccessShareLock))
-				continue;
-
-			/* Verify that the table still exists */
-			if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(class->oid)))
-			{
-				UnlockRelationOid(class->oid, AccessShareLock);
-				continue;
-			}
-
 			/* Can only process plain tables and matviews */
 			if (class->relkind != RELKIND_RELATION &&
 				class->relkind != RELKIND_MATVIEW)
-			{
-				UnlockRelationOid(class->oid, AccessShareLock);
 				continue;
-			}
+
+			/* Skip temp relations belonging to other sessions */
+			if (class->relpersistence == RELPERSISTENCE_TEMP &&
+				!isTempOrTempToastNamespace(class->relnamespace))
+				continue;
 
 			/* noisily skip rels which the user can't process */
 			if (!repack_is_permitted_for_relation(cmd, class->oid,
 												  GetUserId()))
-			{
-				UnlockRelationOid(class->oid, AccessShareLock);
 				continue;
-			}
 
 			/* Use a permanent memory context for the result list */
 			oldcxt = MemoryContextSwitchTo(permcxt);
@@ -2200,7 +2249,7 @@ get_tables_to_repack(RepackCommand cmd, bool usingindex, MemoryContext permcxt)
 	}
 
 	table_endscan(scan);
-	relation_close(catalog, AccessShareLock);
+	table_close(catalog, AccessShareLock);
 
 	return rtcs;
 }
@@ -2272,21 +2321,42 @@ get_tables_to_repack_partitioned(RepackCommand cmd, Oid relid,
 
 
 /*
- * Return whether userid has privileges to REPACK relid.  If not, this
- * function emits a WARNING.
+ * Return whether userid has privileges to execute REPACK on relid.
+ *
+ * Caller may not have a lock on the relation, so it could have been
+ * dropped concurrently.  In that case, silently return false.
+ *
+ * If the relation does exist but the user doesn't have the required
+ * privs, emit a WARNING and return false.  Otherwise, return true.
  */
 static bool
 repack_is_permitted_for_relation(RepackCommand cmd, Oid relid, Oid userid)
 {
+	bool		is_missing = false;
+	AclResult	result;
+	char	   *relname;
+
 	Assert(cmd == REPACK_COMMAND_CLUSTER || cmd == REPACK_COMMAND_REPACK);
 
-	if (pg_class_aclcheck(relid, userid, ACL_MAINTAIN) == ACLCHECK_OK)
+	result = pg_class_aclcheck_ext(relid, userid, ACL_MAINTAIN, &is_missing);
+	if (is_missing)
+		return false;
+
+	if (result == ACLCHECK_OK)
 		return true;
 
-	ereport(WARNING,
-			errmsg("permission denied to execute %s on \"%s\", skipping it",
-				   RepackCommandAsString(cmd),
-				   get_rel_name(relid)));
+	/*
+	 * The relation can also be dropped after we tested its ACL and before we
+	 * read its relname, so be careful here.
+	 */
+	relname = get_rel_name(relid);
+	if (relname != NULL)
+	{
+		ereport(WARNING,
+				errmsg("permission denied to execute %s on \"%s\", skipping it",
+					   RepackCommandAsString(cmd), relname));
+		pfree(relname);
+	}
 
 	return false;
 }
@@ -2531,7 +2601,7 @@ apply_concurrent_changes(BufFile *file, ChangeContext *chgcxt)
 			/* Find the tuple to be deleted */
 			found = find_target_tuple(rel, chgcxt, spilled_tuple, ondisk_tuple);
 			if (!found)
-				elog(ERROR, "failed to find target tuple");
+				elog(ERROR, "could not find target tuple");
 			apply_concurrent_delete(rel, ondisk_tuple);
 		}
 		else if (kind == CHANGE_UPDATE_NEW)
@@ -2547,7 +2617,7 @@ apply_concurrent_changes(BufFile *file, ChangeContext *chgcxt)
 			/* Find the tuple to be updated or deleted. */
 			found = find_target_tuple(rel, chgcxt, key, ondisk_tuple);
 			if (!found)
-				elog(ERROR, "failed to find target tuple");
+				elog(ERROR, "could not find target tuple");
 
 			/*
 			 * If 'tup' contains TOAST pointers, they point to the old
@@ -2624,7 +2694,9 @@ apply_concurrent_update(Relation rel, TupleTableSlot *spilled_tuple,
 							 &tmfd, &lockmode, &update_indexes);
 	if (res != TM_Ok)
 		ereport(ERROR,
-				errmsg("failed to apply concurrent UPDATE"));
+				errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				errmsg("could not apply concurrent %s on relation \"%s\"",
+					   "UPDATE", RelationGetRelationName(rel)));
 
 	if (update_indexes != TU_None)
 	{
@@ -2660,7 +2732,9 @@ apply_concurrent_delete(Relation rel, TupleTableSlot *slot)
 
 	if (res != TM_Ok)
 		ereport(ERROR,
-				errmsg("failed to apply concurrent DELETE"));
+				errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				errmsg("could not apply concurrent %s on relation \"%s\"",
+					   "DELETE", RelationGetRelationName(rel)));
 
 	pgstat_progress_incr_param(PROGRESS_REPACK_HEAP_TUPLES_DELETED, 1);
 }
@@ -2727,16 +2801,19 @@ restore_tuple(BufFile *file, Relation relation, TupleTableSlot *slot)
 			varlensz = VARSIZE_ANY(&chunk_header);
 
 			value = palloc(varlensz);
-			SET_VARSIZE(value, VARSIZE_ANY(&chunk_header));
+			memcpy(value, &chunk_header, VARHDRSZ);
 			BufFileReadExact(file, (char *) value + VARHDRSZ, varlensz - VARHDRSZ);
 
 			slot->tts_values[i] = PointerGetDatum(value);
 			natt_ext--;
 			if (natt_ext < 0)
-				ereport(ERROR,
-						errcode(ERRCODE_DATA_CORRUPTED),
-						errmsg("insufficient number of attributes stored separately"));
+				elog(ERROR, "insufficient number of attributes stored separately");
 		}
+
+		if (natt_ext != 0)
+			elog(ERROR,
+				 "unexpected number of attributes stored separately (%d remaining)",
+				 natt_ext);
 	}
 }
 
@@ -2785,7 +2862,7 @@ find_target_tuple(Relation rel, ChangeContext *chgcxt, TupleTableSlot *locator,
 {
 	Form_pg_index idx = chgcxt->cc_ident_index->rd_index;
 	IndexScanDesc scan;
-	bool		retval;
+	bool		retval = false;
 
 	/*
 	 * Scan key is passed by caller, so it does not have to be constructed
@@ -2807,10 +2884,59 @@ find_target_tuple(Relation rel, ChangeContext *chgcxt, TupleTableSlot *locator,
 	scan = index_beginscan(rel, chgcxt->cc_ident_index, GetActiveSnapshot(),
 						   NULL, chgcxt->cc_ident_key_nentries, 0, 0);
 	index_rescan(scan, chgcxt->cc_ident_key, chgcxt->cc_ident_key_nentries, NULL, 0);
-	retval = index_getnext_slot(scan, ForwardScanDirection, retrieved);
+	while (index_getnext_slot(scan, ForwardScanDirection, retrieved))
+	{
+		/* Be wary of temporal constraints */
+		if (scan->xs_recheck && !identity_key_equal(chgcxt, locator, retrieved))
+		{
+			CHECK_FOR_INTERRUPTS();
+			continue;
+		}
+
+		retval = true;
+		break;
+	}
 	index_endscan(scan);
 
 	return retval;
+}
+
+/*
+ * Check whether the candidate tuple matches the locator tuple on all replica
+ * identity key columns, using the same equality operators as the identity
+ * index scan.  The locator tuple has already been loaded into cc_ident_key.
+ *
+ * This is needed to filter lossy index matches, such as GiST multirange scans
+ * used for temporal constraints.
+ */
+static bool
+identity_key_equal(ChangeContext *chgcxt, TupleTableSlot *locator,
+				   TupleTableSlot *candidate)
+{
+	slot_getsomeattrs(locator, chgcxt->cc_last_key_attno);
+	slot_getsomeattrs(candidate, chgcxt->cc_last_key_attno);
+
+	for (int i = 0; i < chgcxt->cc_ident_key_nentries; i++)
+	{
+		ScanKey		entry = &chgcxt->cc_ident_key[i];
+		AttrNumber	attno = chgcxt->cc_ident_index->rd_index->indkey.values[i];
+
+		Assert(attno > 0);
+
+		if (locator->tts_isnull[attno - 1] != candidate->tts_isnull[attno - 1])
+			return false;
+
+		if (locator->tts_isnull[attno - 1])
+			continue;
+
+		if (!DatumGetBool(FunctionCall2Coll(&entry->sk_func,
+											entry->sk_collation,
+											candidate->tts_values[attno - 1],
+											entry->sk_argument)))
+			return false;
+	}
+
+	return true;
 }
 
 /*
@@ -2885,8 +3011,60 @@ initialize_change_context(ChangeContext *chgcxt,
 	/* Only initialize fields needed by ExecInsertIndexTuples(). */
 	chgcxt->cc_estate = CreateExecutorState();
 
-	chgcxt->cc_rri = (ResultRelInfo *) palloc(sizeof(ResultRelInfo));
-	InitResultRelInfo(chgcxt->cc_rri, relation, 0, 0, 0);
+	/*
+	 * Set up a range table for the executor, containing our repacked table as
+	 * its only member.
+	 */
+	{
+		RangeTblEntry *rte;
+		TupleDesc	desc = RelationGetDescr(relation);
+		List	   *perminfos = NIL;
+		Bitmapset  *updatedCols = NULL;
+		RTEPermissionInfo *perminfo;
+
+		/*
+		 * For our use, the RTE only needs to have perminfoindex initialized,
+		 * but there's no reason to not set the fields whose values we have at
+		 * hand.
+		 */
+		rte = makeNode(RangeTblEntry);
+		rte->rtekind = RTE_RELATION;
+		rte->relid = RelationGetRelid(relation);
+		rte->relkind = RelationGetForm(relation)->relkind;
+		/* Create the RTEPermissionInfo instance (and set ->perminfoindex). */
+		addRTEPermissionInfo(&perminfos, rte);
+
+		/*
+		 * Initialize updatedCols to show that all columns are updated.  This
+		 * is of course not necessarily true, and we cannot know this early;
+		 * but this is only used by ExecInsertIndexTuples to flag index
+		 * updates with no logical value changes, so if it's wrong, nothing
+		 * terribly bad happens. We may want to improve this someday though.
+		 *
+		 * Don't claim that dropped columns are changed though.
+		 */
+		for (int i = 0; i < desc->natts; i++)
+		{
+			CompactAttribute *attr = TupleDescCompactAttr(desc, i);
+
+			if (attr->attisdropped)
+				continue;
+			updatedCols = bms_add_member(updatedCols,
+										 i + 1 - FirstLowInvalidHeapAttributeNumber);
+		}
+
+		/* install updatedCols in the right place */
+		perminfo = getRTEPermissionInfo(perminfos, rte);
+		perminfo->updatedCols = updatedCols;
+
+		/* finally we can initialize the range table proper */
+		ExecInitRangeTable(chgcxt->cc_estate, list_make1(rte), perminfos,
+						   bms_make_singleton(1));
+	}
+
+	/* Set up our ResultRelInfo to use for index updates */
+	chgcxt->cc_rri = makeNode(ResultRelInfo);
+	InitResultRelInfo(chgcxt->cc_rri, relation, 1, NULL, 0);
 	ExecOpenIndices(chgcxt->cc_rri, false);
 
 	/*
@@ -2906,7 +3084,7 @@ initialize_change_context(ChangeContext *chgcxt,
 		}
 	}
 	if (chgcxt->cc_ident_index == NULL)
-		elog(ERROR, "failed to find identity index");
+		elog(ERROR, "could not find identity index");
 
 	/* Set up for scanning said identity index */
 	{
@@ -2922,26 +3100,44 @@ initialize_change_context(ChangeContext *chgcxt,
 						opcintype,
 						opno,
 						opcode;
+			StrategyNumber eq_strategy;
 
 			entry = &chgcxt->cc_ident_key[i];
 
 			opfamily = chgcxt->cc_ident_index->rd_opfamily[i];
 			opcintype = chgcxt->cc_ident_index->rd_opcintype[i];
+			eq_strategy = IndexAmTranslateCompareType(COMPARE_EQ,
+													  chgcxt->cc_ident_index->rd_rel->relam,
+													  opfamily, false);
+			if (eq_strategy == InvalidStrategy)
+				elog(ERROR, "could not find equality strategy for index operator family %u for type %u",
+					 opfamily, opcintype);
 			opno = get_opfamily_member(opfamily, opcintype, opcintype,
-									   BTEqualStrategyNumber);
+									   eq_strategy);
 			if (!OidIsValid(opno))
-				elog(ERROR, "failed to find = operator for type %u", opcintype);
+				elog(ERROR, "missing operator %d(%u,%u) in opfamily %u",
+					 eq_strategy, opcintype, opcintype, opfamily);
 			opcode = get_opcode(opno);
 			if (!OidIsValid(opcode))
-				elog(ERROR, "failed to find = operator for operator %u", opno);
+				elog(ERROR, "missing oprcode for operator %u", opno);
 
 			/* Initialize everything but argument. */
 			ScanKeyInit(entry,
 						i + 1,
-						BTEqualStrategyNumber, opcode,
+						eq_strategy, opcode,
 						(Datum) 0);
 			entry->sk_collation = chgcxt->cc_ident_index->rd_indcollation[i];
 		}
+	}
+
+	/* Determine the last column we must deform to read the identity */
+	chgcxt->cc_last_key_attno = InvalidAttrNumber;
+	for (int i = 0; i < chgcxt->cc_ident_key_nentries; i++)
+	{
+		AttrNumber	attno = chgcxt->cc_ident_index->rd_index->indkey.values[i];
+
+		Assert(attno > 0);
+		chgcxt->cc_last_key_attno = Max(chgcxt->cc_last_key_attno, attno);
 	}
 
 	chgcxt->cc_file_seq = WORKER_FILE_SNAPSHOT + 1;
@@ -3018,7 +3214,7 @@ rebuild_relation_finish_concurrent(Relation NewHeap, Relation OldHeap,
 		{
 			int			pos = foreach_current_index(ind_old);
 
-			if (unlikely(list_length(ind_oids_new) < pos))
+			if (list_length(ind_oids_new) <= pos)
 				elog(ERROR, "list of new indexes too short");
 			ident_idx_new = list_nth_oid(ind_oids_new, pos);
 			break;
@@ -3227,7 +3423,7 @@ build_new_indexes(Relation NewHeap, Relation OldHeap, List *OldIndexes)
  *
  * We don't need the constraints for anything else (the original constraints
  * will be there once repack completes), so we add pg_depend entries so that
- * the are dropped when the transient table is dropped.
+ * they are dropped when the transient table is dropped.
  */
 static void
 copy_index_constraints(Relation old_index, Oid new_index_id, Oid new_heap_id)
@@ -3292,6 +3488,98 @@ copy_index_constraints(Relation old_index, Oid new_index_id, Oid new_heap_id)
 }
 
 /*
+ * Create a transient copy of attribute defaults.
+ *
+ * When repacking a table that has stored generated columns, the executor
+ * relies on these entries to generate the values for them during apply of
+ * concurrent operations.  These copies are there to support that.
+ *
+ * We don't need the defaults for anything else, so we add pg_depend entries
+ * so that they are dropped when the transient table is dropped.
+ */
+static void
+copy_attribute_defaults(Oid old_heap_oid, Oid new_heap_oid)
+{
+	ScanKeyData skey;
+	Relation	rel;
+	Relation	att_rel;
+	SysScanDesc scan;
+	HeapTuple	def_tup;
+	ObjectAddress objrel;
+
+	rel = table_open(AttrDefaultRelationId, RowExclusiveLock);
+	att_rel = table_open(AttributeRelationId, RowExclusiveLock);
+
+	ObjectAddressSet(objrel, RelationRelationId, new_heap_oid);
+
+	ScanKeyInit(&skey,
+				Anum_pg_attrdef_adrelid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(old_heap_oid));
+	scan = systable_beginscan(rel, AttrDefaultIndexId, true,
+							  NULL, 1, &skey);
+	while (HeapTupleIsValid(def_tup = systable_getnext(scan)))
+	{
+		Form_pg_attrdef adform;
+		Oid			oid;
+		Datum		def_values[Natts_pg_attrdef];
+		bool		def_nulls[Natts_pg_attrdef];
+		bool		def_replaces[Natts_pg_attrdef] = {0};
+		Datum		att_values[Natts_pg_attribute];
+		bool		att_nulls[Natts_pg_attribute];
+		bool		att_replaces[Natts_pg_attribute] = {0};
+		HeapTuple	new_def_tup,
+					att_tup,
+					new_att_tup;
+		ObjectAddress objad;
+
+		adform = (Form_pg_attrdef) GETSTRUCT(def_tup);
+		Assert(adform->adrelid == old_heap_oid);
+
+		/*
+		 * Insert a new tuple that's identical to the existing one, other than
+		 * its OID and the relation it refers to.
+		 */
+		oid = GetNewOidWithIndex(rel, AttrDefaultOidIndexId,
+								 Anum_pg_attrdef_oid);
+		def_values[Anum_pg_attrdef_oid - 1] = ObjectIdGetDatum(oid);
+		def_nulls[Anum_pg_attrdef_oid - 1] = false;
+		def_replaces[Anum_pg_attrdef_oid - 1] = true;
+		def_values[Anum_pg_attrdef_adrelid - 1] = ObjectIdGetDatum(new_heap_oid);
+		def_nulls[Anum_pg_attrdef_adrelid - 1] = false;
+		def_replaces[Anum_pg_attrdef_adrelid - 1] = true;
+		new_def_tup = heap_modify_tuple(def_tup, RelationGetDescr(rel),
+										def_values, def_nulls, def_replaces);
+		CatalogTupleInsert(rel, new_def_tup);
+
+		/* Set atthasdef for this attribute in the transient table */
+		att_tup = SearchSysCache2(ATTNUM,
+								  ObjectIdGetDatum(new_heap_oid),
+								  ObjectIdGetDatum(adform->adnum));
+		if (!HeapTupleIsValid(att_tup))
+			elog(ERROR, "cache lookup failed for attribute %d of relation %u",
+				 adform->adnum, new_heap_oid);
+		att_values[Anum_pg_attribute_atthasdef - 1] = BoolGetDatum(true);
+		att_nulls[Anum_pg_attribute_atthasdef - 1] = false;
+		att_replaces[Anum_pg_attribute_atthasdef - 1] = true;
+		new_att_tup = heap_modify_tuple(att_tup, RelationGetDescr(att_rel),
+										att_values, att_nulls, att_replaces);
+		CatalogTupleUpdate(att_rel, &new_att_tup->t_self, new_att_tup);
+		ReleaseSysCache(att_tup);
+
+		/* Add a pg_depend record so it's removed with the transient table */
+		ObjectAddressSet(objad, AttrDefaultRelationId, oid);
+		recordDependencyOn(&objad, &objrel, DEPENDENCY_AUTO);
+	}
+	systable_endscan(scan);
+
+	table_close(rel, RowExclusiveLock);
+	table_close(att_rel, RowExclusiveLock);
+
+	CommandCounterIncrement();
+}
+
+/*
  * Try to start a background worker to perform logical decoding of data
  * changes applied to relation while REPACK CONCURRENTLY is copying its
  * contents to a new table.
@@ -3300,21 +3588,22 @@ static void
 start_repack_decoding_worker(Oid relid)
 {
 	Size		size;
-	dsm_segment *seg;
 	DecodingWorkerShared *shared;
 	shm_mq	   *mq;
-	shm_mq_handle *mqh;
 	BackgroundWorker bgw;
+
+	decoding_worker = palloc0_object(DecodingWorker);
 
 	/* Setup shared memory. */
 	size = BUFFERALIGN(offsetof(DecodingWorkerShared, error_queue)) +
 		BUFFERALIGN(REPACK_ERROR_QUEUE_SIZE);
-	seg = dsm_create(size, 0);
-	shared = (DecodingWorkerShared *) dsm_segment_address(seg);
+	decoding_worker->seg = dsm_create(size, 0);
+
+	shared = (DecodingWorkerShared *) dsm_segment_address(decoding_worker->seg);
 	shared->initialized = false;
 	shared->lsn_upto = InvalidXLogRecPtr;
 	shared->done = false;
-	SharedFileSetInit(&shared->sfs, seg);
+	SharedFileSetInit(&shared->sfs, decoding_worker->seg);
 	shared->last_exported = -1;
 	SpinLockInit(&shared->mutex);
 	shared->dbid = MyDatabaseId;
@@ -3333,7 +3622,8 @@ start_repack_decoding_worker(Oid relid)
 	mq = shm_mq_create((char *) BUFFERALIGN(shared->error_queue),
 					   REPACK_ERROR_QUEUE_SIZE);
 	shm_mq_set_receiver(mq, MyProc);
-	mqh = shm_mq_attach(mq, seg, NULL);
+
+	decoding_worker->error_mqh = shm_mq_attach(mq, decoding_worker->seg, NULL);
 
 	memset(&bgw, 0, sizeof(bgw));
 	snprintf(bgw.bgw_name, BGW_MAXLEN,
@@ -3346,18 +3636,14 @@ start_repack_decoding_worker(Oid relid)
 	bgw.bgw_restart_time = BGW_NEVER_RESTART;
 	snprintf(bgw.bgw_library_name, MAXPGPATH, "postgres");
 	snprintf(bgw.bgw_function_name, BGW_MAXLEN, "RepackWorkerMain");
-	bgw.bgw_main_arg = UInt32GetDatum(dsm_segment_handle(seg));
+	bgw.bgw_main_arg = UInt32GetDatum(dsm_segment_handle(decoding_worker->seg));
 	bgw.bgw_notify_pid = MyProcPid;
 
-	decoding_worker = palloc0_object(DecodingWorker);
 	if (!RegisterDynamicBackgroundWorker(&bgw, &decoding_worker->handle))
 		ereport(ERROR,
 				errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
 				errmsg("out of background worker slots"),
 				errhint("You might need to increase \"%s\".", "max_worker_processes"));
-
-	decoding_worker->seg = seg;
-	decoding_worker->error_mqh = mqh;
 
 	/*
 	 * The decoding setup must be done before the caller can have XID assigned
@@ -3391,40 +3677,52 @@ start_repack_decoding_worker(Oid relid)
 static void
 stop_repack_decoding_worker(void)
 {
-	BgwHandleStatus status;
-
-	/* Haven't reached the worker startup? */
+	/* Nothing to do if no worker was set up. */
 	if (decoding_worker == NULL)
 		return;
 
-	/* Could not register the worker? */
-	if (decoding_worker->handle == NULL)
-		return;
+	/* Terminate the worker process, if one is running. */
+	if (decoding_worker->handle != NULL)
+	{
+		BgwHandleStatus status;
 
-	TerminateBackgroundWorker(decoding_worker->handle);
-	/* The worker should really exit before the REPACK command does. */
-	HOLD_INTERRUPTS();
-	status = WaitForBackgroundWorkerShutdown(decoding_worker->handle);
-	RESUME_INTERRUPTS();
+		TerminateBackgroundWorker(decoding_worker->handle);
+		/* The worker should really exit before the REPACK command does. */
+		HOLD_INTERRUPTS();
+		status = WaitForBackgroundWorkerShutdown(decoding_worker->handle);
+		RESUME_INTERRUPTS();
 
-	if (status == BGWH_POSTMASTER_DIED)
-		ereport(FATAL,
-				errcode(ERRCODE_ADMIN_SHUTDOWN),
-				errmsg("postmaster exited during REPACK command"));
-
-	shm_mq_detach(decoding_worker->error_mqh);
+		if (status == BGWH_POSTMASTER_DIED)
+			ereport(FATAL,
+					errcode(ERRCODE_ADMIN_SHUTDOWN),
+					errmsg("postmaster exited during REPACK command"));
+	}
 
 	/*
-	 * If we could not cancel the current sleep due to ERROR, do that before
-	 * we detach from the shared memory the condition variable is located in.
-	 * If we did not, the bgworker ERROR handling code would try and fail
-	 * badly.
+	 * Now detach from our shared memory segment.  In error cases there might
+	 * still be messages from the worker in the queue, which ProcessInterrupts
+	 * would try to read; this is pointless (and causes an assertion failure),
+	 * so set the global pointer to NULL to have ProcessRepackMessages ignore
+	 * them.
+	 *
+	 * We must also cancel the current sleep, if one is still set up.  This is
+	 * critical because the CV lives in the DSM that we're about to detach, so
+	 * if we omit it, later automatic cleanup tries to clear freed memory.
 	 */
+	if (decoding_worker->error_mqh != NULL)
+		shm_mq_detach(decoding_worker->error_mqh);
 	ConditionVariableCancelSleep();
-
-	dsm_detach(decoding_worker->seg);
+	if (decoding_worker->seg != NULL)
+		dsm_detach(decoding_worker->seg);
 	pfree(decoding_worker);
 	decoding_worker = NULL;
+}
+
+/* stop_repack_decoding_worker, wrapped as a before_shmem_exit callback */
+static void
+stop_repack_decoding_worker_cb(int code, Datum arg)
+{
+	stop_repack_decoding_worker();
 }
 
 /*

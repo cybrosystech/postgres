@@ -1361,15 +1361,36 @@ SELECT * FROM
 WHERE c <= 3;
 
 -- Ensure we get the correct run condition when the window function is both
--- monotonically increasing and decreasing.
+-- monotonically increasing and decreasing in RANGE mode without an ORDER BY
 EXPLAIN (COSTS OFF)
 SELECT * FROM
   (SELECT empno,
           depname,
           salary,
-          count(empno) OVER () c
+          count(empno) OVER (RANGE BETWEEN CURRENT ROW AND CURRENT ROW) c
    FROM empsalary) emp
 WHERE c = 1;
+
+-- As above, but check we detect it's monotonically increasing
+EXPLAIN (COSTS OFF)
+SELECT * FROM
+  (SELECT empno,
+          depname,
+          salary,
+          count(empno) OVER (RANGE BETWEEN CURRENT ROW AND CURRENT ROW) c
+   FROM empsalary) emp
+WHERE c <= 3;
+
+-- Ensure that ROWS mode without an ORDER BY doesn't think it's monotonically
+-- decreasing, i.e. don't push down the run condition.
+EXPLAIN (COSTS OFF)
+SELECT * FROM
+  (SELECT empno,
+          depname,
+          salary,
+          count(empno) OVER (ROWS BETWEEN CURRENT ROW AND CURRENT ROW) c
+   FROM empsalary) emp
+WHERE c > 1;
 
 -- Try another case with a WindowFunc with a byref return type
 SELECT * FROM
@@ -1459,6 +1480,96 @@ SELECT * FROM
           count((SELECT 1)) OVER (ORDER BY empno DESC) c
    FROM empsalary) emp
 WHERE c = 1;
+
+--
+-- Ensure we get the correct behavior for run condition pushdown when the
+-- frame option has an EXCLUDE clause
+--
+
+-- Ensure pushdown occurs for ROWS BETWEEN UNBOUNDED PRECEDING with EXCLUDE
+-- CURRENT ROW with COUNT(*)
+EXPLAIN (COSTS OFF)
+SELECT * FROM
+  (SELECT empno,
+          salary,
+          count(*) OVER (ORDER BY salary ROWS BETWEEN UNBOUNDED PRECEDING AND 0 PRECEDING EXCLUDE CURRENT ROW) c
+   FROM empsalary) emp
+WHERE c <= 3;
+
+-- Ensure pushdown occurs for GROUPS BETWEEN UNBOUNDED PRECEDING with EXCLUDE
+-- CURRENT ROW with COUNT(*)
+EXPLAIN (COSTS OFF)
+SELECT * FROM
+  (SELECT empno,
+          salary,
+          count(*) OVER (ORDER BY salary GROUPS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE CURRENT ROW) c
+   FROM empsalary) emp
+WHERE c <= 3;
+
+-- Ensure pushdown occurs for RANGE BETWEEN UNBOUNDED PRECEDING with EXCLUDE
+-- CURRENT ROW with COUNT(*)
+EXPLAIN (COSTS OFF)
+SELECT * FROM
+  (SELECT empno,
+          salary,
+          count(*) OVER (ORDER BY salary RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE CURRENT ROW) c
+   FROM empsalary) emp
+WHERE c <= 3;
+
+-- Ensure we don't get pushdown when a FILTER clause is present
+EXPLAIN (COSTS OFF)
+SELECT * FROM
+  (SELECT empno,
+          salary,
+          count(*) FILTER (WHERE salary > 4000) OVER (ORDER BY salary ROWS BETWEEN UNBOUNDED PRECEDING AND 0 PRECEDING EXCLUDE CURRENT ROW) c
+   FROM empsalary) emp
+WHERE c <= 3;
+
+-- Ensure we don't get pushdown with COUNT(ANY)
+EXPLAIN (COSTS OFF)
+SELECT * FROM
+  (SELECT empno,
+          salary,
+          count(salary) OVER (ORDER BY salary ROWS BETWEEN UNBOUNDED PRECEDING AND 0 PRECEDING EXCLUDE CURRENT ROW) c
+   FROM empsalary) emp
+WHERE c <= 3;
+
+-- Ensure we don't get pushdown with EXCLUDE GROUP
+EXPLAIN (COSTS OFF)
+SELECT * FROM
+  (SELECT empno,
+          salary,
+          count(*) OVER (ORDER BY salary ROWS BETWEEN UNBOUNDED PRECEDING AND 0 PRECEDING EXCLUDE GROUP) c
+   FROM empsalary) emp
+WHERE c <= 3;
+
+-- Ensure we don't get pushdown with EXCLUDE TIES
+EXPLAIN (COSTS OFF)
+SELECT * FROM
+  (SELECT empno,
+          salary,
+          count(*) OVER (ORDER BY salary ROWS BETWEEN UNBOUNDED PRECEDING AND 0 PRECEDING EXCLUDE TIES) c
+   FROM empsalary) emp
+WHERE c <= 3;
+
+-- Ensure we don't get pushdown with GROUPS mode and EXCLUDE GROUP
+EXPLAIN (COSTS OFF)
+SELECT * FROM
+  (SELECT empno,
+          salary,
+          count(*) OVER (ORDER BY salary GROUPS BETWEEN UNBOUNDED PRECEDING AND 0 PRECEDING EXCLUDE GROUP) c
+   FROM empsalary) emp
+WHERE c <= 3;
+
+-- Ensure we don't get pushdown with GROUPS mode and EXCLUDE TIES
+EXPLAIN (COSTS OFF)
+SELECT * FROM
+  (SELECT empno,
+          salary,
+          count(*) OVER (ORDER BY salary GROUPS BETWEEN UNBOUNDED PRECEDING AND 0 PRECEDING EXCLUDE TIES) c
+   FROM empsalary) emp
+WHERE c <= 3;
+
 
 -- Test Sort node collapsing
 EXPLAIN (COSTS OFF)
@@ -2099,6 +2210,9 @@ WINDOW w AS (ORDER BY name ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING EXCLUDE CURR
 ;
 
 -- valid and invalid functions
+SELECT abs(1) IGNORE NULLS; -- fails
+SELECT no_such_window_func() IGNORE NULLS; -- fails, but not because of null treatment
+SELECT sum(orbit) IGNORE NULLS FROM planets; -- fails
 SELECT sum(orbit) OVER () FROM planets; -- succeeds
 SELECT sum(orbit) RESPECT NULLS OVER () FROM planets; -- fails
 SELECT sum(orbit) IGNORE NULLS OVER () FROM planets; -- fails
@@ -2156,6 +2270,34 @@ SELECT x,
        nth_value(x,2) IGNORE NULLS OVER w
 FROM generate_series(1,5) g(x)
 WINDOW w AS (ORDER BY x ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING);
+
+-- volatile arguments cannot use the IGNORE NULLS nullness cache
+CREATE TEMPORARY SEQUENCE null_treatment_seq;
+CREATE FUNCTION pg_temp.volatile_null(i int) RETURNS int
+LANGUAGE sql VOLATILE AS
+$$
+  SELECT CASE WHEN nextval('null_treatment_seq') % 2 = 0 THEN i ELSE NULL END;
+$$;
+
+SELECT x,
+       first_value(pg_temp.volatile_null(x)) IGNORE NULLS
+         OVER (ORDER BY x ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+FROM generate_series(1,5) g(x);
+SELECT last_value FROM null_treatment_seq;
+
+ALTER SEQUENCE null_treatment_seq RESTART WITH 1;
+SELECT x,
+       lead(pg_temp.volatile_null(x), 1) IGNORE NULLS OVER (ORDER BY x)
+FROM generate_series(1,5) g(x);
+SELECT last_value FROM null_treatment_seq;
+
+ALTER SEQUENCE null_treatment_seq RESTART WITH 1;
+SELECT x,
+       first_value((SELECT CASE WHEN nextval('null_treatment_seq') % 2 = 0
+                                THEN x ELSE NULL END)) IGNORE NULLS
+         OVER (ORDER BY x ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+FROM generate_series(1,5) g(x);
+SELECT last_value FROM null_treatment_seq;
 
 --cleanup
 DROP TABLE planets CASCADE;

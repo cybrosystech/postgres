@@ -60,31 +60,42 @@ initcap_wbnext(void *state)
 {
 	struct WordBoundaryState *wbstate = (struct WordBoundaryState *) state;
 
-	while (wbstate->offset < wbstate->len &&
-		   wbstate->str[wbstate->offset] != '\0')
+	while (wbstate->offset < wbstate->len)
 	{
-		char32_t	u = utf8_to_unicode((const unsigned char *) wbstate->str +
+		int			ulen = pg_utf_mblen((const unsigned char *) wbstate->str +
 										wbstate->offset);
-		bool		curr_alnum = pg_u_isalnum(u, wbstate->posix);
+		char32_t	u;
+		bool		curr_alnum;
+		size_t		prev_offset = wbstate->offset;
+
+		/* invalid UTF8 */
+		if (wbstate->offset + ulen > wbstate->len)
+		{
+			wbstate->init = true;
+			wbstate->offset = wbstate->len;
+			return prev_offset;
+		}
+
+		u = utf8_to_unicode((const unsigned char *) wbstate->str +
+							wbstate->offset);
+		curr_alnum = pg_u_isalnum(u, wbstate->posix);
 
 		if (!wbstate->init || curr_alnum != wbstate->prev_alnum)
 		{
-			size_t		prev_offset = wbstate->offset;
-
 			wbstate->init = true;
-			wbstate->offset += unicode_utf8len(u);
+			wbstate->offset += ulen;
 			wbstate->prev_alnum = curr_alnum;
 			return prev_offset;
 		}
 
-		wbstate->offset += unicode_utf8len(u);
+		wbstate->offset += ulen;
 	}
 
 	return wbstate->len;
 }
 
 static size_t
-strlower_builtin(char *dest, size_t destsize, const char *src, ssize_t srclen,
+strlower_builtin(char *dest, size_t destsize, const char *src, size_t srclen,
 				 pg_locale_t locale)
 {
 	return unicode_strlower(dest, destsize, src, srclen,
@@ -92,12 +103,12 @@ strlower_builtin(char *dest, size_t destsize, const char *src, ssize_t srclen,
 }
 
 static size_t
-strtitle_builtin(char *dest, size_t destsize, const char *src, ssize_t srclen,
+strtitle_builtin(char *dest, size_t destsize, const char *src, size_t srclen,
 				 pg_locale_t locale)
 {
 	struct WordBoundaryState wbstate = {
 		.str = src,
-		.len = (srclen < 0) ? strlen(src) : srclen,
+		.len = srclen,
 		.offset = 0,
 		.posix = !locale->builtin.casemap_full,
 		.init = false,
@@ -110,7 +121,7 @@ strtitle_builtin(char *dest, size_t destsize, const char *src, ssize_t srclen,
 }
 
 static size_t
-strupper_builtin(char *dest, size_t destsize, const char *src, ssize_t srclen,
+strupper_builtin(char *dest, size_t destsize, const char *src, size_t srclen,
 				 pg_locale_t locale)
 {
 	return unicode_strupper(dest, destsize, src, srclen,
@@ -118,7 +129,7 @@ strupper_builtin(char *dest, size_t destsize, const char *src, ssize_t srclen,
 }
 
 static size_t
-strfold_builtin(char *dest, size_t destsize, const char *src, ssize_t srclen,
+strfold_builtin(char *dest, size_t destsize, const char *src, size_t srclen,
 				pg_locale_t locale)
 {
 	return unicode_strfold(dest, destsize, src, srclen,

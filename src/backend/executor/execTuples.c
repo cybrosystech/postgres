@@ -72,8 +72,8 @@
 
 static TupleDesc ExecTypeFromTLInternal(List *targetList,
 										bool skipjunk);
-static pg_attribute_always_inline void slot_deform_heap_tuple(TupleTableSlot *slot, HeapTuple tuple, uint32 *offp,
-															  int reqnatts, bool support_cstring);
+static pg_always_inline void slot_deform_heap_tuple(TupleTableSlot *slot, HeapTuple tuple, uint32 *offp,
+													int reqnatts, bool support_cstring);
 static inline void tts_buffer_heap_store_tuple(TupleTableSlot *slot,
 											   HeapTuple tuple,
 											   Buffer buffer,
@@ -1013,7 +1013,7 @@ tts_buffer_heap_store_tuple(TupleTableSlot *slot, HeapTuple tuple,
  * emit code during inlining for cstring deforming when it's required.
  * cstrings can exist in MinimalTuples, but not in HeapTuples.
  */
-static pg_attribute_always_inline void
+static pg_always_inline void
 slot_deform_heap_tuple(TupleTableSlot *slot, HeapTuple tuple, uint32 *offp,
 					   int reqnatts, bool support_cstring)
 {
@@ -1074,6 +1074,13 @@ slot_deform_heap_tuple(TupleTableSlot *slot, HeapTuple tuple, uint32 *offp,
 		{
 			/* Otherwise all required columns are guaranteed to exist */
 			firstNullAttr = natts;
+
+			/*
+			 * Check TupleDescFinalize() didn't get confused when setting
+			 * firstNonGuaranteedAttr.  There should never be a NULL in a
+			 * guaranteed column.
+			 */
+			Assert(first_null_attr(tup->t_bits, natts) >= firstNullAttr);
 		}
 	}
 	else
