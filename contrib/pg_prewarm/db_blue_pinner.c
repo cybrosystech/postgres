@@ -96,7 +96,7 @@ static char *DBBluePinner_ring_buffer_tables = NULL;
  * Recommended: 300 (5 minutes). Under heavy autovacuum activity or
  * when reports run frequently, consider 60-120.
  */
-static int DBBluePinner_check_interval = 300;
+static int DBBluePinner_check_interval = 0;
 
 /*
  * db_blue.max_pin_size_percent
