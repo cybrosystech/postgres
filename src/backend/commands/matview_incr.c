@@ -339,6 +339,10 @@ static void incr_create_having_view(Oid mvrelid,
 									const char *origschema,
 									const char *origname,
 									Query *viewQuery);
+static void incr_create_overlay_view(Oid mvrelid,
+									 const char *origschema,
+									 const char *origname,
+									 Query *origQuery);
 static void incr_create_trigger(Oid mvrelid, Oid srctable,
 								int16 tgtype_event,
 								const char *newtable,
@@ -1358,6 +1362,155 @@ incr_notice_serialized_shape(Query *viewQuery)
 				 errdetail("This shape recomputes a region per delta, so it takes a matview-level lock to stay consistent with a full REFRESH at any isolation level (including READ COMMITTED). Concurrent writers to the source tables therefore apply their deltas one at a time.")));
 }
 
+/* ----------------------------------------------------------------
+ * Overlay / peel decomposition (M-OV.1)
+ *
+ * A view rejected only because of non-immutable SELECT-list projections
+ * (now()/CURRENT_DATE/STABLE columns) is split into a maintained CORE matview
+ * (grain keys + aggregates + immutable projections) and a read-time VIEW that
+ * re-adds the peeled columns from the core's stored columns.  The core rides the
+ * existing engine; the overlay reuses the HAVING base+view lifecycle.
+ * ---------------------------------------------------------------- */
+
+/* Set at CREATE (createas.c) with the ORIGINAL (pre-peel) query so MatviewIncrSetup
+ * can build the overlay view; consumed and cleared at the start of setup. */
+static Query *incr_pending_overlay_original = NULL;
+
+void
+MatviewIncrSetOverlayOriginal(Query *original)
+{
+	incr_pending_overlay_original = original;
+}
+
+/* A peelable output column: a non-immutable projection (now()/STABLE/…) that is
+ * NOT a group key and NOT a bare Var/Aggref (those define the grain / are the
+ * maintained values and must be stored). */
+static bool
+incr_te_is_peelable(TargetEntry *te)
+{
+	if (te->resjunk || te->resname == NULL || incr_is_hidden_col(te->resname))
+		return false;
+	if (te->ressortgroupref != 0)		/* a GROUP BY key — must be stored */
+		return false;
+	if (IsA(te->expr, Var) || IsA(te->expr, Aggref))
+		return false;
+	return contain_mutable_functions((Node *) te->expr);
+}
+
+typedef struct { Query *q; List *peeled; bool ok; } IncrReconCtx;
+
+/* Every Var/Aggref leaf of a peeled expression must equal a NON-peeled output
+ * column, so the overlay can reconstruct it from the core's stored columns.
+ * (Basic variant: no new core columns are synthesized.) */
+static bool
+incr_recon_walker(Node *node, IncrReconCtx *cx)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Var) || IsA(node, Aggref))
+	{
+		ListCell *lc;
+
+		foreach(lc, cx->q->targetList)
+		{
+			TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+			if (te->resjunk || te->resname == NULL ||
+				incr_is_hidden_col(te->resname))
+				continue;
+			if (list_member_int(cx->peeled, te->resno))
+				continue;			/* peeled: not stored in the core */
+			if (equal(te->expr, node))
+				return false;		/* leaf is a stored column — good */
+		}
+		cx->ok = false;				/* leaf not stored — cannot reconstruct */
+		return false;
+	}
+	return expression_tree_walker(node, incr_recon_walker, cx);
+}
+
+/* Reject the peel if a non-immutable function sits in a MEMBERSHIP-determining
+ * position (WHERE / any JOIN ON / HAVING): there it changes which rows exist with
+ * zero DML, so no read-time overlay can be byte-identical.  (Group keys keep the
+ * engine's existing STABLE-key policy.) */
+static bool
+incr_membership_has_mutable(Query *q)
+{
+	if (q->jointree && contain_mutable_functions((Node *) q->jointree))
+		return true;				/* WHERE + all JOIN ON quals */
+	if (q->havingQual && contain_mutable_functions(q->havingQual))
+		return true;
+	return false;
+}
+
+bool
+MatviewIncrPeelProjection(Query *viewQuery, Query **core_out, const char **reason)
+{
+	List	   *peeled = NIL;
+	ListCell   *lc;
+	Query	   *core;
+	List	   *newtl = NIL;
+	int			rn = 1;
+
+	*core_out = NULL;
+
+	/* M-OV.1 scope: GROUP BY views only (row-level/window peel is M-OV.2). */
+	if (viewQuery->groupClause == NIL)
+		return false;
+	if (viewQuery->setOperations != NULL || viewQuery->hasWindowFuncs)
+		return false;
+
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+		if (incr_te_is_peelable(te))
+			peeled = lappend_int(peeled, te->resno);
+	}
+	if (peeled == NIL)
+		return false;				/* nothing to peel */
+
+	/* Each peeled expression must be reconstructible from stored columns. */
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+		IncrReconCtx cx;
+
+		if (!list_member_int(peeled, te->resno))
+			continue;
+		cx.q = viewQuery;
+		cx.peeled = peeled;
+		cx.ok = true;
+		incr_recon_walker((Node *) te->expr, &cx);
+		if (!cx.ok)
+			return false;
+	}
+
+	/* Volatile in a membership position defeats a read-time overlay. */
+	if (incr_membership_has_mutable(viewQuery))
+		return false;
+
+	/* Build the core: drop the peeled columns, renumber resnos. */
+	core = copyObject(viewQuery);
+	foreach(lc, core->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+		if (list_member_int(peeled, te->resno))
+			continue;
+		te->resno = rn++;
+		newtl = lappend(newtl, te);
+	}
+	core->targetList = newtl;
+
+	/* The core (minus the peeled projections) must itself be maintainable. */
+	if (!MatviewIncrIsEligible(core, reason))
+		return false;
+
+	*core_out = core;
+	return true;
+}
+
 /*
  * MatviewIncrSetup
  * Called from ExecCreateTableAs after the matview is created and populated.
@@ -1383,6 +1536,11 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 	char	   *origschema = NULL;
 	char	   *origname = NULL;
 	ListCell   *lc;
+	Query	   *overlay_orig = incr_pending_overlay_original;
+	bool		isOverlay;
+
+	incr_pending_overlay_original = NULL;	/* consume (one per CREATE) */
+	isOverlay = (overlay_orig != NULL);
 
 	if (!MatviewIncrIsEligible(viewQuery, &reason))
 		ereport(ERROR,
@@ -1449,7 +1607,7 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 	 * After this rename mv_qname(mvrelid) returns the base table name, so
 	 * all subsequent SQL builders reference the base table automatically.
 	 */
-	if (hasHaving && mv_populated)
+	if ((hasHaving || isOverlay) && mv_populated)
 	{
 		origschema = pstrdup(get_namespace_name(get_rel_namespace(mvrelid)));
 		origname   = pstrdup(get_rel_name(mvrelid));
@@ -1980,6 +2138,14 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 	 */
 	if (hasHaving && mv_populated)
 		incr_create_having_view(mvrelid, origschema, origname, viewQuery);
+
+	/*
+	 * Overlay/peel: create the read-time VIEW that re-adds the peeled
+	 * (non-immutable) projections over the renamed base.  The base maintains the
+	 * core query; the overlay reconstructs now()/STABLE columns at read time.
+	 */
+	if (isOverlay && mv_populated)
+		incr_create_overlay_view(mvrelid, origschema, origname, overlay_orig);
 
 	ereport(DEBUG1,
 			(errmsg("DBblue: incremental refresh (Phase %d%s) set up for matview %s",
@@ -4247,6 +4413,132 @@ incr_create_having_view(Oid mvrelid,
 		{
 			ObjectAddress baseaddr,
 						  viewaddr;
+
+			ObjectAddressSet(baseaddr, RelationRelationId, mvrelid);
+			ObjectAddressSet(viewaddr, RelationRelationId, viewoid);
+			recordDependencyOn(&baseaddr, &viewaddr, DEPENDENCY_INTERNAL);
+		}
+	}
+}
+
+/*
+ * overlay_rewrite_mutator — rewrite a peeled expression so it reads from the base
+ * matview: replace each maximal Var/Aggref sub-expression that equals a stored
+ * (non-peeled) output column with a Var(1, base_attno), so deparse_expression
+ * renders it as that base column.
+ */
+typedef struct { Query *orig; List *peeled; Oid baserelid; } IncrOverlayCtx;
+
+static Node *
+overlay_rewrite_mutator(Node *node, IncrOverlayCtx *cx)
+{
+	if (node == NULL)
+		return NULL;
+	if (IsA(node, Var) || IsA(node, Aggref))
+	{
+		ListCell *lc;
+
+		foreach(lc, cx->orig->targetList)
+		{
+			TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+			if (te->resjunk || te->resname == NULL ||
+				incr_is_hidden_col(te->resname))
+				continue;
+			if (list_member_int(cx->peeled, te->resno))
+				continue;
+			if (equal(te->expr, node))
+			{
+				AttrNumber att = get_attnum(cx->baserelid, te->resname);
+
+				return (Node *) makeVar(1, att, exprType(node),
+										exprTypmod(node), exprCollation(node), 0);
+			}
+		}
+		return node;			/* recon guaranteed a match; leave as-is otherwise */
+	}
+	return expression_tree_mutator(node, overlay_rewrite_mutator, cx);
+}
+
+/*
+ * incr_create_overlay_view
+ * Create the read-time VIEW <origschema>.<origname> that re-adds the peeled
+ * (non-immutable) projections over the renamed base matview.  Mirrors
+ * incr_create_having_view's lifecycle; the difference is the SELECT list, where a
+ * peeled column is rendered as its expression over the base's stored columns and
+ * a stored column is emitted directly.
+ */
+static void
+incr_create_overlay_view(Oid mvrelid,
+						 const char *origschema,
+						 const char *origname,
+						 Query *origQuery)
+{
+	StringInfoData	buf;
+	ListCell	   *lc;
+	bool			first = true;
+	List		   *peeled = NIL;
+	List		   *dpcontext;
+	IncrOverlayCtx	cx;
+	int				ret;
+
+	foreach(lc, origQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+		if (incr_te_is_peelable(te))
+			peeled = lappend_int(peeled, te->resno);
+	}
+
+	dpcontext = deparse_context_for(get_rel_name(mvrelid), mvrelid);
+	cx.orig = origQuery;
+	cx.peeled = peeled;
+	cx.baserelid = mvrelid;
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf, "CREATE VIEW %s AS SELECT ",
+					 quote_qualified_identifier(origschema, origname));
+
+	foreach(lc, origQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+		if (te->resjunk || te->resname == NULL || incr_is_hidden_col(te->resname))
+			continue;
+		if (!first)
+			appendStringInfoString(&buf, ", ");
+		first = false;
+
+		if (list_member_int(peeled, te->resno))
+		{
+			Node *rw = overlay_rewrite_mutator((Node *) copyObject(te->expr), &cx);
+
+			appendStringInfo(&buf, "%s AS %s",
+							 deparse_expression(rw, dpcontext, false, false),
+							 quote_identifier(te->resname));
+		}
+		else
+			appendStringInfoString(&buf, quote_identifier(te->resname));
+	}
+
+	appendStringInfo(&buf, " FROM %s", mv_qname(mvrelid));
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "incr_create_overlay_view: SPI_connect failed");
+	ret = SPI_exec(buf.data, 0);
+	SPI_finish();
+	if (ret < 0)
+		elog(ERROR, "incr_create_overlay_view: CREATE VIEW failed: %s",
+			 SPI_result_code_string(ret));
+
+	/* Tie the hidden base matview's lifetime to the overlay view (as HAVING). */
+	CommandCounterIncrement();
+	{
+		Oid viewoid = get_relname_relid(origname, get_rel_namespace(mvrelid));
+
+		if (OidIsValid(viewoid))
+		{
+			ObjectAddress baseaddr, viewaddr;
 
 			ObjectAddressSet(baseaddr, RelationRelationId, mvrelid);
 			ObjectAddressSet(viewaddr, RelationRelationId, viewoid);

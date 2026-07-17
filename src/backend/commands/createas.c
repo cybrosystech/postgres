@@ -346,9 +346,35 @@ ExecCreateTableAs(ParseState *pstate, CreateTableAsStmt *stmt,
 			MatviewIncrRewriteAggFilters(query);
 
 			if (!MatviewIncrIsEligible(vq, &reason))
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("cannot use incremental_refresh: %s", reason)));
+			{
+				Query	   *core = NULL;
+				const char *preason;
+
+				/*
+				 * Overlay/peel: if the only blockers are non-immutable SELECT-list
+				 * projections (now()/CURRENT_DATE/STABLE), split into a maintained
+				 * CORE matview plus a read-time VIEW that re-adds the peeled columns.
+				 * The core replaces the stored + executed query; the original
+				 * (pre-peel) output list is handed to setup for the overlay view.
+				 *
+				 * WITH DATA only: the base rename + overlay-view creation run in
+				 * MatviewIncrSetup on the populated path (like HAVING).  Under WITH
+				 * NO DATA they are skipped, which would leave a column-reduced core
+				 * matview, so do not peel there — fall through to the clean reject.
+				 */
+				if (do_refresh &&
+					MatviewIncrPeelProjection(vq, &core, &preason))
+				{
+					MatviewIncrSetOverlayOriginal(copyObject(vq));
+					into->viewQuery = core;
+					vq = core;
+					query->targetList = copyObject(core->targetList);
+				}
+				else
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("cannot use incremental_refresh: %s", reason)));
+			}
 
 			/*
 			 * Keep NULL-key rows out of scope (writes to the source are never

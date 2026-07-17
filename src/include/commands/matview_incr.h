@@ -110,6 +110,17 @@ extern bool MatviewIncrIsSetUp(Oid mvrelid);
 extern bool MatviewIncrIsEligible(Query *viewQuery, const char **reason);
 
 /*
+ * Overlay/peel: split a view whose only blockers are non-immutable SELECT-list
+ * projections into a maintainable CORE query (returned) plus a read-time overlay
+ * view.  Returns true and sets *core_out when the peel applies; the original
+ * (pre-peel) query is handed to MatviewIncrSetOverlayOriginal so setup can build
+ * the overlay view after the core matview is renamed to its base name.
+ */
+extern bool MatviewIncrPeelProjection(Query *viewQuery, Query **core_out,
+									  const char **reason);
+extern void MatviewIncrSetOverlayOriginal(Query *original);
+
+/*
  * Append COUNT(*) AS __mv_count__ to q->targetList.
  * Must be called for both the schema query and the view-definition query
  * before the matview is created.
