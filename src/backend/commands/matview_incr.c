@@ -3549,6 +3549,23 @@ incr_validate_expr(Node *expr, Query *viewQuery, bool allow_aggref)
 		return incr_validate_expr((Node *) ((RelabelType *) expr)->arg,
 								  viewQuery, allow_aggref);
 
+	/*
+	 * ArrayCoerceExpr: a per-element array coercion, e.g. the
+	 * ARRAY[...]::varchar[]::text[] that Odoo IN-lists (col = ANY(ARRAY[...]))
+	 * produce.  Byte-identical to maintain ONLY when the per-element coercion is
+	 * immutable — a STABLE/VOLATILE element cast in a WHERE/membership position
+	 * would drift like any other non-immutable predicate, so require immutability
+	 * (not merely non-volatility) before recursing into the coerced array.
+	 */
+	if (IsA(expr, ArrayCoerceExpr))
+	{
+		ArrayCoerceExpr *ace = (ArrayCoerceExpr *) expr;
+
+		if (contain_mutable_functions((Node *) ace->elemexpr))
+			return false;
+		return incr_validate_expr((Node *) ace->arg, viewQuery, allow_aggref);
+	}
+
 	/* Searched CASE: every WHEN condition / result and the ELSE must validate.
 	 * (Simple "CASE x WHEN v" — arg != NULL — uses CaseTestExpr internally and is
 	 * not handled; rewrite as a searched CASE.) */
