@@ -245,6 +245,13 @@ static void incr_store_catalog(Oid mvrelid, Oid srctable,
 static void incr_create_unique_index(Oid mvrelid, List *groupColNames);
 static bool incr_has_self_join(List *all_tables);
 static int  incr_self_join_other_varno(List *all_tables, int own_varno, Oid shared_oid);
+static bool incr_varnos_connected(List *all_tables, int va, int vb);
+static bool incr_has_real_self_join(List *all_tables);
+static bool incr_all_group_keys_inner(Query *viewQuery, List *all_tables);
+static char *incr_build_recompute_sql_multirole(Oid mvrelid, Query *viewQuery,
+												Oid delta_oid, const char *delta_table,
+												List *all_tables,
+												bool include_delete_step);
 static char *incr_build_self_join_row_ins_sql(Oid mvrelid, Query *viewQuery,
 											   int v1, int v2,
 											   const char *delta_table,
@@ -917,23 +924,50 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 						  "in an incremental matview";
 				return false;
 			}
-			if (has_outer_join && self_join_seen &&
-				!incr_self_outer_supported_shape(viewQuery))
+			if (has_outer_join && self_join_seen)
 			{
-				/*
-				 * The outer-join maintenance path registers one catalog row per
-				 * join alias keyed by (mvrelid, srctable); a self-join would
-				 * collide on that key.  The self-outer builder handles the
-				 * supported shape (two-way self LEFT/RIGHT join, GROUP BY keys
-				 * on the preserved anchor) with a single combined catalog row;
-				 * everything else (optional-side keys, FULL self join, 3+-table,
-				 * or row-level self outer join) is rejected cleanly rather than
-				 * leaking an internal unique-constraint violation at CREATE.
-				 */
-				*reason = "a self-join combined with LEFT/RIGHT/FULL OUTER JOIN "
-						  "is supported only as a two-table self LEFT/RIGHT join "
-						  "with GROUP BY keys on the preserved side";
-				return false;
+				List *sj_tabs = incr_collect_tables(viewQuery);
+
+				if (incr_has_real_self_join(sj_tabs))
+				{
+					/*
+					 * A GENUINE self OUTER join (two same-OID aliases connected by
+					 * a join qual).  The outer-join maintenance path registers one
+					 * catalog row per join alias keyed by (mvrelid, srctable); a
+					 * self-join would collide on that key.  The self-outer builder
+					 * handles the supported shape (two-way self LEFT/RIGHT join,
+					 * GROUP BY keys on the preserved anchor) with a single combined
+					 * catalog row; everything else (optional-side keys, FULL self
+					 * join, 3+-table, or row-level self outer join) is rejected.
+					 */
+					if (!incr_self_outer_supported_shape(viewQuery))
+					{
+						*reason = "a self-join combined with LEFT/RIGHT/FULL OUTER JOIN "
+								  "is supported only as a two-table self LEFT/RIGHT join "
+								  "with GROUP BY keys on the preserved side";
+						return false;
+					}
+				}
+				else
+				{
+					/*
+					 * The same table appears twice on INDEPENDENT branches (no qual
+					 * connects the two aliases) — two dimension lookups, not a self
+					 * join.  Maintained by incr_build_recompute_sql_multirole, whose
+					 * per-role-UNION _affected_ set is complete ONLY when no group key
+					 * can be NULL-extended — i.e. every GROUP BY key is on the
+					 * preserved anchor or an inner-joined table (no orphan arm).
+					 */
+					if (viewQuery->groupClause == NIL ||
+						!incr_all_group_keys_inner(viewQuery, sj_tabs))
+					{
+						*reason = "the same table joined twice in independent branches is "
+								  "maintainable incrementally only with a GROUP BY whose "
+								  "keys are all on the preserved anchor or an inner-joined "
+								  "table";
+						return false;
+					}
+				}
 			}
 			if (has_full_join && viewQuery->groupClause != NIL)
 			{
@@ -1675,14 +1709,16 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 
 				v2 = incr_self_join_other_varno(all_tables, delta->varno,
 												delta->oid);
-				if (v2 != -1)
+				if (v2 != -1 &&
+					incr_varnos_connected(all_tables, delta->varno, v2))
 				{
 					/*
-					 * Self OUTER join: the same table appears in two roles, so
-					 * a single combined statement handles both (like the INNER
-					 * self-join path) and one catalog row is stored for the OID
-					 * — registering per-varno would collide on (mvrelid,oid).
-					 * The supported shape is gated by incr_self_outer_supported_shape.
+					 * GENUINE self OUTER join: the same table appears in two roles
+					 * connected by a join qual, so a single combined statement
+					 * handles both (like the INNER self-join path) and one catalog
+					 * row is stored for the OID — registering per-varno would
+					 * collide on (mvrelid,oid).  Shape gated by
+					 * incr_self_outer_supported_shape.
 					 */
 					int v1 = delta->varno;
 
@@ -1693,6 +1729,25 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 														all_tables, false);
 					del_sql = incr_build_self_recompute_sql(mvrelid, viewQuery,
 														v1, v2,
+														MATVIEW_INCR_OLDTABLE,
+														all_tables, true);
+					done_oids = bms_add_member(done_oids, (int) delta->oid);
+				}
+				else if (v2 != -1)
+				{
+					/*
+					 * INDEPENDENT duplicate: the OID appears at 2+ varnos on
+					 * unconnected branches.  The trigger delivers one transition
+					 * table for the OID, but the change reaches groups through
+					 * either role, so the _affected_ set must UNION arm 1 over all
+					 * roles (incr_build_recompute_sql_multirole).  One catalog row.
+					 */
+					ins_sql = incr_build_recompute_sql_multirole(mvrelid, viewQuery,
+														delta->oid,
+														MATVIEW_INCR_NEWTABLE,
+														all_tables, false);
+					del_sql = incr_build_recompute_sql_multirole(mvrelid, viewQuery,
+														delta->oid,
 														MATVIEW_INCR_OLDTABLE,
 														all_tables, true);
 					done_oids = bms_add_member(done_oids, (int) delta->oid);
@@ -5763,6 +5818,109 @@ incr_qual_varnos_walker(Node *node, Bitmapset **varnos)
 }
 
 /*
+ * incr_varnos_connected — true if some join ON qual references BOTH varnos va and
+ * vb.  A qual mentioning both is what makes a same-OID pair a GENUINE self-join
+ * (e.g. t1.parent = t2.id).  Two same-OID tables in independent branches (no such
+ * qual) are just two dimension lookups, not a self-join.
+ */
+static bool
+incr_varnos_connected(List *all_tables, int va, int vb)
+{
+	ListCell *lc;
+
+	foreach(lc, all_tables)
+	{
+		IncrJoinEntry *je = lfirst(lc);
+		Bitmapset	  *vs = NULL;
+
+		if (je->quals == NULL)
+			continue;
+		incr_qual_varnos_walker((Node *) je->quals, &vs);
+		if (bms_is_member(va, vs) && bms_is_member(vb, vs))
+		{
+			bms_free(vs);
+			return true;
+		}
+		bms_free(vs);
+	}
+	return false;
+}
+
+/*
+ * incr_has_real_self_join — true if any two same-OID join entries are CONNECTED
+ * by a join qual (a genuine self-join predicate).  Distinguished from
+ * incr_has_self_join (bare OID sharing): the same table appearing twice on
+ * INDEPENDENT branches — no qual mentioning both varnos — is NOT a real self-join
+ * and is maintained by the general per-role-UNION recompute, not the self-join
+ * builder.
+ */
+static bool
+incr_has_real_self_join(List *all_tables)
+{
+	ListCell *lc1;
+
+	foreach(lc1, all_tables)
+	{
+		IncrJoinEntry *a = lfirst(lc1);
+		ListCell	  *lc2;
+
+		foreach(lc2, all_tables)
+		{
+			IncrJoinEntry *b = lfirst(lc2);
+
+			if (b->oid != a->oid || b->varno <= a->varno)
+				continue;
+			if (incr_varnos_connected(all_tables, a->varno, b->varno))
+				return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * incr_all_group_keys_inner — every GROUP BY key resolves to a base relation
+ * joined by an INNER join (which includes the preserved anchor, whose
+ * IncrJoinEntry carries JOIN_INNER).  Guards the independent-duplicate recompute
+ * path: with only anchor/inner-side group keys, no group key is ever NULL-extended,
+ * so no orphan / all-NULL arm fires and the per-role UNION affected-set is the
+ * complete set of affected groups.  Optional-side or expression keys are rejected
+ * (their orphan-arm interaction with the multi-role union is not proven).
+ */
+static bool
+incr_all_group_keys_inner(Query *viewQuery, List *all_tables)
+{
+	ListCell *lc;
+
+	foreach(lc, viewQuery->groupClause)
+	{
+		SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+		TargetEntry     *te  = get_sortgroupclause_tle(sgc, viewQuery->targetList);
+		Node			*ge  = incr_group_key_expr(viewQuery, te);
+		int				 rv;
+		ListCell		*l2;
+		bool			 inner = false;
+
+		if (ge == NULL || !IsA(ge, Var))
+			return false;				/* expression key: reject conservatively */
+		if (!incr_try_resolve_var_to_rel((Var *) ge, viewQuery->rtable, &rv))
+			return false;
+		foreach(l2, all_tables)
+		{
+			IncrJoinEntry *je = lfirst(l2);
+
+			if (je->varno == rv)
+			{
+				inner = (je->join_type == JOIN_INNER);
+				break;
+			}
+		}
+		if (!inner)
+			return false;				/* optional-side key */
+	}
+	return true;
+}
+
+/*
  * incr_build_join_list_for_delta
  *
  * Given the full table list (from incr_collect_tables) and the varno of the
@@ -6690,8 +6848,15 @@ incr_build_affected_sql(StringInfo buf, Query *viewQuery,
 	 * GROUP BY column names from that result.  aff_sel is reused by the orphan
 	 * arm below.
 	 * ---------------------------------------------------------------- */
-	aff_dq = incr_build_delta_select_query(viewQuery, delta_entry->oid,
-										   delta_table);
+	/*
+	 * Swap the SPECIFIC delta varno (not the first RTE matching the OID) to the
+	 * ENR.  Equivalent for a single-role delta, but essential when the OID appears
+	 * at multiple independent varnos (incr_build_recompute_sql_multirole calls this
+	 * once per role): swapping by OID would always pick the first role and miss
+	 * groups reachable only through the others.
+	 */
+	aff_dq = incr_build_delta_select_query_at_varno(viewQuery, delta_varno,
+												   delta_table);
 	aff_dq->havingQual = NULL;
 
 	/*
@@ -6986,6 +7151,55 @@ incr_build_recompute_sql(Oid mvrelid, Query *viewQuery,
 	force_delete = incr_build_affected_sql(&buf, viewQuery, delta_varno,
 										   delta_table, all_tables, anchor_col,
 										   anchor_restrict_varno);
+	appendStringInfoString(&buf, "\n),\n");
+	incr_append_recompute_tail(&buf, mv_qname(mvrelid), viewQuery, all_tables,
+							   include_delete_step || force_delete);
+	return buf.data;
+}
+
+/*
+ * incr_build_recompute_sql_multirole
+ *
+ * Recompute SQL for a delta on a table that appears at MULTIPLE varnos in
+ * INDEPENDENT branches (same OID, no connecting self-join qual — e.g. uom_uom
+ * used once via the product template and once via the stock move line).  The
+ * trigger delivers ONE transition table for the OID, but the change reaches the
+ * affected groups through EITHER role, so the _affected_ CTE must be the UNION of
+ * arm 1 over EVERY role's varno — building it for a single varno (as the plain
+ * recompute does) silently misses groups reachable only through the other role.
+ *
+ * Requires (gate-enforced by incr_all_group_keys_inner) that all GROUP BY keys are
+ * on the preserved anchor / an inner-joined table, so no orphan / all-NULL arm
+ * fires and arm 1 alone is the complete affected set per role.  Anchor restriction
+ * is skipped here: a role on a LEFT-joined branch would over-capture groups, which
+ * is byte-identical-safe (idempotent recompute + NOT-EXISTS-guarded DELETE) and,
+ * since only the rarely-changing shared dimension takes this path, cheap enough.
+ */
+static char *
+incr_build_recompute_sql_multirole(Oid mvrelid, Query *viewQuery,
+								   Oid delta_oid, const char *delta_table,
+								   List *all_tables, bool include_delete_step)
+{
+	StringInfoData	buf;
+	ListCell	   *lc;
+	bool			first = true;
+	bool			force_delete = false;
+
+	initStringInfo(&buf);
+	appendStringInfoString(&buf, "WITH _affected_ AS (");
+	foreach(lc, all_tables)
+	{
+		IncrJoinEntry *je = lfirst(lc);
+
+		if (je->oid != delta_oid)
+			continue;
+		if (!first)
+			appendStringInfoString(&buf, "\n  UNION");
+		if (incr_build_affected_sql(&buf, viewQuery, je->varno, delta_table,
+									all_tables, NULL, 0))
+			force_delete = true;
+		first = false;
+	}
 	appendStringInfoString(&buf, "\n),\n");
 	incr_append_recompute_tail(&buf, mv_qname(mvrelid), viewQuery, all_tables,
 							   include_delete_step || force_delete);
