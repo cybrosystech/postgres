@@ -345,6 +345,11 @@ ExecCreateTableAs(ParseState *pstate, CreateTableAsStmt *stmt,
 			MatviewIncrRewriteAggFilters(vq);
 			MatviewIncrRewriteAggFilters(query);
 
+			/* Fold trivial "(SELECT <const>)" marker sublinks (e.g. Odoo's
+			 * "(SELECT 1) AS nbr") so they no longer trip the subquery gate. */
+			MatviewIncrConstFoldSublinks(vq);
+			MatviewIncrConstFoldSublinks(query);
+
 			if (!MatviewIncrIsEligible(vq, &reason))
 			{
 				Query	   *core = NULL;

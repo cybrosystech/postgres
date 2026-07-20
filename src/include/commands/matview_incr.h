@@ -151,6 +151,7 @@ extern List *MatviewIncrAddNotNullKeyFilters(Query *q);
  * itself if nothing changed.
  */
 extern Query *MatviewIncrNormalize(Query *viewQuery);
+extern void MatviewIncrConstFoldSublinks(Query *q);
 
 /* Trigger function — registered in pg_proc as matview_delta_apply */
 extern Datum matview_delta_apply(PG_FUNCTION_ARGS);

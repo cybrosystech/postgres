@@ -12084,6 +12084,76 @@ incr_normalize_query_body(Query *q)
 
 
 /*
+ * incr_constfold_sublink_mutator — replace a trivial constant scalar sublink,
+ * "(SELECT <Const>)" with no FROM / WHERE / GROUP BY (Odoo uses "(SELECT 1) AS
+ * nbr" as a fixed marker column), by that Const.  Folding it is byte-identical —
+ * the value is a compile-time constant — and it clears the query's hasSubLinks so
+ * the eligibility gate no longer rejects it as a subquery.
+ */
+static Node *
+incr_constfold_sublink_mutator(Node *node, void *ctx)
+{
+	if (node == NULL)
+		return NULL;
+	if (IsA(node, SubLink))
+	{
+		SubLink *sl = (SubLink *) node;
+
+		if (sl->subLinkType == EXPR_SUBLINK && sl->subselect != NULL &&
+			IsA(sl->subselect, Query))
+		{
+			Query	 *sub = (Query *) sl->subselect;
+			FromExpr *fe = IsA(sub->jointree, FromExpr) ?
+				(FromExpr *) sub->jointree : NULL;
+
+			if (sub->rtable == NIL && sub->groupClause == NIL &&
+				!sub->hasAggs && !sub->hasWindowFuncs && !sub->hasSubLinks &&
+				sub->setOperations == NULL &&
+				fe != NULL && fe->fromlist == NIL && fe->quals == NULL &&
+				list_length(sub->targetList) == 1)
+			{
+				TargetEntry *te = linitial_node(TargetEntry, sub->targetList);
+
+				if (IsA(te->expr, Const))
+					return (Node *) copyObject(te->expr);
+			}
+		}
+		return node;			/* non-trivial sublink: leave it (gate rejects) */
+	}
+	return expression_tree_mutator(node, incr_constfold_sublink_mutator, ctx);
+}
+
+void
+MatviewIncrConstFoldSublinks(Query *q)
+{
+	ListCell *lc;
+
+	if (!q->hasSubLinks)
+		return;
+
+	q->targetList = (List *)
+		incr_constfold_sublink_mutator((Node *) q->targetList, NULL);
+	if (q->jointree)
+		q->jointree = (FromExpr *)
+			incr_constfold_sublink_mutator((Node *) q->jointree, NULL);
+	if (q->havingQual)
+		q->havingQual = incr_constfold_sublink_mutator(q->havingQual, NULL);
+	foreach(lc, q->rtable)
+	{
+		RangeTblEntry *r = lfirst_node(RangeTblEntry, lc);
+
+		if (r->rtekind == RTE_GROUP && r->groupexprs != NIL)
+			r->groupexprs = (List *)
+				incr_constfold_sublink_mutator((Node *) r->groupexprs, NULL);
+	}
+
+	/* recompute the flag: clear it only if no sublink survived */
+	q->hasSubLinks = checkExprHasSubLink((Node *) q->targetList) ||
+		(q->jointree && checkExprHasSubLink((Node *) q->jointree)) ||
+		(q->havingQual && checkExprHasSubLink(q->havingQual));
+}
+
+/*
  * MatviewIncrNormalize — public entry point.
  *
  * Returns a normalized copy of viewQuery if any CTE or FROM-subquery
