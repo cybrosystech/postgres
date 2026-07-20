@@ -103,6 +103,7 @@
 #include "commands/dbblue_brin_worker.h"
 #include "postmaster/autovacuum.h"
 #include "postmaster/bgworker_internals.h"
+#include "postmaster/dbblue_create_standby.h"
 #include "postmaster/pgarch.h"
 #include "postmaster/postmaster.h"
 #include "postmaster/syslogger.h"
@@ -930,6 +931,12 @@ PostmasterMain(int argc, char *argv[])
 	 * Register the BRIN worker for automatic BRIN index creation
 	 */
 	DBBlueBrinWorkerRegister();
+	/*
+	 * Register the dbblue create standby worker.  Like the apply launcher,
+	 * this is done before any external preloaded library has a chance to
+	 * take a bgworker slot.
+	 */
+	DbblueCreateStandbyRegister();
 
 	/*
 	 * Register the shared memory needs of all core subsystems.
