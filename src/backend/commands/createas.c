@@ -369,6 +369,8 @@ ExecCreateTableAs(ParseState *pstate, CreateTableAsStmt *stmt,
 					into->viewQuery = core;
 					vq = core;
 					query->targetList = copyObject(core->targetList);
+					query->hasWindowFuncs = core->hasWindowFuncs;
+					query->windowClause = copyObject(core->windowClause);
 				}
 				else
 					ereport(ERROR,

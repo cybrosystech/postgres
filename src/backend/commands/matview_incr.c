@@ -1382,16 +1382,74 @@ MatviewIncrSetOverlayOriginal(Query *original)
 	incr_pending_overlay_original = original;
 }
 
-/* A peelable output column: a non-immutable projection (now()/STABLE/…) that is
- * NOT a group key and NOT a bare Var/Aggref (those define the grain / are the
- * maintained values and must be stored). */
+/* Strip value-preserving casts (row_number() is int8; an Odoo id column is int4,
+ * so the surrogate is usually wrapped in a coercion). */
+static Node *
+incr_strip_cast(Node *expr)
+{
+	for (;;)
+	{
+		if (expr == NULL)
+			return NULL;
+		if (IsA(expr, RelabelType))
+			expr = (Node *) ((RelabelType *) expr)->arg;
+		else if (IsA(expr, CoerceViaIO))
+			expr = (Node *) ((CoerceViaIO *) expr)->arg;
+		else if (IsA(expr, FuncExpr) &&
+				 ((FuncExpr *) expr)->funcformat != COERCE_EXPLICIT_CALL &&
+				 list_length(((FuncExpr *) expr)->args) == 1)
+			expr = (Node *) linitial(((FuncExpr *) expr)->args);
+		else
+			return expr;
+	}
+}
+
+/* If expr (through any cast) is a pure-surrogate window function —
+ * row_number() OVER () with no arguments and an empty frame (no PARTITION BY /
+ * ORDER BY) — return that WindowFunc, else NULL.  It has no data leaves, so it is
+ * reconstructed at read time as an opt-in surrogate id (order-nondeterministic
+ * under a full REFRESH too).  Windows with a partition/order spec (M-OV.2.x) or
+ * arguments are NOT surrogates. */
+static WindowFunc *
+incr_surrogate_winfunc(Node *expr, Query *q)
+{
+	WindowFunc *wf;
+	ListCell   *lc;
+
+	expr = incr_strip_cast(expr);
+	if (expr == NULL || !IsA(expr, WindowFunc))
+		return NULL;
+	wf = (WindowFunc *) expr;
+	if (wf->args != NIL)
+		return NULL;
+	foreach(lc, q->windowClause)
+	{
+		WindowClause *wc = lfirst_node(WindowClause, lc);
+
+		if (wc->winref == wf->winref)
+			return (wc->partitionClause == NIL && wc->orderClause == NIL) ? wf : NULL;
+	}
+	return NULL;
+}
+
 static bool
-incr_te_is_peelable(TargetEntry *te)
+incr_win_is_pure_surrogate(Node *expr, Query *q)
+{
+	return incr_surrogate_winfunc(expr, q) != NULL;
+}
+
+/* A peelable output column: a pure-surrogate window (row_number() OVER ()) or a
+ * non-immutable projection (now()/STABLE/…), that is NOT a group key and NOT a
+ * bare Var/Aggref (those define the grain / are the maintained values). */
+static bool
+incr_te_is_peelable(TargetEntry *te, Query *q)
 {
 	if (te->resjunk || te->resname == NULL || incr_is_hidden_col(te->resname))
 		return false;
 	if (te->ressortgroupref != 0)		/* a GROUP BY key — must be stored */
 		return false;
+	if (incr_win_is_pure_surrogate((Node *) te->expr, q))
+		return true;
 	if (IsA(te->expr, Var) || IsA(te->expr, Aggref))
 		return false;
 	return contain_mutable_functions((Node *) te->expr);
@@ -1454,17 +1512,17 @@ MatviewIncrPeelProjection(Query *viewQuery, Query **core_out, const char **reaso
 
 	*core_out = NULL;
 
-	/* M-OV.1 scope: GROUP BY views only (row-level/window peel is M-OV.2). */
+	/* Scope: GROUP BY views (row-level cores are a later increment). */
 	if (viewQuery->groupClause == NIL)
 		return false;
-	if (viewQuery->setOperations != NULL || viewQuery->hasWindowFuncs)
+	if (viewQuery->setOperations != NULL)
 		return false;
 
 	foreach(lc, viewQuery->targetList)
 	{
 		TargetEntry *te = lfirst_node(TargetEntry, lc);
 
-		if (incr_te_is_peelable(te))
+		if (incr_te_is_peelable(te, viewQuery))
 			peeled = lappend_int(peeled, te->resno);
 	}
 	if (peeled == NIL)
@@ -1502,6 +1560,17 @@ MatviewIncrPeelProjection(Query *viewQuery, Query **core_out, const char **reaso
 		newtl = lappend(newtl, te);
 	}
 	core->targetList = newtl;
+
+	/* If any window functions were peeled, the core must retain NONE (a
+	 * non-surrogate window would still block it, and hasWindowFuncs must be
+	 * consistent with the trimmed target list). */
+	if (viewQuery->hasWindowFuncs)
+	{
+		if (contain_windowfuncs((Node *) core->targetList))
+			return false;
+		core->hasWindowFuncs = false;
+		core->windowClause = NIL;
+	}
 
 	/* The core (minus the peeled projections) must itself be maintainable. */
 	if (!MatviewIncrIsEligible(core, reason))
@@ -4486,7 +4555,7 @@ incr_create_overlay_view(Oid mvrelid,
 	{
 		TargetEntry *te = lfirst_node(TargetEntry, lc);
 
-		if (incr_te_is_peelable(te))
+		if (incr_te_is_peelable(te, origQuery))
 			peeled = lappend_int(peeled, te->resno);
 	}
 
@@ -4511,11 +4580,26 @@ incr_create_overlay_view(Oid mvrelid,
 
 		if (list_member_int(peeled, te->resno))
 		{
-			Node *rw = overlay_rewrite_mutator((Node *) copyObject(te->expr), &cx);
+			WindowFunc *swf = incr_surrogate_winfunc((Node *) te->expr, origQuery);
 
-			appendStringInfo(&buf, "%s AS %s",
-							 deparse_expression(rw, dpcontext, false, false),
-							 quote_identifier(te->resname));
+			if (swf != NULL)
+			{
+				/* read-time surrogate id, cast back to the original column type so
+				 * the view stays column-identical (row_number() is int8). */
+				appendStringInfo(&buf, "%s() OVER ()::%s AS %s",
+								 quote_identifier(get_func_name(swf->winfnoid)),
+								 format_type_be(exprType((Node *) te->expr)),
+								 quote_identifier(te->resname));
+			}
+			else
+			{
+				Node *rw = overlay_rewrite_mutator((Node *) copyObject(te->expr),
+												   &cx);
+
+				appendStringInfo(&buf, "%s AS %s",
+								 deparse_expression(rw, dpcontext, false, false),
+								 quote_identifier(te->resname));
+			}
 		}
 		else
 			appendStringInfoString(&buf, quote_identifier(te->resname));

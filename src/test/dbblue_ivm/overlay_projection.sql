@@ -89,5 +89,34 @@ BEGIN
   IF rej = 2 THEN RAISE NOTICE 'WITH-NO-DATA + non-reconstructible-leaf both rejected cleanly: PASS';
   ELSE RAISE EXCEPTION 'expected 2 rejections, got %', rej; END IF;
 END $$;
+
+\echo '--- window-peel: a row_number() OVER () surrogate id is peeled to read time (M-OV.2) ---'
+CREATE MATERIALIZED VIEW ovp_w WITH (incremental_refresh=true) AS
+  SELECT (row_number() OVER ())::int AS rid, k, count(*) c, sum(amt) tot
+  FROM ovp GROUP BY k;
+CREATE MATERIALIZED VIEW ovp_wref AS
+  SELECT (row_number() OVER ())::int AS rid, k, count(*) c, sum(amt) tot
+  FROM ovp GROUP BY k;
+DO $$
+DECLARE kind "char"; ty text; d int;
+BEGIN
+  SELECT relkind INTO kind FROM pg_class WHERE relname='ovp_w';
+  IF kind <> 'v' THEN RAISE EXCEPTION 'ovp_w should be a view (window peeled), got %', kind; END IF;
+  -- the cast-preserved surrogate id keeps the original column type
+  SELECT format_type(atttypid,atttypmod) INTO ty FROM pg_attribute
+   WHERE attrelid='ovp_w'::regclass AND attname='rid';
+  IF ty <> 'integer' THEN RAISE EXCEPTION 'rid type should be integer, got %', ty; END IF;
+  INSERT INTO ovp VALUES (200,'K1', now(), 3);
+  DELETE FROM ovp WHERE id=5;
+  REFRESH MATERIALIZED VIEW ovp_wref;
+  SELECT count(*) INTO d FROM (
+    (SELECT k,c,tot FROM ovp_w EXCEPT SELECT k,c,tot FROM ovp_wref)
+    UNION ALL (SELECT k,c,tot FROM ovp_wref EXCEPT SELECT k,c,tot FROM ovp_w)) z;
+  IF d <> 0 THEN RAISE EXCEPTION 'window-peel core diverged from REFRESH by % row(s)', d; END IF;
+  RAISE NOTICE 'window-peel (row_number() OVER () surrogate id) stable cols == REFRESH: PASS';
+END $$;
+DROP VIEW ovp_w CASCADE;
+DROP MATERIALIZED VIEW ovp_wref;
+
 DROP TABLE ovp CASCADE;
 \echo ''
