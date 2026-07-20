@@ -106,6 +106,45 @@ BEGIN
   IF d = 0 THEN RAISE NOTICE 'independent-duplicate (incl. ml-only role) == REFRESH: PASS';
   ELSE RAISE EXCEPTION 'independent-duplicate diverged from REFRESH by % row(s)', d; END IF;
 END $$;
+DROP MATERIALIZED VIEW idp_inc, idp_ref;
+
+-- ------------------------------------ recompute aggregate over independent dup
+-- COUNT(DISTINCT)/MIN over the independent-duplicate shape: the multi-role
+-- recompute re-runs the full query per affected group, so the recompute
+-- aggregate is computed exactly as a full REFRESH (the im_livechat_report_operator
+-- pattern: count(DISTINCT) over mail_message joined twice on independent branches).
+\echo '--- count(DISTINCT) + MIN over the independent-duplicate shape == REFRESH ---'
+CREATE MATERIALIZED VIEW idp_d_inc WITH (incremental_refresh=true) AS
+  SELECT m.id, count(DISTINCT pt_uom.id) npt, count(DISTINCT ml_uom.id) nml,
+         min(ml_uom.factor) minf
+  FROM idp_fct m JOIN idp_prod p ON p.id=m.prod_id
+    JOIN idp_uom pt_uom ON pt_uom.id=p.tmpl_uom
+    LEFT JOIN idp_ml ml ON ml.fact_id=m.id
+    LEFT JOIN idp_uom ml_uom ON ml_uom.id=ml.ml_uom
+  GROUP BY m.id;
+CREATE MATERIALIZED VIEW idp_d_ref AS
+  SELECT m.id, count(DISTINCT pt_uom.id) npt, count(DISTINCT ml_uom.id) nml,
+         min(ml_uom.factor) minf
+  FROM idp_fct m JOIN idp_prod p ON p.id=m.prod_id
+    JOIN idp_uom pt_uom ON pt_uom.id=p.tmpl_uom
+    LEFT JOIN idp_ml ml ON ml.fact_id=m.id
+    LEFT JOIN idp_uom ml_uom ON ml_uom.id=ml.ml_uom
+  GROUP BY m.id;
+DO $$
+DECLARE d int;
+BEGIN
+  INSERT INTO idp_uom VALUES (6, 7.0);
+  INSERT INTO idp_ml VALUES (1010, 100, 6, 4.0);   -- new ml row, ml-only role uom
+  UPDATE idp_uom SET factor=8.0 WHERE id=3;
+  DELETE FROM idp_ml WHERE id=1000;
+  REFRESH MATERIALIZED VIEW idp_d_ref;
+  SELECT count(*) INTO d FROM (
+    (SELECT id,npt,nml,minf FROM idp_d_inc EXCEPT SELECT id,npt,nml,minf FROM idp_d_ref)
+    UNION ALL (SELECT id,npt,nml,minf FROM idp_d_ref EXCEPT SELECT id,npt,nml,minf FROM idp_d_inc)) z;
+  IF d = 0 THEN RAISE NOTICE 'count(DISTINCT)/MIN over independent-duplicate == REFRESH: PASS';
+  ELSE RAISE EXCEPTION 'recompute-agg over independent-duplicate diverged by % row(s)', d; END IF;
+END $$;
+DROP MATERIALIZED VIEW idp_d_inc, idp_d_ref;
 
 DROP TABLE idp_uom, idp_prod, idp_fct, idp_ml CASCADE;
 \echo ''

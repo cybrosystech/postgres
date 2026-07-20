@@ -310,6 +310,7 @@ static bool incr_has_stable_group_key(Query *viewQuery);
 static bool incr_aggs_need_deparse(Query *viewQuery);
 static bool incr_inner_join_deparse_shape(Query *viewQuery, int nbasetables);
 static bool incr_recompute_outer_shape(Query *viewQuery, int nbasetables);
+static bool incr_independent_dup_recompute_shape(Query *viewQuery);
 static bool incr_full_join_single_side_keys(Query *viewQuery);
 static bool incr_full_join_coalesce_keys(Query *viewQuery);
 static bool incr_is_coalesce_of_join_keys(Node *gexpr, Query *viewQuery);
@@ -416,14 +417,16 @@ incr_validate_group_aggref(Aggref *agg, Query *viewQuery, int nbasetables,
 		if (!(nbasetables == 1 ||
 			  incr_inner_join_deparse_shape(viewQuery, nbasetables) ||
 			  incr_recompute_outer_shape(viewQuery, nbasetables) ||
-			  incr_self_recompute_shape(viewQuery)) ||
+			  incr_self_recompute_shape(viewQuery) ||
+			  incr_independent_dup_recompute_shape(viewQuery)) ||
 			agg->aggorder != NIL)
 		{
 			*reason = psprintf("incremental %s(...) with DISTINCT / FILTER / "
 							   "stddev / collect / float is supported only over "
 							   "a single table, INNER JOIN, a supported outer "
-							   "join, or a two-way self join, without "
-							   "ordered-set aggregates", fname);
+							   "join, a two-way self join, or independent "
+							   "duplicate tables, without ordered-set aggregates",
+							   fname);
 			return false;
 		}
 		if (agg->args != NIL)
@@ -3348,6 +3351,28 @@ incr_recompute_outer_shape(Query *viewQuery, int nbasetables)
 	 * own recompute path.)
 	 */
 	return true;
+}
+
+/*
+ * incr_independent_dup_recompute_shape — true for an outer-join view where the
+ * same table appears twice on INDEPENDENT branches (a self-join false positive,
+ * not a real self-join) and every GROUP BY key is on the preserved anchor / an
+ * inner-joined table.  This is the shape incr_build_recompute_sql_multirole
+ * maintains: it re-runs the full query per affected group, so any recompute
+ * aggregate (COUNT(DISTINCT), MIN/MAX, stddev, FILTER, …) is recomputed exactly.
+ * Mirrors the eligibility gate's independent-duplicate acceptance so the
+ * per-aggregate shape check agrees with it.
+ */
+static bool
+incr_independent_dup_recompute_shape(Query *viewQuery)
+{
+	List *tabs = incr_collect_tables(viewQuery);
+
+	return incr_has_outer_join(tabs) &&
+		incr_has_self_join(tabs) &&			/* a duplicated OID … */
+		!incr_has_real_self_join(tabs) &&	/* … but on unconnected branches */
+		viewQuery->groupClause != NIL &&
+		incr_all_group_keys_inner(viewQuery, tabs);
 }
 
 /*
