@@ -85,16 +85,34 @@ resolve_standby_directory(void)
 {
 	const char *dir = dbblue_standby_directory;
 	char		parent[MAXPGPATH];
+	char	   *result;
 
 	if (dir == NULL || dir[0] == '\0')
-		return psprintf("%s_standby", DataDir);
+		result = psprintf("%s_standby", DataDir);
+	else if (is_absolute_path(dir))
+		result = pstrdup(dir);
+	else
+	{
+		strlcpy(parent, DataDir, sizeof(parent));
+		get_parent_directory(parent);
+		result = psprintf("%s/%s", parent, dir);
+	}
 
-	if (is_absolute_path(dir))
-		return pstrdup(dir);
+	/*
+	 * Validate path length: must leave room for suffixes like "/PG_VERSION",
+	 * "/postgresql.auto.conf", "/postmaster.pid", etc. Reserve 32 bytes.
+	 */
+	if (strlen(result) >= MAXPGPATH - 32)
+	{
+		ereport(ERROR,
+				(errmsg("dbblue create standby: directory path is too long (exceeds %d bytes)",
+						MAXPGPATH - 32),
+				 errdetail("Path: %s", result)));
+		pfree(result);
+		return NULL;
+	}
 
-	strlcpy(parent, DataDir, sizeof(parent));
-	get_parent_directory(parent);
-	return psprintf("%s/%s", parent, dir);
+	return result;
 }
 
 /*
@@ -193,10 +211,26 @@ find_free_port(void)
 		struct sockaddr_in addr;
 		bool		free_port;
 
-		sock = socket(AF_INET, SOCK_STREAM, 0);
-		// here we create a socket in kernal level to check that the postgres port is available with this socket number
-		if (sock < 0)
+		/*
+		 * Validate port is within valid TCP port range (1-65535).
+		 * Prevents integer overflow when casting to uint16.
+		 */
+		if (port > 65535)
+		{
+			ereport(WARNING,
+					(errmsg("dbblue create standby: port %d exceeds maximum port 65535; cannot search further",
+							port)));
 			return -1;
+		}
+
+		sock = socket(AF_INET, SOCK_STREAM, 0);
+		if (sock < 0)
+		{
+			ereport(DEBUG2,
+					(errmsg("dbblue create standby: socket creation failed for port %d: %m",
+							port)));
+			continue;	/* Try next port */
+		}
 
 		memset(&addr, 0, sizeof(addr));
 		addr.sin_family = AF_INET;
@@ -236,7 +270,14 @@ append_standby_port(const char *dir, int port)
 		return false;
 	}
 	fprintf(fp, "port = %d\n", port);
-	fclose(fp);
+	if (fclose(fp) != 0)
+	{
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("dbblue create standby: could not write \"%s\": %m",
+						path)));
+		return false;
+	}
 	return true;
 }
 
@@ -268,7 +309,13 @@ report_standby_port(const char *dir, int port)
 		return;
 	}
 	fprintf(fp, "%d\n", port);
-	fclose(fp);
+	if (fclose(fp) != 0)
+	{
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("dbblue create standby: could not write \"%s\": %m",
+						path)));
+	}
 }
 
 /*
@@ -309,6 +356,42 @@ run_shell(const char *cmd, const char *logfile, const char *what)
 }
 
 /*
+ * verify_port_still_free
+ *		Double-check that a port is still available to bind after discovery.
+ *		Returns true if the port is free, false otherwise.
+ *		Used to detect TOCTOU race: port may have been claimed between
+ *		find_free_port() and starting the standby.
+ */
+static bool
+verify_port_still_free(int port)
+{
+	int			sock;
+	struct sockaddr_in addr;
+	bool		free_port;
+
+	/*
+	 * Validate port is within valid TCP port range (1-65535).
+	 * Prevents integer overflow when casting to uint16.
+	 */
+	if (port < 1 || port > 65535)
+		return false;
+
+	sock = socket(AF_INET, SOCK_STREAM, 0);
+	if (sock < 0)
+		return false;
+
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	addr.sin_port = htons((uint16) port);
+
+	free_port = (bind(sock, (struct sockaddr *) &addr, sizeof(addr)) == 0);
+	close(sock);
+
+	return free_port;
+}
+
+/*
  * run_standby_tick
  *		Create the standby if needed and make sure it is running.
  *		Returns true if the standby is (now) up, false on failure.
@@ -326,6 +409,11 @@ run_standby_tick(void)
 	bool		ok;
 
 	dir = resolve_standby_directory();
+	if (dir == NULL)
+	{
+		/* Path validation error already reported */
+		return false;
+	}
 
 	/* Nothing to do while the standby postmaster is alive. */
 	if (standby_is_running(dir))
@@ -365,6 +453,17 @@ run_standby_tick(void)
 					}
 				}
 				closedir(d);
+			}
+			else
+			{
+				/* opendir failed - report the error clearly */
+				ereport(WARNING,
+						(errcode_for_file_access(),
+						 errmsg("dbblue create standby: could not read directory \"%s\": %m",
+								dir)));
+				pfree(logfile);
+				pfree(dir);
+				return false;
 			}
 
 			if (!empty)
@@ -437,6 +536,21 @@ run_standby_tick(void)
 
 	if (!append_standby_port(dir, port))
 	{
+		pfree(logfile);
+		pfree(dir);
+		return false;
+	}
+
+	/*
+	 * Verify the port is still free: it may have been claimed since we
+	 * discovered it. If not, don't penalize with a failure count; just
+	 * return false to retry on the next tick.
+	 */
+	if (!verify_port_still_free(port))
+	{
+		ereport(DEBUG1,
+				(errmsg("dbblue create standby: port %d was claimed after discovery; will retry",
+						port)));
 		pfree(logfile);
 		pfree(dir);
 		return false;
