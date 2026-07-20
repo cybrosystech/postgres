@@ -648,20 +648,20 @@
   boot_val => 'false',
 },
 
-{name => 'dbblue_fillfactor_map', type => 'string', context => 'PGC_USERSET', group => 'CUSTOM_OPTIONS',
-  short_desc => 'Specifies the fillfactor setting for specific models in dbblue',
-  flags => '0',
-  variable => 'dbblue_fillfactor_map',
-  boot_val => '""',
-  assign_hook => 'dbblue_fillfactor_assign_hook',
-},
-
 { name => 'dbblue_create_standby', type => 'bool', context => 'PGC_SIGHUP', group => 'REPLICATION_PRIMARY',
   short_desc => 'Automatically creates and runs a local streaming-replication standby.',
   long_desc => 'When enabled, a background worker provisions a standby of this cluster with pg_basebackup (if dbblue_standby_directory does not contain one yet), starts it on the first free port above this server\'s port, and keeps it running. The chosen port is reported in the server log and in the dbblue_standby.port file in the data directory, ready for Odoo\'s db_replica_port setting.',
   flags => 'GUC_NOT_IN_SAMPLE',
   variable => 'dbblue_create_standby',
   boot_val => 'false',
+},
+
+{name => 'dbblue_fillfactor_map', type => 'string', context => 'PGC_USERSET', group => 'CUSTOM_OPTIONS',
+  short_desc => 'Specifies the fillfactor setting for specific models in dbblue',
+  flags => '0',
+  variable => 'dbblue_fillfactor_map',
+  boot_val => '""',
+  assign_hook => 'dbblue_fillfactor_assign_hook',
 },
 
 { name => 'dbblue_standby_directory', type => 'string', context => 'PGC_SIGHUP', group => 'REPLICATION_PRIMARY',
