@@ -85,6 +85,7 @@
 #include "utils/expandeddatum.h"
 #include "utils/fmgroids.h"
 #include "utils/hsearch.h"
+#include "lib/stringinfo.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -723,6 +724,14 @@ dbbc_estimate_serve_fractions(Relation rel, List *clauses, Index varno,
 }
 
 /*
+ * Relids for which this backend has already logged a coverage miss. Kept in
+ * TopMemoryContext so it survives per-query contexts. Bounds the coverage-miss
+ * LOG to at most once per relation per backend, so a partially-covered hot
+ * table queried at high volume cannot flood the server log (one line per plan).
+ */
+static List *dbbc_logged_coverage_misses = NIL;
+
+/*
  * Can this base relation's scan be served by the column store? On success,
  * *needed_out receives the (possibly empty) list of user attnos the scan
  * references, for re-validation at executor startup.
@@ -733,6 +742,7 @@ dbbc_rel_ready(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 {
 	Bitmapset  *attrs = NULL;
 	List	   *needed = NIL;
+	List	   *missing = NIL;
 	ListCell   *lc;
 	int			x;
 	DbbcRelVersion *version;
@@ -830,13 +840,46 @@ dbbc_rel_ready(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 		if (!found)
 		{
 			ok = false;
-			break;
+			missing = lappend_int(missing, attno);
 		}
 	}
 	dbbc_version_unpin_tracked(version);
 
 	if (!ok)
+	{
+		/*
+		 * Turn the otherwise-silent heap fallback into an operator-visible
+		 * signal: name the unregistered columns that disqualified the scan so
+		 * they can be registered. LOG (not WARNING) keeps it out of the client
+		 * stream; the GUC lets operators silence it once coverage is complete.
+		 * Logged at most once per relation per backend (dedup set below) so a
+		 * partially-covered hot table cannot flood the log with one line/plan.
+		 */
+		if (dbblue_columnar_log_coverage_misses && missing != NIL &&
+			!list_member_oid(dbbc_logged_coverage_misses, rte->relid))
+		{
+			StringInfoData buf;
+			MemoryContext oldcxt;
+
+			initStringInfo(&buf);
+			foreach(lc, missing)
+				appendStringInfo(&buf, "%s%s", buf.len ? ", " : "",
+								 get_attname(rte->relid, lfirst_int(lc), false));
+			ereport(LOG,
+					(errmsg("dbblue_columnar: \"%s\" scan fell back to heap - unregistered column(s): %s",
+							get_rel_name(rte->relid), buf.data),
+					 errhint("Register them with dbblue_columnar_add('%s', ARRAY[...]) then repopulate.",
+							 get_rel_name(rte->relid))));
+			pfree(buf.data);
+
+			/* remember it so we do not log this relation again this backend */
+			oldcxt = MemoryContextSwitchTo(TopMemoryContext);
+			dbbc_logged_coverage_misses =
+				lappend_oid(dbbc_logged_coverage_misses, rte->relid);
+			MemoryContextSwitchTo(oldcxt);
+		}
 		return false;
+	}
 
 	*needed_out = needed;
 	return true;

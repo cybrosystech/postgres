@@ -211,6 +211,7 @@ typedef struct DbbcRelEntry
 extern bool dbblue_columnar_enabled;
 extern bool dbblue_columnar_enable_columnar_scan;
 extern int	dbblue_columnar_memory_mb;
+extern bool dbblue_columnar_log_coverage_misses;
 
 /* columnar_store.c */
 extern void dbbc_store_attach(void);

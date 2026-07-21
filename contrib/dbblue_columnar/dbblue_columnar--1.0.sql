@@ -30,6 +30,14 @@ RETURNS integer
 AS 'MODULE_PATHNAME', 'dbblue_columnar_add'
 LANGUAGE C VOLATILE STRICT;
 
+-- Unregister columns of a relation (inverse of dbblue_columnar_add). Only
+-- edits the registry; the change takes effect on the next
+-- dbblue_columnar_populate. Returns the number of registrations removed.
+CREATE FUNCTION dbblue_columnar_remove(rel regclass, columns text[])
+RETURNS integer
+AS 'MODULE_PATHNAME', 'dbblue_columnar_remove'
+LANGUAGE C VOLATILE STRICT;
+
 -- Human-friendly view over the registrations.
 CREATE VIEW dbblue_columnar_status AS
 	SELECT relid, attnum, auto_added, added_by, added_at

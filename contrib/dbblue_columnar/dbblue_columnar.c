@@ -52,6 +52,7 @@ PG_MODULE_MAGIC;
 bool		dbblue_columnar_enabled = false;
 bool		dbblue_columnar_enable_columnar_scan = true;
 int			dbblue_columnar_memory_mb = 128;
+bool		dbblue_columnar_log_coverage_misses = true;
 static bool dbblue_columnar_auto_columnarize = false;
 
 /* auto-refresh worker settings */
@@ -318,6 +319,80 @@ dbblue_columnar_add(PG_FUNCTION_ARGS)
 }
 
 /*
+ * dbblue_columnar_remove(rel regclass, columns text[]) -> int
+ *
+ * Inverse of dbblue_columnar_add: unregister the named columns of a relation.
+ * Like add, this only edits the registry; the change takes effect on the next
+ * dbblue_columnar_populate (which rebuilds the store version from the reduced
+ * column set). Returns the number of registrations actually removed.
+ */
+PG_FUNCTION_INFO_V1(dbblue_columnar_remove);
+
+Datum
+dbblue_columnar_remove(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	ArrayType  *arr = PG_GETARG_ARRAYTYPE_P(1);
+	Datum	   *elems;
+	bool	   *nulls;
+	int			nelems;
+	int			i;
+	int64		removed = 0;
+	char	   *delete_sql;
+
+	if (ARR_NDIM(arr) > 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
+				 errmsg("column list must be a one-dimensional array")));
+
+	deconstruct_array(arr, TEXTOID, -1, false, TYPALIGN_INT,
+					  &elems, &nulls, &nelems);
+
+	/* schema-qualify the registry, exactly like add/populate */
+	delete_sql = psprintf("DELETE FROM %s WHERE relid = $1 AND attnum = $2",
+						  dbbc_registry_table_name());
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "dbblue_columnar: SPI_connect failed");
+
+	for (i = 0; i < nelems; i++)
+	{
+		char	   *colname;
+		AttrNumber	attnum;
+		Oid			argtypes[2] = {REGCLASSOID, INT2OID};
+		Datum		values[2];
+		int			ret;
+
+		if (nulls[i])
+			ereport(ERROR,
+					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+					 errmsg("column name cannot be NULL")));
+
+		colname = TextDatumGetCString(elems[i]);
+		attnum = get_attnum(relid, colname);
+		if (attnum == InvalidAttrNumber)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_COLUMN),
+					 errmsg("column \"%s\" does not exist in relation \"%s\"",
+							colname, get_rel_name(relid))));
+
+		values[0] = ObjectIdGetDatum(relid);
+		values[1] = Int16GetDatum(attnum);
+
+		ret = SPI_execute_with_args(delete_sql,
+									2, argtypes, values, NULL, false, 0);
+		if (ret != SPI_OK_DELETE)
+			elog(ERROR, "dbblue_columnar: registration delete failed (%d)", ret);
+
+		removed += SPI_processed;
+	}
+
+	SPI_finish();
+
+	PG_RETURN_INT32((int32) removed);
+}
+
+/*
  * Module entry point. Only meaningful when preloaded via
  * shared_preload_libraries; if the library is instead loaded on demand (e.g.
  * to run dbblue_columnar_add()), this returns without registering anything.
@@ -393,6 +468,17 @@ _PG_init(void)
 							PGC_SIGHUP,
 							0,
 							NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("dbblue_columnar.log_coverage_misses",
+							 "Log (LOG level) when a query bypasses the columnar "
+							 "store because a referenced column is not registered.",
+							 "Names the missing columns so operators can register them; "
+							 "turn off once coverage is complete.",
+							 &dbblue_columnar_log_coverage_misses,
+							 true,
+							 PGC_SUSET,
+							 0,
+							 NULL, NULL, NULL);
 
 	MarkGUCPrefixReserved("dbblue_columnar");
 
