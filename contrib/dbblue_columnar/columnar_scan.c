@@ -104,6 +104,9 @@ typedef struct DbbcColPtrs
 	uint8	   *values;			/* fixed array or uint32 offsets */
 	uint8	   *blob;			/* varlena blob, or NULL */
 	uint8	   *nulls;			/* null bitmap, or NULL */
+	int16		attlen;			/* hoisted from the chunk: read per value */
+	bool		attbyval;		/* hoisted from the chunk: read per value */
+	int			attidx;			/* attnum - 1: the slot index to write */
 } DbbcColPtrs;
 
 /*
@@ -1329,11 +1332,32 @@ dbbc_block_valid(DbbcScanState *s, Relation rel, DbbcBlock *block)
 	return true;
 }
 
+/*
+ * Resolve chunk c's DSA addresses and hoist its hot per-value constants into
+ * the small DbbcColPtrs struct, so the emit/prefilter/aggregate inner loops
+ * never dereference the wide (~80 B) DbbcColumnChunk per value. Called at every
+ * columnar block-open, for both the scan serve path and the aggregate paths.
+ */
+static inline void
+dbbc_col_ptrs_set(DbbcScanState *s, int c)
+{
+	DbbcColumnChunk *chunk = &s->cur_chunks[c];
+	DbbcColPtrs *p = &s->col_ptrs[c];
+
+	p->values = (uint8 *) dsa_get_address(s->dsa, chunk->values);
+	p->blob = DsaPointerIsValid(chunk->varblob) ?
+		(uint8 *) dsa_get_address(s->dsa, chunk->varblob) : NULL;
+	p->nulls = DsaPointerIsValid(chunk->nulls) ?
+		(uint8 *) dsa_get_address(s->dsa, chunk->nulls) : NULL;
+	p->attlen = chunk->attlen;
+	p->attbyval = chunk->attbyval;
+	p->attidx = chunk->attnum - 1;
+}
+
 /* read one value of chunk c at row from the current block */
 static inline Datum
 dbbc_chunk_read(DbbcScanState *s, int c, uint32 row, bool *isnull)
 {
-	DbbcColumnChunk *chunk = &s->cur_chunks[c];
 	DbbcColPtrs *ptrs = &s->col_ptrs[c];
 
 	if (ptrs->nulls != NULL &&
@@ -1343,13 +1367,13 @@ dbbc_chunk_read(DbbcScanState *s, int c, uint32 row, bool *isnull)
 		return (Datum) 0;
 	}
 
-	if (chunk->attlen > 0)
+	if (ptrs->attlen > 0)
 	{
-		uint8	   *ptr = ptrs->values + (Size) row * chunk->attlen;
+		uint8	   *ptr = ptrs->values + (Size) row * ptrs->attlen;
 
 		*isnull = false;
-		if (chunk->attbyval)
-			return fetch_att(ptr, true, chunk->attlen);
+		if (ptrs->attbyval)
+			return fetch_att(ptr, true, ptrs->attlen);
 		return PointerGetDatum(ptr);
 	}
 	else
@@ -1447,33 +1471,68 @@ dbbc_row_passes(DbbcScanState *s, uint32 row)
 	return true;
 }
 
+/*
+ * Commit to serving `block` (already validated and not zone-skipped): resolve
+ * its column pointers and establish this block's NULL background in the scan
+ * slot, so dbbc_emit_row writes only the registered columns per row.
+ *
+ * LOAD-BEARING: the NULL background must be (re-)established here at EVERY
+ * columnar block-open, not once per scan. Columnar blocks and heap-fallback
+ * ranges interleave through this one scan slot, and the heap arm's
+ * ExecCopySlot (in dbbc_next) overwrites all natts columns. Re-establishing
+ * the background here stops a preceding heap range's values from leaking into
+ * the unregistered columns of this columnar block - a silent wrong result, not
+ * a crash. ExecClearTuple first frees any should-free Datums that heap copy
+ * materialized before we overwrite the pointer array.
+ */
+static void
+dbbc_open_columnar_block(DbbcScanState *s, DbbcBlock *block,
+						 DbbcColumnChunk *chunks)
+{
+	TupleTableSlot *slot = s->css.ss.ss_ScanTupleSlot;
+	int			natts = slot->tts_tupleDescriptor->natts;
+	int			c;
+
+	s->cur_block = block;
+	s->cur_chunks = chunks;
+	for (c = 0; c < s->ncols; c++)
+		dbbc_col_ptrs_set(s, c);
+
+	ExecClearTuple(slot);
+	memset(slot->tts_isnull, true, natts * sizeof(bool));
+	memset(slot->tts_values, 0, natts * sizeof(Datum));
+
+	s->cur_row = 0;
+}
+
 /* fill the virtual scan slot from cur_block[cur_row] */
 static TupleTableSlot *
 dbbc_emit_row(DbbcScanState *s)
 {
 	TupleTableSlot *slot = s->css.ss.ss_ScanTupleSlot;
 	uint32		row = s->cur_row;
-	int			natts = slot->tts_tupleDescriptor->natts;
 	int			c;
 
 	ExecClearTuple(slot);
 
-	/* unregistered columns are never referenced (planner gating): NULL them */
-	memset(slot->tts_isnull, true, natts * sizeof(bool));
-	memset(slot->tts_values, 0, natts * sizeof(Datum));
-
+	/*
+	 * Write ONLY the registered columns. Every other column keeps the NULL
+	 * background established once per block in dbbc_open_columnar_block(), so
+	 * we avoid two natts-wide memsets per row (~531 B/row on a 59-column
+	 * table = the largest single component of scan self-time). Each registered
+	 * column's tts_isnull is set every row (a value present last row may be
+	 * NULL this row); the Datum is written only when non-NULL (a stale Datum
+	 * under tts_isnull=true is never read).
+	 */
 	for (c = 0; c < s->ncols; c++)
 	{
-		int			attidx = s->cur_chunks[c].attnum - 1;
+		DbbcColPtrs *p = &s->col_ptrs[c];
 		bool		isnull;
-		Datum		value;
+		Datum		value = dbbc_chunk_read(s, c, row, &isnull);
 
-		value = dbbc_chunk_read(s, c, row, &isnull);
+		slot->tts_isnull[p->attidx] = isnull;
 		if (!isnull)
-		{
-			slot->tts_values[attidx] = value;
-			slot->tts_isnull[attidx] = false;
-		}
+			slot->tts_values[p->attidx] = value;
 	}
 
 	ExecStoreVirtualTuple(slot);
@@ -1586,7 +1645,6 @@ dbbc_next(ScanState *ss)
 			{
 				DbbcColumnChunk *chunks = (DbbcColumnChunk *)
 					dsa_get_address(s->dsa, block->chunks);
-				int			c;
 
 				/*
 				 * Zone-map skip: only after the validity proof (a stale
@@ -1602,22 +1660,7 @@ dbbc_next(ScanState *ss)
 					continue;
 				}
 
-				s->cur_block = block;
-				s->cur_chunks = chunks;
-				for (c = 0; c < s->ncols; c++)
-				{
-					DbbcColumnChunk *chunk = &s->cur_chunks[c];
-
-					s->col_ptrs[c].values = (uint8 *)
-						dsa_get_address(s->dsa, chunk->values);
-					s->col_ptrs[c].blob =
-						DsaPointerIsValid(chunk->varblob) ? (uint8 *)
-						dsa_get_address(s->dsa, chunk->varblob) : NULL;
-					s->col_ptrs[c].nulls =
-						DsaPointerIsValid(chunk->nulls) ? (uint8 *)
-						dsa_get_address(s->dsa, chunk->nulls) : NULL;
-				}
-				s->cur_row = 0;
+				dbbc_open_columnar_block(s, block, chunks);
 				s->blocks_columnar++;
 			}
 			else
@@ -3186,18 +3229,7 @@ dbbc_grp_consume_block(DbbcAggScanState *as, DbbcScanState *s,
 	s->cur_block = block;
 	s->cur_chunks = chunks;
 	for (c = 0; c < s->ncols; c++)
-	{
-		DbbcColumnChunk *chunk = &s->cur_chunks[c];
-
-		s->col_ptrs[c].values = (uint8 *)
-			dsa_get_address(s->dsa, chunk->values);
-		s->col_ptrs[c].blob =
-			DsaPointerIsValid(chunk->varblob) ? (uint8 *)
-			dsa_get_address(s->dsa, chunk->varblob) : NULL;
-		s->col_ptrs[c].nulls =
-			DsaPointerIsValid(chunk->nulls) ? (uint8 *)
-			dsa_get_address(s->dsa, chunk->nulls) : NULL;
-	}
+		dbbc_col_ptrs_set(s, c);
 
 	for (row = 0; row < block->nrows; row++)
 	{
