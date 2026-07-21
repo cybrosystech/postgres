@@ -83,6 +83,7 @@
 #include "utils/queryenvironment.h"
 #include "utils/rel.h"
 #include "utils/ruleutils.h"
+#include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/tuplestore.h"
 #include "utils/typcache.h"
@@ -9363,6 +9364,28 @@ incr_register_empty_enr(const char *name, Relation rel)
 PG_FUNCTION_INFO_V1(matview_delta_apply);
 
 /*
+ * incr_spi_exec_maint — run a recompute maintenance plan.
+ *
+ * When maint_snap is a valid (registered latest) snapshot — the recompute /
+ * multiset shapes, captured AFTER the serialization lock — execute the plan
+ * against it via SPI_execute_snapshot so the live re-read sees ALL committed
+ * rows plus the writer's own delta, matching a full REFRESH at commit time, at
+ * EVERY isolation level.  A plain SPI_execute_plan(read_only=false) would instead
+ * push GetTransactionSnapshot(), which under REPEATABLE READ / SERIALIZABLE is
+ * the writer's FROZEN snapshot — so a serialized maintainer misses the rows the
+ * maintainer it just waited on committed (a lost update).  Additive shapes pass
+ * InvalidSnapshot here and keep the plain, snapshot-free path.
+ */
+static int
+incr_spi_exec_maint(SPIPlanPtr plan, Snapshot maint_snap)
+{
+	if (maint_snap != InvalidSnapshot)
+		return SPI_execute_snapshot(plan, NULL, NULL, maint_snap,
+									InvalidSnapshot, false, false, 0);
+	return SPI_execute_plan(plan, NULL, NULL, false, 0);
+}
+
+/*
  * matview_delta_apply — AFTER STATEMENT trigger function
  *
  * tgargs[0] = matview OID (as cstring)
@@ -9378,6 +9401,7 @@ matview_delta_apply(PG_FUNCTION_ARGS)
 				is_update,
 				is_truncate;
 	int			ret;
+	Snapshot	maint_snap = InvalidSnapshot;
 
 	if (!CALLED_AS_TRIGGER(fcinfo))
 		elog(ERROR, "matview_delta_apply: not called as trigger");
@@ -9533,11 +9557,16 @@ matview_delta_apply(PG_FUNCTION_ARGS)
 	 * UNION ALL, outer join, self-join, MIN/MAX) store a matview-level advisory
 	 * lock in lock_sql.  Run it FIRST, as its own SPI statement, for every
 	 * event (insert/update/delete): a concurrent maintainer of the same matview
-	 * blocks here until we commit, and because it is a separate statement, the
-	 * delta statements that follow take fresh READ COMMITTED snapshots that
-	 * already include our committed changes — eliminating lost updates without
-	 * requiring REPEATABLE READ.  Additive shapes store NULL here and skip it,
-	 * keeping their per-group write concurrency.
+	 * blocks here until we commit.  The recompute steps then run against a fresh
+	 * latest snapshot captured right AFTER the lock is granted (maint_snap,
+	 * applied by incr_spi_exec_maint), so the live re-read sees the rows the
+	 * serialized-behind maintainer just committed — matching a full REFRESH at
+	 * commit time at EVERY isolation level.  (Under READ COMMITTED the lock as a
+	 * separate statement already yields a fresh per-statement snapshot; the
+	 * explicit capture extends that to REPEATABLE READ / SERIALIZABLE, whose
+	 * frozen transaction snapshot would otherwise miss those committed rows — a
+	 * lost update.)  Additive shapes store NULL here and skip both the lock and
+	 * the snapshot capture, keeping their per-group write concurrency.
 	 */
 	{
 		char *lock_sql_str = incr_fetch_sql(mvrelid, srctable, INCR_PLAN_LOCK);
@@ -9561,6 +9590,17 @@ matview_delta_apply(PG_FUNCTION_ARGS)
 			if (ret < 0)
 				elog(ERROR, "matview_delta_apply: lock step failed: %s",
 					 SPI_result_code_string(ret));
+
+			/*
+			 * Capture ONE latest snapshot now — AFTER the advisory lock is
+			 * granted, so it reflects the rows committed by the maintainer we
+			 * just serialized behind.  All recompute steps run against it (via
+			 * incr_spi_exec_maint), restoring the fresh-snapshot semantics under
+			 * REPEATABLE READ / SERIALIZABLE that the design already gets for free
+			 * at READ COMMITTED.  Registered so it is stable across the four
+			 * maintenance statements; released just before SPI_finish.
+			 */
+			maint_snap = RegisterSnapshot(GetLatestSnapshot());
 		}
 	}
 
@@ -9584,7 +9624,7 @@ matview_delta_apply(PG_FUNCTION_ARGS)
 			incr_cache_plan(mvrelid, srctable, INCR_PLAN_INS, plan);
 		}
 
-		ret = SPI_execute_plan(plan, NULL, NULL, false, 0);
+		ret = incr_spi_exec_maint(plan, maint_snap);
 		if (ret < 0)
 			elog(ERROR, "matview_delta_apply: insert delta failed: %s",
 				 SPI_result_code_string(ret));
@@ -9611,7 +9651,7 @@ matview_delta_apply(PG_FUNCTION_ARGS)
 				incr_cache_plan(mvrelid, srctable, INCR_PLAN_DEL, plan);
 			}
 
-			ret = SPI_execute_plan(plan, NULL, NULL, false, 0);
+			ret = incr_spi_exec_maint(plan, maint_snap);
 			if (ret < 0)
 				elog(ERROR, "matview_delta_apply: delete delta failed: %s",
 					 SPI_result_code_string(ret));
@@ -9636,7 +9676,7 @@ matview_delta_apply(PG_FUNCTION_ARGS)
 				incr_cache_plan(mvrelid, srctable, INCR_PLAN_CLN, cplan);
 			}
 
-			ret = SPI_execute_plan(cplan, NULL, NULL, false, 0);
+			ret = incr_spi_exec_maint(cplan, maint_snap);
 			if (ret < 0)
 				elog(ERROR, "matview_delta_apply: cleanup failed: %s",
 					 SPI_result_code_string(ret));
@@ -9662,12 +9702,15 @@ matview_delta_apply(PG_FUNCTION_ARGS)
 				incr_cache_plan(mvrelid, srctable, INCR_PLAN_HAV, hplan);
 			}
 
-			ret = SPI_execute_plan(hplan, NULL, NULL, false, 0);
+			ret = incr_spi_exec_maint(hplan, maint_snap);
 			if (ret < 0)
 				elog(ERROR, "matview_delta_apply: having step failed: %s",
 					 SPI_result_code_string(ret));
 		}
 	}
+
+	if (maint_snap != InvalidSnapshot)
+		UnregisterSnapshot(maint_snap);
 
 	CloseMatViewIncrementalMaintenance();
 	SPI_finish();
