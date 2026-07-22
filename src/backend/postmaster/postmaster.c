@@ -102,6 +102,7 @@
 #include "port/pg_getopt_ctx.h"
 #include "postmaster/autovacuum.h"
 #include "postmaster/bgworker_internals.h"
+#include "postmaster/dbblue_index_advisor.h"
 #include "postmaster/pgarch.h"
 #include "postmaster/postmaster.h"
 #include "postmaster/syslogger.h"
@@ -924,6 +925,11 @@ PostmasterMain(int argc, char *argv[])
 	 * before any modules had a chance to take the background worker slots.
 	 */
 	ApplyLauncherRegister();
+
+	/*
+	 * Register the dbblue index advisor worker.
+	 */
+	DbblueIndexAdvisorRegister();
 
 	/*
 	 * Register the shared memory needs of all core subsystems.

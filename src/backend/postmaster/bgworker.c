@@ -20,6 +20,7 @@
 #include "port/atomics.h"
 #include "postmaster/bgworker_internals.h"
 #include "postmaster/datachecksum_state.h"
+#include "postmaster/dbblue_index_advisor.h"
 #include "postmaster/postmaster.h"
 #include "replication/logicallauncher.h"
 #include "replication/logicalworker.h"
@@ -134,6 +135,10 @@ static const struct
 	{
 		.fn_name = "ApplyLauncherMain",
 		.fn_addr = ApplyLauncherMain
+	},
+	{
+		.fn_name = "DbblueIndexAdvisorMain",
+		.fn_addr = DbblueIndexAdvisorMain
 	},
 	{
 		.fn_name = "ApplyWorkerMain",
