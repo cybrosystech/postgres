@@ -109,6 +109,7 @@ typedef struct DbbcColPtrs
 	bool		attbyval;		/* hoisted from the chunk: read per value */
 	bool		is_dict;		/* DBBC_ENCODING_DICT: translate row -> code */
 	uint8		code_width;		/* DICT: 1 or 2 bytes per code */
+	uint32		dict_count;		/* DICT: number of dictionary entries */
 	int			attidx;			/* attnum - 1: the slot index to write */
 } DbbcColPtrs;
 
@@ -1520,6 +1521,7 @@ dbbc_col_ptrs_set(DbbcScanState *s, int c)
 		(uint8 *) dsa_get_address(s->dsa, chunk->nulls) : NULL;
 	p->is_dict = (chunk->encoding == DBBC_ENCODING_DICT);
 	p->code_width = chunk->code_width;
+	p->dict_count = chunk->dict_count;
 	p->codes = p->is_dict ?
 		(uint8 *) dsa_get_address(s->dsa, chunk->codes) : NULL;
 	p->attlen = chunk->attlen;
@@ -1585,16 +1587,108 @@ dbbc_widen(Datum d, int16 kind)
 	return (int64) DatumGetInt16(d);	/* kind == 2 */
 }
 
+/* read dictionary entry `e` (a distinct value) - the PLAIN read at index e,
+ * with NO row->code translation. Dict entries are never NULL. */
+static inline Datum
+dbbc_dict_entry(DbbcColPtrs *p, uint32 e)
+{
+	if (p->attlen > 0)
+	{
+		uint8	   *ptr = p->values + (Size) e * p->attlen;
+
+		if (p->attbyval)
+			return fetch_att(ptr, true, p->attlen);
+		return PointerGetDatum(ptr);
+	}
+	return PointerGetDatum(p->blob + ((uint32 *) p->values)[e]);
+}
+
+/*
+ * Does a single non-NULL value pass an OP or SAOP_EQ qual? Integer-family quals
+ * compare inline as int64 (no fmgr); everything else uses the btree ORDER proc.
+ * NULLTEST is handled by the caller (it needs the null flag, not the value).
+ */
+static inline bool
+dbbc_qual_pass_value(DbbcSkipQual *q, Datum v)
+{
+	if (q->kind == DBBC_SKIP_OP)
+	{
+		if (q->fast_int)
+		{
+			int64		x = dbbc_widen(v, q->col_ikind);
+			int64		rhs = q->fast_ival;
+
+			switch (q->strategy)
+			{
+				case BTLessStrategyNumber:
+					return x < rhs;
+				case BTLessEqualStrategyNumber:
+					return x <= rhs;
+				case BTEqualStrategyNumber:
+					return x == rhs;
+				case BTGreaterEqualStrategyNumber:
+					return x >= rhs;
+				case BTGreaterStrategyNumber:
+					return x > rhs;
+			}
+			return true;		/* unreachable; leave to ExecScan */
+		}
+		else
+		{
+			int32		r = dbbc_skip_cmp(q, v, q->value);
+
+			switch (q->strategy)
+			{
+				case BTLessStrategyNumber:
+					return r < 0;
+				case BTLessEqualStrategyNumber:
+					return r <= 0;
+				case BTEqualStrategyNumber:
+					return r == 0;
+				case BTGreaterEqualStrategyNumber:
+					return r >= 0;
+				case BTGreaterStrategyNumber:
+					return r > 0;
+			}
+			return true;
+		}
+	}
+	else						/* DBBC_SKIP_SAOP_EQ */
+	{
+		int			e;
+
+		if (q->fast_int)
+		{
+			int64		x = dbbc_widen(v, q->col_ikind);
+
+			for (e = 0; e < q->nelems; e++)
+				if (x == q->fast_ielems[e])
+					return true;
+		}
+		else
+		{
+			for (e = 0; e < q->nelems; e++)
+				if (dbbc_skip_cmp(q, v, q->elems[e]) == 0)
+					return true;
+		}
+		return false;
+	}
+}
+
 /*
  * Decode this block's filter columns into the SoA buffer (Step 3) and
  * precompute the row selection bitmap sel[] (Step 4). Runs once per block-open.
  *
- * The decode loop is today the PLAIN codec (per-value read); it is the seam
- * where a compressed codec would bulk-decompress a column instead. Selection
- * evaluates each qual over the decoded array: integer-family quals use inline
- * int64 comparisons (no per-row fmgr), everything else falls back to the btree
- * ORDER proc. Strict ops fail NULL; NULLTEST compares the null flag. Quals stay
- * in plan.qual so ExecScan re-checks - the prefilter can only remove rows.
+ * Two per-column strategies:
+ *  - PLAIN column: decode all rows into dec_val/dec_null, then evaluate the
+ *    qual per row (dbbc_qual_pass_value: int64 inline or btree ORDER proc).
+ *  - DICT column (dict-aware filtering): evaluate the qual ONCE per dictionary
+ *    entry (<=256) into dict_pass[], then per row it is a 1-byte code -> 1-byte
+ *    lookup. No per-row decode, no per-row fmgr - the payoff of dictionary
+ *    encoding on the filter path. Such columns are NOT row-decoded above.
+ *
+ * Strict OP/SAOP fail NULL; NULLTEST compares the null flag. Quals stay in
+ * plan.qual so ExecScan re-checks - the prefilter can only ever remove rows.
  */
 static void
 dbbc_decode_and_select(DbbcScanState *s, uint32 nrows)
@@ -1611,13 +1705,15 @@ dbbc_decode_and_select(DbbcScanState *s, uint32 nrows)
 	if (s->decode_col == NULL)
 		return;
 
+	/* decode PLAIN filter columns; dict columns are evaluated via their
+	 * dictionary + codes below, so they are not decoded per row. */
 	for (c = 0; c < s->ncols; c++)
 	{
 		Datum	   *dv;
 		bool	   *dn;
 		uint32		row;
 
-		if (!s->decode_col[c])
+		if (!s->decode_col[c] || s->col_ptrs[c].is_dict)
 			continue;
 		dv = s->dec_val + (Size) c * s->decode_cap;
 		dn = s->dec_null + (Size) c * s->decode_cap;
@@ -1639,154 +1735,80 @@ dbbc_decode_and_select(DbbcScanState *s, uint32 nrows)
 	{
 		DbbcSkipQual *q = &s->skipquals[i];
 		int			c2 = s->attno_to_col[q->attno - 1];
-		Datum	   *dv;
-		bool	   *dn;
+		DbbcColPtrs *p;
 		uint32		row;
 
 		if (c2 < 0)
 			continue;			/* not served columnar; leave to ExecScan */
-		dv = s->dec_val + (Size) c2 * s->decode_cap;
-		dn = s->dec_null + (Size) c2 * s->decode_cap;
+		p = &s->col_ptrs[c2];
 
 		if (q->kind == DBBC_SKIP_NULLTEST)
 		{
-			for (row = 0; row < nrows; row++)
-				if (s->sel[row] && dn[row] != q->nulltest_isnull)
-					s->sel[row] = false;
-			continue;
-		}
-
-		if (q->fast_int && q->kind == DBBC_SKIP_OP)
-		{
-			int64		rhs = q->fast_ival;
-			int16		kind = q->col_ikind;
-			uint16		strat = q->strategy;
+			bool	   *dn = p->is_dict ? NULL :
+				(s->dec_null + (Size) c2 * s->decode_cap);
 
 			for (row = 0; row < nrows; row++)
 			{
-				int64		v;
-				bool		pass;
+				bool		isn;
 
 				if (!s->sel[row])
 					continue;
-				if (dn[row])		/* strict operator: NULL never passes */
-				{
-					s->sel[row] = false;
-					continue;
-				}
-				v = dbbc_widen(dv[row], kind);
-				switch (strat)
-				{
-					case BTLessStrategyNumber:
-						pass = v < rhs;
-						break;
-					case BTLessEqualStrategyNumber:
-						pass = v <= rhs;
-						break;
-					case BTEqualStrategyNumber:
-						pass = v == rhs;
-						break;
-					case BTGreaterEqualStrategyNumber:
-						pass = v >= rhs;
-						break;
-					case BTGreaterStrategyNumber:
-						pass = v > rhs;
-						break;
-					default:
-						pass = true;	/* unreachable; leave to ExecScan */
-						break;
-				}
-				if (!pass)
+				isn = p->is_dict
+					? (p->nulls != NULL &&
+					   (p->nulls[row / 8] & (1 << (row % 8))) != 0)
+					: dn[row];
+				if (isn != q->nulltest_isnull)
 					s->sel[row] = false;
 			}
 			continue;
 		}
 
-		if (q->fast_int && q->kind == DBBC_SKIP_SAOP_EQ)
+		if (p->is_dict)
 		{
-			int16		kind = q->col_ikind;
+			/* evaluate the qual against each dictionary entry once, then map
+			 * every row through its 1-byte code (dict-aware filtering). */
+			bool		dict_pass[DBBC_DICT_MAX];	/* build caps dict_count here */
+			uint32		e;
+
+			Assert(p->dict_count <= DBBC_DICT_MAX);
+			for (e = 0; e < p->dict_count; e++)
+				dict_pass[e] = dbbc_qual_pass_value(q, dbbc_dict_entry(p, e));
 
 			for (row = 0; row < nrows; row++)
 			{
-				int64		v;
-				bool		any = false;
-				int			e;
+				uint32		code;
 
 				if (!s->sel[row])
 					continue;
-				if (dn[row])
+				if (p->nulls != NULL &&
+					(p->nulls[row / 8] & (1 << (row % 8))) != 0)
 				{
-					s->sel[row] = false;
+					s->sel[row] = false;	/* strict OP/SAOP: NULL fails */
 					continue;
 				}
-				v = dbbc_widen(dv[row], kind);
-				for (e = 0; e < q->nelems; e++)
-				{
-					if (v == q->fast_ielems[e])
-					{
-						any = true;
-						break;
-					}
-				}
-				if (!any)
+				code = (p->code_width == 1) ? (uint32) p->codes[row]
+					: (uint32) ((uint16 *) p->codes)[row];
+				if (!dict_pass[code])
 					s->sel[row] = false;
 			}
 			continue;
 		}
 
-		/* fallback: btree ORDER proc per row (text/numeric/non-int types) */
-		for (row = 0; row < nrows; row++)
+		/* PLAIN column: per-row evaluation from the decode buffer */
 		{
-			Datum		val;
+			Datum	   *dv = s->dec_val + (Size) c2 * s->decode_cap;
+			bool	   *dn = s->dec_null + (Size) c2 * s->decode_cap;
 
-			if (!s->sel[row])
-				continue;
-			if (dn[row])			/* strict OP/SAOP: NULL fails */
+			for (row = 0; row < nrows; row++)
 			{
-				s->sel[row] = false;
-				continue;
-			}
-			val = dv[row];
-			if (q->kind == DBBC_SKIP_OP)
-			{
-				int32		r = dbbc_skip_cmp(q, val, q->value);
-				bool		pass = false;
-
-				switch (q->strategy)
+				if (!s->sel[row])
+					continue;
+				if (dn[row])		/* strict OP/SAOP: NULL fails */
 				{
-					case BTLessStrategyNumber:
-						pass = r < 0;
-						break;
-					case BTLessEqualStrategyNumber:
-						pass = r <= 0;
-						break;
-					case BTEqualStrategyNumber:
-						pass = r == 0;
-						break;
-					case BTGreaterEqualStrategyNumber:
-						pass = r >= 0;
-						break;
-					case BTGreaterStrategyNumber:
-						pass = r > 0;
-						break;
-				}
-				if (!pass)
 					s->sel[row] = false;
-			}
-			else				/* DBBC_SKIP_SAOP_EQ */
-			{
-				bool		any = false;
-				int			e;
-
-				for (e = 0; e < q->nelems; e++)
-				{
-					if (dbbc_skip_cmp(q, val, q->elems[e]) == 0)
-					{
-						any = true;
-						break;
-					}
+					continue;
 				}
-				if (!any)
+				if (!dbbc_qual_pass_value(q, dv[row]))
 					s->sel[row] = false;
 			}
 		}

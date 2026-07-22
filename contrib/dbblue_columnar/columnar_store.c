@@ -729,7 +729,7 @@ dbbc_try_dict_fixed(DbbcColMeta *meta, DbbcColBuild *cb, uint32 ntuples,
 					DbbcColumnChunk *chunk, Size *chunk_acct)
 {
 	int16		attlen = meta->attlen;
-	const uint32 cap = 256;		/* 1-byte codes: at most 256 distinct */
+	const uint32 cap = DBBC_DICT_MAX;	/* 1-byte codes: at most 256 distinct */
 	uint8	   *dict;
 	uint8	   *codes;
 	uint32		ndict = 0;
@@ -813,7 +813,7 @@ static bool
 dbbc_try_dict_varlena(DbbcColBuild *cb, uint32 ntuples,
 					  DbbcColumnChunk *chunk, Size *chunk_acct)
 {
-	const uint32 cap = 256;
+	const uint32 cap = DBBC_DICT_MAX;
 	uint32	   *srcoff;			/* cap: cb->blob offset of each distinct value */
 	uint8	   *codes;
 	uint32		ndict = 0;

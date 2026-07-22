@@ -75,14 +75,27 @@ typedef enum DbbcEncoding
 	DBBC_ENCODING_PLAIN = 0,
 
 	/*
-	 * Dictionary: `values` holds dict_count distinct entries (stride=attlen,
-	 * fixed-width types only for now), sorted ascending; `codes` holds one
-	 * code_width-byte (1 or 2) index per row into that dictionary. NULL rows
-	 * are marked in the null bitmap and their code is undefined. Zone-map
-	 * min/max are unchanged (min = dict[0], max = dict[dict_count-1]).
+	 * Dictionary. `values` holds dict_count distinct entries in first-seen
+	 * (unsorted) order - fixed-width: a stride=attlen array; varlena: uint32
+	 * offsets into `varblob` (a MAXALIGN'd packed blob of the distinct values),
+	 * exactly the PLAIN layout but over the dictionary. `codes` holds one
+	 * code_width-byte index per row into that dictionary. NULL rows are marked
+	 * in the null bitmap and their code is undefined. Zone-map min/max are
+	 * unchanged - they come from the separately-tracked min/max, NOT the dict
+	 * order (which is unsorted). Both builders cap distinct values at
+	 * DBBC_DICT_MAX, so code_width is always 1 today (2 is reserved).
 	 */
 	DBBC_ENCODING_DICT = 1,
 } DbbcEncoding;
+
+/*
+ * Max distinct values a dictionary chunk may hold. Shared by the builders
+ * (columnar_store.c) and the dict-aware filter's stack dict_pass[] table
+ * (columnar_scan.c) so they cannot drift; keeping it <= 256 keeps codes at one
+ * byte. Raising it past 256 requires code_width=2 AND a heap-allocated
+ * dict_pass - do not just bump this constant.
+ */
+#define DBBC_DICT_MAX	256
 
 /*
  * Per-heap-page stamp taken at build time, under a share lock on the page.
