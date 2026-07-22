@@ -423,6 +423,8 @@ dbbc_block_unref(dsa_pointer blockptr, int ncols)
 
 			if (DsaPointerIsValid(chunk->values))
 				dsa_free(dbbc_dsa, chunk->values);
+			if (DsaPointerIsValid(chunk->codes))
+				dsa_free(dbbc_dsa, chunk->codes);
 			if (DsaPointerIsValid(chunk->nulls))
 				dsa_free(dbbc_dsa, chunk->nulls);
 			if (DsaPointerIsValid(chunk->varblob))
@@ -706,6 +708,96 @@ Datum
 dbblue_columnar_populate(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_INT32(dbbc_populate_relation(PG_GETARG_OID(0)));
+}
+
+/*
+ * Try to dictionary-encode a fixed-width column chunk (DBBC_ENCODING_DICT).
+ * On success, writes the dictionary (distinct values, in `chunk->values`) and
+ * a 1-byte-per-row code array (`chunk->codes`) and returns true; the caller
+ * then skips the PLAIN value copy. Returns false, leaving the chunk untouched,
+ * when it is not a win: a non-fixed-width type, more than 256 distinct values
+ * in the block (so the codes would not fit one byte), all-NULL, or when
+ * dict+codes would not be strictly smaller than the plain array.
+ *
+ * The dictionary is block-local and unsorted (insertion order); the zone-map
+ * min/max come from cb->min_val/max_val, tracked separately during append, so
+ * dictionary order does not affect them. NULL rows keep an undefined code and
+ * are resolved through the null bitmap at read time.
+ */
+static bool
+dbbc_try_dict_encode(DbbcColMeta *meta, DbbcColBuild *cb, uint32 ntuples,
+					 DbbcColumnChunk *chunk, Size *chunk_acct)
+{
+	int16		attlen = meta->attlen;
+	const uint32 cap = 256;		/* 1-byte codes: at most 256 distinct */
+	uint8	   *dict;
+	uint8	   *codes;
+	uint32		ndict = 0;
+	uint32		row;
+	Size		dict_bytes,
+				codes_bytes,
+				plain_bytes;
+
+	if (attlen <= 0 || ntuples == 0)
+		return false;
+
+	dict = (uint8 *) palloc((Size) cap * attlen);
+	codes = (uint8 *) palloc(ntuples);	/* one byte per row */
+
+	for (row = 0; row < ntuples; row++)
+	{
+		const uint8 *v;
+		uint32		k;
+
+		if (cb->nullbits &&
+			(cb->nullbits[row >> 3] & (1 << (row & 7))))
+		{
+			codes[row] = 0;		/* NULL: code is undefined (bitmap wins) */
+			continue;
+		}
+		v = cb->fixed + (Size) row * attlen;
+		for (k = 0; k < ndict; k++)
+			if (memcmp(dict + (Size) k * attlen, v, attlen) == 0)
+				break;
+		if (k == ndict)
+		{
+			if (ndict == cap)	/* > 256 distinct: not dictionary-friendly */
+			{
+				pfree(dict);
+				pfree(codes);
+				return false;
+			}
+			memcpy(dict + (Size) ndict * attlen, v, attlen);
+			ndict++;
+		}
+		codes[row] = (uint8) k;
+	}
+
+	if (ndict == 0)				/* all NULL: let the caller store PLAIN */
+	{
+		pfree(dict);
+		pfree(codes);
+		return false;
+	}
+
+	dict_bytes = (Size) ndict * attlen;
+	codes_bytes = ntuples;		/* code_width == 1 */
+	plain_bytes = (Size) ntuples * attlen;
+	if (dict_bytes + codes_bytes >= plain_bytes)	/* not a size win */
+	{
+		pfree(dict);
+		pfree(codes);
+		return false;
+	}
+
+	chunk->encoding = DBBC_ENCODING_DICT;
+	chunk->dict_count = ndict;
+	chunk->code_width = 1;
+	chunk->values = dbbc_copy_to_dsa(dict, dict_bytes, chunk_acct);
+	chunk->codes = dbbc_copy_to_dsa(codes, codes_bytes, chunk_acct);
+	pfree(dict);
+	pfree(codes);
+	return true;
 }
 
 /*
@@ -1239,9 +1331,15 @@ dbbc_populate_relation(Oid relid)
 					chunk->varblob_len = 0;
 
 					if (meta->attlen > 0)
-						chunk->values = dbbc_copy_to_dsa(cb->fixed,
-														 (Size) ntuples * meta->attlen,
-														 &chunk_acct);
+					{
+						/* dictionary-encode if it is a size win, else PLAIN */
+						if (!dbbc_try_dict_encode(meta, cb, (uint32) ntuples,
+												  chunk, &chunk_acct))
+							chunk->values =
+								dbbc_copy_to_dsa(cb->fixed,
+												 (Size) ntuples * meta->attlen,
+												 &chunk_acct);
+					}
 					else
 					{
 						chunk->values = dbbc_copy_to_dsa(cb->offsets,

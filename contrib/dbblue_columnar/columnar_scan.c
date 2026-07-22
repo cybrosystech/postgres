@@ -101,11 +101,14 @@ static set_rel_pathlist_hook_type prev_set_rel_pathlist_hook = NULL;
 /* executor state */
 typedef struct DbbcColPtrs
 {
-	uint8	   *values;			/* fixed array or uint32 offsets */
+	uint8	   *values;			/* PLAIN: nrows values; DICT: dict entries */
 	uint8	   *blob;			/* varlena blob, or NULL */
 	uint8	   *nulls;			/* null bitmap, or NULL */
+	uint8	   *codes;			/* DICT: nrows codes (code_width bytes); else NULL */
 	int16		attlen;			/* hoisted from the chunk: read per value */
 	bool		attbyval;		/* hoisted from the chunk: read per value */
+	bool		is_dict;		/* DBBC_ENCODING_DICT: translate row -> code */
+	uint8		code_width;		/* DICT: 1 or 2 bytes per code */
 	int			attidx;			/* attnum - 1: the slot index to write */
 } DbbcColPtrs;
 
@@ -1515,6 +1518,10 @@ dbbc_col_ptrs_set(DbbcScanState *s, int c)
 		(uint8 *) dsa_get_address(s->dsa, chunk->varblob) : NULL;
 	p->nulls = DsaPointerIsValid(chunk->nulls) ?
 		(uint8 *) dsa_get_address(s->dsa, chunk->nulls) : NULL;
+	p->is_dict = (chunk->encoding == DBBC_ENCODING_DICT);
+	p->code_width = chunk->code_width;
+	p->codes = p->is_dict ?
+		(uint8 *) dsa_get_address(s->dsa, chunk->codes) : NULL;
 	p->attlen = chunk->attlen;
 	p->attbyval = chunk->attbyval;
 	p->attidx = chunk->attnum - 1;
@@ -1525,6 +1532,7 @@ static inline Datum
 dbbc_chunk_read(DbbcScanState *s, int c, uint32 row, bool *isnull)
 {
 	DbbcColPtrs *ptrs = &s->col_ptrs[c];
+	uint32		idx = row;
 
 	if (ptrs->nulls != NULL &&
 		(ptrs->nulls[row / 8] & (1 << (row % 8))) != 0)
@@ -1533,9 +1541,18 @@ dbbc_chunk_read(DbbcScanState *s, int c, uint32 row, bool *isnull)
 		return (Datum) 0;
 	}
 
+	/*
+	 * Dictionary: the null check is by row (above), then the row's code selects
+	 * the dictionary entry to read. `values` holds the dict; the read below is
+	 * identical to PLAIN but at the code index instead of the row index.
+	 */
+	if (ptrs->is_dict)
+		idx = (ptrs->code_width == 1) ? (uint32) ptrs->codes[row]
+			: (uint32) ((uint16 *) ptrs->codes)[row];
+
 	if (ptrs->attlen > 0)
 	{
-		uint8	   *ptr = ptrs->values + (Size) row * ptrs->attlen;
+		uint8	   *ptr = ptrs->values + (Size) idx * ptrs->attlen;
 
 		*isnull = false;
 		if (ptrs->attbyval)
@@ -1544,7 +1561,7 @@ dbbc_chunk_read(DbbcScanState *s, int c, uint32 row, bool *isnull)
 	}
 	else
 	{
-		uint32		off = ((uint32 *) ptrs->values)[row];
+		uint32		off = ((uint32 *) ptrs->values)[idx];
 
 		if (off == DBBC_VAR_NULL_OFFSET)
 		{
@@ -1584,6 +1601,15 @@ dbbc_decode_and_select(DbbcScanState *s, uint32 nrows)
 {
 	int			c;
 	int			i;
+
+	/*
+	 * No prefilter (nskipquals == 0, incl. the RLS/prefilter_unsafe path): the
+	 * decode buffer and selection bitmap were never allocated (decode_col is
+	 * NULL), and there is nothing to decode or select. dbbc_next then emits
+	 * every row (its own nskipquals>0 guard skips the sel[] lookup).
+	 */
+	if (s->decode_col == NULL)
+		return;
 
 	for (c = 0; c < s->ncols; c++)
 	{

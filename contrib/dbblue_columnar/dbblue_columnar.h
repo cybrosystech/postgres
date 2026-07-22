@@ -73,6 +73,15 @@
 typedef enum DbbcEncoding
 {
 	DBBC_ENCODING_PLAIN = 0,
+
+	/*
+	 * Dictionary: `values` holds dict_count distinct entries (stride=attlen,
+	 * fixed-width types only for now), sorted ascending; `codes` holds one
+	 * code_width-byte (1 or 2) index per row into that dictionary. NULL rows
+	 * are marked in the null bitmap and their code is undefined. Zone-map
+	 * min/max are unchanged (min = dict[0], max = dict[dict_count-1]).
+	 */
+	DBBC_ENCODING_DICT = 1,
 } DbbcEncoding;
 
 /*
@@ -105,10 +114,17 @@ typedef struct DbbcColumnChunk
 
 	/* data */
 	dsa_pointer nulls;			/* null bitmap (nrows bits); Invalid if none */
-	dsa_pointer values;			/* fixed: stride=attlen array; varlena: uint32
-								 * offsets into varblob */
+	dsa_pointer values;			/* PLAIN: nrows values (fixed: stride=attlen;
+								 * varlena: uint32 offsets into varblob). DICT:
+								 * dict_count distinct entries (stride=attlen). */
 	dsa_pointer varblob;		/* varlena only: concatenated detoasted values */
 	Size		varblob_len;
+
+	/* dictionary encoding (DBBC_ENCODING_DICT): else Invalid / 0 */
+	dsa_pointer codes;			/* nrows codes, code_width bytes each */
+	uint32		dict_count;		/* number of distinct entries in `values` */
+	uint8		code_width;		/* 1 (dict_count<=256) or 2 (<=65536) */
+
 	Size		total_bytes;	/* accounting: all DSA bytes of this chunk */
 } DbbcColumnChunk;
 
