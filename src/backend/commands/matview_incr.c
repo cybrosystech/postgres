@@ -2207,21 +2207,22 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 	}
 
 	/*
-	 * Step 3 (HAVING only): rename the matview to its base name and create the
-	 * user-facing filtering VIEW.  Only on the WITH DATA path (mv_populated).
-	 * On restore the base is already named "_dbblue_<oid>_base" and the view
-	 * is dumped/restored as its own object, so this is skipped.
-	 */
-	if (hasHaving && mv_populated)
-		incr_create_having_view(mvrelid, origschema, origname, viewQuery);
-
-	/*
-	 * Overlay/peel: create the read-time VIEW that re-adds the peeled
-	 * (non-immutable) projections over the renamed base.  The base maintains the
-	 * core query; the overlay reconstructs now()/STABLE columns at read time.
+	 * Step 3: rename the matview to its base name and create the user-facing
+	 * VIEW.  Only on the WITH DATA path (mv_populated); on restore the base is
+	 * already named "_dbblue_<oid>_base" and the view is dumped/restored as its
+	 * own object, so this is skipped.
+	 *
+	 * An overlay view re-adds the peeled (now()/STABLE/surrogate) projections
+	 * over the renamed base, and — when the view also has HAVING — applies the
+	 * __mv_having_ok__ filter itself (see incr_create_overlay_view).  It is then
+	 * the single user-facing view, so we must NOT also create a separate HAVING
+	 * view (which would collide on the same name).  A HAVING-only view (no peel)
+	 * uses incr_create_having_view.
 	 */
 	if (isOverlay && mv_populated)
 		incr_create_overlay_view(mvrelid, origschema, origname, overlay_orig);
+	else if (hasHaving && mv_populated)
+		incr_create_having_view(mvrelid, origschema, origname, viewQuery);
 
 	ereport(DEBUG1,
 			(errmsg("DBblue: incremental refresh (Phase %d%s) set up for matview %s",
@@ -4614,9 +4615,12 @@ incr_create_overlay_view(Oid mvrelid,
 			if (swf != NULL)
 			{
 				/* read-time surrogate id, cast back to the original column type so
-				 * the view stays column-identical (row_number() is int8). */
-				appendStringInfo(&buf, "%s() OVER ()::%s AS %s",
+				 * the view stays column-identical (row_number() is int8).  A
+				 * star-aggregate window (count(*) OVER ()) must keep its "*" — it
+				 * takes no argument list but is not argument-less in the SQL text. */
+				appendStringInfo(&buf, "%s(%s) OVER ()::%s AS %s",
 								 quote_identifier(get_func_name(swf->winfnoid)),
+								 swf->winstar ? "*" : "",
 								 format_type_be(exprType((Node *) te->expr)),
 								 quote_identifier(te->resname));
 			}
@@ -4635,6 +4639,16 @@ incr_create_overlay_view(Oid mvrelid,
 	}
 
 	appendStringInfo(&buf, " FROM %s", mv_qname(mvrelid));
+
+	/*
+	 * If the peeled view also has a HAVING clause, this ONE overlay view serves
+	 * both roles: the core maintains __mv_having_ok__ (as for a plain HAVING
+	 * matview), and the overlay filters on it — so we do not additionally create
+	 * a separate HAVING view (which would collide on the user-facing name).
+	 */
+	if (origQuery->havingQual != NULL)
+		appendStringInfo(&buf, " WHERE %s",
+						 quote_identifier(MATVIEW_INCR_HAVING_COL));
 
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "incr_create_overlay_view: SPI_connect failed");

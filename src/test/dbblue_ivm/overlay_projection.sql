@@ -118,5 +118,58 @@ END $$;
 DROP VIEW ovp_w CASCADE;
 DROP MATERIALIZED VIEW ovp_wref;
 
+\echo '--- overlay: count(*) OVER () window aggregate keeps its star (was: count() error) ---'
+-- GROUP BY the PK so k is a bare functionally-dependent column stored in the core;
+-- count(*) OVER () is a peeled read-time surrogate that must NOT lose its star.
+CREATE MATERIALIZED VIEW ovp_cnt WITH (incremental_refresh=true) AS
+  SELECT count(*) OVER () AS total, id, k, sum(amt) tot FROM ovp GROUP BY id;
+CREATE MATERIALIZED VIEW ovp_cntref AS SELECT id, k, sum(amt) tot FROM ovp GROUP BY id;
+DO $$
+DECLARE kind "char"; d int; wtotal bigint;
+BEGIN
+  SELECT relkind INTO kind FROM pg_class WHERE relname='ovp_cnt';
+  IF kind <> 'v' THEN RAISE EXCEPTION 'ovp_cnt should be a view, got %', kind; END IF;
+  INSERT INTO ovp VALUES (300,'K2', now(), 7);
+  UPDATE ovp SET k='RN' WHERE id=6;          -- bare FD column UPDATE (key unchanged)
+  DELETE FROM ovp WHERE id=9;
+  REFRESH MATERIALIZED VIEW ovp_cntref;
+  SELECT count(*) INTO d FROM (
+    (SELECT id,k,tot FROM ovp_cnt EXCEPT SELECT id,k,tot FROM ovp_cntref)
+    UNION ALL (SELECT id,k,tot FROM ovp_cntref EXCEPT SELECT id,k,tot FROM ovp_cnt)) z;
+  IF d <> 0 THEN RAISE EXCEPTION 'count(*) OVER overlay diverged from REFRESH by % row(s)', d; END IF;
+  SELECT DISTINCT total INTO wtotal FROM ovp_cnt;      -- read-time window aggregate
+  IF wtotal <> (SELECT count(*) FROM ovp_cnt) THEN
+    RAISE EXCEPTION 'count(*) OVER () = % but view has % rows', wtotal, (SELECT count(*) FROM ovp_cnt); END IF;
+  RAISE NOTICE 'overlay count(*) OVER () star preserved + stable cols == REFRESH: PASS';
+END $$;
+DROP VIEW ovp_cnt CASCADE;
+DROP MATERIALIZED VIEW ovp_cntref;
+
+\echo '--- overlay: surrogate window + HAVING share ONE user-facing view (was: name collision) ---'
+CREATE MATERIALIZED VIEW ovp_wh WITH (incremental_refresh=true) AS
+  SELECT row_number() OVER () AS rid, id, k, sum(amt) tot FROM ovp GROUP BY id HAVING sum(amt) > 10;
+CREATE MATERIALIZED VIEW ovp_whref AS
+  SELECT id, k, sum(amt) tot FROM ovp GROUP BY id HAVING sum(amt) > 10;
+DO $$
+DECLARE kind "char"; d int;
+BEGIN
+  SELECT relkind INTO kind FROM pg_class WHERE relname='ovp_wh';
+  IF kind <> 'v' THEN RAISE EXCEPTION 'ovp_wh should be a view (window+HAVING overlay), got %', kind; END IF;
+  IF EXISTS (SELECT 1 FROM pg_matviews WHERE matviewname='ovp_wh') THEN
+    RAISE EXCEPTION 'ovp_wh must be the single user-facing view, not a matview'; END IF;
+  INSERT INTO ovp VALUES (400,'K3', now(), 50);
+  UPDATE ovp SET amt = amt + 100 WHERE id=2;   -- push a group across the HAVING threshold
+  UPDATE ovp SET k='RN2' WHERE id=7;           -- bare FD column
+  DELETE FROM ovp WHERE id=11;
+  REFRESH MATERIALIZED VIEW ovp_whref;
+  SELECT count(*) INTO d FROM (
+    (SELECT id,k,tot FROM ovp_wh EXCEPT SELECT id,k,tot FROM ovp_whref)
+    UNION ALL (SELECT id,k,tot FROM ovp_whref EXCEPT SELECT id,k,tot FROM ovp_wh)) z;
+  IF d <> 0 THEN RAISE EXCEPTION 'window+HAVING overlay diverged from REFRESH by % row(s)', d; END IF;
+  RAISE NOTICE 'overlay surrogate window + HAVING single view, stable cols == REFRESH: PASS';
+END $$;
+DROP VIEW ovp_wh CASCADE;
+DROP MATERIALIZED VIEW ovp_whref;
+
 DROP TABLE ovp CASCADE;
 \echo ''
