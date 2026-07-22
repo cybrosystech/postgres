@@ -725,8 +725,8 @@ dbblue_columnar_populate(PG_FUNCTION_ARGS)
  * are resolved through the null bitmap at read time.
  */
 static bool
-dbbc_try_dict_encode(DbbcColMeta *meta, DbbcColBuild *cb, uint32 ntuples,
-					 DbbcColumnChunk *chunk, Size *chunk_acct)
+dbbc_try_dict_fixed(DbbcColMeta *meta, DbbcColBuild *cb, uint32 ntuples,
+					DbbcColumnChunk *chunk, Size *chunk_acct)
 {
 	int16		attlen = meta->attlen;
 	const uint32 cap = 256;		/* 1-byte codes: at most 256 distinct */
@@ -798,6 +798,133 @@ dbbc_try_dict_encode(DbbcColMeta *meta, DbbcColBuild *cb, uint32 ntuples,
 	pfree(dict);
 	pfree(codes);
 	return true;
+}
+
+/*
+ * Varlena counterpart of dbbc_try_dict_fixed. Values are deduplicated by full
+ * varlena bytes (VARSIZE + memcmp of the detoasted value); the dictionary is a
+ * small offsets+blob column (chunk->values = dict_count offsets, chunk->varblob
+ * = the distinct values, each stored MAXALIGN'd exactly like the PLAIN blob so
+ * blob+offset is a valid varlena Datum), and chunk->codes is one byte per row.
+ * The DICT read path (dbbc_chunk_read) translates row->code then does the plain
+ * varlena read at the code index, so decode needs no varlena-specific handling.
+ */
+static bool
+dbbc_try_dict_varlena(DbbcColBuild *cb, uint32 ntuples,
+					  DbbcColumnChunk *chunk, Size *chunk_acct)
+{
+	const uint32 cap = 256;
+	uint32	   *srcoff;			/* cap: cb->blob offset of each distinct value */
+	uint8	   *codes;
+	uint32		ndict = 0;
+	uint32		row,
+				k;
+	Size		dict_blob_len = 0;	/* MAXALIGN'd size of the packed dictionary */
+	Size		codes_bytes,
+				dict_off_bytes,
+				plain_bytes;
+	uint8	   *dictblob;
+	uint32	   *dictoff;
+	Size		cur;
+
+	if (ntuples == 0)
+		return false;
+
+	srcoff = (uint32 *) palloc((Size) cap * sizeof(uint32));
+	codes = (uint8 *) palloc(ntuples);
+
+	for (row = 0; row < ntuples; row++)
+	{
+		uint32		off = cb->offsets[row];
+		struct varlena *v;
+		Size		vlen;
+
+		if (off == DBBC_VAR_NULL_OFFSET)	/* NULL: also in the bitmap */
+		{
+			codes[row] = 0;
+			continue;
+		}
+		v = (struct varlena *) (cb->blob + off);
+		vlen = VARSIZE(v);
+		for (k = 0; k < ndict; k++)
+		{
+			struct varlena *dv = (struct varlena *) (cb->blob + srcoff[k]);
+
+			if (VARSIZE(dv) == vlen && memcmp(dv, v, vlen) == 0)
+				break;
+		}
+		if (k == ndict)
+		{
+			if (ndict == cap)
+			{
+				pfree(srcoff);
+				pfree(codes);
+				return false;
+			}
+			srcoff[ndict] = off;
+			dict_blob_len = MAXALIGN(dict_blob_len) + vlen;
+			ndict++;
+		}
+		codes[row] = (uint8) k;
+	}
+
+	if (ndict == 0)
+	{
+		pfree(srcoff);
+		pfree(codes);
+		return false;
+	}
+
+	codes_bytes = ntuples;		/* code_width == 1 */
+	dict_off_bytes = (Size) ndict * sizeof(uint32);
+	plain_bytes = (Size) ntuples * sizeof(uint32) + cb->blob_len;
+	if (dict_off_bytes + dict_blob_len + codes_bytes >= plain_bytes)
+	{
+		pfree(srcoff);
+		pfree(codes);
+		return false;
+	}
+
+	/* pack the distinct values into the dictionary blob, MAXALIGN'd per entry */
+	dictblob = (uint8 *) palloc(Max(dict_blob_len, 1));
+	dictoff = (uint32 *) palloc(dict_off_bytes);
+	cur = 0;
+	for (k = 0; k < ndict; k++)
+	{
+		struct varlena *dv = (struct varlena *) (cb->blob + srcoff[k]);
+		Size		vlen = VARSIZE(dv);
+		Size		aligned = MAXALIGN(cur);
+
+		if (aligned > cur)
+			memset(dictblob + cur, 0, aligned - cur);
+		memcpy(dictblob + aligned, dv, vlen);
+		dictoff[k] = (uint32) aligned;
+		cur = aligned + vlen;
+	}
+	Assert(cur == dict_blob_len);
+
+	chunk->encoding = DBBC_ENCODING_DICT;
+	chunk->dict_count = ndict;
+	chunk->code_width = 1;
+	chunk->values = dbbc_copy_to_dsa(dictoff, dict_off_bytes, chunk_acct);
+	chunk->varblob = dbbc_copy_to_dsa(dictblob, dict_blob_len, chunk_acct);
+	chunk->varblob_len = dict_blob_len;
+	chunk->codes = dbbc_copy_to_dsa(codes, codes_bytes, chunk_acct);
+	pfree(srcoff);
+	pfree(codes);
+	pfree(dictblob);
+	pfree(dictoff);
+	return true;
+}
+
+/* dispatch dictionary encoding by width; false -> caller stores PLAIN */
+static bool
+dbbc_try_dict_encode(DbbcColMeta *meta, DbbcColBuild *cb, uint32 ntuples,
+					 DbbcColumnChunk *chunk, Size *chunk_acct)
+{
+	if (meta->attlen > 0)
+		return dbbc_try_dict_fixed(meta, cb, ntuples, chunk, chunk_acct);
+	return dbbc_try_dict_varlena(cb, ntuples, chunk, chunk_acct);
 }
 
 /*
@@ -1330,15 +1457,18 @@ dbbc_populate_relation(Oid relid)
 					chunk->varblob = InvalidDsaPointer;
 					chunk->varblob_len = 0;
 
-					if (meta->attlen > 0)
+					/* dictionary-encode if it is a size win, else store PLAIN */
+					if (dbbc_try_dict_encode(meta, cb, (uint32) ntuples,
+											 chunk, &chunk_acct))
 					{
-						/* dictionary-encode if it is a size win, else PLAIN */
-						if (!dbbc_try_dict_encode(meta, cb, (uint32) ntuples,
-												  chunk, &chunk_acct))
-							chunk->values =
-								dbbc_copy_to_dsa(cb->fixed,
-												 (Size) ntuples * meta->attlen,
-												 &chunk_acct);
+						/* dict path filled values/codes (+varblob for varlena) */
+					}
+					else if (meta->attlen > 0)
+					{
+						chunk->values =
+							dbbc_copy_to_dsa(cb->fixed,
+											 (Size) ntuples * meta->attlen,
+											 &chunk_acct);
 					}
 					else
 					{
