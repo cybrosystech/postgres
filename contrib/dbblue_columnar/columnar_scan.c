@@ -142,6 +142,19 @@ typedef struct DbbcSkipQual
 	Datum		value;			/* OP: the Const value */
 	Datum	   *elems;			/* SAOP: non-null array elements */
 	int			nelems;
+
+	/*
+	 * Vectorized fast path (Step 4): set only for OP/SAOP over an
+	 * integer-family column whose comparand(s) also widen losslessly to int64
+	 * (native signed-integer order == btree order for these types). When set,
+	 * dbbc_compute_selection compares as int64 inline, skipping the per-row
+	 * fmgr call in cmp. Everything else (text/numeric/cross-type) falls back
+	 * to cmp, so the fast path can only ever be an optimization, never wrong.
+	 */
+	bool		fast_int;
+	int16		col_ikind;		/* how to widen the COLUMN datum: 2 | 4 | 8 */
+	int64		fast_ival;		/* OP: the Const, widened to int64 */
+	int64	   *fast_ielems;	/* SAOP: elems widened to int64 (nelems) */
 } DbbcSkipQual;
 
 /*
@@ -195,6 +208,19 @@ typedef struct DbbcScanState
 	DbbcSkipQual *skipquals;
 	int			nskipquals;
 	int		   *attno_to_col;	/* [natts] -> chunk index or -1 */
+
+	/*
+	 * Per-block SoA decode buffer (Step 3) + precomputed selection (Step 4).
+	 * Only the columns referenced by a skip qual are decoded (decode_col[c]);
+	 * payload columns stay on-demand in dbbc_emit_row. dbbc_compute_selection
+	 * fills sel[] once per block from the decoded arrays, so the row loop is an
+	 * O(1) lookup instead of a per-row qual evaluation. Scan-serve path only.
+	 */
+	Datum	   *dec_val;		/* [ncols * decode_cap]; valid where decode_col[c] */
+	bool	   *dec_null;		/* [ncols * decode_cap] */
+	bool	   *decode_col;		/* [ncols]: is col c referenced by a skip qual? */
+	uint32		decode_cap;		/* rows allocated per column in dec_val/dec_null */
+	bool	   *sel;			/* [decode_cap]: row passes prefilter (nskipquals>0) */
 
 	/* heap fallback */
 	TableScanDesc heap_scan;
@@ -279,6 +305,74 @@ dbbc_scan_init(void)
 	set_rel_pathlist_hook = dbbc_set_rel_pathlist;
 
 	dbbc_agg_init();
+}
+
+/*
+ * Byte width to widen a fast-path integer type's Datum to int64 (native signed
+ * order == btree order for these), or 0 if the type is not fast-path eligible.
+ */
+static inline int16
+dbbc_int_kind(Oid typid)
+{
+	switch (typid)
+	{
+		case INT2OID:
+			return 2;
+		case INT4OID:
+		case DATEOID:
+			return 4;
+		case INT8OID:
+		case TIMESTAMPOID:
+		case TIMESTAMPTZOID:
+			return 8;
+	}
+	return 0;
+}
+
+/*
+ * Comparison "domain" of a fast-path type. Two operands may be compared as raw
+ * int64 only when their domains match: int2/int4/int8 share one domain (raw
+ * integers, cross-comparable by value), but date (days), timestamp and
+ * timestamptz (microseconds) are each their own domain - comparing a date's
+ * day count against a timestamp's microsecond count as int64 would be wrong,
+ * even though they share a btree opfamily. 0 = not fast-path eligible.
+ */
+static inline int
+dbbc_int_domain(Oid typid)
+{
+	switch (typid)
+	{
+		case INT2OID:
+		case INT4OID:
+		case INT8OID:
+			return 1;
+		case DATEOID:
+			return 2;
+		case TIMESTAMPOID:
+			return 3;
+		case TIMESTAMPTZOID:
+			return 4;
+	}
+	return 0;
+}
+
+/* Widen an int-family Datum of type typid to int64; false if not eligible. */
+static inline bool
+dbbc_datum_to_int64(Datum d, Oid typid, int64 *out)
+{
+	switch (dbbc_int_kind(typid))
+	{
+		case 2:
+			*out = (int64) DatumGetInt16(d);
+			return true;
+		case 4:
+			*out = (int64) DatumGetInt32(d);
+			return true;
+		case 8:
+			*out = (int64) DatumGetInt64(d);
+			return true;
+	}
+	return false;
 }
 
 /*
@@ -369,6 +463,15 @@ dbbc_extract_one_qual(Node *clause, Index varno, DbbcSkipQual *q)
 		q->collation = op->inputcollid;
 		q->value = cst->constvalue;
 		fmgr_info(cmpproc, &q->cmp);
+
+		/* vectorized fast path when column and comparand share an int domain */
+		if (dbbc_int_domain(q->coltype) != 0 &&
+			dbbc_int_domain(q->coltype) == dbbc_int_domain(rtype) &&
+			dbbc_datum_to_int64(cst->constvalue, rtype, &q->fast_ival))
+		{
+			q->fast_int = true;
+			q->col_ikind = dbbc_int_kind(q->coltype);
+		}
 		return true;
 	}
 
@@ -445,6 +548,31 @@ dbbc_extract_one_qual(Node *clause, Index varno, DbbcSkipQual *q)
 		q->elems = elems;
 		q->nelems = nkeep;
 		fmgr_info(cmpproc, &q->cmp);
+
+		/* vectorized fast path: widen all elements to int64 (same domain) */
+		if (dbbc_int_domain(q->coltype) != 0 &&
+			dbbc_int_domain(q->coltype) == dbbc_int_domain(elemtype))
+		{
+			int64	   *iv = (int64 *) palloc(Max(nkeep, 1) * sizeof(int64));
+			bool		allok = true;
+
+			for (i = 0; i < nkeep; i++)
+			{
+				if (!dbbc_datum_to_int64(elems[i], elemtype, &iv[i]))
+				{
+					allok = false;
+					break;
+				}
+			}
+			if (allok)
+			{
+				q->fast_int = true;
+				q->col_ikind = dbbc_int_kind(q->coltype);
+				q->fast_ielems = iv;
+			}
+			else
+				pfree(iv);
+		}
 		return true;
 	}
 
@@ -1097,7 +1225,7 @@ dbbc_scan_common(DbbcScanState *s, Relation rel, EState *estate)
 static void
 dbbc_scan_bind_version(DbbcScanState *s, Relation rel, List *needed_attnos,
 					   List *qual_clauses, Index qual_varno,
-					   DbbcRelVersion *version)
+					   DbbcRelVersion *version, bool alloc_decode)
 {
 	bool		usable;
 
@@ -1158,6 +1286,44 @@ dbbc_scan_bind_version(DbbcScanState *s, Relation rel, List *needed_attnos,
 		/* simple quals for zone skipping + the columnar pre-filter */
 		s->nskipquals = dbbc_extract_skip_quals(qual_clauses, qual_varno,
 												&s->skipquals);
+
+		/*
+		 * Per-block SoA decode buffer + selection bitmap. Only the scan-serve
+		 * path (dbbc_open_columnar_block -> dbbc_decode_and_select) uses these,
+		 * so alloc_decode is false for the grouped-aggregate pushdown path,
+		 * whose scratch state filters via dbbc_skipqual_test and would otherwise
+		 * pay several MB of dead allocation per execution. Mark the filter
+		 * columns (only those are decoded), then size the buffers once to the
+		 * max rows a block can hold, in this stable per-scan context (never at
+		 * block-open, where CurrentMemoryContext is the per-tuple context).
+		 */
+		if (alloc_decode && s->nskipquals > 0)
+		{
+			int			qi;
+
+			s->decode_col = (bool *) palloc0(s->ncols * sizeof(bool));
+			for (qi = 0; qi < s->nskipquals; qi++)
+			{
+				int			qc = s->attno_to_col[s->skipquals[qi].attno - 1];
+
+				if (qc >= 0)
+					s->decode_col[qc] = true;
+			}
+			s->decode_cap = (uint32) MaxHeapTuplesPerPage * DBBC_PAGES_PER_BLOCK;
+			s->dec_val = (Datum *)
+				palloc((Size) s->ncols * s->decode_cap * sizeof(Datum));
+			s->dec_null = (bool *)
+				palloc((Size) s->ncols * s->decode_cap * sizeof(bool));
+			s->sel = (bool *) palloc(s->decode_cap * sizeof(bool));
+		}
+		else
+		{
+			s->decode_col = NULL;
+			s->decode_cap = 0;
+			s->dec_val = NULL;
+			s->dec_null = NULL;
+			s->sel = NULL;
+		}
 	}
 	else
 	{
@@ -1205,7 +1371,7 @@ dbbc_begin_scan(CustomScanState *node, EState *estate, int eflags)
 		dbbc_scan_bind_version(s, rel, s->needed_attnos,
 							   s->prefilter_unsafe ? NIL : cscan->scan.plan.qual,
 							   s->prefilter_unsafe ? 0 : cscan->scan.scanrelid,
-							   v);
+							   v, true);
 	}
 }
 
@@ -1260,7 +1426,7 @@ dbbc_scan_initialize_worker(CustomScanState *node, shm_toc *toc,
 	v = dbbc_version_attach_tracked(p->version_dp);
 	dbbc_scan_bind_version(s, rel, s->needed_attnos,
 						   s->prefilter_unsafe ? NIL : cscan->scan.plan.qual,
-						   s->prefilter_unsafe ? 0 : cscan->scan.scanrelid, v);
+						   s->prefilter_unsafe ? 0 : cscan->scan.scanrelid, v, true);
 }
 
 /* the columnar block for a range, or NULL if absent / store unusable */
@@ -1391,90 +1557,221 @@ dbbc_chunk_read(DbbcScanState *s, int c, uint32 row, bool *isnull)
 	}
 }
 
-/*
- * Columnar pre-filter: evaluate the simple quals against raw column values
- * before paying for slot formation. Rows removed here would have been
- * removed by ExecScan's qual anyway (same operator semantics via the btree
- * ORDER proc); rows passed are still re-checked by ExecScan, so this can
- * only ever remove, never wrongly admit.
- */
-static bool
-dbbc_row_passes(DbbcScanState *s, uint32 row)
+/* widen a decoded fast-int column Datum to int64 per the qual's col_ikind */
+static inline int64
+dbbc_widen(Datum d, int16 kind)
 {
+	if (kind == 4)
+		return (int64) DatumGetInt32(d);
+	if (kind == 8)
+		return (int64) DatumGetInt64(d);
+	return (int64) DatumGetInt16(d);	/* kind == 2 */
+}
+
+/*
+ * Decode this block's filter columns into the SoA buffer (Step 3) and
+ * precompute the row selection bitmap sel[] (Step 4). Runs once per block-open.
+ *
+ * The decode loop is today the PLAIN codec (per-value read); it is the seam
+ * where a compressed codec would bulk-decompress a column instead. Selection
+ * evaluates each qual over the decoded array: integer-family quals use inline
+ * int64 comparisons (no per-row fmgr), everything else falls back to the btree
+ * ORDER proc. Strict ops fail NULL; NULLTEST compares the null flag. Quals stay
+ * in plan.qual so ExecScan re-checks - the prefilter can only remove rows.
+ */
+static void
+dbbc_decode_and_select(DbbcScanState *s, uint32 nrows)
+{
+	int			c;
 	int			i;
+
+	for (c = 0; c < s->ncols; c++)
+	{
+		Datum	   *dv;
+		bool	   *dn;
+		uint32		row;
+
+		if (!s->decode_col[c])
+			continue;
+		dv = s->dec_val + (Size) c * s->decode_cap;
+		dn = s->dec_null + (Size) c * s->decode_cap;
+		for (row = 0; row < nrows; row++)
+		{
+			bool		isnull;
+
+			dv[row] = dbbc_chunk_read(s, c, row, &isnull);
+			dn[row] = isnull;
+		}
+	}
+
+	if (s->nskipquals == 0)
+		return;					/* no prefilter; sel[] is unused */
+
+	memset(s->sel, true, nrows * sizeof(bool));
 
 	for (i = 0; i < s->nskipquals; i++)
 	{
 		DbbcSkipQual *q = &s->skipquals[i];
-		int			c = s->attno_to_col[q->attno - 1];
-		Datum		value;
-		bool		isnull;
+		int			c2 = s->attno_to_col[q->attno - 1];
+		Datum	   *dv;
+		bool	   *dn;
+		uint32		row;
 
-		if (c < 0)
+		if (c2 < 0)
 			continue;			/* not served columnar; leave to ExecScan */
-		value = dbbc_chunk_read(s, c, row, &isnull);
+		dv = s->dec_val + (Size) c2 * s->decode_cap;
+		dn = s->dec_null + (Size) c2 * s->decode_cap;
 
 		if (q->kind == DBBC_SKIP_NULLTEST)
 		{
-			if (isnull != q->nulltest_isnull)
-				return false;
+			for (row = 0; row < nrows; row++)
+				if (s->sel[row] && dn[row] != q->nulltest_isnull)
+					s->sel[row] = false;
 			continue;
 		}
 
-		if (isnull)
-			return false;		/* strict operators never pass NULL */
-
-		if (q->kind == DBBC_SKIP_OP)
+		if (q->fast_int && q->kind == DBBC_SKIP_OP)
 		{
-			int32		r = dbbc_skip_cmp(q, value, q->value);
-			bool		pass = false;
+			int64		rhs = q->fast_ival;
+			int16		kind = q->col_ikind;
+			uint16		strat = q->strategy;
 
-			switch (q->strategy)
+			for (row = 0; row < nrows; row++)
 			{
-				case BTLessStrategyNumber:
-					pass = r < 0;
-					break;
-				case BTLessEqualStrategyNumber:
-					pass = r <= 0;
-					break;
-				case BTEqualStrategyNumber:
-					pass = r == 0;
-					break;
-				case BTGreaterEqualStrategyNumber:
-					pass = r >= 0;
-					break;
-				case BTGreaterStrategyNumber:
-					pass = r > 0;
-					break;
-			}
-			if (!pass)
-				return false;
-		}
-		else					/* DBBC_SKIP_SAOP_EQ */
-		{
-			bool		any = false;
-			int			e;
+				int64		v;
+				bool		pass;
 
-			for (e = 0; e < q->nelems; e++)
-			{
-				if (dbbc_skip_cmp(q, value, q->elems[e]) == 0)
+				if (!s->sel[row])
+					continue;
+				if (dn[row])		/* strict operator: NULL never passes */
 				{
-					any = true;
-					break;
+					s->sel[row] = false;
+					continue;
 				}
+				v = dbbc_widen(dv[row], kind);
+				switch (strat)
+				{
+					case BTLessStrategyNumber:
+						pass = v < rhs;
+						break;
+					case BTLessEqualStrategyNumber:
+						pass = v <= rhs;
+						break;
+					case BTEqualStrategyNumber:
+						pass = v == rhs;
+						break;
+					case BTGreaterEqualStrategyNumber:
+						pass = v >= rhs;
+						break;
+					case BTGreaterStrategyNumber:
+						pass = v > rhs;
+						break;
+					default:
+						pass = true;	/* unreachable; leave to ExecScan */
+						break;
+				}
+				if (!pass)
+					s->sel[row] = false;
 			}
-			if (!any)
-				return false;
+			continue;
+		}
+
+		if (q->fast_int && q->kind == DBBC_SKIP_SAOP_EQ)
+		{
+			int16		kind = q->col_ikind;
+
+			for (row = 0; row < nrows; row++)
+			{
+				int64		v;
+				bool		any = false;
+				int			e;
+
+				if (!s->sel[row])
+					continue;
+				if (dn[row])
+				{
+					s->sel[row] = false;
+					continue;
+				}
+				v = dbbc_widen(dv[row], kind);
+				for (e = 0; e < q->nelems; e++)
+				{
+					if (v == q->fast_ielems[e])
+					{
+						any = true;
+						break;
+					}
+				}
+				if (!any)
+					s->sel[row] = false;
+			}
+			continue;
+		}
+
+		/* fallback: btree ORDER proc per row (text/numeric/non-int types) */
+		for (row = 0; row < nrows; row++)
+		{
+			Datum		val;
+
+			if (!s->sel[row])
+				continue;
+			if (dn[row])			/* strict OP/SAOP: NULL fails */
+			{
+				s->sel[row] = false;
+				continue;
+			}
+			val = dv[row];
+			if (q->kind == DBBC_SKIP_OP)
+			{
+				int32		r = dbbc_skip_cmp(q, val, q->value);
+				bool		pass = false;
+
+				switch (q->strategy)
+				{
+					case BTLessStrategyNumber:
+						pass = r < 0;
+						break;
+					case BTLessEqualStrategyNumber:
+						pass = r <= 0;
+						break;
+					case BTEqualStrategyNumber:
+						pass = r == 0;
+						break;
+					case BTGreaterEqualStrategyNumber:
+						pass = r >= 0;
+						break;
+					case BTGreaterStrategyNumber:
+						pass = r > 0;
+						break;
+				}
+				if (!pass)
+					s->sel[row] = false;
+			}
+			else				/* DBBC_SKIP_SAOP_EQ */
+			{
+				bool		any = false;
+				int			e;
+
+				for (e = 0; e < q->nelems; e++)
+				{
+					if (dbbc_skip_cmp(q, val, q->elems[e]) == 0)
+					{
+						any = true;
+						break;
+					}
+				}
+				if (!any)
+					s->sel[row] = false;
+			}
 		}
 	}
-
-	return true;
 }
 
 /*
  * Commit to serving `block` (already validated and not zone-skipped): resolve
- * its column pointers and establish this block's NULL background in the scan
- * slot, so dbbc_emit_row writes only the registered columns per row.
+ * its column pointers, decode its filter columns + compute the selection
+ * bitmap, and establish this block's NULL background in the scan slot, so
+ * dbbc_emit_row writes only the registered columns per row.
  *
  * LOAD-BEARING: the NULL background must be (re-)established here at EVERY
  * columnar block-open, not once per scan. Columnar blocks and heap-fallback
@@ -1497,6 +1794,9 @@ dbbc_open_columnar_block(DbbcScanState *s, DbbcBlock *block,
 	s->cur_chunks = chunks;
 	for (c = 0; c < s->ncols; c++)
 		dbbc_col_ptrs_set(s, c);
+
+	/* decode filter columns + precompute the row selection for this block */
+	dbbc_decode_and_select(s, block->nrows);
 
 	ExecClearTuple(slot);
 	memset(slot->tts_isnull, true, natts * sizeof(bool));
@@ -1601,7 +1901,8 @@ dbbc_next(ScanState *ss)
 		{
 			while (s->cur_row < s->cur_block->nrows)
 			{
-				if (s->nskipquals > 0 && !dbbc_row_passes(s, s->cur_row))
+				/* sel[] was precomputed for the whole block at block-open */
+				if (s->nskipquals > 0 && !s->sel[s->cur_row])
 				{
 					s->rows_filtered++;
 					s->cur_row++;
@@ -3394,7 +3695,7 @@ dbbc_grp_build(DbbcAggScanState *as, EState *estate)
 			? dbbc_version_pin_tracked(RelationGetRelid(as->rel)) : NULL;
 
 		dbbc_scan_bind_version(&scratch, as->rel, needed, as->qual_clauses,
-							   as->qual_varno, v);
+							   as->qual_varno, v, false);
 	}
 
 	if (scratch.whole_rel_mode)
@@ -3597,7 +3898,7 @@ dbbc_agg_exec(CustomScanState *node)
 		DbbcRelVersion *v = (as->rel->rd_rel->relam == HEAP_TABLE_AM_OID)
 			? dbbc_version_pin_tracked(RelationGetRelid(as->rel)) : NULL;
 
-		dbbc_scan_bind_version(&scratch, as->rel, needed, NIL, 0, v);
+		dbbc_scan_bind_version(&scratch, as->rel, needed, NIL, 0, v, false);
 	}
 
 	if (scratch.whole_rel_mode)
