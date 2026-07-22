@@ -613,6 +613,8 @@ incr_where_admits_orphans(Node *where_qual)
 	return incr_where_orphan_nulltest_walker(where_qual, NULL);
 }
 
+static bool incr_membership_has_mutable(Query *q);
+
 /*
  * MatviewIncrIsEligible
  * Returns true if the query can be maintained incrementally (Phase 1 or 2).
@@ -625,6 +627,28 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 	int			nbasetables = 0;
 	bool		deparse_agg_shape;
 	bool		self_join_seen = false;
+
+	/*
+	 * A mutable (VOLATILE or STABLE) function in a MEMBERSHIP position — WHERE,
+	 * any JOIN ON, or HAVING — determines which rows/groups the view contains as
+	 * a function of wall-clock time or session settings, with ZERO DML.  A full
+	 * REFRESH re-evaluates it every time, so an incrementally-maintained matview
+	 * silently diverges from REFRESH the instant the clock crosses a boundary
+	 * (e.g. WHERE created > now() - interval '24 hours'): no delta can capture a
+	 * change that no write caused.  Reject at CREATE rather than serve a
+	 * silently-stale answer.  (now()/CURRENT_DATE/STABLE in the SELECT list are
+	 * fine — the overlay peels them to read time; this guard is membership-only,
+	 * matching MatviewIncrPeelProjection's use of incr_membership_has_mutable.)
+	 */
+	if (incr_membership_has_mutable(viewQuery))
+	{
+		*reason = "a volatile or stable function (e.g. now(), CURRENT_DATE) in "
+			"WHERE, JOIN ON, or HAVING cannot be maintained incrementally: it "
+			"changes which rows match as time passes, with no DML to trigger a "
+			"delta, so the matview would drift from a full REFRESH; move it to "
+			"the SELECT list (re-evaluated at read time) or use a constant bound";
+		return false;
+	}
 
 	if (viewQuery->havingQual != NULL && viewQuery->groupClause == NIL)
 	{

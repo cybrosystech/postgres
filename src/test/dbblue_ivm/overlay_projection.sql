@@ -171,5 +171,33 @@ END $$;
 DROP VIEW ovp_wh CASCADE;
 DROP MATERIALIZED VIEW ovp_whref;
 
+\echo '--- volatile/STABLE in a MEMBERSHIP position is rejected (would drift from REFRESH, zero DML) ---'
+-- now()/CURRENT_DATE in WHERE / JOIN ON / HAVING decides membership as a function
+-- of wall-clock time; a full REFRESH re-evaluates it but no DML fires a delta, so
+-- an incremental matview would silently diverge.  Must be rejected at CREATE.
+DO $$
+BEGIN
+  BEGIN
+    EXECUTE 'CREATE MATERIALIZED VIEW ovp_bad1 WITH (incremental_refresh=true) AS
+             SELECT k, count(*) c FROM ovp WHERE created > now() - interval ''1 hour'' GROUP BY k';
+    RAISE EXCEPTION 'now() in WHERE should have been rejected';
+  EXCEPTION WHEN feature_not_supported THEN NULL; END;
+
+  BEGIN
+    EXECUTE 'CREATE MATERIALIZED VIEW ovp_bad2 WITH (incremental_refresh=true) AS
+             SELECT k, count(*) c, max(created) mx FROM ovp GROUP BY k HAVING max(created) > now()';
+    RAISE EXCEPTION 'now() in HAVING should have been rejected';
+  EXCEPTION WHEN feature_not_supported THEN NULL; END;
+
+  -- but now() in the SELECT list stays accepted (overlay re-evaluates at read time)
+  EXECUTE 'CREATE MATERIALIZED VIEW ovp_ok WITH (incremental_refresh=true) AS
+           SELECT k, count(*) c, now() AS asof FROM ovp GROUP BY k';
+  IF (SELECT relkind FROM pg_class WHERE relname='ovp_ok') <> 'v' THEN
+    RAISE EXCEPTION 'now() in SELECT should be an overlay view'; END IF;
+  EXECUTE 'DROP VIEW ovp_ok CASCADE';
+
+  RAISE NOTICE 'membership-mutable (now() in WHERE/HAVING) rejected; now() in SELECT accepted: PASS';
+END $$;
+
 DROP TABLE ovp CASCADE;
 \echo ''
