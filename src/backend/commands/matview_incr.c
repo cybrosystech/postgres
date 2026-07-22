@@ -56,6 +56,7 @@
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_aggregate.h"
+#include "catalog/pg_constraint.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_dbblue_matview.h"
@@ -73,6 +74,8 @@
 #include "nodes/nodeFuncs.h"
 #include "nodes/primnodes.h"
 #include "optimizer/optimizer.h"
+#include "parser/parse_clause.h"
+#include "parser/parse_oper.h"
 #include "parser/parsetree.h"
 #include "rewrite/rewriteManip.h"
 #include "storage/lmgr.h"
@@ -5544,6 +5547,198 @@ incr_emit_del_update_tail(StringInfo buf, Oid mvrelid, Query *viewQuery)
 }
 
 /*
+ * incr_bare_grouped_var_walker — collect Vars that appear in a grouped-context
+ * position (i.e. NOT inside an aggregate) and are not themselves group keys.
+ *
+ * These are the columns a GROUP BY query is only allowed to reference because
+ * they are functionally dependent on the group keys (see
+ * incr_augment_groupby_for_enr).  We stop at Aggref/GroupingFunc (their inner
+ * Vars are aggregated, hence always legal) and at SubLink/Query boundaries
+ * (Vars there belong to another query level, not this GROUP BY).
+ */
+typedef struct IncrBareVarCtx
+{
+	Query	   *q;				/* the query, to classify a Var's RTE */
+	List	   *group_key_vars; /* base Var nodes already serving as group keys */
+	List	   *bare;			/* collected result: base Var nodes to promote */
+} IncrBareVarCtx;
+
+static bool
+incr_var_matches(Var *a, Var *b)
+{
+	return a->varno == b->varno &&
+		a->varattno == b->varattno &&
+		a->varlevelsup == b->varlevelsup;
+}
+
+static bool
+incr_bare_grouped_var_walker(Node *node, IncrBareVarCtx *ctx)
+{
+	if (node == NULL)
+		return false;
+	/* aggregate arguments are always legal ungrouped — do not descend */
+	if (IsA(node, Aggref) || IsA(node, GroupingFunc))
+		return false;
+	/* another query level (correlated subquery etc.) — not our concern */
+	if (IsA(node, SubLink) || IsA(node, Query))
+		return false;
+	if (IsA(node, Var))
+	{
+		Var			   *v = (Var *) node;
+		RangeTblEntry  *rte;
+		ListCell	   *lc;
+
+		if (v->varlevelsup != 0)
+			return false;		/* outer reference: leave alone */
+		/* a Var into the PG17+ RTE_GROUP *is* a grouping column — skip it */
+		if (v->varno >= 1 && v->varno <= list_length(ctx->q->rtable))
+		{
+			rte = rt_fetch(v->varno, ctx->q->rtable);
+			if (rte->rtekind == RTE_GROUP)
+				return false;
+		}
+		foreach(lc, ctx->group_key_vars)
+			if (incr_var_matches((Var *) lfirst(lc), v))
+				return false;	/* already a group key */
+		foreach(lc, ctx->bare)
+			if (incr_var_matches((Var *) lfirst(lc), v))
+				return false;	/* already collected */
+		ctx->bare = lappend(ctx->bare, v);
+		return false;
+	}
+	return expression_tree_walker(node, incr_bare_grouped_var_walker, ctx);
+}
+
+/*
+ * incr_augment_groupby_for_enr — make an ENR-swapped delta query re-parse cleanly.
+ *
+ * A grouped view may SELECT bare (non-aggregated, non-group-key) columns of a
+ * table when the GROUP BY includes that table's PRIMARY KEY: Postgres proves the
+ * functional dependency at parse time (parseCheckAggregates ->
+ * check_functional_grouping) and admits them.  Our delta SELECT copies such a
+ * view and swaps one base relation for a NamedTuplestore ENR (the transition
+ * table), which carries no primary-key metadata; when the deparsed delta SQL is
+ * re-parsed by SPI the functional-dependency proof no longer applies and it
+ * errors ("column t.c must appear in the GROUP BY clause").
+ *
+ * Restore the proof by making it explicit — add every bare grouped-context
+ * column to the delta query's GROUP BY.  This is sound precisely because each
+ * such column is functionally dependent on the existing group keys, and grouping
+ * by a dependent column never subdivides a group.  We re-verify that dependency
+ * here with check_functional_grouping (the exact test Postgres used to accept the
+ * view) per contributing relation BEFORE changing anything, testing against the
+ * ORIGINAL group keys only (never the columns we are about to add).  If any bare
+ * column cannot be proven dependent we touch nothing and return: a not-actually-
+ * dependent column (impossible for an already-accepted view, but a guard against
+ * future gate changes) must never be silently folded into the GROUP BY, which
+ * would change the result.  The caller then deparses the query unchanged; for an
+ * accepted view augmentation always succeeds.
+ *
+ * Only the ENR-swapped delta builders call this.  The live-table recompute reads
+ * the real relation (primary key intact) and re-parses without help; and the
+ * outer _affected_ projection selects the ORIGINAL group keys, so the extra
+ * inner group columns (being FD) do not change which groups it captures.
+ */
+static void
+incr_augment_groupby_for_enr(Query *q)
+{
+	IncrBareVarCtx	ctx;
+	List		   *group_key_vars = NIL;
+	ListCell	   *lc;
+
+	if (q->groupClause == NIL)
+		return;					/* row-level or pure-DISTINCT: nothing bare */
+
+	/*
+	 * The current group-key expressions, resolved through the PG17+ RTE_GROUP
+	 * indirection (grouped target-list entries are Vars into the *GROUP* RTE);
+	 * keep those that resolve to a plain base-relation Var, since FD is proven
+	 * per base relation.
+	 */
+	foreach(lc, q->groupClause)
+	{
+		SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+		TargetEntry	    *te  = get_sortgroupclause_tle(sgc, q->targetList);
+		Node			*ge  = incr_group_key_expr(q, te);
+
+		if (ge != NULL && IsA(ge, Var) && ((Var *) ge)->varlevelsup == 0)
+			group_key_vars = lappend(group_key_vars, ge);
+	}
+
+	/* collect bare grouped-context base Vars across the whole target list */
+	ctx.q = q;
+	ctx.group_key_vars = group_key_vars;
+	ctx.bare = NIL;
+	(void) incr_bare_grouped_var_walker((Node *) q->targetList, &ctx);
+
+	if (ctx.bare == NIL)
+		return;					/* fully grouped already */
+
+	/*
+	 * Prove FD for every relation contributing a bare column against the
+	 * original group keys.  Bail on the first that cannot be proven — never
+	 * augment on an unproven dependency.
+	 */
+	foreach(lc, ctx.bare)
+	{
+		Var			   *v = (Var *) lfirst(lc);
+		RangeTblEntry  *rte = rt_fetch(v->varno, q->rtable);
+		List		   *deps = NIL;
+
+		if (rte == NULL || !OidIsValid(rte->relid))
+			return;				/* not a base relation: cannot prove via PK */
+		if (!check_functional_grouping(rte->relid, v->varno, 0,
+									   group_key_vars, &deps))
+			return;				/* not functionally dependent: leave unchanged */
+	}
+
+	/* all proven — promote each bare Var into the GROUP BY */
+	foreach(lc, ctx.bare)
+	{
+		Var			   *v = (Var *) lfirst(lc);
+		TargetEntry	   *te = NULL;
+		SortGroupClause *grpcl;
+		ListCell	   *tlc;
+		Oid				sortop;
+		Oid				eqop;
+		bool			hashable;
+
+		/* reuse an existing standalone target for this Var if there is one */
+		foreach(tlc, q->targetList)
+		{
+			TargetEntry *cand = lfirst_node(TargetEntry, tlc);
+
+			if (IsA(cand->expr, Var) && incr_var_matches((Var *) cand->expr, v))
+			{
+				te = cand;
+				break;
+			}
+		}
+		/* otherwise add a resjunk target (deparse keeps it out of the SELECT
+		 * list; it exists only to anchor the new GROUP BY item) */
+		if (te == NULL)
+		{
+			te = makeTargetEntry((Expr *) copyObject(v),
+								 list_length(q->targetList) + 1, NULL, true);
+			q->targetList = lappend(q->targetList, te);
+		}
+
+		get_sort_group_operators(exprType((Node *) te->expr),
+								 false, true, false,
+								 &sortop, &eqop, NULL, &hashable);
+
+		grpcl = makeNode(SortGroupClause);
+		grpcl->tleSortGroupRef = assignSortGroupRef(te, q->targetList);
+		grpcl->eqop = eqop;
+		grpcl->sortop = sortop;
+		grpcl->reverse_sort = false;
+		grpcl->nulls_first = false;
+		grpcl->hashable = hashable;
+		q->groupClause = lappend(q->groupClause, grpcl);
+	}
+}
+
+/*
  * incr_build_delta_select_query — copy the stored view Query and swap the
  * single source relation RTE for a named-tuplestore (ENR) RTE that points at
  * the transition table enrName ("__mv_newtable" / "__mv_oldtable").  The
@@ -5627,6 +5822,10 @@ incr_build_delta_select_query(Query *viewQuery, Oid srctable, const char *enrNam
 	/* ENRs carry no permission info; deparse ignores rteperminfos either way. */
 	target->perminfoindex = 0;
 	/* keep relid (plan invalidation) and eref (column names) unchanged */
+
+	/* the ENR has no primary key: make PK-functional-dependent SELECT columns
+	 * explicit group keys so the deparsed delta re-parses cleanly */
+	incr_augment_groupby_for_enr(q);
 
 	return q;
 }
@@ -8265,6 +8464,11 @@ incr_build_delta_select_query_at_varno(Query *viewQuery, int target_varno,
 	table_close(rel, AccessShareLock);
 
 	target->perminfoindex = 0;
+
+	/* see incr_build_delta_select_query: restore PK functional dependency lost
+	 * with the ENR swap by promoting FD-proven bare columns to group keys */
+	incr_augment_groupby_for_enr(q);
+
 	return q;
 }
 
@@ -10125,6 +10329,30 @@ incr_is_recompute_only_func(const char *fname)
  * (stddev/variance/bool_and/bool_or).  Such a matview is routed entirely to
  * the deparse-based recompute engine (incr_build_recompute_sql).
  */
+/*
+ * incr_te_is_group_key — true if target entry te is (or duplicates) one of the
+ * query's GROUP BY keys.  Compared by Var identity so a second output column
+ * that repeats a group-key Var (e.g. SELECT id, id AS id2 ... GROUP BY id) is
+ * recognized as a key, not a bare dependent column.
+ */
+static bool
+incr_te_is_group_key(Query *q, TargetEntry *te)
+{
+	Node	   *tex = incr_group_key_expr(q, te);
+	ListCell   *lc;
+
+	foreach(lc, q->groupClause)
+	{
+		SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+		TargetEntry	    *gte = get_sortgroupclause_tle(sgc, q->targetList);
+		Node			*gex = incr_group_key_expr(q, gte);
+
+		if (equal(tex, gex))
+			return true;
+	}
+	return false;
+}
+
 static bool
 incr_needs_recompute(Query *viewQuery)
 {
@@ -10156,6 +10384,20 @@ incr_needs_recompute(Query *viewQuery)
 		 */
 		if (!te->resjunk && !incr_is_hidden_col(te->resname) &&
 			!IsA(te->expr, Var) && !IsA(te->expr, Aggref))
+			return true;
+
+		/*
+		 * A bare non-key column — a plain Var that is not one of the GROUP BY
+		 * keys — is only legal because it is functionally dependent on the keys
+		 * (the grouped table's primary key is in the GROUP BY; Postgres proved
+		 * this when it accepted the view).  The additive delta path cannot
+		 * maintain such a column's VALUE: its ON CONFLICT touches only aggregate
+		 * columns, so an UPDATE that changes the dependent column (with the key
+		 * unchanged) would leave the matview stale.  Recompute re-derives every
+		 * column of each affected group from the live table, so route there.
+		 */
+		if (!te->resjunk && !incr_is_hidden_col(te->resname) &&
+			IsA(te->expr, Var) && !incr_te_is_group_key(viewQuery, te))
 			return true;
 
 		if (te->resjunk || !IsA(te->expr, Aggref))
