@@ -2241,7 +2241,8 @@ typedef struct DbbcGroupEntry
  *   [2] payload:
  *       metadata: List of list_make5(kind, attno, collation, opcintype,
  *                 cmpproc) per output column
- *       grouped : list_make5(key attnos       IntList,
+ *       grouped : list_make5(key exprs        List (bare Var or expression;
+ *                                             expr keys evaluated per row),
  *                            output map       IntList (>=0: key index,
  *                                             <0: -(agg index)-1),
  *                            aggrefs          List of Aggref,
@@ -2274,7 +2275,23 @@ typedef struct DbbcAggScanState
 	/* grouped mode */
 	bool		grouped;
 	int			nkeys;
-	AttrNumber	key_attnos[DBBC_GRP_MAX_KEYS];
+	AttrNumber	key_attnos[DBBC_GRP_MAX_KEYS];	/* bare-Var key: the column; else Invalid */
+
+	/*
+	 * Expression group keys (e.g. date_trunc('month', datecol)). key_exprstate[k]
+	 * is NULL for a bare-Var key (read the column directly via key_attnos[k]),
+	 * else the compiled expression, evaluated per row over key_slot (populated
+	 * with the referenced columns; econtext->ecxt_scantuple = key_slot). The
+	 * result type is byval + bit-equality-safe (validated at plan time), so the
+	 * Datum goes straight into the raw-bits group hash. The input columns are in
+	 * the used/used_types set so the per-block type-identity gate covers them.
+	 */
+	bool		has_key_exprs;
+	ExprState **key_exprstate;	/* [nkeys], entry NULL for a bare-Var key */
+	TupleTableSlot *key_slot;	/* relation-width virtual slot for the inputs */
+	ExprContext *key_econtext;
+	AttrNumber *key_input_attnos;	/* distinct columns the expr keys read */
+	int			nkey_input;
 	int			ntrans;
 	DbbcAggTrans *trans;
 	Datum	   *in_vals;		/* per-trans current-row input */
@@ -2613,14 +2630,39 @@ dbbc_agg_trans_ok(Aggref *agg, Index relid, List **needcols)
  * pieces and the needed-column list; returns false (offer no path) on the
  * first unsupported construct.
  */
+/*
+ * Validate that every Var in a group-key expression is a live user column of
+ * this relation, and record those columns in *needcols. Returns false for an
+ * outer/system/other-relation Var. Used only for non-bare-Var group keys.
+ */
+static bool
+dbbc_expr_vars_ok(Node *expr, Index relid, List **needcols)
+{
+	List	   *vars = pull_var_clause(expr,
+									  PVC_RECURSE_AGGREGATES |
+									  PVC_RECURSE_WINDOWFUNCS |
+									  PVC_RECURSE_PLACEHOLDERS);
+	ListCell   *lc;
+
+	foreach(lc, vars)
+	{
+		Var		   *v = (Var *) lfirst(lc);
+
+		if (!IsA(v, Var) || v->varno != relid || v->varlevelsup != 0 ||
+			v->varattno <= 0)
+			return false;
+		*needcols = list_append_unique_int(*needcols, v->varattno);
+	}
+	return true;
+}
+
 static bool
 dbbc_agg_grouped_classify(PlannerInfo *root, RelOptInfo *input_rel,
 						  RelOptInfo *output_rel, Index relid,
-						  List **keyattnos_out, List **outmap_out,
+						  List **keyexprs_out, List **outmap_out,
 						  List **aggrefs_out, List **quals_out,
 						  List **needcols, double *ngroups_out)
 {
-	List	   *keyattnos = NIL;
 	List	   *keyexprs = NIL;
 	List	   *outmap = NIL;
 	List	   *aggrefs = NIL;
@@ -2652,48 +2694,71 @@ dbbc_agg_grouped_classify(PlannerInfo *root, RelOptInfo *input_rel,
 		*needcols = list_append_unique_int(*needcols, probe.attno);
 	}
 
-	/* group keys: bare Vars of bit-equality-safe by-value types */
+	/*
+	 * Group keys: a bare Var, or a non-volatile expression whose result type is
+	 * bit-equality-safe by-value (hashed on raw Datum bits) and whose input Vars
+	 * are all live columns of this relation (e.g. date_trunc('month', datecol)).
+	 * Deduplicated by equal(); the per-key expression is stored and, at Begin,
+	 * either read directly (bare Var) or compiled to an ExprState.
+	 */
 	foreach(lc, root->processed_groupClause)
 	{
 		SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
 		Node	   *expr = get_sortgroupclause_expr(sgc,
 													root->parse->targetList);
-		Var		   *var;
-
-		if (!IsA(expr, Var))
-			return false;
-		var = (Var *) expr;
-		if (var->varno != relid || var->varlevelsup != 0 || var->varattno <= 0)
-			return false;
-		if (!dbbc_grp_key_type_ok(var->vartype))
-			return false;
-		if (!list_member_int(keyattnos, var->varattno))
-		{
-			if (list_length(keyattnos) >= DBBC_GRP_MAX_KEYS)
-				return false;
-			keyattnos = lappend_int(keyattnos, var->varattno);
-			keyexprs = lappend(keyexprs, var);
-		}
-		*needcols = list_append_unique_int(*needcols, var->varattno);
-	}
-
-	/* every output expr: a group-key Var, or a supported bare Aggref */
-	foreach(lc, output_rel->reltarget->exprs)
-	{
-		Node	   *expr = (Node *) lfirst(lc);
 
 		if (IsA(expr, Var))
 		{
 			Var		   *var = (Var *) expr;
+
+			if (var->varno != relid || var->varlevelsup != 0 ||
+				var->varattno <= 0)
+				return false;
+			if (!dbbc_grp_key_type_ok(var->vartype))
+				return false;
+			*needcols = list_append_unique_int(*needcols, var->varattno);
+		}
+		else
+		{
+			if (!dbbc_grp_key_type_ok(exprType(expr)))
+				return false;
+			if (contain_volatile_functions(expr))
+				return false;
+			if (!dbbc_expr_vars_ok(expr, relid, needcols))
+				return false;
+		}
+		if (!list_member(keyexprs, expr))
+		{
+			if (list_length(keyexprs) >= DBBC_GRP_MAX_KEYS)
+				return false;
+			keyexprs = lappend(keyexprs, expr);
+		}
+	}
+
+	/*
+	 * Every output expr must be a group key (matched by equal(), covering both
+	 * bare-Var and expression keys) or a supported bare Aggref.
+	 */
+	foreach(lc, output_rel->reltarget->exprs)
+	{
+		Node	   *expr = (Node *) lfirst(lc);
+
+		if (IsA(expr, Aggref))
+		{
+			if (!dbbc_agg_trans_ok((Aggref *) expr, relid, needcols))
+				return false;
+			outmap = lappend_int(outmap, -(list_length(aggrefs)) - 1);
+			aggrefs = lappend(aggrefs, expr);
+		}
+		else
+		{
 			int			k = 0;
 			bool		found = false;
 			ListCell   *lk;
 
-			if (var->varno != relid || var->varlevelsup != 0)
-				return false;
-			foreach(lk, keyattnos)
+			foreach(lk, keyexprs)
 			{
-				if ((AttrNumber) lfirst_int(lk) == var->varattno)
+				if (equal(lfirst(lk), expr))
 				{
 					found = true;
 					break;
@@ -2704,15 +2769,6 @@ dbbc_agg_grouped_classify(PlannerInfo *root, RelOptInfo *input_rel,
 				return false;	/* not a group key (e.g. FD on a PK) */
 			outmap = lappend_int(outmap, k);
 		}
-		else if (IsA(expr, Aggref))
-		{
-			if (!dbbc_agg_trans_ok((Aggref *) expr, relid, needcols))
-				return false;
-			outmap = lappend_int(outmap, -(list_length(aggrefs)) - 1);
-			aggrefs = lappend(aggrefs, expr);
-		}
-		else
-			return false;
 	}
 	if (outmap == NIL)
 		return false;
@@ -2742,7 +2798,7 @@ dbbc_agg_grouped_classify(PlannerInfo *root, RelOptInfo *input_rel,
 			return false;
 	}
 
-	*keyattnos_out = keyattnos;
+	*keyexprs_out = keyexprs;
 	*outmap_out = outmap;
 	*aggrefs_out = aggrefs;
 	*quals_out = quals;
@@ -2768,7 +2824,7 @@ dbbc_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	int16	   *reg;
 	bool		ok = true;
 	bool		grouped;
-	List	   *keyattnos = NIL;
+	List	   *keyexprs = NIL;
 	List	   *outmap = NIL;
 	List	   *aggrefs = NIL;
 	List	   *quals = NIL;
@@ -2845,7 +2901,7 @@ dbbc_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	{
 		needcols = NIL;			/* a failed metadata walk may have added some */
 		if (!dbbc_agg_grouped_classify(root, input_rel, output_rel, relid,
-									   &keyattnos, &outmap, &aggrefs, &quals,
+									   &keyexprs, &outmap, &aggrefs, &quals,
 									   &needcols, &ngroups))
 			return;
 	}
@@ -2906,7 +2962,7 @@ dbbc_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	cpath->custom_private =
 		list_make4(makeInteger((int) rte->relid),
 				   makeInteger(grouped ? 1 : 0),
-				   grouped ? list_make5(keyattnos, outmap, aggrefs, quals,
+				   grouped ? list_make5(keyexprs, outmap, aggrefs, quals,
 										makeInteger((int) relid))
 				   : items,
 				   tlist);
@@ -3009,22 +3065,61 @@ dbbc_agg_create_scan_state(CustomScan *cscan)
 static void
 dbbc_grp_begin(DbbcAggScanState *as, List *payload, EState *estate, int eflags)
 {
-	List	   *keyattnos = (List *) linitial(payload);
+	List	   *keyexprs = (List *) linitial(payload);
 	List	   *outmap = (List *) lsecond(payload);
 	List	   *aggrefs = (List *) lthird(payload);
 	ListCell   *lc;
 	int			i;
 	ExprContext *fakeecxt;
+	List	   *keyinput = NIL;
 
 	as->grouped = true;
 	as->qual_clauses = (List *) lfourth(payload);
 	as->qual_varno = (Index) intVal(list_nth(payload, 4));
 
-	as->nkeys = list_length(keyattnos);
+	as->nkeys = list_length(keyexprs);
 	Assert(as->nkeys <= DBBC_GRP_MAX_KEYS);
+	as->key_exprstate = (ExprState **)
+		palloc0(Max(as->nkeys, 1) * sizeof(ExprState *));
+	as->has_key_exprs = false;
 	i = 0;
-	foreach(lc, keyattnos)
-		as->key_attnos[i++] = (AttrNumber) lfirst_int(lc);
+	foreach(lc, keyexprs)
+	{
+		Node	   *kexpr = (Node *) lfirst(lc);
+
+		if (IsA(kexpr, Var))
+		{
+			/* bare-Var key: read the column directly, no ExprState */
+			as->key_attnos[i] = ((Var *) kexpr)->varattno;
+		}
+		else
+		{
+			/*
+			 * Expression key: compiled and evaluated per row over key_slot.
+			 * key_attnos[i] is Invalid so the consume loops take the expr path.
+			 * Its input columns join the used/needed set (type-identity gate +
+			 * version coverage) and are populated into key_slot per row.
+			 */
+			ListCell   *lv;
+
+			as->key_attnos[i] = InvalidAttrNumber;
+			as->has_key_exprs = true;
+			foreach(lv, pull_var_clause(kexpr,
+										PVC_RECURSE_AGGREGATES |
+										PVC_RECURSE_WINDOWFUNCS |
+										PVC_RECURSE_PLACEHOLDERS))
+				keyinput = list_append_unique_int(keyinput,
+												  ((Var *) lfirst(lv))->varattno);
+		}
+		i++;
+	}
+
+	as->nkey_input = list_length(keyinput);
+	as->key_input_attnos = (AttrNumber *)
+		palloc(Max(as->nkey_input, 1) * sizeof(AttrNumber));
+	i = 0;
+	foreach(lc, keyinput)
+		as->key_input_attnos[i++] = (AttrNumber) lfirst_int(lc);
 
 	as->noutcols = list_length(outmap);
 	as->outmap = (int *) palloc(as->noutcols * sizeof(int));
@@ -3041,6 +3136,34 @@ dbbc_grp_begin(DbbcAggScanState *as, List *payload, EState *estate, int eflags)
 
 	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
 		return;
+
+	/*
+	 * Expression group keys: build the per-row evaluation machinery. Placed
+	 * after the EXPLAIN-only return because the scratch slot needs the relation
+	 * descriptor and the relation is opened only for real execution. A
+	 * relation-width virtual slot holds the input columns per row; ExecEvalExpr
+	 * reads it via econtext->ecxt_scantuple (reset per row).
+	 */
+	if (as->has_key_exprs)
+	{
+		List	   *keyexprs2 = (List *) linitial(payload);
+
+		/* EState-registered slot + econtext: freed with the plan, no leak */
+		as->key_slot = ExecInitExtraTupleSlot(estate,
+											  RelationGetDescr(as->rel),
+											  &TTSOpsVirtual);
+		as->key_econtext = CreateExprContext(estate);
+		i = 0;
+		foreach(lc, keyexprs2)
+		{
+			Node	   *kexpr = (Node *) lfirst(lc);
+
+			if (!IsA(kexpr, Var))
+				as->key_exprstate[i] = ExecInitExpr((Expr *) kexpr,
+													(PlanState *) &as->css.ss.ps);
+			i++;
+		}
+	}
 
 	as->groupctx = AllocSetContextCreate(CurrentMemoryContext,
 										 "dbblue_columnar group states",
@@ -3246,7 +3369,11 @@ dbbc_grp_begin(DbbcAggScanState *as, List *payload, EState *estate, int eflags)
 		int			u;
 
 		for (k = 0; k < as->nkeys; k++)
-			used = list_append_unique_int(used, as->key_attnos[k]);
+			if (as->key_attnos[k] != InvalidAttrNumber)	/* bare-Var key */
+				used = list_append_unique_int(used, as->key_attnos[k]);
+		/* expression-key input columns (expr keys have key_attnos == Invalid) */
+		for (k = 0; k < as->nkey_input; k++)
+			used = list_append_unique_int(used, as->key_input_attnos[k]);
 		for (a = 0; a < as->ntrans; a++)
 		{
 			int			f;
@@ -3732,11 +3859,36 @@ dbbc_grp_consume_block(DbbcAggScanState *as, DbbcScanState *s,
 		}
 		if (pass)
 		{
+			if (as->has_key_exprs)
+			{
+				/* load the expr-key input columns into the scratch slot */
+				int			j;
+
+				ResetExprContext(as->key_econtext);
+				ExecClearTuple(as->key_slot);
+				for (j = 0; j < as->nkey_input; j++)
+				{
+					AttrNumber	at = as->key_input_attnos[j];
+					int			ic = s->attno_to_col[at - 1];
+
+					as->key_slot->tts_values[at - 1] =
+						dbbc_chunk_read(s, ic, row,
+										&as->key_slot->tts_isnull[at - 1]);
+				}
+				ExecStoreVirtualTuple(as->key_slot);
+				as->key_econtext->ecxt_scantuple = as->key_slot;
+			}
 			for (k = 0; k < as->nkeys; k++)
 			{
-				int			kc = s->attno_to_col[as->key_attnos[k] - 1];
+				if (as->key_attnos[k] != InvalidAttrNumber)
+				{
+					int			kc = s->attno_to_col[as->key_attnos[k] - 1];
 
-				keyvals[k] = dbbc_chunk_read(s, kc, row, &keynulls[k]);
+					keyvals[k] = dbbc_chunk_read(s, kc, row, &keynulls[k]);
+				}
+				else
+					keyvals[k] = ExecEvalExpr(as->key_exprstate[k],
+											  as->key_econtext, &keynulls[k]);
 			}
 			for (a = 0; a < as->ntrans; a++)
 			{
@@ -3826,9 +3978,22 @@ dbbc_grp_consume_heap_range(DbbcAggScanState *as, DbbcScanState *s,
 		}
 		if (pass)
 		{
+			if (as->has_key_exprs)
+			{
+				/* the heap slot already holds all columns; point the expr
+				 * context at it directly (no separate scratch slot needed) */
+				ResetExprContext(as->key_econtext);
+				as->key_econtext->ecxt_scantuple = s->heap_slot;
+			}
 			for (k = 0; k < as->nkeys; k++)
-				keyvals[k] = slot_getattr(s->heap_slot, as->key_attnos[k],
-										  &keynulls[k]);
+			{
+				if (as->key_attnos[k] != InvalidAttrNumber)
+					keyvals[k] = slot_getattr(s->heap_slot, as->key_attnos[k],
+											  &keynulls[k]);
+				else
+					keyvals[k] = ExecEvalExpr(as->key_exprstate[k],
+											  as->key_econtext, &keynulls[k]);
+			}
 			for (a = 0; a < as->ntrans; a++)
 			{
 				DbbcAggTrans *t = &as->trans[a];
