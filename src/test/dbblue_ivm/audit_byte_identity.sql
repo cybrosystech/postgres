@@ -183,11 +183,19 @@ BEGIN
     EXECUTE 'CREATE MATERIALIZED VIEW ab6_bad3 WITH (incremental_refresh=true) AS SELECT g,f,count(*) c FROM ab_gs GROUP BY GROUPING SETS ((g),(f))';
     RAISE EXCEPTION 'GROUPING SETS should be rejected';
   EXCEPTION WHEN feature_not_supported THEN NULL; END;
+  BEGIN
+    EXECUTE 'CREATE MATERIALIZED VIEW ab6_bad4 WITH (incremental_refresh=true) AS SELECT g,count(*) c FROM ab_gs TABLESAMPLE BERNOULLI(50) GROUP BY g';
+    RAISE EXCEPTION 'TABLESAMPLE should be rejected';
+  EXCEPTION WHEN feature_not_supported THEN NULL; END;
+  BEGIN
+    EXECUTE 'CREATE MATERIALIZED VIEW ab6_bad5 WITH (incremental_refresh=true) AS SELECT unnest(ARRAY[g,g]) u, count(*) c FROM ab_gs GROUP BY unnest(ARRAY[g,g])';
+    RAISE EXCEPTION 'set-returning function in SELECT should be rejected';
+  EXCEPTION WHEN feature_not_supported THEN NULL; END;
   -- a leaf partition used directly, and a plain GROUP BY, must still be accepted
   EXECUTE 'CREATE MATERIALIZED VIEW ab6_ok1 WITH (incremental_refresh=true) AS SELECT grp,count(*) c FROM ab_part_a GROUP BY grp';
   EXECUTE 'CREATE MATERIALIZED VIEW ab6_ok2 WITH (incremental_refresh=true) AS SELECT g,count(*) c FROM ab_gs GROUP BY g';
   EXECUTE 'DROP MATERIALIZED VIEW ab6_ok1'; EXECUTE 'DROP MATERIALIZED VIEW ab6_ok2';
-  RAISE NOTICE '6. partitioned source + GROUPING SETS/ROLLUP rejected; leaf + plain GROUP BY accepted: PASS';
+  RAISE NOTICE '6. partitioned/GROUPING SETS/TABLESAMPLE/SRF rejected; leaf + plain GROUP BY accepted: PASS';
 END $$;
 DROP TABLE ab_part, ab_gs CASCADE;
 \echo 'PASS: byte-identity audit regressions all green'

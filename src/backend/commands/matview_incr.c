@@ -703,6 +703,30 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 		return false;
 	}
 
+	/*
+	 * A set-returning function in the SELECT list (e.g. unnest/generate_series)
+	 * expands one input row into many output rows; the per-row delta engine has
+	 * no way to attribute a source change to the right expanded output rows.
+	 */
+	if (viewQuery->hasTargetSRFs)
+	{
+		*reason = "set-returning functions in the SELECT list cannot be "
+			"maintained incrementally";
+		return false;
+	}
+
+	/*
+	 * Row-locking clauses (FOR UPDATE/SHARE) have no meaning for a maintained
+	 * matview and are not part of any proven-safe shape — reject rather than
+	 * silently ignore.
+	 */
+	if (viewQuery->rowMarks != NIL || viewQuery->hasForUpdate)
+	{
+		*reason = "FOR UPDATE/SHARE cannot be used in an incremental "
+			"materialized view definition";
+		return false;
+	}
+
 	if (viewQuery->havingQual != NULL && viewQuery->groupClause == NIL)
 	{
 		*reason = "HAVING requires GROUP BY";
@@ -911,6 +935,18 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 					*reason = psprintf("partitioned table \"%s\" is not supported "
 									   "as a source for incremental refresh",
 									   get_rel_name(rte->relid));
+					hash_destroy(oid_counts);
+					return false;
+				}
+				/*
+				 * TABLESAMPLE draws a RANDOM subset, so the result is not a
+				 * deterministic function of the base data — neither incremental
+				 * maintenance nor a re-REFRESH would reproduce the same rows.
+				 */
+				if (rte->tablesample != NULL)
+				{
+					*reason = "TABLESAMPLE cannot be maintained incrementally "
+						"(its row set is nondeterministic)";
 					hash_destroy(oid_counts);
 					return false;
 				}
