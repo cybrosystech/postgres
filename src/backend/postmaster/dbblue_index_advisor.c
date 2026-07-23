@@ -42,12 +42,15 @@
 
 #include "access/transam.h"
 #include "access/xact.h"
+#include "catalog/pg_am.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_database.h"
+#include "catalog/pg_namespace.h"
 #include "catalog/pg_type.h"
 #include "common/hashfn.h"
 #include "executor/spi.h"
 #include "libpq/pqsignal.h"
+#include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/optimizer.h"
@@ -99,6 +102,7 @@ typedef struct WorkloadEntry
 	int64		calls;
 	double		total_exec_ms;
 	char	   *query_text;
+	Oid			userid;			/* role that ran the query (for planning) */
 } WorkloadEntry;
 
 /*
@@ -149,8 +153,24 @@ static MemoryContext advisor_cxt = NULL;
  */
 static bool advisor_env_ready = false;
 
+/*
+ * Set once BackgroundWorkerInitializeConnection has attached the worker to
+ * its database.  The connection is deferred until the feature is first
+ * enabled, so a cluster that never turns the advisor on neither pins the
+ * database (which would block DROP DATABASE) nor holds a connection for a
+ * feature doing nothing.
+ */
+static bool advisor_connected = false;
+
 /* Time the last analysis pass started; 0 forces a pass on next wakeup. */
 static TimestampTz advisor_last_pass = 0;
+
+/*
+ * Start time of the pass currently running.  Read by advisor_store_suggestion
+ * to decide whether a conflicting row is from this pass (accumulate the
+ * estimated benefit) or an earlier one (reset it): a fresh snapshot.
+ */
+static TimestampTz advisor_pass_start = 0;
 
 static void advisor_ensure_environment(void);
 static bool advisor_exec_in_subxact(const char *sql, const char *what);
@@ -168,7 +188,7 @@ static void add_candidate(List **candidates, Oid relid,
 static bool existing_index_covers(Oid relid, int nkeys,
 								  const AttrNumber *keys);
 static void advisor_prune_stale(TimestampTz pass_start);
-static double advisor_plan_cost(const char *query_text);
+static double advisor_plan_cost(const char *query_text, Oid userid);
 static void advisor_evaluate_candidate(WorkloadEntry *entry,
 									   IndexCandidate *cand,
 									   double baseline);
@@ -219,9 +239,14 @@ dbblue_check_advisor_enabled(bool *newval, void **extra, GucSource source)
 				 errdetail("The dbblue index advisor reads its workload from pg_stat_statements, which collects statistics only when preloaded."),
 				 errhint("Add pg_stat_statements to shared_preload_libraries and restart the server.")));
 
-	if (dbblue_auto_index_suggestion_database != NULL &&
-		!OidIsValid(get_database_oid(dbblue_auto_index_suggestion_database,
-									 true)))
+	if (dbblue_auto_index_suggestion_database == NULL ||
+		dbblue_auto_index_suggestion_database[0] == '\0')
+		ereport(WARNING,
+				(errmsg("dbblue_auto_index_suggestion_enabled is on, but dbblue_auto_index_suggestion_database is not set"),
+				 errdetail("With no database configured the advisor worker is not registered and will not run."),
+				 errhint("Set dbblue_auto_index_suggestion_database to an existing database and restart the server.")));
+	else if (!OidIsValid(get_database_oid(dbblue_auto_index_suggestion_database,
+										  true)))
 		ereport(WARNING,
 				(errmsg("dbblue index advisor database \"%s\" does not exist",
 						dbblue_auto_index_suggestion_database),
@@ -302,6 +327,18 @@ advisor_ensure_environment(void)
 
 	pgss_ok = advisor_exec_in_subxact("CREATE EXTENSION IF NOT EXISTS pg_stat_statements",
 									  "installing pg_stat_statements");
+
+	/*
+	 * CREATE EXTENSION IF NOT EXISTS is a no-op when the extension already
+	 * exists at an older version, so bring it up to the newest installed
+	 * version explicitly.  The workload query reads columns (toplevel,
+	 * total_exec_time) that only exist in pg_stat_statements 1.9+; without
+	 * this an old pre-existing install would make every pass fail.  UPDATE
+	 * is itself a no-op when already current.
+	 */
+	if (pgss_ok)
+		(void) advisor_exec_in_subxact("ALTER EXTENSION pg_stat_statements UPDATE",
+									   "upgrading pg_stat_statements");
 	hypopg_ok = advisor_exec_in_subxact("CREATE EXTENSION IF NOT EXISTS hypopg",
 										"installing hypopg");
 	table_ok = advisor_exec_in_subxact(
@@ -319,6 +356,7 @@ advisor_ensure_environment(void)
 									   "  cost_after double precision NOT NULL,"
 									   "  cost_reduction double precision NOT NULL,"
 									   "  estimated_benefit double precision,"
+									   "  queries_helped bigint NOT NULL DEFAULT 1,"
 									   "  first_suggested timestamptz NOT NULL DEFAULT now(),"
 									   "  last_suggested timestamptz NOT NULL DEFAULT now(),"
 									   "  times_suggested bigint NOT NULL DEFAULT 1,"
@@ -328,9 +366,82 @@ advisor_ensure_environment(void)
 
 	/* Schema migration for tables created by older advisor versions. */
 	if (table_ok)
+	{
 		(void) advisor_exec_in_subxact("ALTER TABLE public." ADVISOR_RESULT_TABLE
 									   " ADD COLUMN IF NOT EXISTS estimated_benefit double precision",
 									   "migrating results table");
+		(void) advisor_exec_in_subxact("ALTER TABLE public." ADVISOR_RESULT_TABLE
+									   " ADD COLUMN IF NOT EXISTS queries_helped bigint NOT NULL DEFAULT 1",
+									   "migrating results table (queries_helped)");
+	}
+
+	/*
+	 * CREATE TABLE IF NOT EXISTS is a no-op against a pre-existing table of
+	 * the same name but a different shape.  The upsert relies on the unique
+	 * constraint, so verify it is present; if it is missing, try to add it,
+	 * and if that fails the table is unusable - refuse to mark the
+	 * environment ready rather than warn on every candidate of every pass.
+	 */
+	if (table_ok)
+	{
+		MemoryContext envcxt = CurrentMemoryContext;
+		ResourceOwner envowner = CurrentResourceOwner;
+		bool		has_constraint = false;
+
+		/*
+		 * Guard the catalog probe with a subtransaction.  Everything else in
+		 * this function is throw-safe (advisor_exec_in_subxact); a bare
+		 * SPI_execute that threw here would abort the whole environment setup
+		 * and, because advisor_env_ready stays false, make the main loop retry
+		 * it with no wait in between.
+		 */
+		BeginInternalSubTransaction(NULL);
+		PG_TRY();
+		{
+			int			spi_ret;
+
+			spi_ret = SPI_execute(
+								  "SELECT 1 FROM pg_catalog.pg_constraint "
+								  "WHERE conname = 'dbblue_index_suggestions_ddl_unique' "
+								  "AND conrelid = 'public." ADVISOR_RESULT_TABLE "'::regclass",
+								  true, 1);
+			has_constraint = (spi_ret == SPI_OK_SELECT && SPI_processed > 0);
+
+			ReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(envcxt);
+			CurrentResourceOwner = envowner;
+		}
+		PG_CATCH();
+		{
+			MemoryContextSwitchTo(envcxt);
+			FlushErrorState();
+			RollbackAndReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(envcxt);
+			CurrentResourceOwner = envowner;
+			has_constraint = false;
+		}
+		PG_END_TRY();
+
+		if (!has_constraint)
+		{
+			bool		added;
+
+			added = advisor_exec_in_subxact(
+										   "ALTER TABLE public." ADVISOR_RESULT_TABLE
+										   " ADD CONSTRAINT dbblue_index_suggestions_ddl_unique"
+										   " UNIQUE (suggested_index)",
+										   "adding missing unique constraint");
+
+			if (!added)
+			{
+				ereport(WARNING,
+						(errmsg("dbblue index advisor: results table public.%s exists but lacks the required unique constraint",
+								ADVISOR_RESULT_TABLE),
+						 errhint("Drop or rename the conflicting table so the advisor can recreate it.")));
+				table_ok = false;
+			}
+		}
+	}
 
 	SPI_finish();
 	PopActiveSnapshot();
@@ -415,7 +526,8 @@ record_column(Query *query, Node *node, ColumnRole role, List **tables)
 
 		if (relname == NULL)
 			return;
-		if (strcmp(relname, ADVISOR_RESULT_TABLE) == 0)
+		if (strcmp(relname, ADVISOR_RESULT_TABLE) == 0 &&
+			get_rel_namespace(rte->relid) == PG_PUBLIC_NAMESPACE)
 		{
 			pfree(relname);
 			return;
@@ -605,10 +717,16 @@ collect_query_columns(Query *query, List **tables)
 
 	if (query->commandType != CMD_SELECT &&
 		query->commandType != CMD_UPDATE &&
-		query->commandType != CMD_DELETE)
+		query->commandType != CMD_DELETE &&
+		query->commandType != CMD_INSERT &&
+		query->commandType != CMD_MERGE)
 		return;
 
-	/* WHERE clause and JOIN ON conditions. */
+	/*
+	 * WHERE clause and JOIN ON conditions.  For INSERT ... SELECT the source
+	 * SELECT is a subquery RTE, reached by the rtable loop below; for MERGE
+	 * the join lives in mergeJoinCondition, handled further down.
+	 */
 	collect_from_node(query, (Node *) query->jointree, tables);
 
 	/* HAVING. */
@@ -630,6 +748,56 @@ collect_query_columns(Query *query, List **tables)
 
 		if (tle != NULL)
 			record_column(query, (Node *) tle->expr, COLROLE_SORT, tables);
+	}
+
+	/* DISTINCT / DISTINCT ON keys behave like ordering keys. */
+	foreach(lc, query->distinctClause)
+	{
+		SortGroupClause *sgc = (SortGroupClause *) lfirst(lc);
+		TargetEntry *tle = get_sortgroupclause_tle(sgc, query->targetList);
+
+		if (tle != NULL)
+			record_column(query, (Node *) tle->expr, COLROLE_SORT, tables);
+	}
+
+	/* Window PARTITION BY (grouping) and ORDER BY (sort) keys. */
+	foreach(lc, query->windowClause)
+	{
+		WindowClause *wc = (WindowClause *) lfirst(lc);
+		ListCell   *wlc;
+
+		foreach(wlc, wc->partitionClause)
+		{
+			SortGroupClause *sgc = (SortGroupClause *) lfirst(wlc);
+			TargetEntry *tle = get_sortgroupclause_tle(sgc, query->targetList);
+
+			if (tle != NULL)
+				record_column(query, (Node *) tle->expr, COLROLE_GROUP, tables);
+		}
+		foreach(wlc, wc->orderClause)
+		{
+			SortGroupClause *sgc = (SortGroupClause *) lfirst(wlc);
+			TargetEntry *tle = get_sortgroupclause_tle(sgc, query->targetList);
+
+			if (tle != NULL)
+				record_column(query, (Node *) tle->expr, COLROLE_SORT, tables);
+		}
+	}
+
+	/*
+	 * MERGE: the ON condition (kept apart from the jointree at parse-analysis
+	 * time) and each WHEN action's qual.
+	 */
+	if (query->commandType == CMD_MERGE)
+	{
+		classify_qual(query, query->mergeJoinCondition, tables);
+
+		foreach(lc, query->mergeActionList)
+		{
+			MergeAction *action = (MergeAction *) lfirst(lc);
+
+			classify_qual(query, action->qual, tables);
+		}
 	}
 
 	/* Subqueries in FROM (this also covers UNION/INTERSECT branches). */
@@ -678,13 +846,18 @@ candidate_index_name(const char *table_name, List *colnames)
 		/*
 		 * Too long to survive as an identifier.  Keep a recognisable
 		 * prefix and disambiguate with a hash of the full name, so two
-		 * long candidates that share a prefix cannot collide after
+		 * long candidates that share a prefix cannot	 collide after
 		 * truncation (IF NOT EXISTS would then skip the second one).
 		 */
 		uint32		hash = hash_bytes((const unsigned char *) buf.data,
 									  buf.len);
 
-		buf.len = NAMEDATALEN - 10;
+		/*
+		 * Clip on a character boundary, not a raw byte offset: a byte-offset
+		 * cut can split a multibyte (e.g. UTF-8) identifier mid-character and
+		 * leave invalid bytes in the stored DDL.
+		 */
+		buf.len = pg_mbcliplen(buf.data, buf.len, NAMEDATALEN - 10);
 		buf.data[buf.len] = '\0';
 		appendStringInfo(&buf, "_%08x", hash);
 	}
@@ -711,7 +884,12 @@ add_candidate(List **candidates, Oid relid, int nkeys, const AttrNumber *keys)
 	int			i;
 
 	if (list_length(*candidates) >= ADVISOR_MAX_CANDIDATES)
+	{
+		ereport(DEBUG1,
+				(errmsg("dbblue index advisor: candidate cap (%d) reached for relation %u, dropping further candidates",
+						ADVISOR_MAX_CANDIDATES, relid)));
 		return;
+	}
 
 	/* Dedup against candidates gathered so far. */
 	foreach(lc, *candidates)
@@ -796,13 +974,15 @@ build_candidates(List *tables)
 		role_lists[2] = usage->sort_cols;
 		role_lists[3] = usage->range_cols;
 
+		/*
+		 * Build the composite key list first, in equality -> group -> sort ->
+		 * range order, capped at max_index_columns.
+		 */
 		for (i = 0; i < 4; i++)
 		{
 			foreach(lc2, role_lists[i])
 			{
 				AttrNumber	attno = (AttrNumber) lfirst_int(lc2);
-
-				add_candidate(&candidates, usage->relid, 1, &attno);
 
 				if (!list_member_int(composite, (int) attno) &&
 					list_length(composite) <
@@ -811,6 +991,12 @@ build_candidates(List *tables)
 			}
 		}
 
+		/*
+		 * Emit the composite candidate before the single-column ones.  It is
+		 * usually the most valuable suggestion, and add_candidate enforces a
+		 * hard cap (ADVISOR_MAX_CANDIDATES); adding singles first could push
+		 * the composite past the cap on a wide, multi-column query.
+		 */
 		if (list_length(composite) >= 2)
 		{
 			int			nkeys = list_length(composite);
@@ -822,6 +1008,17 @@ build_candidates(List *tables)
 
 			add_candidate(&candidates, usage->relid, nkeys, keys);
 			pfree(keys);
+		}
+
+		/* Then the single-column candidates. */
+		for (i = 0; i < 4; i++)
+		{
+			foreach(lc2, role_lists[i])
+			{
+				AttrNumber	attno = (AttrNumber) lfirst_int(lc2);
+
+				add_candidate(&candidates, usage->relid, 1, &attno);
+			}
 		}
 
 		list_free(composite);
@@ -864,15 +1061,17 @@ existing_index_covers(Oid relid, int nkeys, const AttrNumber *keys)
 
 	initStringInfo(&sql);
 	appendStringInfo(&sql,
-					 "SELECT 1 FROM pg_catalog.pg_index "
-					 "WHERE indrelid = %u AND indisvalid "
-					 "AND ((indnkeyatts >= %d AND "
-					 "      (string_to_array(indkey::text, ' ')::int2[])[1:%d] = %s) "
-					 " OR  (indisunique AND indnkeyatts <= %d AND "
-					 "      (string_to_array(indkey::text, ' ')::int2[])[1:indnkeyatts] "
-					 "      = (%s)[1:indnkeyatts])) "
+					 "SELECT 1 FROM pg_catalog.pg_index i "
+					 "JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid "
+					 "WHERE i.indrelid = %u AND i.indisvalid "
+					 "AND i.indpred IS NULL AND c.relam = %u "
+					 "AND ((i.indnkeyatts >= %d AND "
+					 "      (string_to_array(i.indkey::text, ' ')::int2[])[1:%d] = %s) "
+					 " OR  (i.indisunique AND i.indnkeyatts <= %d AND "
+					 "      (string_to_array(i.indkey::text, ' ')::int2[])[1:i.indnkeyatts] "
+					 "      = (%s)[1:i.indnkeyatts])) "
 					 "LIMIT 1",
-					 relid, nkeys, nkeys, arr.data, nkeys, arr.data);
+					 relid, BTREE_AM_OID, nkeys, nkeys, arr.data, nkeys, arr.data);
 
 	if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
 		covered = true;
@@ -892,15 +1091,37 @@ existing_index_covers(Oid relid, int nkeys, const AttrNumber *keys)
  * "Total Cost" key in the JSON output belongs to the topmost plan node.
  */
 static double
-advisor_plan_cost(const char *query_text)
+advisor_plan_cost(const char *query_text, Oid userid)
 {
 	char	   *sql;
 	double		cost = -1.0;
 	int			ret;
+	Oid			save_userid;
+	int			save_sec_context;
 
 	sql = psprintf("EXPLAIN (GENERIC_PLAN, COSTS ON, FORMAT JSON) %s",
 				   query_text);
+
+	/*
+	 * Plan the untrusted query text as the user who ran it, inside a
+	 * restricted security context.  Planning constant-folds immutable
+	 * functions embedded in the query text, which executes them; doing so
+	 * under the advisor's (superuser) identity would let any user who can
+	 * get a query into pg_stat_statements run code as superuser.  Planning
+	 * as the original user also makes the estimated cost honour that user's
+	 * row-level security policies.
+	 *
+	 * On error SPI_execute longjmps out before the identity is restored;
+	 * the enclosing subtransaction's abort path restores it.  On success it
+	 * is restored explicitly right after the call.
+	 */
+	GetUserIdAndSecContext(&save_userid, &save_sec_context);
+	SetUserIdAndSecContext(userid,
+						   save_sec_context | SECURITY_RESTRICTED_OPERATION);
+
 	ret = SPI_execute(sql, false, 0);
+
+	SetUserIdAndSecContext(save_userid, save_sec_context);
 
 	if ((ret == SPI_OK_UTILITY || ret == SPI_OK_SELECT) &&
 		SPI_processed > 0 && SPI_tuptable != NULL)
@@ -931,11 +1152,12 @@ static void
 advisor_store_suggestion(WorkloadEntry *entry, IndexCandidate *cand,
 						 double baseline, double hypo_cost, double reduction)
 {
-	Oid			argtypes[12] = {
+	Oid			argtypes[13] = {
 		TEXTOID, TEXTOID, TEXTARRAYOID, TEXTOID, INT8OID, TEXTOID,
-		INT8OID, FLOAT8OID, FLOAT8OID, FLOAT8OID, FLOAT8OID, FLOAT8OID
+		INT8OID, FLOAT8OID, FLOAT8OID, FLOAT8OID, FLOAT8OID, FLOAT8OID,
+		TIMESTAMPTZOID
 	};
-	Datum		values[12];
+	Datum		values[13];
 	Datum	   *colnames;
 	ListCell   *lc;
 	int			i = 0;
@@ -960,11 +1182,17 @@ advisor_store_suggestion(WorkloadEntry *entry, IndexCandidate *cand,
 	values[10] = Float8GetDatum(reduction);
 
 	/*
-	 * Total planner cost the index would save across all recorded calls
-	 * of the query.  Sorting by this column separates a big win on a hot
+	 * Per-query planner cost the index would save across all recorded calls
+	 * of this query.  The upsert below sums this over every query in the
+	 * current pass that the same index helps (tracked in queries_helped), so
+	 * the stored estimated_benefit reflects the index's total value, not just
+	 * the last query processed.  Sorting by it separates a big win on a hot
 	 * query from an equally large *percentage* win on a trivial one.
 	 */
 	values[11] = Float8GetDatum((baseline - hypo_cost) * (double) entry->calls);
+
+	/* Pass start, so the upsert can tell "this pass" from "an earlier one". */
+	values[12] = TimestampTzGetDatum(advisor_pass_start);
 
 	ret = SPI_execute_with_args(
 								"INSERT INTO public." ADVISOR_RESULT_TABLE
@@ -983,8 +1211,23 @@ advisor_store_suggestion(WorkloadEntry *entry, IndexCandidate *cand,
 								"  cost_before = EXCLUDED.cost_before,"
 								"  cost_after = EXCLUDED.cost_after,"
 								"  cost_reduction = EXCLUDED.cost_reduction,"
-								"  estimated_benefit = EXCLUDED.estimated_benefit",
-								12, argtypes, values, NULL, false, 0);
+								/*
+								 * A row last touched before this pass started is
+								 * a stale snapshot: reset the benefit and the
+								 * helped-query count.  A row already touched in
+								 * this pass came from another query hitting the
+								 * same index: accumulate.
+								 */
+								"  estimated_benefit = CASE"
+								"    WHEN " ADVISOR_RESULT_TABLE ".last_suggested < $13"
+								"      THEN EXCLUDED.estimated_benefit"
+								"    ELSE COALESCE(" ADVISOR_RESULT_TABLE ".estimated_benefit, 0)"
+								"         + EXCLUDED.estimated_benefit END,"
+								"  queries_helped = CASE"
+								"    WHEN " ADVISOR_RESULT_TABLE ".last_suggested < $13"
+								"      THEN 1"
+								"    ELSE " ADVISOR_RESULT_TABLE ".queries_helped + 1 END",
+								13, argtypes, values, NULL, false, 0);
 
 	if (ret != SPI_OK_INSERT && ret != SPI_OK_UPDATE)
 		ereport(WARNING,
@@ -1018,7 +1261,7 @@ advisor_evaluate_candidate(WorkloadEntry *entry, IndexCandidate *cand,
 		(void) SPI_execute(hypo_sql, false, 0);
 		pfree(hypo_sql);
 
-		hypo_cost = advisor_plan_cost(entry->query_text);
+		hypo_cost = advisor_plan_cost(entry->query_text, entry->userid);
 
 		if (hypo_cost >= 0.0 && hypo_cost < baseline)
 		{
@@ -1123,7 +1366,9 @@ advisor_process_entry(WorkloadEntry *entry)
 
 			if (IsA(raw->stmt, SelectStmt) ||
 				IsA(raw->stmt, UpdateStmt) ||
-				IsA(raw->stmt, DeleteStmt))
+				IsA(raw->stmt, DeleteStmt) ||
+				IsA(raw->stmt, InsertStmt) ||
+				IsA(raw->stmt, MergeStmt))
 			{
 				Oid		   *paramtypes = NULL;
 				int			numparams = 0;
@@ -1187,7 +1432,7 @@ advisor_process_entry(WorkloadEntry *entry)
 		BeginInternalSubTransaction(NULL);
 		PG_TRY();
 		{
-			baseline = advisor_plan_cost(entry->query_text);
+			baseline = advisor_plan_cost(entry->query_text, entry->userid);
 			ReleaseCurrentSubTransaction();
 			MemoryContextSwitchTo(oldcxt);
 			CurrentResourceOwner = oldowner;
@@ -1270,7 +1515,7 @@ advisor_load_workload(void)
 	pgstat_report_activity(STATE_RUNNING,
 						   "dbblue index advisor: reading pg_stat_statements");
 
-	sql = psprintf("SELECT queryid, calls, total_exec_time, query "
+	sql = psprintf("SELECT queryid, calls, total_exec_time, query, userid "
 				   "FROM pg_stat_statements "
 				   "WHERE dbid = %u AND toplevel "
 				   "AND queryid IS NOT NULL AND calls >= %d "
@@ -1293,11 +1538,13 @@ advisor_load_workload(void)
 		bool		null_qid,
 					null_calls,
 					null_time,
-					null_text;
+					null_text,
+					null_user;
 		Datum		d_qid,
 					d_calls,
 					d_time,
-					d_text;
+					d_text,
+					d_user;
 		WorkloadEntry *entry;
 		MemoryContext oldcxt;
 
@@ -1305,8 +1552,9 @@ advisor_load_workload(void)
 		d_calls = SPI_getbinval(tuple, tupdesc, 2, &null_calls);
 		d_time = SPI_getbinval(tuple, tupdesc, 3, &null_time);
 		d_text = SPI_getbinval(tuple, tupdesc, 4, &null_text);
+		d_user = SPI_getbinval(tuple, tupdesc, 5, &null_user);
 
-		if (null_qid || null_calls || null_time || null_text)
+		if (null_qid || null_calls || null_time || null_text || null_user)
 			continue;
 
 		oldcxt = MemoryContextSwitchTo(advisor_cxt);
@@ -1315,6 +1563,7 @@ advisor_load_workload(void)
 		entry->calls = DatumGetInt64(d_calls);
 		entry->total_exec_ms = DatumGetFloat8(d_time);
 		entry->query_text = TextDatumGetCString(d_text);
+		entry->userid = DatumGetObjectId(d_user);
 		entries = lappend(entries, entry);
 		MemoryContextSwitchTo(oldcxt);
 	}
@@ -1378,6 +1627,8 @@ advisor_run_pass(void)
 	ListCell   *lc;
 	TimestampTz pass_start = GetCurrentTimestamp();
 
+	advisor_pass_start = pass_start;
+
 	entries = advisor_load_workload();
 
 	ereport(LOG,
@@ -1394,11 +1645,20 @@ advisor_run_pass(void)
 	}
 
 	/*
-	 * Prune only after a complete pass; an interrupted pass must not
-	 * wipe suggestions it did not get around to re-confirming.
+	 * Prune only after a complete pass; an interrupted pass must not wipe
+	 * suggestions it did not get around to re-confirming.
+	 *
+	 * Also skip pruning when the workload came back empty: a
+	 * pg_stat_statements_reset() (or eviction from its fixed-size hash)
+	 * leaves nothing to re-confirm, and pruning then would delete every
+	 * accumulated suggestion.  Keeping stale advice for one more interval is
+	 * far better than discarding all of it because statistics were reset.
 	 */
-	if (!ShutdownRequestPending)
+	if (!ShutdownRequestPending && entries != NIL)
 		advisor_prune_stale(pass_start);
+	else if (entries == NIL)
+		ereport(DEBUG1,
+				(errmsg("dbblue index advisor: empty workload, keeping existing suggestions")));
 
 	/* Free the workload copies. */
 	MemoryContextSwitchTo(TopMemoryContext);
@@ -1419,20 +1679,12 @@ DbblueIndexAdvisorMain(Datum main_arg)
 	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
 	BackgroundWorkerUnblockSignals();
 
-	BackgroundWorkerInitializeConnection(dbblue_auto_index_suggestion_database,
-										 NULL, 0);
-
 	/*
-	 * Keep the advisor's own statements (EXPLAINs, hypopg calls, the
-	 * result-table upserts) out of pg_stat_statements.  Without this,
-	 * every pass roughly doubles the extension's entry count, evicts
-	 * genuine workload queries from its fixed-size hash table, and the
-	 * advisor eventually starts analysing its own queries.  The setting
-	 * is session-local to this worker; client backends are unaffected.
+	 * The database connection is deferred to the main loop and opened the
+	 * first time the feature is seen enabled (see advisor_connected).  A
+	 * cluster that never enables the advisor therefore never attaches to the
+	 * database, so DROP DATABASE on it is not blocked by this worker.
 	 */
-	SetConfigOption("pg_stat_statements.track", "none",
-					PGC_SUSET, PGC_S_SESSION);
-
 	ereport(LOG,
 			(errmsg("dbblue index advisor started (database \"%s\", %s)",
 					dbblue_auto_index_suggestion_database,
@@ -1452,6 +1704,9 @@ DbblueIndexAdvisorMain(Datum main_arg)
 	 */
 	if (sigsetjmp(local_sigjmp_buf, 1) != 0)
 	{
+		/* Since not using PG_TRY, must reset error stack by hand. */
+		error_context_stack = NULL;
+
 		HOLD_INTERRUPTS();
 
 		EmitErrorReport();
@@ -1491,6 +1746,42 @@ DbblueIndexAdvisorMain(Datum main_arg)
 
 		if (dbblue_auto_index_suggestion_enabled)
 		{
+			if (!advisor_connected)
+			{
+				BackgroundWorkerInitializeConnection(
+									dbblue_auto_index_suggestion_database,
+									NULL, 0);
+
+				/*
+				 * Keep the advisor's own statements (EXPLAINs, hypopg calls,
+				 * the result-table upserts) out of pg_stat_statements.
+				 * Without this, every pass roughly doubles the extension's
+				 * entry count, evicts genuine workload queries from its
+				 * fixed-size hash table, and the advisor eventually starts
+				 * analysing its own queries.  The setting is session-local to
+				 * this worker; client backends are unaffected.
+				 */
+				SetConfigOption("pg_stat_statements.track", "none",
+								PGC_SUSET, PGC_S_SESSION);
+
+				/*
+				 * Bound how long the advisor will wait for a lock.  Planning
+				 * an EXPLAINed UPDATE/DELETE takes RowExclusiveLock on the
+				 * target table at parse-analysis time; if that queues behind
+				 * an ACCESS EXCLUSIVE waiter (ALTER TABLE, VACUUM FULL, ...),
+				 * the worker would wait indefinitely and stall everything
+				 * queued behind it.  On timeout the statement errors and the
+				 * candidate is skipped by its subtransaction.  lock_timeout is
+				 * honoured in ProcSleep regardless of the command path, unlike
+				 * statement_timeout, which is armed only by the normal client
+				 * command loop this worker does not use.
+				 */
+				SetConfigOption("lock_timeout", "5s",
+								PGC_SUSET, PGC_S_SESSION);
+
+				advisor_connected = true;
+			}
+
 			if (!advisor_env_ready)
 				advisor_ensure_environment();
 
@@ -1531,7 +1822,18 @@ DbblueIndexAdvisorMain(Datum main_arg)
 	}
 
 	ereport(LOG, (errmsg("dbblue index advisor shutting down")));
-	proc_exit(0);
+
+	/*
+	 * Exit non-zero on SIGTERM.  A background worker that exits 0 is treated
+	 * by the postmaster as "terminate and forget" (rw_terminate), so a
+	 * pg_terminate_backend() on this worker would remove it until the next
+	 * server restart even while the feature is still enabled.  Exiting 1 is
+	 * not treated as a crash (no cluster-wide restart), but it does let
+	 * bgw_restart_time bring the worker back after an individual terminate.
+	 * During a full cluster shutdown the postmaster is going down anyway and
+	 * will not restart it regardless of the exit code.
+	 */
+	proc_exit(1);
 }
 
 /*
