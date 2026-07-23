@@ -375,6 +375,38 @@ mv_qname(Oid relid)
  */
 
 /*
+ * incr_sumavg_scale_unsafe — true if a SUM/AVG aggregate cannot be maintained
+ * byte-identically by the additive running-total path and must be recomputed:
+ *   - float4/float8: IEEE addition is non-associative, so a running total rounds
+ *     differently than a full re-aggregation over a different scan order;
+ *   - UNCONSTRAINED numeric (argument typmod -1): rows may carry different display
+ *     scales, and numeric add/subtract takes the MAX operand scale and never
+ *     shrinks, so after a higher-scale contributor is removed (or lowered) the
+ *     running total keeps stale trailing zeros — numerically equal to a full
+ *     REFRESH but not byte-identical.  Fixed-scale numeric(p,s) cannot drift
+ *     (every value has scale s), so it stays on the fast additive path.
+ * Kept in one place so the CREATE-time validator and the routing decision agree.
+ */
+static bool
+incr_sumavg_scale_unsafe(Aggref *agg)
+{
+	char	   *fname = get_func_name(agg->aggfnoid);
+
+	if (strcmp(fname, "sum") != 0 && strcmp(fname, "avg") != 0)
+		return false;
+	if (agg->aggtype == FLOAT4OID || agg->aggtype == FLOAT8OID)
+		return true;
+	if (agg->aggtype == NUMERICOID && agg->args != NIL)
+	{
+		TargetEntry *arg = linitial_node(TargetEntry, agg->args);
+
+		if (exprTypmod((Node *) arg->expr) == -1)
+			return true;
+	}
+	return false;
+}
+
+/*
  * incr_validate_group_aggref — validate one aggregate appearing in a GROUP BY
  * matview's target list, either as a bare output column or nested inside a
  * projection expression.  Sets *reason and returns false when the aggregate, its
@@ -390,12 +422,9 @@ incr_validate_group_aggref(Aggref *agg, Query *viewQuery, int nbasetables,
 		(strcmp(fname, "sum") == 0 || strcmp(fname, "count") == 0 ||
 		 strcmp(fname, "avg") == 0 || strcmp(fname, "min") == 0 ||
 		 strcmp(fname, "max") == 0);
-	bool		is_float_sumavg =
-		(strcmp(fname, "sum") == 0 || strcmp(fname, "avg") == 0) &&
-		(agg->aggtype == FLOAT4OID || agg->aggtype == FLOAT8OID);
 	bool		needs_rc =
 		agg->aggdistinct != NIL || agg->aggfilter != NULL ||
-		incr_is_recompute_only_func(fname) || is_float_sumavg;
+		incr_is_recompute_only_func(fname) || incr_sumavg_scale_unsafe(agg);
 
 	if (!is_additive && !incr_is_recompute_only_func(fname))
 	{
@@ -2194,8 +2223,23 @@ MatviewIncrSetup(Oid mvrelid, Query *viewQuery)
 									 delta->oid, MATVIEW_INCR_NEWTABLE);
 						del_sql = incr_build_del_sql_deparse(mvrelid, viewQuery,
 									 delta->oid, MATVIEW_INCR_OLDTABLE);
+						/*
+						 * Serialize multi-table additive deltas on the matview
+						 * advisory lock (unlike the single-table additive path,
+						 * which is safely unlocked).  A delta on a JOINED table
+						 * that changes a group key must READ the other table(s)
+						 * through the join to compute the per-group contribution
+						 * it moves (e.g. changing head.region re-buckets the sum
+						 * of that head's lines).  That cross-table read is not
+						 * serializable against concurrent deltas on those other
+						 * tables: without the lock, a row committing between the
+						 * read and the write is lost or double-counted, and the
+						 * matview drifts permanently from REFRESH.  The lock (plus
+						 * the post-lock fresh snapshot) makes the read atomic.
+						 */
 						incr_store_catalog(mvrelid, delta->oid,
-									   ins_sql, del_sql, cln_sql, hav_sql, NULL);
+									   ins_sql, del_sql, cln_sql, hav_sql,
+									   incr_build_mv_lock_sql(mvrelid));
 					}
 				incr_install_triggers(mvrelid, delta->oid);
 			}
@@ -5251,7 +5295,23 @@ incr_build_self_join_row_del_sql(Oid mvrelid, Query *viewQuery,
 
 	initStringInfo(&buf);
 
-	appendStringInfo(&buf, "DELETE FROM %s WHERE (", mv_qname(mvrelid));
+	/*
+	 * Match the matview rows to delete NULL-SAFELY.  A row-constructor
+	 * "(cols) IN (subquery)" uses "=" semantics, so any NULL output column
+	 * makes the comparison UNKNOWN and the row is never matched — a deleted
+	 * source row whose projection contains a NULL (e.g. an optional dimension
+	 * column) would be left behind, diverging from REFRESH.  Use EXISTS with
+	 * IS NOT DISTINCT FROM per column instead (same "delete every matching row"
+	 * behavior as IN, but NULL-safe).
+	 */
+	appendStringInfo(&buf, "DELETE FROM %s _mv_ WHERE EXISTS (\nSELECT 1 FROM (\n",
+					 mv_qname(mvrelid));
+
+	incr_build_self_join_select(&buf, viewQuery, v1, delta_table, all_tables);
+	appendStringInfoString(&buf, "\nUNION ALL\n");
+	incr_build_self_join_select(&buf, viewQuery, v2, delta_table, all_tables);
+
+	appendStringInfoString(&buf, "\n) _dr_ (");
 	first = true;
 	foreach(lc, viewQuery->targetList)
 	{
@@ -5261,12 +5321,18 @@ incr_build_self_join_row_del_sql(Oid mvrelid, Query *viewQuery,
 		appendStringInfoString(&buf, quote_identifier(te->resname));
 		first = false;
 	}
-	appendStringInfoString(&buf, ") IN (\n");
-
-	incr_build_self_join_select(&buf, viewQuery, v1, delta_table, all_tables);
-	appendStringInfoString(&buf, "\nUNION ALL\n");
-	incr_build_self_join_select(&buf, viewQuery, v2, delta_table, all_tables);
-
+	appendStringInfoString(&buf, ")\nWHERE ");
+	first = true;
+	foreach(lc, viewQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+		const char *col;
+		if (te->resjunk) continue;
+		if (!first) appendStringInfoString(&buf, " AND ");
+		col = quote_identifier(te->resname);
+		appendStringInfo(&buf, "_mv_.%s IS NOT DISTINCT FROM _dr_.%s", col, col);
+		first = false;
+	}
 	appendStringInfoString(&buf, "\n)");
 
 	return buf.data;
@@ -10444,14 +10510,14 @@ incr_needs_recompute(Query *viewQuery)
 		fname = get_func_name(agg->aggfnoid);
 
 		/* recompute-only funcs (stddev/bool/collect), FILTERed aggregates, and
-		 * float SUM/AVG (recompute avoids running-total rounding drift) all use
-		 * the recompute engine rather than an additive delta. */
+		 * scale-unsafe SUM/AVG (float, or unconstrained numeric — see
+		 * incr_sumavg_scale_unsafe) all use the recompute engine rather than an
+		 * additive running-total delta. */
 		if (incr_is_recompute_only_func(fname))
 			return true;
 		if (agg->aggfilter != NULL)
 			return true;
-		if ((strcmp(fname, "sum") == 0 || strcmp(fname, "avg") == 0) &&
-			(agg->aggtype == FLOAT4OID || agg->aggtype == FLOAT8OID))
+		if (incr_sumavg_scale_unsafe(agg))
 			return true;
 	}
 	return false;
@@ -11073,17 +11139,19 @@ incr_build_minmax_del_sql_gen(Oid mvrelid, Query *viewQuery,
 			if (!first)
 				appendStringInfoChar(&buf, ',');
 			first = false;
-			if (has_join)
-			{
-				appendStringInfoString(&buf, quote_identifier(te2->resname));
-			}
-			else
-			{
-				initStringInfo(&ebuf2);
-				incr_deparse_where_qual((Node *) te2->expr, viewQuery->rtable,
-										delta_varno, &ebuf2);
-				appendStringInfoString(&buf, ebuf2.data);
-			}
+			/*
+			 * Group by the QUALIFIED source expression, never the bare output
+			 * name.  A bare name that also exists as an input column of a joined
+			 * table — e.g. GROUP BY did when both the transition-table ENR and
+			 * the dimension expose a "did" column — is ambiguous: Postgres
+			 * resolves a bare GROUP BY name to an input column before an output
+			 * alias, and finds it in two relations.  The SELECT list above and
+			 * the new_agg CTE already qualify the same key the same way.
+			 */
+			initStringInfo(&ebuf2);
+			incr_deparse_where_qual((Node *) te2->expr, viewQuery->rtable,
+									delta_varno, &ebuf2);
+			appendStringInfoString(&buf, ebuf2.data);
 		}
 	}
 	appendStringInfoString(&buf, "),");
