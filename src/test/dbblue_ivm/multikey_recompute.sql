@@ -46,7 +46,7 @@ INSERT INTO mkr_am VALUES (100,'2024-01-10'),(101,'2024-02-20'),(102,'2024-01-15
 INSERT INTO mkr_aml VALUES
   (1,100,10,50,5),(2,100,11,50,2),(3,101,12,20,1),(4,101,NULL,10,3),
   (5,102,13,50,4),(6,102,99,30,7);         -- aml 4: orphan product; aml 6: dangling product_id
-CREATE MATERIALIZED VIEW mkr_i WITH (incremental_refresh=true) AS
+CREATE MATERIALIZED VIEW mkr_i WITH (incremental_refresh=true, allow_stable_keys=true) AS
   SELECT to_char(mkr_am.invoice_date,'YYYY-MM') mon, mkr_pt.default_code, mkr_pt.name,
          mkr_aml.price_unit, mkr_pp.bunch_code, sum(mkr_aml.quantity) qty, count(*) c
   FROM mkr_am JOIN mkr_aml ON mkr_aml.move_id=mkr_am.id
@@ -96,7 +96,7 @@ CREATE TABLE ao_d(id int primary key, k1 text, k2 text);
 CREATE TABLE ao_f(id int primary key, did int, amt numeric NOT NULL);
 INSERT INTO ao_d VALUES (1,'x','p'),(2,'y','q'),(3,NULL,'r');
 INSERT INTO ao_f VALUES (1,1,10),(2,1,20),(3,2,30),(4,3,40),(5,NULL,50),(6,7,60);
-CREATE MATERIALIZED VIEW ao_i WITH (incremental_refresh=true) AS
+CREATE MATERIALIZED VIEW ao_i WITH (incremental_refresh=true, allow_stable_keys=true) AS
   SELECT d.k1, d.k2, sum(f.amt) s, count(*) c
   FROM ao_f f LEFT JOIN ao_d d ON f.did=d.id GROUP BY d.k1, d.k2;
 CREATE MATERIALIZED VIEW ao_o AS

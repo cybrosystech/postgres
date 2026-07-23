@@ -29,7 +29,7 @@ INSERT INTO pt VALUES (1,'A','Alpha'),(2,'B','Beta');
 INSERT INTO pp VALUES (10,1),(11,2),(12,NULL);
 INSERT INTO am VALUES (1,'2024-01-10'),(2,'2024-02-15');
 INSERT INTO aml VALUES (1,1,10,100),(2,1,11,50),(3,2,12,20),(4,2,NULL,10);
-CREATE MATERIALIZED VIEW dbk_i WITH (incremental_refresh=true) AS
+CREATE MATERIALIZED VIEW dbk_i WITH (incremental_refresh=true, allow_stable_keys=true) AS
   SELECT to_char(am.d,'mon') m, pt.code, pt.name, sum(aml.price) rev, count(*) c
   FROM am JOIN aml ON aml.mid=am.id LEFT JOIN pp ON aml.pid=pp.id LEFT JOIN pt ON pp.tmpl=pt.id
   GROUP BY to_char(am.d,'mon'), pt.code, pt.name;
@@ -54,7 +54,7 @@ DROP TABLE am, aml, pp, pt CASCADE;
 DROP TABLE IF EXISTS ev CASCADE;
 CREATE TABLE ev(id int primary key, d date, amt numeric);
 INSERT INTO ev SELECT g, '2024-01-01'::date + (g*10), g FROM generate_series(1,20) g;
-CREATE MATERIALIZED VIEW ev_i WITH (incremental_refresh=true) AS
+CREATE MATERIALIZED VIEW ev_i WITH (incremental_refresh=true, allow_stable_keys=true) AS
   SELECT to_char(d,'mon') m, date_trunc('month', d::timestamp) mt, sum(amt) s, count(*) c
   FROM ev GROUP BY to_char(d,'mon'), date_trunc('month', d::timestamp);
 CREATE MATERIALIZED VIEW ev_o AS
@@ -80,14 +80,14 @@ DO $$
 DECLARE made bool;
 BEGIN
   made:=false;
-  BEGIN CREATE MATERIALIZED VIEW _v WITH (incremental_refresh=true) AS
+  BEGIN CREATE MATERIALIZED VIEW _v WITH (incremental_refresh=true, allow_stable_keys=true) AS
     SELECT (random()*10)::int r, count(*) c FROM va GROUP BY (random()*10)::int;
     made:=true; EXCEPTION WHEN feature_not_supported THEN NULL; END;
   IF made THEN DROP MATERIALIZED VIEW _v; RAISE EXCEPTION 'volatile key: FAIL (accepted)';
   ELSE RAISE NOTICE 'VOLATILE group key rejected: PASS'; END IF;
 
   made:=false;
-  BEGIN CREATE MATERIALIZED VIEW _v WITH (incremental_refresh=true) AS
+  BEGIN CREATE MATERIALIZED VIEW _v WITH (incremental_refresh=true, allow_stable_keys=true) AS
     SELECT COALESCE(vb.v,-1) x, count(*) c FROM va LEFT JOIN vb ON vb.aid=va.id GROUP BY COALESCE(vb.v,-1);
     made:=true; EXCEPTION WHEN feature_not_supported THEN NULL; END;
   IF made THEN DROP MATERIALIZED VIEW _v; RAISE EXCEPTION 'optional-ref expr key: FAIL (accepted)';

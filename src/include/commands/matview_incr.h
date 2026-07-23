@@ -121,6 +121,14 @@ extern bool MatviewIncrPeelProjection(Query *viewQuery, Query **core_out,
 extern void MatviewIncrSetOverlayOriginal(Query *original);
 
 /*
+ * Opt-in toggle consulted by MatviewIncrIsEligible: when true, a STABLE GROUP BY
+ * key expression is accepted (documented staleness on TimeZone/lc_time change
+ * until the next REFRESH) instead of rejected.  Set from the matview's
+ * allow_stable_keys reloption before each eligibility check.
+ */
+extern void MatviewIncrSetAllowStableKeys(bool allow);
+
+/*
  * Append COUNT(*) AS __mv_count__ to q->targetList.
  * Must be called for both the schema query and the view-definition query
  * before the matview is created.

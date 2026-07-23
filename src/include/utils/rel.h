@@ -362,6 +362,10 @@ typedef struct StdRdOptions
 
 	/* DBblue: maintain matview incrementally on source table writes */
 	bool		incremental_refresh;
+
+	/* DBblue: allow STABLE GROUP BY key expressions in an incremental matview
+	 * (opt-in; documented staleness on TimeZone/lc_time change until REFRESH) */
+	bool		allow_stable_keys;
 } StdRdOptions;
 
 #define HEAP_MIN_FILLFACTOR			10
@@ -432,6 +436,14 @@ typedef struct StdRdOptions
 #define RelationGetIncrementalRefresh(relation) \
 	((relation)->rd_options ? \
 	 ((StdRdOptions *) (relation)->rd_options)->incremental_refresh : false)
+
+/*
+ * RelationGetAllowStableKeys
+ *		Returns true if the incremental matview opted in to STABLE GROUP BY keys.
+ */
+#define RelationGetAllowStableKeys(relation) \
+	((relation)->rd_options ? \
+	 ((StdRdOptions *) (relation)->rd_options)->allow_stable_keys : false)
 
 /* ViewOptions->check_option values */
 typedef enum ViewOptCheckOption

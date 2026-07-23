@@ -646,6 +646,16 @@ incr_where_admits_orphans(Node *where_qual)
 static bool incr_membership_has_mutable(Query *q);
 
 /*
+ * Opt-in (set from the matview's allow_stable_keys reloption via
+ * MatviewIncrSetAllowStableKeys before each eligibility check): when true,
+ * MatviewIncrIsEligible accepts a STABLE GROUP BY key expression (e.g.
+ * to_char / date_trunc month buckets) instead of rejecting it, accepting the
+ * documented staleness after a TimeZone/lc_time change until the next REFRESH.
+ * VOLATILE keys are always rejected regardless.
+ */
+static bool incr_allow_stable_keys = false;
+
+/*
  * MatviewIncrIsEligible
  * Returns true if the query can be maintained incrementally (Phase 1 or 2).
  * Sets *reason on failure.
@@ -1169,14 +1179,14 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 				continue;			/* plain column — always supported */
 
 			/*
-			 * Expression group key (e.g. GROUP BY to_char(invoice_date,'mon') or
-			 * date_trunc('month', d) — the ubiquitous report month/year bucket).
-			 * Maintained by the recompute path, which re-derives each affected
-			 * group from live: so the key may be STABLE (locale/timezone-
-			 * dependent, e.g. to_char), not only IMMUTABLE — a touched group
-			 * always matches a current REFRESH.  (A STABLE key can still diverge
-			 * from a full REFRESH for UNtouched groups if lc_time/TimeZone is
-			 * later changed; a REFRESH re-syncs.  Documented caveat.)
+			 * Expression group key (e.g. GROUP BY date_trunc('month', d) — the
+			 * ubiquitous report month/year bucket).  Must be IMMUTABLE: a STABLE
+			 * key (locale/timezone-dependent, e.g. to_char, or date_trunc on a
+			 * timestamptz) buckets rows as a function of session settings, so an
+			 * untouched group silently diverges from a full REFRESH the moment
+			 * TimeZone/lc_time changes — no DML fires a delta to re-bucket it.
+			 * Reject STABLE (and VOLATILE) here for strict byte-identity; plain
+			 * date_trunc on a timestamp-without-tz is IMMUTABLE and still works.
 			 */
 			if (te->resjunk || te->resname == NULL)
 			{
@@ -1189,6 +1199,17 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 				*reason = "GROUP BY on a VOLATILE expression cannot be maintained "
 					"incrementally (its value can change between the insert and "
 					"delete of the same row)";
+				return false;
+			}
+			if (contain_mutable_functions(gexpr) && !incr_allow_stable_keys)
+			{
+				*reason = "GROUP BY on a STABLE expression (e.g. date_trunc on a "
+					"timestamptz, to_char) is rejected by default: it buckets rows "
+					"by session time/locale, so untouched groups can drift from a "
+					"full REFRESH after a TimeZone/lc_time change (with no DML to "
+					"re-sync).  Use an IMMUTABLE grouping expression, or opt in with "
+					"WITH (incremental_refresh=true, allow_stable_keys=true) to "
+					"accept the documented staleness (a REFRESH re-syncs)";
 				return false;
 			}
 			if (incr_agg_arg_unsafe_walker(gexpr, NULL))
@@ -1471,6 +1492,12 @@ void
 MatviewIncrSetOverlayOriginal(Query *original)
 {
 	incr_pending_overlay_original = original;
+}
+
+void
+MatviewIncrSetAllowStableKeys(bool allow)
+{
+	incr_allow_stable_keys = allow;
 }
 
 /* Strip value-preserving casts (row_number() is int8; an Odoo id column is int4,

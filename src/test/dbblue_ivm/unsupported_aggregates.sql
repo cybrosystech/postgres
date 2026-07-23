@@ -37,10 +37,14 @@ BEGIN
   IF _try('CREATE MATERIALIZED VIEW _m WITH (incremental_refresh=true) AS SELECT (random()*10)::int r, SUM(amount) s FROM uagg GROUP BY (random()*10)::int WITH DATA')
      THEN RAISE EXCEPTION 'GROUP BY volatile expr: FAIL (accepted)'; ELSE RAISE NOTICE 'GROUP BY volatile expression: PASS (rejected)'; END IF;
 
-  -- GROUP BY <STABLE expression> (date_trunc/to_char month bucket) is now
-  -- SUPPORTED via the recompute path (documented lc_time/TimeZone caveat).
+  -- GROUP BY <STABLE expression> (date_trunc/to_char month bucket) is REJECTED
+  -- by default (it buckets by session time/locale, so untouched groups can drift
+  -- from a full REFRESH on a TimeZone/lc_time change) ...
   IF _try('CREATE MATERIALIZED VIEW _m WITH (incremental_refresh=true) AS SELECT date_trunc(''month'',d) m, SUM(amount) s FROM uagg GROUP BY date_trunc(''month'',d) WITH DATA')
-     THEN RAISE NOTICE 'GROUP BY stable date bucket: PASS (accepted)'; ELSE RAISE EXCEPTION 'GROUP BY stable date bucket: FAIL (rejected)'; END IF;
+     THEN RAISE EXCEPTION 'GROUP BY stable date bucket: FAIL (accepted by default)'; ELSE RAISE NOTICE 'GROUP BY stable date bucket rejected by default: PASS'; END IF;
+  -- ... but ACCEPTED with the explicit opt-in (documented lc_time/TimeZone caveat).
+  IF _try('CREATE MATERIALIZED VIEW _m WITH (incremental_refresh=true, allow_stable_keys=true) AS SELECT date_trunc(''month'',d) m, SUM(amount) s FROM uagg GROUP BY date_trunc(''month'',d) WITH DATA')
+     THEN RAISE NOTICE 'GROUP BY stable date bucket with allow_stable_keys: PASS (accepted)'; ELSE RAISE EXCEPTION 'GROUP BY stable date bucket opt-in: FAIL (rejected)'; END IF;
 
   -- must be ACCEPTED
   IF _try('CREATE MATERIALIZED VIEW _m WITH (incremental_refresh=true) AS SELECT p, SUM(amount) s, COUNT(*) c, AVG(amount) a, MIN(amount) mn, MAX(amount) mx FROM uagg GROUP BY p WITH DATA')

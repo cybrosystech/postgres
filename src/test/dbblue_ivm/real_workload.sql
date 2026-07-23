@@ -36,7 +36,7 @@ INSERT INTO so_ VALUES (2000,100,200,'2024-01-15'),(2001,101,201,'2024-03-05'),(
 INSERT INTO sol VALUES (1,2000,10,9,5),(2,2001,11,8,7),(3,2002,12,7,3),(4,2000,NULL,6,9);
 
 -- RW-01 Invoice KPI (full group-key set)
-CREATE MATERIALIZED VIEW rw01_i WITH (incremental_refresh=true) AS
+CREATE MATERIALIZED VIEW rw01_i WITH (incremental_refresh=true, allow_stable_keys=true) AS
   SELECT to_char(am.invoice_date,'mon') mon, to_char(am.invoice_date,'YYYY') yr,
          pt.default_code, pt.name, aml.price_unit, pp.bunch_code,
          sum(aml.quantity) qty, count(pp.bunch_code) nb
@@ -58,7 +58,7 @@ CREATE MATERIALIZED VIEW rw01_o AS
            pt.default_code, pt.name, aml.price_unit, pp.bunch_code;
 
 -- RW-02 Sales KPI (full group-key set: currency direct + product multi-hop)
-CREATE MATERIALIZED VIEW rw02_i WITH (incremental_refresh=true) AS
+CREATE MATERIALIZED VIEW rw02_i WITH (incremental_refresh=true, allow_stable_keys=true) AS
   SELECT to_char(so_.date_order,'Mon-YY') mon, pt.default_code, pt.name,
          sol.price_unit, pp.default_code2, pp.bunch_code, rc.symbol,
          sum(sol.product_uom_qty) qty, count(pp.bunch_code) nb

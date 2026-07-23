@@ -298,17 +298,19 @@ ExecCreateTableAs(ParseState *pstate, CreateTableAsStmt *stmt,
 		Query	   *vq = castNode(Query, into->viewQuery);
 		ListCell   *lc;
 		bool		want_incr = false;
+		bool		allow_stable_keys = false;
 
 		foreach(lc, into->options)
 		{
 			DefElem    *opt = lfirst_node(DefElem, lc);
 
 			if (strcmp(opt->defname, "incremental_refresh") == 0)
-			{
 				want_incr = defGetBoolean(opt);
-				break;
-			}
+			else if (strcmp(opt->defname, "allow_stable_keys") == 0)
+				allow_stable_keys = defGetBoolean(opt);
 		}
+		/* consulted by MatviewIncrIsEligible (and the setup re-arm) */
+		MatviewIncrSetAllowStableKeys(allow_stable_keys);
 
 		if (want_incr)
 		{

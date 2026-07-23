@@ -180,6 +180,15 @@ static relopt_bool boolRelOpts[] =
 		},
 		false
 	},
+	{
+		{
+			"allow_stable_keys",
+			"Allow STABLE GROUP BY key expressions (e.g. to_char/date_trunc month buckets) in an incremental matview, accepting documented staleness after a TimeZone/lc_time change until the next REFRESH (DBblue)",
+			RELOPT_KIND_HEAP,
+			ShareUpdateExclusiveLock
+		},
+		false
+	},
 	/* list terminator */
 	{{NULL}}
 };
@@ -2047,7 +2056,9 @@ default_reloptions(Datum reloptions, bool validate, relopt_kind kind)
 		{"auto_skip_unchanged", RELOPT_TYPE_BOOL,
 		offsetof(StdRdOptions, auto_skip_unchanged)},
 		{"incremental_refresh", RELOPT_TYPE_BOOL,
-		offsetof(StdRdOptions, incremental_refresh)}
+		offsetof(StdRdOptions, incremental_refresh)},
+		{"allow_stable_keys", RELOPT_TYPE_BOOL,
+		offsetof(StdRdOptions, allow_stable_keys)}
 	};
 
 	return (bytea *) build_reloptions(reloptions, validate, kind,
