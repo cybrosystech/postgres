@@ -22,6 +22,7 @@
 #include "postmaster/bgworker_internals.h"
 #include "postmaster/datachecksum_state.h"
 #include "postmaster/dbblue_create_standby.h"
+#include "postmaster/dbblue_index_advisor.h"
 #include "postmaster/postmaster.h"
 #include "replication/logicallauncher.h"
 #include "replication/logicalworker.h"
@@ -136,6 +137,10 @@ static const struct
 	{
 		.fn_name = "ApplyLauncherMain",
 		.fn_addr = ApplyLauncherMain
+	},
+	{
+		.fn_name = "DbblueIndexAdvisorMain",
+		.fn_addr = DbblueIndexAdvisorMain
 	},
 	{
 		.fn_name = "ApplyWorkerMain",
@@ -1375,9 +1380,7 @@ LookupBackgroundWorkerFunction(const char *libraryname, const char *funcname)
 	 */
 	if (strcmp(libraryname, "postgres") == 0)
 	{
-		int			i;
-
-		for (i = 0; i < lengthof(InternalBGWorkers); i++)
+		for (size_t i = 0; i < lengthof(InternalBGWorkers); i++)
 		{
 			if (strcmp(InternalBGWorkers[i].fn_name, funcname) == 0)
 				return InternalBGWorkers[i].fn_addr;

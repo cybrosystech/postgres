@@ -386,6 +386,7 @@ CFuncHashTabEntry
 CHAR
 CHECKPOINT
 CHKVAL
+CIEN_context
 CIRCLE
 CMPDAffix
 CONTEXT
@@ -515,6 +516,8 @@ ConditionalStack
 ConditionalStackData
 ConfigData
 ConfigVariable
+ConflictLogColumnDef
+ConflictLogDest
 ConflictTupleInfo
 ConflictType
 ConnCacheEntry
@@ -1505,7 +1508,10 @@ JsonTablePathScan
 JsonTablePathSpec
 JsonTablePlan
 JsonTablePlanRowSource
+JsonTablePlanSpec
 JsonTablePlanState
+JsonTablePlanJoinType
+JsonTablePlanType
 JsonTableSiblingJoin
 JsonTokenType
 JsonTransformStringValuesAction
@@ -3415,7 +3421,6 @@ WaitEvent
 WaitEventActivity
 WaitEventBuffer
 WaitEventClient
-WaitEventCustomCounterData
 WaitEventCustomEntryByInfo
 WaitEventCustomEntryByName
 WaitEventIO
@@ -3720,6 +3725,7 @@ deparse_context
 deparse_expr_cxt
 deparse_namespace
 derives_hash
+desigidx_type
 dev_t
 disassembledLeaf
 dlist_head
@@ -3894,6 +3900,7 @@ int64_t
 int8
 int8_t
 int8x16_t
+int_fast32_2s
 int_fast32_t
 int_fast64_t
 internalPQconninfoOption
