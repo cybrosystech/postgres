@@ -133,4 +133,61 @@ BEGIN
   RAISE NOTICE '4. multi-table additive aggregate serializes on the matview lock: PASS';
 END $$;
 DROP MATERIALIZED VIEW ab4_m CASCADE; DROP TABLE ab_h, ab_l CASCADE;
+
+-- ---------- 5. row-level self-join: join-key UPDATE on a both-sides node ----------
+-- The INSERT delta re-derives a changed row's pairs in BOTH roles; a
+-- delete-every-match DELETE then wiped the freshly re-derived copy.  The
+-- count-based DELETE removes exactly the old multiplicity, so the row survives.
+DROP TABLE IF EXISTS ab_sj CASCADE;
+CREATE TABLE ab_sj(id int primary key, parent int, val int);
+INSERT INTO ab_sj VALUES (6,NULL,60),(13,6,130),(26,13,260),(27,13,270),(52,26,520);
+CREATE MATERIALIZED VIEW ab5_m WITH (incremental_refresh=true) AS
+  SELECT c.id cid, c.parent cpar, p.id pid, p.val pval FROM ab_sj c JOIN ab_sj p ON c.parent=p.id;
+CREATE MATERIALIZED VIEW ab5_r AS
+  SELECT c.id cid, c.parent cpar, p.id pid, p.val pval FROM ab_sj c JOIN ab_sj p ON c.parent=p.id;
+DO $$
+DECLARE d int;
+BEGIN
+  UPDATE ab_sj SET parent=NULL WHERE id=13;       -- 13 is child (of 6) AND parent (of 26,27)
+  UPDATE ab_sj SET parent=6 WHERE id=13;          -- re-point back
+  INSERT INTO ab_sj VALUES (99,6,990);            -- new row that is a parent's child
+  UPDATE ab_sj SET val=val+1 WHERE id=6;          -- measure change on a parent (fans out)
+  DELETE FROM ab_sj WHERE id=27;
+  REFRESH MATERIALIZED VIEW ab5_r;
+  SELECT count(*) INTO d FROM (
+    (SELECT cid,cpar,pid,pval FROM ab5_m EXCEPT ALL SELECT cid,cpar,pid,pval FROM ab5_r)
+    UNION ALL (SELECT cid,cpar,pid,pval FROM ab5_r EXCEPT ALL SELECT cid,cpar,pid,pval FROM ab5_m)) z;
+  IF d <> 0 THEN RAISE EXCEPTION 'self-join join-key UPDATE: diverged by %', d; END IF;
+  RAISE NOTICE '5. row-level self-join join-key UPDATE (both-sides node) == REFRESH: PASS';
+END $$;
+DROP MATERIALIZED VIEW ab5_m CASCADE; DROP MATERIALIZED VIEW ab5_r; DROP TABLE ab_sj CASCADE;
+
+-- ---------- 6. unsupported shapes are cleanly REJECTED (not accepted-then-fail/diverge) ----------
+DROP TABLE IF EXISTS ab_part, ab_gs CASCADE;
+CREATE TABLE ab_part(id int, dt date, grp int, amt numeric, PRIMARY KEY(id,dt)) PARTITION BY RANGE(dt);
+CREATE TABLE ab_part_a PARTITION OF ab_part FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+INSERT INTO ab_part SELECT g,'2024-06-01'::date, g%3, g FROM generate_series(1,20) g;
+CREATE TABLE ab_gs(id int primary key, g text, f text, v numeric);
+INSERT INTO ab_gs SELECT g,'g'||(g%3),'f'||(g%2),g FROM generate_series(1,20) g;
+DO $$
+BEGIN
+  BEGIN
+    EXECUTE 'CREATE MATERIALIZED VIEW ab6_bad1 WITH (incremental_refresh=true) AS SELECT grp,count(*) c FROM ab_part GROUP BY grp';
+    RAISE EXCEPTION 'partitioned source should be rejected';
+  EXCEPTION WHEN feature_not_supported THEN NULL; END;
+  BEGIN
+    EXECUTE 'CREATE MATERIALIZED VIEW ab6_bad2 WITH (incremental_refresh=true) AS SELECT g,f,count(*) c FROM ab_gs GROUP BY ROLLUP(g,f)';
+    RAISE EXCEPTION 'ROLLUP should be rejected';
+  EXCEPTION WHEN feature_not_supported THEN NULL; END;
+  BEGIN
+    EXECUTE 'CREATE MATERIALIZED VIEW ab6_bad3 WITH (incremental_refresh=true) AS SELECT g,f,count(*) c FROM ab_gs GROUP BY GROUPING SETS ((g),(f))';
+    RAISE EXCEPTION 'GROUPING SETS should be rejected';
+  EXCEPTION WHEN feature_not_supported THEN NULL; END;
+  -- a leaf partition used directly, and a plain GROUP BY, must still be accepted
+  EXECUTE 'CREATE MATERIALIZED VIEW ab6_ok1 WITH (incremental_refresh=true) AS SELECT grp,count(*) c FROM ab_part_a GROUP BY grp';
+  EXECUTE 'CREATE MATERIALIZED VIEW ab6_ok2 WITH (incremental_refresh=true) AS SELECT g,count(*) c FROM ab_gs GROUP BY g';
+  EXECUTE 'DROP MATERIALIZED VIEW ab6_ok1'; EXECUTE 'DROP MATERIALIZED VIEW ab6_ok2';
+  RAISE NOTICE '6. partitioned source + GROUPING SETS/ROLLUP rejected; leaf + plain GROUP BY accepted: PASS';
+END $$;
+DROP TABLE ab_part, ab_gs CASCADE;
 \echo 'PASS: byte-identity audit regressions all green'

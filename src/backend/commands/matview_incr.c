@@ -56,6 +56,7 @@
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_aggregate.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_proc.h"
@@ -679,6 +680,19 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 		return false;
 	}
 
+	/*
+	 * GROUPING SETS / ROLLUP / CUBE produce multiple grouping levels (with NULLs
+	 * marking rolled-up columns) in one scan.  The delta engine maintains a
+	 * single grain, and the generated delta SQL raises a hard error on every
+	 * base-table change (accept-then-fail), so reject at CREATE.
+	 */
+	if (viewQuery->groupingSets != NIL)
+	{
+		*reason = "GROUPING SETS, ROLLUP, and CUBE cannot be maintained "
+			"incrementally; use a plain GROUP BY";
+		return false;
+	}
+
 	if (viewQuery->havingQual != NULL && viewQuery->groupClause == NIL)
 	{
 		*reason = "HAVING requires GROUP BY";
@@ -873,6 +887,23 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 
 			if (rte->rtekind == RTE_RELATION)
 			{
+				/*
+				 * A declaratively-partitioned parent cannot be a source: the
+				 * delta triggers are AFTER STATEMENT triggers carrying transition
+				 * tables, which Postgres never clones to leaf partitions, so DML
+				 * addressed directly to a leaf (the common bulk-ingestion path)
+				 * never fires them and the matview silently goes stale.  Reject
+				 * until per-leaf maintenance + row-movement/ATTACH/DETACH are
+				 * handled.  (A single non-partitioned table or leaf is fine.)
+				 */
+				if (get_rel_relkind(rte->relid) == RELKIND_PARTITIONED_TABLE)
+				{
+					*reason = psprintf("partitioned table \"%s\" is not supported "
+									   "as a source for incremental refresh",
+									   get_rel_name(rte->relid));
+					hash_destroy(oid_counts);
+					return false;
+				}
 				nbasetables++;
 				entry = (Oid *) hash_search(oid_counts, &rte->relid, HASH_ENTER, &found);
 				if (!found)
@@ -5293,47 +5324,67 @@ incr_build_self_join_row_del_sql(Oid mvrelid, Query *viewQuery,
 	ListCell	   *lc;
 	bool			first;
 
+	StringInfoData	collist,	/* col1,col2,...                              */
+					part,		/* _m.col1,_m.col2,...                         */
+					joincond;	/* _m.col IS NOT DISTINCT FROM _rd.col AND ... */
+
 	initStringInfo(&buf);
+	initStringInfo(&collist);
+	initStringInfo(&part);
+	initStringInfo(&joincond);
 
-	/*
-	 * Match the matview rows to delete NULL-SAFELY.  A row-constructor
-	 * "(cols) IN (subquery)" uses "=" semantics, so any NULL output column
-	 * makes the comparison UNKNOWN and the row is never matched — a deleted
-	 * source row whose projection contains a NULL (e.g. an optional dimension
-	 * column) would be left behind, diverging from REFRESH.  Use EXISTS with
-	 * IS NOT DISTINCT FROM per column instead (same "delete every matching row"
-	 * behavior as IN, but NULL-safe).
-	 */
-	appendStringInfo(&buf, "DELETE FROM %s _mv_ WHERE EXISTS (\nSELECT 1 FROM (\n",
-					 mv_qname(mvrelid));
-
-	incr_build_self_join_select(&buf, viewQuery, v1, delta_table, all_tables);
-	appendStringInfoString(&buf, "\nUNION ALL\n");
-	incr_build_self_join_select(&buf, viewQuery, v2, delta_table, all_tables);
-
-	appendStringInfoString(&buf, "\n) _dr_ (");
-	first = true;
-	foreach(lc, viewQuery->targetList)
-	{
-		TargetEntry *te = lfirst_node(TargetEntry, lc);
-		if (te->resjunk) continue;
-		if (!first) appendStringInfoChar(&buf, ',');
-		appendStringInfoString(&buf, quote_identifier(te->resname));
-		first = false;
-	}
-	appendStringInfoString(&buf, ")\nWHERE ");
 	first = true;
 	foreach(lc, viewQuery->targetList)
 	{
 		TargetEntry *te = lfirst_node(TargetEntry, lc);
 		const char *col;
-		if (te->resjunk) continue;
-		if (!first) appendStringInfoString(&buf, " AND ");
+
+		if (te->resjunk)
+			continue;
 		col = quote_identifier(te->resname);
-		appendStringInfo(&buf, "_mv_.%s IS NOT DISTINCT FROM _dr_.%s", col, col);
+		if (!first)
+		{
+			appendStringInfoChar(&collist, ',');
+			appendStringInfoChar(&part, ',');
+			appendStringInfoString(&joincond, " AND ");
+		}
+		appendStringInfoString(&collist, col);
+		appendStringInfo(&part, "_m.%s", col);
+		appendStringInfo(&joincond, "_m.%s IS NOT DISTINCT FROM _rd.%s", col, col);
 		first = false;
 	}
-	appendStringInfoString(&buf, "\n)");
+
+	/*
+	 * Count-based, NULL-safe self-join DELETE.  Aggregate BOTH role arms of the
+	 * delta into one row per distinct output tuple with its multiplicity _k, then
+	 * number the matview's copies of that tuple and drop exactly the first _k.
+	 *
+	 * Deleting exactly the OLD multiplicity — not every value-identical copy — is
+	 * what makes an UPDATE on a node that appears on both sides of the self-join
+	 * correct.  The INSERT delta runs first and re-derives every pair the changed
+	 * row participates in, in BOTH roles (child and parent); for a pair whose
+	 * other-role projection did not change that re-adds a duplicate.  A
+	 * delete-every-match DELETE would then wipe both the stale and the fresh copy
+	 * (row vanishes — the observed divergence); deleting exactly _k removes only
+	 * the stale one.  The NULL-safe join (IS NOT DISTINCT FROM) matches tuples
+	 * with NULL columns, which "(cols) IN (subquery)" could not.
+	 */
+	appendStringInfo(&buf,
+					 "DELETE FROM %s WHERE ctid IN ("
+					 "SELECT s.ctid FROM ("
+					 "SELECT _m.ctid, row_number() OVER (PARTITION BY %s) AS _rn, _rd._k "
+					 "FROM %s _m JOIN ("
+					 "SELECT %s, count(*) AS _k FROM (\n",
+					 mv_qname(mvrelid), part.data, mv_qname(mvrelid), collist.data);
+
+	incr_build_self_join_select(&buf, viewQuery, v1, delta_table, all_tables);
+	appendStringInfoString(&buf, "\nUNION ALL\n");
+	incr_build_self_join_select(&buf, viewQuery, v2, delta_table, all_tables);
+
+	appendStringInfo(&buf,
+					 "\n) _u (%s) GROUP BY %s) _rd ON (%s)"
+					 ") s WHERE s._rn <= s._k)",
+					 collist.data, collist.data, joincond.data);
 
 	return buf.data;
 }
