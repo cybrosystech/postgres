@@ -208,6 +208,17 @@ typedef struct DbbcScanState
 	DbbcColPtrs *col_ptrs;		/* resolved addresses for cur_block */
 	uint32		cur_row;
 
+	/*
+	 * Chunk indices the scan-serve path actually emits: exactly the columns the
+	 * query references (needed_attnos = qual + tlist columns, which is all
+	 * ExecScan reads back from the slot). A relation may have more columns
+	 * registered/columnarized than one query touches, so emitting only these
+	 * avoids reading+writing unreferenced columns per row. Others stay at the
+	 * per-block NULL background.
+	 */
+	int		   *emit_cols;
+	int			n_emit;
+
 	/* pushed-down simple quals (zone skipping + columnar pre-filter) */
 	DbbcSkipQual *skipquals;
 	int			nskipquals;
@@ -1287,6 +1298,26 @@ dbbc_scan_bind_version(DbbcScanState *s, Relation rel, List *needed_attnos,
 				s->attno_to_col[s->attnums[c] - 1] = c;
 		}
 
+		/*
+		 * The columns dbbc_emit_row must fill: the query's referenced columns
+		 * (needed_attnos), not every columnarized column. All are registered
+		 * (dbbc_rel_ready gated the path on it), so attno_to_col is valid.
+		 */
+		{
+			ListCell   *nc;
+
+			s->emit_cols = (int *) palloc(Max(list_length(needed_attnos), 1) *
+										  sizeof(int));
+			s->n_emit = 0;
+			foreach(nc, needed_attnos)
+			{
+				int			ec = s->attno_to_col[lfirst_int(nc) - 1];
+
+				if (ec >= 0)
+					s->emit_cols[s->n_emit++] = ec;
+			}
+		}
+
 		/* simple quals for zone skipping + the columnar pre-filter */
 		s->nskipquals = dbbc_extract_skip_quals(qual_clauses, qual_varno,
 												&s->skipquals);
@@ -1864,19 +1895,20 @@ dbbc_emit_row(DbbcScanState *s)
 	ExecClearTuple(slot);
 
 	/*
-	 * Write ONLY the registered columns. Every other column keeps the NULL
-	 * background established once per block in dbbc_open_columnar_block(), so
-	 * we avoid two natts-wide memsets per row (~531 B/row on a 59-column
-	 * table = the largest single component of scan self-time). Each registered
-	 * column's tts_isnull is set every row (a value present last row may be
-	 * NULL this row); the Datum is written only when non-NULL (a stale Datum
-	 * under tts_isnull=true is never read).
+	 * Write ONLY the columns the query references (emit_cols), not every
+	 * columnarized column - the rest keep the NULL background established once
+	 * per block in dbbc_open_columnar_block(), so we avoid two natts-wide
+	 * memsets per row AND avoid reading/writing columns nobody reads back.
+	 * Each emitted column's tts_isnull is set every row (a value present last
+	 * row may be NULL this row); the Datum is written only when non-NULL (a
+	 * stale Datum under tts_isnull=true is never read).
 	 */
-	for (c = 0; c < s->ncols; c++)
+	for (c = 0; c < s->n_emit; c++)
 	{
-		DbbcColPtrs *p = &s->col_ptrs[c];
+		int			cc = s->emit_cols[c];
+		DbbcColPtrs *p = &s->col_ptrs[cc];
 		bool		isnull;
-		Datum		value = dbbc_chunk_read(s, c, row, &isnull);
+		Datum		value = dbbc_chunk_read(s, cc, row, &isnull);
 
 		slot->tts_isnull[p->attidx] = isnull;
 		if (!isnull)
