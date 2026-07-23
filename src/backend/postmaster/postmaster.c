@@ -104,6 +104,7 @@
 #include "postmaster/autovacuum.h"
 #include "postmaster/bgworker_internals.h"
 #include "postmaster/dbblue_create_standby.h"
+#include "postmaster/dbblue_index_advisor.h"
 #include "postmaster/pgarch.h"
 #include "postmaster/postmaster.h"
 #include "postmaster/syslogger.h"
@@ -937,6 +938,10 @@ PostmasterMain(int argc, char *argv[])
 	 * take a bgworker slot.
 	 */
 	DbblueCreateStandbyRegister();
+	/*
+	 * Register the dbblue index advisor worker.
+	 */
+	DbblueIndexAdvisorRegister();
 
 	/*
 	 * Register the shared memory needs of all core subsystems.

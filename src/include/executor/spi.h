@@ -127,11 +127,11 @@ extern int	SPI_execute_snapshot(SPIPlanPtr plan,
 								 Snapshot crosscheck_snapshot,
 								 bool read_only, bool fire_triggers, long tcount);
 extern int	SPI_execute_with_args(const char *src,
-								  int nargs, Oid *argtypes,
+								  int nargs, const Oid *argtypes,
 								  const Datum *Values, const char *Nulls,
 								  bool read_only, long tcount);
-extern SPIPlanPtr SPI_prepare(const char *src, int nargs, Oid *argtypes);
-extern SPIPlanPtr SPI_prepare_cursor(const char *src, int nargs, Oid *argtypes,
+extern SPIPlanPtr SPI_prepare(const char *src, int nargs, const Oid *argtypes);
+extern SPIPlanPtr SPI_prepare_cursor(const char *src, int nargs, const Oid *argtypes,
 									 int cursorOptions);
 extern SPIPlanPtr SPI_prepare_extended(const char *src,
 									   const SPIPrepareOptions *options);

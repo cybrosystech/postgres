@@ -996,12 +996,12 @@ find_matching_ts_config(const char *lc_type)
 	{
 		if (pg_strcasecmp(tsearch_config_languages[i].langname, langname) == 0)
 		{
-			free(langname);
+			pg_free(langname);
 			return tsearch_config_languages[i].tsconfname;
 		}
 	}
 
-	free(langname);
+	pg_free(langname);
 	return NULL;
 }
 
@@ -1065,7 +1065,7 @@ write_version_file(const char *extrapath)
 	if (fprintf(version_file, "%s\n", PG_MAJORVERSION) < 0 ||
 		fclose(version_file))
 		pg_fatal("could not write file \"%s\": %m", path);
-	free(path);
+	pfree(path);
 }
 
 /*
@@ -1084,7 +1084,7 @@ set_null_conf(void)
 		pg_fatal("could not open file \"%s\" for writing: %m", path);
 	if (fclose(conf_file))
 		pg_fatal("could not write file \"%s\": %m", path);
-	free(path);
+	pfree(path);
 }
 
 /*
@@ -2003,6 +2003,12 @@ setup_privileges(FILE *cmdfd)
 				  "  AND relacl IS NULL;\n\n",
 				  escape_quotes(username));
 	PG_CMD_PUTS("GRANT USAGE ON SCHEMA pg_catalog, public TO PUBLIC;\n\n");
+
+	/*
+	 * Allow non-superuser subscription owners to access their associated
+	 * conflict log tables in the pg_conflict schema.
+	 */
+	PG_CMD_PUTS("GRANT USAGE ON SCHEMA pg_conflict TO PUBLIC;\n\n");
 	PG_CMD_PUTS("REVOKE ALL ON pg_largeobject FROM PUBLIC;\n\n");
 	PG_CMD_PUTS("INSERT INTO pg_init_privs "
 				"  (objoid, classoid, objsubid, initprivs, privtype)"
@@ -3213,7 +3219,7 @@ create_xlog_or_symlink(void)
 					 subdirloc);
 	}
 
-	free(subdirloc);
+	pfree(subdirloc);
 }
 
 
@@ -3235,7 +3241,6 @@ initialize_data_directory(void)
 {
 	PG_CMD_DECL;
 	PQExpBufferData cmd;
-	int			i;
 
 	setup_signals();
 
@@ -3255,7 +3260,7 @@ initialize_data_directory(void)
 	printf(_("creating subdirectories ... "));
 	fflush(stdout);
 
-	for (i = 0; i < lengthof(subdirs); i++)
+	for (size_t i = 0; i < lengthof(subdirs); i++)
 	{
 		char	   *path;
 
@@ -3268,7 +3273,7 @@ initialize_data_directory(void)
 		if (mkdir(path, pg_dir_create_mode) < 0)
 			pg_fatal("could not create directory \"%s\": %m", path);
 
-		free(path);
+		pfree(path);
 	}
 
 	check_ok();
@@ -3472,7 +3477,7 @@ main(int argc, char *argv[])
 					*equals++ = '\0';	/* terminate variable name */
 					add_stringlist_item(&extra_guc_names, buf);
 					add_stringlist_item(&extra_guc_values, equals);
-					pfree(buf);
+					pg_free(buf);
 				}
 				break;
 			case 'D':

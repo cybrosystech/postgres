@@ -20,6 +20,7 @@ OBJS = \
 	checkpointer.o \
 	datachecksum_state.o \
 	dbblue_create_standby.o \
+	dbblue_index_advisor.o \
 	fork_process.o \
 	interrupt.o \
 	launch_backend.o \
