@@ -2198,6 +2198,16 @@ typedef struct DbbcAggTrans
 	Oid			finalfn_oid;
 	int			numFinalArgs;
 	FunctionCallInfo trans_fcinfo;	/* context = the fabricated AggState */
+
+	/*
+	 * FILTER (WHERE ...): the aggregate advances only for rows where every
+	 * filter qual passes. The filter must decompose into an AND-list of simple
+	 * comparisons over registered columns (dbbc_agg_filter_decompose), reusing
+	 * the same skip-qual machinery as the WHERE pre-filter. nfilter == 0 means
+	 * no FILTER (advance every row that reached the group).
+	 */
+	DbbcSkipQual *filter;
+	int			nfilter;
 } DbbcAggTrans;
 
 /* per-group per-aggregate running state (mirrors AggStatePerGroupData) */
@@ -2269,6 +2279,7 @@ typedef struct DbbcAggScanState
 	DbbcAggTrans *trans;
 	Datum	   *in_vals;		/* per-trans current-row input */
 	bool	   *in_nulls;
+	bool	   *in_filterpass;	/* per-trans: does this row pass the agg's FILTER */
 	int			noutcols;
 	int		   *outmap;			/* per output column: key idx or -(agg)-1 */
 	List	   *qual_clauses;	/* pushed quals (this node has no recheck) */
@@ -2467,12 +2478,73 @@ dbbc_grp_key_type_ok(Oid typid)
 }
 
 /*
+ * Decompose an aggregate FILTER (WHERE ...) expression into an AND-list of
+ * simple comparisons over relation `relid`, reusing dbbc_extract_one_qual (the
+ * same Var op Const / Var = ANY / IS [NOT] NULL machinery as the WHERE
+ * pre-filter). Returns true and (when out is non-NULL) fills the out/nout
+ * quals; false if any conjunct is not extractable, so the pushdown is simply
+ * not offered and the query falls back to a scan + core Agg. Because
+ * dbbc_extract_one_qual only accepts Var/Const/array shapes, the filter is
+ * inherently non-volatile. Each referenced column is added to *needcols so the
+ * coverage gate requires it to be columnarized.
+ */
+static bool
+dbbc_agg_filter_decompose(Node *filter, Index relid,
+						  DbbcSkipQual **out, int *nout, List **needcols)
+{
+	List	   *args;
+	ListCell   *lc;
+	DbbcSkipQual *quals;
+	int			n;
+	int			i = 0;
+
+	if (filter == NULL)
+	{
+		if (out)
+		{
+			*out = NULL;
+			*nout = 0;
+		}
+		return true;
+	}
+
+	if (IsA(filter, BoolExpr) && ((BoolExpr *) filter)->boolop == AND_EXPR)
+		args = ((BoolExpr *) filter)->args;
+	else
+		args = list_make1(filter);
+
+	n = list_length(args);
+	quals = (DbbcSkipQual *) palloc(n * sizeof(DbbcSkipQual));
+	foreach(lc, args)
+	{
+		if (!dbbc_extract_one_qual((Node *) lfirst(lc), relid, &quals[i]))
+		{
+			pfree(quals);
+			return false;
+		}
+		if (needcols)
+			*needcols = list_append_unique_int(*needcols, quals[i].attno);
+		i++;
+	}
+
+	if (out)
+	{
+		*out = quals;
+		*nout = n;
+	}
+	else
+		pfree(quals);
+	return true;
+}
+
+/*
  * Is this Aggref computable by our transition-function machinery? Builtin
  * (trusted to use only AggCheckCallContext - the ordered-set family, the one
  * exception, is excluded by aggkind), plain, unsplit, and its argument (if
- * any) a bare Var of this relation. The strict-transfn/NULL-initcond
- * binary-coercibility rule is checked here so the path is simply not offered
- * for an aggregate the executor setup would reject.
+ * any) a bare Var of this relation. A FILTER (WHERE ...) is allowed when it
+ * decomposes into simple comparisons over registered columns. The strict-
+ * transfn/NULL-initcond binary-coercibility rule is checked here so the path
+ * is simply not offered for an aggregate the executor setup would reject.
  */
 static bool
 dbbc_agg_trans_ok(Aggref *agg, Index relid, List **needcols)
@@ -2483,12 +2555,17 @@ dbbc_agg_trans_ok(Aggref *agg, Index relid, List **needcols)
 	bool		ok = true;
 	Var		   *var = NULL;
 
-	if (agg->aggdistinct != NIL || agg->aggfilter != NULL ||
+	if (agg->aggdistinct != NIL ||
 		agg->aggorder != NIL || agg->aggkind != AGGKIND_NORMAL ||
 		agg->aggsplit != AGGSPLIT_SIMPLE)
 		return false;
 	if (agg->aggfnoid >= FirstNormalObjectId)
 		return false;			/* builtin aggregates only */
+	/* FILTER (WHERE ...): only if it decomposes into simple pushable quals */
+	if (agg->aggfilter != NULL &&
+		!dbbc_agg_filter_decompose((Node *) agg->aggfilter, relid,
+								   NULL, NULL, needcols))
+		return false;
 	if (!OidIsValid(agg->aggtranstype))
 		return false;
 
@@ -2960,6 +3037,7 @@ dbbc_grp_begin(DbbcAggScanState *as, List *payload, EState *estate, int eflags)
 										 sizeof(DbbcAggTrans));
 	as->in_vals = (Datum *) palloc0(Max(as->ntrans, 1) * sizeof(Datum));
 	as->in_nulls = (bool *) palloc0(Max(as->ntrans, 1) * sizeof(bool));
+	as->in_filterpass = (bool *) palloc0(Max(as->ntrans, 1) * sizeof(bool));
 
 	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
 		return;
@@ -3025,6 +3103,17 @@ dbbc_grp_begin(DbbcAggScanState *as, List *payload, EState *estate, int eflags)
 			t->input_attno = ((Var *) arg)->varattno;
 			t->numTransInputs = 1;
 		}
+
+		/*
+		 * FILTER (WHERE ...): rebuild the per-agg qual list from the Aggref
+		 * (which carries aggfilter through custom_private). It was validated as
+		 * decomposable at plan time; here it must succeed. Lives in this
+		 * (per-query) context for the scan's lifetime.
+		 */
+		if (!dbbc_agg_filter_decompose((Node *) aggref->aggfilter,
+									   as->qual_varno, &t->filter, &t->nfilter,
+									   NULL))
+			elog(ERROR, "dbblue_columnar: aggregate FILTER no longer decomposes");
 
 		/* the aggregate as the calling user, its fns as the owner */
 		aclresult = object_aclcheck(ProcedureRelationId, aggref->aggfnoid,
@@ -3159,8 +3248,24 @@ dbbc_grp_begin(DbbcAggScanState *as, List *payload, EState *estate, int eflags)
 		for (k = 0; k < as->nkeys; k++)
 			used = list_append_unique_int(used, as->key_attnos[k]);
 		for (a = 0; a < as->ntrans; a++)
+		{
+			int			f;
+
 			if (as->trans[a].numTransInputs == 1)
 				used = list_append_unique_int(used, as->trans[a].input_attno);
+			/*
+			 * FILTER columns must be in the used/used_types set too: they are
+			 * read from columnar chunks (dbbc_chunk_read) and compared with a
+			 * proc resolved for their CURRENT type, so the per-block
+			 * type-identity gate (dbbc_grp_chunks_usable) must validate them -
+			 * a no-rewrite ALTER COLUMN TYPE on a FILTER-only column would
+			 * otherwise be served from a stale-typed chunk. This also puts them
+			 * in `needed`, so dbbc_scan_bind_version requires them registered
+			 * (else attno_to_col would be -1 and the read out of bounds).
+			 */
+			for (f = 0; f < as->trans[a].nfilter; f++)
+				used = list_append_unique_int(used, as->trans[a].filter[f].attno);
+		}
 		for (a = 0; a < as->nskipquals; a++)
 			used = list_append_unique_int(used, as->skipquals[a].attno);
 
@@ -3487,6 +3592,15 @@ dbbc_grp_advance(DbbcAggScanState *as, DbbcGroupEntry *grp)
 		MemoryContext oldctx;
 		Datum		newVal;
 
+		/*
+		 * FILTER (WHERE ...): this row does not contribute to this aggregate.
+		 * The group itself was still created by dbbc_grp_lookup, so a group all
+		 * of whose rows are filtered out still appears with the empty aggregate
+		 * - matching SQL FILTER semantics.
+		 */
+		if (t->nfilter > 0 && !as->in_filterpass[a])
+			continue;
+
 		if (t->numTransInputs == 1)
 		{
 			if (t->transfn.fn_strict)
@@ -3625,13 +3739,33 @@ dbbc_grp_consume_block(DbbcAggScanState *as, DbbcScanState *s,
 				keyvals[k] = dbbc_chunk_read(s, kc, row, &keynulls[k]);
 			}
 			for (a = 0; a < as->ntrans; a++)
-				if (as->trans[a].numTransInputs == 1)
+			{
+				DbbcAggTrans *t = &as->trans[a];
+				int			f;
+
+				if (t->numTransInputs == 1)
 				{
-					int			ac = s->attno_to_col[as->trans[a].input_attno - 1];
+					int			ac = s->attno_to_col[t->input_attno - 1];
 
 					as->in_vals[a] = dbbc_chunk_read(s, ac, row,
 													 &as->in_nulls[a]);
 				}
+				/* FILTER (WHERE ...): advance this agg only if every qual passes */
+				as->in_filterpass[a] = true;
+				for (f = 0; f < t->nfilter; f++)
+				{
+					DbbcSkipQual *q = &t->filter[f];
+					int			fc = s->attno_to_col[q->attno - 1];
+					bool		fn;
+					Datum		fv = dbbc_chunk_read(s, fc, row, &fn);
+
+					if (!dbbc_skipqual_test(q, fv, fn))
+					{
+						as->in_filterpass[a] = false;
+						break;
+					}
+				}
+			}
 			dbbc_grp_advance(as, dbbc_grp_lookup(as, keyvals, keynulls));
 			as->grp_rows++;
 		}
@@ -3696,10 +3830,29 @@ dbbc_grp_consume_heap_range(DbbcAggScanState *as, DbbcScanState *s,
 				keyvals[k] = slot_getattr(s->heap_slot, as->key_attnos[k],
 										  &keynulls[k]);
 			for (a = 0; a < as->ntrans; a++)
-				if (as->trans[a].numTransInputs == 1)
+			{
+				DbbcAggTrans *t = &as->trans[a];
+				int			f;
+
+				if (t->numTransInputs == 1)
 					as->in_vals[a] = slot_getattr(s->heap_slot,
-												  as->trans[a].input_attno,
+												  t->input_attno,
 												  &as->in_nulls[a]);
+				/* FILTER (WHERE ...): advance this agg only if every qual passes */
+				as->in_filterpass[a] = true;
+				for (f = 0; f < t->nfilter; f++)
+				{
+					DbbcSkipQual *q = &t->filter[f];
+					bool		fn;
+					Datum		fv = slot_getattr(s->heap_slot, q->attno, &fn);
+
+					if (!dbbc_skipqual_test(q, fv, fn))
+					{
+						as->in_filterpass[a] = false;
+						break;
+					}
+				}
+			}
 			dbbc_grp_advance(as, dbbc_grp_lookup(as, keyvals, keynulls));
 			as->grp_rows++;
 		}
