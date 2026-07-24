@@ -29,6 +29,7 @@ backend_sources += files(
   'date.c',
   'datetime.c',
   'datum.c',
+  'dbblue_stat_activity.c',
   'dbsize.c',
   'ddlutils.c',
   'domains.c',

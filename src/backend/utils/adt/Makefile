@@ -30,6 +30,7 @@ OBJS = \
 	date.o \
 	datetime.o \
 	datum.o \
+	dbblue_stat_activity.o \
 	dbsize.o \
 	ddlutils.o \
 	domains.o \

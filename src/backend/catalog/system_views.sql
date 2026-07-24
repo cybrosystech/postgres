@@ -964,6 +964,22 @@ CREATE VIEW pg_stat_activity AS
         LEFT JOIN pg_database AS D ON (S.datid = D.oid)
         LEFT JOIN pg_authid AS U ON (S.usesysid = U.oid);
 
+-- dbblue_stat_activity: pg_stat_activity enriched with extended per-backend
+-- resource usage (CPU time, resident memory, cumulative I/O), inspired by
+-- PolarDB's polar_stat_activity.
+CREATE VIEW dbblue_stat_activity AS
+    SELECT
+            A.*,
+            R.cpu_user_ms,
+            R.cpu_sys_ms,
+            R.rss_kb,
+            R.shared_read_bytes,
+            R.shared_write_bytes,
+            R.local_read_bytes,
+            R.local_write_bytes
+    FROM pg_stat_activity AS A
+        LEFT JOIN dbblue_stat_get_backend_resources() AS R ON (R.pid = A.pid);
+
 CREATE VIEW pg_stat_replication AS
     SELECT
             S.pid,
