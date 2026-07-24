@@ -8,7 +8,7 @@ OBJS = \
 	dbblue_columnar.o
 
 EXTENSION = dbblue_columnar
-DATA = dbblue_columnar--1.0.sql
+DATA = dbblue_columnar--1.0.sql dbblue_columnar--1.0--1.1.sql
 PGFILEDESC = "dbblue_columnar - DBblue Columnar Engine (skeleton)"
 
 # Differential regression test (columnar results must equal heap results).
