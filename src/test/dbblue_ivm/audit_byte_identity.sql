@@ -49,28 +49,31 @@ BEGIN
 END $$;
 DROP MATERIALIZED VIEW ab1_m, ab1_r CASCADE; DROP TABLE ab_dim, ab_fact CASCADE;
 
--- ---------- 2. Row-level self-join, NULL projected column ----------
+-- ---------- 2. Row-level join, NULL projected column (NULL-safe delete match) ----------
+-- The row-level DELETE matches matview rows by all projected columns; a plain
+-- "= " match makes a NULL column UNKNOWN and never matches, leaving the row
+-- stale.  The count-based delete matches with IS NOT DISTINCT FROM.
 DROP TABLE IF EXISTS ab_c, ab_f CASCADE;
 CREATE TABLE ab_c(cid int primary key, region text);
-CREATE TABLE ab_f(fid int primary key, parent int, dkey int, qty numeric);
-INSERT INTO ab_c VALUES (1, NULL), (2, 'north');
-INSERT INTO ab_f VALUES (10,NULL,1,100),(20,10,1,200),(30,NULL,2,300),(40,30,2,400);
+CREATE TABLE ab_f(fid int primary key, dkey int, qty numeric);
+INSERT INTO ab_c VALUES (1, NULL), (2, 'north');      -- region 1 is NULL
+INSERT INTO ab_f VALUES (10,1,100),(20,1,200),(30,2,300),(40,2,400);
 CREATE MATERIALIZED VIEW ab2_m WITH (incremental_refresh=true) AS
-  SELECT f.fid, f.qty cq, p.qty pq, p.fid pid, c.region FROM ab_f f JOIN ab_f p ON f.parent=p.fid JOIN ab_c c ON f.dkey=c.cid;
+  SELECT f.fid, f.qty cq, c.region FROM ab_f f JOIN ab_c c ON f.dkey=c.cid;
 CREATE MATERIALIZED VIEW ab2_r AS
-  SELECT f.fid, f.qty cq, p.qty pq, p.fid pid, c.region FROM ab_f f JOIN ab_f p ON f.parent=p.fid JOIN ab_c c ON f.dkey=c.cid;
+  SELECT f.fid, f.qty cq, c.region FROM ab_f f JOIN ab_c c ON f.dkey=c.cid;
 DO $$
 DECLARE d int;
 BEGIN
-  DELETE FROM ab_f WHERE fid=10;              -- deletes the NULL-region row's partner (was: left stale)
+  DELETE FROM ab_f WHERE fid=10;              -- a NULL-region row (was: left stale)
   UPDATE ab_f SET qty=qty+1 WHERE fid=40;
-  INSERT INTO ab_f VALUES (50, 30, 1, 500);
+  INSERT INTO ab_f VALUES (50, 1, 500);       -- another NULL-region row
   REFRESH MATERIALIZED VIEW ab2_r;
   SELECT count(*) INTO d FROM (
-    (SELECT fid,cq,pq,pid,region FROM ab2_m EXCEPT SELECT fid,cq,pq,pid,region FROM ab2_r)
-    UNION ALL (SELECT fid,cq,pq,pid,region FROM ab2_r EXCEPT SELECT fid,cq,pq,pid,region FROM ab2_m)) z;
-  IF d <> 0 THEN RAISE EXCEPTION 'row-level self-join NULL column: diverged by %', d; END IF;
-  RAISE NOTICE '2. row-level self-join with NULL projected column == REFRESH: PASS';
+    (SELECT fid,cq,region FROM ab2_m EXCEPT SELECT fid,cq,region FROM ab2_r)
+    UNION ALL (SELECT fid,cq,region FROM ab2_r EXCEPT SELECT fid,cq,region FROM ab2_m)) z;
+  IF d <> 0 THEN RAISE EXCEPTION 'row-level NULL column: diverged by %', d; END IF;
+  RAISE NOTICE '2. row-level join with NULL projected column == REFRESH: PASS';
 END $$;
 DROP MATERIALIZED VIEW ab2_m, ab2_r CASCADE; DROP TABLE ab_c, ab_f CASCADE;
 
@@ -134,33 +137,41 @@ BEGIN
 END $$;
 DROP MATERIALIZED VIEW ab4_m CASCADE; DROP TABLE ab_h, ab_l CASCADE;
 
--- ---------- 5. row-level self-join: join-key UPDATE on a both-sides node ----------
--- The INSERT delta re-derives a changed row's pairs in BOTH roles; a
--- delete-every-match DELETE then wiped the freshly re-derived copy.  The
--- count-based DELETE removes exactly the old multiplicity, so the row survives.
+-- ---------- 5. self-joins: row-level rejected; aggregate maintains under join-key churn ----------
+-- A row-level (non-aggregated) self-join is REJECTED: both role arms re-derive
+-- the self-matching diagonal pair (for ON a.k=b.k, every row), which an INSERT
+-- double-counts and a DELETE cannot reconcile.  An AGGREGATE self-join uses the
+-- recompute path and stays byte-identical even under join-key UPDATEs.
 DROP TABLE IF EXISTS ab_sj CASCADE;
-CREATE TABLE ab_sj(id int primary key, parent int, val int);
-INSERT INTO ab_sj VALUES (6,NULL,60),(13,6,130),(26,13,260),(27,13,270),(52,26,520);
-CREATE MATERIALIZED VIEW ab5_m WITH (incremental_refresh=true) AS
-  SELECT c.id cid, c.parent cpar, p.id pid, p.val pval FROM ab_sj c JOIN ab_sj p ON c.parent=p.id;
-CREATE MATERIALIZED VIEW ab5_r AS
-  SELECT c.id cid, c.parent cpar, p.id pid, p.val pval FROM ab_sj c JOIN ab_sj p ON c.parent=p.id;
+CREATE TABLE ab_sj(id int primary key, parent int, k int, cat text, val int);
+INSERT INTO ab_sj VALUES (6,NULL,0,'a',60),(13,6,1,'a',130),(26,13,1,'b',260),(27,13,2,'b',270),(52,26,2,'a',520);
+CREATE MATERIALIZED VIEW ab5agg_m WITH (incremental_refresh=true) AS
+  SELECT a.cat, count(*) c, sum(b.val) s FROM ab_sj a JOIN ab_sj b ON a.k=b.k GROUP BY a.cat;
+CREATE MATERIALIZED VIEW ab5agg_r AS
+  SELECT a.cat, count(*) c, sum(b.val) s FROM ab_sj a JOIN ab_sj b ON a.k=b.k GROUP BY a.cat;
 DO $$
 DECLARE d int;
 BEGIN
-  UPDATE ab_sj SET parent=NULL WHERE id=13;       -- 13 is child (of 6) AND parent (of 26,27)
-  UPDATE ab_sj SET parent=6 WHERE id=13;          -- re-point back
-  INSERT INTO ab_sj VALUES (99,6,990);            -- new row that is a parent's child
-  UPDATE ab_sj SET val=val+1 WHERE id=6;          -- measure change on a parent (fans out)
+  -- row-level self-join must be rejected
+  BEGIN
+    EXECUTE 'CREATE MATERIALIZED VIEW ab5row WITH (incremental_refresh=true) AS
+             SELECT a.id, b.val FROM ab_sj a JOIN ab_sj b ON a.k=b.k';
+    RAISE EXCEPTION 'row-level self-join should be rejected';
+  EXCEPTION WHEN feature_not_supported THEN NULL; END;
+
+  -- aggregate self-join stays byte-identical under join-key + measure + membership churn
+  UPDATE ab_sj SET k=k+1 WHERE id=13;             -- join-key change on a both-sides node
+  INSERT INTO ab_sj VALUES (99,6,1,'a',990);
+  UPDATE ab_sj SET val=val+1 WHERE id=6;
   DELETE FROM ab_sj WHERE id=27;
-  REFRESH MATERIALIZED VIEW ab5_r;
+  REFRESH MATERIALIZED VIEW ab5agg_r;
   SELECT count(*) INTO d FROM (
-    (SELECT cid,cpar,pid,pval FROM ab5_m EXCEPT ALL SELECT cid,cpar,pid,pval FROM ab5_r)
-    UNION ALL (SELECT cid,cpar,pid,pval FROM ab5_r EXCEPT ALL SELECT cid,cpar,pid,pval FROM ab5_m)) z;
-  IF d <> 0 THEN RAISE EXCEPTION 'self-join join-key UPDATE: diverged by %', d; END IF;
-  RAISE NOTICE '5. row-level self-join join-key UPDATE (both-sides node) == REFRESH: PASS';
+    (SELECT cat,c,s FROM ab5agg_m EXCEPT ALL SELECT cat,c,s FROM ab5agg_r)
+    UNION ALL (SELECT cat,c,s FROM ab5agg_r EXCEPT ALL SELECT cat,c,s FROM ab5agg_m)) z;
+  IF d <> 0 THEN RAISE EXCEPTION 'aggregate self-join join-key churn: diverged by %', d; END IF;
+  RAISE NOTICE '5. row-level self-join rejected; aggregate self-join join-key churn == REFRESH: PASS';
 END $$;
-DROP MATERIALIZED VIEW ab5_m CASCADE; DROP MATERIALIZED VIEW ab5_r; DROP TABLE ab_sj CASCADE;
+DROP MATERIALIZED VIEW ab5agg_m, ab5agg_r CASCADE; DROP TABLE ab_sj CASCADE;
 
 -- ---------- 6. unsupported shapes are cleanly REJECTED (not accepted-then-fail/diverge) ----------
 DROP TABLE IF EXISTS ab_part, ab_gs CASCADE;
@@ -198,4 +209,33 @@ BEGIN
   RAISE NOTICE '6. partitioned/GROUPING SETS/TABLESAMPLE/SRF rejected; leaf + plain GROUP BY accepted: PASS';
 END $$;
 DROP TABLE ab_part, ab_gs CASCADE;
+
+-- ---------- 7. no-aggregate GROUP BY under parallel aggregation must NOT crash ----------
+-- A GROUP BY view with only the key + functionally-dependent bare columns (no
+-- explicit aggregate) injects a hidden count(*).  If hasAggs is left false the
+-- planner never resolves that Aggref's transition type and a parallel/partial
+-- aggregate plan aborts the backend (whole-cluster crash).  hasAggs is now set
+-- whenever the count is injected.
+DROP TABLE IF EXISTS ab_noagg CASCADE;
+CREATE TABLE ab_noagg(id int primary key, dim text, cat text);
+INSERT INTO ab_noagg SELECT g,'d'||(g%7),'c'||(g%3) FROM generate_series(1,2000) g;
+DO $$
+DECLARE d int;
+BEGIN
+  SET LOCAL debug_parallel_query = on;          -- force the crash-triggering plan
+  SET LOCAL min_parallel_table_scan_size = 0;
+  EXECUTE 'CREATE MATERIALIZED VIEW ab7_m WITH (incremental_refresh=true) AS SELECT id, dim, cat FROM ab_noagg GROUP BY id';
+  EXECUTE 'CREATE MATERIALIZED VIEW ab7_r AS SELECT id, dim, cat FROM ab_noagg GROUP BY id';
+  RESET debug_parallel_query; RESET min_parallel_table_scan_size;
+  INSERT INTO ab_noagg VALUES (3000,'dX','cX');
+  UPDATE ab_noagg SET dim='RN' WHERE id=5;
+  DELETE FROM ab_noagg WHERE id=9;
+  REFRESH MATERIALIZED VIEW ab7_r;
+  SELECT count(*) INTO d FROM (
+    (SELECT id,dim,cat FROM ab7_m EXCEPT SELECT id,dim,cat FROM ab7_r)
+    UNION ALL (SELECT id,dim,cat FROM ab7_r EXCEPT SELECT id,dim,cat FROM ab7_m)) z;
+  IF d <> 0 THEN RAISE EXCEPTION 'no-aggregate GROUP BY: diverged by %', d; END IF;
+  RAISE NOTICE '7. no-aggregate GROUP BY survives parallel aggregation + == REFRESH: PASS';
+END $$;
+DROP MATERIALIZED VIEW ab7_m CASCADE; DROP MATERIALIZED VIEW ab7_r; DROP TABLE ab_noagg CASCADE;
 \echo 'PASS: byte-identity audit regressions all green'

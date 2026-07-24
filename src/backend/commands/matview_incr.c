@@ -978,6 +978,24 @@ MatviewIncrIsEligible(Query *viewQuery, const char **reason)
 
 		hash_destroy(oid_counts);
 
+		/*
+		 * A row-level (non-aggregated, non-DISTINCT) self-join has no correct
+		 * incremental delta: both role arms re-derive the self-matching DIAGONAL
+		 * pair — a row that satisfies the join predicate with itself, which for
+		 * an equi-self-join (ON a.k = b.k) is EVERY row — so an INSERT
+		 * double-counts it and a DELETE cannot reconcile it.  Aggregated and
+		 * DISTINCT self-joins go through the recompute path (which re-derives each
+		 * affected group from the live tables) and are unaffected.
+		 */
+		if (self_join_seen && viewQuery->groupClause == NIL &&
+			viewQuery->distinctClause == NIL)
+		{
+			*reason = "a self-join without GROUP BY or DISTINCT (row-level) "
+				"cannot be maintained incrementally; aggregate it, or use a "
+				"plain (non-incremental) materialized view";
+			return false;
+		}
+
 		/* self-join + GROUP BY is handled by incr_build_self_recompute_sql */
 	}
 
@@ -3220,6 +3238,19 @@ MatviewIncrAddCountTarget(Query *q)
 						 pstrdup(MATVIEW_INCR_COUNT_COL),
 						 false);
 	q->targetList = lappend(q->targetList, te);
+
+	/*
+	 * We have injected at least the COUNT(*) aggregate, so the query now
+	 * contains aggregates — mark it.  A GROUP BY view with NO explicit aggregate
+	 * in the original target list (e.g. SELECT id, name FROM t GROUP BY id, the
+	 * functionally-dependent-columns shape) would otherwise keep hasAggs=false;
+	 * the planner then skips aggregate pre-processing and never resolves the
+	 * injected Aggref's transition type, so a parallel/partial aggregate plan
+	 * hits Assert(OidIsValid(agg->aggtranstype)) and the backend aborts (a
+	 * whole-cluster crash).  Setting hasAggs here — not only in the DISTINCT
+	 * branch above — makes the planner fill aggtranstype for every case.
+	 */
+	q->hasAggs = true;
 }
 
 /* ============================================================
@@ -9937,11 +9968,35 @@ matview_delta_apply(PG_FUNCTION_ARGS)
 			{
 				StringInfoData	refresh_sql;
 				char		   *nspname = get_namespace_name(get_rel_namespace(mvrelid));
+				SPIPlanPtr		rplan;
+				Snapshot		rsnap;
 
 				initStringInfo(&refresh_sql);
 				appendStringInfo(&refresh_sql, "REFRESH MATERIALIZED VIEW %s",
 								 quote_qualified_identifier(nspname, relname));
-				ret = SPI_execute(refresh_sql.data, false, 0);
+
+				/*
+				 * Rebuild from a FRESH latest snapshot, not the writer's
+				 * transaction snapshot (which is frozen under REPEATABLE READ /
+				 * SERIALIZABLE).  REFRESH scans the source under GetActiveSnapshot
+				 * (matview.c), and SPI_execute_snapshot pushes the snapshot we
+				 * pass as the active one, so the rebuild reflects every row
+				 * committed by concurrently-serialized writers — matching a
+				 * post-commit REFRESH.  Without this, a large-delta statement that
+				 * fell back to REFRESH under RR/SER would silently drop rows other
+				 * sessions committed after this transaction's snapshot was taken (a
+				 * lost update).  Mirrors the incremental path's post-lock maint_snap
+				 * (REFRESH's own AccessExclusiveLock serializes matview access).
+				 */
+				rplan = SPI_prepare(refresh_sql.data, 0, NULL);
+				if (rplan == NULL)
+					elog(ERROR, "matview_delta_apply: cost-router SPI_prepare failed: %s",
+						 SPI_result_code_string(SPI_result));
+				rsnap = RegisterSnapshot(GetLatestSnapshot());
+				ret = SPI_execute_snapshot(rplan, NULL, NULL, rsnap,
+										   InvalidSnapshot, false, false, 0);
+				UnregisterSnapshot(rsnap);
+				SPI_freeplan(rplan);
 				if (ret != SPI_OK_UTILITY)
 					elog(ERROR, "matview_delta_apply: cost-router refresh failed: %s",
 						 SPI_result_code_string(ret));
