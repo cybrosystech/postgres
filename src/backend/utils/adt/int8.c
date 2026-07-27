@@ -44,7 +44,8 @@ typedef struct
  * Formatting and conversion routines.
  *---------------------------------------------------------*/
 
-/* int8in()
+/*
+ * int8in()
  */
 Datum
 int8in(PG_FUNCTION_ARGS)
@@ -55,7 +56,8 @@ int8in(PG_FUNCTION_ARGS)
 }
 
 
-/* int8out()
+/*
+ * int8out()
  */
 Datum
 int8out(PG_FUNCTION_ARGS)
@@ -106,7 +108,8 @@ int8send(PG_FUNCTION_ARGS)
  *	Relational operators for int8s, including cross-data-type comparisons.
  *---------------------------------------------------------*/
 
-/* int8relop()
+/*
+ * int8relop()
  * Is val1 relop val2?
  */
 Datum
@@ -163,7 +166,8 @@ int8ge(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(val1 >= val2);
 }
 
-/* int84relop()
+/*
+ * int84relop()
  * Is 64-bit val1 relop 32-bit val2?
  */
 Datum
@@ -220,7 +224,8 @@ int84ge(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(val1 >= val2);
 }
 
-/* int48relop()
+/*
+ * int48relop()
  * Is 32-bit val1 relop 64-bit val2?
  */
 Datum
@@ -277,7 +282,8 @@ int48ge(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(val1 >= val2);
 }
 
-/* int82relop()
+/*
+ * int82relop()
  * Is 64-bit val1 relop 16-bit val2?
  */
 Datum
@@ -334,7 +340,8 @@ int82ge(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(val1 >= val2);
 }
 
-/* int28relop()
+/*
+ * int28relop()
  * Is 16-bit val1 relop 64-bit val2?
  */
 Datum
@@ -539,7 +546,8 @@ int8div(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64(result);
 }
 
-/* int8abs()
+/*
+ * int8abs()
  * Absolute value
  */
 Datum
@@ -556,7 +564,8 @@ int8abs(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64(result);
 }
 
-/* int8mod()
+/*
+ * int8mod()
  * Modulo operation.
  */
 Datum
@@ -786,8 +795,38 @@ int8inc_support(PG_FUNCTION_ARGS)
 		MonotonicFunction monotonic = MONOTONICFUNC_NONE;
 		int			frameOptions = req->window_clause->frameOptions;
 
-		/* No ORDER BY clause then all rows are peers */
-		if (req->window_clause->orderClause == NIL)
+		/*
+		 * Because an EXCLUDE clauses in the window definition can exclude
+		 * rows that have previously been included in the aggregate result for
+		 * prior rows, this can break the monotonic properties that might
+		 * otherwise be guaranteed.  There's a narrow set of circumstances
+		 * that can be guaranteed, which we check for below.
+		 */
+		if (frameOptions & FRAMEOPTION_EXCLUSION)
+		{
+			WindowFunc *wfunc = req->window_func;
+
+			/*
+			 * To add handling for all valid monotonic cases with an EXCLUDE
+			 * clause is complex and likely not worth troubling over.  For
+			 * now, just bail unless we see EXCLUDE CURRENT ROW with COUNT(*)
+			 * and no FILTER.  Excluding the current row is fine when using
+			 * COUNT(*) as this always reduces the count by 1.  The same isn't
+			 * true for COUNY(ANY) as a NULL won't be counted, and a
+			 * subsequent non-NULL could make the count decrease.
+			 */
+			if ((frameOptions & FRAMEOPTION_EXCLUDE_CURRENT_ROW) == 0 ||
+				wfunc->winfnoid != F_COUNT_ ||
+				wfunc->aggfilter != NULL)
+			{
+				req->monotonic = MONOTONICFUNC_NONE;
+				PG_RETURN_POINTER(req);
+			}
+		}
+
+		/* No ORDER BY clause and RANGE mode means all rows are peers. */
+		if (req->window_clause->orderClause == NIL &&
+			(frameOptions & FRAMEOPTION_RANGE))
 			monotonic = MONOTONICFUNC_BOTH;
 		else
 		{
@@ -1170,7 +1209,8 @@ int28div(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64((int64) arg1 / arg2);
 }
 
-/* Binary arithmetics
+/*
+ * Binary arithmetics
  *
  *		int8and		- returns arg1 & arg2
  *		int8or		- returns arg1 | arg2
@@ -1290,7 +1330,8 @@ i8tod(PG_FUNCTION_ARGS)
 	PG_RETURN_FLOAT8(result);
 }
 
-/* dtoi8()
+/*
+ * dtoi8()
  * Convert float8 to 8-byte integer.
  */
 Datum
@@ -1325,7 +1366,8 @@ i8tof(PG_FUNCTION_ARGS)
 	PG_RETURN_FLOAT4(result);
 }
 
-/* ftoi8()
+/*
+ * ftoi8()
  * Convert float4 to 8-byte integer.
  */
 Datum

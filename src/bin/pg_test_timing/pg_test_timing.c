@@ -7,6 +7,7 @@
 #include "postgres_fe.h"
 
 #include <limits.h>
+#include <math.h>
 
 #include "getopt_long.h"
 #include "port/pg_bitutils.h"
@@ -61,8 +62,8 @@ static void
 handle_args(int argc, char *argv[])
 {
 	static struct option long_options[] = {
-		{"duration", required_argument, NULL, 'd'},
 		{"cutoff", required_argument, NULL, 'c'},
+		{"duration", required_argument, NULL, 'd'},
 		{NULL, 0, NULL, 0}
 	};
 
@@ -75,7 +76,7 @@ handle_args(int argc, char *argv[])
 	{
 		if (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-?") == 0)
 		{
-			printf(_("Usage: %s [-d DURATION] [-c CUTOFF]\n"), progname);
+			printf(_("Usage: %s [-c CUTOFF] [-d DURATION]\n"), progname);
 			exit(0);
 		}
 		if (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)
@@ -85,11 +86,31 @@ handle_args(int argc, char *argv[])
 		}
 	}
 
-	while ((option = getopt_long(argc, argv, "d:c:",
+	while ((option = getopt_long(argc, argv, "c:d:",
 								 long_options, &optindex)) != -1)
 	{
 		switch (option)
 		{
+			case 'c':
+				errno = 0;
+				max_rprct = strtod(optarg, &endptr);
+
+				if (endptr == optarg || *endptr != '\0' || errno != 0)
+				{
+					fprintf(stderr, _("%s: invalid argument for option %s\n"),
+							progname, "--cutoff");
+					fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
+					exit(1);
+				}
+
+				if (max_rprct < 0 || max_rprct > 100)
+				{
+					fprintf(stderr, _("%s: %s must be in range %u..%u\n"),
+							progname, "--cutoff", 0, 100);
+					exit(1);
+				}
+				break;
+
 			case 'd':
 				errno = 0;
 				optval = strtoul(optarg, &endptr, 10);
@@ -108,26 +129,6 @@ handle_args(int argc, char *argv[])
 				{
 					fprintf(stderr, _("%s: %s must be in range %u..%u\n"),
 							progname, "--duration", 1, UINT_MAX);
-					exit(1);
-				}
-				break;
-
-			case 'c':
-				errno = 0;
-				max_rprct = strtod(optarg, &endptr);
-
-				if (endptr == optarg || *endptr != '\0' || errno != 0)
-				{
-					fprintf(stderr, _("%s: invalid argument for option %s\n"),
-							progname, "--cutoff");
-					fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
-					exit(1);
-				}
-
-				if (max_rprct < 0 || max_rprct > 100)
-				{
-					fprintf(stderr, _("%s: %s must be in range %u..%u\n"),
-							progname, "--cutoff", 0, 100);
 					exit(1);
 				}
 				break;
@@ -184,7 +185,7 @@ static void
 test_tsc_timing(void)
 {
 	uint64		loop_count;
-	uint32		calibrated_freq;
+	const TscClockSourceInfo *info;
 
 	printf("\n");
 	loop_count = test_timing(test_duration, TIMING_CLOCK_SOURCE_TSC, false);
@@ -197,23 +198,51 @@ test_tsc_timing(void)
 		loop_count = test_timing(test_duration, TIMING_CLOCK_SOURCE_TSC, true);
 		output(loop_count);
 		printf("\n");
+	}
 
-		printf(_("TSC frequency in use: %u kHz\n"), timing_tsc_frequency_khz);
+	/*
+	 * Report TSC information regardless of whether it was usable, makes
+	 * debugging a lot easier.
+	 */
+	info = pg_timing_tsc_clock_source_info();
+	if (info->frequency_source[0] != '\0')
+		printf(_("TSC frequency source: %s\n"), info->frequency_source);
+	printf(_("TSC frequency in use: %d kHz\n"), info->frequency_khz);
 
-		calibrated_freq = pg_tsc_calibrate_frequency();
-		if (calibrated_freq > 0)
-			printf(_("TSC frequency from calibration: %u kHz\n"), calibrated_freq);
-		else
-			printf(_("TSC calibration did not converge\n"));
+	if (info->calibrated_frequency_khz > 0)
+	{
+		double		diff_pct;
 
-		pg_set_timing_clock_source(TIMING_CLOCK_SOURCE_AUTO);
-		if (pg_current_timing_clock_source() == TIMING_CLOCK_SOURCE_TSC)
-			printf(_("TSC clock source will be used by default, unless timing_clock_source is set to 'system'.\n"));
-		else
-			printf(_("TSC clock source will not be used by default, unless timing_clock_source is set to 'tsc'.\n"));
+		printf(_("TSC frequency from calibration: %d kHz\n"), info->calibrated_frequency_khz);
+
+		diff_pct = fabs((double) info->calibrated_frequency_khz - info->frequency_khz) /
+			info->frequency_khz * 100.0;
+
+		if (diff_pct > 10.0)
+		{
+			printf(_("WARNING: Calibrated TSC frequency differs by %.1f%% from the TSC frequency in use\n"),
+				   diff_pct);
+			printf(_("HINT: Consider setting timing_clock_source to 'system'. Report bugs to <%s>.\n"), PACKAGE_BUGREPORT);
+			exit(1);
+		}
 	}
 	else
-		printf(_("TSC clock source is not usable. Likely unable to determine TSC frequency. Are you running in an unsupported virtualized environment?\n"));
+		printf(_("TSC calibration did not converge\n"));
+
+	/*
+	 * Report whether TSC was usable and, if so, whether it will be used
+	 * automatically.
+	 */
+	if (loop_count > 0)
+	{
+		pg_set_timing_clock_source(TIMING_CLOCK_SOURCE_AUTO);
+		if (pg_current_timing_clock_source() == TIMING_CLOCK_SOURCE_TSC)
+			printf(_("\nTSC clock source will be used by default, unless timing_clock_source is set to 'system'.\n"));
+		else
+			printf(_("\nTSC clock source will not be used by default, unless timing_clock_source is set to 'tsc'.\n"));
+	}
+	else
+		printf(_("\nTSC clock source is not usable. Likely unable to determine TSC frequency. Are you running in an unsupported virtualized environment?\n"));
 }
 #endif
 
@@ -281,7 +310,7 @@ test_timing(unsigned int duration, TimingClockSourceType source, bool fast_timin
 		if (unlikely(diff < 0))
 		{
 			fprintf(stderr, _("Detected clock going backwards in time.\n"));
-			fprintf(stderr, _("Time warp: " INT64_FORMAT " ns\n"), diff);
+			fprintf(stderr, _("Time warp: %" PRId64 " ns\n"), diff);
 			exit(1);
 		}
 
@@ -340,6 +369,12 @@ output(uint64 loop_count)
 	int			len4 = strlen(header4);
 	double		rprct;
 	bool		stopped = false;
+
+	if (loop_count == 0)
+	{
+		printf(_("WARNING: No timing measurements collected. Report this as a bug to <%s>.\n"), PACKAGE_BUGREPORT);
+		return;
+	}
 
 	/* find highest bit value */
 	while (max_bit > 0 && histogram[max_bit] == 0)

@@ -12,7 +12,8 @@
  *
  *-------------------------------------------------------------------------
  */
-/* INTERFACE ROUTINES
+/*
+ * INTERFACE ROUTINES
  *		ExecInitModifyTable - initialize the ModifyTable node
  *		ExecModifyTable		- retrieve the next tuple from the node
  *		ExecEndModifyTable	- shut down the ModifyTable node
@@ -198,6 +199,8 @@ static TupleTableSlot *ExecMergeNotMatched(ModifyTableContext *context,
 static void ExecSetupTransitionCaptureState(ModifyTableState *mtstate, EState *estate);
 static void fireBSTriggers(ModifyTableState *node);
 static void fireASTriggers(ModifyTableState *node);
+static void ExecInitForPortionOf(ModifyTableState *mtstate, EState *estate,
+								 ResultRelInfo *resultRelInfo);
 
 
 /*
@@ -1409,7 +1412,6 @@ ExecForPortionOfLeftovers(ModifyTableContext *context,
 	ModifyTableState *mtstate = context->mtstate;
 	ModifyTable *node = (ModifyTable *) mtstate->ps.plan;
 	ForPortionOfExpr *forPortionOf = (ForPortionOfExpr *) node->forPortionOf;
-	AttrNumber	rangeAttno;
 	Datum		oldRange;
 	TypeCacheEntry *typcache;
 	ForPortionOfState *fpoState;
@@ -1424,37 +1426,13 @@ ExecForPortionOfLeftovers(ModifyTableContext *context,
 	ReturnSetInfo rsi;
 	bool		didInit = false;
 	bool		shouldFree = false;
+	ResultRelInfo *rootRelInfo = mtstate->rootResultRelInfo;
+	bool		partitionRouting =
+		rootRelInfo &&
+		rootRelInfo->ri_RelationDesc->rd_rel->relkind == RELKIND_PARTITIONED_TABLE;
 
 	LOCAL_FCINFO(fcinfo, 2);
 
-	if (!resultRelInfo->ri_forPortionOf)
-	{
-		/*
-		 * If we don't have a ForPortionOfState yet, we must be a partition
-		 * child being hit for the first time. Make a copy from the root, with
-		 * our own TupleTableSlot. We do this lazily so that we don't pay the
-		 * price of unused partitions.
-		 */
-		ForPortionOfState *leafState = makeNode(ForPortionOfState);
-
-		if (!mtstate->rootResultRelInfo)
-			elog(ERROR, "no root relation but ri_forPortionOf is uninitialized");
-
-		fpoState = mtstate->rootResultRelInfo->ri_forPortionOf;
-		Assert(fpoState);
-
-		leafState->fp_rangeName = fpoState->fp_rangeName;
-		leafState->fp_rangeType = fpoState->fp_rangeType;
-		leafState->fp_rangeAttno = fpoState->fp_rangeAttno;
-		leafState->fp_targetRange = fpoState->fp_targetRange;
-		leafState->fp_Leftover = fpoState->fp_Leftover;
-		/* Each partition needs a slot matching its tuple descriptor */
-		leafState->fp_Existing =
-			table_slot_create(resultRelInfo->ri_RelationDesc,
-							  &mtstate->ps.state->es_tupleTable);
-
-		resultRelInfo->ri_forPortionOf = leafState;
-	}
 	fpoState = resultRelInfo->ri_forPortionOf;
 	oldtupleSlot = fpoState->fp_Existing;
 	leftoverSlot = fpoState->fp_Leftover;
@@ -1475,21 +1453,12 @@ ExecForPortionOfLeftovers(ModifyTableContext *context,
 	if (!table_tuple_fetch_row_version(resultRelInfo->ri_RelationDesc, tupleid, SnapshotAny, oldtupleSlot))
 		elog(ERROR, "failed to fetch tuple for FOR PORTION OF");
 
-	/*
-	 * Get the old range of the record being updated/deleted. Must read with
-	 * the attno of the leaf partition being updated.
-	 */
-
-	rangeAttno = forPortionOf->rangeVar->varattno;
-	if (resultRelInfo->ri_RootResultRelInfo)
-		map = ExecGetChildToRootMap(resultRelInfo);
-	if (map != NULL)
-		rangeAttno = map->attrMap->attnums[rangeAttno - 1];
 	slot_getallattrs(oldtupleSlot);
 
-	if (oldtupleSlot->tts_isnull[rangeAttno - 1])
+	/* Get the old range of the record being updated/deleted. */
+	if (oldtupleSlot->tts_isnull[fpoState->fp_rangeAttno - 1])
 		elog(ERROR, "found a NULL range in a temporal table");
-	oldRange = oldtupleSlot->tts_values[rangeAttno - 1];
+	oldRange = oldtupleSlot->tts_values[fpoState->fp_rangeAttno - 1];
 
 	/*
 	 * Get the range's type cache entry. This is worth caching for the whole
@@ -1527,12 +1496,19 @@ ExecForPortionOfLeftovers(ModifyTableContext *context,
 	fcinfo->args[1].isnull = false;
 
 	/*
-	 * If there are partitions, we must insert into the root table, so we get
-	 * tuple routing. We already set up leftoverSlot with the root tuple
-	 * descriptor.
+	 * For partitioned tables, we must read leftovers with the tuple
+	 * descriptor of the child table, but insert into the root table to enable
+	 * tuple routing. So leftoverSlot is configured with the root's tuple
+	 * descriptor. But for traditional table inheritance, we don't need tuple
+	 * routing and just insert directly into the child table to preserve
+	 * child-specific columns. In that case, leftoverSlot uses the child's
+	 * (resultRelInfo) tuple descriptor.
 	 */
-	if (resultRelInfo->ri_RootResultRelInfo)
+	if (partitionRouting)
+	{
+		map = ExecGetChildToRootMap(resultRelInfo);
 		resultRelInfo = resultRelInfo->ri_RootResultRelInfo;
+	}
 
 	/*
 	 * Insert a leftover for each value returned by the without_portion helper
@@ -1574,9 +1550,9 @@ ExecForPortionOfLeftovers(ModifyTableContext *context,
 		{
 			/*
 			 * Make a copy of the pre-UPDATE row. Then we'll overwrite the
-			 * range column below. Convert oldtuple to the base table's format
-			 * if necessary. We need to insert temporal leftovers through the
-			 * root partition so they get routed correctly.
+			 * range column below. Only partitioned targets need conversion to
+			 * the root table's format, because they reinsert through the root
+			 * relation for tuple routing.
 			 */
 			if (map != NULL)
 			{
@@ -1600,9 +1576,21 @@ ExecForPortionOfLeftovers(ModifyTableContext *context,
 
 			didInit = true;
 		}
+		else
+		{
+			/*
+			 * Re-copy the original row into leftoverSlot because ExecInsert
+			 * might pass leftoverSlot to BEFORE ROW INSERT triggers, which
+			 * can modify the slot contents.
+			 */
+			if (map != NULL)
+				execute_attr_map_slot(map->attrMap, oldtupleSlot, leftoverSlot);
+			else
+				ExecForceStoreHeapTuple(oldtuple, leftoverSlot, false);
+		}
 
-		leftoverSlot->tts_values[forPortionOf->rangeVar->varattno - 1] = leftover;
-		leftoverSlot->tts_isnull[forPortionOf->rangeVar->varattno - 1] = false;
+		leftoverSlot->tts_values[resultRelInfo->ri_forPortionOf->fp_rangeAttno - 1] = leftover;
+		leftoverSlot->tts_isnull[resultRelInfo->ri_forPortionOf->fp_rangeAttno - 1] = false;
 		ExecMaterializeSlot(leftoverSlot);
 
 		/*
@@ -2777,8 +2765,27 @@ ExecUpdate(ModifyTableContext *context, ResultRelInfo *resultRelInfo,
 	 * Prepare for the update.  This includes BEFORE ROW triggers, so we're
 	 * done if it says we are.
 	 */
+	context->tmfd.traversed = false;
 	if (!ExecUpdatePrologue(context, resultRelInfo, tupleid, oldtuple, slot, NULL))
 		return NULL;
+
+	/*
+	 * If the target tuple was concurrently updated, the trigger code will
+	 * have done EPQ and updated tupleid, following the update chain.  In this
+	 * case, we must fetch the most recent version of old tuple for the
+	 * benefit of RETURNING.  Technically, we could get away with not doing
+	 * this, if there is no RETURNING clause, or it doesn't refer to OLD, but
+	 * it seems preferable to always ensure that the contents of oldSlot are
+	 * correct.
+	 */
+	if (context->tmfd.traversed)
+	{
+		if (!table_tuple_fetch_row_version(resultRelInfo->ri_RelationDesc,
+										   tupleid,
+										   SnapshotAny,
+										   oldSlot))
+			elog(ERROR, "failed to re-fetch tuple updated during trigger execution");
+	}
 
 	/* INSTEAD OF ROW UPDATE Triggers */
 	if (resultRelInfo->ri_TrigDesc &&
@@ -4778,6 +4785,16 @@ ExecModifyTable(PlanState *pstate)
 		}
 
 		/*
+		 * If we don't have a ForPortionOfState yet, we must be a partition or
+		 * inheritance child being hit for the first time. Make a copy from
+		 * the root, with our own TupleTableSlot. We do this lazily so that we
+		 * don't pay the price of unused partitions.
+		 */
+		if (((ModifyTable *) context.mtstate->ps.plan)->forPortionOf &&
+			!resultRelInfo->ri_forPortionOf)
+			ExecInitForPortionOf(context.mtstate, estate, resultRelInfo);
+
+		/*
 		 * If resultRelInfo->ri_usesFdwDirectModify is true, all we need to do
 		 * here is compute the RETURNING expressions.
 		 */
@@ -5110,6 +5127,8 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 	List	   *updateColnosLists = NIL;
 	List	   *mergeActionLists = NIL;
 	List	   *mergeJoinConditions = NIL;
+	List	   *fdwPrivLists = NIL;
+	Bitmapset  *fdwDirectModifyPlans = NULL;
 	ResultRelInfo *resultRelInfo;
 	List	   *arowmarks;
 	ListCell   *l;
@@ -5152,6 +5171,8 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 
 		if (keep_rel)
 		{
+			List	   *fdwPrivList = (List *) list_nth(node->fdwPrivLists, i);
+
 			resultRelations = lappend_int(resultRelations, rti);
 			if (node->withCheckOptionLists)
 			{
@@ -5187,6 +5208,19 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 
 				mergeJoinConditions = lappend(mergeJoinConditions, mergeJoinCondition);
 			}
+
+			/*
+			 * fdwPrivLists/fdwDirectModifyPlans are re-indexed to match
+			 * resultRelations
+			 */
+			fdwPrivLists = lappend(fdwPrivLists, fdwPrivList);
+			if (bms_is_member(i, node->fdwDirectModifyPlans))
+			{
+				int			new_index = list_length(resultRelations) - 1;
+
+				fdwDirectModifyPlans = bms_add_member(fdwDirectModifyPlans,
+													  new_index);
+			}
 		}
 		i++;
 	}
@@ -5215,6 +5249,7 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 	mtstate->mt_updateColnosLists = updateColnosLists;
 	mtstate->mt_mergeActionLists = mergeActionLists;
 	mtstate->mt_mergeJoinConditions = mergeJoinConditions;
+	mtstate->mt_fdwPrivLists = fdwPrivLists;
 
 	/*----------
 	 * Resolve the target relation. This is the same as:
@@ -5290,13 +5325,13 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 
 		/* Initialize the usesFdwDirectModify flag */
 		resultRelInfo->ri_usesFdwDirectModify =
-			bms_is_member(i, node->fdwDirectModifyPlans);
+			bms_is_member(i, fdwDirectModifyPlans);
 
 		/*
 		 * Verify result relation is a valid target for the current operation
 		 */
 		CheckValidResultRel(resultRelInfo, operation, node->onConflictAction,
-							mergeActions);
+							mergeActions, node);
 
 		resultRelInfo++;
 		i++;
@@ -5319,7 +5354,7 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 			resultRelInfo->ri_FdwRoutine != NULL &&
 			resultRelInfo->ri_FdwRoutine->BeginForeignModify != NULL)
 		{
-			List	   *fdw_private = (List *) list_nth(node->fdwPrivLists, i);
+			List	   *fdw_private = (List *) list_nth(fdwPrivLists, i);
 
 			resultRelInfo->ri_FdwRoutine->BeginForeignModify(mtstate,
 															 resultRelInfo,
@@ -5859,4 +5894,77 @@ ExecReScanModifyTable(ModifyTableState *node)
 	 * semantics of that would be a bit debatable anyway.
 	 */
 	elog(ERROR, "ExecReScanModifyTable is not implemented");
+}
+
+/* ----------------------------------------------------------------
+ *		ExecInitForPortionOf
+ *
+ *		Initializes resultRelInfo->ri_forPortionOf for child tables.
+ *
+ *		Partitions share the root leftover slot, since they must insert via
+ *		the root relation to get tuple routing. Plain inheritance children
+ *		must keep their own leftover slot and insert back into the child, or
+ *		else child-only column values and physical placement would be lost.
+ * ----------------------------------------------------------------
+ */
+static void
+ExecInitForPortionOf(ModifyTableState *mtstate, EState *estate,
+					 ResultRelInfo *resultRelInfo)
+{
+	MemoryContext oldcxt;
+	ForPortionOfState *leafState;
+	ResultRelInfo *rootRelInfo = mtstate->rootResultRelInfo;
+	ForPortionOfState *fpoState;
+	TupleConversionMap *map;
+
+	if (!rootRelInfo)
+		elog(ERROR, "no root relation but ri_forPortionOf is uninitialized");
+
+	fpoState = rootRelInfo->ri_forPortionOf;
+	Assert(fpoState);
+
+	/* Things built here have to last for the query duration. */
+	oldcxt = MemoryContextSwitchTo(estate->es_query_cxt);
+
+	leafState = makeNode(ForPortionOfState);
+
+	leafState->fp_rangeName = fpoState->fp_rangeName;
+	leafState->fp_rangeType = fpoState->fp_rangeType;
+	leafState->fp_targetRange = fpoState->fp_targetRange;
+	map = ExecGetChildToRootMap(resultRelInfo);
+
+	/*
+	 * fp_rangeAttno must match the tuple layout used for reading the old
+	 * range value. The query uses the target relation's attno, so translate
+	 * it to the child attno when the child has a different column layout.
+	 */
+	if (map)
+		leafState->fp_rangeAttno = map->attrMap->attnums[fpoState->fp_rangeAttno - 1];
+	else
+		leafState->fp_rangeAttno = fpoState->fp_rangeAttno;
+
+	/*
+	 * For partitioned tables we must read the leftovers using the child
+	 * table's tuple descriptor, but then insert them into the root table
+	 * (using its tuple descriptor) so we get tuple routing.
+	 *
+	 * For traditional table inheritance, we read and insert directly into
+	 * this resultRelInfo; no tuple routing via the parent is required.
+	 */
+	if (rootRelInfo->ri_RelationDesc->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+		leafState->fp_Leftover = fpoState->fp_Leftover;
+	else
+		leafState->fp_Leftover =
+			ExecInitExtraTupleSlot(mtstate->ps.state,
+								   RelationGetDescr(resultRelInfo->ri_RelationDesc),
+								   &TTSOpsVirtual);
+
+	/* Each child relation needs a slot matching its tuple descriptor. */
+	leafState->fp_Existing =
+		table_slot_create(resultRelInfo->ri_RelationDesc,
+						  &mtstate->ps.state->es_tupleTable);
+
+	resultRelInfo->ri_forPortionOf = leafState;
+
+	MemoryContextSwitchTo(oldcxt);
 }

@@ -419,7 +419,7 @@ propgraph_edge_get_ref_keys(ParseState *pstate, const List *keycols, const List 
 			 * strategies.
 			 *
 			 * If the required operators do not exist, we can not construct
-			 * quals linking an edge to its adjacent vertexes.
+			 * quals linking an edge to its adjacent vertices.
 			 */
 			get_atttypetypmodcoll(RelationGetRelid(edge_rel), keyattnums[i], &keytype, &keytypmod, &keycoll);
 			get_atttypetypmodcoll(RelationGetRelid(ref_rel), refattnums[i], &reftype, &reftypmod, &refcoll);
@@ -456,7 +456,7 @@ propgraph_edge_get_ref_keys(ParseState *pstate, const List *keycols, const List 
 			/*
 			 * If collations of key attribute and referenced attribute are
 			 * different, an edge may end up being adjacent to undesired
-			 * vertexes.  Prohibit such a case.
+			 * vertices.  Prohibit such a case.
 			 *
 			 * PK/FK allows different collations as long as they are
 			 * deterministic for backward compatibility. But we can be a bit
@@ -897,6 +897,8 @@ insert_property_records(Oid graphid, Oid ellabeloid, Oid pgerelid, const PropGra
 	table_close(rel, NoLock);
 
 	tp = transformTargetList(pstate, proplist, EXPR_KIND_PROPGRAPH_PROPERTY);
+	if (pstate->p_resolve_unknowns)
+		resolveTargetListUnknowns(pstate, tp);
 	assign_expr_collations(pstate, (Node *) tp);
 
 	foreach(lc, tp)
@@ -1266,7 +1268,7 @@ check_element_label_properties(Oid ellabeloid)
 	if (diff1 || diff2)
 		ereport(ERROR,
 				errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-				errmsg("mismatching properties names in definition of label \"%s\"", get_propgraph_label_name(labelid)));
+				errmsg("mismatching property names in definition of label \"%s\"", get_propgraph_label_name(labelid)));
 }
 
 /*
@@ -1294,6 +1296,11 @@ AlterPropGraph(ParseState *pstate, const AlterPropGraphStmt *stmt)
 	ListCell   *lc;
 	ObjectAddress pgaddress;
 
+	/*
+	 * ShareRowExclusiveLock is required because this command runs some
+	 * graph-wide consistency checks that wouldn't work if more than one ALTER
+	 * PROPERTY GRAPH could operate on the same graph at once.
+	 */
 	pgrelid = RangeVarGetRelidExtended(stmt->pgname,
 									   ShareRowExclusiveLock,
 									   stmt->missing_ok ? RVR_MISSING_OK : 0,
@@ -1491,8 +1498,13 @@ AlterPropGraph(ParseState *pstate, const AlterPropGraphStmt *stmt)
 	{
 		Oid			peoid;
 		Oid			labeloid;
-		Oid			ellabeloid;
+		Oid			ellabeloid = InvalidOid;
 		ObjectAddress obj;
+		Relation	ellabelrel;
+		SysScanDesc ellabelscan;
+		ScanKeyData ellabelkey[1];
+		int			nlabels;
+		HeapTuple	tuple;
 
 		if (stmt->element_kind == PROPGRAPH_ELEMENT_KIND_VERTEX)
 			peoid = get_vertex_oid(pstate, pgrelid, stmt->element_alias, -1);
@@ -1510,10 +1522,34 @@ AlterPropGraph(ParseState *pstate, const AlterPropGraphStmt *stmt)
 						   get_rel_name(pgrelid), stmt->element_alias, stmt->drop_label),
 					parser_errposition(pstate, -1));
 
-		ellabeloid = GetSysCacheOid2(PROPGRAPHELEMENTLABELELEMENTLABEL,
-									 Anum_pg_propgraph_element_label_oid,
-									 ObjectIdGetDatum(peoid),
-									 ObjectIdGetDatum(labeloid));
+		/*
+		 * Is the given label associated with the element?  Is this the only
+		 * label associated with the element?  Scan the
+		 * pg_propgraph_element_label table to find answers to these
+		 * questions.  Stop scanning when we know both answers.
+		 */
+		ellabelrel = table_open(PropgraphElementLabelRelationId, AccessShareLock);
+		ScanKeyInit(&ellabelkey[0],
+					Anum_pg_propgraph_element_label_pgelelid,
+					BTEqualStrategyNumber, F_OIDEQ,
+					ObjectIdGetDatum(peoid));
+		ellabelscan = systable_beginscan(ellabelrel, PropgraphElementLabelElementLabelIndexId,
+										 true, NULL, 1, ellabelkey);
+		nlabels = 0;
+		while (HeapTupleIsValid(tuple = systable_getnext(ellabelscan)))
+		{
+			Form_pg_propgraph_element_label ellabelform = (Form_pg_propgraph_element_label) GETSTRUCT(tuple);
+
+			nlabels++;
+
+			if (ellabelform->pgellabelid == labeloid)
+				ellabeloid = ellabelform->oid;
+
+			if (nlabels > 1 && ellabeloid)
+				break;
+		}
+		systable_endscan(ellabelscan);
+		table_close(ellabelrel, AccessShareLock);
 
 		if (!ellabeloid)
 			ereport(ERROR,
@@ -1521,6 +1557,17 @@ AlterPropGraph(ParseState *pstate, const AlterPropGraphStmt *stmt)
 					errmsg("property graph \"%s\" element \"%s\" has no label \"%s\"",
 						   get_rel_name(pgrelid), stmt->element_alias, stmt->drop_label),
 					parser_errposition(pstate, -1));
+
+		/*
+		 * Prevent dropping the last label from an element. Every element must
+		 * have at least one label associated with it.
+		 */
+		if (nlabels == 1)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("cannot drop the last label from element \"%s\"",
+							stmt->element_alias),
+					 errhint("Every element must have at least one label.")));
 
 		ObjectAddressSet(obj, PropgraphElementLabelRelationId, ellabeloid);
 		performDeletion(&obj, stmt->drop_behavior, 0);
@@ -1538,7 +1585,7 @@ AlterPropGraph(ParseState *pstate, const AlterPropGraphStmt *stmt)
 		Oid			peoid;
 		Oid			pgerelid;
 		Oid			labeloid;
-		Oid			ellabeloid;
+		Oid			ellabeloid = InvalidOid;
 
 		if (stmt->element_kind == PROPGRAPH_ELEMENT_KIND_VERTEX)
 			peoid = get_vertex_oid(pstate, pgrelid, stmt->element_alias, -1);
@@ -1549,17 +1596,11 @@ AlterPropGraph(ParseState *pstate, const AlterPropGraphStmt *stmt)
 								   Anum_pg_propgraph_label_oid,
 								   ObjectIdGetDatum(pgrelid),
 								   CStringGetDatum(stmt->alter_label));
-		if (!labeloid)
-			ereport(ERROR,
-					errcode(ERRCODE_UNDEFINED_OBJECT),
-					errmsg("property graph \"%s\" element \"%s\" has no label \"%s\"",
-						   get_rel_name(pgrelid), stmt->element_alias, stmt->alter_label),
-					parser_errposition(pstate, -1));
-
-		ellabeloid = GetSysCacheOid2(PROPGRAPHELEMENTLABELELEMENTLABEL,
-									 Anum_pg_propgraph_element_label_oid,
-									 ObjectIdGetDatum(peoid),
-									 ObjectIdGetDatum(labeloid));
+		if (labeloid)
+			ellabeloid = GetSysCacheOid2(PROPGRAPHELEMENTLABELELEMENTLABEL,
+										 Anum_pg_propgraph_element_label_oid,
+										 ObjectIdGetDatum(peoid),
+										 ObjectIdGetDatum(labeloid));
 		if (!ellabeloid)
 			ereport(ERROR,
 					errcode(ERRCODE_UNDEFINED_OBJECT),
@@ -1580,7 +1621,7 @@ AlterPropGraph(ParseState *pstate, const AlterPropGraphStmt *stmt)
 	{
 		Oid			peoid;
 		Oid			labeloid;
-		Oid			ellabeloid;
+		Oid			ellabeloid = InvalidOid;
 		ObjectAddress obj;
 
 		if (stmt->element_kind == PROPGRAPH_ELEMENT_KIND_VERTEX)
@@ -1592,17 +1633,11 @@ AlterPropGraph(ParseState *pstate, const AlterPropGraphStmt *stmt)
 								   Anum_pg_propgraph_label_oid,
 								   ObjectIdGetDatum(pgrelid),
 								   CStringGetDatum(stmt->alter_label));
-		if (!labeloid)
-			ereport(ERROR,
-					errcode(ERRCODE_UNDEFINED_OBJECT),
-					errmsg("property graph \"%s\" element \"%s\" has no label \"%s\"",
-						   get_rel_name(pgrelid), stmt->element_alias, stmt->alter_label),
-					parser_errposition(pstate, -1));
-
-		ellabeloid = GetSysCacheOid2(PROPGRAPHELEMENTLABELELEMENTLABEL,
-									 Anum_pg_propgraph_element_label_oid,
-									 ObjectIdGetDatum(peoid),
-									 ObjectIdGetDatum(labeloid));
+		if (labeloid)
+			ellabeloid = GetSysCacheOid2(PROPGRAPHELEMENTLABELELEMENTLABEL,
+										 Anum_pg_propgraph_element_label_oid,
+										 ObjectIdGetDatum(peoid),
+										 ObjectIdGetDatum(labeloid));
 
 		if (!ellabeloid)
 			ereport(ERROR,
@@ -1615,20 +1650,23 @@ AlterPropGraph(ParseState *pstate, const AlterPropGraphStmt *stmt)
 		{
 			char	   *propname = strVal(lfirst(lc));
 			Oid			propoid;
-			Oid			plpoid;
+			Oid			plpoid = InvalidOid;
 
 			propoid = GetSysCacheOid2(PROPGRAPHPROPNAME,
 									  Anum_pg_propgraph_property_oid,
 									  ObjectIdGetDatum(pgrelid),
 									  CStringGetDatum(propname));
-			if (!propoid)
+			if (propoid)
+				plpoid = GetSysCacheOid2(PROPGRAPHLABELPROP,
+										 Anum_pg_propgraph_label_property_oid,
+										 ObjectIdGetDatum(ellabeloid),
+										 ObjectIdGetDatum(propoid));
+			if (!plpoid)
 				ereport(ERROR,
 						errcode(ERRCODE_UNDEFINED_OBJECT),
 						errmsg("property graph \"%s\" element \"%s\" label \"%s\" has no property \"%s\"",
 							   get_rel_name(pgrelid), stmt->element_alias, stmt->alter_label, propname),
 						parser_errposition(pstate, -1));
-
-			plpoid = GetSysCacheOid2(PROPGRAPHLABELPROP, Anum_pg_propgraph_label_property_oid, ObjectIdGetDatum(ellabeloid), ObjectIdGetDatum(propoid));
 
 			ObjectAddressSet(obj, PropgraphLabelPropertyRelationId, plpoid);
 			performDeletion(&obj, stmt->drop_behavior, 0);
@@ -1638,7 +1676,7 @@ AlterPropGraph(ParseState *pstate, const AlterPropGraphStmt *stmt)
 	}
 
 	/* Remove any orphaned pg_propgraph_property entries */
-	if (stmt->drop_properties || stmt->drop_vertex_tables || stmt->drop_edge_tables)
+	if (stmt->drop_properties || stmt->drop_vertex_tables || stmt->drop_edge_tables || stmt->drop_label)
 	{
 		foreach_oid(propoid, get_graph_property_ids(pgrelid))
 		{

@@ -328,6 +328,34 @@ EXPLAIN (COSTS OFF) SELECT * FROM clstr_expression WHERE -a = -3 ORDER BY -a, b;
 SELECT * FROM clstr_expression WHERE -a = -3 ORDER BY -a, b;
 COMMIT;
 
+-- verify some error cases
+CREATE TABLE clstr_table_one (id int, val text);
+CREATE TABLE clstr_table_two (id int, val text);
+CREATE INDEX clstr_idx_b ON clstr_table_two (id);
+CLUSTER clstr_table_one USING clstr_idx_b;
+CLUSTER clstr_table_one USING nonexistant;
+
+CREATE INDEX clstr_hash_idx ON clstr_table_one USING hash (id);
+CLUSTER clstr_table_one USING clstr_hash_idx;
+
+CREATE INDEX clstr_partial_idx ON clstr_table_one (id) WHERE id > 0;
+CLUSTER clstr_table_one USING clstr_partial_idx;
+
+REPACK pg_class USING INDEX pg_class_oid_index;
+
+DROP TABLE clstr_table_one, clstr_table_two;
+
+-- verify that CLUSTER/REPACK don't touch a NO DATA matview
+CREATE MATERIALIZED VIEW clstr_matview AS
+    SELECT i FROM generate_series(1, 5) i
+    WITH NO DATA;
+CREATE INDEX clstr_matview_idx ON clstr_matview (i);
+SELECT relfilenode FROM pg_class WHERE oid = 'clstr_matview'::regclass \gset
+CLUSTER clstr_matview USING clstr_matview_idx;
+REPACK clstr_matview USING INDEX clstr_matview_idx;
+SELECT relfilenode = :relfilenode FROM pg_class WHERE oid = 'clstr_matview'::regclass;
+DROP MATERIALIZED VIEW clstr_matview;
+
 ----------------------------------------------------------------------
 --
 -- REPACK
@@ -382,12 +410,6 @@ SELECT o.relname FROM relnodes_old o
 JOIN relnodes_new n ON o.relname = n.relname
 WHERE o.relfilenode <> n.relfilenode
 ORDER BY o.relname;
-
--- concurrently disallowed in catalogs
-REPACK (CONCURRENTLY) pg_class;
-
--- CONCURRENTLY doesn't like partitioned tables
-REPACK (CONCURRENTLY) clstrpart;
 
 -- clean up
 DROP TABLE clustertest;
