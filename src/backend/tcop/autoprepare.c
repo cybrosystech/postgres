@@ -835,7 +835,7 @@ AutoprepareConsult(Query *analyzed_query, const char *query_string,
 void
 AutoprepareRegisterGUCs(void)
 {
-	DefineCustomBoolVariable("autoprepare.enabled",
+	DefineCustomBoolVariable("db_blue.autoprepare_enabled",
 							 "Cache and reuse plans for repeated query shapes.",
 							 NULL,
 							 &autoprepare_enabled,
@@ -843,7 +843,7 @@ AutoprepareRegisterGUCs(void)
 							 PGC_SUSET, 0,
 							 NULL, NULL, NULL);
 
-	DefineCustomIntVariable("autoprepare.threshold",
+	DefineCustomIntVariable("db_blue.autoprepare_threshold",
 							"Cache a query shape after it is seen this many times.",
 							NULL,
 							&autoprepare_threshold,
@@ -851,7 +851,7 @@ AutoprepareRegisterGUCs(void)
 							PGC_SUSET, 0,
 							NULL, NULL, NULL);
 
-	DefineCustomIntVariable("autoprepare.limit",
+	DefineCustomIntVariable("db_blue.autoprepare_limit",
 							"Maximum number of cached query shapes per backend.",
 							NULL,
 							&autoprepare_limit,
@@ -859,7 +859,16 @@ AutoprepareRegisterGUCs(void)
 							PGC_SUSET, 0,
 							NULL, NULL, NULL);
 
-	MarkGUCPrefixReserved("autoprepare");
+	/*
+	 * Reserve the whole "db_blue" GUC prefix. This is the correct single home
+	 * for the reservation: AutoprepareRegisterGUCs() runs in PostgresMain()
+	 * after process_shared_preload_libraries(), so any db_blue.* GUCs owned by
+	 * preloaded modules (e.g. the pg_prewarm soft-pin pinner:
+	 * db_blue.pinned_tables, db_blue.ring_buffer_tables, ...) are already
+	 * defined by this point and are left untouched — only unrecognized
+	 * db_blue.* placeholders (typos) are flagged.
+	 */
+	MarkGUCPrefixReserved("db_blue");
 
 	/*
 	 * Our fingerprint is the query jumble (Query->queryId).  Force it on so
