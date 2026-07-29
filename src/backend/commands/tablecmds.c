@@ -7831,6 +7831,64 @@ add_column_collation_dependency(Oid relid, int32 attnum, Oid collid)
 }
 
 /*
+ * dbblue_ignore_drop_notnull
+ *
+ * Report whether a DROP NOT NULL on attnum should be silently ignored rather
+ * than raising an error.  That is the case only when all of the following
+ * hold, which is exactly the situation partitioning an Odoo table creates:
+ *
+ *	- rel is a partitioned table,
+ *	- attnum is one of its partition key columns, and
+ *	- attnum is part of its primary key, so the drop is going to fail anyway.
+ *
+ * Requiring the primary key membership keeps this narrow: we only suppress an
+ * error that would certainly have been raised further down in
+ * dropconstraint_internal().  A nullable partition key that is not part of a
+ * primary key can still have its not-null constraint dropped normally.
+ *
+ * Expression partition keys are recorded with an attnum of 0, which never
+ * matches a real column number, so they are excluded implicitly.
+ *
+ * See ATExecDropNotNull() for why DBblue needs this.
+ */
+static bool
+dbblue_ignore_drop_notnull(Relation rel, AttrNumber attnum)
+{
+	PartitionKey key;
+	Bitmapset  *pkattrs;
+	bool		is_partkey = false;
+	bool		in_pkey;
+	int			i;
+
+	if (rel->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
+		return false;
+
+	key = RelationGetPartitionKey(rel);
+	if (key == NULL)
+		return false;
+
+	for (i = 0; i < get_partition_natts(key); i++)
+	{
+		if (get_partition_col_attnum(key, i) == attnum)
+		{
+			is_partkey = true;
+			break;
+		}
+	}
+
+	if (!is_partkey)
+		return false;
+
+	pkattrs = RelationGetIndexAttrBitmap(rel, INDEX_ATTR_BITMAP_PRIMARY_KEY);
+	in_pkey = (pkattrs != NULL &&
+			   bms_is_member(attnum - FirstLowInvalidHeapAttributeNumber,
+							 pkattrs));
+	bms_free(pkattrs);
+
+	return in_pkey;
+}
+
+/*
  * ALTER TABLE ALTER COLUMN DROP NOT NULL
  *
  * Return the address of the modified column.  If the column was already
@@ -7866,6 +7924,34 @@ ATExecDropNotNull(Relation rel, const char *colName, bool recurse,
 	/* If the column is already nullable there's nothing to do. */
 	if (!attTup->attnotnull)
 	{
+		table_close(attr_rel, RowExclusiveLock);
+		return InvalidObjectAddress;
+	}
+
+	/*
+	 * DBblue: tolerate DROP NOT NULL on a partition key column.
+	 *
+	 * PostgreSQL requires every UNIQUE or PRIMARY KEY on a partitioned table
+	 * to include all partition key columns, so partitioning an Odoo table by
+	 * create_date widens its primary key from (id) to (id, create_date) and
+	 * makes create_date NOT NULL.  Odoo's ORM, however, issues ALTER COLUMN
+	 * ... DROP NOT NULL for every field whose Python definition is not
+	 * required, and create_date is not required.  Erroring out there aborts
+	 * module installation and upgrades on any partitioned table.
+	 *
+	 * Ignore the request instead of failing it.  The column deliberately
+	 * stays NOT NULL: we are declining a statement, not recording anything
+	 * untrue in the catalog, so the primary key and pg_dump output remain
+	 * correct.  A WARNING keeps the divergence from standard behaviour
+	 * visible.
+	 */
+	if (dbblue_ignore_drop_notnull(rel, attnum))
+	{
+		ereport(WARNING,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("ignoring DROP NOT NULL on partition key column \"%s\" of relation \"%s\"",
+						colName, RelationGetRelationName(rel)),
+				 errdetail("A partition key column must remain NOT NULL because it is part of the partitioned table's primary key.")));
 		table_close(attr_rel, RowExclusiveLock);
 		return InvalidObjectAddress;
 	}
@@ -13951,6 +14037,65 @@ transformFkeyGetPrimaryKey(Relation pkrel, Oid *indexOid,
 }
 
 /*
+ * dbblue_index_extras_are_partkey
+ *
+ * Helper for transformFkeyCheckAttrs().  Given a unique index on a partitioned
+ * table that has more key columns than the foreign key references, report
+ * whether every surplus column is a partition key column.
+ *
+ * This keeps DBblue's relaxation of the FK column-count rule to the exact case
+ * it exists for: PostgreSQL forces partition key columns into every unique
+ * index on a partitioned table, so an Odoo table partitioned by create_date
+ * ends up with a primary key of (id, create_date) even though only (id) is the
+ * logical key.  Surplus columns that are *not* part of the partition key were
+ * chosen by the user and must still be matched exactly, as upstream requires.
+ */
+static bool
+dbblue_index_extras_are_partkey(PartitionKey partkey,
+								Form_pg_index indexStruct,
+								int numattrs, const int16 *attnums)
+{
+	int			j;
+
+	if (partkey == NULL)
+		return false;
+
+	for (j = 0; j < indexStruct->indnkeyatts; j++)
+	{
+		AttrNumber	indattno = indexStruct->indkey.values[j];
+		bool		referenced = false;
+		bool		is_partkey = false;
+		int			k;
+
+		/* Columns the foreign key actually references are fine. */
+		for (k = 0; k < numattrs; k++)
+		{
+			if (attnums[k] == indattno)
+			{
+				referenced = true;
+				break;
+			}
+		}
+		if (referenced)
+			continue;
+
+		/* Anything else must be a partition key column. */
+		for (k = 0; k < get_partition_natts(partkey); k++)
+		{
+			if (get_partition_col_attnum(partkey, k) == indattno)
+			{
+				is_partkey = true;
+				break;
+			}
+		}
+		if (!is_partkey)
+			return false;
+	}
+
+	return true;
+}
+
+/*
  * transformFkeyCheckAttrs -
  *
  *	Validate that the 'attnums' columns in the 'pkrel' relation are valid to
@@ -13976,6 +14121,41 @@ transformFkeyCheckAttrs(Relation pkrel,
 	ListCell   *indexoidscan;
 	int			i,
 				j;
+	PartitionKey partkey = NULL;
+
+	/*
+	 * DBblue: when the referenced table is a partitioned table, PostgreSQL
+	 * requires that any UNIQUE or PRIMARY KEY index include all partition key
+	 * columns (see indexcmds.c).  This means a table partitioned by
+	 * create_date will have a composite PK of (id, create_date) even when
+	 * only (id) is the logical primary key.  To allow foreign keys that
+	 * reference only the logical key columns (e.g., REFERENCES
+	 * sale_order(id), which is what Odoo's ORM generates), we relax the
+	 * exact-column-count requirement for partitioned referenced tables: the
+	 * index must contain all FK-referenced columns, but may also contain
+	 * additional partition key columns.
+	 *
+	 * The relaxation is deliberately narrow: the *only* extra columns
+	 * tolerated are the partition key columns that PostgreSQL forced into the
+	 * index in the first place (see dbblue_index_extras_are_partkey).  A
+	 * unique index on (name, company_id) still does not satisfy REFERENCES
+	 * t(name), exactly as upstream requires.
+	 *
+	 * Temporal FKs (WITH PERIOD) keep the strict exact-match requirement
+	 * because their semantics depend on precise column positioning.
+	 *
+	 * NOTE: because a subset of a composite unique key is not itself unique,
+	 * the resulting foreign key relies on the referenced column being
+	 * globally unique by convention rather than by enforcement.  Odoo
+	 * satisfies this by drawing id from a sequence.  If duplicate ids ever
+	 * appear across partitions, referential actions are applied per leaf
+	 * partition and will misbehave.  This trade-off is accepted; see the
+	 * DBblue documentation.
+	 */
+	bool		pk_is_partitioned = (pkrel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE);
+
+	if (pk_is_partitioned)
+		partkey = RelationGetPartitionKey(pkrel);
 
 	/*
 	 * Reject duplicate appearances of columns in the referenced-columns list.
@@ -14014,11 +14194,18 @@ transformFkeyCheckAttrs(Relation pkrel,
 		indexStruct = (Form_pg_index) GETSTRUCT(indexTuple);
 
 		/*
-		 * Must have the right number of columns; must be unique (or if
-		 * temporal then exclusion instead) and not a partial index; forget it
-		 * if there are any expressions, too. Invalid indexes are out as well.
+		 * Must have the right number of columns (or, for non-temporal FKs on
+		 * partitioned tables, at least as many columns as the FK references,
+		 * with every surplus column being a partition key column); must be
+		 * unique (or if temporal then exclusion instead) and not a partial
+		 * index; forget it if there are any expressions, too. Invalid indexes
+		 * are out as well.
 		 */
-		if (indexStruct->indnkeyatts == numattrs &&
+		if ((indexStruct->indnkeyatts == numattrs ||
+			 (pk_is_partitioned && !with_period &&
+			  indexStruct->indnkeyatts > numattrs &&
+			  dbblue_index_extras_are_partkey(partkey, indexStruct,
+											  numattrs, attnums))) &&
 			(with_period ? indexStruct->indisexclusion : indexStruct->indisunique) &&
 			indexStruct->indisvalid &&
 			heap_attisnull(indexTuple, Anum_pg_index_indpred, NULL) &&
@@ -14037,15 +14224,17 @@ transformFkeyCheckAttrs(Relation pkrel,
 			 * Check for a match, and extract the appropriate opclasses while
 			 * we're at it.
 			 *
-			 * We know that attnums[] is duplicate-free per the test at the
-			 * start of this function, and we checked above that the number of
-			 * index columns agrees, so if we find a match for each attnums[]
-			 * entry then we must have a one-to-one match in some order.
+			 * For non-partitioned tables the number of index columns equals
+			 * numattrs (verified above), so as attnums[] is duplicate-free
+			 * per the test at the start of this function, this is a
+			 * one-to-one match check.  For partitioned tables the index may
+			 * have extra partition key columns; we search all indnkeyatts
+			 * positions to locate each FK column anywhere within the index.
 			 */
 			for (i = 0; i < numattrs; i++)
 			{
 				found = false;
-				for (j = 0; j < numattrs; j++)
+				for (j = 0; j < indexStruct->indnkeyatts; j++)
 				{
 					if (attnums[i] == indexStruct->indkey.values[j])
 					{

@@ -1,0 +1,5 @@
+# dbblue_partition extension
+comment = 'Odoo-aware in-place conversion of live tables to native range partitioning, built on pg_partman'
+default_version = '1.2'
+relocatable = false
+requires = 'pg_partman'
