@@ -70,6 +70,7 @@ extern PGDLLIMPORT bool enable_parallel_hash;
 extern PGDLLIMPORT bool enable_partition_pruning;
 extern PGDLLIMPORT bool enable_presorted_aggregate;
 extern PGDLLIMPORT bool enable_async_append;
+extern PGDLLIMPORT bool dbblue_enable_fk_join_reduction;
 extern PGDLLIMPORT int constraint_exclusion;
 
 extern double index_pages_fetched(double tuples_fetched, BlockNumber pages,
