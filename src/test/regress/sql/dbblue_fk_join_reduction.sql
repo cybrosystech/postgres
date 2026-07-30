@@ -15,12 +15,18 @@ declare ln text;
 begin
   for ln in execute 'explain (costs off) ' || q loop
     if ln ~ 'Full Join' then return 'FULL (not reduced)'; end if;
+    if ln ~ 'Anti Join' then return 'ANTI (not reduced)'; end if;
+    if ln ~ 'Semi Join' then return 'SEMI (not reduced)'; end if;
     if ln ~ 'Left Join' then return 'LEFT (not reduced)'; end if;
     if ln ~ 'Right Join' then return 'RIGHT (not reduced)'; end if;
     if ln ~ '(Hash|Merge|Nested Loop)' then return 'INNER (reduced)'; end if;
   end loop;
   return 'no join';
 end $$;
+
+-- off by default, because the reduction trusts that referential integrity was
+-- never bypassed; these tests are about the reduction itself, so enable it
+set dbblue_enable_fk_join_reduction = on;
 
 create table fkr_p (id int primary key, v int);
 create table fkr_c (id int primary key, pid int not null references fkr_p(id),
@@ -37,7 +43,26 @@ select fk_plan_kind('select c.id, p.v from fkr_c c left join fkr_p p on c.pid = 
 -- the GUC turns it off
 set dbblue_enable_fk_join_reduction = off;
 select fk_plan_kind('select c.id, p.v from fkr_c c left join fkr_p p on c.pid = p.id') as plan;
-reset dbblue_enable_fk_join_reduction;
+set dbblue_enable_fk_join_reduction = on;
+
+-- An upper qual forcing a nullable-side Var to NULL asks for the rows that did
+-- NOT match, so the join must not become inner.  RI_Initial_Check() validates a
+-- foreign key with exactly this shape, so reducing here would let a constraint
+-- prove itself valid; it is also how users look for orphaned rows.
+select fk_plan_kind('select c.id from fkr_c c left join fkr_p p on c.pid = p.id where p.id is null') as plan;
+
+-- ... so adding a foreign key over data that violates it must still fail
+create table fkr_bad_p (id int primary key);
+create table fkr_bad_c (id int primary key, pid int not null);
+insert into fkr_bad_p values (1);
+insert into fkr_bad_c values (10, 1), (11, 999);
+alter table fkr_bad_c add constraint fkr_bad_fk
+  foreign key (pid) references fkr_bad_p(id);
+-- and validating one separately must still fail
+alter table fkr_bad_c add constraint fkr_bad_fk2
+  foreign key (pid) references fkr_bad_p(id) not valid;
+alter table fkr_bad_c validate constraint fkr_bad_fk2;
+drop table fkr_bad_c, fkr_bad_p;
 
 -- RIGHT JOIN is the mirror image and also reduces
 select fk_plan_kind('select c.id, p.v from fkr_p p right join fkr_c c on c.pid = p.id') as plan,
@@ -122,6 +147,54 @@ select fk_plan_kind('select cc.id, pp.v from fkr_cc cc left join fkr_pp pp on cc
 
 -- ... but not when the ON clause covers only part of the key
 select fk_plan_kind('select cc.id, pp.v from fkr_cc cc left join fkr_pp pp on cc.a = pp.a') as plan;
+
+-- A qual BELOW the join is invisible to the ON-clause check: pull_up_subqueries
+-- splices a pulled-up subquery's FromExpr in as the join's arm, quals included,
+-- and such a qual can reject the row the foreign key promised.
+create table fkr_flag (id int primary key, v int, active boolean);
+create table fkr_ref (id int primary key, fid int not null references fkr_flag(id));
+insert into fkr_flag values (1, 10, true), (2, 20, false);
+insert into fkr_ref values (100, 1), (200, 2);
+analyze fkr_flag, fkr_ref;
+create view fkr_active as select * from fkr_flag where active;
+-- FROM-subquery, view, and CTE forms must all refuse
+select fk_plan_kind('select r.id, f.v from fkr_ref r left join (select * from fkr_flag where active) f on r.fid = f.id') as plan,
+       (select count(*) from fkr_ref r left join (select * from fkr_flag where active) f on r.fid = f.id) as outer_rows,
+       (select count(*) from fkr_ref r join (select * from fkr_flag where active) f on r.fid = f.id) as inner_rows;
+select fk_plan_kind('select r.id, f.v from fkr_ref r left join fkr_active f on r.fid = f.id') as plan,
+       (select count(*) from fkr_ref r left join fkr_active f on r.fid = f.id) as outer_rows;
+-- control: no filter below the join, so this one may reduce
+select fk_plan_kind('select r.id, f.v from fkr_ref r left join (select * from fkr_flag) f on r.fid = f.id') as plan,
+       (select count(*) from fkr_ref r left join (select * from fkr_flag) f on r.fid = f.id) as outer_rows;
+drop view fkr_active;
+drop table fkr_ref, fkr_flag;
+
+-- ONLY on a partitioned table reads no storage at all, so every row would be
+-- null-extended; reducing would drop the entire result.
+-- Note: these select a column of the nullable side, so that PostgreSQL's
+-- existing join removal cannot delete the join and leave the test vacuous.
+create table fkr_part (id int primary key, v int) partition by range (id);
+create table fkr_part_1 partition of fkr_part for values from (1) to (100);
+create table fkr_part_2 partition of fkr_part for values from (100) to (1000);
+create table fkr_pchild (id int primary key, pid int not null references fkr_part(id));
+insert into fkr_part values (1, 1), (2, 2), (500, 500);
+insert into fkr_pchild values (10, 1), (20, 2), (30, 500);
+analyze fkr_part, fkr_pchild;
+select fk_plan_kind('select c.id, p.v from fkr_pchild c left join only fkr_part p on c.pid = p.id') as plan,
+       (select count(*) from fkr_pchild c left join only fkr_part p on c.pid = p.id) as outer_rows,
+       (select count(*) from fkr_pchild c join only fkr_part p on c.pid = p.id) as inner_rows;
+-- control: without ONLY the partitions are scanned, so this may reduce
+select fk_plan_kind('select c.id, p.v from fkr_pchild c left join fkr_part p on c.pid = p.id') as plan,
+       (select count(*) from fkr_pchild c left join fkr_part p on c.pid = p.id) as outer_rows,
+       (select count(*) from fkr_pchild c join fkr_part p on c.pid = p.id) as inner_rows;
+
+-- A constraint cloned to a partition constrains only that partition's rows and
+-- may reference a single leaf, so it is not a whole-table proof.  Child row 30
+-- references partition 2, so joining partition 1 alone must keep it.
+select fk_plan_kind('select c.id, p.v from fkr_pchild c left join fkr_part_1 p on c.pid = p.id') as plan,
+       (select count(*) from fkr_pchild c left join fkr_part_1 p on c.pid = p.id) as outer_rows,
+       (select count(*) from fkr_pchild c join fkr_part_1 p on c.pid = p.id) as inner_rows;
+drop table fkr_pchild, fkr_part;
 
 drop table fkr_cc, fkr_pp, fkr_top, fkr_c, fkr_p;
 drop function fk_plan_kind(text);

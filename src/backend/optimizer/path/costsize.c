@@ -164,7 +164,7 @@ bool		enable_parallel_hash = true;
 bool		enable_partition_pruning = true;
 bool		enable_presorted_aggregate = true;
 bool		enable_async_append = true;
-bool		dbblue_enable_fk_join_reduction = true;
+bool		dbblue_enable_fk_join_reduction = false;
 
 typedef struct
 {
