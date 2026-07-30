@@ -142,6 +142,9 @@ typedef struct RI_ConstraintInfo
 
 	Oid			conindid;
 	bool		pk_is_partitioned;
+	bool		conindid_is_exact;	/* conindid has exactly nkeys key
+									 * columns (see DBblue note in
+									 * ri_fastpath_is_applicable) */
 
 	FastPathMeta *fpmeta;
 } RI_ConstraintInfo;
@@ -2504,6 +2507,32 @@ ri_LoadConstraintInfo(Oid constraintOid)
 	riinfo->pk_is_partitioned =
 		(get_rel_relkind(riinfo->pk_relid) == RELKIND_PARTITIONED_TABLE);
 
+	/*
+	 * DBblue: transformFkeyCheckAttrs() accepts a supporting unique index
+	 * with more key columns than the foreign key references when the
+	 * referenced table is partitioned (the surplus columns being partition
+	 * key columns).  The fast path builds its index scan keys positionally
+	 * and assumes conindid has exactly nkeys key columns, so record whether
+	 * that holds.  Cached here rather than tested per row: indnkeyatts
+	 * cannot change for a live index, and replacing the index rewrites
+	 * pg_constraint.conindid, which invalidates this entry.
+	 */
+	riinfo->conindid_is_exact = false;
+	if (OidIsValid(riinfo->conindid))
+	{
+		HeapTuple	indexTuple;
+
+		indexTuple = SearchSysCache1(INDEXRELID,
+									 ObjectIdGetDatum(riinfo->conindid));
+		if (HeapTupleIsValid(indexTuple))
+		{
+			riinfo->conindid_is_exact =
+				(((Form_pg_index) GETSTRUCT(indexTuple))->indnkeyatts ==
+				 riinfo->nkeys);
+			ReleaseSysCache(indexTuple);
+		}
+	}
+
 	ReleaseSysCache(tup);
 
 	/*
@@ -3360,6 +3389,20 @@ ri_fastpath_is_applicable(const RI_ConstraintInfo *riinfo)
 	 * reasoning, so they stay on the SPI path.
 	 */
 	if (riinfo->hasperiod)
+		return false;
+
+	/*
+	 * DBblue: the supporting index must have exactly as many key columns as
+	 * the foreign key references, because build_index_scankeys() fills scan
+	 * keys positionally.  transformFkeyCheckAttrs() can accept a wider
+	 * unique index when the referenced table is partitioned, and although
+	 * such a constraint cannot reach this point today (pk_is_partitioned is
+	 * rejected above, and leaf-level clones carry action triggers only),
+	 * checking it keeps a future change to those conditions degrading to
+	 * the SPI path rather than probing the wrong index column.  Computed
+	 * once in ri_LoadConstraintInfo(), not per row.
+	 */
+	if (!riinfo->conindid_is_exact)
 		return false;
 
 	return true;

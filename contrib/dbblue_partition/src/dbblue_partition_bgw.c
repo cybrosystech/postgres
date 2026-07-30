@@ -34,7 +34,6 @@
 #include "postgres.h"
 
 #include "access/xact.h"
-#include "commands/dbcommands.h"
 #include "executor/spi.h"
 #include "fmgr.h"
 #include "lib/stringinfo.h"
@@ -45,10 +44,12 @@
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/proc.h"
+#include "tcop/tcopprot.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
+#include "utils/timestamp.h"
 #include "utils/varlena.h"
 
 PG_MODULE_MAGIC;
@@ -67,9 +68,11 @@ pg_noreturn PGDLLEXPORT void dbblue_partition_bgw_main(Datum main_arg);
  * and call its run_maintenance().  A database without pg_partman (or with
  * nothing to maintain) is not an error; the extension may simply not be
  * installed there yet.
+ *
+ * Errors are the caller's problem: see dbblue_partition_bgw_run_maintenance().
  */
 static void
-dbblue_partition_bgw_run_maintenance(void)
+dbblue_partition_bgw_maintenance_pass(void)
 {
 	StringInfoData buf;
 	char	   *partman_schema;
@@ -97,7 +100,7 @@ dbblue_partition_bgw_run_maintenance(void)
 	{
 		ereport(DEBUG1,
 				(errmsg("dbblue_partition maintenance: pg_partman is not installed in database \"%s\", nothing to do",
-						get_database_name(MyDatabaseId))));
+						MyBgworkerEntry->bgw_extra)));
 		SPI_finish();
 		PopActiveSnapshot();
 		CommitTransactionCommand();
@@ -105,11 +108,16 @@ dbblue_partition_bgw_run_maintenance(void)
 		return;
 	}
 
-	partman_schema = TextDatumGetCString(SPI_getbinval(SPI_tuptable->vals[0],
-													   SPI_tuptable->tupdesc,
-													   1, &isnull));
-	if (isnull)
-		elog(ERROR, "pg_partman schema lookup returned NULL");
+	{
+		Datum		schema_datum;
+
+		schema_datum = SPI_getbinval(SPI_tuptable->vals[0],
+									 SPI_tuptable->tupdesc,
+									 1, &isnull);
+		if (isnull)
+			elog(ERROR, "pg_partman schema lookup returned NULL");
+		partman_schema = TextDatumGetCString(schema_datum);
+	}
 
 	resetStringInfo(&buf);
 	appendStringInfo(&buf,
@@ -126,9 +134,55 @@ dbblue_partition_bgw_run_maintenance(void)
 	CommitTransactionCommand();
 	pgstat_report_activity(STATE_IDLE, NULL);
 
+	/*
+	 * No catalog access here: the transaction is closed, so resolving the
+	 * database name again would read the syscache without a snapshot.
+	 */
 	ereport(DEBUG1,
 			(errmsg("dbblue_partition maintenance completed in database \"%s\"",
-					get_database_name(MyDatabaseId))));
+					MyBgworkerEntry->bgw_extra)));
+}
+
+/*
+ * Run one maintenance pass, surviving any error it raises.
+ *
+ * Letting an error escape would terminate the worker, and the postmaster
+ * would restart it after bgw_restart_time seconds -- which, because the
+ * restarted worker runs a pass immediately, turns any persistent failure
+ * (a partition set whose table was dropped, a lock timeout, insufficient
+ * privilege on one table) into a retry loop far tighter than the
+ * configured interval.  Log the failure instead and wait for the next
+ * scheduled pass.
+ */
+static void
+dbblue_partition_bgw_run_maintenance(void)
+{
+	MemoryContext caller_context = CurrentMemoryContext;
+
+	PG_TRY();
+	{
+		dbblue_partition_bgw_maintenance_pass();
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		MemoryContextSwitchTo(caller_context);
+		edata = CopyErrorData();
+		FlushErrorState();
+
+		/* Release whatever the failed pass left open. */
+		AbortOutOfAnyTransaction();
+		pgstat_report_activity(STATE_IDLE, NULL);
+
+		ereport(LOG,
+				(errmsg("dbblue_partition maintenance failed in database \"%s\": %s",
+						MyBgworkerEntry->bgw_extra, edata->message),
+				 errdetail("Retrying at the next scheduled run, in %d second(s).",
+						   dbblue_partition_maintenance_interval)));
+		FreeErrorData(edata);
+	}
+	PG_END_TRY();
 }
 
 /*
@@ -140,9 +194,18 @@ dbblue_partition_bgw_main(Datum main_arg)
 {
 	char	   *dbname = MyBgworkerEntry->bgw_extra;
 	char	   *role = dbblue_partition_maintenance_role;
+	TimestampTz next_run;
 
+	/*
+	 * SIGTERM maps to die(), not SignalHandlerForShutdownRequest: an
+	 * in-flight run_maintenance() can take minutes and must be cancellable
+	 * (fast shutdown, DROP DATABASE ... FORCE), and exiting 0 on a targeted
+	 * pg_terminate_backend() would deregister the worker for the life of
+	 * the postmaster, silently stopping maintenance.  die() exits 1, so the
+	 * postmaster restarts the worker after bgw_restart_time instead.
+	 */
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
-	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
+	pqsignal(SIGTERM, die);
 	BackgroundWorkerUnblockSignals();
 
 	if (role != NULL && role[0] == '\0')
@@ -156,19 +219,28 @@ dbblue_partition_bgw_main(Datum main_arg)
 					dbname, dbblue_partition_maintenance_interval)));
 
 	dbblue_partition_bgw_run_maintenance();
+	next_run = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+										   dbblue_partition_maintenance_interval * 1000L);
 
 	for (;;)
 	{
+		long		timeout;
+
+		/*
+		 * Wait until the next scheduled run.  Anything that sets the latch
+		 * (a config reload, a shutdown request) wakes us early, so the
+		 * decision to run is made from the clock rather than from the fact
+		 * that we woke up -- otherwise a SIGHUP arriving during a pass would
+		 * immediately trigger another one.
+		 */
+		timeout = TimestampDifferenceMilliseconds(GetCurrentTimestamp(), next_run);
+
 		(void) WaitLatch(MyLatch,
 						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-						 dbblue_partition_maintenance_interval * 1000L,
-						 PG_WAIT_EXTENSION);
+						 timeout, PG_WAIT_EXTENSION);
 		ResetLatch(MyLatch);
 
 		CHECK_FOR_INTERRUPTS();
-
-		if (ShutdownRequestPending)
-			break;
 
 		if (ConfigReloadPending)
 		{
@@ -176,14 +248,13 @@ dbblue_partition_bgw_main(Datum main_arg)
 			ProcessConfigFile(PGC_SIGHUP);
 		}
 
-		dbblue_partition_bgw_run_maintenance();
+		if (GetCurrentTimestamp() >= next_run)
+		{
+			dbblue_partition_bgw_run_maintenance();
+			next_run = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+												   dbblue_partition_maintenance_interval * 1000L);
+		}
 	}
-
-	ereport(LOG,
-			(errmsg("dbblue_partition maintenance worker for database \"%s\" shutting down",
-					dbname)));
-
-	proc_exit(0);
 }
 
 void
@@ -244,10 +315,28 @@ _PG_init(void)
 	}
 
 	rawstring = pstrdup(dbblue_partition_maintenance_dbname);
+
+	/*
+	 * A malformed list must not stop the cluster: _PG_init runs in the
+	 * postmaster during shared_preload_libraries processing, where there is
+	 * no exception stack, so an ERROR here would prevent startup entirely --
+	 * an easy thing to trigger with a trailing comma while editing the list.
+	 * Log and start no worker instead.
+	 *
+	 * Note that unquoted names are folded to lower case, as everywhere else
+	 * in PostgreSQL: a mixed-case database needs '"MixedCase"'.
+	 */
 	if (!SplitIdentifierString(rawstring, ',', &dblist))
-		ereport(ERROR,
+	{
+		ereport(LOG,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("invalid list syntax in dbblue_partition.maintenance_dbname")));
+				 errmsg("invalid list syntax in dbblue_partition.maintenance_dbname: \"%s\"",
+						dbblue_partition_maintenance_dbname),
+				 errdetail("No partition maintenance worker was started."),
+				 errhint("Use a comma-separated list of database names, and double-quote any name that is not all lower case.")));
+		pfree(rawstring);
+		return;
+	}
 
 	foreach(lc, dblist)
 	{

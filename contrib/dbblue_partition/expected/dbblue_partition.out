@@ -6,67 +6,38 @@
 CREATE EXTENSION dbblue_partition CASCADE;
 NOTICE:  installing required extension "pg_partman"
 SET client_min_messages = warning;
+-- Error CONTEXT pins PL/pgSQL line numbers and full procedure signatures,
+-- which change on any edit to the extension scripts; the messages themselves
+-- are what these tests assert.
+\set SHOW_CONTEXT never
 SET timezone = 'UTC';
 -- Refuses to run until explicitly enabled (off by default)
-CALL dbblue_partition_model('anything');
+CALL dbblue_partition_model('anything', p_odoo_compat => false);
 ERROR:  dbblue_partition is disabled
 HINT:  Run SET dbblue_partition.enabled = on; to enable it for this session.
-CONTEXT:  PL/pgSQL function public.dbblue_partition_enabled_check() line 4 at RAISE
-SQL statement "SELECT public.dbblue_partition_enabled_check()"
-PL/pgSQL function dbblue_partition_model(text,text,text,text,integer,interval,boolean,boolean,boolean) line 24 at PERFORM
 SET dbblue_partition.enabled = on;
 -- ---------------------------------------------------------------------
 -- Validation: fail early, before touching anything
 -- ---------------------------------------------------------------------
-CALL dbblue_partition_model('no_such_table');
+CALL dbblue_partition_model('no_such_table', p_odoo_compat => false);
 ERROR:  table public.no_such_table does not exist
-CONTEXT:  PL/pgSQL function public.dbblue_partition_convert(name,name,name,text,integer) line 83 at RAISE
-SQL statement "SELECT public.dbblue_partition_convert(p_schema::name, v_table,
-													 p_control::name, p_interval,
-													 p_premake)"
-PL/pgSQL function dbblue_partition_model(text,text,text,text,integer,interval,boolean,boolean,boolean) line 40 at PERFORM
 CREATE TABLE val_t (id serial PRIMARY KEY, v text, create_date timestamp);
-CALL dbblue_partition_model('val_t', 'no_such_column');
+CALL dbblue_partition_model('val_t', 'no_such_column', p_odoo_compat => false);
 ERROR:  column "no_such_column" of table public.val_t does not exist
-CONTEXT:  PL/pgSQL function public.dbblue_partition_convert(name,name,name,text,integer) line 142 at RAISE
-SQL statement "SELECT public.dbblue_partition_convert(p_schema::name, v_table,
-													 p_control::name, p_interval,
-													 p_premake)"
-PL/pgSQL function dbblue_partition_model(text,text,text,text,integer,interval,boolean,boolean,boolean) line 40 at PERFORM
-CALL dbblue_partition_model('val_t', 'v');				-- wrong type
+CALL dbblue_partition_model('val_t', 'v', p_odoo_compat => false);				-- wrong type
 ERROR:  column "v" has type text, but range partitioning needs date, timestamp or timestamptz
-CONTEXT:  PL/pgSQL function public.dbblue_partition_convert(name,name,name,text,integer) line 146 at RAISE
-SQL statement "SELECT public.dbblue_partition_convert(p_schema::name, v_table,
-													 p_control::name, p_interval,
-													 p_premake)"
-PL/pgSQL function dbblue_partition_model(text,text,text,text,integer,interval,boolean,boolean,boolean) line 40 at PERFORM
 INSERT INTO val_t (v, create_date) VALUES ('x', NULL);
-CALL dbblue_partition_model('val_t');					-- NULL in control column
+CALL dbblue_partition_model('val_t', p_odoo_compat => false);					-- NULL in control column
 ERROR:  column "create_date" contains 1 NULL value(s) and cannot become the partition key
 HINT:  Backfill the column first; it will become part of the primary key.
-CONTEXT:  PL/pgSQL function public.dbblue_partition_convert(name,name,name,text,integer) line 198 at RAISE
-SQL statement "SELECT public.dbblue_partition_convert(p_schema::name, v_table,
-													 p_control::name, p_interval,
-													 p_premake)"
-PL/pgSQL function dbblue_partition_model(text,text,text,text,integer,interval,boolean,boolean,boolean) line 40 at PERFORM
 DELETE FROM val_t;
 CREATE TABLE val_nopk (create_date timestamp NOT NULL);
-CALL dbblue_partition_model('val_nopk');				-- no primary key
+CALL dbblue_partition_model('val_nopk', p_odoo_compat => false);				-- no primary key
 ERROR:  table public.val_nopk has no primary key
 DETAIL:  dbblue_partition expects an Odoo-style table with a primary key.
-CONTEXT:  PL/pgSQL function public.dbblue_partition_convert(name,name,name,text,integer) line 165 at RAISE
-SQL statement "SELECT public.dbblue_partition_convert(p_schema::name, v_table,
-													 p_control::name, p_interval,
-													 p_premake)"
-PL/pgSQL function dbblue_partition_model(text,text,text,text,integer,interval,boolean,boolean,boolean) line 40 at PERFORM
 CREATE TABLE val_interval (id serial PRIMARY KEY, create_date timestamp NOT NULL);
-CALL dbblue_partition_model('val_interval', 'create_date', '-1 month');
+CALL dbblue_partition_model('val_interval', 'create_date', '-1 month', p_odoo_compat => false);
 ERROR:  partition interval must be positive, not -1 month
-CONTEXT:  PL/pgSQL function public.dbblue_partition_convert(name,name,name,text,integer) line 70 at RAISE
-SQL statement "SELECT public.dbblue_partition_convert(p_schema::name, v_table,
-													 p_control::name, p_interval,
-													 p_premake)"
-PL/pgSQL function dbblue_partition_model(text,text,text,text,integer,interval,boolean,boolean,boolean) line 40 at PERFORM
 -- ---------------------------------------------------------------------
 -- The full Odoo-shaped scenario
 -- ---------------------------------------------------------------------
@@ -117,7 +88,7 @@ INSERT INTO sale_order (name, partner_id, company_id, amount, create_date)
     VALUES ('SO-old', 1, 1, 10, timestamp '2023-06-15 12:00:00');
 INSERT INTO sale_order_line (order_id, company_id, qty)
     SELECT g, 1, g % 5 FROM generate_series(1, 5000) g;
-CALL dbblue_partition_model('sale.order', 'create_date', '1 month');
+CALL dbblue_partition_model('sale.order', 'create_date', '1 month', p_odoo_compat => false);
 WARNING:  primary key of public.sale_order widens from (id) to (id, create_date): "id" is unique per partition only
 DETAIL:  A unique index on a partitioned table must include the partition key. Odoo ids come from a sequence, so cross-partition duplicates do not occur in normal operation.
 HINT:  Monitoring: SELECT id, count(*) FROM public.sale_order GROUP BY id HAVING count(*) > 1;
@@ -126,8 +97,11 @@ DETAIL:  PostgreSQL requires every global unique index on a partitioned table to
 WARNING:  unique constraint/index "sale_order_id_company_uniq" on (id, company_id) does not include "create_date": it will be enforced per partition, not globally
 DETAIL:  PostgreSQL requires every global unique index on a partitioned table to include the partition key.
 WARNING:  created unique index sale_order_fkuq1 on (id, company_id, create_date) to back foreign key sol_order_company_fk from public.sale_order_line; uniqueness of (id, company_id) alone is per partition only
+WARNING:  foreign key relies on a non-primary unique constraint widened by the partition key
+DETAIL:  Uniqueness of the referenced columns is not enforced across partitions, so referential actions may misbehave if duplicates appear.
+HINT:  Reference the primary key instead, or include the partition key columns in the foreign key.
 -- now partitioned, all rows retained, nothing stranded
-SELECT relkind FROM pg_class WHERE relname = 'sale_order';
+SELECT relkind FROM pg_catalog.pg_class WHERE relname = 'sale_order';
  relkind 
 ---------
  p
@@ -257,14 +231,62 @@ SELECT backup_exists FROM dbblue_partition_status('sale.order');
  f
 (1 row)
 
-CALL dbblue_partition_model('sale.order');
+CALL dbblue_partition_model('sale.order', p_odoo_compat => false);
 ERROR:  table public.sale_order is already partitioned by dbblue_partition
-CONTEXT:  PL/pgSQL function dbblue_partition_model(text,text,text,text,integer,interval,boolean,boolean,boolean) line 36 at RAISE
+-- ---------------------------------------------------------------------
+-- Self-referencing FK (account_move.reversed_entry_id pattern): the FK
+-- constraint also carries conindid/conrelid of the source table, which
+-- must not duplicate the index capture nor be dropped from the wrong
+-- table during the swap.
+-- ---------------------------------------------------------------------
+CREATE TABLE acc_move (
+    id serial PRIMARY KEY,
+    reversed_entry_id int REFERENCES acc_move(id) ON DELETE SET NULL,
+    create_date timestamp NOT NULL
+);
+INSERT INTO acc_move (reversed_entry_id, create_date)
+    SELECT NULL, timestamp '2025-04-01' + (g || ' hours')::interval
+    FROM generate_series(1, 100) g;
+UPDATE acc_move SET reversed_entry_id = id - 1 WHERE id % 10 = 0;
+CALL dbblue_partition_model('acc_move', 'create_date', '1 month', p_odoo_compat => false);
+WARNING:  primary key of public.acc_move widens from (id) to (id, create_date): "id" is unique per partition only
+DETAIL:  A unique index on a partitioned table must include the partition key. Odoo ids come from a sequence, so cross-partition duplicates do not occur in normal operation.
+HINT:  Monitoring: SELECT id, count(*) FROM public.acc_move GROUP BY id HAVING count(*) > 1;
+SELECT relkind FROM pg_catalog.pg_class WHERE relname = 'acc_move';
+ relkind 
+---------
+ p
+(1 row)
+
+SELECT count(*) FROM acc_move;
+ count 
+-------
+   100
+(1 row)
+
+INSERT INTO acc_move (reversed_entry_id, create_date)
+    VALUES (999999, timestamp '2025-04-02');		-- self-FK enforced
+ERROR:  insert or update on table "acc_move_p20250401" violates foreign key constraint "acc_move_reversed_entry_id_fkey"
+DETAIL:  Key (reversed_entry_id)=(999999) is not present in table "acc_move".
+DELETE FROM acc_move WHERE id = 9;					-- ON DELETE SET NULL flows
+SELECT reversed_entry_id IS NULL AS set_null_ok FROM acc_move WHERE id = 10;
+ set_null_ok 
+-------------
+ t
+(1 row)
+
+SELECT convalidated FROM pg_constraint
+WHERE conname = 'acc_move_reversed_entry_id_fkey' AND conrelid = 'acc_move'::regclass;
+ convalidated 
+--------------
+ t
+(1 row)
+
 -- ---------------------------------------------------------------------
 -- Empty table: zero partitions was an unwritable-table defect
 -- ---------------------------------------------------------------------
 CREATE TABLE empty_model (id serial PRIMARY KEY, create_date timestamp NOT NULL DEFAULT now());
-CALL dbblue_partition_model('empty_model');
+CALL dbblue_partition_model('empty_model', p_odoo_compat => false);
 WARNING:  primary key of public.empty_model widens from (id) to (id, create_date): "id" is unique per partition only
 DETAIL:  A unique index on a partitioned table must include the partition key. Odoo ids come from a sequence, so cross-partition duplicates do not occur in normal operation.
 HINT:  Monitoring: SELECT id, count(*) FROM public.empty_model GROUP BY id HAVING count(*) > 1;
@@ -292,7 +314,7 @@ CREATE TABLE "Part Case" ("Id" int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
 INSERT INTO "Part Case" ("When Created")
     SELECT timestamptz '2025-02-01' + (g || ' days')::interval
     FROM generate_series(1, 100) g;
-CALL dbblue_partition_model('Part Case', 'When Created', '1 month');
+CALL dbblue_partition_model('Part Case', 'When Created', '1 month', p_odoo_compat => false);
 WARNING:  primary key of public."Part Case" widens from (Id) to (Id, When Created): "Id" is unique per partition only
 DETAIL:  A unique index on a partitioned table must include the partition key. Odoo ids come from a sequence, so cross-partition duplicates do not occur in normal operation.
 HINT:  Monitoring: SELECT Id, count(*) FROM public."Part Case" GROUP BY Id HAVING count(*) > 1;
@@ -320,20 +342,20 @@ INSERT INTO undo_me (v, create_date)
     SELECT 'v' || g, timestamp '2025-03-01' + (g || ' hours')::interval
     FROM generate_series(1, 1000) g;
 INSERT INTO undo_child (undo_id) SELECT g FROM generate_series(1, 1000) g;
-CALL dbblue_partition_model('undo_me', 'create_date', '1 month');
+CALL dbblue_partition_model('undo_me', 'create_date', '1 month', p_odoo_compat => false);
 WARNING:  primary key of public.undo_me widens from (id) to (id, create_date): "id" is unique per partition only
 DETAIL:  A unique index on a partitioned table must include the partition key. Odoo ids come from a sequence, so cross-partition duplicates do not occur in normal operation.
 HINT:  Monitoring: SELECT id, count(*) FROM public.undo_me GROUP BY id HAVING count(*) > 1;
 WARNING:  unique constraint/index "undo_me_v_key" on (v) does not include "create_date": it will be enforced per partition, not globally
 DETAIL:  PostgreSQL requires every global unique index on a partitioned table to include the partition key.
-SELECT relkind FROM pg_class WHERE relname = 'undo_me';
+SELECT relkind FROM pg_catalog.pg_class WHERE relname = 'undo_me';
  relkind 
 ---------
  p
 (1 row)
 
 CALL dbblue_partition_undo('undo_me');
-SELECT relkind FROM pg_class WHERE relname = 'undo_me';
+SELECT relkind FROM pg_catalog.pg_class WHERE relname = 'undo_me';
  relkind 
 ---------
  r
@@ -377,18 +399,77 @@ SELECT indexname FROM pg_indexes WHERE tablename = 'undo_me' ORDER BY indexname;
 (2 rows)
 
 -- ---------------------------------------------------------------------
+-- Publications: membership must move from the renamed backup to the new
+-- parent on convert (else subscribers see the batched deletes), and undo
+-- must restore membership without double-adding.
+-- ---------------------------------------------------------------------
+CREATE TABLE pub_t (id serial PRIMARY KEY, create_date timestamp NOT NULL);
+INSERT INTO pub_t (create_date) VALUES (timestamp '2025-06-01');
+CREATE PUBLICATION dbblue_test_pub FOR TABLE pub_t;
+CALL dbblue_partition_model('pub_t', p_odoo_compat => false);
+WARNING:  table public.pub_t is part of a logical replication publication; moved rows will be re-published as inserts
+HINT:  Consider publish_via_partition_root = true on the publication, and deduplicate on subscribers.
+WARNING:  primary key of public.pub_t widens from (id) to (id, create_date): "id" is unique per partition only
+DETAIL:  A unique index on a partitioned table must include the partition key. Odoo ids come from a sequence, so cross-partition duplicates do not occur in normal operation.
+HINT:  Monitoring: SELECT id, count(*) FROM public.pub_t GROUP BY id HAVING count(*) > 1;
+SELECT pr.prrelid::regclass::text AS published
+FROM pg_publication_rel pr JOIN pg_publication p ON p.oid = pr.prpubid
+WHERE p.pubname = 'dbblue_test_pub';
+ published 
+-----------
+ pub_t
+(1 row)
+
+CALL dbblue_partition_undo('pub_t');
+SELECT pr.prrelid::regclass::text AS published
+FROM pg_publication_rel pr JOIN pg_publication p ON p.oid = pr.prpubid
+WHERE p.pubname = 'dbblue_test_pub';
+ published 
+-----------
+ pub_t
+(1 row)
+
+DROP PUBLICATION dbblue_test_pub;
+-- ---------------------------------------------------------------------
+-- A NOT VALID incoming FK (tolerating pre-existing violations) must stay
+-- NOT VALID through both conversion and undo.
+-- ---------------------------------------------------------------------
+CREATE TABLE nv_parent (id serial PRIMARY KEY, create_date timestamp NOT NULL);
+CREATE TABLE nv_child (id serial PRIMARY KEY, parent_id int);
+INSERT INTO nv_parent (create_date) VALUES (timestamp '2025-06-01');
+INSERT INTO nv_child (parent_id) VALUES (424242);	-- pre-existing violation
+ALTER TABLE nv_child ADD CONSTRAINT nv_child_fk
+    FOREIGN KEY (parent_id) REFERENCES nv_parent(id) NOT VALID;
+CALL dbblue_partition_model('nv_parent', p_odoo_compat => false);
+WARNING:  primary key of public.nv_parent widens from (id) to (id, create_date): "id" is unique per partition only
+DETAIL:  A unique index on a partitioned table must include the partition key. Odoo ids come from a sequence, so cross-partition duplicates do not occur in normal operation.
+HINT:  Monitoring: SELECT id, count(*) FROM public.nv_parent GROUP BY id HAVING count(*) > 1;
+SELECT convalidated FROM pg_constraint WHERE conname = 'nv_child_fk';
+ convalidated 
+--------------
+ f
+(1 row)
+
+CALL dbblue_partition_undo('nv_parent');
+SELECT convalidated FROM pg_constraint WHERE conname = 'nv_child_fk';
+ convalidated 
+--------------
+ f
+(1 row)
+
+-- ---------------------------------------------------------------------
 -- Single-transaction mode is atomic: a ROLLBACK undoes the conversion
 -- ---------------------------------------------------------------------
 CREATE TABLE atomic_t (id serial PRIMARY KEY, create_date timestamp NOT NULL);
 INSERT INTO atomic_t (create_date)
     SELECT timestamp '2025-05-01' + g * interval '1 hour' FROM generate_series(1, 500) g;
 BEGIN;
-CALL dbblue_partition_model('atomic_t', p_single_transaction => true);
+CALL dbblue_partition_model('atomic_t', p_single_transaction => true, p_odoo_compat => false);
 WARNING:  primary key of public.atomic_t widens from (id) to (id, create_date): "id" is unique per partition only
 DETAIL:  A unique index on a partitioned table must include the partition key. Odoo ids come from a sequence, so cross-partition duplicates do not occur in normal operation.
 HINT:  Monitoring: SELECT id, count(*) FROM public.atomic_t GROUP BY id HAVING count(*) > 1;
 ROLLBACK;
-SELECT relkind FROM pg_class WHERE relname = 'atomic_t';
+SELECT relkind FROM pg_catalog.pg_class WHERE relname = 'atomic_t';
  relkind 
 ---------
  r
@@ -401,12 +482,12 @@ SELECT count(*) FROM atomic_t;
 (1 row)
 
 BEGIN;
-CALL dbblue_partition_model('atomic_t', p_single_transaction => true);
+CALL dbblue_partition_model('atomic_t', p_single_transaction => true, p_odoo_compat => false);
 WARNING:  primary key of public.atomic_t widens from (id) to (id, create_date): "id" is unique per partition only
 DETAIL:  A unique index on a partitioned table must include the partition key. Odoo ids come from a sequence, so cross-partition duplicates do not occur in normal operation.
 HINT:  Monitoring: SELECT id, count(*) FROM public.atomic_t GROUP BY id HAVING count(*) > 1;
 COMMIT;
-SELECT relkind FROM pg_class WHERE relname = 'atomic_t';
+SELECT relkind FROM pg_catalog.pg_class WHERE relname = 'atomic_t';
  relkind 
 ---------
  p
@@ -475,3 +556,33 @@ SELECT count(*) FROM pg_namespace WHERE nspname = 'dbblue_compat';
      0
 (1 row)
 
+-- ---------------------------------------------------------------------
+-- Leave nothing behind: no dangling role search_path, no template
+-- tables, no catalog or pg_partman rows.  Without this, a second
+-- installcheck run fails on "backup table already exists".
+-- ---------------------------------------------------------------------
+SELECT dbblue_partition_odoo_compat_remove(current_user);
+ dbblue_partition_odoo_compat_remove 
+-------------------------------------
+ 
+(1 row)
+
+SELECT dbblue_partition_odoo_compat_remove(
+           (SELECT pg_get_userbyid(datdba) FROM pg_database
+            WHERE datname = current_database()));
+ dbblue_partition_odoo_compat_remove 
+-------------------------------------
+ 
+(1 row)
+
+SELECT count(*) AS roles_still_pointing_at_compat
+FROM pg_db_role_setting s
+JOIN pg_database d ON d.oid = s.setdatabase
+WHERE d.datname = current_database()
+  AND array_to_string(s.setconfig, ' ') LIKE '%dbblue_compat%';
+ roles_still_pointing_at_compat 
+--------------------------------
+                              0
+(1 row)
+
+\set SHOW_CONTEXT errors

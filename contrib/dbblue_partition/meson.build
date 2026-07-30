@@ -19,6 +19,7 @@ install_data(
   'dbblue_partition--1.0.sql',
   'dbblue_partition--1.0--1.1.sql',
   'dbblue_partition--1.1--1.2.sql',
+  'dbblue_partition--1.2--1.3.sql',
   kwargs: contrib_data_args,
 )
 
