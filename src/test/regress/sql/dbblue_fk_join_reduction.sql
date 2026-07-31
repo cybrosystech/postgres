@@ -24,8 +24,9 @@ begin
   return 'no join';
 end $$;
 
--- off by default, because the reduction trusts that referential integrity was
--- never bypassed; these tests are about the reduction itself, so enable it
+-- The reduction applies only to constraints explicitly declared trustworthy,
+-- so each test grants trust after any constraint change.  A grant is reported
+-- as "trusted (verified)" only when scanning the data found no violating row.
 set dbblue_enable_fk_join_reduction = on;
 
 create table fkr_p (id int primary key, v int);
@@ -34,6 +35,7 @@ create table fkr_c (id int primary key, pid int not null references fkr_p(id),
 insert into fkr_p select g, g * 10 from generate_series(1, 20) g;
 insert into fkr_c select g, 1 + (g % 20), 't' || g from generate_series(1, 60) g;
 analyze fkr_p, fkr_c;
+select action from dbblue_trust_foreign_keys('fkr_c'::regclass);
 
 -- mandatory FK: reduces, and the two join types agree
 select fk_plan_kind('select c.id, p.v from fkr_c c left join fkr_p p on c.pid = p.id') as plan,
@@ -87,22 +89,21 @@ alter table fkr_c alter column pid set not null;
 alter table fkr_c drop constraint fkr_c_pid_fkey;
 select fk_plan_kind('select c.id, p.v from fkr_c c left join fkr_p p on c.pid = p.id') as plan;
 
--- NOT VALID FK proves nothing, and an orphan row can actually exist
-insert into fkr_c values (9002, 999, 'orphan');
+-- A NOT VALID FK was never checked, so it proves nothing.  The data here is
+-- clean and trust is granted, isolating convalidated as the sole reason.
 alter table fkr_c add constraint fkr_c_pid_fkey foreign key (pid)
   references fkr_p(id) not valid;
 analyze fkr_c;
-select fk_plan_kind('select c.id, p.v from fkr_c c left join fkr_p p on c.pid = p.id') as plan,
-       (select count(*) from fkr_c c left join fkr_p p on c.pid = p.id) as outer_rows,
-       (select count(*) from fkr_c c join fkr_p p on c.pid = p.id) as inner_rows;
+select action from dbblue_trust_foreign_keys('fkr_c'::regclass);
+select fk_plan_kind('select c.id, p.v from fkr_c c left join fkr_p p on c.pid = p.id') as plan;
 alter table fkr_c drop constraint fkr_c_pid_fkey;
-delete from fkr_c where id = 9002;
 
 -- a DEFERRABLE FK may legally be violated in mid-transaction, which is exactly
 -- where the two join types diverge, so it must not be trusted
 alter table fkr_c add constraint fkr_c_pid_fkey foreign key (pid)
   references fkr_p(id) deferrable initially deferred;
 analyze fkr_c;
+select action from dbblue_trust_foreign_keys('fkr_c'::regclass);
 select fk_plan_kind('select c.id, p.v from fkr_c c left join fkr_p p on c.pid = p.id') as plan;
 begin;
   insert into fkr_c values (9003, 4242, 'deferred-orphan');
@@ -112,6 +113,7 @@ rollback;
 alter table fkr_c drop constraint fkr_c_pid_fkey;
 alter table fkr_c add constraint fkr_c_pid_fkey foreign key (pid)
   references fkr_p(id);
+select action from dbblue_trust_foreign_keys('fkr_c'::regclass);
 
 -- any extra ON qual can reject the matching row, on either side
 select fk_plan_kind('select c.id, p.v from fkr_c c left join fkr_p p on c.pid = p.id and p.v > 100') as plan,
@@ -141,6 +143,7 @@ create table fkr_cc (id int primary key, a int not null, b int not null,
 insert into fkr_pp select g, g + 1, g * 7 from generate_series(1, 10) g;
 insert into fkr_cc select g, 1 + (g % 10), 2 + (g % 10) from generate_series(1, 40) g;
 analyze fkr_pp, fkr_cc;
+select action from dbblue_trust_foreign_keys('fkr_cc'::regclass);
 select fk_plan_kind('select cc.id, pp.v from fkr_cc cc left join fkr_pp pp on cc.a = pp.a and cc.b = pp.b') as plan,
        (select count(*) from fkr_cc cc left join fkr_pp pp on cc.a = pp.a and cc.b = pp.b) as outer_rows,
        (select count(*) from fkr_cc cc join fkr_pp pp on cc.a = pp.a and cc.b = pp.b) as inner_rows;
@@ -156,6 +159,7 @@ create table fkr_ref (id int primary key, fid int not null references fkr_flag(i
 insert into fkr_flag values (1, 10, true), (2, 20, false);
 insert into fkr_ref values (100, 1), (200, 2);
 analyze fkr_flag, fkr_ref;
+select action from dbblue_trust_foreign_keys('fkr_ref'::regclass);
 create view fkr_active as select * from fkr_flag where active;
 -- FROM-subquery, view, and CTE forms must all refuse
 select fk_plan_kind('select r.id, f.v from fkr_ref r left join (select * from fkr_flag where active) f on r.fid = f.id') as plan,
@@ -180,6 +184,7 @@ create table fkr_pchild (id int primary key, pid int not null references fkr_par
 insert into fkr_part values (1, 1), (2, 2), (500, 500);
 insert into fkr_pchild values (10, 1), (20, 2), (30, 500);
 analyze fkr_part, fkr_pchild;
+select action from dbblue_trust_foreign_keys('fkr_pchild'::regclass);
 select fk_plan_kind('select c.id, p.v from fkr_pchild c left join only fkr_part p on c.pid = p.id') as plan,
        (select count(*) from fkr_pchild c left join only fkr_part p on c.pid = p.id) as outer_rows,
        (select count(*) from fkr_pchild c join only fkr_part p on c.pid = p.id) as inner_rows;

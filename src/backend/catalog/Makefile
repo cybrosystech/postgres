@@ -30,6 +30,7 @@ OBJS = \
 	pg_class.o \
 	pg_collation.o \
 	pg_constraint.o \
+	pg_dbblue_trusted_fkey.o \
 	pg_conversion.o \
 	pg_db_role_setting.o \
 	pg_depend.o \

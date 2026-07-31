@@ -26,9 +26,12 @@
  */
 #include "postgres.h"
 
+#include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "catalog/pg_constraint.h"
+#include "catalog/pg_dbblue_trusted_fkey.h"
+#include "catalog/pg_trigger.h"
 #include "catalog/pg_type.h"
 #include "commands/trigger.h"
 #include "funcapi.h"
@@ -48,6 +51,7 @@
 #include "parser/parsetree.h"
 #include "rewrite/rewriteHandler.h"
 #include "rewrite/rewriteManip.h"
+#include "utils/fmgroids.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
@@ -170,6 +174,7 @@ static void report_reduced_full_join(reduce_outer_joins_pass2_state *state2,
 									 int rtindex, Relids relids);
 static bool has_notnull_forced_var(PlannerInfo *root, List *forced_null_vars,
 								   reduce_outer_joins_pass1_state *right_state);
+static bool fkey_triggers_disabled(Oid conoid);
 static bool fkey_proves_inner_join(PlannerInfo *root, JoinExpr *j,
 								   Node *innernode,
 								   reduce_outer_joins_pass1_state *outer_state,
@@ -3845,6 +3850,49 @@ has_notnull_forced_var(PlannerInfo *root, List *forced_null_vars,
 }
 
 /*
+ * fkey_triggers_disabled
+ *		Are this constraint's referential-integrity triggers switched off?
+ *
+ * A foreign key is enforced by triggers, so while they are disabled -- by
+ * ALTER TABLE ... DISABLE TRIGGER, say -- writes can violate it freely.  The
+ * catalog still reports the constraint as validated and enforced throughout,
+ * so this has to be read from pg_trigger.
+ */
+static bool
+fkey_triggers_disabled(Oid conoid)
+{
+	Relation	rel;
+	SysScanDesc scan;
+	ScanKeyData skey;
+	HeapTuple	tup;
+	bool		disabled = false;
+
+	rel = table_open(TriggerRelationId, AccessShareLock);
+
+	ScanKeyInit(&skey, Anum_pg_trigger_tgconstraint,
+				BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(conoid));
+	scan = systable_beginscan(rel, TriggerConstraintIndexId, true,
+							  NULL, 1, &skey);
+
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_pg_trigger trg = (Form_pg_trigger) GETSTRUCT(tup);
+
+		if (trg->tgenabled != TRIGGER_FIRES_ALWAYS &&
+			trg->tgenabled != TRIGGER_FIRES_ON_ORIGIN)
+		{
+			disabled = true;
+			break;
+		}
+	}
+
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+
+	return disabled;
+}
+
+/*
  * fkey_proves_inner_join
  *		Can a foreign key prove that this outer join never null-extends?
  *
@@ -4114,8 +4162,25 @@ fkey_proves_inner_join(PlannerInfo *root, JoinExpr *j, Node *innernode,
 			con->confmatchtype != FKCONSTR_MATCH_FULL)
 			ok = false;
 
+		/*
+		 * The catalog says integrity checking is armed; it cannot say the data
+		 * satisfies it.  Require someone to have accepted responsibility for
+		 * this particular constraint.
+		 */
+		if (ok && !DbblueFkeyIsTrusted(fk->conoid, con->conrelid,
+									   NameStr(con->conname)))
+			ok = false;
+
 		ReleaseSysCache(tup);
 		if (!ok)
+			continue;
+
+		/*
+		 * Even a trusted constraint is not being enforced right now if its own
+		 * RI triggers are switched off, so anything written in this window can
+		 * violate it.  Refuse while that is the case.
+		 */
+		if (fkey_triggers_disabled(fk->conoid))
 			continue;
 
 		/* Every referencing column must be NOT NULL. */

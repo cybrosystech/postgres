@@ -628,7 +628,7 @@
   long_desc => 'When a mandatory foreign key proves that every row of the preserved side has exactly one match on the nullable side, the outer join cannot produce null-extended rows, so it is planned as an inner join.',
   flags => 'GUC_EXPLAIN',
   variable => 'dbblue_enable_fk_join_reduction',
-  boot_val => 'false',
+  boot_val => 'true',
 },
 
 # This is PGC_SUSET to prevent hiding from log_lock_waits.

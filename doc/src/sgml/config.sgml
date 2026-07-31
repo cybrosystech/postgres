@@ -1144,12 +1144,35 @@ include_dir 'conf.d'
         mechanism, and hence not work with passwords encrypted with
         SCRAM-SHA-256.  See <xref linkend="auth-password"/> for more details.
        </para>
+       <para>
+        Because a foreign key is enforced by triggers rather than checked
+        directly, the catalog can only record that enforcement was
+        <emphasis>armed</emphasis>, never that the data satisfies it. Integrity
+        can be bypassed by <xref linkend="guc-session-replication-role"/> set to
+        <literal>replica</literal>, which is how a logical replication
+        subscriber applies changes, by <command>ALTER TABLE ... DISABLE
+        TRIGGER</command>, or by a user <literal>BEFORE</literal> trigger that
+        cancels a cascaded delete. So an optimization that changes results
+        cannot rely on the constraint alone; it relies on
+        <function>dbblue_trust_foreign_keys</function>,
+        which scans for violating rows and, finding none, records that the
+        constraint may be relied upon. Re-running it after a suspected bypass
+        withdraws the declaration again if violating rows have appeared.
+       </para>
+       <para>
+        The reduction is additionally refused while the constraint's own
+        referential-integrity triggers are disabled, and while the session is
+        in replica mode, since the constraint is not being enforced at all in
+        those windows.
+       </para>
        <warning>
         <para>
-         Support for MD5-encrypted passwords is deprecated and will be removed
-         in a future release of <productname>PostgreSQL</productname>.  Refer
-         to <xref linkend="auth-password"/> for details about migrating to
-         another password type.
+         A trust declaration reflects the data at the moment it was made. If
+         referential integrity is bypassed afterwards, rows can exist that the
+         constraint forbids, and queries planned with this parameter on will
+         silently omit them until the declaration is renewed or withdrawn. Grant
+         trust only where referential integrity is known to be maintained, and
+         renew it after any bulk load or restore that bypassed enforcement.
         </para>
        </warning>
       </listitem>
@@ -5780,8 +5803,10 @@ ANY <replaceable class="parameter">num_sync</replaceable> ( <replaceable class="
        <para>
         Enables or disables reducing an outer join to an inner join when a
         foreign key proves that the outer join cannot produce null-extended
-        rows. The default is <literal>off</literal>; see the caveat below
-        before enabling it.
+        rows. The default is <literal>on</literal>, but the reduction applies
+        only to foreign keys that have been declared trustworthy with
+        <function>dbblue_trust_foreign_keys</function>, so enabling it changes
+        nothing until such a declaration is made.
        </para>
        <para>
         If every row of the join's preserved side is guaranteed exactly one
