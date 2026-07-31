@@ -690,19 +690,31 @@ AutoprepareConsult(Query *analyzed_query, const char *query_string,
 	AutoprepareEntry *entry;
 	uint64		fp;
 	bool		found;
+	bool		dbg;
 
 	*plansource_out = NULL;
 	*boundParams_out = NULL;
 
+	/* dbblue diagnostic: focus logging on ir_attachment queries only */
+	dbg = (query_string != NULL && strstr(query_string, "ir_attachment") != NULL);
+
 	if (!autoprepare_enabled)
 		return APREP_UNCACHEABLE;
 	if (!query_is_cacheable(analyzed_query))
+	{
+		if (dbg)
+			elog(LOG, "[autoprep] UNCACHEABLE(not-cacheable: utility/cmdtype/graph) :: %.160s", query_string);
 		return APREP_UNCACHEABLE;
+	}
 
 	/* The fingerprint is the queryId the core jumbler already computed. */
 	fp = (uint64) analyzed_query->queryId;
 	if (fp == UINT64CONST(0))
+	{
+		if (dbg)
+			elog(LOG, "[autoprep] UNCACHEABLE(queryId=0; compute_query_id off?) :: %.160s", query_string);
 		return APREP_UNCACHEABLE;	/* query-id computation disabled */
+	}
 
 	if (autoprepare_table == NULL)
 		autoprepare_init();
@@ -724,6 +736,9 @@ AutoprepareConsult(Query *analyzed_query, const char *query_string,
 		entry->plansource = NULL;
 		entry->param_types = NULL;
 		entry->num_params = 0;
+		if (dbg)
+			elog(LOG, "[autoprep] MISS(first-sighting) qid=%llu seen=1 :: %.160s",
+				 (unsigned long long) fp, query_string);
 		return APREP_MISS;
 	}
 
@@ -757,22 +772,42 @@ AutoprepareConsult(Query *analyzed_query, const char *query_string,
 		(void) inparams;
 		if (ipquery == NULL ||
 			!equal(ipquery, entry->plansource->analyzed_parse_tree))
+		{
+			if (dbg)
+				elog(LOG, "[autoprep] MISS(reuse-fail: %s) qid=%llu seen=%u -> REPLAN :: %.160s",
+					 (ipquery == NULL) ? "reparameterize-returned-null(0-params/too-many)"
+									   : "equal()-shape-mismatch(query text/aliases/kept-literals differ)",
+					 (unsigned long long) fp, entry->seen_count, query_string);
 			return APREP_MISS;	/* queryId collision -> plan normally */
+		}
 
 		boundParams = extract_bound_params(analyzed_query,
 										   entry->param_types,
 										   entry->num_params);
 		if (boundParams == NULL)
+		{
+			if (dbg)
+				elog(LOG, "[autoprep] MISS(reuse-fail: extract-mismatch, param count/types diverged) qid=%llu -> REPLAN :: %.160s",
+					 (unsigned long long) fp, query_string);
 			return APREP_MISS;	/* divergence -> plan normally */
+		}
 
 		*plansource_out = entry->plansource;
 		*boundParams_out = boundParams;
+		if (dbg)
+			elog(LOG, "[autoprep] HIT (reusing cached plan) qid=%llu nparams=%d seen=%u :: %.160s",
+				 (unsigned long long) fp, entry->num_params, entry->seen_count, query_string);
 		return APREP_HIT;
 	}
 
 	/* ---- known-uncacheable shape: never re-attempt the build ---- */
 	if (entry->declined)
+	{
+		if (dbg)
+			elog(LOG, "[autoprep] MISS(previously-declined; won't rebuild) qid=%llu -> REPLAN :: %.160s",
+				 (unsigned long long) fp, query_string);
 		return APREP_MISS;
+	}
 
 	/* ---- seen before, not yet promoted: bump and maybe promote ---- */
 	entry->seen_count++;
@@ -809,6 +844,9 @@ AutoprepareConsult(Query *analyzed_query, const char *query_string,
 															sizeof(Oid) * nparams);
 			memcpy(entry->param_types, ptypes, sizeof(Oid) * nparams);
 			entry->promoted = true;
+			if (dbg)
+				elog(LOG, "[autoprep] PROMOTED (cached now; future runs can HIT) qid=%llu nparams=%d :: %.160s",
+					 (unsigned long long) fp, nparams, query_string);
 		}
 		else
 		{
@@ -819,6 +857,9 @@ AutoprepareConsult(Query *analyzed_query, const char *query_string,
 			 * copyObject + QueryRewrite.
 			 */
 			entry->declined = true;
+			if (dbg)
+				elog(LOG, "[autoprep] DECLINED(build returned NULL: 0-params, >%d params, or QueryRewrite expanded to !=1 query) qid=%llu -> always REPLAN :: %.160s",
+					 APREP_MAX_PARAMS, (unsigned long long) fp, query_string);
 		}
 		MemoryContextSwitchTo(old);
 		MemoryContextDelete(build_cxt);		/* frees all build scratch */
@@ -835,42 +876,14 @@ AutoprepareConsult(Query *analyzed_query, const char *query_string,
 void
 AutoprepareRegisterGUCs(void)
 {
-	DefineCustomBoolVariable("db_blue.autoprepare_enabled",
-							 "Cache and reuse plans for repeated query shapes.",
-							 NULL,
-							 &autoprepare_enabled,
-							 false,
-							 PGC_SUSET, 0,
-							 NULL, NULL, NULL);
-
-	DefineCustomIntVariable("db_blue.autoprepare_threshold",
-							"Cache a query shape after it is seen this many times.",
-							NULL,
-							&autoprepare_threshold,
-							2, 1, INT_MAX,
-							PGC_SUSET, 0,
-							NULL, NULL, NULL);
-
-	DefineCustomIntVariable("db_blue.autoprepare_limit",
-							"Maximum number of cached query shapes per backend.",
-							NULL,
-							&autoprepare_limit,
-							1024, 1, INT_MAX,
-							PGC_SUSET, 0,
-							NULL, NULL, NULL);
-
 	/*
-	 * Reserve the whole "db_blue" GUC prefix. This is the correct single home
-	 * for the reservation: AutoprepareRegisterGUCs() runs in PostgresMain()
-	 * after process_shared_preload_libraries(), so any db_blue.* GUCs owned by
-	 * preloaded modules (e.g. the pg_prewarm soft-pin pinner:
-	 * db_blue.pinned_tables, db_blue.ring_buffer_tables, ...) are already
-	 * defined by this point and are left untouched — only unrecognized
-	 * db_blue.* placeholders (typos) are flagged.
-	 */
-	MarkGUCPrefixReserved("db_blue");
-
-	/*
+	 * The autoprepare parameters (dbblue_autoprepare_enabled,
+	 * dbblue_autoprepare_threshold, dbblue_autoprepare_limit) are now core
+	 * GUCs defined in src/backend/utils/misc/guc_parameters.dat, so there is
+	 * nothing to register here at backend start.
+	 *
+	 * We still force query-id computation on:
+	 *
 	 * Our fingerprint is the query jumble (Query->queryId).  Force it on so
 	 * the feature works even under the default compute_query_id = auto when no
 	 * other consumer (e.g. pg_stat_statements) has requested it.

@@ -366,6 +366,23 @@ int			checkpoint_flush_after = DEFAULT_CHECKPOINT_FLUSH_AFTER;
 int			bgwriter_flush_after = DEFAULT_BGWRITER_FLUSH_AFTER;
 int			backend_flush_after = DEFAULT_BACKEND_FLUSH_AFTER;
 
+/*
+ * dbblue soft-pin / ring-buffer GUC variables.
+ *
+ * These back the core dbblue_* GUCs defined in guc_parameters.dat. They live
+ * in core (rather than the pg_prewarm contrib module) because flat, dotless
+ * GUC names must be core GUCs, and a loadable module cannot register those.
+ * The pg_prewarm "db_blue pinner" background worker reads these via the extern
+ * declarations in storage/bufmgr.h.
+ */
+bool		DBBluePinner_enabled = false;	/* master switch: register the pinner worker? */
+char	   *DBBluePinner_pinned_tables = NULL;
+char	   *DBBluePinner_ring_buffer_tables = NULL;
+char	   *DBBluePinner_database = NULL;
+int			DBBluePinner_check_interval = 0;
+int			DBBluePinner_max_pin_percent = 35;
+int			DBBluePinner_min_access_count = 100;
+
 /* local state for LockBufferForCleanup */
 static BufferDesc *PinCountWaitBuf = NULL;
 
