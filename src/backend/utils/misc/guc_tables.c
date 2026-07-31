@@ -90,6 +90,7 @@
 #include "storage/proc.h"
 #include "storage/procnumber.h"
 #include "storage/standby.h"
+#include "tcop/autoprepare.h"
 #include "tcop/backend_startup.h"
 #include "tcop/tcopprot.h"
 #include "portability/instr_time.h"
