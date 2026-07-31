@@ -59,5 +59,7 @@ typedef FormData_pg_dbblue_trusted_fkey *Form_pg_dbblue_trusted_fkey;
 DECLARE_UNIQUE_INDEX_PKEY(pg_dbblue_trusted_fkey_conoid_index, 8337, DbblueTrustedFkeyIndexId, pg_dbblue_trusted_fkey, btree(conoid oid_ops));
 
 extern bool DbblueFkeyIsTrusted(Oid conoid, Oid conrelid, const char *conname);
+extern bool DbblueFkeyTrustRowExists(Oid conoid);
+extern void DbblueFkeyNoteBypass(Oid conoid);
 
 #endif							/* PG_DBBLUE_TRUSTED_FKEY_H */

@@ -201,5 +201,44 @@ select fk_plan_kind('select c.id, p.v from fkr_pchild c left join fkr_part_1 p o
        (select count(*) from fkr_pchild c join fkr_part_1 p on c.pid = p.id) as inner_rows;
 drop table fkr_pchild, fkr_part;
 
+-- Trust is withdrawn automatically when enforcement is actually bypassed: the
+-- referential-integrity triggers are what enforce a foreign key, so passing one
+-- over means the change went unchecked.  No re-verification is needed for the
+-- withdrawal to take effect.
+create table fkr_rp (id int primary key, v int);
+create table fkr_rc (id int primary key, pid int not null references fkr_rp(id));
+insert into fkr_rp select g, g from generate_series(1, 10) g;
+insert into fkr_rc select g, 1 + (g % 10) from generate_series(1, 30) g;
+analyze fkr_rp, fkr_rc;
+select action from dbblue_trust_foreign_keys('fkr_rc'::regclass);
+select fk_plan_kind('select c.id, p.v from fkr_rc c left join fkr_rp p on c.pid = p.id') as plan_trusted;
+
+-- an unchecked write in replica mode withdraws it
+begin;
+  set session_replication_role = replica;
+  insert into fkr_rc values (9001, 4242);
+  reset session_replication_role;
+commit;
+select fk_plan_kind('select c.id, p.v from fkr_rc c left join fkr_rp p on c.pid = p.id') as plan_after_bypass,
+       (select count(*) from fkr_rc c left join fkr_rp p on c.pid = p.id) as outer_rows,
+       (select count(*) from fkr_rc c join fkr_rp p on c.pid = p.id) as inner_rows;
+
+-- a bypass that rolls back wrote nothing, so trust must survive it
+delete from fkr_rc where id = 9001;
+select action from dbblue_trust_foreign_keys('fkr_rc'::regclass);
+begin;
+  set session_replication_role = replica;
+  insert into fkr_rc values (9002, 8888);
+  reset session_replication_role;
+rollback;
+select fk_plan_kind('select c.id, p.v from fkr_rc c left join fkr_rp p on c.pid = p.id') as plan_after_rollback;
+
+-- and ordinary writes must not disturb it
+insert into fkr_rc values (9003, 5);
+update fkr_rc set pid = 6 where id = 9003;
+delete from fkr_rc where id = 9003;
+select fk_plan_kind('select c.id, p.v from fkr_rc c left join fkr_rp p on c.pid = p.id') as plan_after_normal_dml;
+drop table fkr_rc, fkr_rp;
+
 drop table fkr_cc, fkr_pp, fkr_top, fkr_c, fkr_p;
 drop function fk_plan_kind(text);

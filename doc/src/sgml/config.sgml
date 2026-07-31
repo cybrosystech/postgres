@@ -1165,14 +1165,25 @@ include_dir 'conf.d'
         in replica mode, since the constraint is not being enforced at all in
         those windows.
        </para>
+       <para>
+        A declaration is also withdrawn automatically as soon as enforcement is
+        genuinely bypassed. Those triggers are what enforce a foreign key, so if
+        one of them is passed over for a change &mdash; because it was disabled,
+        or because of the replication role &mdash; that change went unchecked,
+        and the declaration stops being warranted. The withdrawal happens when
+        the transaction commits, so a bypass that rolls back leaves the
+        declaration intact, and ordinary writes never disturb it. Renew it with
+        <function>dbblue_trust_foreign_keys</function>, which will report any
+        violating rows the bypass admitted.
+       </para>
        <warning>
         <para>
-         A trust declaration reflects the data at the moment it was made. If
-         referential integrity is bypassed afterwards, rows can exist that the
-         constraint forbids, and queries planned with this parameter on will
-         silently omit them until the declaration is renewed or withdrawn. Grant
-         trust only where referential integrity is known to be maintained, and
-         renew it after any bulk load or restore that bypassed enforcement.
+         Automatic withdrawal covers bypasses this server observes. It cannot
+         cover data that arrived without those triggers ever being consulted, as
+         when a table is loaded by a restore that disabled them, or replaced at
+         the file level. Renew the declaration after any such operation; until
+         it is renewed, and while it stands, queries planned with this parameter
+         on will omit rows the constraint forbids.
         </para>
        </warning>
       </listitem>

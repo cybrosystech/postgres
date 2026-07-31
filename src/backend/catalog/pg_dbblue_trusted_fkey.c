@@ -21,6 +21,7 @@
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/table.h"
+#include "access/xact.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_dbblue_trusted_fkey.h"
@@ -81,6 +82,38 @@ DbblueFkeyIsTrusted(Oid conoid, Oid conrelid, const char *conname)
 	table_close(rel, AccessShareLock);
 
 	return result;
+}
+
+/*
+ * DbblueFkeyTrustRowExists
+ *		Is there a trust declaration for this constraint OID at all?
+ *
+ * Unlike DbblueFkeyIsTrusted this does not verify the relation and name, which
+ * is what withdrawal wants: removing a row left behind by a dropped constraint
+ * is harmless, and matching on OID alone keeps this cheap enough for the write
+ * path.
+ */
+bool
+DbblueFkeyTrustRowExists(Oid conoid)
+{
+	Relation	rel;
+	SysScanDesc scan;
+	ScanKeyData skey;
+	bool		found;
+
+	if (!OidIsValid(conoid))
+		return false;
+
+	rel = table_open(DbblueTrustedFkeyRelationId, AccessShareLock);
+	ScanKeyInit(&skey, Anum_pg_dbblue_trusted_fkey_conoid,
+				BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(conoid));
+	scan = systable_beginscan(rel, DbblueTrustedFkeyIndexId, true,
+							  NULL, 1, &skey);
+	found = HeapTupleIsValid(systable_getnext(scan));
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+
+	return found;
 }
 
 /*
@@ -150,6 +183,116 @@ dbblue_fkey_set_trusted(Oid conoid, Oid conrelid, const char *conname,
 	CommandCounterIncrement();
 
 	return changed;
+}
+
+/*
+ * Constraints whose referential-integrity trigger was skipped during this
+ * transaction, and which were trusted at the time.  Their trust declarations
+ * are withdrawn when the transaction commits: whatever the transaction wrote
+ * was not checked against them.
+ */
+static List *dbblue_pending_untrust = NIL;
+static bool dbblue_untrust_callback_registered = false;
+
+static bool
+dbblue_fkey_delete_row(Oid conoid)
+{
+	Relation	rel;
+	SysScanDesc scan;
+	ScanKeyData skey;
+	HeapTuple	tup;
+	bool		deleted = false;
+
+	rel = table_open(DbblueTrustedFkeyRelationId, RowExclusiveLock);
+	ScanKeyInit(&skey, Anum_pg_dbblue_trusted_fkey_conoid,
+				BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(conoid));
+	scan = systable_beginscan(rel, DbblueTrustedFkeyIndexId, true,
+							  NULL, 1, &skey);
+	if (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		CatalogTupleDelete(rel, &tup->t_self);
+		deleted = true;
+	}
+	systable_endscan(scan);
+	table_close(rel, RowExclusiveLock);
+
+	return deleted;
+}
+
+static void
+dbblue_untrust_at_xact_end(XactEvent event, void *arg)
+{
+	List	   *pending = dbblue_pending_untrust;
+	ListCell   *lc;
+
+	if (pending == NIL)
+		return;
+
+	switch (event)
+	{
+		case XACT_EVENT_PRE_COMMIT:
+		case XACT_EVENT_PARALLEL_PRE_COMMIT:
+			/* still safe to write catalogs here */
+			dbblue_pending_untrust = NIL;
+			foreach(lc, pending)
+			{
+				if (dbblue_fkey_delete_row(lfirst_oid(lc)))
+					ereport(LOG,
+							(errmsg("DBblue: withdrew the trust declaration for "
+									"foreign key %u", lfirst_oid(lc)),
+							 errdetail("Its referential-integrity trigger did not "
+									   "fire for a change made in this transaction, "
+									   "so the constraint may no longer hold."),
+							 errhint("Run dbblue_trust_foreign_keys() to re-verify "
+									 "and restore it.")));
+			}
+			CommandCounterIncrement();
+			break;
+		case XACT_EVENT_ABORT:
+		case XACT_EVENT_PARALLEL_ABORT:
+			/* nothing was written, so nothing to withdraw */
+			dbblue_pending_untrust = NIL;
+			break;
+		default:
+			break;
+	}
+}
+
+/*
+ * DbblueFkeyNoteBypass
+ *		Note that a foreign key's RI trigger was skipped.
+ *
+ * Called from the trigger machinery when a constraint trigger is passed over
+ * because of session_replication_role or because it has been disabled.  Rows
+ * written in that window were never checked, so any trust declaration for the
+ * constraint stops being warranted and is withdrawn at commit.
+ *
+ * This runs on the write path, so it must stay cheap and must not error.  Once
+ * a constraint is no longer trusted there is nothing left to do, which is what
+ * keeps the cost off replication apply after the first transaction.
+ */
+void
+DbblueFkeyNoteBypass(Oid conoid)
+{
+	MemoryContext oldcxt;
+
+	if (!OidIsValid(conoid))
+		return;
+	if (list_member_oid(dbblue_pending_untrust, conoid))
+		return;
+	/* not trusted: nothing to withdraw */
+	if (!DbblueFkeyTrustRowExists(conoid))
+		return;
+
+	oldcxt = MemoryContextSwitchTo(TopTransactionContext);
+	dbblue_pending_untrust = lappend_oid(dbblue_pending_untrust, conoid);
+	MemoryContextSwitchTo(oldcxt);
+
+	if (!dbblue_untrust_callback_registered)
+	{
+		RegisterXactCallback(dbblue_untrust_at_xact_end, NULL);
+		dbblue_untrust_callback_registered = true;
+	}
 }
 
 /*
@@ -248,6 +391,39 @@ dbblue_fkey_trust_worker(FunctionCallInfo fcinfo, Oid onerel, bool trust,
 	ListCell   *lc;
 
 	InitMaterializedSRF(fcinfo, 0);
+
+	/*
+	 * A whole-database pass also tidies up: dropping a constraint leaves its
+	 * declaration behind, harmlessly, since a declaration only speaks for the
+	 * relation and name it recorded.  Clear those out while we are here.
+	 */
+	if (!OidIsValid(onerel))
+	{
+		Relation	trel;
+		SysScanDesc tscan;
+		HeapTuple	ttup;
+		List	   *stale = NIL;
+
+		trel = table_open(DbblueTrustedFkeyRelationId, AccessShareLock);
+		tscan = systable_beginscan(trel, InvalidOid, false, NULL, 0, NULL);
+		while (HeapTupleIsValid(ttup = systable_getnext(tscan)))
+		{
+			Form_pg_dbblue_trusted_fkey trow =
+				(Form_pg_dbblue_trusted_fkey) GETSTRUCT(ttup);
+
+			if (!SearchSysCacheExists1(CONSTROID,
+									   ObjectIdGetDatum(trow->conoid)))
+				stale = lappend_oid(stale, trow->conoid);
+		}
+		systable_endscan(tscan);
+		table_close(trel, AccessShareLock);
+
+		foreach(lc, stale)
+			dbblue_fkey_delete_row(lfirst_oid(lc));
+		if (stale != NIL)
+			CommandCounterIncrement();
+		list_free(stale);
+	}
 
 	/*
 	 * Collect the constraints of interest first and close the scan before
