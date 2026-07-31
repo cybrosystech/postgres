@@ -68,7 +68,6 @@
  *       res_partner, account_move, product_product
  *   '
  */
-static char *DBBluePinner_pinned_tables = NULL;
 
 /*
  * db_blue.ring_buffer_tables
@@ -85,7 +84,6 @@ static char *DBBluePinner_pinned_tables = NULL;
  *       account_analytic_line, mrp_production
  *   '
  */
-static char *DBBluePinner_ring_buffer_tables = NULL;
 
 /*
  * db_blue.pin_check_interval
@@ -96,7 +94,6 @@ static char *DBBluePinner_ring_buffer_tables = NULL;
  * Recommended: 300 (5 minutes). Under heavy autovacuum activity or
  * when reports run frequently, consider 60-120.
  */
-static int DBBluePinner_check_interval = 0;
 
 /*
  * db_blue.max_pin_size_percent
@@ -108,7 +105,6 @@ static int DBBluePinner_check_interval = 0;
  * IMPORTANT: Leave at least 60% free for normal OLTP working set.
  * Recommended: 25-40%. Never set above 60%.
  */
-static int DBBluePinner_max_pin_percent = 35;
 
 /*
  * db_blue.pinner_database
@@ -117,7 +113,6 @@ static int DBBluePinner_max_pin_percent = 35;
  * Odoo setups, set this to your Odoo database name. For multi-DB
  * setups, run one pinner per database (future enhancement).
  */
-static char *DBBluePinner_database = NULL;
 
 /*
  * db_blue.min_access_count
@@ -130,7 +125,6 @@ static char *DBBluePinner_database = NULL;
  *
  * Set to 0 to disable this filter (always warm listed tables).
  */
-static int DBBluePinner_min_access_count = 100;
 
 /* =========================================================================
  * INTERNAL TYPES
@@ -242,85 +236,21 @@ GetRelFileNumber(Oid relid)
 void
 DBBluePinnerRegisterGUCs(void)
 {
-    DefineCustomStringVariable(
-        "db_blue.pinned_tables",
-        "Tables to keep resident in shared_buffers (comma-separated)",
-        "Use 'tablename:tier1' for metadata tables that must never be evicted. "
-        "Empty by default — enable only when the hot working set is ~3x or more "
-        "of shared_buffers. Benchmarks show 3-7% throughput regression in "
-        "deployments where the working set already fits comfortably.",
-        &DBBluePinner_pinned_tables,
-        "",         /* off by default — opt-in feature */
-        PGC_SIGHUP,
-        0,
-        NULL, NULL, NULL
-    );
-
-    DefineCustomStringVariable(
-        "db_blue.ring_buffer_tables",
-        "Tables whose scans must never pollute shared_buffers",
-        "All sequential reads for these tables are routed through a "
-        "private ring buffer, preventing large reports from evicting "
-        "hot OLTP data. PostgreSQL's BAS_BULKREAD strategy already handles "
-        "this automatically for tables larger than shared_buffers/4; this "
-        "GUC is only needed for smaller report-shaped tables.",
-        &DBBluePinner_ring_buffer_tables,
-        "",         /* off by default — opt-in feature */
-        PGC_SIGHUP,
-        0,
-        NULL, NULL, NULL
-    );
-
-    DefineCustomIntVariable(
-        "db_blue.pin_check_interval",
-        "Seconds between pinner maintenance cycles (0 = worker exits after one cycle)",
-        NULL,
-        &DBBluePinner_check_interval,
-        0,      /* default: 0 = effectively disabled */
-        0,      /* min: disabled */
-        3600,   /* max: 1 hour */
-        PGC_SIGHUP,
-        GUC_UNIT_S,
-        NULL, NULL, NULL
-    );
-
-    DefineCustomIntVariable(
-        "db_blue.max_pin_size_percent",
-        "Max percentage of shared_buffers used for pinned tables",
-        "The pinner fills tables in order of access frequency until "
-        "this percentage of shared_buffers is consumed.",
-        &DBBluePinner_max_pin_percent,
-        35,     /* default: 35% */
-        5,      /* min */
-        60,     /* max — hard cap to prevent starving OLTP */
-        PGC_SIGHUP,
-        0,
-        NULL, NULL, NULL
-    );
-
-    DefineCustomStringVariable(
-        "db_blue.pinner_database",
-        "Database the pinner background worker connects to",
-        NULL,
-        &DBBluePinner_database,
-        "postgres",   /* operator must change this to their Odoo DB */
-        PGC_POSTMASTER,   /* requires restart — connects at startup */
-        0,
-        NULL, NULL, NULL
-    );
-
-    DefineCustomIntVariable(
-        "db_blue.min_access_count",
-        "Minimum pg_stat_user_tables access count before a table is warmed",
-        "Set to 0 to warm all listed tables regardless of access history.",
-        &DBBluePinner_min_access_count,
-        100,
-        0,
-        INT_MAX,
-        PGC_SIGHUP,
-        0,
-        NULL, NULL, NULL
-    );
+    /*
+     * Nothing to register here anymore.
+     *
+     * The pinner parameters are now flat, core GUCs (dbblue_pinned_tables,
+     * dbblue_ring_buffer_tables, dbblue_pin_check_interval,
+     * dbblue_max_pin_size_percent, dbblue_pinner_database,
+     * dbblue_min_access_count), defined in
+     * src/backend/utils/misc/guc_parameters.dat with their backing variables
+     * (DBBluePinner_*) in src/backend/storage/buffer/bufmgr.c. A loadable
+     * module cannot register dotless core GUCs, so this worker only *reads*
+     * them via the extern declarations in storage/bufmgr.h.
+     *
+     * The function is kept (as a no-op) so the _PG_init() call site in
+     * autoprewarm.c does not have to change.
+     */
 }
 
 /* =========================================================================

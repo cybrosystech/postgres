@@ -182,6 +182,15 @@ extern PGDLLIMPORT int checkpoint_flush_after;
 extern PGDLLIMPORT int backend_flush_after;
 extern PGDLLIMPORT int bgwriter_flush_after;
 
+/* dbblue soft-pin / ring-buffer GUCs (backed in bufmgr.c, read by the pinner) */
+extern PGDLLIMPORT bool DBBluePinner_enabled;
+extern PGDLLIMPORT char *DBBluePinner_pinned_tables;
+extern PGDLLIMPORT char *DBBluePinner_ring_buffer_tables;
+extern PGDLLIMPORT char *DBBluePinner_database;
+extern PGDLLIMPORT int DBBluePinner_check_interval;
+extern PGDLLIMPORT int DBBluePinner_max_pin_percent;
+extern PGDLLIMPORT int DBBluePinner_min_access_count;
+
 extern PGDLLIMPORT const PgAioHandleCallbacks aio_shared_buffer_readv_cb;
 extern PGDLLIMPORT const PgAioHandleCallbacks aio_local_buffer_readv_cb;
 
