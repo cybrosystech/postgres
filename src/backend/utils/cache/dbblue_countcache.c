@@ -187,11 +187,11 @@ dbblue_countcache_insert(Oid reloid, int64 fingerprint, int64 count)
 		return;
 
 	/*
-	 * A transaction that has written anything cannot contribute a cacheable
-	 * count: it either counted its own uncommitted rows, or it is about to
-	 * change the very number it just measured.
+	 * A count over a relation this transaction has written to is not
+	 * cacheable: it includes our own uncommitted rows, which may yet be
+	 * rolled back.  Writes to other relations are irrelevant to it.
 	 */
-	if (!dbblue_relmod_xact_is_cacheable())
+	if (dbblue_relmod_xact_wrote(reloid))
 		return;
 	if (!IsTransactionState())
 		return;

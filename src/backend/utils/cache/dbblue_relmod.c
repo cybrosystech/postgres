@@ -80,13 +80,6 @@ static List *xact_written_rels = NIL;
 /* One-entry memo so a bulk load pays only a comparison per row. */
 static Oid	last_noted_rel = InvalidOid;
 
-/*
- * False once this transaction has written to anything (or has rolled back a
- * subtransaction).  A count captured by such a transaction must not be
- * cached: its own uncommitted or since-discarded changes are baked into it.
- */
-static bool xact_cacheable = true;
-
 static void DBBlueRelModShmemRequest(void *arg);
 static void DBBlueRelModShmemInit(void *arg);
 
@@ -202,13 +195,6 @@ dbblue_relmod_note_write(Oid reloid)
 	if (!OidIsValid(reloid))
 		return;
 
-	/*
-	 * A count captured by a transaction that writes cannot be cached, no
-	 * matter which relation it wrote to -- flag that first, before the
-	 * per-relation fast path can short-circuit us.
-	 */
-	xact_cacheable = false;
-
 	if (reloid == last_noted_rel)
 		return;
 	if (list_member_oid(xact_written_rels, reloid))
@@ -246,17 +232,26 @@ dbblue_relmod_reset_xact(void)
 {
 	xact_written_rels = NIL;
 	last_noted_rel = InvalidOid;
-	xact_cacheable = true;
 }
 
-void
-dbblue_relmod_poison_xact(void)
-{
-	xact_cacheable = false;
-}
-
+/*
+ * Has the current transaction written to this relation?
+ *
+ * A count is uncacheable only if *this* relation was written, not if the
+ * transaction wrote to anything at all: changes to another relation cannot
+ * alter how many rows of this one are visible.  The distinction matters in
+ * practice -- an application whose every request writes a session or audit
+ * row (Odoo does) would otherwise never cache a single count.
+ *
+ * This also covers subtransaction rollback without a separate flag: a
+ * relation written by a subtransaction stays in the write set even after
+ * that subtransaction aborts, so counts over it remain refused for the rest
+ * of the transaction.
+ */
 bool
-dbblue_relmod_xact_is_cacheable(void)
+dbblue_relmod_xact_wrote(Oid reloid)
 {
-	return xact_cacheable;
+	if (reloid == last_noted_rel)
+		return true;
+	return list_member_oid(xact_written_rels, reloid);
 }

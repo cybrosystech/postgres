@@ -5313,15 +5313,6 @@ AbortSubTransaction(void)
 {
 	TransactionState s = CurrentTransactionState;
 
-	/*
-	 * DBblue: rolling back a subtransaction removes rows that a COUNT
-	 * captured earlier in this transaction may have counted, without moving
-	 * any relation's write stamp.  Rather than track write sets per
-	 * subtransaction, simply refuse to cache anything captured by this
-	 * transaction.
-	 */
-	dbblue_relmod_poison_xact();
-
 	/* Prevent cancel/die interrupt while cleaning up */
 	HOLD_INTERRUPTS();
 
