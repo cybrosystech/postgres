@@ -62,13 +62,17 @@ static void remove_rel_from_query(PlannerInfo *root, int relid,
 								  Relids joinrelids);
 static void remove_rel_from_restrictinfo(RestrictInfo *rinfo,
 										 int relid, int ojrelid);
-static void remove_rel_from_eclass(EquivalenceClass *ec,
+static void remove_rel_from_eclass(PlannerInfo *root, EquivalenceClass *ec,
 								   int relid, int ojrelid);
+static void remove_rel_from_restrictinfo_phvs(RestrictInfo *rinfo,
+											  int relid, int ojrelid);
+static Node *remove_rel_from_phvs(Node *node, int relid, int ojrelid);
+static Node *remove_rel_from_phvs_mutator(Node *node, Relids removable);
 static List *remove_rel_from_joinlist(List *joinlist, int relid, int *nremoved);
 static bool rel_supports_distinctness(PlannerInfo *root, RelOptInfo *rel);
 static bool rel_is_distinct_for(PlannerInfo *root, RelOptInfo *rel,
 								List *clause_list, List **extra_clauses);
-static Oid	distinct_col_search(int colno, List *colnos, List *opids);
+static DistinctColInfo *distinct_col_search(int colno, List *distinct_cols);
 static bool is_innerrel_unique_for(PlannerInfo *root,
 								   Relids joinrelids,
 								   Relids outerrelids,
@@ -455,6 +459,7 @@ remove_rel_from_query(PlannerInfo *root, int relid,
 	ListCell   *l;
 	bool		is_outer_join = (sjinfo != NULL);
 	bool		is_self_join = (!is_outer_join && subst > 0);
+	Bitmapset  *seen_serials = NULL;
 
 	Assert(is_outer_join || is_self_join);
 	Assert(!is_outer_join || ojrelid > 0);
@@ -618,9 +623,7 @@ remove_rel_from_query(PlannerInfo *root, int relid,
 		{
 			EquivalenceClass *ec = (EquivalenceClass *) lfirst(l);
 
-			if (bms_is_member(relid, ec->ec_relids) ||
-				bms_is_member(ojrelid, ec->ec_relids))
-				remove_rel_from_eclass(ec, relid, ojrelid);
+			remove_rel_from_eclass(root, ec, relid, ojrelid);
 		}
 	}
 
@@ -642,6 +645,11 @@ remove_rel_from_query(PlannerInfo *root, int relid,
 	 * Additionally, if we are performing self-join elimination, we must
 	 * replace references to the removed relid with subst within the
 	 * lateral_vars lists.
+	 *
+	 * Also, for left-join removal, we strip the removed rel and join from any
+	 * PlaceHolderVar embedded in the surviving rels' restriction clauses and
+	 * join clauses; we needn't bother with the rel being removed, nor when
+	 * the query has no PlaceHolderVars.
 	 */
 	for (rti = 1; rti < root->simple_rel_array_size; rti++)
 	{
@@ -667,6 +675,33 @@ remove_rel_from_query(PlannerInfo *root, int relid,
 		if (is_self_join)
 			ChangeVarNodesExtended((Node *) otherrel->lateral_vars, relid,
 								   subst, 0, replace_relid_callback);
+
+		if (is_outer_join && rti != relid && root->glob->lastPHId != 0)
+		{
+			foreach_node(RestrictInfo, rinfo, otherrel->baserestrictinfo)
+				remove_rel_from_restrictinfo_phvs(rinfo, relid, ojrelid);
+
+			/*
+			 * Join clauses need the same treatment, but there's no value in
+			 * processing any join clause more than once.  So it's slightly
+			 * annoying that we have to find them via the per-base-relation
+			 * joininfo lists.  Avoid duplicate processing by tracking the
+			 * rinfo_serial numbers of join clauses we've already seen.  (This
+			 * doesn't work for is_clone clauses, so we must waste effort on
+			 * them.)
+			 */
+			foreach_node(RestrictInfo, rinfo, otherrel->joininfo)
+			{
+				if (!rinfo->is_clone)	/* else serial number is not unique */
+				{
+					if (bms_is_member(rinfo->rinfo_serial, seen_serials))
+						continue;	/* saw it already */
+					seen_serials = bms_add_member(seen_serials,
+												  rinfo->rinfo_serial);
+				}
+				remove_rel_from_restrictinfo_phvs(rinfo, relid, ojrelid);
+			}
+		}
 	}
 }
 
@@ -748,16 +783,38 @@ remove_rel_from_restrictinfo(RestrictInfo *rinfo, int relid, int ojrelid)
 /*
  * Remove any references to relid or ojrelid from the EquivalenceClass.
  *
- * Like remove_rel_from_restrictinfo, we don't worry about cleaning out
- * any nullingrel bits in contained Vars and PHVs.  (This might have to be
- * improved sometime.)  We do need to fix the EC and EM relid sets to ensure
- * that implied join equalities will be generated at the appropriate join
- * level(s).
+ * We fix the EC and EM relid sets to ensure that implied join equalities will
+ * be generated at the appropriate join level(s).  We also strip the removed
+ * rel from PlaceHolderVars embedded in member expressions; a member's
+ * em_relids reflects ph_eval_at rather than the PHV's phrels, so the latter
+ * can still mention the removed rel even when em_relids does not.  Like
+ * remove_rel_from_restrictinfo, we don't bother with nullingrel bits in
+ * contained plain Vars.
  */
 static void
-remove_rel_from_eclass(EquivalenceClass *ec, int relid, int ojrelid)
+remove_rel_from_eclass(PlannerInfo *root, EquivalenceClass *ec,
+					   int relid, int ojrelid)
 {
 	ListCell   *lc;
+
+	/*
+	 * Strip the removed rel/join from PlaceHolderVars in member expressions.
+	 * This is needed even when the EC's relids don't mention the removed rel.
+	 * Plain Vars and Consts can't contain a PlaceHolderVar, so skip them.
+	 */
+	if (root->glob->lastPHId != 0)
+	{
+		foreach_node(EquivalenceMember, em, ec->ec_members)
+		{
+			if (!IsA(em->em_expr, Var) && !IsA(em->em_expr, Const))
+				em->em_expr = (Expr *)
+					remove_rel_from_phvs((Node *) em->em_expr, relid, ojrelid);
+		}
+	}
+
+	if (!bms_is_member(relid, ec->ec_relids) &&
+		!bms_is_member(ojrelid, ec->ec_relids))
+		return;
 
 	/* Fix up the EC's overall relids */
 	ec->ec_relids = bms_del_member(ec->ec_relids, relid);
@@ -806,6 +863,116 @@ remove_rel_from_eclass(EquivalenceClass *ec, int relid, int ojrelid)
 	 * clauses, which we'd not need anymore anyway.)
 	 */
 	ec_clear_derived_clauses(ec);
+}
+
+/*
+ * Remove any references to relid or ojrelid from the PlaceHolderVars embedded
+ * in a RestrictInfo's clause.
+ *
+ * If it's an OR clause, we must also fix up the orclause, which is a parallel
+ * representation built from its own sub-RestrictInfos.  We recurse into the
+ * sub-clauses for that, mirroring remove_rel_from_restrictinfo.
+ */
+static void
+remove_rel_from_restrictinfo_phvs(RestrictInfo *rinfo, int relid, int ojrelid)
+{
+	rinfo->clause = (Expr *)
+		remove_rel_from_phvs((Node *) rinfo->clause, relid, ojrelid);
+
+	/* If it's an OR, recurse to clean up sub-clauses */
+	if (restriction_is_or_clause(rinfo))
+	{
+		ListCell   *lc;
+
+		Assert(is_orclause(rinfo->orclause));
+		foreach(lc, ((BoolExpr *) rinfo->orclause)->args)
+		{
+			Node	   *orarg = (Node *) lfirst(lc);
+
+			/* OR arguments should be ANDs or sub-RestrictInfos */
+			if (is_andclause(orarg))
+			{
+				List	   *andargs = ((BoolExpr *) orarg)->args;
+				ListCell   *lc2;
+
+				foreach(lc2, andargs)
+				{
+					RestrictInfo *rinfo2 = lfirst_node(RestrictInfo, lc2);
+
+					remove_rel_from_restrictinfo_phvs(rinfo2, relid, ojrelid);
+				}
+			}
+			else
+			{
+				RestrictInfo *rinfo2 = castNode(RestrictInfo, orarg);
+
+				remove_rel_from_restrictinfo_phvs(rinfo2, relid, ojrelid);
+			}
+		}
+	}
+}
+
+/*
+ * Remove any references to the specified RT index(es) from the phrels (and
+ * phnullingrels) of every PlaceHolderVar in the given expression.
+ *
+ * remove_rel_from_query() fixes up the relid sets of RestrictInfos and
+ * EquivalenceMembers, but not the PlaceHolderVars embedded in their
+ * expressions.  That's normally fine, but such an expression may later be
+ * translated for an appendrel child and have its relids recomputed by
+ * pull_varnos().  A leftover removed relid in phrels would then make
+ * pull_varnos() reference a nonexistent rel, so we strip it here to match the
+ * canonical PlaceHolderVar.
+ */
+static Node *
+remove_rel_from_phvs(Node *node, int relid, int ojrelid)
+{
+	Relids		removable = bms_add_member(bms_make_singleton(relid), ojrelid);
+
+	return remove_rel_from_phvs_mutator(node, removable);
+}
+
+static Node *
+remove_rel_from_phvs_mutator(Node *node, Relids removable)
+{
+	if (node == NULL)
+		return NULL;
+	if (IsA(node, PlaceHolderVar))
+	{
+		PlaceHolderVar *phv = (PlaceHolderVar *) node;
+		Relids		newphrels;
+
+		/* Upper-level PlaceHolderVars should be long gone at this point */
+		Assert(phv->phlevelsup == 0);
+
+		/* Copy the PlaceHolderVar and mutate what's below ... */
+		phv = (PlaceHolderVar *)
+			expression_tree_mutator(node,
+									remove_rel_from_phvs_mutator,
+									removable);
+
+		/*
+		 * ... then strip the removed rels from its relid sets.
+		 *
+		 * If stripping would empty phrels, the PHV is evaluated only at the
+		 * removed relation(s); it then belongs to an EquivalenceMember that
+		 * the caller drops immediately afterwards.  Leave such a PHV
+		 * untouched rather than build one with empty phrels, which the rest
+		 * of the planner assumes never occurs.
+		 */
+		newphrels = bms_difference(phv->phrels, removable);
+		if (!bms_is_empty(newphrels))
+		{
+			phv->phrels = newphrels;
+			phv->phnullingrels = bms_difference(phv->phnullingrels,
+												removable);
+		}
+
+		return (Node *) phv;
+	}
+	return expression_tree_mutator(node,
+								   remove_rel_from_phvs_mutator,
+								   removable);
 }
 
 /*
@@ -1032,15 +1199,17 @@ rel_is_distinct_for(PlannerInfo *root, RelOptInfo *rel, List *clause_list,
 	{
 		Index		relid = rel->relid;
 		Query	   *subquery = root->simple_rte_array[relid]->subquery;
-		List	   *colnos = NIL;
-		List	   *opids = NIL;
+		List	   *distinct_cols = NIL;
 		ListCell   *l;
 
 		/*
-		 * Build the argument lists for query_is_distinct_for: a list of
-		 * output column numbers that the query needs to be distinct over, and
-		 * a list of equality operators that the output columns need to be
-		 * distinct according to.
+		 * Build the argument list for query_is_distinct_for: a list of
+		 * DistinctColInfo entries, each holding an output column number that
+		 * the query needs to be distinct over, the equality operator that the
+		 * column needs to be distinct according to, and that operator's input
+		 * collation.  The collation matters because the subquery's own
+		 * DISTINCT / GROUP BY / set-op proves uniqueness under its own
+		 * collation, which need not agree with the operator's.
 		 *
 		 * (XXX we are not considering restriction clauses attached to the
 		 * subquery; is that worth doing?)
@@ -1048,18 +1217,18 @@ rel_is_distinct_for(PlannerInfo *root, RelOptInfo *rel, List *clause_list,
 		foreach(l, clause_list)
 		{
 			RestrictInfo *rinfo = lfirst_node(RestrictInfo, l);
-			Oid			op;
+			OpExpr	   *opexpr;
 			Var		   *var;
+			DistinctColInfo *dcinfo;
 
 			/*
-			 * Get the equality operator we need uniqueness according to.
-			 * (This might be a cross-type operator and thus not exactly the
-			 * same operator the subquery would consider; that's all right
-			 * since query_is_distinct_for can resolve such cases.)  The
-			 * caller's mergejoinability test should have selected only
-			 * OpExprs.
+			 * The caller's mergejoinability test should have selected only
+			 * OpExprs.  The operator might be a cross-type operator and thus
+			 * not exactly the same operator the subquery would consider;
+			 * that's all right since query_is_distinct_for can resolve such
+			 * cases.
 			 */
-			op = castNode(OpExpr, rinfo->clause)->opno;
+			opexpr = castNode(OpExpr, rinfo->clause);
 
 			/* caller identified the inner side for us */
 			if (rinfo->outer_is_left)
@@ -1083,11 +1252,14 @@ rel_is_distinct_for(PlannerInfo *root, RelOptInfo *rel, List *clause_list,
 				var->varno != relid || var->varlevelsup != 0)
 				continue;
 
-			colnos = lappend_int(colnos, var->varattno);
-			opids = lappend_oid(opids, op);
+			dcinfo = palloc(sizeof(DistinctColInfo));
+			dcinfo->colno = var->varattno;
+			dcinfo->opid = opexpr->opno;
+			dcinfo->collid = opexpr->inputcollid;
+			distinct_cols = lappend(distinct_cols, dcinfo);
 		}
 
-		if (query_is_distinct_for(subquery, colnos, opids))
+		if (query_is_distinct_for(subquery, distinct_cols))
 			return true;
 	}
 	return false;
@@ -1131,25 +1303,32 @@ query_supports_distinctness(Query *query)
  * query is a not-yet-planned subquery (in current usage, it's always from
  * a subquery RTE, which the planner avoids scribbling on).
  *
- * colnos is an integer list of output column numbers (resno's).  We are
- * interested in whether rows consisting of just these columns are certain
- * to be distinct.  "Distinctness" is defined according to whether the
- * corresponding upper-level equality operators listed in opids would think
- * the values are distinct.  (Note: the opids entries could be cross-type
- * operators, and thus not exactly the equality operators that the subquery
- * would use itself.  We use equality_ops_are_compatible() to check
- * compatibility.  That looks at opfamily membership for index AMs that have
- * declared that they support consistent equality semantics within an
+ * distinct_cols is a list of DistinctColInfo, one per requested output column.
+ * Each entry names the subquery output column number we want distinct, the
+ * upper-level equality operator we'll compare values with, and that operator's
+ * input collation.  We are interested in whether rows consisting of just these
+ * columns are certain to be distinct.
+ *
+ * "Distinctness" is defined according to whether the corresponding upper-level
+ * equality operators would think the values are distinct.  (Note: each opid
+ * could be a cross-type operator, and thus not exactly the equality operator
+ * that the subquery would use itself.  We use equality_ops_are_compatible() to
+ * check compatibility.  That looks at opfamily membership for index AMs that
+ * have declared that they support consistent equality semantics within an
  * opfamily, and so should give trustworthy answers for all operators that we
  * might need to deal with here.)
+ *
+ * The collid must also agree on equality with the collation the subquery's own
+ * DISTINCT/GROUP BY/set-op uses to deduplicate the column, else the subquery's
+ * distinctness does not carry over to the caller's equality semantics.  Two
+ * collations agree on equality if they match or if both are deterministic (in
+ * which case both reduce equality to byte-equality; see CREATE COLLATION).
  */
 bool
-query_is_distinct_for(Query *query, List *colnos, List *opids)
+query_is_distinct_for(Query *query, List *distinct_cols)
 {
 	ListCell   *l;
-	Oid			opid;
-
-	Assert(list_length(colnos) == list_length(opids));
+	DistinctColInfo *dcinfo;
 
 	/*
 	 * DISTINCT (including DISTINCT ON) guarantees uniqueness if all the
@@ -1165,9 +1344,11 @@ query_is_distinct_for(Query *query, List *colnos, List *opids)
 			TargetEntry *tle = get_sortgroupclause_tle(sgc,
 													   query->targetList);
 
-			opid = distinct_col_search(tle->resno, colnos, opids);
-			if (!OidIsValid(opid) ||
-				!equality_ops_are_compatible(opid, sgc->eqop))
+			dcinfo = distinct_col_search(tle->resno, distinct_cols);
+			if (dcinfo == NULL ||
+				!equality_ops_are_compatible(dcinfo->opid, sgc->eqop) ||
+				!collations_agree_on_equality(dcinfo->collid,
+											  exprCollation((Node *) tle->expr)))
 				break;			/* exit early if no match */
 		}
 		if (l == NULL)			/* had matches for all? */
@@ -1196,9 +1377,11 @@ query_is_distinct_for(Query *query, List *colnos, List *opids)
 			TargetEntry *tle = get_sortgroupclause_tle(sgc,
 													   query->targetList);
 
-			opid = distinct_col_search(tle->resno, colnos, opids);
-			if (!OidIsValid(opid) ||
-				!equality_ops_are_compatible(opid, sgc->eqop))
+			dcinfo = distinct_col_search(tle->resno, distinct_cols);
+			if (dcinfo == NULL ||
+				!equality_ops_are_compatible(dcinfo->opid, sgc->eqop) ||
+				!collations_agree_on_equality(dcinfo->collid,
+											  exprCollation((Node *) tle->expr)))
 				break;			/* exit early if no match */
 		}
 		if (l == NULL)			/* had matches for all? */
@@ -1268,9 +1451,11 @@ query_is_distinct_for(Query *query, List *colnos, List *opids)
 				sgc = (SortGroupClause *) lfirst(lg);
 				lg = lnext(topop->groupClauses, lg);
 
-				opid = distinct_col_search(tle->resno, colnos, opids);
-				if (!OidIsValid(opid) ||
-					!equality_ops_are_compatible(opid, sgc->eqop))
+				dcinfo = distinct_col_search(tle->resno, distinct_cols);
+				if (dcinfo == NULL ||
+					!equality_ops_are_compatible(dcinfo->opid, sgc->eqop) ||
+					!collations_agree_on_equality(dcinfo->collid,
+												  exprCollation((Node *) tle->expr)))
 					break;		/* exit early if no match */
 			}
 			if (l == NULL)		/* had matches for all? */
@@ -1292,22 +1477,21 @@ query_is_distinct_for(Query *query, List *colnos, List *opids)
 /*
  * distinct_col_search - subroutine for query_is_distinct_for
  *
- * If colno is in colnos, return the corresponding element of opids,
- * else return InvalidOid.  (Ordinarily colnos would not contain duplicates,
- * but if it does, we arbitrarily select the first match.)
+ * If colno matches the colno field of an entry in distinct_cols, return a
+ * pointer to that entry; else return NULL.  (Ordinarily distinct_cols would
+ * not contain duplicate colnos, but if it does, we arbitrarily select the
+ * first match.)
  */
-static Oid
-distinct_col_search(int colno, List *colnos, List *opids)
+static DistinctColInfo *
+distinct_col_search(int colno, List *distinct_cols)
 {
-	ListCell   *lc1,
-			   *lc2;
-
-	forboth(lc1, colnos, lc2, opids)
+	foreach_ptr(DistinctColInfo, dcinfo, distinct_cols)
 	{
-		if (colno == lfirst_int(lc1))
-			return lfirst_oid(lc2);
+		if (dcinfo->colno == colno)
+			return dcinfo;
 	}
-	return InvalidOid;
+
+	return NULL;
 }
 
 
@@ -1994,8 +2178,16 @@ remove_self_join_rel(PlannerInfo *root, PlanRowMark *kmark, PlanRowMark *rmark,
 	ChangeVarNodesExtended((Node *) root->processed_tlist, toRemove->relid,
 						   toKeep->relid, 0, replace_relid_callback);
 
-	adjust_relid_set(root->all_result_relids, toRemove->relid, toKeep->relid);
-	adjust_relid_set(root->leaf_result_relids, toRemove->relid, toKeep->relid);
+	/*
+	 * No need to touch all_result_relids or leaf_result_relids: at this point
+	 * those sets contain only parse->resultRelation; inheritance children
+	 * have not been added yet; that happens later in add_other_rels_to_query.
+	 * And remove_self_joins_recurse rejects parse->resultRelation as an SJE
+	 * candidate to preserve the EPQ mechanism.  So toRemove->relid cannot be
+	 * a member.
+	 */
+	Assert(!bms_is_member(toRemove->relid, root->all_result_relids));
+	Assert(!bms_is_member(toRemove->relid, root->leaf_result_relids));
 
 	/*
 	 * There may be references to the rel in root->fkey_list, but if so,

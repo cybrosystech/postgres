@@ -61,6 +61,8 @@ tests += {
       't/050_redo_segment_missing.pl',
       't/051_effective_wal_level.pl',
       't/052_checkpoint_segment_missing.pl',
+      't/053_standby_login_event_trigger.pl',
+      't/054_unlogged_sequence_promotion.pl',
     ],
   },
 }

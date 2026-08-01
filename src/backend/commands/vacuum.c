@@ -1063,6 +1063,11 @@ get_all_vacuum_rels(MemoryContext vac_context, int options)
 			classForm->relkind != RELKIND_PARTITIONED_TABLE)
 			continue;
 
+		/* Skip temp relations belonging to other sessions */
+		if (classForm->relpersistence == RELPERSISTENCE_TEMP &&
+			!isTempOrTempToastNamespace(classForm->relnamespace))
+			continue;
+
 		/* check permissions of relation */
 		if (!vacuum_is_permitted_for_relation(relid, classForm, options))
 			continue;
@@ -1172,7 +1177,7 @@ vacuum_get_cutoffs(Relation rel, const VacuumParams *params,
 		ereport(WARNING,
 				(errmsg("cutoff for freezing multixacts is far in the past"),
 				 errhint("Close open transactions soon to avoid wraparound problems.\n"
-						 "You might also need to commit or roll back old prepared transactions, or drop stale replication slots.")));
+						 "You might also need to commit or roll back old prepared transactions.")));
 
 	/*
 	 * Determine the minimum freeze age to use: as specified by the caller, or

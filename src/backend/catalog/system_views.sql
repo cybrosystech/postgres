@@ -1482,7 +1482,7 @@ CREATE VIEW pg_stat_progress_data_checksums AS
                       WHEN 4 THEN 'done'
                       END AS phase,
         CASE S.param2 WHEN -1 THEN NULL ELSE S.param2 END AS databases_total,
-        S.param3 AS databases_done,
+        CASE S.param3 WHEN -1 THEN NULL ELSE S.param3 END AS databases_done,
         CASE S.param4 WHEN -1 THEN NULL ELSE S.param4 END AS relations_total,
         CASE S.param5 WHEN -1 THEN NULL ELSE S.param5 END AS relations_done,
         CASE S.param6 WHEN -1 THEN NULL ELSE S.param6 END AS blocks_total,
@@ -1527,7 +1527,8 @@ GRANT SELECT (oid, subdbid, subskiplsn, subname, subowner, subenabled,
               subbinary, substream, subtwophasestate, subdisableonerr,
 			  subpasswordrequired, subrunasowner, subfailover,
               subretaindeadtuples, submaxretention, subretentionactive,
-              subserver, subslotname, subsynccommit, subpublications, suborigin)
+              subserver, subslotname, subsynccommit, subwalrcvtimeout,
+              subpublications, suborigin)
     ON pg_subscription TO public;
 
 CREATE VIEW pg_stat_subscription_stats AS
