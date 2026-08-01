@@ -7,8 +7,12 @@
  * The cache is populated as a side effect when Odoo's web_search_read
  * emits its leading "SELECT COUNT(*) FROM <rel> WHERE ..." query, and is
  * consulted by the planner when shaping the matching paginated SELECT.
- * Cross-transaction reuse is not a goal; the natural lifetime of an
- * entry is one HTTP request (~one Odoo cursor txn).
+ * Those arrive as separate transactions on the same backend, so
+ * cross-transaction reuse is the whole point -- and is what makes the
+ * validity gate load-bearing rather than advisory.  An entry may be served
+ * only while the relation's shared modification stamp is unchanged from
+ * capture; see dbblue_relmod.c.  The TTL is a memory-hygiene bound on top
+ * of that, not a correctness mechanism.
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -22,6 +26,7 @@
 
 #include "access/transam.h"
 #include "datatype/timestamp.h"
+#include "utils/dbblue_relmod.h"
 
 typedef struct CountCacheKey
 {
@@ -38,11 +43,12 @@ typedef struct CountCacheEntry
 	int64		count;
 
 	/*
-	 * Snapshot horizon at the time of capture.  Used as a freshness gate:
-	 * if the current active snapshot's xmin differs, we treat the entry
-	 * as stale and drop it on the lookup path.
+	 * The relation's shared modification stamp as of capture.  This is the
+	 * correctness gate: the entry may be served only while a fresh reading
+	 * still compares equal, which is true exactly when no transaction --
+	 * in this backend or any other -- has written to the relation since.
 	 */
-	TransactionId snapshot_xmin;
+	DBBlueRelModStamp relmod;
 
 	/* Wall-clock capture time; drives FIFO eviction when the cache fills. */
 	TimestampTz captured_at;
@@ -67,18 +73,23 @@ extern const CountCacheEntry *dbblue_countcache_lookup(Oid reloid,
 													   int64 fingerprint);
 
 /*
- * Insert or refresh an entry for (reloid, fingerprint) with the given
- * count, stamping it with the current active snapshot's xmin.  When the
- * cache is at capacity the oldest entry (by captured_at) is evicted first.
+ * Queue a count for insertion, stamped with the relation's modification
+ * stamp as read right now.  The entry is not published to the cache until
+ * the current transaction commits, and then only if the transaction wrote
+ * nothing and the stamp is still unchanged -- so a count computed inside a
+ * transaction that later rolls back, or that is overtaken by a concurrent
+ * writer, is discarded rather than cached.
  *
- * No-op if fingerprint == 0 (caller signalled "uncacheable") or there is
- * no active snapshot.
+ * No-op if fingerprint == 0 (caller signalled "uncacheable").
  */
 extern void dbblue_countcache_insert(Oid reloid, int64 fingerprint,
 									 int64 count);
 
 /* Current populated size, exposed for observability / tests. */
 extern int dbblue_countcache_current_size(void);
+
+/* Discard queued (uncommitted) counts; called at transaction start. */
+extern void dbblue_countcache_reset_xact(void);
 
 /*
  * Capture-side hook called by standard_ExecutorRun.  When the planned

@@ -14,10 +14,14 @@
  * When full, the entry with the oldest captured_at is evicted; for a
  * 16-entry bound the linear scan to find it is cheap.
  *
- * Invalidation: a relcache callback drops cached entries for any
- * relation that PG flushes from the relcache.  Combined with the
- * snapshot-xmin check on lookup, this keeps the cache aligned with
- * whatever the current backend can see.
+ * Invalidation: correctness rests on the shared per-relation modification
+ * stamp maintained by dbblue_relmod.c.  An entry records the stamp it was
+ * captured under and is served only while a fresh reading still matches,
+ * which holds exactly when no transaction -- in this backend or any other
+ * -- has written to the relation in the meantime.  A relcache callback
+ * additionally drops entries for relations flushed from the relcache
+ * (DDL), and the TTL bounds how long an idle entry holds a slot.  Neither
+ * of those two is load-bearing for correctness on its own.
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -38,6 +42,7 @@
 #include "nodes/plannodes.h"
 #include "tcop/dest.h"
 #include "utils/dbblue_countcache.h"
+#include "utils/dbblue_relmod.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
@@ -47,7 +52,7 @@
 
 #define DBBLUE_COUNTCACHE_DEFAULT_SIZE	16
 
-bool		dbblue_count_cache = true;	/* enable COUNT result caching */
+bool		dbblue_count_cache = false; /* enable COUNT result caching */
 int			dbblue_countcache_ttl = 300;	/* cache TTL in seconds (GUC) */
 
 static HTAB *countcache = NULL;
@@ -55,10 +60,26 @@ static int	countcache_count = 0;
 static int	countcache_max_entries = DBBLUE_COUNTCACHE_DEFAULT_SIZE;
 static bool callback_registered = false;
 
+/*
+ * Counts captured during the current transaction, awaiting commit.  Nothing
+ * reaches the cache proper until the transaction commits, so a count taken
+ * inside a transaction that later aborts is never published.
+ */
+typedef struct PendingCount
+{
+	Oid			reloid;
+	int64		fingerprint;
+	int64		count;
+	DBBlueRelModStamp relmod;	/* stamp as of capture */
+} PendingCount;
+
+static List *pending_counts = NIL;
+
 static void countcache_relcache_callback(Datum arg, Oid relid);
+static void countcache_xact_callback(XactEvent event, void *arg);
 static void ensure_init(void);
 static void evict_oldest(void);
-static TransactionId current_snapshot_xmin(void);
+static void countcache_publish_pending(void);
 
 /*
  * Lazy initialization.  We don't pay for the HTAB until the first time
@@ -88,46 +109,19 @@ ensure_init(void)
 	{
 		CacheRegisterRelcacheCallback(countcache_relcache_callback,
 									  (Datum) 0);
+		RegisterXactCallback(countcache_xact_callback, NULL);
 		callback_registered = true;
 	}
 }
 
 /*
- * Return the xmin of the currently active snapshot.  If no snapshot is
- * registered yet (e.g. a utility command running outside of any
- * transaction-level snapshot), we return InvalidTransactionId, which
- * makes the cache miss-by-default for that path.
- */
-static TransactionId
-current_snapshot_xmin(void)
-{
-	Snapshot	snap;
-
-	/*
-	 * Prefer the active snapshot (available during executor run).  Fall back
-	 * to the transaction snapshot for callers that run during planning, where
-	 * no active snapshot has been pushed yet.  In READ COMMITTED mode both
-	 * call GetSnapshotData() and will have the same xmin within the tiny
-	 * window of a single Odoo request.
-	 */
-	if (ActiveSnapshotSet())
-		snap = GetActiveSnapshot();
-	else if (IsTransactionState())
-		snap = GetTransactionSnapshot();
-	else
-		return InvalidTransactionId;
-
-	if (snap == NULL)
-		return InvalidTransactionId;
-
-	return snap->xmin;
-}
-
-/*
  * TTL for cache entries.  Driven by the dbblue_count_cache_ttl GUC (seconds).
- * Odoo's search_count and web_search_read are separate HTTP requests so the
- * TTL must cover the round-trip between them; 300 s (5 min) suits typical
- * browsing pace.  DDL-driven staleness is handled by the relcache callback.
+ *
+ * This is a memory-hygiene bound, not a correctness mechanism: an entry that
+ * outlives its usefulness should not occupy one of the few slots forever.
+ * Staleness is prevented by the modification-stamp check below, which is why
+ * a cache *hit* must not renew captured_at -- otherwise a shape polled faster
+ * than the TTL would never age out at all.
  */
 #define DBBLUE_COUNTCACHE_TTL_USEC	((int64) dbblue_countcache_ttl * USECS_PER_SEC)
 
@@ -154,14 +148,23 @@ dbblue_countcache_lookup(Oid reloid, int64 fingerprint)
 	if (!found)
 		return NULL;
 
-	/*
-	 * TTL check: reject entries older than DBBLUE_COUNTCACHE_TTL_USEC.
-	 * We use wall-clock age rather than snapshot_xmin equality so that
-	 * the cached count from Odoo's search_count request is still usable
-	 * in the immediately following web_search_read request (a separate
-	 * transaction on the same backend, typically < 5 seconds later).
-	 */
+	/* TTL: retire entries nobody has needed for a while. */
 	if (GetCurrentTimestamp() - entry->captured_at > DBBLUE_COUNTCACHE_TTL_USEC)
+	{
+		(void) hash_search(countcache, &key, HASH_REMOVE, NULL);
+		countcache_count--;
+		return NULL;
+	}
+
+	/*
+	 * The correctness gate.  The count was computed against a particular
+	 * state of the relation; serving it now is sound only if that state is
+	 * demonstrably unchanged.  A differing stamp means somebody wrote to the
+	 * relation -- possibly in another backend, possibly a transaction that
+	 * was already in flight when we captured and has since committed -- so
+	 * the entry is worthless and we drop it rather than keep re-testing it.
+	 */
+	if (!dbblue_relmod_stamp_equal(dbblue_relmod_read(reloid), entry->relmod))
 	{
 		(void) hash_search(countcache, &key, HASH_REMOVE, NULL);
 		countcache_count--;
@@ -175,44 +178,131 @@ dbblue_countcache_lookup(Oid reloid, int64 fingerprint)
 void
 dbblue_countcache_insert(Oid reloid, int64 fingerprint, int64 count)
 {
-	CountCacheKey key;
-	CountCacheEntry *entry;
-	bool		found;
-	TransactionId xmin_now;
+	PendingCount *pc;
+	MemoryContext oldcxt;
 
 	if (!dbblue_count_cache)
 		return;
 	if (!OidIsValid(reloid) || fingerprint == INT64CONST(0))
 		return;
 
-	xmin_now = current_snapshot_xmin();
-	if (!TransactionIdIsValid(xmin_now))
+	/*
+	 * A transaction that has written anything cannot contribute a cacheable
+	 * count: it either counted its own uncommitted rows, or it is about to
+	 * change the very number it just measured.
+	 */
+	if (!dbblue_relmod_xact_is_cacheable())
+		return;
+	if (!IsTransactionState())
 		return;
 
+	/* Also registers the transaction callback that drains the queue. */
 	ensure_init();
 
 	/*
-	 * Evict before INSERT_ENTRY so the htab never exceeds its size budget.
-	 * The check is on the *current* count (before insert); if the key
-	 * happens to already exist below we'll overwrite, not grow, so an
-	 * unnecessary eviction is harmless in that case.
+	 * Queue it rather than publishing now.  The stamp is read here, at
+	 * capture, because that is the state the count actually describes; at
+	 * commit we re-read and only publish if it still holds.
 	 */
-	if (countcache_count >= countcache_max_entries)
-		evict_oldest();
+	oldcxt = MemoryContextSwitchTo(TopTransactionContext);
+	pc = (PendingCount *) palloc(sizeof(PendingCount));
+	pc->reloid = reloid;
+	pc->fingerprint = fingerprint;
+	pc->count = count;
+	pc->relmod = dbblue_relmod_read(reloid);
+	pending_counts = lappend(pending_counts, pc);
+	MemoryContextSwitchTo(oldcxt);
+}
 
-	memset(&key, 0, sizeof(key));
-	key.reloid = reloid;
-	key.qual_fingerprint = fingerprint;
+/*
+ * Move committed pending counts into the cache proper.
+ */
+static void
+countcache_publish_pending(void)
+{
+	ListCell   *lc;
 
-	entry = (CountCacheEntry *) hash_search(countcache, &key, HASH_ENTER,
-											&found);
-	if (!found)
-		countcache_count++;
+	if (pending_counts == NIL)
+		return;
 
-	entry->count = count;
-	entry->snapshot_xmin = xmin_now;
-	entry->captured_at = GetCurrentTimestamp();
-	entry->hits = 0;
+	foreach(lc, pending_counts)
+	{
+		PendingCount *pc = (PendingCount *) lfirst(lc);
+		CountCacheKey key;
+		CountCacheEntry *entry;
+		bool		found;
+
+		/*
+		 * Between capture and commit somebody may have written to the
+		 * relation, which would make the count wrong the moment we published
+		 * it.  Re-check and drop it if so.
+		 */
+		if (!dbblue_relmod_stamp_equal(dbblue_relmod_read(pc->reloid),
+									   pc->relmod))
+			continue;
+
+		ensure_init();
+
+		/*
+		 * Evict before HASH_ENTER so the htab never exceeds its size budget.
+		 * The check is on the *current* count (before insert); if the key
+		 * happens to already exist below we'll overwrite, not grow, so an
+		 * unnecessary eviction is harmless in that case.
+		 */
+		if (countcache_count >= countcache_max_entries)
+			evict_oldest();
+
+		memset(&key, 0, sizeof(key));
+		key.reloid = pc->reloid;
+		key.qual_fingerprint = pc->fingerprint;
+
+		entry = (CountCacheEntry *) hash_search(countcache, &key, HASH_ENTER,
+												&found);
+		if (!found)
+			countcache_count++;
+
+		entry->count = pc->count;
+		entry->relmod = pc->relmod;
+		entry->captured_at = GetCurrentTimestamp();
+		entry->hits = 0;
+	}
+
+	pending_counts = NIL;
+}
+
+/*
+ * Drop any queued counts without publishing them.  Called at transaction
+ * start: like the relmod write set, pending_counts lives in
+ * TopTransactionContext and must never be carried across a transaction
+ * boundary, whatever path the previous transaction exited by.
+ */
+void
+dbblue_countcache_reset_xact(void)
+{
+	pending_counts = NIL;
+}
+
+/*
+ * Pending counts are published on commit and thrown away on abort, which is
+ * what keeps a rolled-back transaction's counts out of the cache.
+ */
+static void
+countcache_xact_callback(XactEvent event, void *arg)
+{
+	switch (event)
+	{
+		case XACT_EVENT_COMMIT:
+		case XACT_EVENT_PARALLEL_COMMIT:
+			countcache_publish_pending();
+			break;
+		case XACT_EVENT_ABORT:
+		case XACT_EVENT_PARALLEL_ABORT:
+		case XACT_EVENT_PREPARE:
+			pending_counts = NIL;
+			break;
+		default:
+			break;
+	}
 }
 
 int
@@ -273,6 +363,7 @@ typedef struct CountCaptureDest
 	int			tuples_seen;	/* receiveSlot calls during this run */
 	bool		shape_ok;		/* TupleDesc is single int8 attr */
 	int64		captured_count;	/* first row's first attribute */
+	bool		served_from_cache;	/* tuple came from the cache, not a scan */
 } CountCaptureDest;
 
 static bool
@@ -325,6 +416,14 @@ ccd_rShutdown(DestReceiver *self)
 	CountCaptureDest *ccd = (CountCaptureDest *) self;
 
 	ccd->wrapped->rShutdown(ccd->wrapped);
+
+	/*
+	 * Never re-record a value we just read out of the cache.  Doing so would
+	 * renew the entry's captured_at on every hit, turning the TTL into an
+	 * idle timeout that a steadily-polled query shape never reaches.
+	 */
+	if (ccd->served_from_cache)
+		return;
 
 	/*
 	 * Insert only when we observed exactly one BIGINT row.  More tuples
@@ -385,6 +484,7 @@ dbblue_count_capture_install(QueryDesc *queryDesc)
 	ccd->tuples_seen = 0;
 	ccd->shape_ok = false;		/* set true in rStartup if natts/type ok */
 	ccd->captured_count = 0;
+	ccd->served_from_cache = false;
 
 	queryDesc->dest = (DestReceiver *) ccd;
 	return true;
@@ -513,6 +613,13 @@ dbblue_count_serve_if_cached(QueryDesc *queryDesc)
 	slot->tts_values = values;
 	slot->tts_isnull = isnull;
 	ExecStoreVirtualTuple(slot);
+
+	/*
+	 * Tell the capture wrapper this tuple came from the cache so it does not
+	 * feed it straight back in and renew the entry's age.
+	 */
+	if (queryDesc->dest->receiveSlot == ccd_receiveSlot)
+		((CountCaptureDest *) queryDesc->dest)->served_from_cache = true;
 
 	queryDesc->dest->receiveSlot(slot, queryDesc->dest);
 

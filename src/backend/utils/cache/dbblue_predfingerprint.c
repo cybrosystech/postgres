@@ -21,10 +21,14 @@
  */
 #include "postgres.h"
 
+#include "catalog/catalog.h"
+#include "catalog/pg_class_d.h"
+#include "catalog/pg_inherits.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/queryjumble.h"
 #include "optimizer/optimizer.h"
 #include "utils/dbblue_predfingerprint.h"
+#include "utils/lsyscache.h"
 
 typedef struct CacheabilityCtx
 {
@@ -70,16 +74,44 @@ dbblue_predicate_fingerprint(Oid reloid, Node *quals)
 	if (quals == NULL || !OidIsValid(reloid))
 		return INT64CONST(0);
 
+	/*
+	 * System catalogs are written through paths that bypass the table AM --
+	 * CatalogTupleInsert/Update/Delete reach heap_* directly, and
+	 * heap_inplace_update bypasses even that -- so their modification stamps
+	 * are not reliably maintained.  Rather than chase every catalog write
+	 * site, refuse to cache counts over catalogs; no paginated application
+	 * query counts them anyway.
+	 */
+	if (IsCatalogRelationOid(reloid))
+		return INT64CONST(0);
+
+	/*
+	 * A count over a partitioned table or an inheritance parent aggregates
+	 * rows that physically live in child relations, and writes bump the
+	 * child's stamp, not the parent's.  Tracking the whole ancestry on every
+	 * write would make the common case pay for the rare one, so exclude
+	 * these instead.
+	 */
+	if (get_rel_relkind(reloid) == RELKIND_PARTITIONED_TABLE ||
+		has_subclass(reloid))
+		return INT64CONST(0);
+
 	(void) predicate_cacheability_walker(quals, &ctx);
 	if (ctx.rejected)
 		return INT64CONST(0);
 
 	/*
-	 * A volatile function call invalidates the very notion of a cached
-	 * row count, since two calls in the same snapshot could disagree.
-	 * contain_volatile_functions is the standard PG check; reuse it.
+	 * Reject anything that is not IMMUTABLE, not merely anything VOLATILE.
+	 *
+	 * The fingerprint hashes the *expression*, so two evaluations that read
+	 * differently but look identical collapse onto one cache key.  A STABLE
+	 * function is exactly that case: "WHERE owner = current_user" has one
+	 * fingerprint but a different answer per role, and "WHERE ts > now() -
+	 * interval '1 day'" has one fingerprint but a different answer per day.
+	 * contain_mutable_functions() also covers SQLValueFunction, which is how
+	 * current_user and friends are represented.
 	 */
-	if (contain_volatile_functions(quals))
+	if (contain_mutable_functions(quals))
 		return INT64CONST(0);
 
 	hash = JumbleExpr(quals, true);

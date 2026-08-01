@@ -71,7 +71,7 @@ double		cursor_tuple_fraction = DEFAULT_CURSOR_TUPLE_FRACTION;
 int			debug_parallel_query = DEBUG_PARALLEL_OFF;
 bool		parallel_leader_participation = true;
 bool		enable_distinct_reordering = true;
-bool		dbblue_offset_flip = true;	/* enable offset-flip planner rewrite */
+bool		dbblue_offset_flip = false; /* enable offset-flip planner rewrite */
 
 /* Hook for plugins to get control in planner() */
 planner_hook_type planner_hook = NULL;

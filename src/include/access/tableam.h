@@ -22,6 +22,7 @@
 #include "access/xact.h"
 #include "executor/tuptable.h"
 #include "storage/read_stream.h"
+#include "utils/dbblue_relmod.h"
 #include "utils/rel.h"
 #include "utils/snapshot.h"
 
@@ -1458,6 +1459,7 @@ static inline void
 table_tuple_insert(Relation rel, TupleTableSlot *slot, CommandId cid,
 				   uint32 options, BulkInsertStateData *bistate)
 {
+	dbblue_relmod_note_write(RelationGetRelid(rel));
 	rel->rd_tableam->tuple_insert(rel, slot, cid, options,
 								  bistate);
 }
@@ -1479,6 +1481,7 @@ table_tuple_insert_speculative(Relation rel, TupleTableSlot *slot,
 							   BulkInsertStateData *bistate,
 							   uint32 specToken)
 {
+	dbblue_relmod_note_write(RelationGetRelid(rel));
 	rel->rd_tableam->tuple_insert_speculative(rel, slot, cid, options,
 											  bistate, specToken);
 }
@@ -1513,6 +1516,7 @@ static inline void
 table_multi_insert(Relation rel, TupleTableSlot **slots, int nslots,
 				   CommandId cid, uint32 options, BulkInsertStateData *bistate)
 {
+	dbblue_relmod_note_write(RelationGetRelid(rel));
 	rel->rd_tableam->multi_insert(rel, slots, nslots,
 								  cid, options, bistate);
 }
@@ -1550,6 +1554,7 @@ table_tuple_delete(Relation rel, ItemPointer tid, CommandId cid,
 				   uint32 options, Snapshot snapshot, Snapshot crosscheck,
 				   bool wait, TM_FailureData *tmfd)
 {
+	dbblue_relmod_note_write(RelationGetRelid(rel));
 	return rel->rd_tableam->tuple_delete(rel, tid, cid, options,
 										 snapshot, crosscheck,
 										 wait, tmfd);
@@ -1601,6 +1606,7 @@ table_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 				   bool wait, TM_FailureData *tmfd, LockTupleMode *lockmode,
 				   TU_UpdateIndexes *update_indexes)
 {
+	dbblue_relmod_note_write(RelationGetRelid(rel));
 	return rel->rd_tableam->tuple_update(rel, otid, slot,
 										 cid, options, snapshot, crosscheck,
 										 wait, tmfd,
@@ -1704,6 +1710,7 @@ table_relation_set_new_filelocator(Relation rel,
 static inline void
 table_relation_nontransactional_truncate(Relation rel)
 {
+	dbblue_relmod_note_write(RelationGetRelid(rel));
 	rel->rd_tableam->relation_nontransactional_truncate(rel);
 }
 
