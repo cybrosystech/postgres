@@ -240,5 +240,14 @@ delete from fkr_rc where id = 9003;
 select fk_plan_kind('select c.id, p.v from fkr_rc c left join fkr_rp p on c.pid = p.id') as plan_after_normal_dml;
 drop table fkr_rc, fkr_rp;
 
+-- When nothing outside the join condition uses the nullable side, PostgreSQL can
+-- drop the join outright, which beats reducing it: an inner join can eliminate
+-- rows and so cannot be dropped.  Counting rows over a join is exactly this
+-- shape, and reducing it turned a single scan back into a join.
+select fk_plan_kind('select count(*) from fkr_c c left join fkr_p p on c.pid = p.id') as plan_must_be_no_join,
+       (select count(*) from fkr_c c left join fkr_p p on c.pid = p.id) as rows;
+-- referencing the nullable side makes removal impossible, so it reduces again
+select fk_plan_kind('select count(p.v) from fkr_c c left join fkr_p p on c.pid = p.id') as plan_must_reduce;
+
 drop table fkr_cc, fkr_pp, fkr_top, fkr_c, fkr_p;
 drop function fk_plan_kind(text);

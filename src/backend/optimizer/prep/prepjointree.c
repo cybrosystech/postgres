@@ -174,6 +174,10 @@ static void report_reduced_full_join(reduce_outer_joins_pass2_state *state2,
 									 int rtindex, Relids relids);
 static bool has_notnull_forced_var(PlannerInfo *root, List *forced_null_vars,
 								   reduce_outer_joins_pass1_state *right_state);
+static void fkey_collect_jointree_quals(Node *jtnode, JoinExpr *skip,
+										List **quals);
+static bool fkey_nullable_side_is_referenced(PlannerInfo *root, JoinExpr *j,
+											 int innerrelid);
 static bool fkey_triggers_disabled(Oid conoid);
 static bool fkey_proves_inner_join(PlannerInfo *root, JoinExpr *j,
 								   Node *innernode,
@@ -3850,6 +3854,105 @@ has_notnull_forced_var(PlannerInfo *root, List *forced_null_vars,
 }
 
 /*
+ * fkey_collect_jointree_quals
+ *		Gather every qual in the join tree except those of one JoinExpr.
+ */
+static void
+fkey_collect_jointree_quals(Node *jtnode, JoinExpr *skip, List **quals)
+{
+	if (jtnode == NULL || IsA(jtnode, RangeTblRef))
+		return;
+	if (IsA(jtnode, FromExpr))
+	{
+		FromExpr   *f = (FromExpr *) jtnode;
+		ListCell   *lc;
+
+		if (f->quals)
+			*quals = lappend(*quals, f->quals);
+		foreach(lc, f->fromlist)
+			fkey_collect_jointree_quals(lfirst(lc), skip, quals);
+	}
+	else if (IsA(jtnode, JoinExpr))
+	{
+		JoinExpr   *je = (JoinExpr *) jtnode;
+
+		if (je != skip && je->quals)
+			*quals = lappend(*quals, je->quals);
+		fkey_collect_jointree_quals(je->larg, skip, quals);
+		fkey_collect_jointree_quals(je->rarg, skip, quals);
+	}
+}
+
+/*
+ * fkey_nullable_side_is_referenced
+ *		Does anything but this join's own condition use the nullable side?
+ *
+ * If nothing does, the outer join is a candidate for removal altogether:
+ * remove_useless_joins() drops a LEFT JOIN whose inner side is unique on the
+ * join key and otherwise unused, and the foreign key guarantees that
+ * uniqueness.  Reducing to an inner join forfeits that, because an inner join
+ * can eliminate rows and so cannot simply be dropped -- turning a query that
+ * scanned one table into one that performs a join.  Object-relational mappers
+ * run exactly this shape to count rows for a pager, where it measurably lost.
+ *
+ * When the nullable side is unreferenced there is nothing for the reduction to
+ * gain either, since no ordering or filtering depends on it, so declining costs
+ * nothing.  Being unsure counts as unreferenced, which merely leaves the query
+ * planned the way PostgreSQL would have planned it anyway.
+ */
+static bool
+fkey_nullable_side_is_referenced(PlannerInfo *root, JoinExpr *j, int innerrelid)
+{
+	Query	   *parse = root->parse;
+	List	   *quals = NIL;
+	ListCell   *lc;
+	Relids		used;
+	bool		result;
+
+	used = pull_varnos(root, (Node *) parse->targetList);
+	used = bms_join(used, pull_varnos(root, parse->havingQual));
+	used = bms_join(used, pull_varnos(root, (Node *) parse->returningList));
+	used = bms_join(used, pull_varnos(root, parse->limitOffset));
+	used = bms_join(used, pull_varnos(root, parse->limitCount));
+
+	fkey_collect_jointree_quals((Node *) parse->jointree, j, &quals);
+	foreach(lc, quals)
+		used = bms_join(used, pull_varnos(root, (Node *) lfirst(lc)));
+
+	/* a LATERAL item can reference it from inside the range table */
+	foreach(lc, parse->rtable)
+	{
+		RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+
+		if (!rte->lateral)
+			continue;
+		switch (rte->rtekind)
+		{
+			case RTE_SUBQUERY:
+				used = bms_join(used, pull_varnos(root, (Node *) rte->subquery));
+				break;
+			case RTE_FUNCTION:
+				used = bms_join(used, pull_varnos(root, (Node *) rte->functions));
+				break;
+			case RTE_VALUES:
+				used = bms_join(used, pull_varnos(root, (Node *) rte->values_lists));
+				break;
+			case RTE_TABLEFUNC:
+				used = bms_join(used, pull_varnos(root, (Node *) rte->tablefunc));
+				break;
+			default:
+				break;
+		}
+	}
+
+	result = bms_is_member(innerrelid, used);
+	bms_free(used);
+	list_free(quals);
+
+	return result;
+}
+
+/*
  * fkey_triggers_disabled
  *		Are this constraint's referential-integrity triggers switched off?
  *
@@ -4029,6 +4132,14 @@ fkey_proves_inner_join(PlannerInfo *root, JoinExpr *j, Node *innernode,
 
 	/* A policy or sample could hide the row the FK promises us. */
 	if (innerrte->securityQuals != NIL || innerrte->tablesample != NULL)
+		return false;
+
+	/*
+	 * If nothing outside this join's own condition uses the nullable side, the
+	 * join can be removed outright rather than reduced, which is strictly
+	 * better.  Leave it alone and let remove_useless_joins() have it.
+	 */
+	if (!fkey_nullable_side_is_referenced(root, j, innerrelid))
 		return false;
 
 	/* The ON clause must be a plain conjunction of Var = Var. */
