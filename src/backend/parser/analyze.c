@@ -1606,7 +1606,6 @@ transformForPortionOfClause(ParseState *pstate,
 	else
 		result->rangeTargetList = NIL;
 
-	result->range_name = forPortionOf->range_name;
 	result->location = forPortionOf->location;
 	result->targetLocation = forPortionOf->target_location;
 
@@ -1811,14 +1810,12 @@ transformSelectStmt(ParseState *pstate, SelectStmt *stmt,
 
 	qry->groupClause = transformGroupClause(pstate,
 											stmt->groupClause,
-											stmt->groupByAll,
 											&qry->groupingSets,
 											&qry->targetList,
 											qry->sortClause,
 											EXPR_KIND_GROUP_BY,
 											false /* allow SQL92 rules */ );
 	qry->groupDistinct = stmt->groupDistinct;
-	qry->groupByAll = stmt->groupByAll;
 
 	if (stmt->distinctClause == NIL)
 	{

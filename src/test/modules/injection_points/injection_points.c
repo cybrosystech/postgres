@@ -285,9 +285,7 @@ injection_wait(const char *name, const void *private_data, void *arg)
 	pgstat_report_wait_end();
 
 	/* Remove this injection point from the waiters. */
-	SpinLockAcquire(&inj_state->lock);
-	inj_state->name[index][0] = '\0';
-	SpinLockRelease(&inj_state->lock);
+	injection_wait_cleanup(0, Int32GetDatum(index));
 }
 
 /*

@@ -15,6 +15,7 @@ SUBDIRS = \
 		btree_gist	\
 		citext		\
 		cube		\
+		dbblue_partition \
 		dblink		\
 		dict_int	\
 		dict_xsyn	\
@@ -34,6 +35,7 @@ SUBDIRS = \
 		pg_freespacemap \
 		pg_logicalinspect \
 		pg_overexplain \
+		pg_partman\
 		pg_plan_advice \
 		pg_prewarm	\
 		pg_stash_advice	\

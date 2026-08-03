@@ -14,11 +14,13 @@ REGRESS_OPTS = --dlpath=$(top_builddir)/src/test/regress
 
 ISOLATION = basic \
 	    inplace \
+	    reindex_concurrently_deferred \
 	    repack \
 	    repack_temporal \
 	    repack_temporal_multirange \
 	    repack_toast \
 	    syscache-update-pruned \
+	    wait_cleanup \
 	    heap_lock_update
 
 # some isolation tests require wal_level=replica
