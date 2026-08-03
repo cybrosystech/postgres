@@ -306,6 +306,51 @@ SELECT dbblue_partition_odoo_compat_remove();
 SELECT count(*) FROM pg_namespace WHERE nspname = 'dbblue_compat';
 
 -- ---------------------------------------------------------------------
+-- 1.4 behaviour: a precision-qualified control column is accepted, the
+-- default interval is 1 year, conversions are atomic by default, and a
+-- dependent materialized view is carried across (recreated with its
+-- index and refreshed only after the data has landed, so it holds the
+-- same rows as before rather than an empty snapshot).
+-- ---------------------------------------------------------------------
+CREATE TABLE mv_t (id serial PRIMARY KEY, create_date timestamp(3) NOT NULL);
+INSERT INTO mv_t (create_date)
+    SELECT timestamp '2021-06-01' + (g || ' days')::interval
+    FROM generate_series(1, 400) g;
+CREATE MATERIALIZED VIEW mv_t_agg AS
+    SELECT date_trunc('year', create_date) AS yr, count(*) AS n FROM mv_t GROUP BY 1;
+CREATE INDEX mv_t_agg_yr ON mv_t_agg (yr);
+COMMENT ON MATERIALIZED VIEW mv_t_agg IS 'per year';
+CREATE MATERIALIZED VIEW mv_t_empty AS SELECT 1 AS x FROM mv_t WITH NO DATA;
+
+CALL dbblue_partition_model('mv_t', p_odoo_compat => false);
+SELECT partition_interval FROM part_config WHERE parent_table = 'public.mv_t';
+SELECT count(*) FROM mv_t;
+SELECT yr, n FROM mv_t_agg ORDER BY yr;                 -- must match pre-conversion
+SELECT relispopulated FROM pg_catalog.pg_class WHERE relname = 'mv_t_agg';
+SELECT relispopulated FROM pg_catalog.pg_class WHERE relname = 'mv_t_empty';
+SELECT indexname FROM pg_indexes WHERE tablename = 'mv_t_agg';
+SELECT obj_description('mv_t_agg'::regclass, 'pg_class');
+-- status reports the partition set's real size, not the parent's zero
+SELECT state, total_size <> '0 bytes' AS size_reported, rows_not_visible_to_odoo
+FROM dbblue_partition_status('mv_t');
+
+-- ---------------------------------------------------------------------
+-- 1.4 behaviour: undo reconciles column drift by itself when the backup
+-- is empty, so a module update between conversion and undo is not an
+-- obstacle; added values survive and generated columns recompute.
+-- ---------------------------------------------------------------------
+ALTER TABLE mv_t ADD COLUMN note text;
+ALTER TABLE mv_t ADD COLUMN doubled numeric GENERATED ALWAYS AS (id * 2) STORED;
+UPDATE mv_t SET note = 'kept' WHERE id <= 3;
+CALL dbblue_partition_undo('mv_t');
+SELECT relkind FROM pg_catalog.pg_class WHERE relname = 'mv_t';
+SELECT count(*) AS rows, count(*) FILTER (WHERE note = 'kept') AS kept FROM mv_t;
+SELECT doubled FROM mv_t WHERE id = 3;
+SELECT count(*) FROM mv_t_agg;                          -- matview survived the undo
+DROP MATERIALIZED VIEW mv_t_agg, mv_t_empty;
+DROP TABLE mv_t;
+
+-- ---------------------------------------------------------------------
 -- Leave nothing behind: no dangling role search_path, no template
 -- tables, no catalog or pg_partman rows.  Without this, a second
 -- installcheck run fails on "backup table already exists".

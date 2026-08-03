@@ -200,8 +200,8 @@ dbblue_partition_bgw_main(Datum main_arg)
 	 * SIGTERM maps to die(), not SignalHandlerForShutdownRequest: an
 	 * in-flight run_maintenance() can take minutes and must be cancellable
 	 * (fast shutdown, DROP DATABASE ... FORCE), and exiting 0 on a targeted
-	 * pg_terminate_backend() would deregister the worker for the life of
-	 * the postmaster, silently stopping maintenance.  die() exits 1, so the
+	 * pg_terminate_backend() would deregister the worker for the life of the
+	 * postmaster, silently stopping maintenance.  die() exits 1, so the
 	 * postmaster restarts the worker after bgw_restart_time instead.
 	 */
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
@@ -227,10 +227,10 @@ dbblue_partition_bgw_main(Datum main_arg)
 		long		timeout;
 
 		/*
-		 * Wait until the next scheduled run.  Anything that sets the latch
-		 * (a config reload, a shutdown request) wakes us early, so the
-		 * decision to run is made from the clock rather than from the fact
-		 * that we woke up -- otherwise a SIGHUP arriving during a pass would
+		 * Wait until the next scheduled run.  Anything that sets the latch (a
+		 * config reload, a shutdown request) wakes us early, so the decision
+		 * to run is made from the clock rather than from the fact that we
+		 * woke up -- otherwise a SIGHUP arriving during a pass would
 		 * immediately trigger another one.
 		 */
 		timeout = TimestampDifferenceMilliseconds(GetCurrentTimestamp(), next_run);

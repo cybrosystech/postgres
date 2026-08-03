@@ -14094,16 +14094,16 @@ dbblue_index_extras_are_partkey(PartitionKey partkey,
 	}
 
 	/*
-	 * The relaxation rests on the referenced columns being unique in
-	 * practice even though the widened index cannot enforce it.  That holds
-	 * for a primary key, whose remaining column is the table's identity
-	 * drawn from a sequence -- the Odoo case this exists for.  A plain
-	 * UNIQUE carries no such promise: REFERENCES t(name) backed by UNIQUE
-	 * (name, create_date) is accepted here, but two rows in different
-	 * partitions may then share "name", and referential actions applied per
-	 * leaf partition would cascade or restrict against a parent that still
-	 * exists.  Accept it -- refusing would break legitimate composite keys
-	 * whose leading column is itself unique -- but say so.
+	 * The relaxation rests on the referenced columns being unique in practice
+	 * even though the widened index cannot enforce it.  That holds for a
+	 * primary key, whose remaining column is the table's identity drawn from
+	 * a sequence -- the Odoo case this exists for.  A plain UNIQUE carries no
+	 * such promise: REFERENCES t(name) backed by UNIQUE (name, create_date)
+	 * is accepted here, but two rows in different partitions may then share
+	 * "name", and referential actions applied per leaf partition would
+	 * cascade or restrict against a parent that still exists.  Accept it --
+	 * refusing would break legitimate composite keys whose leading column is
+	 * itself unique -- but say so.
 	 */
 	if (!indexStruct->indisprimary)
 		ereport(WARNING,
@@ -14157,10 +14157,9 @@ transformFkeyCheckAttrs(Relation pkrel,
 	 * The relaxation is deliberately narrow: it applies only to the primary
 	 * key, and the *only* extra columns tolerated are the partition key
 	 * columns that PostgreSQL forced into it (see
-	 * dbblue_index_extras_are_partkey).  A unique index on (name,
-	 * company_id) still does not satisfy REFERENCES t(name), and neither
-	 * does a non-primary UNIQUE (name, create_date), exactly as upstream
-	 * requires.
+	 * dbblue_index_extras_are_partkey).  A unique index on (name, company_id)
+	 * still does not satisfy REFERENCES t(name), and neither does a
+	 * non-primary UNIQUE (name, create_date), exactly as upstream requires.
 	 *
 	 * Temporal FKs (WITH PERIOD) keep the strict exact-match requirement
 	 * because their semantics depend on precise column positioning.

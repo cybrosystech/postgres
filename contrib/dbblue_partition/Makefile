@@ -3,7 +3,8 @@
 EXTENSION = dbblue_partition
 MODULES = src/dbblue_partition_bgw
 DATA = dbblue_partition--1.0.sql dbblue_partition--1.0--1.1.sql \
-	dbblue_partition--1.1--1.2.sql dbblue_partition--1.2--1.3.sql
+	dbblue_partition--1.1--1.2.sql dbblue_partition--1.2--1.3.sql \
+	dbblue_partition--1.3--1.4.sql
 PGFILEDESC = "dbblue_partition - convert live Odoo tables to native range partitioning"
 
 REGRESS = dbblue_partition
