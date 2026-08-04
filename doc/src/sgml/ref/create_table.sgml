@@ -1738,6 +1738,62 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
+   <varlistentry id="reloption-auto-skip-unchanged" xreflabel="auto_skip_unchanged">
+    <term><literal>auto_skip_unchanged</literal> (<type>boolean</type>)
+    <indexterm>
+     <primary><varname>auto_skip_unchanged</varname></primary>
+     <secondary>storage parameter</secondary>
+    </indexterm>
+    </term>
+    <listitem>
+     <para>
+      Applies to materialized views only.  When enabled,
+      <link linkend="sql-refreshmaterializedview"><command>REFRESH
+      MATERIALIZED VIEW</command></link> returns without rebuilding the
+      materialized view if it can prove that nothing the view depends on has
+      changed since its last successful refresh.  The default is
+      <literal>false</literal>.
+     </para>
+     <para>
+      This is intended for reporting views that are refreshed on a schedule
+      far more often than their source tables are written.  A skipped refresh
+      is independent of the size of the sources, so a refresh that would take
+      minutes returns in well under a millisecond.  Setting the parameter on
+      any other kind of relation is accepted but has no effect.
+     </para>
+     <para>
+      The proof requires that the materialized view be a function of a set of
+      ordinary tables that can be completely enumerated, and that each of them
+      be observably unchanged.  When any part of that cannot be established the
+      refresh proceeds normally, so enabling the parameter can cost an extra
+      rebuild but can never return a stale result.  In particular the rebuild
+      is always performed when the transaction is running at
+      <literal>REPEATABLE READ</literal> or <literal>SERIALIZABLE</literal>,
+      when <command>REFRESH</command> is run with
+      <literal>CONCURRENTLY</literal> or <literal>WITH NO DATA</literal>, when
+      the same transaction has itself written one of the sources, when the
+      defining query uses a function that is not <literal>IMMUTABLE</literal>
+      (including <function>now</function>) or uses
+      <literal>TABLESAMPLE</literal>, when any source has row-level security
+      enabled or has a virtual generated column, and when a source is anything
+      other than an ordinary table or another materialized view — a sequence,
+      a foreign table or a system catalog, for example.  Views are supported:
+      they are expanded to their base tables, and redefining a view causes the
+      next refresh to rebuild.
+     </para>
+     <para>
+      Note that a skipped <command>REFRESH</command> still takes the same
+      <literal>ACCESS EXCLUSIVE</literal> lock on the materialized view as an
+      ordinary one, and holds it until the end of the transaction.  The
+      parameter removes the cost of the rebuild, not the locking.
+     </para>
+     <para>
+      See also <xref linkend="guc-dbblue-matview-skip-unchanged"/>, which
+      disables the behavior for the whole cluster.
+     </para>
+    </listitem>
+   </varlistentry>
+
   <varlistentry id="reloption-autovacuum-parallel-workers" xreflabel="autovacuum_parallel_workers">
     <term><literal>autovacuum_parallel_workers</literal> (<type>integer</type>)
     <indexterm>
