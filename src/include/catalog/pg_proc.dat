@@ -12690,4 +12690,37 @@
   proname => 'hashoid8extended', prorettype => 'int8',
   proargtypes => 'oid8 int8', prosrc => 'hashoid8extended' },
 
+# DBblue: foreign keys declared trustworthy for correctness-affecting planning
+{ oid => '8338', descr => 'DBblue: verify and trust all foreign keys',
+  proname => 'dbblue_trust_foreign_keys', provolatile => 'v', proparallel => 'u',
+  prorows => '100', proretset => 't', prorettype => 'record', proargtypes => '',
+  proallargtypes => '{regclass,name,regclass,text,int8}',
+  proargmodes => '{o,o,o,o,o}',
+  proargnames => '{relation,constraint_name,references,action,violating_rows}',
+  prosrc => 'dbblue_trust_foreign_keys' },
+
+{ oid => '8339', descr => 'DBblue: verify and trust the foreign keys of one table',
+  proname => 'dbblue_trust_foreign_keys', provolatile => 'v', proparallel => 'u',
+  prorows => '10', proretset => 't', prorettype => 'record', proargtypes => 'regclass',
+  proallargtypes => '{regclass,regclass,name,regclass,text,int8}',
+  proargmodes => '{i,o,o,o,o,o}',
+  proargnames => '{table,relation,constraint_name,references,action,violating_rows}',
+  prosrc => 'dbblue_trust_foreign_keys_rel' },
+
+{ oid => '8340', descr => 'DBblue: withdraw trust from all foreign keys',
+  proname => 'dbblue_untrust_foreign_keys', provolatile => 'v', proparallel => 'u',
+  prorows => '100', proretset => 't', prorettype => 'record', proargtypes => '',
+  proallargtypes => '{regclass,name,regclass,text,int8}',
+  proargmodes => '{o,o,o,o,o}',
+  proargnames => '{relation,constraint_name,references,action,violating_rows}',
+  prosrc => 'dbblue_untrust_foreign_keys' },
+
+{ oid => '8341', descr => 'DBblue: withdraw trust from the foreign keys of one table',
+  proname => 'dbblue_untrust_foreign_keys', provolatile => 'v', proparallel => 'u',
+  prorows => '10', proretset => 't', prorettype => 'record', proargtypes => 'regclass',
+  proallargtypes => '{regclass,regclass,name,regclass,text,int8}',
+  proargmodes => '{i,o,o,o,o,o}',
+  proargnames => '{table,relation,constraint_name,references,action,violating_rows}',
+  prosrc => 'dbblue_untrust_foreign_keys_rel' },
+
 ]

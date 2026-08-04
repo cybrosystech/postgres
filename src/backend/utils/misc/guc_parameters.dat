@@ -623,6 +623,14 @@
   assign_hook => 'assign_datestyle',
 },
 
+{ name => 'dbblue_enable_fk_join_reduction', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
+  short_desc => 'Enables reducing outer joins to inner joins using foreign keys.',
+  long_desc => 'When a mandatory foreign key proves that every row of the preserved side has exactly one match on the nullable side, the outer join cannot produce null-extended rows, so it is planned as an inner join.',
+  flags => 'GUC_EXPLAIN',
+  variable => 'dbblue_enable_fk_join_reduction',
+  boot_val => 'true',
+},
+
 # This is PGC_SUSET to prevent hiding from log_lock_waits.
 { name => 'deadlock_timeout', type => 'int', context => 'PGC_SUSET', group => 'LOCK_MANAGEMENT',
   short_desc => 'Sets the time to wait on a lock before checking for deadlock.',

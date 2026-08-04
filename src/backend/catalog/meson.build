@@ -17,6 +17,7 @@ backend_sources += files(
   'pg_class.c',
   'pg_collation.c',
   'pg_constraint.c',
+  'pg_dbblue_trusted_fkey.c',
   'pg_conversion.c',
   'pg_db_role_setting.c',
   'pg_depend.c',
