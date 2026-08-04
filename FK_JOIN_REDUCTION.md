@@ -458,7 +458,13 @@ Always confirm a negative test can actually fail.
 
 ## 9. Production readiness
 
-**Not production ready. Ready for controlled testing on non-critical systems.**
+**Every gate that can be closed off a live system is closed. The remaining one
+is real traffic, which is by definition not closable here.**
+
+Recommended: a controlled rollout. Deploy on a staging or reporting replica
+carrying real traffic, grant trust only on the tables that matter, and watch.
+The feature is inert until trust is granted, so the exposure is exactly what is
+opted into, and a bypass withdraws it without operator action.
 
 ### Verified
 
@@ -469,38 +475,61 @@ Always confirm a negative test can actually fail.
 - acceptance on a cluster built from scratch: 10/10, and inert until trusted
 - write path: zero cost on ordinary DML, bounded cost on bulk loads (§5a)
 - dump/restore: trust correctly does not carry over (§5b)
-- **concurrency soak, 300 s**: 3 writers doing ordinary DML, 2 readers running
-  the accelerated shape, repeated bypass windows creating real orphans, and
-  trust being re-earned throughout. **16,928 checks of the identity
-  `LEFT JOIN rows == INNER JOIN rows + orphan rows`, zero violations, zero
-  errors.** The first attempt at this recorded *zero* checks because a parsing
-  bug silently emptied the counts, so the script now refuses to report a pass
-  under 20 checks and also reports the maximum orphan count observed — a run
-  that never sees an orphan never enters the state that matters.
+- **concurrency soak**: 3 writers doing ordinary DML, 2 readers running the
+  accelerated shape, repeated bypass windows creating real orphans, and trust
+  re-earned throughout. Two runs of the identity
+  `LEFT JOIN rows == INNER JOIN rows + orphan rows`:
+
+  | run | duration | checks | max orphans | violations | errors |
+  |---|---|---|---|---|---|
+  | first | 300 s | 16,928 | 1 | 0 | 0 |
+  | heavier | 1800 s | **94,560** | 5 | **0** | **0** |
+
+  The very first attempt recorded *zero* checks because a parsing bug silently
+  emptied the counts, so the script now refuses to report a pass under 20
+  checks and reports the largest orphan count seen — a run that never observes
+  an orphan never enters the state the invariant is about.
+- **crash recovery**: `SIGKILL` of the postmaster with an uncommitted
+  withdrawal in flight. After recovery the committed grant survived, the
+  uncommitted withdrawal did not, results stayed identical, and withdrawal
+  still worked. Trust rows are ordinary catalog rows and so are WAL-logged;
+  this confirms it rather than assuming it.
+- **logical replication, two clusters**: a subscriber's apply worker runs with
+  `session_replication_role = replica`, so RI triggers do not fire there.
+  Granting trust on the subscriber and then replicating 500 valid rows
+  **withdrew it automatically**; re-granting and then replicating a row whose
+  parent exists only upstream withdrew it again, left the orphan visible, and
+  the invariant held at `501 = 500 + 1`. A subscriber cannot silently hide
+  replicated orphans.
 
 ### Not yet verified
 
 | Gap | Why it matters |
 |---|---|
-| **`pg_upgrade`** | New catalog and a bumped catversion; the upgrade path is untested. |
-| **Crash recovery** | Trust rows are ordinary catalog rows and so are WAL-logged, but recovery has not been exercised. |
-| **Logical replication end to end** | A subscriber applies in replica mode, so withdrawal *should* fire on first apply. Reasoned, not observed. |
-| **Sustained real workload** | Nothing has run for longer than a benchmark. |
+| **Sustained real workload** | Everything above is synthetic or a benchmark. Nothing has carried real users' traffic over days. This is the one gap that cannot be closed without deploying it. |
+| **`pg_upgrade`** | Deliberately deferred. This branch's catalog layout will never ship on its own; it merges with the other features first, so the upgrade path should be tested once against the product's final catalog set, not per feature. The rule that keeps it possible — DBblue only ever *adds* catalogs, never alters existing ones — holds across all current feature branches. |
 
 ### The honest signal
 
 Two of the five defects in §4 were found only by measuring against a real
 database, and the write-path regression in §5a was found only by bulk loading.
-Every time this has met a genuinely new workload, that workload has found
-something. That is the argument for more real-workload testing before
-production, not for confidence.
+Every new *kind* of workload found something — until these last four
+(soak, crash, replication, heavier soak), which found nothing.
 
-### Suggested order
+That is the first evidence pointing the other way, and it is why the
+recommendation moved from "controlled testing" to "controlled rollout". It is
+not proof: none of it carried real users' traffic, and the failure mode this
+feature can have — rows quietly missing from a list — is one an unwatched
+system will not report.
 
-1. Restore a real Odoo dump onto this binary — exercises constraint creation,
-   validation, and the `--disable-triggers` path in one go.
-2. `SELECT * FROM dbblue_trust_foreign_keys();` and check for refusals.
-3. Run a real Odoo workload against it, with `log_min_duration_statement` set,
-   and compare the log with trust granted and withdrawn.
-4. A concurrency soak with writers, readers, and a bypass window.
-5. `pg_upgrade` from a stock PostgreSQL 19 cluster.
+### Suggested rollout
+
+1. Deploy on a staging or reporting replica carrying real traffic.
+2. `SELECT * FROM dbblue_trust_foreign_keys();` — check for refusals, which
+   would mean that database already contains rows its constraints forbid.
+3. Grant trust only on the tables whose list views matter (§2 says which shapes
+   benefit: a `NOT NULL` many-to-one led `_order`).
+4. Watch `pg_dbblue_trusted_fkey` for unexpected withdrawals — each one means
+   integrity was bypassed somewhere, which is worth knowing regardless.
+5. Promote to production once it has carried real traffic for a period you are
+   comfortable with.
