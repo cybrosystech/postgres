@@ -98,6 +98,29 @@ non-transactional truncate) rather than in heapam, so every table AM is covered.
 A one-entry per-transaction memo means a bulk load pays a single comparison per
 row.
 
+### 2.2.1 The cache is inert during recovery
+
+**WAL redo does not go through the `tableam` wrappers**, so on a hot standby a
+relation changes with no stamp movement whatsoever. An entry cached there would
+remain "valid" and wrong indefinitely — and because a hit does not renew the
+TTL, a polled query shape would never age out of the wrong answer. Demonstrated
+on a streaming replica before the guard was added, within one session:
+
+```
+1. standby caches                            100
+2. same session, after full replay           100   <- wrong
+3. same session, feature off (ground truth)   150
+```
+
+Both `dbblue_countcache_lookup()` and `dbblue_countcache_insert()` therefore
+return early when `RecoveryInProgress()`. Refusing to *populate* as well as to
+*serve* means a standby that is later promoted cannot inherit an entry captured
+while stamps were not being maintained.
+
+The cost is real: replicas are the read-mostly workload where this feature works
+best (96.7 % hit rate at zero writes), and it is switched off there entirely.
+Lifting the restriction means bumping stamps from the redo handlers — see §7.4.
+
 ### 2.3 Publication is deferred to commit
 
 Counts are **queued**, not published, and reach the cache only at
@@ -280,17 +303,39 @@ filter · `IS NOT NULL` · numeric comparison.
 
 Known limitations:
 
-1. **Unfiltered list views are never cached.** The gate requires
+1. **No benefit on hot standbys** — the cache is inert during recovery (§2.2.1).
+   This is the largest functional gap, because replicas are otherwise the ideal
+   workload for it.
+2. **Unfiltered list views are never cached.** The gate requires
    `parse->jointree->quals != NULL`, so `SELECT count(*) FROM t` with no `WHERE`
    is excluded — yet that is the most expensive count and the most cacheable.
    Allowing it looks straightforward and sound (no predicate means no mutable
    functions, and the same stamp check applies).
-2. **Plan-dependent results** (§4.1) — lossy geometric GiST operators where
-   PostgreSQL itself is inconsistent between plans.
-3. **System catalogs and partitioned/inheritance parents** are excluded, not
+3. **Plan-dependent results** (§4.1) — lossy geometric GiST operators where
+   PostgreSQL itself is inconsistent between plans. Verified *not* to affect
+   `gin_trgm_ops` `ILIKE` counts, which Odoo relies on heavily: index and
+   sequential scans agree.
+4. **System catalogs and partitioned/inheritance parents** are excluded, not
    supported.
-4. **Write-hot tables** get no benefit (§5.4).
-5. **Write-path cost is unconditional** (§5.3).
+5. **Write-hot tables** get no benefit (§5.4).
+6. **Write-path cost is unconditional** (§5.3).
+
+### 6.1 Not production ready
+
+The core is well validated on a primary, but the following should land before
+this is enabled anywhere real:
+
+- **No committed regression tests.** Every correctness vector in §4.2 was
+  verified by hand-run probes. Nothing in `make check` would catch a
+  regression, and the failure mode is *silently wrong rows*. This is the
+  biggest gap.
+- **Untested paths:** two-phase commit / prepared transactions, crash
+  recovery, `EXEC_BACKEND` shared-memory initialisation (Windows), and slot
+  collision behaviour under real multi-relation pressure. A collision bumps a
+  *global* epoch, so a busy multi-tenant instance may thrash toward a 0 % hit
+  rate — plausible but unmeasured.
+- **`PGC_POSTMASTER` master switch** so the write-path cost is genuinely zero
+  when the feature is off (§5.3).
 
 ---
 
@@ -338,7 +383,20 @@ rate on update-heavy tables.
 
 ### 7.3 Cache unfiltered counts
 
-See §6 item 1.
+See §6 item 2.
+
+### 7.4 Bump stamps during redo, to re-enable the cache on standbys
+
+Teach the heap (and other AM) redo handlers to call
+`dbblue_relmod_note_write()` for the relation being replayed, so a hot standby
+maintains stamps the same way a primary does. Then the `RecoveryInProgress()`
+guard in §2.2.1 can be lifted and replicas get the optimisation back.
+
+Points needing care: redo has no relcache entry, only a `RelFileLocator`, so the
+relation OID must be recovered from it (or the stamp keyed on the locator
+instead of the OID); and the stamp must be bumped before the replayed changes
+become visible to queries on the standby, mirroring the pre-commit ordering
+used on the primary.
 
 ---
 

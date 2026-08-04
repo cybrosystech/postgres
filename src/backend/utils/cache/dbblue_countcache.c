@@ -34,6 +34,7 @@
 #include "postgres.h"
 
 #include "access/xact.h"
+#include "access/xlog.h"
 #include "catalog/pg_type_d.h"
 #include "executor/execdesc.h"
 #include "executor/executor.h"
@@ -139,6 +140,19 @@ dbblue_countcache_lookup(Oid reloid, int64 fingerprint)
 	if (!OidIsValid(reloid) || fingerprint == INT64CONST(0))
 		return NULL;
 
+	/*
+	 * Never serve a cached count during recovery.  Write stamps are moved by
+	 * the tableam wrappers, which redo does not go through, so on a hot
+	 * standby a relation can change under us with no stamp movement at all --
+	 * an entry cached there would stay "valid" and wrong indefinitely.
+	 *
+	 * This makes the cache inert on standbys rather than merely cautious.
+	 * Lifting it means teaching the redo handlers to bump stamps; until then
+	 * the optimisation is forfeited on replicas, which is the safe direction.
+	 */
+	if (RecoveryInProgress())
+		return NULL;
+
 	memset(&key, 0, sizeof(key));
 	key.reloid = reloid;
 	key.qual_fingerprint = fingerprint;
@@ -184,6 +198,14 @@ dbblue_countcache_insert(Oid reloid, int64 fingerprint, int64 count)
 	if (!dbblue_count_cache)
 		return;
 	if (!OidIsValid(reloid) || fingerprint == INT64CONST(0))
+		return;
+
+	/*
+	 * Don't populate during recovery either -- see dbblue_countcache_lookup().
+	 * Refusing here as well means a standby that is later promoted cannot
+	 * inherit an entry captured while stamps were not being maintained.
+	 */
+	if (RecoveryInProgress())
 		return;
 
 	/*
