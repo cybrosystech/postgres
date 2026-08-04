@@ -117,6 +117,36 @@ DbblueFkeyTrustRowExists(Oid conoid)
 }
 
 /*
+ * Whether this database has any trust declaration at all, cached for the
+ * transaction: -1 not yet looked at, 0 none, 1 some.
+ *
+ * A database that has never granted trust -- the default, since nothing is
+ * trusted until an administrator opts in -- can answer every bypass without
+ * examining a single constraint.  Without this the per-constraint memo still
+ * costs one catalog lookup per distinct constraint per transaction, which a
+ * restore touching many tables pays over and over for no possible benefit.
+ */
+static int	dbblue_any_trusted = -1;
+
+static bool
+dbblue_any_trust_declared(void)
+{
+	Relation	rel;
+	SysScanDesc scan;
+
+	if (dbblue_any_trusted >= 0)
+		return dbblue_any_trusted > 0;
+
+	rel = table_open(DbblueTrustedFkeyRelationId, AccessShareLock);
+	scan = systable_beginscan(rel, DbblueTrustedFkeyIndexId, true, NULL, 0, NULL);
+	dbblue_any_trusted = HeapTupleIsValid(systable_getnext(scan)) ? 1 : 0;
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+
+	return dbblue_any_trusted > 0;
+}
+
+/*
  * dbblue_fkey_set_trusted
  *		Record or remove a trust declaration.  Returns true if anything changed.
  */
@@ -175,6 +205,8 @@ dbblue_fkey_set_trusted(Oid conoid, Oid conrelid, const char *conname,
 
 		heap_freetuple(newtup);
 		changed = true;
+		/* a bypass later in this transaction must now be able to see it */
+		dbblue_any_trusted = 1;
 	}
 
 	systable_endscan(scan);
@@ -246,6 +278,7 @@ dbblue_untrust_at_xact_end(XactEvent event, void *arg)
 			/* still safe to write catalogs here */
 			dbblue_pending_untrust = NIL;
 			dbblue_bypass_seen = NIL;
+			dbblue_any_trusted = -1;
 			foreach(lc, pending)
 			{
 				if (dbblue_fkey_delete_row(lfirst_oid(lc)))
@@ -266,6 +299,7 @@ dbblue_untrust_at_xact_end(XactEvent event, void *arg)
 			/* nothing was written, so nothing to withdraw */
 			dbblue_pending_untrust = NIL;
 			dbblue_bypass_seen = NIL;
+			dbblue_any_trusted = -1;
 			break;
 		default:
 			break;
@@ -294,10 +328,17 @@ DbblueFkeyNoteBypass(Oid conoid)
 		return;
 
 	/*
-	 * One catalog lookup per constraint per transaction, no matter how many
-	 * rows go by.  Record the constraint as examined before deciding, so that
-	 * "not trusted" is remembered too -- that is the case a bulk load hits,
-	 * once per row per foreign key.
+	 * If nothing in this database is trusted there is nothing any bypass can
+	 * withdraw, so answer without looking at the constraint at all.  This is
+	 * the default state and the one a restore runs in.
+	 */
+	if (!dbblue_any_trust_declared())
+		return;
+
+	/*
+	 * Otherwise one catalog lookup per constraint per transaction, no matter
+	 * how many rows go by.  Record the constraint as examined before deciding,
+	 * so that "not trusted" is remembered too.
 	 */
 	if (list_member_oid(dbblue_bypass_seen, conoid))
 		return;
