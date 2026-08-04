@@ -18,15 +18,23 @@
 /*
  * A point-in-time reading of one relation's modification state.
  *
- * Two readings taken at different times compare equal only if no
- * transaction has written to the relation in between (and no slot
- * eviction has clouded the picture).  Equality is therefore a sound
+ * Two readings taken at different times compare equal only if no transaction
+ * has written to the relation in between.  Equality is therefore a sound
  * licence to reuse a row count captured at the earlier reading.
+ *
+ * slot_gen guards the case where the relation's slot was taken over by another
+ * relation in the meantime, which erases this relation's stamp back to the
+ * zero default and would otherwise make a written-since relation look
+ * untouched.  It is per-slot rather than global so that one collision
+ * invalidates only the relations that shared that slot, not every cached count
+ * in the cluster.  global_epoch remains for the rare cases that genuinely need
+ * a cluster-wide sweep (COMMIT PREPARED).
  */
 typedef struct DBBlueRelModStamp
 {
 	uint64		stamp;			/* per-relation monotonic write stamp */
-	uint64		evict_epoch;	/* global slot-eviction counter */
+	uint64		slot_gen;		/* generation of the slot it was read from */
+	uint64		global_epoch;	/* cluster-wide invalidation counter */
 } DBBlueRelModStamp;
 
 extern PGDLLIMPORT const ShmemCallbacks DBBlueRelModShmemCallbacks;
@@ -84,13 +92,16 @@ dbblue_relmod_stamp_equal(DBBlueRelModStamp a, DBBlueRelModStamp b)
 	/*
 	 * Compare unequal if either reading was taken with no shared state.  Field
 	 * equality alone would report two such readings as equal -- both are
-	 * {0, INVALID} -- and serve a count that nothing was tracking.
+	 * zeroed with an INVALID epoch -- and serve a count that nothing was
+	 * tracking.
 	 */
-	if (a.evict_epoch == DBBLUE_RELMOD_EPOCH_INVALID ||
-		b.evict_epoch == DBBLUE_RELMOD_EPOCH_INVALID)
+	if (a.global_epoch == DBBLUE_RELMOD_EPOCH_INVALID ||
+		b.global_epoch == DBBLUE_RELMOD_EPOCH_INVALID)
 		return false;
 
-	return a.stamp == b.stamp && a.evict_epoch == b.evict_epoch;
+	return a.stamp == b.stamp &&
+		a.slot_gen == b.slot_gen &&
+		a.global_epoch == b.global_epoch;
 }
 
 #endif							/* DBBLUE_RELMOD_H */

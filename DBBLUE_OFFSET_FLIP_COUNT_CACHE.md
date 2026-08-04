@@ -56,6 +56,7 @@ A qual is rejected outright (fingerprint 0 = uncacheable) when it contains:
 | `SubLink` / `SubPlan` | out of scope |
 | **any non-IMMUTABLE function** | see below |
 | a system catalog relation | catalog writes bypass the tracking hooks |
+| **a foreign table** | FDW writes bypass the tableam wrappers, and the remote side can change from outside this cluster entirely |
 | a partitioned table or inheritance parent | writes bump the child's stamp, not the parent's |
 
 The mutable-function rule uses `contain_mutable_functions()`, **not**
@@ -87,10 +88,8 @@ this backend or any other, has written to the relation since.
 
 Bumping on the abort path too is conservative and therefore safe.
 
-Slot collisions **steal** the slot and bump a global eviction epoch which is
-folded into every stamp reading. So a collision causes a spurious
-*invalidation*, never a spurious *validation* — the failure direction is always
-safe.
+Slot collisions **steal** the slot; see §2.2.0. In every collision case the
+failure direction is a spurious *invalidation*, never a spurious *validation*.
 
 Writes are hooked at the `tableam.h` wrappers (`table_tuple_insert`,
 `_insert_speculative`, `_multi_insert`, `_delete`, `_update`, and
@@ -98,7 +97,34 @@ non-transactional truncate) rather than in heapam, so every table AM is covered.
 A one-entry per-transaction memo means a bulk load pays a single comparison per
 row.
 
-### 2.2.1 The cache is inert during recovery
+### 2.2.1 Slot collisions are contained per-slot
+
+Each slot carries a **generation**, bumped when the slot changes owner, and a
+cached stamp records the generation it was read from. This is what distinguishes
+"never written" from "written, then displaced": a steal erases the displaced
+relation's stamp back to the zero default, which would otherwise make a relation
+that *has* been written look untouched.
+
+The generation is per-slot rather than global, and that distinction turned out to
+matter far more than the collision rate suggests. With a single global eviction
+counter, one unlucky pair of colliding relations dropped the **cluster-wide** hit
+rate to zero — every write to either relation invalidated every cached count
+everywhere. Measured, with one relation of 40 colliding with the counted one:
+
+```
+                                  global epoch    per-slot generation
+writes to 40 relations             0/10 served         10/10 served
+writes to 600 relations            0/10 served         10/10 served
+```
+
+Soundness is unchanged; only the blast radius shrinks. Verified adversarially:
+write to the counted relation, *then* let the colliding relation steal its slot,
+and the stale count is still correctly rejected.
+
+`global_epoch` remains for the one case that genuinely needs a cluster-wide
+sweep — COMMIT PREPARED (§2.3).
+
+### 2.2.2 The cache is inert during recovery
 
 **WAL redo does not go through the `tableam` wrappers**, so on a hot standby a
 relation changes with no stamp movement whatsoever. An entry cached there would
@@ -158,7 +184,8 @@ order over the ≤ L returned rows.
 
 | GUC | Default | Notes |
 |---|---|---|
-| `dbblue_count_cache` | `off` | Serves `count(*)` from cache. |
+| `dbblue_track_relation_writes` | `off` | **PGC_POSTMASTER.** Maintains the per-relation write stamps the cache validates against, and allocates their 128 kB of shared memory. With it off the write hook returns after a single branch, so a cluster that does not use the cache pays essentially nothing — but the cache then cannot operate at all, because every stamp reading comes back invalid. Cannot be per-session: a session with it off would not record its writes while another cached counts against them. |
+| `dbblue_count_cache` | `off` | Serves `count(*)` from cache. Requires the above. |
 | `dbblue_offset_flip` | `off` | The rewrite. Depends on the cache — with the cache off there is no `N`, so the flip cannot fire. |
 | `dbblue_count_cache_ttl` | `300s` | Memory hygiene, **not** a correctness mechanism. Staleness is prevented by the stamp check. A cache *hit* deliberately does not renew `captured_at`; otherwise a shape polled faster than the TTL would never age out. |
 
@@ -303,7 +330,7 @@ filter · `IS NOT NULL` · numeric comparison.
 
 Known limitations:
 
-1. **No benefit on hot standbys** — the cache is inert during recovery (§2.2.1).
+1. **No benefit on hot standbys** — the cache is inert during recovery (§2.2.2).
    This is the largest functional gap, because replicas are otherwise the ideal
    workload for it.
 2. **Unfiltered list views are never cached.** The gate requires
@@ -329,13 +356,11 @@ this is enabled anywhere real:
   verified by hand-run probes. Nothing in `make check` would catch a
   regression, and the failure mode is *silently wrong rows*. This is the
   biggest gap.
-- **Untested paths:** two-phase commit / prepared transactions, crash
-  recovery, `EXEC_BACKEND` shared-memory initialisation (Windows), and slot
-  collision behaviour under real multi-relation pressure. A collision bumps a
-  *global* epoch, so a busy multi-tenant instance may thrash toward a 0 % hit
-  rate — plausible but unmeasured.
-- **`PGC_POSTMASTER` master switch** so the write-path cost is genuinely zero
-  when the feature is off (§5.3).
+- **`EXEC_BACKEND` (Windows) is reviewed but untested.** The
+  `{request_fn, init_fn}` pattern matches what most core subsystems use
+  (`WalRcv`, `WalSnd`, `ApplyLauncher`, `ReplicationSlots`, `SlotSync`); only
+  subsystems needing extra per-backend work define `attach_fn`, which this does
+  not. Correct by construction, but never run on Windows.
 
 ---
 
@@ -390,7 +415,7 @@ See §6 item 2.
 Teach the heap (and other AM) redo handlers to call
 `dbblue_relmod_note_write()` for the relation being replayed, so a hot standby
 maintains stamps the same way a primary does. Then the `RecoveryInProgress()`
-guard in §2.2.1 can be lifted and replicas get the optimisation back.
+guard in §2.2.2 can be lifted and replicas get the optimisation back.
 
 Points needing care: redo has no relcache entry, only a `RelFileLocator`, so the
 relation OID must be recovered from it (or the stamp keyed on the locator
@@ -403,11 +428,34 @@ used on the primary.
 ## 8. Testing
 
 ```bash
-make check                                                # defaults (feature off)
-make check EXTRA_REGRESS_OPTS="--temp-config=on.conf"     # both GUCs forced on
+# defaults: everything off.  Asserts the answers are right with the cache inert.
+make check
+make -C src/test/isolation check
+
+# feature fully on.  on.conf must set all three, including the postmaster switch
+# -- a test cannot SET that one itself:
+#     dbblue_track_relation_writes = on
+#     dbblue_count_cache = on
+#     dbblue_offset_flip = on
+make check                     EXTRA_REGRESS_OPTS="--temp-config=on.conf"
+make -C src/test/isolation check EXTRA_REGRESS_OPTS="--temp-config=on.conf"
+
+# standby inertness, COMMIT PREPARED, promotion.  Sets its own config.
+make -C src/test/recovery check PROVE_TESTS="t/055_dbblue_countcache.pl"
+
+# foreign-table rejection (needs a working FDW, hence contrib)
+make -C contrib/postgres_fdw check
 ```
 
-where `on.conf` contains `dbblue_count_cache = on` and `dbblue_offset_flip = on`.
+Every check asserts on the **answer**, never on whether a query hit the cache.
+That makes the suites insensitive to concurrent activity and to slot eviction —
+a missed cache costs a recompute, not a failure — and it is why they pass with
+the feature both on and off rather than silently testing nothing in one mode.
+The trade-off is that they would catch a correctness regression but not a
+silent performance regression.
+
+Note TAP requires the Perl `IPC::Run` module (`--enable-tap-tests` fails
+without it).
 
 Observability: the serve and flip paths emit `DEBUG1` lines, so
 `log_min_messages = debug1` plus `grep dbblue` on the server log shows exactly

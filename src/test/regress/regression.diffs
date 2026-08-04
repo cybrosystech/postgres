@@ -1,6 +1,6 @@
 diff -U3 /home/cybrosys/dbblue-offset-flip/src/test/regress/expected/create_index.out /home/cybrosys/dbblue-offset-flip/src/test/regress/results/create_index.out
 --- /home/cybrosys/dbblue-offset-flip/src/test/regress/expected/create_index.out	2026-07-30 18:05:20.362517189 +0530
-+++ /home/cybrosys/dbblue-offset-flip/src/test/regress/results/create_index.out	2026-08-04 14:34:32.731363537 +0530
++++ /home/cybrosys/dbblue-offset-flip/src/test/regress/results/create_index.out	2026-08-04 15:10:34.285874808 +0530
 @@ -380,7 +380,7 @@
  SELECT count(*) FROM point_tbl WHERE f1 <@ polygon '(0,0),(0,100),(100,100),(50,50),(100,0),(0,0)';
   count 

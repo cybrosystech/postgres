@@ -58,13 +58,14 @@ typedef struct DBBlueRelModSlot
 {
 	Oid			reloid;
 	uint64		stamp;
+	uint64		generation;		/* bumped whenever this slot changes owner */
 } DBBlueRelModSlot;
 
 typedef struct DBBlueRelModShared
 {
 	slock_t		mutex;
 	uint64		next_stamp;		/* monotonic; values are never reused */
-	uint64		evict_epoch;	/* bumped whenever a slot is stolen */
+	uint64		global_epoch;	/* bumped only for cluster-wide sweeps */
 	DBBlueRelModSlot slots[DBBLUE_RELMOD_NSLOTS];
 } DBBlueRelModShared;
 
@@ -128,12 +129,13 @@ DBBlueRelModShmemInit(void *arg)
 	 * that remains true, which is the common read-only case.
 	 */
 	relmod->next_stamp = 1;
-	relmod->evict_epoch = 0;
+	relmod->global_epoch = 0;
 
 	for (i = 0; i < DBBLUE_RELMOD_NSLOTS; i++)
 	{
 		relmod->slots[i].reloid = InvalidOid;
 		relmod->slots[i].stamp = 0;
+		relmod->slots[i].generation = 0;
 	}
 }
 
@@ -159,14 +161,19 @@ relmod_bump(Oid reloid)
 	SpinLockAcquire(&relmod->mutex);
 
 	/*
-	 * Taking the slot from another relation makes that relation's history
-	 * unreadable, so advance the eviction epoch.  Every cached stamp carries
-	 * the epoch, so all outstanding counts are invalidated -- conservative,
-	 * but a steal is rare and the alternative would be unsound.
+	 * Taking the slot from another relation erases that relation's stamp back
+	 * to the zero default, which would make a relation that HAS been written
+	 * look untouched.  Advancing this slot's generation makes any cached stamp
+	 * previously read from it compare unequal.
+	 *
+	 * Per-slot, not global: a collision then invalidates only counts over
+	 * relations that shared this slot.  A global counter here was measured to
+	 * be far more damaging than the collision rate suggests -- one unlucky
+	 * pair of relations dropped the cluster-wide hit rate to zero.
 	 */
 	if (relmod->slots[idx].reloid != reloid &&
 		OidIsValid(relmod->slots[idx].reloid))
-		relmod->evict_epoch++;
+		relmod->slots[idx].generation++;
 
 	relmod->slots[idx].reloid = reloid;
 	relmod->slots[idx].stamp = ++relmod->next_stamp;
@@ -195,7 +202,7 @@ dbblue_relmod_invalidate_all(void)
 		return;
 
 	SpinLockAcquire(&relmod->mutex);
-	relmod->evict_epoch++;
+	relmod->global_epoch++;
 	SpinLockRelease(&relmod->mutex);
 }
 
@@ -206,24 +213,35 @@ dbblue_relmod_read(Oid reloid)
 	uint32		idx;
 
 	result.stamp = 0;
-	result.evict_epoch = 0;
+	result.slot_gen = 0;
+	result.global_epoch = 0;
 
 	if (relmod == NULL || !OidIsValid(reloid))
 	{
 		/*
-		 * No shared state (e.g. single-user bootstrap).  Return an epoch that
-		 * cannot match any real reading so nothing is ever served from cache.
+		 * No shared state: write tracking is off, or single-user bootstrap.
+		 * Return the sentinel epoch, which dbblue_relmod_stamp_equal() treats
+		 * as unequal to everything -- including another such reading -- so a
+		 * count captured while nothing was tracking is never served.
 		 */
-		result.evict_epoch = DBBLUE_RELMOD_EPOCH_INVALID;
+		result.global_epoch = DBBLUE_RELMOD_EPOCH_INVALID;
 		return result;
 	}
 
 	idx = relmod_slot_index(reloid);
 
 	SpinLockAcquire(&relmod->mutex);
+
+	/*
+	 * A slot holding a different relation leaves stamp at 0: this relation has
+	 * no recorded history here.  The slot generation still comes back, and it
+	 * is what distinguishes "never written" from "written, then displaced".
+	 */
 	if (relmod->slots[idx].reloid == reloid)
 		result.stamp = relmod->slots[idx].stamp;
-	result.evict_epoch = relmod->evict_epoch;
+	result.slot_gen = relmod->slots[idx].generation;
+	result.global_epoch = relmod->global_epoch;
+
 	SpinLockRelease(&relmod->mutex);
 
 	return result;
