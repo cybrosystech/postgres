@@ -143,6 +143,12 @@ test: event_trigger_login
 # this test also uses event triggers, so likewise run it by itself
 test: fast_default
 
+# DBblue COUNT cache / OFFSET-flip.  Asserts only on answers, never on whether
+# a given query hit the cache, so it is unaffected by concurrent activity (a
+# slot steal elsewhere may invalidate an entry, which only costs a recompute).
+# Run alone anyway so a failure here is unambiguous.
+test: dbblue_countcache
+
 # run tablespace test at the end because it drops the tablespace created during
 # setup that other tests may use.
 test: tablespace

@@ -104,6 +104,7 @@
 #include "storage/procarray.h"
 #include "storage/subsystems.h"
 #include "utils/builtins.h"
+#include "utils/dbblue_relmod.h"
 #include "utils/injection_point.h"
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
@@ -1574,6 +1575,17 @@ FinishPreparedTransaction(const char *gid, bool isCommit)
 	 * progress), then run the post-commit or post-abort callbacks. The
 	 * callbacks will release the locks the transaction held.
 	 */
+	/*
+	 * DBblue: the rows written by this prepared transaction become visible
+	 * below.  Its per-relation write stamps were bumped back at PREPARE time,
+	 * which is too early -- a count captured between PREPARE and here would
+	 * survive with an unchanged stamp and then be wrong.  The write set
+	 * belonged to the backend that ran PREPARE and is no longer available, so
+	 * invalidate every cached count.  Must precede the commit record so that
+	 * any backend able to see the new rows also sees the new epoch.
+	 */
+	dbblue_relmod_invalidate_all();
+
 	if (isCommit)
 		RecordTransactionCommitPrepared(xid,
 										hdr->nsubxacts, children,

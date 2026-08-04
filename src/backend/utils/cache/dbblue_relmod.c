@@ -157,6 +157,31 @@ relmod_bump(Oid reloid)
 	SpinLockRelease(&relmod->mutex);
 }
 
+/*
+ * Invalidate every cached count in every backend, by advancing the eviction
+ * epoch that each cached stamp carries.
+ *
+ * Used where a set of rows becomes visible but the relations involved are not
+ * knowable from the current backend's write set -- specifically COMMIT/ROLLBACK
+ * PREPARED, where the write set belonged to the transaction that ran PREPARE
+ * and is long gone.  Bumping per-relation stamps at PREPARE time is not enough:
+ * the rows only become visible at COMMIT PREPARED, so a count captured in
+ * between would otherwise survive with an unchanged stamp.
+ *
+ * A cluster-wide invalidation is heavy-handed, but two-phase commit is rare and
+ * the alternative is a wrong answer.
+ */
+void
+dbblue_relmod_invalidate_all(void)
+{
+	if (relmod == NULL)
+		return;
+
+	SpinLockAcquire(&relmod->mutex);
+	relmod->evict_epoch++;
+	SpinLockRelease(&relmod->mutex);
+}
+
 DBBlueRelModStamp
 dbblue_relmod_read(Oid reloid)
 {

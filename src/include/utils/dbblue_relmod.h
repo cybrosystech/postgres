@@ -60,6 +60,13 @@ extern bool dbblue_relmod_xact_wrote(Oid reloid);
 /* Read the current modification stamp for reloid. */
 extern DBBlueRelModStamp dbblue_relmod_read(Oid reloid);
 
+/*
+ * Invalidate all cached counts cluster-wide.  For paths where rows become
+ * visible but the affected relations are not knowable from this backend's
+ * write set -- COMMIT/ROLLBACK PREPARED.
+ */
+extern void dbblue_relmod_invalidate_all(void);
+
 static inline bool
 dbblue_relmod_stamp_equal(DBBlueRelModStamp a, DBBlueRelModStamp b)
 {
