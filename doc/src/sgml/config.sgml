@@ -10666,6 +10666,45 @@ COPY postgres_log FROM '/full/path/to/logfile.csv' WITH csv;
       </listitem>
      </varlistentry>
 
+     <varlistentry id="guc-dbblue-matview-skip-unchanged" xreflabel="dbblue_matview_skip_unchanged">
+      <term><varname>dbblue_matview_skip_unchanged</varname> (<type>boolean</type>)
+      <indexterm>
+       <primary><varname>dbblue_matview_skip_unchanged</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Allows <link linkend="sql-refreshmaterializedview"><command>REFRESH
+        MATERIALIZED VIEW</command></link> to return without rebuilding when
+        nothing the materialized view depends on has changed.  The default is
+        <literal>on</literal>, but the behavior applies only to materialized
+        views defined with the
+        <link linkend="reloption-auto-skip-unchanged"><literal>auto_skip_unchanged</literal></link>
+        storage parameter set, so turning it on changes nothing by itself.
+        Setting it to <literal>off</literal> makes every
+        <command>REFRESH</command> rebuild unconditionally, regardless of that
+        storage parameter.
+       </para>
+       <para>
+        The intended use of <literal>off</literal> is as a cluster-wide switch:
+        it restores the standard behavior without having to locate and alter
+        every materialized view that opts in, which is useful when comparing
+        results or when isolating a problem.
+       </para>
+       <para>
+        A materialized view is considered unchanged only when its defining
+        query can be proven to be a function of a fully enumerated set of
+        ordinary tables, and every one of those tables is observably unchanged
+        since that view's own last successful refresh.  Whenever this cannot be
+        proven the rebuild is performed, so the setting can affect how long a
+        <command>REFRESH</command> takes but not what it produces.  The
+        conditions under which the rebuild always happens are listed with the
+        <link linkend="reloption-auto-skip-unchanged"><literal>auto_skip_unchanged</literal></link>
+        storage parameter.
+       </para>
+      </listitem>
+     </varlistentry>
+
      <varlistentry id="guc-default-transaction-isolation" xreflabel="default_transaction_isolation">
       <term><varname>default_transaction_isolation</varname> (<type>enum</type>)
       <indexterm>

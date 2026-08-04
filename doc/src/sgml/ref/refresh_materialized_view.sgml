@@ -44,6 +44,15 @@ REFRESH MATERIALIZED VIEW [ CONCURRENTLY ] <replaceable class="parameter">name</
    <literal>CONCURRENTLY</literal> and <literal>WITH NO DATA</literal> may not
    be specified together.
   </para>
+  <para>
+   If the materialized view was defined with the
+   <link linkend="reloption-auto-skip-unchanged"><literal>auto_skip_unchanged</literal></link>
+   storage parameter, the contents are left alone and the command returns
+   immediately whenever nothing the view depends on has changed since its last
+   successful refresh.  The command still reports success, and still takes the
+   same lock.  When that cannot be proven the view is rebuilt as usual, so the
+   parameter affects only how long the command takes, never its result.
+  </para>
  </refsect1>
 
  <refsect1>

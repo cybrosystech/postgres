@@ -647,6 +647,13 @@
   boot_val => 'true',
 },
 
+{ name => 'dbblue_matview_skip_unchanged', type => 'bool', context => 'PGC_SUSET', group => 'CLIENT_CONN_STATEMENT',
+  short_desc => 'Allows REFRESH MATERIALIZED VIEW to skip the rebuild when nothing the matview depends on has changed.',
+  long_desc => 'Only affects materialized views defined with auto_skip_unchanged=true. Turning this off makes every REFRESH rebuild unconditionally.',
+  variable => 'dbblue_matview_skip_unchanged',
+  boot_val => 'true',
+},
+
 { name => 'dbblue_offset_flip', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
   short_desc => 'Enables the DBblue OFFSET-flip planner rewrite (requires dbblue_count_cache).',
   flags => 'GUC_EXPLAIN',

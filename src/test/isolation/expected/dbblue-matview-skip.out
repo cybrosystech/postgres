@@ -1,0 +1,90 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s2_dirty s1_begin s1_refresh s2_during s1_commit s3_refresh s3_check
+step s2_dirty: INSERT INTO mvsi_src VALUES (901);
+step s1_begin: BEGIN;
+s1: DEBUG:  matview "mvsi_mv": not skipped: a source was written
+step s1_refresh: REFRESH MATERIALIZED VIEW mvsi_mv;
+step s2_during: INSERT INTO mvsi_src VALUES (902);
+step s1_commit: COMMIT;
+s3: DEBUG:  matview "mvsi_mv": not skipped: a source was written
+step s3_refresh: REFRESH MATERIALIZED VIEW mvsi_mv;
+step s3_check: SELECT c AS matview, (SELECT count(*) FROM mvsi_src) AS truth FROM mvsi_mv;
+matview|truth
+-------+-----
+     12|   12
+(1 row)
+
+
+starting permutation: s2_dirty s2_during s1_begin s1_refresh s1_commit s3_refresh s3_check
+step s2_dirty: INSERT INTO mvsi_src VALUES (901);
+step s2_during: INSERT INTO mvsi_src VALUES (902);
+step s1_begin: BEGIN;
+s1: DEBUG:  matview "mvsi_mv": not skipped: no watermark from an earlier refresh
+step s1_refresh: REFRESH MATERIALIZED VIEW mvsi_mv;
+step s1_commit: COMMIT;
+s3: DEBUG:  matview "mvsi_mv": skipped, nothing it depends on has changed
+step s3_refresh: REFRESH MATERIALIZED VIEW mvsi_mv;
+step s3_check: SELECT c AS matview, (SELECT count(*) FROM mvsi_src) AS truth FROM mvsi_mv;
+matview|truth
+-------+-----
+     12|   12
+(1 row)
+
+
+starting permutation: s2_begin s2_uncommitted s3_refresh s2_commit s3_refresh s3_check
+step s2_begin: BEGIN;
+step s2_uncommitted: INSERT INTO mvsi_src VALUES (903);
+s3: DEBUG:  matview "mvsi_mv": not skipped: a writer holds source "mvsi_src"
+step s3_refresh: REFRESH MATERIALIZED VIEW mvsi_mv;
+step s2_commit: COMMIT;
+s3: DEBUG:  matview "mvsi_mv": not skipped: no watermark from an earlier refresh
+step s3_refresh: REFRESH MATERIALIZED VIEW mvsi_mv;
+step s3_check: SELECT c AS matview, (SELECT count(*) FROM mvsi_src) AS truth FROM mvsi_mv;
+matview|truth
+-------+-----
+     11|   11
+(1 row)
+
+
+starting permutation: s2_dirty s1_begin s1_refresh s1_rollback s3_refresh s3_check
+step s2_dirty: INSERT INTO mvsi_src VALUES (901);
+step s1_begin: BEGIN;
+s1: DEBUG:  matview "mvsi_mv": not skipped: no watermark from an earlier refresh
+step s1_refresh: REFRESH MATERIALIZED VIEW mvsi_mv;
+step s1_rollback: ROLLBACK;
+s3: DEBUG:  matview "mvsi_mv": not skipped: the matview's own storage changed since its watermark was written
+step s3_refresh: REFRESH MATERIALIZED VIEW mvsi_mv;
+step s3_check: SELECT c AS matview, (SELECT count(*) FROM mvsi_src) AS truth FROM mvsi_mv;
+matview|truth
+-------+-----
+     11|   11
+(1 row)
+
+
+starting permutation: s2_hold_b s1_detach s3_refresh_p s3_check_p s2_release s3_refresh_p s3_check_p
+step s2_hold_b: BEGIN; SELECT count(*) FROM mvsi_part_b;
+count
+-----
+   20
+(1 row)
+
+step s1_detach: ALTER TABLE mvsi_part DETACH PARTITION mvsi_part_b CONCURRENTLY; <waiting ...>
+s3: DEBUG:  matview "mvsi_mvpart": not skipped: a DETACH PARTITION CONCURRENTLY is in flight
+step s3_refresh_p: REFRESH MATERIALIZED VIEW mvsi_mvpart;
+step s3_check_p: SELECT c AS matview, (SELECT count(*) FROM mvsi_part) AS truth FROM mvsi_mvpart;
+matview|truth
+-------+-----
+     20|   20
+(1 row)
+
+step s2_release: COMMIT;
+step s1_detach: <... completed>
+s3: DEBUG:  matview "mvsi_mvpart": not skipped: no watermark from an earlier refresh
+step s3_refresh_p: REFRESH MATERIALIZED VIEW mvsi_mvpart;
+step s3_check_p: SELECT c AS matview, (SELECT count(*) FROM mvsi_part) AS truth FROM mvsi_mvpart;
+matview|truth
+-------+-----
+     20|   20
+(1 row)
+

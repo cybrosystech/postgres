@@ -152,6 +152,12 @@ test: dbblue_fk_join_reduction
 # Run alone anyway so a failure here is unambiguous.
 test: dbblue_countcache
 
+# DBblue: REFRESH MATERIALIZED VIEW skip-if-unchanged.  Asserts on the DEBUG1
+# decision line as well as on answers, so run it by itself: concurrent activity
+# elsewhere cannot change the decision for these tables, but running alone keeps
+# a failure unambiguous.  Self-contained, mvs_* objects.
+test: dbblue_matview_skip
+
 # run tablespace test at the end because it drops the tablespace created during
 # setup that other tests may use.
 test: tablespace
