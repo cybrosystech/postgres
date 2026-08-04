@@ -60,6 +60,7 @@
 #include "tcop/utility.h"
 #include "utils/acl.h"
 #include "utils/backend_status.h"
+#include "utils/dbblue_countcache.h"
 #include "utils/lsyscache.h"
 #include "utils/partcache.h"
 #include "utils/rls.h"
@@ -322,6 +323,7 @@ standard_ExecutorRun(QueryDesc *queryDesc,
 	CmdType		operation;
 	DestReceiver *dest;
 	bool		sendTuples;
+	bool		dbblue_capture_installed;
 	MemoryContext oldcontext;
 
 	/* sanity checks */
@@ -345,6 +347,14 @@ standard_ExecutorRun(QueryDesc *queryDesc,
 		InstrStart(queryDesc->query_instr);
 
 	/*
+	 * DBblue: if this is a candidate COUNT shape, install a DestReceiver
+	 * wrapper that intercepts the single result tuple and records it in
+	 * the session COUNT cache.  Must happen before we capture
+	 * queryDesc->dest into the local 'dest' below.
+	 */
+	dbblue_capture_installed = dbblue_count_capture_install(queryDesc);
+
+	/*
 	 * extract information from the query descriptor and the query feature.
 	 */
 	operation = queryDesc->operation;
@@ -360,6 +370,15 @@ standard_ExecutorRun(QueryDesc *queryDesc,
 
 	if (sendTuples)
 		dest->rStartup(dest, operation, queryDesc->tupDesc);
+
+	/*
+	 * DBblue: if this is a cached COUNT and the wrapper is installed,
+	 * inject the cached value and skip the full table scan.
+	 */
+	if (dbblue_capture_installed &&
+		!ScanDirectionIsNoMovement(direction) &&
+		dbblue_count_serve_if_cached(queryDesc))
+		goto dbblue_skip_execute;
 
 	/*
 	 * Run plan, unless direction is NoMovement.
@@ -381,6 +400,7 @@ standard_ExecutorRun(QueryDesc *queryDesc,
 					direction,
 					dest);
 
+dbblue_skip_execute:
 	/*
 	 * Update es_total_processed to keep track of the number of tuples
 	 * processed across multiple ExecutorRun() calls.
@@ -392,6 +412,14 @@ standard_ExecutorRun(QueryDesc *queryDesc,
 	 */
 	if (sendTuples)
 		dest->rShutdown(dest);
+
+	/*
+	 * DBblue: unwrap the capture DestReceiver and free it.  rShutdown
+	 * above already performed the cache insert through the wrapper;
+	 * this just restores queryDesc->dest for any post-run consumer.
+	 */
+	if (dbblue_capture_installed)
+		dbblue_count_capture_finalize(queryDesc);
 
 	if (queryDesc->query_instr)
 		InstrStop(queryDesc->query_instr);

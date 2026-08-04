@@ -76,6 +76,7 @@ PG_SHMEM_SUBSYSTEM(SlotSyncShmemCallbacks)
 /* other modules that need some shared memory space */
 PG_SHMEM_SUBSYSTEM(BTreeShmemCallbacks)
 PG_SHMEM_SUBSYSTEM(SyncScanShmemCallbacks)
+PG_SHMEM_SUBSYSTEM(DBBlueRelModShmemCallbacks)
 PG_SHMEM_SUBSYSTEM(AsyncShmemCallbacks)
 PG_SHMEM_SUBSYSTEM(StatsShmemCallbacks)
 PG_SHMEM_SUBSYSTEM(WaitEventCustomShmemCallbacks)

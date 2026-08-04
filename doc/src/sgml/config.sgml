@@ -5874,6 +5874,115 @@ ANY <replaceable class="parameter">num_sync</replaceable> ( <replaceable class="
       </listitem>
      </varlistentry>
 
+     <varlistentry id="guc-dbblue-count-cache" xreflabel="dbblue_count_cache">
+      <term><varname>dbblue_count_cache</varname> (<type>boolean</type>)
+      <indexterm>
+       <primary><varname>dbblue_count_cache</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Enables or disables serving an exact <literal>count(*)</literal> from a
+        session-local cache instead of scanning the table. The default is
+        <literal>off</literal>. It has no effect unless <xref
+        linkend="guc-dbblue-track-relation-writes"/> is also enabled, since
+        without the write stamps a cached count can never be shown to still be
+        valid.
+       </para>
+       <para>
+        An entry is keyed on the relation and on the literal values of the
+        query's <literal>WHERE</literal> clause, and is reused only while the
+        relation demonstrably has not been written to by any session. It is
+        aimed at applications that ask for a total row count and then page
+        through the rows, as object-relational mappers do when rendering a
+        list view with a pager.
+       </para>
+       <para>
+        Counts are cached only for a single ordinary table with a
+        <literal>WHERE</literal> clause containing no parameters, subqueries, or
+        functions that are not <literal>IMMUTABLE</literal>. Counts over system
+        catalogs, foreign tables, partitioned tables and inheritance parents are
+        never cached. The cache is also inert during recovery, so a standby
+        never serves one.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry id="guc-dbblue-count-cache-ttl" xreflabel="dbblue_count_cache_ttl">
+      <term><varname>dbblue_count_cache_ttl</varname> (<type>integer</type>)
+      <indexterm>
+       <primary><varname>dbblue_count_cache_ttl</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        How long an unused entry may occupy a slot in the
+        <xref linkend="guc-dbblue-count-cache"/>. If this value is specified
+        without units, it is taken as seconds. The default is 300 seconds
+        (5 minutes).
+       </para>
+       <para>
+        This is a memory-hygiene setting, not a correctness one: a cached count
+        is never served once the relation has been written to, however recently
+        it was captured. Lowering it releases slots sooner; raising it does not
+        increase the risk of a stale answer.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry id="guc-dbblue-offset-flip" xreflabel="dbblue_offset_flip">
+      <term><varname>dbblue_offset_flip</varname> (<type>boolean</type>)
+      <indexterm>
+       <primary><varname>dbblue_offset_flip</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Enables or disables rewriting a query with a large
+        <literal>OFFSET</literal> so that the rows are reached from the nearer
+        end of the ordering. The default is <literal>off</literal>.
+       </para>
+       <para>
+        Given a total row count <replaceable>N</replaceable>, a request for
+        <literal>OFFSET <replaceable>K</replaceable> LIMIT
+        <replaceable>L</replaceable></literal> can be answered by scanning in
+        the opposite order with <literal>OFFSET
+        (<replaceable>N</replaceable>-<replaceable>K</replaceable>-<replaceable>L</replaceable>)</literal>
+        and restoring the requested order afterwards, which for a
+        <replaceable>K</replaceable> close to <replaceable>N</replaceable> skips
+        far fewer rows. The rewrite is applied only when
+        <replaceable>K</replaceable> is past the halfway point, and only when
+        <replaceable>N</replaceable> is available from the
+        <xref linkend="guc-dbblue-count-cache"/> &mdash; so this setting has no
+        effect unless that cache is enabled and holds a valid entry for the same
+        relation and <literal>WHERE</literal> clause.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry id="guc-dbblue-track-relation-writes" xreflabel="dbblue_track_relation_writes">
+      <term><varname>dbblue_track_relation_writes</varname> (<type>boolean</type>)
+      <indexterm>
+       <primary><varname>dbblue_track_relation_writes</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Maintains a per-relation write stamp in shared memory, recording that a
+        relation has been modified. The default is <literal>off</literal>. This
+        parameter can only be set at server start.
+       </para>
+       <para>
+        <xref linkend="guc-dbblue-count-cache"/> requires these stamps to tell
+        whether a cached count is still valid, and does not serve any count
+        while this is disabled. It is separate so that a server which does not
+        use the cache pays nothing on the write path, and it cannot be changed
+        per session: a session with it off would not record its own writes,
+        while another session was relying on those records.
+       </para>
+      </listitem>
+     </varlistentry>
+
      <varlistentry id="guc-enable-async-append" xreflabel="enable_async_append">
       <term><varname>enable_async_append</varname> (<type>boolean</type>)
       <indexterm>
