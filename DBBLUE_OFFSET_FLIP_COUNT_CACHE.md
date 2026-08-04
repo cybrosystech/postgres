@@ -347,20 +347,32 @@ Known limitations:
 5. **Write-hot tables** get no benefit (§5.4).
 6. **Write-path cost is unconditional** (§5.3).
 
-### 6.1 Not production ready
+### 6.1 Readiness
 
-The core is well validated on a primary, but the following should land before
-this is enabled anywhere real:
+Correctness is well covered: five distinct staleness defects were found and
+fixed, each with a regression test, and the suites run green with the feature
+both on and off and under `EXEC_BACKEND`.  Remaining caveats:
 
 - **No committed regression tests.** Every correctness vector in §4.2 was
   verified by hand-run probes. Nothing in `make check` would catch a
   regression, and the failure mode is *silently wrong rows*. This is the
   biggest gap.
-- **`EXEC_BACKEND` (Windows) is reviewed but untested.** The
-  `{request_fn, init_fn}` pattern matches what most core subsystems use
-  (`WalRcv`, `WalSnd`, `ApplyLauncher`, `ReplicationSlots`, `SlotSync`); only
-  subsystems needing extra per-backend work define `attach_fn`, which this does
-  not. Correct by construction, but never run on Windows.
+- **`EXEC_BACKEND` is verified on Linux, not on Windows itself.** The whole
+  suite was run with `EXEC_BACKEND` forced on in `pg_config_manual.h`, which is
+  what PostgreSQL provides it for — "on other platforms, it's only useful for
+  verifying those otherwise Windows-specific code paths". Under fork+exec the
+  shared area re-attaches in children, the `PGC_POSTMASTER` GUC survives exec,
+  and cross-backend invalidation still works: regress 245/246 (the known
+  geometric case), isolation 131/131, recovery TAP 9/9. What remains untested is
+  genuinely platform-specific — paths, semaphores, sockets — none of which this
+  feature touches.
+
+- **`pg_upgrade` is not a risk for this feature.** It adds no catalog changes at
+  all: nothing under `src/include/catalog/`, `catversion.h` untouched, no new
+  `pg_proc` entries or system tables. Its settings live in `postgresql.conf`, so
+  there is nothing for `pg_upgrade` to migrate. Features that *do* change the
+  catalog need that checked against the combined catalog on the integration
+  branch, not per-feature.
 
 ---
 
