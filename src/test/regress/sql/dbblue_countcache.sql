@@ -156,6 +156,35 @@ INSERT INTO dbb_part_1 SELECT g, g FROM generate_series(50, 59) g;
 SELECT count(*) AS after_leaf_insert FROM dbb_part WHERE id > 0;
 
 --
+-- Paths where rows change without any tableam tuple write happening on the
+-- relation being counted.  These are covered by the relcache callback rather
+-- than by write stamps, so they get their own checks.
+--
+-- REFRESH MATERIALIZED VIEW swaps in a whole new relfilenode.
+CREATE TABLE dbb_mvsrc (id int);
+INSERT INTO dbb_mvsrc SELECT generate_series(1, 100);
+CREATE MATERIALIZED VIEW dbb_mv AS SELECT id FROM dbb_mvsrc;
+SELECT count(*) FROM dbb_mv WHERE id > 0;
+INSERT INTO dbb_mvsrc SELECT generate_series(101, 150);
+REFRESH MATERIALIZED VIEW dbb_mv;
+SELECT count(*) AS after_refresh FROM dbb_mv WHERE id > 0;
+
+-- A rewrite that changes how the predicate evaluates.  numeric 50.6 satisfies
+-- "> 50.5"; after rounding to int it still does, but the rewrite must not let a
+-- pre-rewrite count survive regardless.
+CREATE TABLE dbb_alt (id int, v numeric);
+INSERT INTO dbb_alt SELECT g, g + 0.6 FROM generate_series(1, 100) g;
+SELECT count(*) FROM dbb_alt WHERE v > 50.5;
+ALTER TABLE dbb_alt ALTER COLUMN v TYPE int;
+SELECT count(*) AS after_type_change FROM dbb_alt WHERE v > 50.5;
+
+-- VACUUM FULL rewrites the heap; the count must reflect the preceding DELETE.
+SELECT count(*) FROM dbb_alt WHERE id > 0;
+DELETE FROM dbb_alt WHERE id > 60;
+VACUUM FULL dbb_alt;
+SELECT count(*) AS after_vacuum_full FROM dbb_alt WHERE id > 0;
+
+--
 -- The GUCs must be independently controllable, and the flip must be inert
 -- without the cache to supply N.
 --
@@ -166,5 +195,6 @@ SELECT id FROM dbb_pg WHERE id > 0 ORDER BY id LIMIT 5 OFFSET 180;
 RESET dbblue_count_cache;
 RESET dbblue_offset_flip;
 
-DROP TABLE dbb_pg, dbb_cc, dbb_cc_tr, dbb_cc_own, dbb_part;
+DROP MATERIALIZED VIEW dbb_mv;
+DROP TABLE dbb_pg, dbb_cc, dbb_cc_tr, dbb_cc_own, dbb_part, dbb_mvsrc, dbb_alt;
 DROP ROLE regress_dbb_alice, regress_dbb_bob;

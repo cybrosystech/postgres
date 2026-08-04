@@ -96,6 +96,20 @@ dbblue_predicate_fingerprint(Oid reloid, Node *quals)
 		has_subclass(reloid))
 		return INT64CONST(0);
 
+	/*
+	 * A foreign table's rows do not live here.  Writes go through the FDW
+	 * rather than the tableam wrappers, so no stamp ever moves -- and the
+	 * remote side can be changed by something outside this cluster entirely,
+	 * which no amount of local tracking could observe.
+	 *
+	 * Aggregate pushdown hides this most of the time: the plan root becomes a
+	 * ForeignScan rather than an Agg, and the shape gate declines it for that
+	 * reason.  But a qual the FDW cannot ship -- a plpgsql function, say --
+	 * keeps the Agg local, and then the count is captured and served stale.
+	 */
+	if (get_rel_relkind(reloid) == RELKIND_FOREIGN_TABLE)
+		return INT64CONST(0);
+
 	(void) predicate_cacheability_walker(quals, &ctx);
 	if (ctx.rejected)
 		return INT64CONST(0);
