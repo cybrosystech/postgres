@@ -337,6 +337,40 @@ operation.**
 
 ---
 
+## 5a. Cost on the write path
+
+The withdrawal hook runs only where PostgreSQL *skips* a referential-integrity
+trigger. Ordinary DML never skips one, so it pays nothing:
+
+| Path | Untrusted | Trusted |
+|---|---|---|
+| normal INSERT, 50k rows, 4 FKs | 252 ms | 242 ms (noise) |
+| bulk load in replica mode, 200k rows, 4 FKs | 285 ms | 294 ms |
+
+The bulk-load figures are *after* commit `63a1b3f0900`. Before it, the same
+load took **1054 ms** untrusted: the "nothing to withdraw" answer was
+recomputed per row per foreign key rather than remembered, which is exactly the
+answer a restore gets. That cost also fell on databases that had never trusted
+anything, and on servers with the optimization switched off, because the hook
+does not consult the GUC. This was found by bulk-loading, not by any test.
+
+## 5b. Dump and restore
+
+`pg_dbblue_trusted_fkey` is a system catalog, so `pg_dump` does not carry trust
+declarations into a restored database — verified: zero references in a dump.
+
+**This is the correct behaviour, and deliberate.** A restored database is one
+whose rows arrived without those triggers being consulted (`pg_restore` adds
+constraints after loading data, and `--disable-triggers` runs in replica mode).
+Trust must therefore be re-earned by scanning the restored data:
+
+```sql
+SELECT * FROM dbblue_trust_foreign_keys();
+```
+
+Adding a foreign key over violating data still fails correctly during a restore
+— that path is protected by the guard in §4.1.
+
 ## 6. Usage
 
 ### Enabling
@@ -419,3 +453,47 @@ Always confirm a negative test can actually fail.
   where referential integrity is bypassed and not renewed, rows will be hidden.
 - **The pager count is deliberately unaffected** — see §4.4. Reducing there was
   a regression, not a missed opportunity.
+
+---
+
+## 9. Production readiness
+
+**Not production ready. Ready for controlled testing on non-critical systems.**
+
+### Verified
+
+- 246/246 regression tests, including all five defects in §4
+- adversarial audit: 15 findings triaged, 5 real defects fixed
+- real Odoo database, 2093 MB: 3510 foreign keys verified in 5.2 s, correct
+  results on every query measured, 427× on Odoo's own generated SQL
+- acceptance on a cluster built from scratch: 10/10, and inert until trusted
+- write path: zero cost on ordinary DML, bounded cost on bulk loads (§5a)
+- dump/restore: trust correctly does not carry over (§5b)
+
+### Not yet verified
+
+| Gap | Why it matters |
+|---|---|
+| **Concurrency soak** | No sustained multi-user run. Withdrawal writes a catalog row at commit; concurrent bypasses across sessions are unexercised. |
+| **`pg_upgrade`** | New catalog and a bumped catversion; the upgrade path is untested. |
+| **Crash recovery** | Trust rows are ordinary catalog rows and so are WAL-logged, but recovery has not been exercised. |
+| **Logical replication end to end** | A subscriber applies in replica mode, so withdrawal *should* fire on first apply. Reasoned, not observed. |
+| **Sustained real workload** | Nothing has run for longer than a benchmark. |
+
+### The honest signal
+
+Two of the five defects in §4 were found only by measuring against a real
+database, and the write-path regression in §5a was found only by bulk loading.
+Every time this has met a genuinely new workload, that workload has found
+something. That is the argument for more real-workload testing before
+production, not for confidence.
+
+### Suggested order
+
+1. Restore a real Odoo dump onto this binary — exercises constraint creation,
+   validation, and the `--disable-triggers` path in one go.
+2. `SELECT * FROM dbblue_trust_foreign_keys();` and check for refusals.
+3. Run a real Odoo workload against it, with `log_min_duration_statement` set,
+   and compare the log with trust granted and withdrawn.
+4. A concurrency soak with writers, readers, and a bypass window.
+5. `pg_upgrade` from a stock PostgreSQL 19 cluster.
