@@ -469,12 +469,19 @@ Always confirm a negative test can actually fail.
 - acceptance on a cluster built from scratch: 10/10, and inert until trusted
 - write path: zero cost on ordinary DML, bounded cost on bulk loads (§5a)
 - dump/restore: trust correctly does not carry over (§5b)
+- **concurrency soak, 300 s**: 3 writers doing ordinary DML, 2 readers running
+  the accelerated shape, repeated bypass windows creating real orphans, and
+  trust being re-earned throughout. **16,928 checks of the identity
+  `LEFT JOIN rows == INNER JOIN rows + orphan rows`, zero violations, zero
+  errors.** The first attempt at this recorded *zero* checks because a parsing
+  bug silently emptied the counts, so the script now refuses to report a pass
+  under 20 checks and also reports the maximum orphan count observed — a run
+  that never sees an orphan never enters the state that matters.
 
 ### Not yet verified
 
 | Gap | Why it matters |
 |---|---|
-| **Concurrency soak** | No sustained multi-user run. Withdrawal writes a catalog row at commit; concurrent bypasses across sessions are unexercised. |
 | **`pg_upgrade`** | New catalog and a bumped catversion; the upgrade path is untested. |
 | **Crash recovery** | Trust rows are ordinary catalog rows and so are WAL-logged, but recovery has not been exercised. |
 | **Logical replication end to end** | A subscriber applies in replica mode, so withdrawal *should* fire on first apply. Reasoned, not observed. |
