@@ -97,6 +97,7 @@
 #include "storage/lmgr.h"
 #include "storage/shmem.h"
 #include "storage/spin.h"
+#include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
@@ -157,9 +158,23 @@ static bool callback_registered = false;
 typedef struct CollectCtx
 {
 	bool		unproven;
+	const char *reason;			/* why, for DEBUG1; first one set wins */
 	int			nsources;
 	Oid			relid[MATVIEW_SKIP_MAX_SOURCES];
 } CollectCtx;
+
+/*
+ * Mark the source set unproven and remember why.  The reason exists so that
+ * "this matview never skips and I cannot tell why" is answerable, and so that
+ * the regression tests can assert which path was taken rather than only that
+ * the answer was right.
+ */
+#define UNPROVEN(ctx, why) \
+	do { \
+		(ctx)->unproven = true; \
+		if ((ctx)->reason == NULL) \
+			(ctx)->reason = (why); \
+	} while (0)
 
 static void MatviewDirtyShmemRequest(void *arg);
 static void MatviewDirtyShmemInit(void *arg);
@@ -418,6 +433,20 @@ MatviewDirtyRegisterCallback(void)
  * Enumeration of source relations
  * ----------
  */
+/* For canonicalising the collected source set; see collect_sources(). */
+static int
+oid_ascending(const void *a, const void *b)
+{
+	Oid			x = *(const Oid *) a;
+	Oid			y = *(const Oid *) b;
+
+	if (x < y)
+		return -1;
+	if (x > y)
+		return 1;
+	return 0;
+}
+
 static void
 add_source(CollectCtx *ctx, Oid relid)
 {
@@ -430,7 +459,7 @@ add_source(CollectCtx *ctx, Oid relid)
 	}
 	if (ctx->nsources >= MATVIEW_SKIP_MAX_SOURCES)
 	{
-		ctx->unproven = true;
+		UNPROVEN(ctx, "more source relations than can be tracked");
 		return;
 	}
 	ctx->relid[ctx->nsources++] = relid;
@@ -486,14 +515,14 @@ collect_relation(CollectCtx *ctx, Oid relid)
 	 */
 	if (relid < FirstNormalObjectId)
 	{
-		ctx->unproven = true;
+		UNPROVEN(ctx, "source is a system catalog");
 		return;
 	}
 
 	tup = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
 	if (!HeapTupleIsValid(tup))
 	{
-		ctx->unproven = true;
+		UNPROVEN(ctx, "source relation vanished");
 		return;
 	}
 	classform = (Form_pg_class) GETSTRUCT(tup);
@@ -509,13 +538,13 @@ collect_relation(CollectCtx *ctx, Oid relid)
 	 */
 	if (rls)
 	{
-		ctx->unproven = true;
+		UNPROVEN(ctx, "source has row-level security enabled");
 		return;
 	}
 
 	if (relpersistence == RELPERSISTENCE_TEMP)
 	{
-		ctx->unproven = true;
+		UNPROVEN(ctx, "source is a temporary relation");
 		return;
 	}
 
@@ -534,7 +563,7 @@ collect_relation(CollectCtx *ctx, Oid relid)
 													  &detached, NULL);
 		if (detached)
 		{
-			ctx->unproven = true;
+			UNPROVEN(ctx, "a DETACH PARTITION CONCURRENTLY is in flight");
 			list_free(children);
 			return;
 		}
@@ -562,7 +591,7 @@ collect_relation(CollectCtx *ctx, Oid relid)
 	 */
 	if (relkind != RELKIND_RELATION && relkind != RELKIND_MATVIEW)
 	{
-		ctx->unproven = true;
+		UNPROVEN(ctx, "source is not an ordinary table or materialized view");
 		return;
 	}
 
@@ -574,13 +603,13 @@ collect_relation(CollectCtx *ctx, Oid relid)
 	 */
 	if (relam != HEAP_TABLE_AM_OID)
 	{
-		ctx->unproven = true;
+		UNPROVEN(ctx, "source does not use the heap access method");
 		return;
 	}
 
 	if (has_virtual_generated_column(relid))
 	{
-		ctx->unproven = true;
+		UNPROVEN(ctx, "source has a virtual generated column");
 		return;
 	}
 
@@ -597,12 +626,28 @@ collect_walker(Node *node, CollectCtx *ctx)
 	{
 		Query	   *q = (Query *) node;
 
-		if (q->commandType != CMD_SELECT ||
-			q->hasModifyingCTE ||
-			q->hasRowSecurity ||
-			q->rowMarks != NIL)
+		/*
+		 * Reported separately rather than as one compound reason, so that the
+		 * DEBUG1 line names the rule that actually fired.
+		 */
+		if (q->commandType != CMD_SELECT)
 		{
-			ctx->unproven = true;
+			UNPROVEN(ctx, "query is not a plain SELECT");
+			return true;
+		}
+		if (q->hasModifyingCTE)
+		{
+			UNPROVEN(ctx, "query has a data-modifying CTE");
+			return true;
+		}
+		if (q->hasRowSecurity)
+		{
+			UNPROVEN(ctx, "query applies row-level security");
+			return true;
+		}
+		if (q->rowMarks != NIL)
+		{
+			UNPROVEN(ctx, "query locks rows");
 			return true;
 		}
 		return query_tree_walker(q, collect_walker, ctx,
@@ -621,7 +666,7 @@ collect_walker(Node *node, CollectCtx *ctx)
 		{
 			case RTE_RELATION:
 				if (rte->tablesample != NULL)
-					ctx->unproven = true;	/* re-samples every refresh */
+					UNPROVEN(ctx, "query uses TABLESAMPLE");
 				else
 					collect_relation(ctx, rte->relid);
 				break;
@@ -639,7 +684,7 @@ collect_walker(Node *node, CollectCtx *ctx)
 			case RTE_TABLEFUNC:
 			case RTE_NAMEDTUPLESTORE:
 			case RTE_GRAPH_TABLE:
-				ctx->unproven = true;
+				UNPROVEN(ctx, "query reads something other than a relation");
 				break;
 		}
 		return false;
@@ -673,10 +718,16 @@ collect_sources(Query *dataQuery, CollectCtx *ctx, uint32 *fingerprint)
 	rewritten = QueryRewrite(copied);
 
 	if (list_length(rewritten) != 1)
+	{
+		UNPROVEN(ctx, "query does not rewrite to a single SELECT");
 		return false;
+	}
 	rq = (Query *) linitial(rewritten);
 	if (!IsA(rq, Query))
+	{
+		UNPROVEN(ctx, "query does not rewrite to a single SELECT");
 		return false;
+	}
 
 	str = nodeToString(rq);
 	*fingerprint = hash_bytes((const unsigned char *) str, strlen(str));
@@ -688,12 +739,26 @@ collect_sources(Query *dataQuery, CollectCtx *ctx, uint32 *fingerprint)
 		return false;
 
 	/*
+	 * Canonicalise the order.  The watermark is compared element by element, so
+	 * the set has to be built in the same order every time or a matview would
+	 * silently stop skipping.  Inheritance expansion is the reason this matters:
+	 * find_inheritance_children_extended makes no ordering promise, and relying
+	 * on it happening to be stable would be a latent way for the feature to
+	 * quietly do nothing.
+	 */
+	if (ctx->nsources > 1)
+		qsort(ctx->relid, ctx->nsources, sizeof(Oid), oid_ascending);
+
+	/*
 	 * A non-IMMUTABLE function can change the contents with no write at all.
 	 * This catches now(), and STABLE functions that read tables we have not
 	 * enumerated.
 	 */
 	if (contain_mutable_functions((Node *) rq))
+	{
+		UNPROVEN(ctx, "query calls a function that is not IMMUTABLE");
 		return false;
+	}
 
 	return true;
 }
@@ -709,13 +774,22 @@ MatviewSkipCheck(Relation matviewRel, Query *dataQuery, bool allow_skip,
 	CollectCtx	ctx;
 	uint32		fingerprint;
 	MatviewWatermark *wm;
+	const char *mvname = RelationGetRelationName(matviewRel);
+	const char *reason;
 	bool		clean;
 	int			i;
 
 	memset(capture, 0, sizeof(*capture));
 
-	if (matview_skip_state == NULL || !dbblue_matview_skip_unchanged)
+	if (matview_skip_state == NULL)
 		return false;
+
+	if (!dbblue_matview_skip_unchanged)
+	{
+		elog(DEBUG1, "matview \"%s\": not skipped: dbblue_matview_skip_unchanged is off",
+			 mvname);
+		return false;
+	}
 
 	/*
 	 * Under REPEATABLE READ or SERIALIZABLE the data-fill query is pinned to
@@ -723,10 +797,18 @@ MatviewSkipCheck(Relation matviewRel, Query *dataQuery, bool allow_skip,
 	 * neither skipping nor recording a watermark is sound.  Run stock.
 	 */
 	if (IsolationUsesXactSnapshot())
+	{
+		elog(DEBUG1, "matview \"%s\": not skipped: isolation level uses a fixed transaction snapshot",
+			 mvname);
 		return false;
+	}
 
 	if (!collect_sources(dataQuery, &ctx, &fingerprint))
+	{
+		elog(DEBUG1, "matview \"%s\": not skipped: %s", mvname,
+			 ctx.reason ? ctx.reason : "source set could not be proven");
 		return false;
+	}
 
 	/*
 	 * Capture each source's counter and storage identity.  ShareLock proves no
@@ -745,15 +827,25 @@ MatviewSkipCheck(Relation matviewRel, Query *dataQuery, bool allow_skip,
 		MatviewSrcEntry *e;
 
 		if (written_locally(relid))
+		{
+			elog(DEBUG1, "matview \"%s\": not skipped: this transaction has written source \"%s\"",
+				 mvname, get_rel_name(relid));
 			return false;
+		}
 
 		if (!ConditionalLockRelationOid(relid, ShareLock))
+		{
+			elog(DEBUG1, "matview \"%s\": not skipped: a writer holds source \"%s\"",
+				 mvname, get_rel_name(relid));
 			return false;
+		}
 
 		rel = try_relation_open(relid, NoLock);
 		if (rel == NULL)
 		{
 			UnlockRelationOid(relid, ShareLock);
+			elog(DEBUG1, "matview \"%s\": not skipped: a source relation vanished",
+				 mvname);
 			return false;
 		}
 
@@ -769,43 +861,79 @@ MatviewSkipCheck(Relation matviewRel, Query *dataQuery, bool allow_skip,
 		UnlockRelationOid(relid, ShareLock);
 
 		if (e == NULL)
-			return false;		/* no room to track it */
+		{
+			/* no room left to track it */
+			elog(DEBUG1, "matview \"%s\": not skipped: more source relations than can be tracked",
+				 mvname);
+			return false;
+		}
 	}
 
 	capture->valid = true;
 
 	if (!allow_skip)
+	{
+		elog(DEBUG1, "matview \"%s\": watermark captured, skipping not applicable to this command",
+			 mvname);
 		return false;
+	}
 
 	/*
-	 * Compare against this matview's own watermark.  Everything must match:
-	 * the recorded source set exactly (which is how partition membership
-	 * changes are caught), every counter, every source's storage identity, the
-	 * query fingerprint, and the matview's own storage identity -- the last of
-	 * which is also the witness that the refresh which wrote the watermark
-	 * actually committed.
+	 * Compare against this matview's own watermark.  Everything must match: the
+	 * recorded source set exactly (which is how partition membership changes
+	 * are caught), every counter, every source's storage identity, the query
+	 * fingerprint, and the matview's own storage identity -- the last of which
+	 * is also the witness that the refresh which wrote the watermark actually
+	 * committed.
+	 *
+	 * The reason is only assigned under the spinlock, never reported there:
+	 * ereport must not be called while holding it.
 	 */
 	clean = false;
+	reason = NULL;
 	SpinLockAcquire(&matview_skip_state->lock);
 	wm = wm_lookup(RelationGetRelid(matviewRel));
-	if (wm != NULL &&
-		wm->nsources == capture->nsources &&
-		wm->fingerprint == capture->fingerprint &&
-		wm->mv_rfn == matviewRel->rd_locator.relNumber)
+	if (wm == NULL)
+		reason = "no watermark from an earlier refresh";
+	else if (wm->mv_rfn != matviewRel->rd_locator.relNumber)
+		reason = "the matview's own storage changed since its watermark was written";
+	else if (wm->fingerprint != capture->fingerprint)
+		reason = "the matview's definition changed";
+	else if (wm->nsources != capture->nsources)
+		reason = "the set of source relations changed";
+	else
 	{
 		clean = true;
 		for (i = 0; i < capture->nsources; i++)
 		{
-			if (wm->relid[i] != capture->relid[i] ||
-				wm->gen[i] != capture->gen[i] ||
-				wm->rfn[i] != capture->rfn[i])
+			if (wm->relid[i] != capture->relid[i])
 			{
+				reason = "the set of source relations changed";
+				clean = false;
+				break;
+			}
+			if (wm->rfn[i] != capture->rfn[i])
+			{
+				reason = "a source's storage changed";
+				clean = false;
+				break;
+			}
+			if (wm->gen[i] != capture->gen[i])
+			{
+				reason = "a source was written";
 				clean = false;
 				break;
 			}
 		}
 	}
 	SpinLockRelease(&matview_skip_state->lock);
+
+	if (clean)
+		elog(DEBUG1, "matview \"%s\": skipped, nothing it depends on has changed",
+			 mvname);
+	else
+		elog(DEBUG1, "matview \"%s\": not skipped: %s", mvname,
+			 reason ? reason : "unknown");
 
 	return clean;
 }

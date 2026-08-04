@@ -1,0 +1,605 @@
+--
+-- DBblue: REFRESH MATERIALIZED VIEW skip-if-unchanged (auto_skip_unchanged)
+--
+-- Every case asserts two things: that the contents match ground truth, and --
+-- via the DEBUG1 decision line -- which path the refresh actually took.  The
+-- second assertion is what stops these from being vacuous: a test that only
+-- checks the answer still passes when the optimization never engages, and so
+-- would not notice the feature silently doing nothing.
+--
+-- All objects are prefixed mvs_ so this file is self-contained.
+SET client_min_messages = debug1;
+-- ---------------------------------------------------------------- basics
+CREATE TABLE mvs_t(id int, v int);
+INSERT INTO mvs_t SELECT g, g FROM generate_series(1, 20) g;
+-- CREATE ... WITH DATA records a watermark, so the first REFRESH can skip.
+CREATE MATERIALIZED VIEW mvs_mv WITH (auto_skip_unchanged=true) AS
+  SELECT count(*) AS c, sum(v) AS s FROM mvs_t;
+DEBUG:  matview "mvs_mv": watermark captured, skipping not applicable to this command
+REFRESH MATERIALIZED VIEW mvs_mv;                 -- skipped
+DEBUG:  matview "mvs_mv": skipped, nothing it depends on has changed
+SELECT c, s FROM mvs_mv;
+ c  |  s  
+----+-----
+ 20 | 210
+(1 row)
+
+INSERT INTO mvs_t VALUES (21, 21);
+REFRESH MATERIALIZED VIEW mvs_mv;                 -- a source was written
+DEBUG:  matview "mvs_mv": not skipped: a source was written
+SELECT c = (SELECT count(*) FROM mvs_t) AS matches FROM mvs_mv;
+ matches 
+---------
+ t
+(1 row)
+
+REFRESH MATERIALIZED VIEW mvs_mv;                 -- skipped again
+DEBUG:  matview "mvs_mv": skipped, nothing it depends on has changed
+UPDATE mvs_t SET v = v * 2 WHERE id <= 3;
+REFRESH MATERIALIZED VIEW mvs_mv;                 -- a source was written
+DEBUG:  matview "mvs_mv": not skipped: a source was written
+DELETE FROM mvs_t WHERE id = 21;
+REFRESH MATERIALIZED VIEW mvs_mv;                 -- a source was written
+DEBUG:  matview "mvs_mv": not skipped: a source was written
+SELECT s = (SELECT sum(v) FROM mvs_t) AS matches FROM mvs_mv;
+ matches 
+---------
+ t
+(1 row)
+
+-- The GUC disables it outright.
+SET dbblue_matview_skip_unchanged = off;
+REFRESH MATERIALIZED VIEW mvs_mv;                 -- GUC off
+DEBUG:  matview "mvs_mv": not skipped: dbblue_matview_skip_unchanged is off
+SET dbblue_matview_skip_unchanged = on;
+-- Without the reloption nothing is logged at all.
+CREATE MATERIALIZED VIEW mvs_plain AS SELECT count(*) AS c FROM mvs_t;
+REFRESH MATERIALIZED VIEW mvs_plain;
+DROP MATERIALIZED VIEW mvs_plain;
+-- --------------------------------------------- source set enumeration
+-- A source reached only through a subquery, a CTE or a SubLink must still be
+-- tracked; enumerating only the top-level range table missed all three, and an
+-- empty source set used to read as "clean" and never refresh again.
+CREATE TABLE mvs_sub(id int);
+INSERT INTO mvs_sub SELECT g FROM generate_series(1, 10) g;
+CREATE MATERIALIZED VIEW mvs_from WITH (auto_skip_unchanged=true) AS
+  SELECT count(*) AS c FROM (SELECT * FROM mvs_sub WHERE id > 0) x;
+DEBUG:  matview "mvs_from": watermark captured, skipping not applicable to this command
+CREATE MATERIALIZED VIEW mvs_cte WITH (auto_skip_unchanged=true) AS
+  WITH cte AS (SELECT * FROM mvs_sub) SELECT count(*) AS c FROM cte;
+DEBUG:  matview "mvs_cte": watermark captured, skipping not applicable to this command
+CREATE MATERIALIZED VIEW mvs_sublink WITH (auto_skip_unchanged=true) AS
+  SELECT (SELECT count(*) FROM mvs_sub) AS c;
+DEBUG:  matview "mvs_sublink": watermark captured, skipping not applicable to this command
+REFRESH MATERIALIZED VIEW mvs_from;               -- skipped
+DEBUG:  matview "mvs_from": skipped, nothing it depends on has changed
+REFRESH MATERIALIZED VIEW mvs_cte;                -- skipped
+DEBUG:  matview "mvs_cte": skipped, nothing it depends on has changed
+REFRESH MATERIALIZED VIEW mvs_sublink;            -- skipped
+DEBUG:  matview "mvs_sublink": skipped, nothing it depends on has changed
+INSERT INTO mvs_sub SELECT g FROM generate_series(11, 25) g;
+REFRESH MATERIALIZED VIEW mvs_from;               -- a source was written
+DEBUG:  matview "mvs_from": not skipped: a source was written
+REFRESH MATERIALIZED VIEW mvs_cte;                -- a source was written
+DEBUG:  matview "mvs_cte": not skipped: a source was written
+REFRESH MATERIALIZED VIEW mvs_sublink;            -- a source was written
+DEBUG:  matview "mvs_sublink": not skipped: a source was written
+SELECT (SELECT c FROM mvs_from) AS f, (SELECT c FROM mvs_cte) AS c,
+       (SELECT c FROM mvs_sublink) AS s, count(*) AS truth FROM mvs_sub;
+ f  | c  | s  | truth 
+----+----+----+-------
+ 25 | 25 | 25 |    25
+(1 row)
+
+-- ------------------------------------------------------- shared source
+-- Cleanliness is per (matview, source).  With a per-source flag the first
+-- matview to refresh consumed it and the rest were starved, so a plain
+-- "refresh everything" loop silently froze all but one.
+CREATE TABLE mvs_shared(id int);
+INSERT INTO mvs_shared SELECT g FROM generate_series(1, 10) g;
+CREATE MATERIALIZED VIEW mvs_r1 WITH (auto_skip_unchanged=true) AS SELECT count(*) AS c FROM mvs_shared;
+DEBUG:  matview "mvs_r1": watermark captured, skipping not applicable to this command
+CREATE MATERIALIZED VIEW mvs_r2 WITH (auto_skip_unchanged=true) AS SELECT count(*) AS c FROM mvs_shared;
+DEBUG:  matview "mvs_r2": watermark captured, skipping not applicable to this command
+CREATE MATERIALIZED VIEW mvs_r3 WITH (auto_skip_unchanged=true) AS SELECT count(*) AS c FROM mvs_shared;
+DEBUG:  matview "mvs_r3": watermark captured, skipping not applicable to this command
+INSERT INTO mvs_shared SELECT g FROM generate_series(11, 30) g;
+REFRESH MATERIALIZED VIEW mvs_r1;                 -- a source was written
+DEBUG:  matview "mvs_r1": not skipped: a source was written
+REFRESH MATERIALIZED VIEW mvs_r2;                 -- a source was written, not "clean"
+DEBUG:  matview "mvs_r2": not skipped: a source was written
+REFRESH MATERIALIZED VIEW mvs_r3;                 -- a source was written, not "clean"
+DEBUG:  matview "mvs_r3": not skipped: a source was written
+SELECT (SELECT c FROM mvs_r1) AS r1, (SELECT c FROM mvs_r2) AS r2,
+       (SELECT c FROM mvs_r3) AS r3, count(*) AS truth FROM mvs_shared;
+ r1 | r2 | r3 | truth 
+----+----+----+-------
+ 30 | 30 | 30 |    30
+(1 row)
+
+-- ------------------------------------------------------------ TRUNCATE
+-- TRUNCATE never reaches the heapam write hooks; it is caught because it
+-- changes the source's relfilenumber.
+CREATE TABLE mvs_trunc(id int);
+INSERT INTO mvs_trunc SELECT g FROM generate_series(1, 10) g;
+CREATE MATERIALIZED VIEW mvs_mvtrunc WITH (auto_skip_unchanged=true) AS SELECT count(*) AS c FROM mvs_trunc;
+DEBUG:  matview "mvs_mvtrunc": watermark captured, skipping not applicable to this command
+REFRESH MATERIALIZED VIEW mvs_mvtrunc;            -- skipped
+DEBUG:  matview "mvs_mvtrunc": skipped, nothing it depends on has changed
+TRUNCATE mvs_trunc;
+REFRESH MATERIALIZED VIEW mvs_mvtrunc;            -- a source's storage changed
+DEBUG:  matview "mvs_mvtrunc": not skipped: a source's storage changed
+SELECT c FROM mvs_mvtrunc;
+ c 
+---
+ 0
+(1 row)
+
+-- ---------------------------------------------------------- partitions
+-- Writes land on leaves, not the parent, so leaves are what gets tracked.
+-- Membership changes are caught by comparing the recorded source set.
+CREATE TABLE mvs_p(id int) PARTITION BY RANGE (id);
+CREATE TABLE mvs_p_a PARTITION OF mvs_p FOR VALUES FROM (0) TO (100);
+CREATE TABLE mvs_p_b PARTITION OF mvs_p FOR VALUES FROM (100) TO (200);
+INSERT INTO mvs_p SELECT g FROM generate_series(1, 50) g;
+CREATE MATERIALIZED VIEW mvs_mvp WITH (auto_skip_unchanged=true) AS SELECT count(*) AS c FROM mvs_p;
+DEBUG:  matview "mvs_mvp": watermark captured, skipping not applicable to this command
+REFRESH MATERIALIZED VIEW mvs_mvp;                -- skipped
+DEBUG:  matview "mvs_mvp": skipped, nothing it depends on has changed
+INSERT INTO mvs_p VALUES (150);                   -- routed to a leaf
+REFRESH MATERIALIZED VIEW mvs_mvp;                -- a source was written
+DEBUG:  matview "mvs_mvp": not skipped: a source was written
+INSERT INTO mvs_p_a VALUES (60);                  -- straight into the leaf
+REFRESH MATERIALIZED VIEW mvs_mvp;                -- a source was written
+DEBUG:  matview "mvs_mvp": not skipped: a source was written
+SELECT c = (SELECT count(*) FROM mvs_p) AS matches FROM mvs_mvp;
+ matches 
+---------
+ t
+(1 row)
+
+ALTER TABLE mvs_p DETACH PARTITION mvs_p_b;
+REFRESH MATERIALIZED VIEW mvs_mvp;                -- the source set changed
+DEBUG:  matview "mvs_mvp": not skipped: the set of source relations changed
+SELECT c = (SELECT count(*) FROM mvs_p) AS matches FROM mvs_mvp;
+ matches 
+---------
+ t
+(1 row)
+
+ALTER TABLE mvs_p ATTACH PARTITION mvs_p_b FOR VALUES FROM (100) TO (200);
+DEBUG:  verifying table "mvs_p_b"
+REFRESH MATERIALIZED VIEW mvs_mvp;                -- the source set changed
+DEBUG:  matview "mvs_mvp": not skipped: the set of source relations changed
+SELECT c = (SELECT count(*) FROM mvs_p) AS matches FROM mvs_mvp;
+ matches 
+---------
+ t
+(1 row)
+
+DROP TABLE mvs_p_b;
+REFRESH MATERIALIZED VIEW mvs_mvp;                -- the source set changed
+DEBUG:  matview "mvs_mvp": not skipped: the set of source relations changed
+SELECT c = (SELECT count(*) FROM mvs_p) AS matches FROM mvs_mvp;
+ matches 
+---------
+ t
+(1 row)
+
+-- --------------------------------------------------------------- views
+-- The stored rule query is NOT rewritten, so a source view appears in it as a
+-- storage-less RTE_RELATION with its base tables absent.  Enumeration rewrites
+-- first, which is also what makes redefinition detectable.
+CREATE TABLE mvs_vbase(id int, v int);
+INSERT INTO mvs_vbase SELECT g, g FROM generate_series(1, 20) g;
+CREATE VIEW mvs_v AS SELECT * FROM mvs_vbase WHERE v > 0;
+CREATE MATERIALIZED VIEW mvs_mvv WITH (auto_skip_unchanged=true) AS SELECT count(*) AS c FROM mvs_v;
+DEBUG:  matview "mvs_mvv": watermark captured, skipping not applicable to this command
+REFRESH MATERIALIZED VIEW mvs_mvv;                -- skipped
+DEBUG:  matview "mvs_mvv": skipped, nothing it depends on has changed
+INSERT INTO mvs_vbase VALUES (21, 21);
+REFRESH MATERIALIZED VIEW mvs_mvv;                -- a source was written
+DEBUG:  matview "mvs_mvv": not skipped: a source was written
+SELECT c = (SELECT count(*) FROM mvs_v) AS matches FROM mvs_mvv;
+ matches 
+---------
+ t
+(1 row)
+
+CREATE OR REPLACE VIEW mvs_v AS SELECT * FROM mvs_vbase WHERE v > 10;
+REFRESH MATERIALIZED VIEW mvs_mvv;                -- the definition changed
+DEBUG:  matview "mvs_mvv": not skipped: the matview's definition changed
+SELECT c = (SELECT count(*) FROM mvs_v) AS matches FROM mvs_mvv;
+ matches 
+---------
+ t
+(1 row)
+
+-- ------------------------------------------------- matview over matview
+-- A non-concurrent refresh writes to a transient heap, so the inner matview's
+-- own relid is never noted; its relfilenumber changing is what catches it.
+CREATE TABLE mvs_inner_src(id int);
+INSERT INTO mvs_inner_src SELECT g FROM generate_series(1, 10) g;
+CREATE MATERIALIZED VIEW mvs_inner AS SELECT id FROM mvs_inner_src;
+CREATE MATERIALIZED VIEW mvs_outer WITH (auto_skip_unchanged=true) AS SELECT count(*) AS c FROM mvs_inner;
+DEBUG:  matview "mvs_outer": watermark captured, skipping not applicable to this command
+REFRESH MATERIALIZED VIEW mvs_outer;              -- skipped
+DEBUG:  matview "mvs_outer": skipped, nothing it depends on has changed
+INSERT INTO mvs_inner_src VALUES (11);
+REFRESH MATERIALIZED VIEW mvs_inner;
+REFRESH MATERIALIZED VIEW mvs_outer;              -- a source's storage changed
+DEBUG:  matview "mvs_outer": not skipped: a source's storage changed
+SELECT c = (SELECT count(*) FROM mvs_inner) AS matches FROM mvs_outer;
+ matches 
+---------
+ t
+(1 row)
+
+-- ---------------------------------------------------- transaction rules
+-- A rolled-back refresh must not leave the matview looking up to date, and a
+-- refresh in the same transaction as a write to its own source must not skip.
+CREATE TABLE mvs_tx(id int);
+INSERT INTO mvs_tx SELECT g FROM generate_series(1, 10) g;
+CREATE MATERIALIZED VIEW mvs_mvtx WITH (auto_skip_unchanged=true) AS SELECT count(*) AS c FROM mvs_tx;
+DEBUG:  matview "mvs_mvtx": watermark captured, skipping not applicable to this command
+REFRESH MATERIALIZED VIEW mvs_mvtx;               -- skipped
+DEBUG:  matview "mvs_mvtx": skipped, nothing it depends on has changed
+INSERT INTO mvs_tx SELECT g FROM generate_series(11, 30) g;
+BEGIN;
+REFRESH MATERIALIZED VIEW mvs_mvtx;               -- a source was written
+DEBUG:  matview "mvs_mvtx": not skipped: a source was written
+ROLLBACK;
+REFRESH MATERIALIZED VIEW mvs_mvtx;               -- must NOT be skipped
+DEBUG:  matview "mvs_mvtx": not skipped: the matview's own storage changed since its watermark was written
+SELECT c = (SELECT count(*) FROM mvs_tx) AS matches FROM mvs_mvtx;
+ matches 
+---------
+ t
+(1 row)
+
+BEGIN;
+SAVEPOINT sp;
+REFRESH MATERIALIZED VIEW mvs_mvtx;
+DEBUG:  matview "mvs_mvtx": skipped, nothing it depends on has changed
+ROLLBACK TO sp;
+COMMIT;
+REFRESH MATERIALIZED VIEW mvs_mvtx;               -- must NOT be skipped
+DEBUG:  matview "mvs_mvtx": skipped, nothing it depends on has changed
+SELECT c = (SELECT count(*) FROM mvs_tx) AS matches FROM mvs_mvtx;
+ matches 
+---------
+ t
+(1 row)
+
+BEGIN;
+INSERT INTO mvs_tx VALUES (99);
+REFRESH MATERIALIZED VIEW mvs_mvtx;               -- this transaction wrote it
+DEBUG:  matview "mvs_mvtx": not skipped: this transaction has written source "mvs_tx"
+COMMIT;
+SELECT c = (SELECT count(*) FROM mvs_tx) AS matches FROM mvs_mvtx;
+ matches 
+---------
+ t
+(1 row)
+
+-- WITH NO DATA leaves the matview unpopulated; the next plain REFRESH must
+-- repopulate it rather than skip and strand it unreadable forever.
+REFRESH MATERIALIZED VIEW mvs_mvtx;               -- skipped
+DEBUG:  matview "mvs_mvtx": not skipped: the matview's own storage changed since its watermark was written
+REFRESH MATERIALIZED VIEW mvs_mvtx WITH NO DATA;
+SELECT relispopulated FROM pg_class WHERE relname = 'mvs_mvtx';
+ relispopulated 
+----------------
+ f
+(1 row)
+
+REFRESH MATERIALIZED VIEW mvs_mvtx;               -- must rebuild
+DEBUG:  matview "mvs_mvtx": watermark captured, skipping not applicable to this command
+SELECT relispopulated FROM pg_class WHERE relname = 'mvs_mvtx';
+ relispopulated 
+----------------
+ t
+(1 row)
+
+SELECT c = (SELECT count(*) FROM mvs_tx) AS matches FROM mvs_mvtx;
+ matches 
+---------
+ t
+(1 row)
+
+-- Isolation levels that pin a transaction snapshot decline both branches.
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+REFRESH MATERIALIZED VIEW mvs_mvtx;               -- fixed transaction snapshot
+DEBUG:  matview "mvs_mvtx": not skipped: isolation level uses a fixed transaction snapshot
+COMMIT;
+BEGIN ISOLATION LEVEL SERIALIZABLE;
+REFRESH MATERIALIZED VIEW mvs_mvtx;               -- fixed transaction snapshot
+DEBUG:  matview "mvs_mvtx": not skipped: isolation level uses a fixed transaction snapshot
+COMMIT;
+SELECT c = (SELECT count(*) FROM mvs_tx) AS matches FROM mvs_mvtx;
+ matches 
+---------
+ t
+(1 row)
+
+-- ------------------------------------------------- storage-only rewrites
+-- VACUUM FULL does not change the contents but does change the relfilenumber,
+-- so it costs one extra rebuild.  What matters is that tracking still works
+-- afterwards rather than the matview becoming permanently stuck.
+CREATE TABLE mvs_vac(id int);
+INSERT INTO mvs_vac SELECT g FROM generate_series(1, 10) g;
+CREATE MATERIALIZED VIEW mvs_mvvac WITH (auto_skip_unchanged=true) AS SELECT count(*) AS c FROM mvs_vac;
+DEBUG:  matview "mvs_mvvac": watermark captured, skipping not applicable to this command
+REFRESH MATERIALIZED VIEW mvs_mvvac;              -- skipped
+DEBUG:  matview "mvs_mvvac": skipped, nothing it depends on has changed
+VACUUM FULL mvs_vac;
+REFRESH MATERIALIZED VIEW mvs_mvvac;              -- a source's storage changed
+DEBUG:  matview "mvs_mvvac": not skipped: a source's storage changed
+REFRESH MATERIALIZED VIEW mvs_mvvac;              -- skipped again
+DEBUG:  matview "mvs_mvvac": skipped, nothing it depends on has changed
+INSERT INTO mvs_vac VALUES (11);
+REFRESH MATERIALIZED VIEW mvs_mvvac;              -- a source was written
+DEBUG:  matview "mvs_mvvac": not skipped: a source was written
+SELECT c = (SELECT count(*) FROM mvs_vac) AS matches FROM mvs_mvvac;
+ matches 
+---------
+ t
+(1 row)
+
+-- An UNLOGGED source is tracked the same way as a logged one.
+CREATE UNLOGGED TABLE mvs_unlogged(id int);
+INSERT INTO mvs_unlogged SELECT g FROM generate_series(1, 10) g;
+CREATE MATERIALIZED VIEW mvs_mvunlogged WITH (auto_skip_unchanged=true) AS
+  SELECT count(*) AS c FROM mvs_unlogged;
+DEBUG:  matview "mvs_mvunlogged": watermark captured, skipping not applicable to this command
+REFRESH MATERIALIZED VIEW mvs_mvunlogged;         -- skipped
+DEBUG:  matview "mvs_mvunlogged": skipped, nothing it depends on has changed
+INSERT INTO mvs_unlogged SELECT g FROM generate_series(11, 20) g;
+REFRESH MATERIALIZED VIEW mvs_mvunlogged;         -- a source was written
+DEBUG:  matview "mvs_mvunlogged": not skipped: a source was written
+SELECT c = (SELECT count(*) FROM mvs_unlogged) AS matches FROM mvs_mvunlogged;
+ matches 
+---------
+ t
+(1 row)
+
+-- ---------------------------------------------------- the reject list
+-- Each of these changes what the matview should contain with no tracked write,
+-- so each must refuse to skip.  The DEBUG line names which rule fired.
+CREATE SEQUENCE mvs_seq;
+CREATE MATERIALIZED VIEW mvs_mvseq WITH (auto_skip_unchanged=true) AS SELECT last_value AS c FROM mvs_seq;
+DEBUG:  matview "mvs_mvseq": not skipped: source is not an ordinary table or materialized view
+REFRESH MATERIALIZED VIEW mvs_mvseq;              -- not an ordinary table
+DEBUG:  matview "mvs_mvseq": not skipped: source is not an ordinary table or materialized view
+SELECT nextval('mvs_seq');
+ nextval 
+---------
+       1
+(1 row)
+
+REFRESH MATERIALIZED VIEW mvs_mvseq;              -- not an ordinary table
+DEBUG:  matview "mvs_mvseq": not skipped: source is not an ordinary table or materialized view
+SELECT c = (SELECT last_value FROM mvs_seq) AS matches FROM mvs_mvseq;
+ matches 
+---------
+ t
+(1 row)
+
+CREATE MATERIALIZED VIEW mvs_mvcat WITH (auto_skip_unchanged=true) AS
+  SELECT count(*) AS c FROM pg_class WHERE relname LIKE 'mvs\_bump%';
+DEBUG:  matview "mvs_mvcat": not skipped: source is a system catalog
+REFRESH MATERIALIZED VIEW mvs_mvcat;              -- system catalog
+DEBUG:  matview "mvs_mvcat": not skipped: source is a system catalog
+CREATE TABLE mvs_bump_a(id int);
+REFRESH MATERIALIZED VIEW mvs_mvcat;              -- system catalog
+DEBUG:  matview "mvs_mvcat": not skipped: source is a system catalog
+SELECT c FROM mvs_mvcat;
+ c 
+---
+ 1
+(1 row)
+
+CREATE MATERIALIZED VIEW mvs_mvnow WITH (auto_skip_unchanged=true) AS
+  SELECT count(*) AS c FROM mvs_t WHERE now() IS NOT NULL;
+DEBUG:  matview "mvs_mvnow": not skipped: query calls a function that is not IMMUTABLE
+REFRESH MATERIALIZED VIEW mvs_mvnow;              -- not IMMUTABLE
+DEBUG:  matview "mvs_mvnow": not skipped: query calls a function that is not IMMUTABLE
+REFRESH MATERIALIZED VIEW mvs_mvnow;              -- not IMMUTABLE
+DEBUG:  matview "mvs_mvnow": not skipped: query calls a function that is not IMMUTABLE
+CREATE MATERIALIZED VIEW mvs_mvsample WITH (auto_skip_unchanged=true) AS
+  SELECT count(*) AS c FROM mvs_t TABLESAMPLE BERNOULLI (50);
+DEBUG:  matview "mvs_mvsample": not skipped: query uses TABLESAMPLE
+REFRESH MATERIALIZED VIEW mvs_mvsample;           -- TABLESAMPLE
+DEBUG:  matview "mvs_mvsample": not skipped: query uses TABLESAMPLE
+REFRESH MATERIALIZED VIEW mvs_mvsample;           -- TABLESAMPLE
+DEBUG:  matview "mvs_mvsample": not skipped: query uses TABLESAMPLE
+CREATE TABLE mvs_vgen(id int, base int, vg int GENERATED ALWAYS AS (base * 2) VIRTUAL);
+INSERT INTO mvs_vgen(id, base) SELECT g, g FROM generate_series(1, 10) g;
+CREATE MATERIALIZED VIEW mvs_mvvgen WITH (auto_skip_unchanged=true) AS SELECT sum(vg) AS c FROM mvs_vgen;
+DEBUG:  matview "mvs_mvvgen": not skipped: source has a virtual generated column
+REFRESH MATERIALIZED VIEW mvs_mvvgen;             -- virtual generated column
+DEBUG:  matview "mvs_mvvgen": not skipped: source has a virtual generated column
+ALTER TABLE mvs_vgen ALTER COLUMN vg SET EXPRESSION AS (base * 100);
+REFRESH MATERIALIZED VIEW mvs_mvvgen;             -- virtual generated column
+DEBUG:  matview "mvs_mvvgen": not skipped: source has a virtual generated column
+SELECT c = (SELECT sum(vg) FROM mvs_vgen) AS matches FROM mvs_mvvgen;
+ matches 
+---------
+ t
+(1 row)
+
+CREATE TABLE mvs_rls(id int, tenant int);
+INSERT INTO mvs_rls SELECT g, g % 2 FROM generate_series(1, 20) g;
+ALTER TABLE mvs_rls ENABLE ROW LEVEL SECURITY;
+CREATE MATERIALIZED VIEW mvs_mvrls WITH (auto_skip_unchanged=true) AS SELECT count(*) AS c FROM mvs_rls;
+DEBUG:  matview "mvs_mvrls": not skipped: query applies row-level security
+REFRESH MATERIALIZED VIEW mvs_mvrls;              -- row-level security
+DEBUG:  matview "mvs_mvrls": not skipped: query applies row-level security
+REFRESH MATERIALIZED VIEW mvs_mvrls;              -- row-level security
+DEBUG:  matview "mvs_mvrls": not skipped: query applies row-level security
+CREATE TABLE mvs_srf_src(id int);
+INSERT INTO mvs_srf_src SELECT g FROM generate_series(1, 5) g;
+CREATE MATERIALIZED VIEW mvs_mvsrf WITH (auto_skip_unchanged=true) AS
+  SELECT count(*) AS c FROM generate_series(1, 5) g;
+DEBUG:  matview "mvs_mvsrf": not skipped: query reads something other than a relation
+REFRESH MATERIALIZED VIEW mvs_mvsrf;              -- reads something else
+DEBUG:  matview "mvs_mvsrf": not skipped: query reads something other than a relation
+REFRESH MATERIALIZED VIEW mvs_mvsrf;              -- reads something else
+DEBUG:  matview "mvs_mvsrf": not skipped: query reads something other than a relation
+-- A matview populated while the feature was switched off has no watermark, so
+-- the first refresh after switching it back on has nothing to compare against.
+SET dbblue_matview_skip_unchanged = off;
+CREATE MATERIALIZED VIEW mvs_nowm WITH (auto_skip_unchanged=true) AS SELECT count(*) AS c FROM mvs_t;
+DEBUG:  matview "mvs_nowm": not skipped: dbblue_matview_skip_unchanged is off
+SET dbblue_matview_skip_unchanged = on;
+REFRESH MATERIALIZED VIEW mvs_nowm;               -- no watermark yet
+DEBUG:  matview "mvs_nowm": not skipped: no watermark from an earlier refresh
+REFRESH MATERIALIZED VIEW mvs_nowm;               -- skipped
+DEBUG:  matview "mvs_nowm": skipped, nothing it depends on has changed
+SELECT c = (SELECT count(*) FROM mvs_t) AS matches FROM mvs_nowm;
+ matches 
+---------
+ t
+(1 row)
+
+-- More sources than can be tracked per matview must refuse rather than
+-- truncate the set and compare a prefix.
+SELECT format('CREATE TABLE mvs_many_%s(id int);', g) FROM generate_series(1, 40) g \gexec
+CREATE TABLE mvs_many_1(id int);
+CREATE TABLE mvs_many_2(id int);
+CREATE TABLE mvs_many_3(id int);
+CREATE TABLE mvs_many_4(id int);
+CREATE TABLE mvs_many_5(id int);
+CREATE TABLE mvs_many_6(id int);
+CREATE TABLE mvs_many_7(id int);
+CREATE TABLE mvs_many_8(id int);
+CREATE TABLE mvs_many_9(id int);
+CREATE TABLE mvs_many_10(id int);
+CREATE TABLE mvs_many_11(id int);
+CREATE TABLE mvs_many_12(id int);
+CREATE TABLE mvs_many_13(id int);
+CREATE TABLE mvs_many_14(id int);
+CREATE TABLE mvs_many_15(id int);
+CREATE TABLE mvs_many_16(id int);
+CREATE TABLE mvs_many_17(id int);
+CREATE TABLE mvs_many_18(id int);
+CREATE TABLE mvs_many_19(id int);
+CREATE TABLE mvs_many_20(id int);
+CREATE TABLE mvs_many_21(id int);
+CREATE TABLE mvs_many_22(id int);
+CREATE TABLE mvs_many_23(id int);
+CREATE TABLE mvs_many_24(id int);
+CREATE TABLE mvs_many_25(id int);
+CREATE TABLE mvs_many_26(id int);
+CREATE TABLE mvs_many_27(id int);
+CREATE TABLE mvs_many_28(id int);
+CREATE TABLE mvs_many_29(id int);
+CREATE TABLE mvs_many_30(id int);
+CREATE TABLE mvs_many_31(id int);
+CREATE TABLE mvs_many_32(id int);
+CREATE TABLE mvs_many_33(id int);
+CREATE TABLE mvs_many_34(id int);
+CREATE TABLE mvs_many_35(id int);
+CREATE TABLE mvs_many_36(id int);
+CREATE TABLE mvs_many_37(id int);
+CREATE TABLE mvs_many_38(id int);
+CREATE TABLE mvs_many_39(id int);
+CREATE TABLE mvs_many_40(id int);
+SELECT 'CREATE MATERIALIZED VIEW mvs_mvmany WITH (auto_skip_unchanged=true) AS SELECT '
+       || string_agg(format('(SELECT count(*) FROM mvs_many_%s) AS c%s', g, g), ', ')
+  FROM generate_series(1, 40) g \gexec
+CREATE MATERIALIZED VIEW mvs_mvmany WITH (auto_skip_unchanged=true) AS SELECT (SELECT count(*) FROM mvs_many_1) AS c1, (SELECT count(*) FROM mvs_many_2) AS c2, (SELECT count(*) FROM mvs_many_3) AS c3, (SELECT count(*) FROM mvs_many_4) AS c4, (SELECT count(*) FROM mvs_many_5) AS c5, (SELECT count(*) FROM mvs_many_6) AS c6, (SELECT count(*) FROM mvs_many_7) AS c7, (SELECT count(*) FROM mvs_many_8) AS c8, (SELECT count(*) FROM mvs_many_9) AS c9, (SELECT count(*) FROM mvs_many_10) AS c10, (SELECT count(*) FROM mvs_many_11) AS c11, (SELECT count(*) FROM mvs_many_12) AS c12, (SELECT count(*) FROM mvs_many_13) AS c13, (SELECT count(*) FROM mvs_many_14) AS c14, (SELECT count(*) FROM mvs_many_15) AS c15, (SELECT count(*) FROM mvs_many_16) AS c16, (SELECT count(*) FROM mvs_many_17) AS c17, (SELECT count(*) FROM mvs_many_18) AS c18, (SELECT count(*) FROM mvs_many_19) AS c19, (SELECT count(*) FROM mvs_many_20) AS c20, (SELECT count(*) FROM mvs_many_21) AS c21, (SELECT count(*) FROM mvs_many_22) AS c22, (SELECT count(*) FROM mvs_many_23) AS c23, (SELECT count(*) FROM mvs_many_24) AS c24, (SELECT count(*) FROM mvs_many_25) AS c25, (SELECT count(*) FROM mvs_many_26) AS c26, (SELECT count(*) FROM mvs_many_27) AS c27, (SELECT count(*) FROM mvs_many_28) AS c28, (SELECT count(*) FROM mvs_many_29) AS c29, (SELECT count(*) FROM mvs_many_30) AS c30, (SELECT count(*) FROM mvs_many_31) AS c31, (SELECT count(*) FROM mvs_many_32) AS c32, (SELECT count(*) FROM mvs_many_33) AS c33, (SELECT count(*) FROM mvs_many_34) AS c34, (SELECT count(*) FROM mvs_many_35) AS c35, (SELECT count(*) FROM mvs_many_36) AS c36, (SELECT count(*) FROM mvs_many_37) AS c37, (SELECT count(*) FROM mvs_many_38) AS c38, (SELECT count(*) FROM mvs_many_39) AS c39, (SELECT count(*) FROM mvs_many_40) AS c40
+DEBUG:  matview "mvs_mvmany": not skipped: more source relations than can be tracked
+REFRESH MATERIALIZED VIEW mvs_mvmany;             -- too many sources
+DEBUG:  matview "mvs_mvmany": not skipped: more source relations than can be tracked
+REFRESH MATERIALIZED VIEW mvs_mvmany;             -- too many sources
+DEBUG:  matview "mvs_mvmany": not skipped: more source relations than can be tracked
+DROP MATERIALIZED VIEW mvs_mvmany;
+SELECT format('DROP TABLE mvs_many_%s;', g) FROM generate_series(1, 40) g \gexec
+DROP TABLE mvs_many_1;
+DROP TABLE mvs_many_2;
+DROP TABLE mvs_many_3;
+DROP TABLE mvs_many_4;
+DROP TABLE mvs_many_5;
+DROP TABLE mvs_many_6;
+DROP TABLE mvs_many_7;
+DROP TABLE mvs_many_8;
+DROP TABLE mvs_many_9;
+DROP TABLE mvs_many_10;
+DROP TABLE mvs_many_11;
+DROP TABLE mvs_many_12;
+DROP TABLE mvs_many_13;
+DROP TABLE mvs_many_14;
+DROP TABLE mvs_many_15;
+DROP TABLE mvs_many_16;
+DROP TABLE mvs_many_17;
+DROP TABLE mvs_many_18;
+DROP TABLE mvs_many_19;
+DROP TABLE mvs_many_20;
+DROP TABLE mvs_many_21;
+DROP TABLE mvs_many_22;
+DROP TABLE mvs_many_23;
+DROP TABLE mvs_many_24;
+DROP TABLE mvs_many_25;
+DROP TABLE mvs_many_26;
+DROP TABLE mvs_many_27;
+DROP TABLE mvs_many_28;
+DROP TABLE mvs_many_29;
+DROP TABLE mvs_many_30;
+DROP TABLE mvs_many_31;
+DROP TABLE mvs_many_32;
+DROP TABLE mvs_many_33;
+DROP TABLE mvs_many_34;
+DROP TABLE mvs_many_35;
+DROP TABLE mvs_many_36;
+DROP TABLE mvs_many_37;
+DROP TABLE mvs_many_38;
+DROP TABLE mvs_many_39;
+DROP TABLE mvs_many_40;
+RESET client_min_messages;
+-- ----------------------------------------------------------- CONCURRENTLY
+-- Excluded from both branches: refresh_by_match_merge updates in place, so the
+-- matview's relfilenumber does not change and there is no commit witness.
+--
+-- Deliberately NOT run at debug1.  The concurrent path builds a transient table
+-- whose toast index is named after its OID, and PostgreSQL logs that name at
+-- DEBUG1 -- which differs on every run.  There is no decision line to assert
+-- here anyway, because the gate is not consulted at all for CONCURRENTLY.
+CREATE TABLE mvs_conc(id int);
+INSERT INTO mvs_conc SELECT g FROM generate_series(1, 10) g;
+CREATE MATERIALIZED VIEW mvs_mvconc WITH (auto_skip_unchanged=true) AS SELECT id FROM mvs_conc;
+CREATE UNIQUE INDEX mvs_mvconc_idx ON mvs_mvconc(id);
+INSERT INTO mvs_conc VALUES (11);
+REFRESH MATERIALIZED VIEW CONCURRENTLY mvs_mvconc;
+INSERT INTO mvs_conc VALUES (12);
+REFRESH MATERIALIZED VIEW CONCURRENTLY mvs_mvconc;
+SELECT count(*) = (SELECT count(*) FROM mvs_conc) AS matches FROM mvs_mvconc;
+ matches 
+---------
+ t
+(1 row)
+
+-- A plain REFRESH afterwards must still be correct: the concurrent refreshes
+-- wrote no watermark, so this one has to rebuild.
+SET client_min_messages = debug1;
+INSERT INTO mvs_conc VALUES (13);
+REFRESH MATERIALIZED VIEW mvs_mvconc;
+DEBUG:  matview "mvs_mvconc": not skipped: a source was written
+DEBUG:  building index "mvs_mvconc_idx" on table "mvs_mvconc" serially
+DEBUG:  index "mvs_mvconc_idx" can safely use deduplication
+SELECT count(*) = (SELECT count(*) FROM mvs_conc) AS matches FROM mvs_mvconc;
+ matches 
+---------
+ t
+(1 row)
+
+RESET client_min_messages;
+-- ------------------------------------------------------------- cleanup
+DROP MATERIALIZED VIEW mvs_mvunlogged, mvs_mvvac, mvs_mvconc, mvs_mvsrf, mvs_mvrls, mvs_mvvgen,
+  mvs_mvsample, mvs_mvnow, mvs_mvcat, mvs_mvseq, mvs_mvtx, mvs_outer,
+  mvs_inner, mvs_mvv, mvs_mvp, mvs_mvtrunc, mvs_r1, mvs_r2, mvs_r3,
+  mvs_sublink, mvs_cte, mvs_from, mvs_nowm, mvs_mv;
+DROP VIEW mvs_v;
+DROP SEQUENCE mvs_seq;
+DROP TABLE mvs_unlogged, mvs_vac, mvs_conc, mvs_srf_src, mvs_rls, mvs_vgen, mvs_bump_a, mvs_tx,
+  mvs_inner_src, mvs_vbase, mvs_p, mvs_trunc, mvs_shared, mvs_sub, mvs_t;

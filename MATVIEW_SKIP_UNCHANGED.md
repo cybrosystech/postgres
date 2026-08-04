@@ -253,10 +253,19 @@ SET dbblue_matview_skip_unchanged = off;   -- PGC_SUSET
 Restores stock behaviour without having to locate every view that opts in.
 Useful for comparing results or isolating a problem.
 
-### Confirming a skip happened
+### Confirming a skip happened, or finding out why not
 
-Time it. A skip is sub-millisecond and independent of source size; a rebuild is
-not. There is no counter or log line for it yet — see §8.
+```sql
+SET client_min_messages = debug1;
+REFRESH MATERIALIZED VIEW daily_sales;
+DEBUG:  matview "daily_sales": skipped, nothing it depends on has changed
+```
+
+When it declines, the line names the rule that fired — `a source was written`,
+`the matview's definition changed`, `query calls a function that is not
+IMMUTABLE`, and so on. That is the way to answer "why does this view never
+skip", which is otherwise invisible: a view excluded by the reject list behaves
+exactly like one whose sources are simply busy.
 
 ### The locking caveat
 
@@ -271,27 +280,42 @@ resolution, which is a much larger change and was not attempted.
 
 ## 7. Testing
 
-`mvskip_regress.sh` in this worktree. Drives the feature to a state where it
-believes nothing changed, applies a mutation, refreshes, and compares against
-ground truth; `T13` is the inverse check that it still actually skips.
+Everything lives in the tree and runs from the standard suites, so an upstream
+merge that breaks the feature fails a build rather than going unnoticed.
 
-```
-38 passed, 0 failed
-```
+| Where | What |
+|---|---|
+| `src/test/regress/sql/dbblue_matview_skip.sql` | the deterministic cases; one line in `parallel_schedule`, run by itself. **246/246** |
+| `src/test/isolation/specs/dbblue-matview-skip.spec` | the concurrency cases. **131/131** |
+| `src/test/recovery/t/056_dbblue_matview_skip.pl` | restart and crash behaviour. **18/18** |
 
-For comparison, the suite as it stood partway through this work — 25 cases —
-scored **9 passed, 16 failed** against the original code. The final 38-case suite
-was never run against the original build, so that is a like-for-like figure only
-for those 25.
+Every case asserts **which path the refresh took**, via the DEBUG1 decision
+line, not merely that the answer was right. That distinction matters: a test
+that only checks contents still passes when the optimization never engages, so
+it would not notice the feature silently doing nothing. The regression file
+exercises all but a handful of the rejection reasons in the code; the remainder
+are either concurrency-only (covered by the isolation spec) or unreachable by
+construction and kept as defence in depth.
 
-Plus `make check` 245/245 and `make -C src/test/isolation check` 130/130.
+Three test-design traps hit while writing these, all worth remembering:
 
-Two of the suite's own tests were wrong at first and are worth knowing about: a
-view over `pg_class` counts the transient heap its own rebuild creates (stock
-behaviour, not a defect), and a superuser bypasses RLS entirely, so the RLS case
-needs a non-superuser owner or it proves nothing.
+1. **`debug1` is not quiet.** It looked clean at first, but `REFRESH
+   CONCURRENTLY` builds a transient toast index and logs its OID-derived name,
+   which changes every run. That section is deliberately not run at `debug1`.
+2. **A skipped refresh proves nothing about a race.** The first attempt at the
+   commit-during-refresh case had the refresh under test skip, so it never took
+   a snapshot and the window never opened. The source has to be dirtied first so
+   the refresh genuinely rebuilds.
+3. **Confirm a test can actually fail.** Of the original 38 standalone cases, 16
+   were observed failing against the pre-fix code; the rest were written
+   afterwards and had never been seen to fail. Asserting the decision line is
+   what closed that gap.
 
----
+Checking the partitioned case this way also found a latent problem: the
+watermark is compared element by element, so the source set has to be built in
+the same order every time. Inheritance expansion makes no ordering promise, so
+the set is now sorted. Without that, a reordering would have made partitioned
+matviews quietly stop skipping — passing every contents-only test.
 
 ## 8. Honest limitations
 
@@ -302,9 +326,10 @@ needs a non-superuser owner or it proves nothing.
 - **No Odoo validation.** The coverage question that matters for this fork is
   what fraction of real Odoo report views survive the §2 rejects. `now()`
   alone may exclude most of them. That number is not known.
-- **No observability.** There is no way to ask "was that refresh skipped, and
-  if not, which source was dirty". A `DEBUG1` line or a counter view would make
-  the feature diagnosable; without it, tuning is guesswork.
+- **Observability is DEBUG1 only.** A refresh logs its decision, and the reason
+  when it declines, which is enough to diagnose "why does this never skip" and
+  is what the tests assert on. There is still no aggregate view or counter, so
+  there is no way to ask how often skipping is paying off across a workload.
 - **`now()` has no opt-in escape.** The IVM work solved the same tension with an
   `allow_stable_keys` reloption. The equivalent here would let a view accept
   time-drift explicitly, and has not been added.
@@ -314,11 +339,17 @@ needs a non-superuser owner or it proves nothing.
 - **Fixed bounds**, all fail-safe: 1024 tracked sources per cluster, 256
   watermarks, 32 sources per view, 256 relations written per transaction.
   Exceeding any of them makes the affected view refuse to skip. Nothing evicts
-  entries, so a cluster with more than 1024 distinct source tables will
-  gradually stop skipping rather than start being wrong.
+  entries — not even when a matview or a source is dropped — so a cluster with
+  more than 1024 distinct source tables, or one that churns through more than
+  256 materialized views, will gradually stop skipping rather than start being
+  wrong.
 - **The SGML docs were not validated by `xmllint`**, which is not installed
   here. Well-formedness and every `linkend` target were checked directly, but
   the DTD validation `make -C doc/src/sgml check` performs has not run.
+- **The TAP test needs `--enable-tap-tests`**, which in turn needs the
+  `IPC::Run` Perl module. Neither was present here initially; both are required
+  for `src/test/recovery` to run at all rather than report success without
+  executing anything.
 
 ---
 
@@ -338,7 +369,7 @@ needs a non-superuser owner or it proves nothing.
 |---|---|
 | **Real traffic** | Nothing has carried real users' load. |
 | **Odoo coverage** | Unknown how many real report views clear the reject list. |
-| **Crash / restart under load** | Reasoned to be fail-safe (empty shared memory reads as changed) but not exercised. |
+| **Crash / restart under sustained load** | Single-client restart and crash are covered by the TAP test, including a crash with a refresh still open. Nothing has been crashed while busy. |
 | **Physical replication** | A standby cannot refresh, and a promoted standby starts with empty shared memory, so it should be fail-safe. Not tested. |
 
 ### Suggested rollout
