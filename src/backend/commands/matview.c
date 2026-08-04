@@ -179,7 +179,8 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 	int			save_sec_context;
 	int			save_nestlevel;
 	ObjectAddress address;
-	List	   *auto_skip_source_relids = NIL;
+	MatviewSkipCapture skip_capture;
+	bool		skip_fresh_snapshot = false;
 
 	matviewRel = table_open(matviewOid, NoLock);
 	relowner = matviewRel->rd_rel->relowner;
@@ -284,37 +285,42 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 	dataQuery = linitial_node(Query, actions);
 
 	/*
-	 * DBblue: auto_skip_unchanged — if every source table is clean (no
-	 * committed writes since the last successful refresh), skip entirely.
+	 * Check for active uses of the relation in the current transaction, such
+	 * as open scans.
+	 *
+	 * NB: We count on this to protect us against problems with refreshing the
+	 * data using TABLE_INSERT_FROZEN.
+	 *
+	 * This is deliberately above the auto_skip_unchanged gate below, so that a
+	 * REFRESH raises the same error whether or not the rebuild gets skipped.
 	 */
-	if (!is_create && !skipData && RelationGetAutoSkipUnchanged(matviewRel))
+	CheckTableNotInUse(matviewRel,
+					   is_create ? "CREATE MATERIALIZED VIEW" :
+					   "REFRESH MATERIALIZED VIEW");
+
+	/*
+	 * DBblue: auto_skip_unchanged.  Ask whether this rebuild can be skipped
+	 * outright, and capture what a real rebuild is about to observe.
+	 *
+	 * Skipping requires a populated matview being refreshed WITH DATA; without
+	 * the populated test a REFRESH ... WITH NO DATA followed by a plain REFRESH
+	 * would skip and leave the matview unpopulated for good.  Recording a
+	 * watermark is allowed more widely -- including for CREATE MATERIALIZED
+	 * VIEW, so that the first REFRESH after a create can skip -- which is why
+	 * the two decisions are separate predicates rather than one gate.
+	 *
+	 * CONCURRENTLY is excluded from both: refresh_by_match_merge updates the
+	 * matview in place, so its relfilenumber does not change and there is no
+	 * witness that the refreshing transaction committed.
+	 */
+	memset(&skip_capture, 0, sizeof(skip_capture));
+	if (RelationGetAutoSkipUnchanged(matviewRel) && !skipData && !concurrent)
 	{
-		ListCell   *lc;
-		bool		all_clean = true;
+		bool		allow_skip = !is_create && RelationIsPopulated(matviewRel);
 
-		foreach(lc, dataQuery->rtable)
+		if (MatviewSkipCheck(matviewRel, dataQuery, allow_skip, &skip_capture))
 		{
-			RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
-
-			if (rte->rtekind == RTE_RELATION)
-			{
-				MatviewDirtyRegister(rte->relid);
-				auto_skip_source_relids =
-					lappend_oid(auto_skip_source_relids, rte->relid);
-			}
-		}
-
-		foreach(lc, auto_skip_source_relids)
-		{
-			if (!MatviewDirtyIsClean(lfirst_oid(lc)))
-			{
-				all_clean = false;
-				break;
-			}
-		}
-
-		if (all_clean)
-		{
+			/* Nothing this matview depends on has changed. */
 			table_close(matviewRel, NoLock);
 			AtEOXact_GUC(false, save_nestlevel);
 			SetUserIdAndSecContext(save_userid, save_sec_context);
@@ -323,18 +329,8 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 				SetQueryCompletion(qc, CMDTAG_REFRESH_MATERIALIZED_VIEW, 0);
 			return address;
 		}
+		skip_fresh_snapshot = skip_capture.valid;
 	}
-
-	/*
-	 * Check for active uses of the relation in the current transaction, such
-	 * as open scans.
-	 *
-	 * NB: We count on this to protect us against problems with refreshing the
-	 * data using TABLE_INSERT_FROZEN.
-	 */
-	CheckTableNotInUse(matviewRel,
-					   is_create ? "CREATE MATERIALIZED VIEW" :
-					   "REFRESH MATERIALIZED VIEW");
 
 	/*
 	 * Tentatively mark the matview as populated or not (this will roll back
@@ -370,8 +366,23 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 		DestReceiver *dest;
 
 		dest = CreateTransientRelDestReceiver(OIDNewHeap);
+
+		/*
+		 * DBblue: the watermark's counters were captured above, before this
+		 * point, so the data-fill has to run on a snapshot taken after that
+		 * capture.  Otherwise a transaction committing between the statement's
+		 * own snapshot and the capture would be absent from the generated data
+		 * yet already counted in the watermark, and its rows would be lost from
+		 * the matview for good.
+		 */
+		if (skip_fresh_snapshot)
+			PushActiveSnapshot(GetLatestSnapshot());
+
 		processed = refresh_matview_datafill(dest, dataQuery, queryString,
 											 is_create);
+
+		if (skip_fresh_snapshot)
+			PopActiveSnapshot();
 	}
 
 	/* Make the matview match the newly generated data. */
@@ -408,17 +419,15 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 	}
 
 	/*
-	 * DBblue: refresh completed — mark every watched source table clean so
-	 * the next REFRESH with auto_skip_unchanged can be skipped if there are
-	 * no further writes.
+	 * DBblue: rebuild succeeded — record the watermark that lets a later
+	 * REFRESH skip.  This has to come after the heap swap above, because it
+	 * stores the matview's new relfilenumber as the witness that this
+	 * transaction committed: on rollback pg_class reverts and the watermark
+	 * stops matching, so an aborted refresh can never leave the matview
+	 * looking up to date.
 	 */
-	if (auto_skip_source_relids != NIL)
-	{
-		ListCell   *lc;
-
-		foreach(lc, auto_skip_source_relids)
-			MatviewDirtyMarkClean(lfirst_oid(lc));
-	}
+	if (skip_capture.valid)
+		MatviewSkipMarkClean(matviewOid, &skip_capture);
 
 	table_close(matviewRel, NoLock);
 

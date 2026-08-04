@@ -624,6 +624,13 @@
 },
 
 # This is PGC_SUSET to prevent hiding from log_lock_waits.
+{ name => 'dbblue_matview_skip_unchanged', type => 'bool', context => 'PGC_SUSET', group => 'CLIENT_CONN_STATEMENT',
+  short_desc => 'Allows REFRESH MATERIALIZED VIEW to skip the rebuild when nothing the matview depends on has changed.',
+  long_desc => 'Only affects materialized views defined with auto_skip_unchanged=true. Turning this off makes every REFRESH rebuild unconditionally.',
+  variable => 'dbblue_matview_skip_unchanged',
+  boot_val => 'true',
+},
+
 { name => 'deadlock_timeout', type => 'int', context => 'PGC_SUSET', group => 'LOCK_MANAGEMENT',
   short_desc => 'Sets the time to wait on a lock before checking for deadlock.',
   flags => 'GUC_UNIT_MS',
