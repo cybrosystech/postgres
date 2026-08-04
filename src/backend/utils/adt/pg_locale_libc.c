@@ -64,11 +64,6 @@
  * where this matters is treatment of I/i in Turkish, and the behavior is
  * meant to match the upper()/lower() SQL functions.
  *
- * We store the active collation setting in static variables.  In principle
- * it could be passed down to here via the regex library's "struct vars" data
- * structure; but that would require somewhat invasive changes in the regex
- * library, and right now there's no real benefit to be gained from that.
- *
  * NB: the coding here assumes pg_wchar is an unsigned type.
  */
 
@@ -82,101 +77,127 @@
 
 extern pg_locale_t create_pg_locale_libc(Oid collid, MemoryContext context);
 
-static int	strncoll_libc(const char *arg1, ssize_t len1,
-						  const char *arg2, ssize_t len2,
+static int	strncoll_libc(const char *arg1, size_t len1,
+						  const char *arg2, size_t len2,
 						  pg_locale_t locale);
+static int	strcoll_libc(const char *arg1, const char *arg2,
+						 pg_locale_t locale);
 static size_t strnxfrm_libc(char *dest, size_t destsize,
-							const char *src, ssize_t srclen,
+							const char *src, size_t srclen,
 							pg_locale_t locale);
+static size_t strxfrm_libc(char *dest, size_t destsize,
+						   const char *src, pg_locale_t locale);
 extern char *get_collation_actual_version_libc(const char *collcollate);
 static locale_t make_libc_collator(const char *collate,
 								   const char *ctype);
 
 #ifdef WIN32
-static int	strncoll_libc_win32_utf8(const char *arg1, ssize_t len1,
-									 const char *arg2, ssize_t len2,
+static int	strncoll_libc_win32_utf8(const char *arg1, size_t len1,
+									 const char *arg2, size_t len2,
 									 pg_locale_t locale);
+static int	strcoll_libc_win32_utf8(const char *arg1, const char *arg2,
+									pg_locale_t locale);
 #endif
 
 static size_t char2wchar(wchar_t *to, size_t tolen, const char *from,
 						 size_t fromlen, locale_t loc);
 
 static size_t strlower_libc_sb(char *dest, size_t destsize,
-							   const char *src, ssize_t srclen,
+							   const char *src, size_t srclen,
 							   pg_locale_t locale);
 static size_t strlower_libc_mb(char *dest, size_t destsize,
-							   const char *src, ssize_t srclen,
+							   const char *src, size_t srclen,
 							   pg_locale_t locale);
 static size_t strtitle_libc_sb(char *dest, size_t destsize,
-							   const char *src, ssize_t srclen,
+							   const char *src, size_t srclen,
 							   pg_locale_t locale);
 static size_t strtitle_libc_mb(char *dest, size_t destsize,
-							   const char *src, ssize_t srclen,
+							   const char *src, size_t srclen,
 							   pg_locale_t locale);
 static size_t strupper_libc_sb(char *dest, size_t destsize,
-							   const char *src, ssize_t srclen,
+							   const char *src, size_t srclen,
 							   pg_locale_t locale);
 static size_t strupper_libc_mb(char *dest, size_t destsize,
-							   const char *src, ssize_t srclen,
+							   const char *src, size_t srclen,
 							   pg_locale_t locale);
 
 static bool
 wc_isdigit_libc_sb(pg_wchar wc, pg_locale_t locale)
 {
+	if (wc > UCHAR_MAX)
+		return false;
 	return isdigit_l((unsigned char) wc, locale->lt);
 }
 
 static bool
 wc_isalpha_libc_sb(pg_wchar wc, pg_locale_t locale)
 {
+	if (wc > UCHAR_MAX)
+		return false;
 	return isalpha_l((unsigned char) wc, locale->lt);
 }
 
 static bool
 wc_isalnum_libc_sb(pg_wchar wc, pg_locale_t locale)
 {
+	if (wc > UCHAR_MAX)
+		return false;
 	return isalnum_l((unsigned char) wc, locale->lt);
 }
 
 static bool
 wc_isupper_libc_sb(pg_wchar wc, pg_locale_t locale)
 {
+	if (wc > UCHAR_MAX)
+		return false;
 	return isupper_l((unsigned char) wc, locale->lt);
 }
 
 static bool
 wc_islower_libc_sb(pg_wchar wc, pg_locale_t locale)
 {
+	if (wc > UCHAR_MAX)
+		return false;
 	return islower_l((unsigned char) wc, locale->lt);
 }
 
 static bool
 wc_isgraph_libc_sb(pg_wchar wc, pg_locale_t locale)
 {
+	if (wc > UCHAR_MAX)
+		return false;
 	return isgraph_l((unsigned char) wc, locale->lt);
 }
 
 static bool
 wc_isprint_libc_sb(pg_wchar wc, pg_locale_t locale)
 {
+	if (wc > UCHAR_MAX)
+		return false;
 	return isprint_l((unsigned char) wc, locale->lt);
 }
 
 static bool
 wc_ispunct_libc_sb(pg_wchar wc, pg_locale_t locale)
 {
+	if (wc > UCHAR_MAX)
+		return false;
 	return ispunct_l((unsigned char) wc, locale->lt);
 }
 
 static bool
 wc_isspace_libc_sb(pg_wchar wc, pg_locale_t locale)
 {
+	if (wc > UCHAR_MAX)
+		return false;
 	return isspace_l((unsigned char) wc, locale->lt);
 }
 
 static bool
 wc_isxdigit_libc_sb(pg_wchar wc, pg_locale_t locale)
 {
+	if (wc > UCHAR_MAX)
+		return false;
 #ifndef WIN32
 	return isxdigit_l((unsigned char) wc, locale->lt);
 #else
@@ -187,6 +208,8 @@ wc_isxdigit_libc_sb(pg_wchar wc, pg_locale_t locale)
 static bool
 wc_iscased_libc_sb(pg_wchar wc, pg_locale_t locale)
 {
+	if (wc > UCHAR_MAX)
+		return false;
 	return isupper_l((unsigned char) wc, locale->lt) ||
 		islower_l((unsigned char) wc, locale->lt);
 }
@@ -194,60 +217,80 @@ wc_iscased_libc_sb(pg_wchar wc, pg_locale_t locale)
 static bool
 wc_isdigit_libc_mb(pg_wchar wc, pg_locale_t locale)
 {
+	if (sizeof(wchar_t) < 4 && wc > (pg_wchar) 0xFFFF)
+		return false;
 	return iswdigit_l((wint_t) wc, locale->lt);
 }
 
 static bool
 wc_isalpha_libc_mb(pg_wchar wc, pg_locale_t locale)
 {
+	if (sizeof(wchar_t) < 4 && wc > (pg_wchar) 0xFFFF)
+		return false;
 	return iswalpha_l((wint_t) wc, locale->lt);
 }
 
 static bool
 wc_isalnum_libc_mb(pg_wchar wc, pg_locale_t locale)
 {
+	if (sizeof(wchar_t) < 4 && wc > (pg_wchar) 0xFFFF)
+		return false;
 	return iswalnum_l((wint_t) wc, locale->lt);
 }
 
 static bool
 wc_isupper_libc_mb(pg_wchar wc, pg_locale_t locale)
 {
+	if (sizeof(wchar_t) < 4 && wc > (pg_wchar) 0xFFFF)
+		return false;
 	return iswupper_l((wint_t) wc, locale->lt);
 }
 
 static bool
 wc_islower_libc_mb(pg_wchar wc, pg_locale_t locale)
 {
+	if (sizeof(wchar_t) < 4 && wc > (pg_wchar) 0xFFFF)
+		return false;
 	return iswlower_l((wint_t) wc, locale->lt);
 }
 
 static bool
 wc_isgraph_libc_mb(pg_wchar wc, pg_locale_t locale)
 {
+	if (sizeof(wchar_t) < 4 && wc > (pg_wchar) 0xFFFF)
+		return false;
 	return iswgraph_l((wint_t) wc, locale->lt);
 }
 
 static bool
 wc_isprint_libc_mb(pg_wchar wc, pg_locale_t locale)
 {
+	if (sizeof(wchar_t) < 4 && wc > (pg_wchar) 0xFFFF)
+		return false;
 	return iswprint_l((wint_t) wc, locale->lt);
 }
 
 static bool
 wc_ispunct_libc_mb(pg_wchar wc, pg_locale_t locale)
 {
+	if (sizeof(wchar_t) < 4 && wc > (pg_wchar) 0xFFFF)
+		return false;
 	return iswpunct_l((wint_t) wc, locale->lt);
 }
 
 static bool
 wc_isspace_libc_mb(pg_wchar wc, pg_locale_t locale)
 {
+	if (sizeof(wchar_t) < 4 && wc > (pg_wchar) 0xFFFF)
+		return false;
 	return iswspace_l((wint_t) wc, locale->lt);
 }
 
 static bool
 wc_isxdigit_libc_mb(pg_wchar wc, pg_locale_t locale)
 {
+	if (sizeof(wchar_t) < 4 && wc > (pg_wchar) 0xFFFF)
+		return false;
 #ifndef WIN32
 	return iswxdigit_l((wint_t) wc, locale->lt);
 #else
@@ -258,6 +301,8 @@ wc_isxdigit_libc_mb(pg_wchar wc, pg_locale_t locale)
 static bool
 wc_iscased_libc_mb(pg_wchar wc, pg_locale_t locale)
 {
+	if (sizeof(wchar_t) < 4 && wc > (pg_wchar) 0xFFFF)
+		return false;
 	return iswupper_l((wint_t) wc, locale->lt) ||
 		iswlower_l((wint_t) wc, locale->lt);
 }
@@ -270,7 +315,7 @@ toupper_libc_sb(pg_wchar wc, pg_locale_t locale)
 	/* force C behavior for ASCII characters, per comments above */
 	if (locale->is_default && wc <= (pg_wchar) 127)
 		return pg_ascii_toupper((unsigned char) wc);
-	if (wc <= (pg_wchar) UCHAR_MAX)
+	else if (wc <= (pg_wchar) UCHAR_MAX)
 		return toupper_l((unsigned char) wc, locale->lt);
 	else
 		return wc;
@@ -284,7 +329,7 @@ toupper_libc_mb(pg_wchar wc, pg_locale_t locale)
 	/* force C behavior for ASCII characters, per comments above */
 	if (locale->is_default && wc <= (pg_wchar) 127)
 		return pg_ascii_toupper((unsigned char) wc);
-	if (sizeof(wchar_t) >= 4 || wc <= (pg_wchar) 0xFFFF)
+	else if (sizeof(wchar_t) >= 4 || wc <= (pg_wchar) 0xFFFF)
 		return towupper_l((wint_t) wc, locale->lt);
 	else
 		return wc;
@@ -298,7 +343,7 @@ tolower_libc_sb(pg_wchar wc, pg_locale_t locale)
 	/* force C behavior for ASCII characters, per comments above */
 	if (locale->is_default && wc <= (pg_wchar) 127)
 		return pg_ascii_tolower((unsigned char) wc);
-	if (wc <= (pg_wchar) UCHAR_MAX)
+	else if (wc <= (pg_wchar) UCHAR_MAX)
 		return tolower_l((unsigned char) wc, locale->lt);
 	else
 		return wc;
@@ -312,7 +357,7 @@ tolower_libc_mb(pg_wchar wc, pg_locale_t locale)
 	/* force C behavior for ASCII characters, per comments above */
 	if (locale->is_default && wc <= (pg_wchar) 127)
 		return pg_ascii_tolower((unsigned char) wc);
-	if (sizeof(wchar_t) >= 4 || wc <= (pg_wchar) 0xFFFF)
+	else if (sizeof(wchar_t) >= 4 || wc <= (pg_wchar) 0xFFFF)
 		return towlower_l((wint_t) wc, locale->lt);
 	else
 		return wc;
@@ -324,7 +369,7 @@ tolower_libc_mb(pg_wchar wc, pg_locale_t locale)
  */
 static size_t
 downcase_ident_libc_sb(char *dst, size_t dstsize, const char *src,
-					   ssize_t srclen, pg_locale_t locale)
+					   size_t srclen, pg_locale_t locale)
 {
 	locale_t	loc = locale->lt;
 	int			i;
@@ -420,8 +465,11 @@ static const struct ctype_methods ctype_methods_libc_utf8 = {
 
 static const struct collate_methods collate_methods_libc = {
 	.strncoll = strncoll_libc,
+	.strcoll = strcoll_libc,
 	.strnxfrm = strnxfrm_libc,
+	.strxfrm = strxfrm_libc,
 	.strnxfrm_prefix = NULL,
+	.strxfrm_prefix = NULL,
 
 	/*
 	 * Unfortunately, it seems that strxfrm() for non-C collations is broken
@@ -442,7 +490,9 @@ static const struct collate_methods collate_methods_libc = {
 #ifdef WIN32
 static const struct collate_methods collate_methods_libc_win32_utf8 = {
 	.strncoll = strncoll_libc_win32_utf8,
+	.strcoll = strcoll_libc_win32_utf8,
 	.strnxfrm = strnxfrm_libc,
+	.strxfrm = strxfrm_libc,
 	.strnxfrm_prefix = NULL,
 #ifdef TRUST_STRXFRM
 	.strxfrm_is_safe = true,
@@ -453,12 +503,9 @@ static const struct collate_methods collate_methods_libc_win32_utf8 = {
 #endif
 
 static size_t
-strlower_libc_sb(char *dest, size_t destsize, const char *src, ssize_t srclen,
+strlower_libc_sb(char *dest, size_t destsize, const char *src, size_t srclen,
 				 pg_locale_t locale)
 {
-	if (srclen < 0)
-		srclen = strlen(src);
-
 	if (srclen + 1 <= destsize)
 	{
 		locale_t	loc = locale->lt;
@@ -480,7 +527,7 @@ strlower_libc_sb(char *dest, size_t destsize, const char *src, ssize_t srclen,
 			{
 				if (*p >= 'A' && *p <= 'Z')
 					*p += 'a' - 'A';
-				else if (IS_HIGHBIT_SET(*p) && isupper_l(*p, loc))
+				else if (IS_HIGHBIT_SET(*p) && isupper_l((unsigned char) *p, loc))
 					*p = tolower_l((unsigned char) *p, loc);
 			}
 			else
@@ -492,7 +539,7 @@ strlower_libc_sb(char *dest, size_t destsize, const char *src, ssize_t srclen,
 }
 
 static size_t
-strlower_libc_mb(char *dest, size_t destsize, const char *src, ssize_t srclen,
+strlower_libc_mb(char *dest, size_t destsize, const char *src, size_t srclen,
 				 pg_locale_t locale)
 {
 	locale_t	loc = locale->lt;
@@ -501,9 +548,6 @@ strlower_libc_mb(char *dest, size_t destsize, const char *src, ssize_t srclen,
 	char	   *result;
 	size_t		curr_char;
 	size_t		max_size;
-
-	if (srclen < 0)
-		srclen = strlen(src);
 
 	/* Overflow paranoia */
 	if ((srclen + 1) > (INT_MAX / sizeof(wchar_t)))
@@ -540,12 +584,9 @@ strlower_libc_mb(char *dest, size_t destsize, const char *src, ssize_t srclen,
 }
 
 static size_t
-strtitle_libc_sb(char *dest, size_t destsize, const char *src, ssize_t srclen,
+strtitle_libc_sb(char *dest, size_t destsize, const char *src, size_t srclen,
 				 pg_locale_t locale)
 {
-	if (srclen < 0)
-		srclen = strlen(src);
-
 	if (srclen + 1 <= destsize)
 	{
 		locale_t	loc = locale->lt;
@@ -570,14 +611,14 @@ strtitle_libc_sb(char *dest, size_t destsize, const char *src, ssize_t srclen,
 				{
 					if (*p >= 'A' && *p <= 'Z')
 						*p += 'a' - 'A';
-					else if (IS_HIGHBIT_SET(*p) && isupper_l(*p, loc))
+					else if (IS_HIGHBIT_SET(*p) && isupper_l((unsigned char) *p, loc))
 						*p = tolower_l((unsigned char) *p, loc);
 				}
 				else
 				{
 					if (*p >= 'a' && *p <= 'z')
 						*p -= 'a' - 'A';
-					else if (IS_HIGHBIT_SET(*p) && islower_l(*p, loc))
+					else if (IS_HIGHBIT_SET(*p) && islower_l((unsigned char) *p, loc))
 						*p = toupper_l((unsigned char) *p, loc);
 				}
 			}
@@ -596,7 +637,7 @@ strtitle_libc_sb(char *dest, size_t destsize, const char *src, ssize_t srclen,
 }
 
 static size_t
-strtitle_libc_mb(char *dest, size_t destsize, const char *src, ssize_t srclen,
+strtitle_libc_mb(char *dest, size_t destsize, const char *src, size_t srclen,
 				 pg_locale_t locale)
 {
 	locale_t	loc = locale->lt;
@@ -606,9 +647,6 @@ strtitle_libc_mb(char *dest, size_t destsize, const char *src, ssize_t srclen,
 	char	   *result;
 	size_t		curr_char;
 	size_t		max_size;
-
-	if (srclen < 0)
-		srclen = strlen(src);
 
 	/* Overflow paranoia */
 	if ((srclen + 1) > (INT_MAX / sizeof(wchar_t)))
@@ -651,12 +689,9 @@ strtitle_libc_mb(char *dest, size_t destsize, const char *src, ssize_t srclen,
 }
 
 static size_t
-strupper_libc_sb(char *dest, size_t destsize, const char *src, ssize_t srclen,
+strupper_libc_sb(char *dest, size_t destsize, const char *src, size_t srclen,
 				 pg_locale_t locale)
 {
-	if (srclen < 0)
-		srclen = strlen(src);
-
 	if (srclen + 1 <= destsize)
 	{
 		locale_t	loc = locale->lt;
@@ -678,7 +713,7 @@ strupper_libc_sb(char *dest, size_t destsize, const char *src, ssize_t srclen,
 			{
 				if (*p >= 'a' && *p <= 'z')
 					*p -= 'a' - 'A';
-				else if (IS_HIGHBIT_SET(*p) && islower_l(*p, loc))
+				else if (IS_HIGHBIT_SET(*p) && islower_l((unsigned char) *p, loc))
 					*p = toupper_l((unsigned char) *p, loc);
 			}
 			else
@@ -690,7 +725,7 @@ strupper_libc_sb(char *dest, size_t destsize, const char *src, ssize_t srclen,
 }
 
 static size_t
-strupper_libc_mb(char *dest, size_t destsize, const char *src, ssize_t srclen,
+strupper_libc_mb(char *dest, size_t destsize, const char *src, size_t srclen,
 				 pg_locale_t locale)
 {
 	locale_t	loc = locale->lt;
@@ -699,9 +734,6 @@ strupper_libc_mb(char *dest, size_t destsize, const char *src, ssize_t srclen,
 	char	   *result;
 	size_t		curr_char;
 	size_t		max_size;
-
-	if (srclen < 0)
-		srclen = strlen(src);
 
 	/* Overflow paranoia */
 	if ((srclen + 1) > (INT_MAX / sizeof(wchar_t)))
@@ -888,18 +920,18 @@ make_libc_collator(const char *collate, const char *ctype)
 /*
  * strncoll_libc
  *
- * NUL-terminate arguments, if necessary, and pass to strcoll_l().
- *
- * An input string length of -1 means that it's already NUL-terminated.
+ * NUL-terminate arguments and pass to strcoll_l().
  */
-int
-strncoll_libc(const char *arg1, ssize_t len1, const char *arg2, ssize_t len2,
+static int
+strncoll_libc(const char *arg1, size_t len1, const char *arg2, size_t len2,
 			  pg_locale_t locale)
 {
 	char		sbuf[TEXTBUFLEN];
 	char	   *buf = sbuf;
-	size_t		bufsize1 = (len1 == -1) ? 0 : len1 + 1;
-	size_t		bufsize2 = (len2 == -1) ? 0 : len2 + 1;
+	size_t		bufsize1 = len1 + 1;
+	size_t		bufsize2 = len2 + 1;
+	char	   *buf1;
+	char	   *buf2;
 	const char *arg1n;
 	const char *arg2n;
 	int			result;
@@ -907,32 +939,16 @@ strncoll_libc(const char *arg1, ssize_t len1, const char *arg2, ssize_t len2,
 	if (bufsize1 + bufsize2 > TEXTBUFLEN)
 		buf = palloc(bufsize1 + bufsize2);
 
-	/* nul-terminate arguments if necessary */
-	if (len1 == -1)
-	{
-		arg1n = arg1;
-	}
-	else
-	{
-		char	   *buf1 = buf;
+	buf1 = buf;
+	buf2 = buf + bufsize1;
 
-		memcpy(buf1, arg1, len1);
-		buf1[len1] = '\0';
-		arg1n = buf1;
-	}
+	memcpy(buf1, arg1, len1);
+	buf1[len1] = '\0';
+	arg1n = buf1;
 
-	if (len2 == -1)
-	{
-		arg2n = arg2;
-	}
-	else
-	{
-		char	   *buf2 = buf + bufsize1;
-
-		memcpy(buf2, arg2, len2);
-		buf2[len2] = '\0';
-		arg2n = buf2;
-	}
+	memcpy(buf2, arg2, len2);
+	buf2[len2] = '\0';
+	arg2n = buf2;
 
 	result = strcoll_l(arg1n, arg2n, locale->lt);
 
@@ -943,23 +959,27 @@ strncoll_libc(const char *arg1, ssize_t len1, const char *arg2, ssize_t len2,
 }
 
 /*
+ * strcoll_libc
+ */
+static int
+strcoll_libc(const char *arg1, const char *arg2, pg_locale_t locale)
+{
+	return strcoll_l(arg1, arg2, locale->lt);
+}
+
+/*
  * strnxfrm_libc
  *
- * NUL-terminate src, if necessary, and pass to strxfrm_l().
- *
- * A source length of -1 means that it's already NUL-terminated.
+ * NUL-terminate src and pass to strxfrm_l().
  */
-size_t
-strnxfrm_libc(char *dest, size_t destsize, const char *src, ssize_t srclen,
+static size_t
+strnxfrm_libc(char *dest, size_t destsize, const char *src, size_t srclen,
 			  pg_locale_t locale)
 {
 	char		sbuf[TEXTBUFLEN];
 	char	   *buf = sbuf;
 	size_t		bufsize = srclen + 1;
 	size_t		result;
-
-	if (srclen == -1)
-		return strxfrm_l(dest, src, destsize, locale->lt);
 
 	if (bufsize > TEXTBUFLEN)
 		buf = palloc(bufsize);
@@ -977,6 +997,15 @@ strnxfrm_libc(char *dest, size_t destsize, const char *src, ssize_t srclen,
 	Assert(result >= destsize || dest[result] == '\0');
 
 	return result;
+}
+
+/*
+ * strxfrm_libc
+ */
+static size_t
+strxfrm_libc(char *dest, size_t destsize, const char *src, pg_locale_t locale)
+{
+	return strxfrm_l(dest, src, destsize, locale->lt);
 }
 
 char *
@@ -1049,35 +1078,34 @@ get_collation_actual_version_libc(const char *collcollate)
  *
  * Win32 does not have UTF-8. Convert UTF8 arguments to wide characters and
  * invoke wcscoll_l().
- *
- * An input string length of -1 means that it's NUL-terminated.
  */
 #ifdef WIN32
 static int
-strncoll_libc_win32_utf8(const char *arg1, ssize_t len1, const char *arg2,
-						 ssize_t len2, pg_locale_t locale)
+strncoll_libc_win32_utf8(const char *arg1, size_t len1, const char *arg2,
+						 size_t len2, pg_locale_t locale)
 {
 	char		sbuf[TEXTBUFLEN];
 	char	   *buf = sbuf;
 	char	   *a1p,
 			   *a2p;
-	int			a1len;
-	int			a2len;
+	size_t		a1len,
+				a2len,
+				buflen;
 	int			r;
 	int			result;
 
 	Assert(GetDatabaseEncoding() == PG_UTF8);
 
-	if (len1 == -1)
-		len1 = strlen(arg1);
-	if (len2 == -1)
-		len2 = strlen(arg2);
+	/*
+	 * In a 32-bit build, twice the input length can overflow size_t, so we
+	 * must be careful.
+	 */
+	a1len = add_size(add_size(len1, len1), 2);
+	a2len = add_size(add_size(len2, len2), 2);
+	buflen = add_size(a1len, a2len);
 
-	a1len = len1 * 2 + 2;
-	a2len = len2 * 2 + 2;
-
-	if (a1len + a2len > TEXTBUFLEN)
-		buf = palloc(a1len + a2len);
+	if (buflen > TEXTBUFLEN)
+		buf = palloc(buflen);
 
 	a1p = buf;
 	a2p = buf + a1len;
@@ -1119,6 +1147,16 @@ strncoll_libc_win32_utf8(const char *arg1, ssize_t len1, const char *arg2,
 		pfree(buf);
 
 	return result;
+}
+
+static int
+strcoll_libc_win32_utf8(const char *arg1, const char *arg2,
+						pg_locale_t locale)
+{
+	size_t		len1 = strlen(arg1);
+	size_t		len2 = strlen(arg2);
+
+	return strncoll_libc_win32_utf8(arg1, len1, arg2, len2, locale);
 }
 #endif							/* WIN32 */
 

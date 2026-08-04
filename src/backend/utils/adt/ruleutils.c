@@ -512,6 +512,8 @@ static void get_json_agg_constructor(JsonConstructorExpr *ctor,
 									 deparse_context *context,
 									 const char *funcname,
 									 bool is_json_objectagg);
+static void get_json_agg_constructor_expr(Node *node, deparse_context *context,
+										  void *callback_arg);
 static void simple_quote_literal(StringInfo buf, const char *val);
 static void get_sublink_expr(SubLink *sublink, deparse_context *context);
 static void get_tablefunc(TableFunc *tf, deparse_context *context,
@@ -12281,6 +12283,21 @@ get_json_constructor(JsonConstructorExpr *ctor, deparse_context *context,
 		get_json_agg_constructor(ctor, context, "JSON_ARRAYAGG", false);
 		return;
 	}
+	else if (ctor->type == JSCTOR_JSON_ARRAY_QUERY)
+	{
+		Query	   *query = castNode(Query, ctor->orig_query);
+
+		appendStringInfo(buf, "JSON_ARRAY(");
+
+		get_query_def(query, buf, context->namespaces, NULL, false,
+					  context->prettyFlags, context->wrapColumn,
+					  context->indentLevel);
+
+		get_json_constructor_options(ctor, buf);
+		appendStringInfoChar(buf, ')');
+
+		return;
+	}
 
 	switch (ctor->type)
 	{
@@ -12374,9 +12391,39 @@ get_json_agg_constructor(JsonConstructorExpr *ctor, deparse_context *context,
 		get_windowfunc_expr_helper((WindowFunc *) ctor->func, context,
 								   funcname, options.data,
 								   is_json_objectagg);
+	else if (IsA(ctor->func, Var))
+	{
+		/*
+		 * If the aggregate is computed by a lower plan node, setrefs.c will
+		 * have replaced the Aggref or WindowFunc with a Var referencing that
+		 * node's output.  Chase the Var back to it so we can still print the
+		 * original JSON aggregate syntax.  This only happens in EXPLAIN.
+		 */
+		resolve_special_varno((Node *) ctor->func, context,
+							  get_json_agg_constructor_expr, ctor);
+	}
 	else
 		elog(ERROR, "invalid JsonConstructorExpr underlying node type: %d",
 			 nodeTag(ctor->func));
+}
+
+/*
+ * Deparse a JsonConstructorExpr whose aggregate is computed by a lower plan
+ * node; resolve_special_varno has located the underlying Aggref/WindowFunc.
+ */
+static void
+get_json_agg_constructor_expr(Node *node, deparse_context *context,
+							  void *callback_arg)
+{
+	JsonConstructorExpr ctor;
+
+	if (!IsA(node, Aggref) && !IsA(node, WindowFunc))
+		elog(ERROR, "JSON aggregate constructor does not point to an Aggref or WindowFunc");
+
+	/* Flat copy suffices; we only replace func. */
+	ctor = *(JsonConstructorExpr *) callback_arg;
+	ctor.func = (Expr *) node;
+	get_json_constructor(&ctor, context, false);
 }
 
 /*
@@ -13861,23 +13908,15 @@ generate_qualified_relation_name(Oid relid)
 {
 	HeapTuple	tp;
 	Form_pg_class reltup;
-	char	   *relname;
-	char	   *nspname;
 	char	   *result;
 
 	tp = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
 	if (!HeapTupleIsValid(tp))
 		elog(ERROR, "cache lookup failed for relation %u", relid);
 	reltup = (Form_pg_class) GETSTRUCT(tp);
-	relname = NameStr(reltup->relname);
 
-	nspname = get_namespace_name_or_temp(reltup->relnamespace);
-	if (!nspname)
-		elog(ERROR, "cache lookup failed for namespace %u",
-			 reltup->relnamespace);
-
-	result = quote_qualified_identifier(nspname, relname);
-
+	result = get_qualified_objname(reltup->relnamespace,
+								   NameStr(reltup->relname));
 	ReleaseSysCache(tp);
 
 	return result;

@@ -2158,9 +2158,17 @@ GetSnapshotData(Snapshot snapshot)
 		snapshot->subxip = (TransactionId *)
 			malloc(GetMaxSnapshotSubxidCount() * sizeof(TransactionId));
 		if (snapshot->subxip == NULL)
+		{
+			/*
+			 * Clean up the Snapshot state before throwing the error, so that
+			 * a retry does not see a partially-initialized snapshot.
+			 */
+			free(snapshot->xip);
+			snapshot->xip = NULL;
 			ereport(ERROR,
 					(errcode(ERRCODE_OUT_OF_MEMORY),
 					 errmsg("out of memory")));
+		}
 	}
 
 	/*
@@ -2623,11 +2631,9 @@ ProcArrayInstallRestoredXmin(TransactionId xmin, PGPROC *proc)
  *
  * Note that if any transaction has overflowed its cached subtransactions
  * then there is no real need include any subtransactions.
- *
- * If 'dbid' is valid, only gather transactions running in that database.
  */
 RunningTransactions
-GetRunningTransactionData(Oid dbid)
+GetRunningTransactionData(void)
 {
 	/* result workspace */
 	static RunningTransactionsData CurrentRunningXactsData;
@@ -2703,18 +2709,6 @@ GetRunningTransactionData(Oid dbid)
 			continue;
 
 		/*
-		 * Filter by database OID if requested.
-		 */
-		if (OidIsValid(dbid))
-		{
-			int			pgprocno = arrayP->pgprocnos[index];
-			PGPROC	   *proc = &allProcs[pgprocno];
-
-			if (proc->databaseId != dbid)
-				continue;
-		}
-
-		/*
 		 * Be careful not to exclude any xids before calculating the values of
 		 * oldestRunningXid and suboverflowed, since these are used to clean
 		 * up transaction information held on standbys.
@@ -2765,12 +2759,6 @@ GetRunningTransactionData(Oid dbid)
 			int			nsubxids;
 
 			/*
-			 * Filter by database OID if requested.
-			 */
-			if (OidIsValid(dbid) && proc->databaseId != dbid)
-				continue;
-
-			/*
 			 * Save subtransaction XIDs. Other backends can't add or remove
 			 * entries while we're holding XidGenLock.
 			 */
@@ -2803,7 +2791,6 @@ GetRunningTransactionData(Oid dbid)
 	 * increases if slots do.
 	 */
 
-	CurrentRunningXacts->dbid = dbid;
 	CurrentRunningXacts->xcnt = count - subcount;
 	CurrentRunningXacts->subxcnt = subcount;
 	CurrentRunningXacts->subxid_status = suboverflowed ? SUBXIDS_IN_SUBTRANS : SUBXIDS_IN_ARRAY;

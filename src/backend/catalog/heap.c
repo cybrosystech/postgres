@@ -263,7 +263,8 @@ SystemAttributeByName(const char *attname)
 
 /* ----------------------------------------------------------------
  *				XXX END OF UGLY HARD CODED BADNESS XXX
- * ---------------------------------------------------------------- */
+ * ----------------------------------------------------------------
+ */
 
 
 /* ----------------------------------------------------------------
@@ -869,6 +870,9 @@ AddNewAttributeTuples(Oid new_rel_oid,
 	{
 		Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
 
+		if (attr->attisdropped)
+			continue;
+
 		/* Add dependency info */
 		ObjectAddressSubSet(myself, RelationRelationId, new_rel_oid, i + 1);
 		ObjectAddressSet(referenced, TypeRelationId, attr->atttypid);
@@ -1347,12 +1351,14 @@ heap_create_with_catalog(const char *relname,
 	/*
 	 * Decide whether to create a pg_type entry for the relation's rowtype.
 	 * These types are made except where the use of a relation as such is an
-	 * implementation detail: toast tables, sequences and indexes.
+	 * implementation detail: toast tables, sequences, indexes, and property
+	 * graphs.
 	 */
 	if (!(relkind == RELKIND_SEQUENCE ||
 		  relkind == RELKIND_TOASTVALUE ||
 		  relkind == RELKIND_INDEX ||
-		  relkind == RELKIND_PARTITIONED_INDEX))
+		  relkind == RELKIND_PARTITIONED_INDEX ||
+		  relkind == RELKIND_PROPGRAPH))
 	{
 		Oid			new_array_oid;
 		ObjectAddress new_type_addr;
