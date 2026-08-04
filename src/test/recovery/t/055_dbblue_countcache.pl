@@ -27,6 +27,7 @@ my $primary = PostgreSQL::Test::Cluster->new('primary');
 $primary->init(allows_streaming => 1);
 $primary->append_conf(
 	'postgresql.conf', q{
+dbblue_track_relation_writes = on
 dbblue_count_cache = on
 dbblue_offset_flip = on
 max_prepared_transactions = 10

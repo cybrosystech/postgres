@@ -80,6 +80,17 @@ static List *xact_written_rels = NIL;
 /* One-entry memo so a bulk load pays only a comparison per row. */
 static Oid	last_noted_rel = InvalidOid;
 
+/*
+ * Whether to maintain per-relation write stamps at all.  PGC_POSTMASTER,
+ * because it decides whether the shared area is allocated -- and because a
+ * per-session setting would be unsound: a session with it off would not bump
+ * stamps while another session cached counts against them.
+ *
+ * With this off the COUNT cache cannot operate, since dbblue_relmod_read()
+ * then returns DBBLUE_RELMOD_EPOCH_INVALID and no cached count ever validates.
+ */
+bool		dbblue_track_relation_writes = false;
+
 static void DBBlueRelModShmemRequest(void *arg);
 static void DBBlueRelModShmemInit(void *arg);
 
@@ -91,6 +102,9 @@ const ShmemCallbacks DBBlueRelModShmemCallbacks = {
 static void
 DBBlueRelModShmemRequest(void *arg)
 {
+	if (!dbblue_track_relation_writes)
+		return;
+
 	ShmemRequestStruct(.name = "DBblue Relation Modification Stamps",
 					   .size = sizeof(DBBlueRelModShared),
 					   .ptr = (void **) &relmod,
@@ -101,6 +115,9 @@ static void
 DBBlueRelModShmemInit(void *arg)
 {
 	int			i;
+
+	if (!dbblue_track_relation_writes)
+		return;
 
 	SpinLockInit(&relmod->mutex);
 
@@ -197,7 +214,7 @@ dbblue_relmod_read(Oid reloid)
 		 * No shared state (e.g. single-user bootstrap).  Return an epoch that
 		 * cannot match any real reading so nothing is ever served from cache.
 		 */
-		result.evict_epoch = PG_UINT64_MAX;
+		result.evict_epoch = DBBLUE_RELMOD_EPOCH_INVALID;
 		return result;
 	}
 
@@ -216,6 +233,13 @@ void
 dbblue_relmod_note_write(Oid reloid)
 {
 	MemoryContext oldcxt;
+
+	/*
+	 * The whole point of the postmaster switch: when tracking is off this is
+	 * the entire cost paid on the write path.
+	 */
+	if (!dbblue_track_relation_writes)
+		return;
 
 	if (!OidIsValid(reloid))
 		return;

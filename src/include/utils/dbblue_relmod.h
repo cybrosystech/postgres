@@ -31,6 +31,9 @@ typedef struct DBBlueRelModStamp
 
 extern PGDLLIMPORT const ShmemCallbacks DBBlueRelModShmemCallbacks;
 
+/* Maintain write stamps at all?  PGC_POSTMASTER; see dbblue_relmod.c. */
+extern PGDLLIMPORT bool dbblue_track_relation_writes;
+
 /*
  * Record that the current transaction has written to reloid.  Cheap and
  * idempotent within a transaction: the shared stamp is bumped only on the
@@ -67,9 +70,26 @@ extern DBBlueRelModStamp dbblue_relmod_read(Oid reloid);
  */
 extern void dbblue_relmod_invalidate_all(void);
 
+/*
+ * Epoch value dbblue_relmod_read() returns when there is no shared state to
+ * read -- write tracking disabled, or single-user bootstrap.  Treated as never
+ * equal to anything, including itself, so a reading taken without tracking can
+ * never validate a cached count.
+ */
+#define DBBLUE_RELMOD_EPOCH_INVALID		PG_UINT64_MAX
+
 static inline bool
 dbblue_relmod_stamp_equal(DBBlueRelModStamp a, DBBlueRelModStamp b)
 {
+	/*
+	 * Compare unequal if either reading was taken with no shared state.  Field
+	 * equality alone would report two such readings as equal -- both are
+	 * {0, INVALID} -- and serve a count that nothing was tracking.
+	 */
+	if (a.evict_epoch == DBBLUE_RELMOD_EPOCH_INVALID ||
+		b.evict_epoch == DBBLUE_RELMOD_EPOCH_INVALID)
+		return false;
+
 	return a.stamp == b.stamp && a.evict_epoch == b.evict_epoch;
 }
 
