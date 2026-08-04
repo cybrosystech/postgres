@@ -192,6 +192,15 @@ dbblue_fkey_set_trusted(Oid conoid, Oid conrelid, const char *conname,
  * was not checked against them.
  */
 static List *dbblue_pending_untrust = NIL;
+
+/*
+ * Constraints already examined this transaction, whether or not they turned
+ * out to be trusted.  Without this a bypass that finds nothing to withdraw
+ * would re-examine the catalog for every row: a restore run with triggers
+ * disabled skips an RI trigger per foreign key per row, and paid a catalog
+ * lookup for each one.
+ */
+static List *dbblue_bypass_seen = NIL;
 static bool dbblue_untrust_callback_registered = false;
 
 static bool
@@ -225,15 +234,18 @@ dbblue_untrust_at_xact_end(XactEvent event, void *arg)
 	List	   *pending = dbblue_pending_untrust;
 	ListCell   *lc;
 
-	if (pending == NIL)
-		return;
-
+	/*
+	 * Both lists live in TopTransactionContext, so they are freed underneath
+	 * us at end of transaction.  Drop the pointers on every event we handle,
+	 * never conditionally, or the next transaction reads freed memory.
+	 */
 	switch (event)
 	{
 		case XACT_EVENT_PRE_COMMIT:
 		case XACT_EVENT_PARALLEL_PRE_COMMIT:
 			/* still safe to write catalogs here */
 			dbblue_pending_untrust = NIL;
+			dbblue_bypass_seen = NIL;
 			foreach(lc, pending)
 			{
 				if (dbblue_fkey_delete_row(lfirst_oid(lc)))
@@ -246,12 +258,14 @@ dbblue_untrust_at_xact_end(XactEvent event, void *arg)
 							 errhint("Run dbblue_trust_foreign_keys() to re-verify "
 									 "and restore it.")));
 			}
-			CommandCounterIncrement();
+			if (pending != NIL)
+				CommandCounterIncrement();
 			break;
 		case XACT_EVENT_ABORT:
 		case XACT_EVENT_PARALLEL_ABORT:
 			/* nothing was written, so nothing to withdraw */
 			dbblue_pending_untrust = NIL;
+			dbblue_bypass_seen = NIL;
 			break;
 		default:
 			break;
@@ -278,8 +292,20 @@ DbblueFkeyNoteBypass(Oid conoid)
 
 	if (!OidIsValid(conoid))
 		return;
-	if (list_member_oid(dbblue_pending_untrust, conoid))
+
+	/*
+	 * One catalog lookup per constraint per transaction, no matter how many
+	 * rows go by.  Record the constraint as examined before deciding, so that
+	 * "not trusted" is remembered too -- that is the case a bulk load hits,
+	 * once per row per foreign key.
+	 */
+	if (list_member_oid(dbblue_bypass_seen, conoid))
 		return;
+
+	oldcxt = MemoryContextSwitchTo(TopTransactionContext);
+	dbblue_bypass_seen = lappend_oid(dbblue_bypass_seen, conoid);
+	MemoryContextSwitchTo(oldcxt);
+
 	/* not trusted: nothing to withdraw */
 	if (!DbblueFkeyTrustRowExists(conoid))
 		return;
