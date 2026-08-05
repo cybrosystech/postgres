@@ -1389,15 +1389,15 @@ GetCachedPlan(CachedPlanSource *plansource, ParamListInfo boundParams,
 			? plansource->total_custom_cost / plansource->num_custom_plans
 			: -1.0;
 
-		elog(LOG,
-			 "[plancache] chose=%s generic_cost=%.2f avg_custom_cost=%.2f "
-			 "n_custom=%d n_generic=%d :: %s",
-			 customplan ? "CUSTOM" : "GENERIC",
-			 plansource->generic_cost,
-			 dbblue_avg_custom,
-			 plansource->num_custom_plans,
-			 plansource->num_generic_plans,
-			 plansource->query_string ? plansource->query_string : "<no query text>");
+		// elog(LOG,
+		// 	 "[plancache] chose=%s generic_cost=%.2f avg_custom_cost=%.2f "
+		// 	 "n_custom=%d n_generic=%d :: %s",
+		// 	 customplan ? "CUSTOM" : "GENERIC",
+		// 	 plansource->generic_cost,
+		// 	 dbblue_avg_custom,
+		// 	 plansource->num_custom_plans,
+		// 	 plansource->num_generic_plans,
+		// 	 plansource->query_string ? plansource->query_string : "<no query text>");
 	}
 
 	Assert(plan != NULL);

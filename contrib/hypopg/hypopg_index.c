@@ -68,6 +68,13 @@
 #include "utils/ruleutils.h"
 #endif
 #include "utils/syscache.h"
+/*
+ * Up to pg18 this was reached through funcapi.h -> executor/executor.h ->
+ * executor/execdesc.h -> nodes/execnodes.h.  pg19 stopped including it from
+ * execnodes.h, and without a declaration tuplestore_begin_heap() is assumed
+ * to return int, which truncates the returned pointer.
+ */
+#include "utils/tuplestore.h"
 
 #include "include/hypopg.h"
 #include "include/hypopg_index.h"
