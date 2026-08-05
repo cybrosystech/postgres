@@ -171,6 +171,24 @@ static relopt_bool boolRelOpts[] =
 		},
 		false
 	},
+	{
+		{
+			"incremental_refresh",
+			"Maintain this materialized view incrementally on source table writes (DBblue)",
+			RELOPT_KIND_HEAP,
+			ShareUpdateExclusiveLock
+		},
+		false
+	},
+	{
+		{
+			"allow_stable_keys",
+			"Allow STABLE GROUP BY key expressions (e.g. to_char/date_trunc month buckets) in an incremental matview, accepting documented staleness after a TimeZone/lc_time change until the next REFRESH (DBblue)",
+			RELOPT_KIND_HEAP,
+			ShareUpdateExclusiveLock
+		},
+		false
+	},
 	/* list terminator */
 	{{NULL}}
 };
@@ -2036,7 +2054,11 @@ default_reloptions(Datum reloptions, bool validate, relopt_kind kind)
 		{"vacuum_max_eager_freeze_failure_rate", RELOPT_TYPE_REAL,
 		offsetof(StdRdOptions, vacuum_max_eager_freeze_failure_rate)},
 		{"auto_skip_unchanged", RELOPT_TYPE_BOOL,
-		offsetof(StdRdOptions, auto_skip_unchanged)}
+		offsetof(StdRdOptions, auto_skip_unchanged)},
+		{"incremental_refresh", RELOPT_TYPE_BOOL,
+		offsetof(StdRdOptions, incremental_refresh)},
+		{"allow_stable_keys", RELOPT_TYPE_BOOL,
+		offsetof(StdRdOptions, allow_stable_keys)}
 	};
 
 	return (bytea *) build_reloptions(reloptions, validate, kind,

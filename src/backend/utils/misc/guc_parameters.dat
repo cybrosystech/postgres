@@ -647,6 +647,22 @@
   boot_val => 'true',
 },
 
+{ name => 'dbblue_ivm_deparse_delta', type => 'bool', context => 'PGC_USERSET', group => 'DEVELOPER_OPTIONS',
+  short_desc => 'DBblue: build incremental-matview delta SQL via the query-tree deparse core (on by default; set off only as a hand-builder escape hatch).',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'dbblue_ivm_deparse_delta',
+  boot_val => 'true',
+},
+
+{ name => 'dbblue_ivm_refresh_threshold', type => 'real', context => 'PGC_USERSET', group => 'DEVELOPER_OPTIONS',
+  short_desc => 'DBblue: rebuild an incremental matview with a full REFRESH when the rows a statement changes exceed this fraction of the source table estimated live tuples (0 disables the fallback).',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'dbblue_ivm_refresh_threshold',
+  boot_val => '0.5',
+  min => '0.0',
+  max => '1e12',
+},
+
 { name => 'dbblue_matview_skip_unchanged', type => 'bool', context => 'PGC_SUSET', group => 'CLIENT_CONN_STATEMENT',
   short_desc => 'Allows REFRESH MATERIALIZED VIEW to skip the rebuild when nothing the matview depends on has changed.',
   long_desc => 'Only affects materialized views defined with auto_skip_unchanged=true. Turning this off makes every REFRESH rebuild unconditionally.',

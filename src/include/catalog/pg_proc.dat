@@ -12722,5 +12722,9 @@
   proargmodes => '{i,o,o,o,o,o}',
   proargnames => '{table,relation,constraint_name,references,action,violating_rows}',
   prosrc => 'dbblue_untrust_foreign_keys_rel' },
+# DBblue: incremental refresh trigger for materialized views
+{ oid => '8335', descr => 'DBblue incremental refresh: apply delta to materialized view',
+  proname => 'matview_delta_apply', provolatile => 'v', prorettype => 'trigger',
+  proargtypes => '', prosrc => 'matview_delta_apply' },
 
 ]

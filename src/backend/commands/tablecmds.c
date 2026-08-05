@@ -62,6 +62,7 @@
 #include "commands/defrem.h"
 #include "commands/event_trigger.h"
 #include "commands/extension.h"
+#include "commands/matview_incr.h"
 #include "commands/repack.h"
 #include "commands/sequence.h"
 #include "commands/tablecmds.h"
@@ -4014,6 +4015,13 @@ renameatt_internal(Oid myrelid,
 						oldattname)));
 
 	/*
+	 * DBblue: refuse renaming a column an incremental materialized view depends
+	 * on — its stored delta SQL is keyed by column name and a rename would
+	 * silently break it.
+	 */
+	MatviewIncrCheckColumnRename(myrelid, attnum);
+
+	/*
 	 * if the attribute is inherited, forbid the renaming.  if this is a
 	 * top-level call to renameatt(), then expected_parents will be 0, so the
 	 * effect of this code will be to prohibit the renaming if the attribute
@@ -5015,7 +5023,8 @@ ATPrepCmd(List **wqueue, Relation rel, AlterTableCmd *cmd,
 		case AT_AddColumn:		/* ADD COLUMN */
 			ATSimplePermissions(cmd->subtype, rel,
 								ATT_TABLE | ATT_PARTITIONED_TABLE |
-								ATT_COMPOSITE_TYPE | ATT_FOREIGN_TABLE);
+								ATT_COMPOSITE_TYPE | ATT_FOREIGN_TABLE |
+								ATT_MATVIEW);	/* DBblue: incremental refresh adds __mv_count__ */
 			ATPrepAddColumn(wqueue, rel, recurse, recursing, false, cmd,
 							lockmode, context);
 			/* Recursion occurs during execution phase */

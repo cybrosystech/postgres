@@ -45,6 +45,7 @@
 #include "commands/extension.h"
 #include "commands/event_trigger.h"
 #include "commands/matview_dirty.h"
+#include "commands/matview_incr.h"
 #include "commands/tablespace.h"
 #include "commands/trigger.h"
 #include "commands/user.h"

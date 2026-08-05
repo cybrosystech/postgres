@@ -43,6 +43,7 @@ OBJS = \
 	lockcmds.o \
 	matview.o \
 	matview_dirty.o \
+	matview_incr.o \
 	opclasscmds.o \
 	operatorcmds.o \
 	policy.o \
