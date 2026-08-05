@@ -60,6 +60,9 @@ static bool dbblue_partition_enabled = false;
 static char *dbblue_partition_maintenance_dbname = NULL;
 static int	dbblue_partition_maintenance_interval = 3600;
 static char *dbblue_partition_maintenance_role = NULL;
+static bool dbblue_partition_auto_provision = true;
+static bool dbblue_partition_auto_reconnect = true;
+static char *dbblue_partition_odoo_role = NULL;
 
 pg_noreturn PGDLLEXPORT void dbblue_partition_bgw_main(Datum main_arg);
 
@@ -298,6 +301,55 @@ _PG_init(void)
 							   &dbblue_partition_maintenance_role,
 							   "",
 							   PGC_POSTMASTER,
+							   0,
+							   NULL, NULL, NULL);
+
+	/*
+	 * Read by the extension's install script, not by this worker.  They have
+	 * to be declared here all the same: _PG_init() calls
+	 * MarkGUCPrefixReserved() below, after which PostgreSQL rejects any
+	 * dbblue_partition.* setting that is not declared, so a placeholder GUC
+	 * is not an option.
+	 *
+	 * Both concern the Odoo compatibility layer, whose search_path half can
+	 * only ever reach a session at connection time -- so it must be in place
+	 * before Odoo connects, and CREATE EXTENSION is the earliest moment the
+	 * extension can act.  See the auto-provisioning block at the foot of
+	 * dbblue_partition--1.6.sql.
+	 */
+	DefineCustomBoolVariable("dbblue_partition.auto_provision",
+							 "Configure the Odoo role's search_path when the extension is installed.",
+							 "On by default. Turning it off means conversions will need Odoo's "
+							 "connections to be re-established unless "
+							 "dbblue_partition_odoo_provision() is run by hand beforehand.",
+							 &dbblue_partition_auto_provision,
+							 true,
+							 PGC_SUSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("dbblue_partition.auto_reconnect",
+							 "Re-establish the Odoo role's stale connections at the end of a conversion.",
+							 "On by default. A session reads its search_path default only at "
+							 "startup, so one opened before the role was configured can never see "
+							 "the compatibility views; terminating it makes Odoo's pool reconnect "
+							 "with the correct search_path on its next request. Turning this off "
+							 "means such a conversion leaves Odoo failing until it is reconnected "
+							 "by hand.",
+							 &dbblue_partition_auto_reconnect,
+							 true,
+							 PGC_SUSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomStringVariable("dbblue_partition.odoo_role",
+							   "Role that auto-provisioning configures at install time.",
+							   "Empty means the owner of the database being installed into, which "
+							   "is correct for a normal Odoo deployment but not for template1, "
+							   "whose owner is usually the bootstrap superuser.",
+							   &dbblue_partition_odoo_role,
+							   "",
+							   PGC_SUSET,
 							   0,
 							   NULL, NULL, NULL);
 

@@ -2,9 +2,12 @@
 
 EXTENSION = dbblue_partition
 MODULES = src/dbblue_partition_bgw
-DATA = dbblue_partition--1.0.sql dbblue_partition--1.0--1.1.sql \
-	dbblue_partition--1.1--1.2.sql dbblue_partition--1.2--1.3.sql \
-	dbblue_partition--1.3--1.4.sql
+# One script, holding the whole extension.  An extension script is read only
+# by CREATE EXTENSION or ALTER EXTENSION ... UPDATE, so a database already at
+# the current version never needs one; the pre-release chain was folded into
+# this file once every deployed database had reached the end of it.  A future
+# release adds dbblue_partition--1.0--1.1.sql beside it.
+DATA = dbblue_partition--1.0.sql
 PGFILEDESC = "dbblue_partition - convert live Odoo tables to native range partitioning"
 
 REGRESS = dbblue_partition

@@ -16,11 +16,9 @@ contrib_targets += dbblue_partition_bgw
 
 install_data(
   'dbblue_partition.control',
+  # single install script; see the Makefile for why there are no
+  # 1.x--1.y upgrade scripts
   'dbblue_partition--1.0.sql',
-  'dbblue_partition--1.0--1.1.sql',
-  'dbblue_partition--1.1--1.2.sql',
-  'dbblue_partition--1.2--1.3.sql',
-  'dbblue_partition--1.3--1.4.sql',
   kwargs: contrib_data_args,
 )
 
