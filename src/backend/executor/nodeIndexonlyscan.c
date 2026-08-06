@@ -194,6 +194,14 @@ IndexOnlyNext(IndexOnlyScanState *node)
 		}
 
 		/*
+		 * This scan returns column values without necessarily visiting the
+		 * heap, so it never reaches the table AM entry points that feed the
+		 * read set.  Record the read here instead; missing it would let a
+		 * merge decision be made against a column we did in fact read.
+		 */
+		DBBlueNoteRowRead(RelationGetRelid(scandesc->heapRelation), tid);
+
+		/*
 		 * Fill the scan tuple slot with data from the index.  This might be
 		 * provided in either HeapTuple or IndexTuple format.  Conceivably an
 		 * index AM might fill both fields, in which case we prefer the heap

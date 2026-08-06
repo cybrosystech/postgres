@@ -17,6 +17,7 @@
 #ifndef TABLEAM_H
 #define TABLEAM_H
 
+#include "access/dbblue_readset.h"
 #include "access/relscan.h"
 #include "access/sdir.h"
 #include "access/xact.h"
@@ -1101,7 +1102,11 @@ table_scan_getnextslot(TableScanDesc sscan, ScanDirection direction, TupleTableS
 	Assert(direction == ForwardScanDirection ||
 		   direction == BackwardScanDirection);
 
-	return sscan->rs_rd->rd_tableam->scan_getnextslot(sscan, direction, slot);
+	if (!sscan->rs_rd->rd_tableam->scan_getnextslot(sscan, direction, slot))
+		return false;
+
+	DBBlueNoteRowRead(RelationGetRelid(sscan->rs_rd), &slot->tts_tid);
+	return true;
 }
 
 /* ----------------------------------------------------------------------------
@@ -1164,9 +1169,13 @@ table_scan_getnextslot_tidrange(TableScanDesc sscan, ScanDirection direction,
 	Assert(direction == ForwardScanDirection ||
 		   direction == BackwardScanDirection);
 
-	return sscan->rs_rd->rd_tableam->scan_getnextslot_tidrange(sscan,
-															   direction,
-															   slot);
+	if (!sscan->rs_rd->rd_tableam->scan_getnextslot_tidrange(sscan,
+															 direction,
+															 slot))
+		return false;
+
+	DBBlueNoteRowRead(RelationGetRelid(sscan->rs_rd), &slot->tts_tid);
+	return true;
 }
 
 
@@ -1308,9 +1317,13 @@ table_index_fetch_tuple(struct IndexFetchTableData *scan,
 						TupleTableSlot *slot,
 						bool *call_again, bool *all_dead)
 {
-	return scan->rel->rd_tableam->index_fetch_tuple(scan, tid, snapshot,
-													slot, call_again,
-													all_dead);
+	if (!scan->rel->rd_tableam->index_fetch_tuple(scan, tid, snapshot,
+												  slot, call_again,
+												  all_dead))
+		return false;
+
+	DBBlueNoteRowRead(RelationGetRelid(scan->rel), &slot->tts_tid);
+	return true;
 }
 
 /*
@@ -1354,7 +1367,11 @@ table_tuple_fetch_row_version(Relation rel,
 	if (unlikely(TransactionIdIsValid(CheckXidAlive) && !bsysscan))
 		elog(ERROR, "unexpected table_tuple_fetch_row_version call during logical decoding");
 
-	return rel->rd_tableam->tuple_fetch_row_version(rel, tid, snapshot, slot);
+	if (!rel->rd_tableam->tuple_fetch_row_version(rel, tid, snapshot, slot))
+		return false;
+
+	DBBlueNoteRowRead(RelationGetRelid(rel), tid);
+	return true;
 }
 
 /*
@@ -1648,9 +1665,20 @@ table_tuple_lock(Relation rel, ItemPointer tid, Snapshot snapshot,
 				 LockWaitPolicy wait_policy, uint8 flags,
 				 TM_FailureData *tmfd)
 {
-	return rel->rd_tableam->tuple_lock(rel, tid, snapshot, slot,
-									   cid, mode, wait_policy,
-									   flags, tmfd);
+	TM_Result	result;
+
+	result = rel->rd_tableam->tuple_lock(rel, tid, snapshot, slot,
+										 cid, mode, wait_policy,
+										 flags, tmfd);
+
+	/*
+	 * A locked row has been read, and *tid has been updated to the version
+	 * actually locked.
+	 */
+	if (result == TM_Ok)
+		DBBlueNoteRowRead(RelationGetRelid(rel), tid);
+
+	return result;
 }
 
 /*
@@ -2038,11 +2066,15 @@ table_scan_bitmap_next_tuple(TableScanDesc scan,
 							 uint64 *lossy_pages,
 							 uint64 *exact_pages)
 {
-	return scan->rs_rd->rd_tableam->scan_bitmap_next_tuple(scan,
-														   slot,
-														   recheck,
-														   lossy_pages,
-														   exact_pages);
+	if (!scan->rs_rd->rd_tableam->scan_bitmap_next_tuple(scan,
+														slot,
+														recheck,
+														lossy_pages,
+														exact_pages))
+		return false;
+
+	DBBlueNoteRowRead(RelationGetRelid(scan->rs_rd), &slot->tts_tid);
+	return true;
 }
 
 /*

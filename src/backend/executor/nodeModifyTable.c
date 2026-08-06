@@ -53,6 +53,7 @@
 
 #include "postgres.h"
 
+#include "access/dbblue_readset.h"
 #include "access/htup_details.h"
 #include "access/tableam.h"
 #include "access/tupconvert.h"
@@ -2716,6 +2717,126 @@ ExecCrossPartitionUpdateForeignKey(ModifyTableContext *context,
 						 tupleid, NULL, newslot, NIL, NULL, true);
 }
 
+/*
+ * DBBlueUpdateMergeFence
+ *
+ * Conditions under which a TM_Updated conflict must not be merged onto the
+ * newest row version, however the read set comes out.  Returns a short reason
+ * string, or NULL if none applies.
+ *
+ * Most of these exist because the merge is performed by the same code that
+ * READ COMMITTED uses: table_tuple_lock(FIND_LAST_VERSION) to get the newest
+ * version, then re-projecting the new tuple from it and our SET expressions.
+ * That path re-evaluates expressions and, via EvalPlanQualFetchRowMark(),
+ * re-reads rows of *other* relations at SnapshotAny -- i.e. outside our
+ * snapshot, and invisible to a per-row read set.  So the merge is only
+ * considered for plans whose new tuple cannot depend on anything but the
+ * target row.
+ */
+static const char *
+DBBlueUpdateMergeFence(ModifyTableContext *context,
+					   ResultRelInfo *resultRelInfo)
+{
+	EState	   *estate = context->estate;
+	Relation	rel = resultRelInfo->ri_RelationDesc;
+	ModifyTable *node = (ModifyTable *) context->mtstate->ps.plan;
+	Plan	   *subplan = outerPlan(node);
+	ListCell   *lc;
+	int			nrels = 0;
+
+	if (context->mtstate->operation != CMD_UPDATE)
+		return "not-a-plain-update";
+
+	/* A5: a BEFORE ROW trigger may have computed NEW from the stale OLD */
+	if (resultRelInfo->ri_TrigDesc &&
+		resultRelInfo->ri_TrigDesc->trig_update_before_row)
+		return "before-row-update-trigger";
+
+	/* the changed-column diff must be taken against our snapshot's version */
+	if (context->tmfd.traversed)
+		return "old-tuple-already-traversed";
+
+	/* A4: cross-partition row movement */
+	if (rel->rd_rel->relispartition)
+		return "partition";
+
+	/* referential integrity enforcement must keep its strict behavior */
+	if (estate->es_crosscheck_snapshot != InvalidSnapshot)
+		return "crosscheck-snapshot";
+
+	/* re-projecting the new tuple must not consume a fresh volatile value */
+	if (subplan != NULL &&
+		contain_volatile_functions((Node *) subplan->targetlist))
+		return "volatile-set-expression";
+
+	if (estate->es_plannedstmt != NULL &&
+		estate->es_plannedstmt->subplans != NIL)
+		return "subplans";
+
+	foreach(lc, estate->es_range_table)
+	{
+		RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+
+		if (rte->rtekind == RTE_RELATION && OidIsValid(rte->relid))
+			nrels++;
+	}
+	if (nrels != 1)
+		return "multi-relation-plan";
+
+	return NULL;
+}
+
+/*
+ * DBBlueReportUpdateConflict
+ *
+ * Called just before an UPDATE under a transaction snapshot aborts with
+ * 40001, to record whether the conflict was false -- i.e. whether the
+ * concurrently committed transaction changed only columns that this
+ * transaction neither read nor writes, so that the update could have been
+ * merged onto the newer version instead.
+ *
+ * Measurement only: the caller aborts either way, and nothing here takes a
+ * lock or writes a page, so behavior is unchanged.
+ */
+static void
+DBBlueReportUpdateConflict(ModifyTableContext *context,
+						   ResultRelInfo *resultRelInfo,
+						   ItemPointer tupleid,
+						   TupleTableSlot *oldSlot)
+{
+	Relation	rel = resultRelInfo->ri_RelationDesc;
+	const char *fence;
+	HeapTuple	snaptup;
+	Bitmapset  *writecols;
+
+	fence = DBBlueReadSetUnusableReason();
+	if (fence != NULL)
+	{
+		DBBlueLogSkippedConflict(rel, tupleid, fence);
+		return;
+	}
+
+	fence = DBBlueUpdateMergeFence(context, resultRelInfo);
+	if (fence != NULL)
+	{
+		DBBlueLogSkippedConflict(rel, tupleid, fence);
+		return;
+	}
+
+	if (TupIsNull(oldSlot) || !ItemPointerIsValid(tupleid))
+	{
+		DBBlueLogSkippedConflict(rel, tupleid, "no-old-tuple");
+		return;
+	}
+
+	writecols = ExecGetAllUpdatedCols(resultRelInfo, context->estate);
+	snaptup = ExecCopySlotHeapTuple(oldSlot);
+
+	DBBlueAnalyzeUpdateConflict(rel, tupleid, snaptup, writecols);
+
+	heap_freetuple(snaptup);
+}
+
 /* ----------------------------------------------------------------
  *		ExecUpdate
  *
@@ -2887,9 +3008,21 @@ redo_act:
 					TupleTableSlot *epqslot;
 
 					if (IsolationUsesXactSnapshot())
+					{
+						/*
+						 * DBblue: measure what share of these aborts are
+						 * false conflicts that a read-set-gated merge could
+						 * remove.  This is the go/no-go gate for building the
+						 * merge itself; it does not change the outcome here.
+						 */
+						if (db_blue_rr_merge_log)
+							DBBlueReportUpdateConflict(context, resultRelInfo,
+													   tupleid, oldSlot);
+
 						ereport(ERROR,
 								(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 								 errmsg("could not serialize access due to concurrent update")));
+					}
 
 					/*
 					 * Already know that we're going to need to do EPQ, so

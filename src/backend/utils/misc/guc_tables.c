@@ -30,6 +30,7 @@
 #endif
 
 #include "access/commit_ts.h"
+#include "access/dbblue_readset.h"
 #include "access/gin.h"
 #include "access/slru.h"
 #include "access/toast_compression.h"

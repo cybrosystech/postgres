@@ -13,6 +13,7 @@ top_builddir = ../../../..
 include $(top_builddir)/src/Makefile.global
 
 OBJS = \
+	dbblue_readset.o \
 	heapam.o \
 	heapam_handler.o \
 	heapam_indexscan.o \

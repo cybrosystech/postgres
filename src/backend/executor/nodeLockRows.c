@@ -21,6 +21,7 @@
 
 #include "postgres.h"
 
+#include "access/dbblue_readset.h"
 #include "access/tableam.h"
 #include "access/xact.h"
 #include "executor/executor.h"
@@ -223,9 +224,22 @@ lnext:
 
 			case TM_Updated:
 				if (IsolationUsesXactSnapshot())
+				{
+					/*
+					 * DBblue: a locked row has by definition been read, so
+					 * these conflicts are not candidates for a read-set-gated
+					 * merge.  Log them anyway, so the measurement in
+					 * nodeModifyTable.c can be read as a share of all 40001s
+					 * rather than only the ones raised by UPDATE.
+					 */
+					if (db_blue_rr_merge_log)
+						DBBlueLogSkippedConflict(erm->relation, &tid,
+												 "site-lockrows");
+
 					ereport(ERROR,
 							(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 							 errmsg("could not serialize access due to concurrent update")));
+				}
 				elog(ERROR, "unexpected table_tuple_lock status: %u",
 					 test);
 				break;

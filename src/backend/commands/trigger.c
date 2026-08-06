@@ -14,6 +14,7 @@
 #include "postgres.h"
 
 #include "access/genam.h"
+#include "access/dbblue_readset.h"
 #include "access/htup_details.h"
 #include "access/relation.h"
 #include "access/sysattr.h"
@@ -3440,9 +3441,21 @@ GetTupleForTrigger(EState *estate,
 
 			case TM_Updated:
 				if (IsolationUsesXactSnapshot())
+				{
+					/*
+					 * DBblue: a BEFORE ROW trigger has already computed NEW
+					 * from the pre-conflict OLD, so this conflict can never be
+					 * merged (abort condition A5).  Log the site so the
+					 * measurement can account for it.
+					 */
+					if (db_blue_rr_merge_log)
+						DBBlueLogSkippedConflict(relation, tid,
+												 "site-before-row-trigger");
+
 					ereport(ERROR,
 							(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 							 errmsg("could not serialize access due to concurrent update")));
+				}
 				elog(ERROR, "unexpected table_tuple_lock status: %u", test);
 				break;
 

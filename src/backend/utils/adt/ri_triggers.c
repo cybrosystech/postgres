@@ -24,6 +24,7 @@
 #include "postgres.h"
 
 #include "access/amapi.h"
+#include "access/dbblue_readset.h"
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/skey.h"
@@ -3309,9 +3310,21 @@ ri_LockPKTuple(Relation pk_rel, TupleTableSlot *slot, Snapshot snap,
 
 		case TM_Updated:
 			if (IsolationUsesXactSnapshot())
+			{
+				/*
+				 * DBblue: the conflict is on a referenced row, not on a row we
+				 * are updating, so there is nothing to merge.  Log the site so
+				 * the measurement can tell FK-check conflicts apart from
+				 * mergeable UPDATE conflicts.
+				 */
+				if (db_blue_rr_merge_log)
+					DBBlueLogSkippedConflict(pk_rel, &slot->tts_tid,
+											 "site-fk-check");
+
 				ereport(ERROR,
 						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 						 errmsg("could not serialize access due to concurrent update")));
+			}
 
 			/*
 			 * In READ COMMITTED, FIND_LAST_VERSION should have chased the

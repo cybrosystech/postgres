@@ -37,6 +37,7 @@
  */
 #include "postgres.h"
 
+#include "access/dbblue_readset.h"
 #include "access/sysattr.h"
 #include "access/table.h"
 #include "access/tableam.h"
@@ -869,6 +870,50 @@ InitPlan(QueryDesc *queryDesc, int eflags)
 
 	estate->es_plannedstmt = plannedstmt;
 	estate->es_part_prune_infos = plannedstmt->partPruneInfos;
+
+	/*
+	 * DBblue: record which columns of which relations this statement reads.
+	 *
+	 * selectedCols covers every column referenced anywhere in the rewritten
+	 * query, after view expansion and RLS, so one hook here catches reads at
+	 * every nesting level -- subqueries, PL/pgSQL and SPI queries, trigger
+	 * bodies, RI check queries -- because they all come through here.
+	 */
+	DBBlueReadSetBegin();
+	if (DBBlueReadSetCurrent != NULL)
+	{
+		/*
+		 * A parallel worker would record reads into its own read set, which
+		 * is discarded when the worker exits.  That would be a missed read,
+		 * so give up on merging for this transaction instead.
+		 */
+		if (plannedstmt->parallelModeNeeded)
+			DBBlueTaintReadSet("parallel-query");
+
+		foreach(l, rangeTable)
+		{
+			RangeTblEntry *rte = lfirst_node(RangeTblEntry, l);
+
+			if (rte->rtekind != RTE_RELATION || !OidIsValid(rte->relid))
+				continue;
+
+			if (rte->perminfoindex > 0)
+			{
+				RTEPermissionInfo *perminfo;
+
+				perminfo = getRTEPermissionInfo(plannedstmt->permInfos, rte);
+				DBBlueNoteRelationRead(rte->relid, perminfo->selectedCols);
+			}
+			else
+			{
+				/*
+				 * No permission info to attribute the read to (inheritance
+				 * children, for one).  Assume every column was read.
+				 */
+				DBBlueNoteAllColsRead(rte->relid);
+			}
+		}
+	}
 
 	/*
 	 * Perform runtime "initial" pruning to identify which child subplans,
