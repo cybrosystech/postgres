@@ -823,6 +823,13 @@
   boot_val => '""',
 },
 
+{ name => 'dbblue_safe_mode', type => 'bool', context => 'PGC_USERSET', group => 'CLIENT_CONN_STATEMENT',
+  short_desc => 'Rejects UPDATE and DELETE statements that have no WHERE clause.',
+  long_desc => 'Guards against accidentally modifying or removing every row in a table by requiring an explicit WHERE clause on UPDATE and DELETE statements.',
+  variable => 'dbblue_safe_mode',
+  boot_val => 'false',
+},
+
 { name => 'dbblue_standby_directory', type => 'string', context => 'PGC_SIGHUP', group => 'REPLICATION_PRIMARY',
   short_desc => 'Data directory of the standby managed by dbblue_create_standby.',
   long_desc => 'An empty value (the default) means a sibling of the data directory named "<datadir>_standby". A relative path is interpreted against the parent directory of the data directory, so the standby never nests inside the primary.',
@@ -837,13 +844,6 @@
   flags => 'GUC_NOT_IN_SAMPLE',
   variable => 'dbblue_standby_user',
   boot_val => '""',
-},
-
-{ name => 'dbblue_safe_mode', type => 'bool', context => 'PGC_USERSET', group => 'CLIENT_CONN_STATEMENT',
-  short_desc => 'Rejects UPDATE and DELETE statements that have no WHERE clause.',
-  long_desc => 'Guards against accidentally modifying or removing every row in a table by requiring an explicit WHERE clause on UPDATE and DELETE statements.',
-  variable => 'dbblue_safe_mode',
-  boot_val => 'false',
 },
 
 # This is PGC_SUSET to prevent hiding from log_lock_waits.
