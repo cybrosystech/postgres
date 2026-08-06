@@ -818,6 +818,7 @@
 #gin_pending_list_limit = 4MB
 #createrole_self_grant = ''             # set and/or inherit
 #event_triggers = on
+#dbblue_safe_mode = off                 # reject UPDATE/DELETE with no WHERE clause
 
 # - Locale and Formatting -
 
