@@ -24,6 +24,9 @@ typedef void (*post_parse_analyze_hook_type) (ParseState *pstate,
 											  const JumbleState *jstate);
 extern PGDLLIMPORT post_parse_analyze_hook_type post_parse_analyze_hook;
 
+/* GUC: reject UPDATE/DELETE statements that have no WHERE clause */
+extern PGDLLIMPORT bool dbblue_safe_mode;
+
 
 extern Query *parse_analyze_fixedparams(RawStmt *parseTree, const char *sourceText,
 										const Oid *paramTypes, int numParams, QueryEnvironment *queryEnv);
