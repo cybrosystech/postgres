@@ -73,6 +73,9 @@ typedef struct SelectStmtPassthrough
 /* Hook for plugins to get control at end of parse analysis */
 post_parse_analyze_hook_type post_parse_analyze_hook = NULL;
 
+/* GUC: reject UPDATE/DELETE statements that have no WHERE clause */
+bool		dbblue_safe_mode = false;
+
 static Query *transformOptionalSelectInto(ParseState *pstate, Node *parseTree);
 static Query *transformDeleteStmt(ParseState *pstate, DeleteStmt *stmt);
 static Query *transformInsertStmt(ParseState *pstate, InsertStmt *stmt);
@@ -580,6 +583,13 @@ transformDeleteStmt(ParseState *pstate, DeleteStmt *stmt)
 	Node	   *qual;
 
 	qry->commandType = CMD_DELETE;
+
+	/* dbblue: block DELETE with no WHERE clause when safe mode is on */
+	if (dbblue_safe_mode && stmt->whereClause == NULL)
+		ereport(ERROR,
+				errcode(ERRCODE_RESTRICT_VIOLATION),
+				errmsg("DELETE requires a WHERE clause because dbblue_safe_mode is enabled"),
+				errhint("Add a WHERE clause to the DELETE, or run \"SET dbblue_safe_mode = off\" for this session if you really intend to delete every row."));
 
 	/* process the WITH clause independently of all else */
 	if (stmt->withClause)
@@ -2855,6 +2865,13 @@ transformUpdateStmt(ParseState *pstate, UpdateStmt *stmt)
 	Node	   *qual;
 
 	qry->commandType = CMD_UPDATE;
+
+	/* dbblue: block UPDATE with no WHERE clause when safe mode is on */
+	if (dbblue_safe_mode && stmt->whereClause == NULL)
+		ereport(ERROR,
+				errcode(ERRCODE_RESTRICT_VIOLATION),
+				errmsg("UPDATE requires a WHERE clause because dbblue_safe_mode is enabled"),
+				errhint("Add a WHERE clause to the UPDATE, or run \"SET dbblue_safe_mode = off\" for this session if you really intend to update every row."));
 
 	/* process the WITH clause independently of all else */
 	if (stmt->withClause)

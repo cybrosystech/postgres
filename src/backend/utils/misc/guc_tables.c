@@ -61,6 +61,7 @@
 #include "optimizer/optimizer.h"
 #include "optimizer/paths.h"
 #include "optimizer/planmain.h"
+#include "parser/analyze.h"
 #include "parser/parse_expr.h"
 #include "parser/parser.h"
 #include "pgstat.h"
