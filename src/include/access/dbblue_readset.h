@@ -26,6 +26,7 @@ extern PGDLLIMPORT bool db_blue_rr_merge_track;
 extern PGDLLIMPORT bool db_blue_rr_merge_log;
 extern PGDLLIMPORT int db_blue_rr_merge_work_mem;
 extern PGDLLIMPORT int db_blue_rr_merge_max_rows;
+extern PGDLLIMPORT char *db_blue_rr_merge_ignore_cols;
 
 typedef struct DBBlueReadSet DBBlueReadSet;
 

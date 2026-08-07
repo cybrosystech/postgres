@@ -70,16 +70,19 @@
 #include "executor/tuptable.h"
 #include "lib/bloomfilter.h"
 #include "lib/stringinfo.h"
+#include "nodes/pg_list.h"
 #include "utils/datum.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/varlena.h"
 
 /* GUCs */
 bool		db_blue_rr_merge_track = false;
 bool		db_blue_rr_merge_log = false;
 int			db_blue_rr_merge_work_mem = 2048;	/* KB */
 int			db_blue_rr_merge_max_rows = 1000000;
+char	   *db_blue_rr_merge_ignore_cols = NULL;
 
 /* Give up on following an update chain after this many hops */
 #define DBBLUE_MAX_CHAIN_HOPS	1000
@@ -119,7 +122,11 @@ static void dbblue_readset_reset_cb(void *arg);
 static bool dbblue_fetch_latest_version(Relation rel, ItemPointer tid,
 										TupleTableSlot *slot);
 static Bitmapset *dbblue_changed_cols(Relation rel, HeapTuple snaptup,
-									  TupleTableSlot *newslot);
+									  TupleTableSlot *newslot,
+									  List *ignorecols,
+									  Bitmapset **ignored);
+static List *dbblue_parse_ignore_cols(void);
+static bool dbblue_name_in_list(const char *name, List *namelist);
 static void dbblue_append_cols(StringInfo buf, Relation rel,
 							   const Bitmapset *cols, bool all);
 
@@ -506,14 +513,20 @@ dbblue_fetch_latest_version(Relation rel, ItemPointer tid,
  * pushed out of line) reports as changed even when it is logically identical.
  * That is the safe direction: it can only produce an unnecessary abort, never
  * a missed change.
+ *
+ * Columns named in `ignorecols` are collected into *ignored instead of into the
+ * result, so the caller can report what was suppressed.  See
+ * db_blue.rr_merge_ignore_cols.
  */
 static Bitmapset *
-dbblue_changed_cols(Relation rel, HeapTuple snaptup, TupleTableSlot *newslot)
+dbblue_changed_cols(Relation rel, HeapTuple snaptup, TupleTableSlot *newslot,
+					List *ignorecols, Bitmapset **ignored)
 {
 	TupleDesc	desc = RelationGetDescr(rel);
 	Bitmapset  *changed = NULL;
 	int			attnum;
 
+	*ignored = NULL;
 	slot_getallattrs(newslot);
 
 	for (attnum = 1; attnum <= desc->natts; attnum++)
@@ -523,6 +536,8 @@ dbblue_changed_cols(Relation rel, HeapTuple snaptup, TupleTableSlot *newslot)
 		Datum		newval;
 		bool		oldnull;
 		bool		newnull;
+		bool		differs;
+		int			bit = attnum - FirstLowInvalidHeapAttributeNumber;
 
 		if (att->attisdropped)
 			continue;
@@ -532,20 +547,65 @@ dbblue_changed_cols(Relation rel, HeapTuple snaptup, TupleTableSlot *newslot)
 		newnull = newslot->tts_isnull[attnum - 1];
 
 		if (oldnull != newnull)
-		{
-			changed = bms_add_member(changed,
-									 attnum - FirstLowInvalidHeapAttributeNumber);
-			continue;
-		}
-		if (oldnull)
+			differs = true;
+		else if (oldnull)
+			differs = false;
+		else
+			differs = !datumIsEqual(oldval, newval, att->attbyval, att->attlen);
+
+		if (!differs)
 			continue;
 
-		if (!datumIsEqual(oldval, newval, att->attbyval, att->attlen))
-			changed = bms_add_member(changed,
-									 attnum - FirstLowInvalidHeapAttributeNumber);
+		if (dbblue_name_in_list(NameStr(att->attname), ignorecols))
+			*ignored = bms_add_member(*ignored, bit);
+		else
+			changed = bms_add_member(changed, bit);
 	}
 
 	return changed;
+}
+
+/*
+ * Parse db_blue.rr_merge_ignore_cols into a list of lowercased names.
+ *
+ * Done per conflict rather than in an assign hook: conflicts are rare, and the
+ * result must live no longer than the caller.  A malformed setting ignores
+ * nothing, which is the safe direction.
+ */
+static List *
+dbblue_parse_ignore_cols(void)
+{
+	char	   *rawstring;
+	List	   *namelist = NIL;
+
+	if (db_blue_rr_merge_ignore_cols == NULL ||
+		db_blue_rr_merge_ignore_cols[0] == '\0')
+		return NIL;
+
+	/* SplitIdentifierString scribbles on its input and points into it */
+	rawstring = pstrdup(db_blue_rr_merge_ignore_cols);
+	if (!SplitIdentifierString(rawstring, ',', &namelist))
+		return NIL;
+
+	return namelist;
+}
+
+/*
+ * Case-insensitive membership test against a SplitIdentifierString() result,
+ * whose entries are already downcased.
+ */
+static bool
+dbblue_name_in_list(const char *name, List *namelist)
+{
+	ListCell   *lc;
+
+	foreach(lc, namelist)
+	{
+		if (pg_strcasecmp(name, (const char *) lfirst(lc)) == 0)
+			return true;
+	}
+
+	return false;
 }
 
 /*
@@ -565,11 +625,14 @@ DBBlueAnalyzeUpdateConflict(Relation rel, ItemPointer snaptid,
 {
 	TupleTableSlot *latestslot;
 	Bitmapset  *changed = NULL;
+	Bitmapset  *ignored = NULL;
 	Bitmapset  *readcols;
+	List	   *ignorecols;
 	bool		allread;
 	bool		rowWasRead;
 	bool		gotlatest;
 	bool		mergeable;
+	bool		wcolsOnly;
 	StringInfoData buf;
 
 	/* Only heap has an update chain we know how to walk */
@@ -588,13 +651,15 @@ DBBlueAnalyzeUpdateConflict(Relation rel, ItemPointer snaptid,
 	readcols = DBBlueGetReadCols(RelationGetRelid(rel), &allread);
 
 	latestslot = table_slot_create(rel, NULL);
+	ignorecols = dbblue_parse_ignore_cols();
 
 	DBBlueTrackingSuppressed++;
 	PG_TRY();
 	{
 		gotlatest = dbblue_fetch_latest_version(rel, snaptid, latestslot);
 		if (gotlatest)
-			changed = dbblue_changed_cols(rel, snaptup, latestslot);
+			changed = dbblue_changed_cols(rel, snaptup, latestslot,
+										  ignorecols, &ignored);
 	}
 	PG_FINALLY();
 	{
@@ -621,12 +686,24 @@ DBBlueAnalyzeUpdateConflict(Relation rel, ItemPointer snaptid,
 		mergeable = !bms_overlap(changed, readcols) &&
 			!bms_overlap(changed, writecols);
 
+	/*
+	 * Would the write-columns-only variant have merged this?  That variant is
+	 * UNSOUND and must never gate anything -- it is the counterexample in the
+	 * design doc, where a write predicated on a column the other transaction
+	 * changed slips through.  It is reported only to size the ceiling: it is
+	 * what a perfectly precise notion of "which reads actually fed this value"
+	 * could at best achieve, so if this is rarely true the whole approach is
+	 * not worth pursuing.
+	 */
+	wcolsOnly = !bms_overlap(changed, writecols);
+
 	if (db_blue_rr_merge_log)
 	{
 		initStringInfo(&buf);
 		appendStringInfo(&buf,
-						 "dbblue_rr_merge: decision=%s rel=\"%s\" ctid=(%u,%u) row_read=%c",
+						 "dbblue_rr_merge: decision=%s wcols_only=%c rel=\"%s\" ctid=(%u,%u) row_read=%c",
 						 mergeable ? "mergeable" : "abort",
+						 wcolsOnly ? 't' : 'f',
 						 RelationGetRelationName(rel),
 						 ItemPointerGetBlockNumber(snaptid),
 						 ItemPointerGetOffsetNumber(snaptid),
@@ -639,6 +716,14 @@ DBBlueAnalyzeUpdateConflict(Relation rel, ItemPointer snaptid,
 		appendStringInfoString(&buf, "} written={");
 		dbblue_append_cols(&buf, rel, writecols, false);
 		appendStringInfoChar(&buf, '}');
+
+		/* only mention suppression when it actually suppressed something */
+		if (!bms_is_empty(ignored))
+		{
+			appendStringInfoString(&buf, " ignored={");
+			dbblue_append_cols(&buf, rel, ignored, false);
+			appendStringInfoChar(&buf, '}');
+		}
 
 		ereport(LOG, (errmsg_internal("%s", buf.data)));
 		pfree(buf.data);

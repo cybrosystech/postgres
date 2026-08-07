@@ -623,6 +623,14 @@
   assign_hook => 'assign_datestyle',
 },
 
+{ name => 'db_blue.rr_merge_ignore_cols', type => 'string', context => 'PGC_USERSET', group => 'DEVELOPER_OPTIONS',
+  short_desc => 'Columns whose concurrent modification never blocks a merge.',
+  long_desc => 'Comma-separated column names, matched in any table. Intended for bookkeeping metadata that no computed value is ever derived from, such as Odoo write_date and write_uid. Changes to these columns are reported as "ignored" rather than counted as a conflict.',
+  flags => 'GUC_LIST_INPUT | GUC_NOT_IN_SAMPLE',
+  variable => 'db_blue_rr_merge_ignore_cols',
+  boot_val => '"write_date,write_uid"',
+},
+
 { name => 'db_blue.rr_merge_log', type => 'bool', context => 'PGC_USERSET', group => 'DEVELOPER_OPTIONS',
   short_desc => 'Logs every read-set-gated merge decision for concurrent updates.',
   long_desc => 'Emits one LOG line per serialization conflict describing the columns the other transaction changed and the columns this transaction read and wrote.',
