@@ -270,7 +270,6 @@ static const struct config_enum_entry dbblue_wait_sampling_profile_queries_optio
 	{"yes", DBBLUE_WS_PROFILE_QUERIES_TOP, false},
 	{"true", DBBLUE_WS_PROFILE_QUERIES_TOP, false},
 	{"1", DBBLUE_WS_PROFILE_QUERIES_TOP, false},
-	{"all", DBBLUE_WS_PROFILE_QUERIES_ALL, false},
 	{NULL, 0, false}
 };
 

@@ -127,7 +127,14 @@ WaitSamplerRegister(void)
 
 	memset(&worker, 0, sizeof(worker));
 	worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
-	worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+
+	/*
+	 * Use ConsistentState rather than RecoveryFinished so this also starts
+	 * on hot standbys (which never reach RecoveryFinished's PM_RUN state).
+	 * The RecoveryInProgress() check in WaitSamplerMain()'s loop is what
+	 * then keeps a standby's copy from ever attempting to write.
+	 */
+	worker.bgw_start_time = BgWorkerStart_ConsistentState;
 	worker.bgw_restart_time = 5;
 	snprintf(worker.bgw_library_name, MAXPGPATH, "postgres");
 	snprintf(worker.bgw_function_name, BGW_MAXLEN, "WaitSamplerMain");
@@ -227,8 +234,27 @@ WaitSamplerMain(Datum main_arg)
 		}
 		else
 		{
-			/* Disabled (or a standby): nothing to do, just idle. */
+			/*
+			 * Disabled (or a standby): nothing to do, just idle.  Discard
+			 * whatever we were tracking so re-enabling starts from a clean
+			 * slate instead of resurrecting stale intervals/counters from
+			 * before the feature was turned off.
+			 */
 			schema_ready = false;
+
+			if (tracked != NULL)
+			{
+				int			j;
+
+				for (j = 0; j < tracked_count; j++)
+					tracked[j].valid = false;
+			}
+			if (profile_hash != NULL && hash_get_num_entries(profile_hash) > 0)
+			{
+				hash_destroy(profile_hash);
+				profile_hash = make_profile_hash();
+			}
+
 			sleep_ms = 5000;
 		}
 
@@ -348,7 +374,20 @@ probe_waits(void)
 		DbblueWSProfileItem *profile_item;
 		bool		found;
 
-		if (pid == 0 || proc->procLatch.owner_pid == 0 || pid == MyProcPid)
+		if (pid == 0 || proc->procLatch.owner_pid == 0)
+		{
+			/*
+			 * Slot isn't occupied by a live backend right now.  Close out
+			 * any interval we were tracking for it, otherwise flush_history()
+			 * would keep upserting a stale row's end_ts forever for a
+			 * backend that's long gone.
+			 */
+			if (i < tracked_count)
+				tracked[i].valid = false;
+			continue;
+		}
+
+		if (pid == MyProcPid)
 			continue;
 
 		wait_event_info = UINT32_ACCESS_ONCE(proc->wait_event_info);
@@ -371,15 +410,16 @@ probe_waits(void)
 			continue;			/* MaxBackends can't shrink at runtime, but be defensive */
 
 		if (!tracked[i].valid || tracked[i].pid != pid ||
-			tracked[i].wait_event_info != wait_event_info)
+			tracked[i].wait_event_info != wait_event_info ||
+			tracked[i].queryid != queryid)
 		{
 			tracked[i].valid = true;
 			tracked[i].pid = pid;
 			tracked[i].datid = datid;
 			tracked[i].wait_event_info = wait_event_info;
+			tracked[i].queryid = queryid;
 			tracked[i].start_ts = now;
 		}
-		tracked[i].queryid = queryid;
 
 		/* Profile: bump the bucket for this sample */
 		memset(&key, 0, sizeof(key));
@@ -460,7 +500,10 @@ flush_history(void)
 			values[3] = CStringGetTextDatum(event);
 		else
 			nulls[3] = 'n';
-		values[4] = Int64GetDatum(tracked[i].queryid);
+		if (tracked[i].queryid != 0)
+			values[4] = Int64GetDatum(tracked[i].queryid);
+		else
+			nulls[4] = 'n';
 		values[5] = TimestampTzGetDatum(tracked[i].start_ts);
 		values[6] = TimestampTzGetDatum(now);
 
@@ -523,7 +566,10 @@ flush_profile(void)
 			values[5] = CStringGetTextDatum(event);
 		else
 			nulls[5] = 'n';
-		values[6] = Int64GetDatum(item->key.queryid);
+		if (item->key.queryid != 0)
+			values[6] = Int64GetDatum(item->key.queryid);
+		else
+			nulls[6] = 'n';
 		values[7] = Int64GetDatum((int64) item->count);
 
 		if (SPI_execute_with_args(sql, 8, (Oid *) argtypes, values, nulls, false, 0) != SPI_OK_INSERT)
@@ -554,12 +600,15 @@ run_retention(void)
 	SPI_connect();
 	PushActiveSnapshot(GetTransactionSnapshot());
 
-	SPI_execute_with_args("DELETE FROM dbblue_catalog.wait_history "
-						  "WHERE end_ts < (now() - make_interval(mins => $1))",
-						  1, &argtype, &value, NULL, false, 0);
-	SPI_execute_with_args("DELETE FROM dbblue_catalog.wait_profile "
-						  "WHERE snapshot_ts < (now() - make_interval(mins => $1))",
-						  1, &argtype, &value, NULL, false, 0);
+	if (SPI_execute_with_args("DELETE FROM dbblue_catalog.wait_history "
+							  "WHERE end_ts < (now() - make_interval(mins => $1))",
+							  1, &argtype, &value, NULL, false, 0) != SPI_OK_DELETE)
+		elog(WARNING, "dbblue wait sampler: failed to delete old wait_history rows");
+
+	if (SPI_execute_with_args("DELETE FROM dbblue_catalog.wait_profile "
+							  "WHERE snapshot_ts < (now() - make_interval(mins => $1))",
+							  1, &argtype, &value, NULL, false, 0) != SPI_OK_DELETE)
+		elog(WARNING, "dbblue wait sampler: failed to delete old wait_profile rows");
 
 	SPI_finish();
 	PopActiveSnapshot();

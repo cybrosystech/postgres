@@ -17,9 +17,8 @@
 
 typedef enum
 {
-	DBBLUE_WS_PROFILE_QUERIES_NONE,	/* profile no statements */
-	DBBLUE_WS_PROFILE_QUERIES_TOP,	/* only top level statements */
-	DBBLUE_WS_PROFILE_QUERIES_ALL	/* all statements, including nested ones */
+	DBBLUE_WS_PROFILE_QUERIES_NONE,	/* don't tag rows with queryid */
+	DBBLUE_WS_PROFILE_QUERIES_TOP	/* tag rows with the top-level queryid */
 } DbblueWSProfileQueries;
 
 extern PGDLLIMPORT bool dbblue_wait_sampling_enabled;
