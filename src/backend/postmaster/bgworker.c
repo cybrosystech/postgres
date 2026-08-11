@@ -24,6 +24,7 @@
 #include "postmaster/dbblue_create_standby.h"
 #include "postmaster/dbblue_index_advisor.h"
 #include "postmaster/postmaster.h"
+#include "postmaster/waitsampler.h"
 #include "replication/logicallauncher.h"
 #include "replication/logicalworker.h"
 #include "storage/ipc.h"
@@ -181,6 +182,10 @@ static const struct
 	{
 		.fn_name = "DBBlueBrinWorkerMain",
 		.fn_addr = DBBlueBrinWorkerMain
+	},
+	{
+		.fn_name = "WaitSamplerMain",
+		.fn_addr = WaitSamplerMain
 	}
 };
 

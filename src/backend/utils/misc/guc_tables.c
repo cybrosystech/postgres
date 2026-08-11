@@ -73,6 +73,7 @@
 #include "postmaster/postmaster.h"
 #include "postmaster/startup.h"
 #include "postmaster/syslogger.h"
+#include "postmaster/waitsampler.h"
 #include "postmaster/walsummarizer.h"
 #include "postmaster/walwriter.h"
 #include "replication/logicallauncher.h"
@@ -263,6 +264,20 @@ static const struct config_enum_entry track_function_options[] = {
 
 StaticAssertDecl(lengthof(track_function_options) == (TRACK_FUNC_ALL + 2),
 				 "array length mismatch");
+
+static const struct config_enum_entry dbblue_wait_sampling_profile_queries_options[] = {
+	{"none", DBBLUE_WS_PROFILE_QUERIES_NONE, false},
+	{"off", DBBLUE_WS_PROFILE_QUERIES_NONE, false},
+	{"no", DBBLUE_WS_PROFILE_QUERIES_NONE, false},
+	{"false", DBBLUE_WS_PROFILE_QUERIES_NONE, false},
+	{"0", DBBLUE_WS_PROFILE_QUERIES_NONE, false},
+	{"top", DBBLUE_WS_PROFILE_QUERIES_TOP, false},
+	{"on", DBBLUE_WS_PROFILE_QUERIES_TOP, false},
+	{"yes", DBBLUE_WS_PROFILE_QUERIES_TOP, false},
+	{"true", DBBLUE_WS_PROFILE_QUERIES_TOP, false},
+	{"1", DBBLUE_WS_PROFILE_QUERIES_TOP, false},
+	{NULL, 0, false}
+};
 
 static const struct config_enum_entry stats_fetch_consistency[] = {
 	{"none", PGSTAT_FETCH_CONSISTENCY_NONE, false},

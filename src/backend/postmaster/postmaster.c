@@ -108,6 +108,7 @@
 #include "postmaster/pgarch.h"
 #include "postmaster/postmaster.h"
 #include "postmaster/syslogger.h"
+#include "postmaster/waitsampler.h"
 #include "postmaster/walsummarizer.h"
 #include "replication/logicallauncher.h"
 #include "replication/slotsync.h"
@@ -942,6 +943,12 @@ PostmasterMain(int argc, char *argv[])
 	 * Register the dbblue index advisor worker.
 	 */
 	DbblueIndexAdvisorRegister();
+	/*
+	 * Register the dbblue wait sampling collector.  Unlike ApplyLauncher,
+	 * this one always runs; whether it actually samples anything is
+	 * controlled at runtime by dbblue_wait_sampling_enabled.
+	 */
+	WaitSamplerRegister();
 
 	/*
 	 * Register the shared memory needs of all core subsystems.
