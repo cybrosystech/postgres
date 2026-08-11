@@ -105,6 +105,7 @@
 #include "postmaster/bgworker_internals.h"
 #include "postmaster/dbblue_create_standby.h"
 #include "postmaster/dbblue_index_advisor.h"
+#include "postmaster/dbblue_repack_launcher.h"
 #include "postmaster/pgarch.h"
 #include "postmaster/postmaster.h"
 #include "postmaster/syslogger.h"
@@ -943,6 +944,12 @@ PostmasterMain(int argc, char *argv[])
 	 * Register the dbblue index advisor worker.
 	 */
 	DbblueIndexAdvisorRegister();
+	/*
+	 * Register the dbblue repack launcher.  Like the index advisor, this
+	 * one always runs; whether it actually repacks anything is controlled
+	 * at runtime by dbblue_repack_enabled.
+	 */
+	RepackLauncherRegister();
 	/*
 	 * Register the dbblue wait sampling collector.  Unlike ApplyLauncher,
 	 * this one always runs; whether it actually samples anything is
