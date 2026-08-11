@@ -9,6 +9,7 @@ backend_sources += files(
   'datachecksum_state.c',
   'dbblue_create_standby.c',
   'dbblue_index_advisor.c',
+  'dbblue_repack_launcher.c',
   'fork_process.c',
   'interrupt.c',
   'launch_backend.c',
