@@ -125,6 +125,15 @@ WaitSamplerRegister(void)
 {
 	BackgroundWorker worker;
 
+	/*
+	 * Don't run during pg_upgrade: the postmaster gets started internally,
+	 * multiple times, in a restricted mode to restore schema objects in a
+	 * precise sequence, and this worker independently connecting and
+	 * issuing its own DDL has no business happening during that window.
+	 */
+	if (IsBinaryUpgrade)
+		return;
+
 	memset(&worker, 0, sizeof(worker));
 	worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
 
@@ -286,6 +295,9 @@ ensure_schema(void)
 	if (SPI_execute("CREATE SCHEMA IF NOT EXISTS dbblue_catalog", false, 0) != SPI_OK_UTILITY)
 		elog(FATAL, "dbblue wait sampler: failed to create schema dbblue_catalog");
 
+	if (SPI_execute("GRANT USAGE ON SCHEMA dbblue_catalog TO PUBLIC", false, 0) != SPI_OK_UTILITY)
+		elog(FATAL, "dbblue wait sampler: failed to grant usage on schema dbblue_catalog");
+
 	if (SPI_execute("CREATE TABLE IF NOT EXISTS dbblue_catalog.wait_history ("
 					"pid integer NOT NULL, "
 					"datid oid NOT NULL, "
@@ -319,6 +331,19 @@ ensure_schema(void)
 					"ON dbblue_catalog.wait_profile (snapshot_ts)",
 					false, 0) != SPI_OK_UTILITY)
 		elog(FATAL, "dbblue wait sampler: failed to create index on wait_profile");
+
+	/*
+	 * Let everyone read this diagnostic data, but only the superuser-owned
+	 * worker itself (which bypasses privilege checks entirely) can ever
+	 * insert/update/delete rows or drop the tables.
+	 */
+	if (SPI_execute("GRANT SELECT ON dbblue_catalog.wait_history TO PUBLIC",
+					false, 0) != SPI_OK_UTILITY)
+		elog(FATAL, "dbblue wait sampler: failed to grant select on wait_history");
+
+	if (SPI_execute("GRANT SELECT ON dbblue_catalog.wait_profile TO PUBLIC",
+					false, 0) != SPI_OK_UTILITY)
+		elog(FATAL, "dbblue wait sampler: failed to grant select on wait_profile");
 
 	SPI_finish();
 	PopActiveSnapshot();
@@ -393,7 +418,12 @@ probe_waits(void)
 		wait_event_info = UINT32_ACCESS_ONCE(proc->wait_event_info);
 
 		if (wait_event_info == 0 && !dbblue_wait_sampling_sample_cpu)
+		{
+			/* Same reasoning as the empty-slot case above: don't ghost-extend. */
+			if (i < tracked_count)
+				tracked[i].valid = false;
 			continue;
+		}
 
 		datid = proc->databaseId;
 
