@@ -47,6 +47,7 @@
 #include "catalog/pg_database.h"
 #include "catalog/pg_type.h"
 #include "commands/repack.h"
+#include "commands/vacuum.h"
 #include "executor/spi.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
@@ -585,14 +586,23 @@ load_bloat_candidates(List *specs)
 							   "         to_regclass(w.qualname)::oid AS relid"
 							   "  FROM wanted w"
 							   ")"
-							   "SELECT r.qualname, r.relid, r.nspname, r.relname, c.relpages,"
+							   "SELECT r.qualname, r.relid, r.nspname, r.relname,"
+							   /*
+							    * pg_class.relpages is a cached statistic that
+							    * only VACUUM/ANALYZE/REPACK refresh; it can
+							    * lag far behind reality between those runs.
+							    * pg_relation_size() reads the file's actual
+							    * current block count directly, so freshly
+							    * created bloat is visible immediately.
+							    */
+							   "       (pg_relation_size(r.relid) /"
+							   "        current_setting('block_size')::bigint)::int AS relpages,"
 							   "       COALESCE(t.n_live_tup, 0) AS n_live_tup,"
 							   "       COALESCE((SELECT SUM(s.avg_width) FROM pg_stats s"
 							   "                 WHERE s.schemaname = r.nspname"
 							   "                   AND s.tablename = r.relname), 0) AS sum_width,"
 							   "       h.last_repack_at"
 							   " FROM resolved r"
-							   " LEFT JOIN pg_class c ON c.oid = r.relid"
 							   " LEFT JOIN pg_stat_user_tables t ON t.relid = r.relid"
 							   " LEFT JOIN public.dbblue_repack_history h"
 							   "   ON h.schema_name = r.nspname AND h.table_name = r.relname",
@@ -819,6 +829,28 @@ repack_one_table(const char *schema, const char *table, Oid relid,
 			cluster_rel(REPACK_COMMAND_REPACK, rel, InvalidOid, &params, true);
 			/* cluster_rel closes rel, but keeps the lock until commit. */
 			PopActiveSnapshot();
+
+			/*
+			 * The rewrite invalidates the planner's statistics -- most
+			 * notably attribute correlation, which changes completely
+			 * once the table is physically reordered -- even though
+			 * pg_class.relpages/reltuples were already fixed up by the
+			 * rewrite itself.  Run a plain ANALYZE the same way VACUUM
+			 * ANALYZE does, by calling analyze_rel() directly under the
+			 * ShareUpdateExclusiveLock already held, so pg_statistic and
+			 * pg_stat_user_tables reflect the repacked table immediately
+			 * instead of waiting on the next autovacuum analyze.
+			 */
+			{
+				VacuumParams analyze_params = {0};
+
+				analyze_params.options = VACOPT_ANALYZE;
+				analyze_params.log_analyze_min_duration = -1;
+
+				PushActiveSnapshot(GetTransactionSnapshot());
+				analyze_rel(relid, NULL, &analyze_params, NIL, false, NULL);
+				PopActiveSnapshot();
+			}
 
 			record_repack_history(schema, table, relid, bloat_ratio);
 
