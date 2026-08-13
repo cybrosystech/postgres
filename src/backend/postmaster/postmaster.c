@@ -106,6 +106,7 @@
 #include "postmaster/dbblue_create_standby.h"
 #include "postmaster/dbblue_index_advisor.h"
 #include "postmaster/dbblue_repack_launcher.h"
+#include "postmaster/dbblue_backup_launcher.h"
 #include "postmaster/pgarch.h"
 #include "postmaster/postmaster.h"
 #include "postmaster/syslogger.h"
@@ -956,6 +957,13 @@ PostmasterMain(int argc, char *argv[])
 	 * controlled at runtime by dbblue_wait_sampling_enabled.
 	 */
 	WaitSamplerRegister();
+	/*
+	 * Register the dbblue backup launcher.  Like the apply launcher, this
+	 * is done before any external preloaded library has a chance to take a
+	 * bgworker slot.  It always runs; whether it actually backs anything up
+	 * is controlled at runtime by dbblue_backup_enabled.
+	 */
+	BackupLauncherRegister();
 
 	/*
 	 * Register the shared memory needs of all core subsystems.
