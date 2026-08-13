@@ -71,6 +71,7 @@
 #include "postmaster/dbblue_create_standby.h"
 #include "postmaster/dbblue_index_advisor.h"
 #include "postmaster/dbblue_repack_launcher.h"
+#include "postmaster/dbblue_backup_launcher.h"
 #include "postmaster/postmaster.h"
 #include "postmaster/startup.h"
 #include "postmaster/syslogger.h"

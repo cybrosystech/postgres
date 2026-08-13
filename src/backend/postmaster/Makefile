@@ -22,6 +22,7 @@ OBJS = \
 	dbblue_create_standby.o \
 	dbblue_index_advisor.o \
 	dbblue_repack_launcher.o \
+	dbblue_backup_launcher.o \
 	fork_process.o \
 	interrupt.o \
 	launch_backend.o \
