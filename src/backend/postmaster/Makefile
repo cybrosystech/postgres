@@ -19,6 +19,7 @@ OBJS = \
 	bgwriter.o \
 	checkpointer.o \
 	datachecksum_state.o \
+	dbblue_backup_launcher.o \
 	fork_process.o \
 	interrupt.o \
 	launch_backend.o \

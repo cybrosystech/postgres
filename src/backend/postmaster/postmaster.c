@@ -102,6 +102,7 @@
 #include "port/pg_getopt_ctx.h"
 #include "postmaster/autovacuum.h"
 #include "postmaster/bgworker_internals.h"
+#include "postmaster/dbblue_backup_launcher.h"
 #include "postmaster/pgarch.h"
 #include "postmaster/postmaster.h"
 #include "postmaster/syslogger.h"
@@ -924,6 +925,14 @@ PostmasterMain(int argc, char *argv[])
 	 * before any modules had a chance to take the background worker slots.
 	 */
 	ApplyLauncherRegister();
+
+	/*
+	 * Register the dbblue backup launcher.  Like the apply launcher, this
+	 * is done before any external preloaded library has a chance to take a
+	 * bgworker slot.  It always runs; whether it actually backs anything up
+	 * is controlled at runtime by dbblue_backup_enabled.
+	 */
+	BackupLauncherRegister();
 
 	/*
 	 * Register the shared memory needs of all core subsystems.
