@@ -7945,6 +7945,18 @@ create_partial_grouping_paths(PlannerInfo *root,
 										 extra);
 	}
 
+	/*
+	 * Let extensions possibly add partially grouped paths (e.g. a custom-scan
+	 * provider that aggregates in parallel and emits partial transition
+	 * states).  This mirrors the UPPERREL_GROUP_AGG hook and the FDW seam just
+	 * above; it fires before the caller's gather_grouping_paths(), so a partial
+	 * path added here is Gathered and topped with a Finalize Aggregate by core.
+	 */
+	if (create_upper_paths_hook)
+		(*create_upper_paths_hook) (root, UPPERREL_PARTIAL_GROUP_AGG,
+									input_rel, partially_grouped_rel,
+									extra);
+
 	return partially_grouped_rel;
 }
 
