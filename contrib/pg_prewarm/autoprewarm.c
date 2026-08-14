@@ -34,6 +34,7 @@
 #include "postmaster/bgworker.h"
 #include "postmaster/interrupt.h"
 #include "storage/buf_internals.h"
+#include "storage/bufmgr.h"
 #include "storage/dsm.h"
 #include "storage/dsm_registry.h"
 #include "storage/fd.h"
@@ -161,9 +162,18 @@ _PG_init(void)
 	/* Register autoprewarm worker, if enabled. */
 	if (autoprewarm)
 		apw_start_leader_worker();
-		/* NEW  */
-    DBBluePinnerRegisterGUCs();
-    DBBluePinnerRegister();
+
+	/*
+	 * Register the dbblue soft-pin / ring-buffer pinner worker, but only when
+	 * dbblue_pinner_enabled is on. This lets pg_prewarm stay preloaded (for
+	 * autoprewarm and the pg_prewarm() function) while advanced caching stays
+	 * fully off by default — no worker, no pinning, no ring-buffer routing.
+	 */
+	if (DBBluePinner_enabled)
+	{
+		DBBluePinnerRegisterGUCs();
+		DBBluePinnerRegister();
+	}
 }
 
 /*
