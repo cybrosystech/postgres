@@ -96,6 +96,34 @@ SELECT 'grp-saop      ', agree($$SELECT grp, count(*) c FROM t WHERE k7 = ANY(AR
 SELECT 'rescan        ', agree($$SELECT o.k, g.s FROM (VALUES (1),(3),(5)) o(k)
 	JOIN LATERAL (SELECT k7 kk, sum(amt) s FROM t GROUP BY k7) g ON g.kk = o.k ORDER BY o.k$$);
 
+-- ---- parallel partial-aggregate pushdown: workers aggregate partial states,
+-- core Finalize Aggregate combines. Force the path (small table needs parallel
+-- enabled + the fused agg preferred over scan-serve/hashagg) and prove results
+-- stay byte-identical to heap. ----
+SET max_parallel_workers_per_gather = 4;
+SET min_parallel_table_scan_size = 0;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET enable_seqscan = off;
+SET enable_hashagg = off;
+-- the parallel partial-agg node must actually be chosen (else the checks below
+-- could pass by silently running some other path)
+SELECT uses_node($$SELECT k7, sum(amt) FROM t GROUP BY k7$$,
+				 'Parallel Custom Scan (DBBlueColumnarAgg)') AS par_agg_used;
+SELECT 'par-1key      ', agree($$SELECT k7, sum(amt) s, count(*) c, avg(amt) a FROM t GROUP BY k7 ORDER BY k7$$);
+SELECT 'par-2key      ', agree($$SELECT k7, grp, sum(amt) s, min(amt) mn, max(amt) mx FROM t GROUP BY k7, grp ORDER BY k7, grp$$);
+SELECT 'par-nullkey   ', agree($$SELECT pid, count(*) c, sum(amt) s FROM t GROUP BY pid ORDER BY pid$$);
+SELECT 'par-filter    ', agree($$SELECT k7, sum(amt) FILTER (WHERE amt > 50) s, count(*) FILTER (WHERE pid IS NOT NULL) c FROM t GROUP BY k7 ORDER BY k7$$);
+SELECT 'par-where     ', agree($$SELECT grp, sum(amt) s FROM t WHERE k7 > 2 GROUP BY grp ORDER BY grp$$);
+SELECT 'par-exprkey   ', agree($$SELECT date_trunc('month', d) m, sum(amt) s FROM t GROUP BY 1 ORDER BY 1$$);
+SELECT 'par-stddev    ', agree($$SELECT k7, round(stddev(amt),8) sd, round(variance(amt),8) v FROM t GROUP BY k7 ORDER BY k7$$);
+RESET enable_seqscan;
+RESET enable_hashagg;
+RESET min_parallel_table_scan_size;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+SET max_parallel_workers_per_gather = 0;
+
 DROP FUNCTION agree(text);
 DROP FUNCTION uses_node(text, text);
 DROP TABLE t;
