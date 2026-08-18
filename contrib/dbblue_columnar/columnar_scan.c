@@ -63,6 +63,7 @@
 #include "nodes/makefuncs.h"
 #include "nodes/pathnodes.h"
 #include "nodes/plannodes.h"
+#include "optimizer/clauses.h"
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
@@ -266,6 +267,13 @@ static void dbbc_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 								  Index rti, RangeTblEntry *rte);
 static bool dbbc_rel_ready(PlannerInfo *root, RelOptInfo *rel,
 						   RangeTblEntry *rte, List **needed_out);
+static void dbbc_try_eager_agg(PlannerInfo *root, RelOptInfo *rel,
+							   RangeTblEntry *rte);
+/* eligibility helpers defined later, reused by the eager-agg fusion path */
+static bool dbbc_grp_key_type_ok(Oid typid);
+static bool dbbc_expr_vars_ok(Node *expr, Index relid, List **needcols);
+static bool dbbc_agg_trans_ok(Aggref *agg, Index relid, bool partial,
+							  List **needcols);
 static Plan *dbbc_plan_custom_path(PlannerInfo *root, RelOptInfo *rel,
 								   CustomPath *best_path, List *tlist,
 								   List *clauses, List *custom_plans);
@@ -1162,6 +1170,9 @@ dbbc_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 			add_partial_path(rel, (Path *) ppath);
 		}
 	}
+
+	/* Offer a fused agg on this rel's eager-aggregation grouped_rel, if any. */
+	dbbc_try_eager_agg(root, rel, rte);
 }
 
 static Plan *
@@ -2228,6 +2239,15 @@ typedef struct DbbcAggTrans
 	FmgrInfo	transfn;
 	FmgrInfo	finalfn;		/* valid iff finalfn_oid is */
 	Oid			finalfn_oid;
+	/*
+	 * Partial (parallel) output: an INTERNAL-transtype aggregate (numeric
+	 * sum/avg, stddev, ...) cannot cross a worker boundary as a raw pointer, so
+	 * partial mode emits aggserialfn(transValue) -> bytea, exactly as core's
+	 * AGGSPLIT_INITIAL_SERIAL does; a byval/copyable transtype emits the raw
+	 * transValue. serialfn is valid iff serialfn_oid is.
+	 */
+	FmgrInfo	serialfn;
+	Oid			serialfn_oid;
 	int			numFinalArgs;
 	FunctionCallInfo trans_fcinfo;	/* context = the fabricated AggState */
 
@@ -2289,6 +2309,10 @@ typedef struct DbbcGroupEntry
 #define DBBC_AGG_PRIV_MODE(cp)		((int) intVal(lsecond(cp)))
 #define DBBC_AGG_PRIV_PAYLOAD(cp)	((List *) lthird(cp))
 #define DBBC_AGG_PRIV_TLIST(cp)		((List *) lfourth(cp))
+/* [4] Integer: 1 = partial (parallel) mode, emitting serialized states. A plan
+ * built before this element existed (length 4) is a final-mode plan. */
+#define DBBC_AGG_PRIV_PARTIAL(cp)	(list_length(cp) >= 5 ? \
+									 (int) intVal(list_nth(cp, 4)) : 0)
 
 typedef struct DbbcAggScanState
 {
@@ -2306,6 +2330,9 @@ typedef struct DbbcAggScanState
 
 	/* grouped mode */
 	bool		grouped;
+	bool		partial;		/* emit serialized partial states (core finalizes) */
+	DbbcParallelState *pstate;	/* shared block cursor when parallel; else NULL */
+	DbbcScanState *pscan;		/* persistently bound scan (version/dir/range) */
 	int			nkeys;
 	AttrNumber	key_attnos[DBBC_GRP_MAX_KEYS];	/* bare-Var key: the column; else Invalid */
 
@@ -2376,6 +2403,15 @@ static void dbbc_agg_end(CustomScanState *node);
 static void dbbc_agg_rescan(CustomScanState *node);
 static void dbbc_agg_explain(CustomScanState *node, List *ancestors,
 							 ExplainState *es);
+static void dbbc_grp_bind(DbbcAggScanState *as, EState *estate,
+						  DbbcRelVersion *v);
+static Size dbbc_agg_estimate_dsm(CustomScanState *node, ParallelContext *pcxt);
+static void dbbc_agg_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
+									void *coordinate);
+static void dbbc_agg_reinitialize_dsm(CustomScanState *node,
+									  ParallelContext *pcxt, void *coordinate);
+static void dbbc_agg_initialize_worker(CustomScanState *node, shm_toc *toc,
+									   void *coordinate);
 
 static const CustomScanMethods dbbc_agg_scan_methods = {
 	.CustomName = "DBBlueColumnarAgg",
@@ -2389,6 +2425,15 @@ static const CustomExecMethods dbbc_agg_exec_methods = {
 	.EndCustomScan = dbbc_agg_end,
 	.ReScanCustomScan = dbbc_agg_rescan,
 	.ExplainCustomScan = dbbc_agg_explain,
+	/*
+	 * Parallel callbacks: the grouped node aggregates a shared-cursor slice of
+	 * columnar blocks per worker. Only exercised once a parallel partial path
+	 * is offered (Phase 4); harmless for the serial/metadata paths.
+	 */
+	.EstimateDSMCustomScan = dbbc_agg_estimate_dsm,
+	.InitializeDSMCustomScan = dbbc_agg_initialize_dsm,
+	.ReInitializeDSMCustomScan = dbbc_agg_reinitialize_dsm,
+	.InitializeWorkerCustomScan = dbbc_agg_initialize_worker,
 };
 
 static Plan *dbbc_agg_plan_custom_path(PlannerInfo *root, RelOptInfo *rel,
@@ -2596,7 +2641,7 @@ dbbc_agg_filter_decompose(Node *filter, Index relid,
  * is simply not offered for an aggregate the executor setup would reject.
  */
 static bool
-dbbc_agg_trans_ok(Aggref *agg, Index relid, List **needcols)
+dbbc_agg_trans_ok(Aggref *agg, Index relid, bool partial, List **needcols)
 {
 	HeapTuple	aggTuple;
 	Form_pg_aggregate aggform;
@@ -2606,7 +2651,7 @@ dbbc_agg_trans_ok(Aggref *agg, Index relid, List **needcols)
 
 	if (agg->aggdistinct != NIL ||
 		agg->aggorder != NIL || agg->aggkind != AGGKIND_NORMAL ||
-		agg->aggsplit != AGGSPLIT_SIMPLE)
+		agg->aggsplit != (partial ? AGGSPLIT_INITIAL_SERIAL : AGGSPLIT_SIMPLE))
 		return false;
 	if (agg->aggfnoid >= FirstNormalObjectId)
 		return false;			/* builtin aggregates only */
@@ -2646,6 +2691,21 @@ dbbc_agg_trans_ok(Aggref *agg, Index relid, List **needcols)
 
 		if (numArgs < 1 ||
 			!IsBinaryCoercible(inputTypes[0], agg->aggtranstype))
+			ok = false;
+	}
+	/*
+	 * Parallel partial output: core's Finalize Aggregate merges worker partials
+	 * with the combine function, so require one; an INTERNAL transition state
+	 * must additionally have serialize + deserialize to cross the worker
+	 * boundary (dbbc_grp_emit_group emits serialfn(state) for those).
+	 */
+	if (ok && partial)
+	{
+		if (!OidIsValid(aggform->aggcombinefn))
+			ok = false;
+		else if (agg->aggtranstype == INTERNALOID &&
+				 (!OidIsValid(aggform->aggserialfn) ||
+				  !OidIsValid(aggform->aggdeserialfn)))
 			ok = false;
 	}
 	ReleaseSysCache(aggTuple);
@@ -2690,7 +2750,7 @@ dbbc_expr_vars_ok(Node *expr, Index relid, List **needcols)
 
 static bool
 dbbc_agg_grouped_classify(PlannerInfo *root, RelOptInfo *input_rel,
-						  RelOptInfo *output_rel, Index relid,
+						  RelOptInfo *output_rel, Index relid, bool partial,
 						  List **keyexprs_out, List **outmap_out,
 						  List **aggrefs_out, List **quals_out,
 						  List **needcols, double *ngroups_out)
@@ -2777,7 +2837,7 @@ dbbc_agg_grouped_classify(PlannerInfo *root, RelOptInfo *input_rel,
 
 		if (IsA(expr, Aggref))
 		{
-			if (!dbbc_agg_trans_ok((Aggref *) expr, relid, needcols))
+			if (!dbbc_agg_trans_ok((Aggref *) expr, relid, partial, needcols))
 				return false;
 			outmap = lappend_int(outmap, -(list_length(aggrefs)) - 1);
 			aggrefs = lappend(aggrefs, expr);
@@ -2856,6 +2916,8 @@ dbbc_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	int16	   *reg;
 	bool		ok = true;
 	bool		grouped;
+	bool		partial;
+	int			parallel_workers = 0;
 	List	   *keyexprs = NIL;
 	List	   *outmap = NIL;
 	List	   *aggrefs = NIL;
@@ -2865,8 +2927,9 @@ dbbc_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	if (prev_create_upper_paths_hook)
 		prev_create_upper_paths_hook(root, stage, input_rel, output_rel, extra);
 
-	if (stage != UPPERREL_GROUP_AGG)
+	if (stage != UPPERREL_GROUP_AGG && stage != UPPERREL_PARTIAL_GROUP_AGG)
 		return;
+	partial = (stage == UPPERREL_PARTIAL_GROUP_AGG);
 	if (!dbblue_columnar_enabled || !dbblue_columnar_enable_columnar_scan)
 		return;
 
@@ -2907,6 +2970,14 @@ dbbc_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	 */
 	grouped = (parse->groupClause != NIL ||
 			   input_rel->baserestrictinfo != NIL);
+	/*
+	 * The partial (parallel) path is grouped-mode only: the metadata mode reads
+	 * pure block metadata and is already near-free serial, so parallelizing it
+	 * would only add Gather overhead. Scalar aggregates still route through
+	 * grouped mode here (one group).
+	 */
+	if (partial)
+		grouped = true;
 	if (!grouped)
 	{
 		foreach(lc, output_rel->reltarget->exprs)
@@ -2933,8 +3004,28 @@ dbbc_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	{
 		needcols = NIL;			/* a failed metadata walk may have added some */
 		if (!dbbc_agg_grouped_classify(root, input_rel, output_rel, relid,
-									   &keyexprs, &outmap, &aggrefs, &quals,
-									   &needcols, &ngroups))
+									   partial, &keyexprs, &outmap, &aggrefs,
+									   &quals, &needcols, &ngroups))
+			return;
+	}
+
+	/*
+	 * Partial path: only worthwhile if the planner can actually parallelize the
+	 * scan, and only sound if everything this node evaluates itself (the pushed
+	 * quals and the group-key expressions) is parallel-safe. The transition
+	 * functions are builtin (checked in dbbc_agg_trans_ok) and thus safe.
+	 */
+	if (partial)
+	{
+		if (!base_rel->consider_parallel)
+			return;
+		parallel_workers = compute_parallel_worker(base_rel, base_rel->pages,
+												   -1,
+												   max_parallel_workers_per_gather);
+		if (parallel_workers <= 0)
+			return;
+		if (!is_parallel_safe(root, (Node *) quals) ||
+			!is_parallel_safe(root, (Node *) keyexprs))
 			return;
 	}
 
@@ -2983,21 +3074,28 @@ dbbc_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	cpath->path.parent = output_rel;
 	cpath->path.pathtarget = output_rel->reltarget;
 	cpath->path.param_info = NULL;
-	cpath->path.parallel_aware = false;
-	cpath->path.parallel_safe = false;
-	cpath->path.parallel_workers = 0;
+	/*
+	 * Partial path: a parallel-aware leaf. Each worker aggregates a shared-
+	 * cursor slice of columnar blocks into partial states; core stacks Gather +
+	 * Finalize Aggregate on top (add_partial_path below). The final path is the
+	 * single-threaded fused scan+aggregate as before.
+	 */
+	cpath->path.parallel_aware = partial;
+	cpath->path.parallel_safe = partial;
+	cpath->path.parallel_workers = partial ? parallel_workers : 0;
 	cpath->path.rows = grouped ? clamp_row_est(ngroups) : 1;
 	cpath->path.pathkeys = NIL;
 	cpath->flags = 0;
 	cpath->custom_paths = NIL;
 	/* store the absolute relation OID (not the RT index; see macro comment) */
 	cpath->custom_private =
-		list_make4(makeInteger((int) rte->relid),
+		list_make5(makeInteger((int) rte->relid),
 				   makeInteger(grouped ? 1 : 0),
 				   grouped ? list_make5(keyexprs, outmap, aggrefs, quals,
 										makeInteger((int) relid))
 				   : items,
-				   tlist);
+				   tlist,
+				   makeInteger(partial ? 1 : 0));
 	cpath->methods = &dbbc_agg_path_methods;
 
 	if (grouped)
@@ -3042,6 +3140,13 @@ dbbc_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 			+ decoded * (cpu_tuple_cost * 0.75
 						 + cpu_operator_cost * list_length(quals))
 			+ surviving * cpu_operator_cost * (list_length(aggrefs) + 1);
+		/*
+		 * Partial path: the per-row scan/decode/qual/transition work is split
+		 * across participants (mirrors the parallel scan path's divisor). Core
+		 * adds the Gather and Finalize Aggregate costs on top of this partial.
+		 */
+		if (partial)
+			run = run / (double) parallel_workers;
 		cpath->path.startup_cost = run;
 		cpath->path.total_cost = run + cpu_tuple_cost * clamp_row_est(ngroups);
 	}
@@ -3057,7 +3162,253 @@ dbbc_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	}
 	cpath->path.disabled_nodes = 0;
 
-	add_path(output_rel, (Path *) cpath);
+	/*
+	 * Partial paths go to partial_pathlist so core Gathers + Finalizes them;
+	 * the final fused path competes directly in the grouped rel.
+	 */
+	if (partial)
+		add_partial_path(output_rel, (Path *) cpath);
+	else
+		add_path(output_rel, (Path *) cpath);
+}
+
+/*
+ * Build one partial-mode DBBlueColumnarAgg CustomPath on a rel's eager-agg
+ * grouped_rel. parallel_workers == 0 builds the serial path (add_path); > 0
+ * builds a parallel-aware partial path (add_partial_path). Both emit
+ * AGGSPLIT_INITIAL_SERIAL partial states (custom_private partial flag = 1); core
+ * puts the Finalize Aggregate above the join.
+ */
+static CustomPath *
+dbbc_make_eager_cpath(RelOptInfo *rel, RelOptInfo *grouped_rel,
+					  RangeTblEntry *rte, List *keyexprs, List *outmap,
+					  List *aggrefs, List *quals, List *tlist,
+					  PathTarget *target, double ngroups, Cost run,
+					  int parallel_workers)
+{
+	CustomPath *cpath = makeNode(CustomPath);
+	Cost		myrun = run;
+
+	cpath->path.pathtype = T_CustomScan;
+	cpath->path.parent = grouped_rel;
+	cpath->path.pathtarget = target;
+	cpath->path.param_info = NULL;
+	cpath->path.parallel_aware = (parallel_workers > 0);
+	cpath->path.parallel_safe = (parallel_workers > 0);
+	cpath->path.parallel_workers = parallel_workers;
+	cpath->path.rows = clamp_row_est(ngroups);
+	cpath->path.pathkeys = NIL;
+	cpath->flags = 0;
+	cpath->custom_paths = NIL;
+	cpath->custom_private =
+		list_make5(makeInteger((int) rte->relid),
+				   makeInteger(1),		/* grouped mode */
+				   list_make5(keyexprs, outmap, aggrefs, quals,
+							  makeInteger((int) rel->relid)),
+				   tlist,
+				   makeInteger(1));		/* partial: eager-agg is always partial */
+	cpath->methods = &dbbc_agg_path_methods;
+	if (parallel_workers > 0)
+		myrun = myrun / (double) parallel_workers;
+	cpath->path.startup_cost = myrun;
+	cpath->path.total_cost = myrun + cpu_tuple_cost * clamp_row_est(ngroups);
+	cpath->path.disabled_nodes = 0;
+	return cpath;
+}
+
+/*
+ * Eager-aggregation fusion (aggregate-below-join). PG core's eager aggregation
+ * (enable_eager_aggregate) pushes a partial aggregate below a join via
+ * rel->grouped_rel: aggregate the fact first, then join to the dimension, then
+ * Finalize above. Core implements that grouped path as an AGGSPLIT_INITIAL_SERIAL
+ * Agg over the base scan (i.e. over our scan-serve). When the fact is a relation
+ * we can aggregate in-engine, offer a fused DBBlueColumnarAgg partial path on
+ * the grouped_rel instead.
+ *
+ * Runs from set_rel_pathlist_hook, which fires before core's
+ * generate_grouped_paths() + set_cheapest(grouped_rel) (see
+ * set_grouped_rel_pathlist in allpaths.c), so a path added here competes with
+ * core's on cost - no core patch. We add a serial partial path and, when the
+ * scan is parallel-safe, a parallel-aware partial path.
+ */
+static void
+dbbc_try_eager_agg(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
+{
+	RelOptInfo *grouped_rel = rel->grouped_rel;
+	RelAggInfo *agg_info;
+	List	   *needcols = NIL;
+	List	   *keyexprs;
+	List	   *outmap = NIL;
+	List	   *aggrefs = NIL;
+	List	   *quals = NIL;
+	List	   *tlist;
+	DbbcRelVersion *version;
+	int16	   *reg;
+	bool		ok = true;
+	double		ngroups;
+	double		skip_frac = 0.0;
+	double		vm_frac = 0.0;
+	double		decoded;
+	double		surviving;
+	Cost		run;
+	ListCell   *lc;
+
+	if (!dbblue_columnar_enabled || !dbblue_columnar_enable_columnar_scan)
+		return;
+	if (grouped_rel == NULL || grouped_rel->agg_info == NULL)
+		return;
+	agg_info = grouped_rel->agg_info;
+
+	/* only where core deems the partial aggregation useful at THIS rel */
+	if (!agg_info->agg_useful ||
+		!bms_equal(agg_info->apply_agg_at, rel->relids))
+		return;
+
+	/* single plain heap base relation (matches the scan-side gate) */
+	if (rel->reloptkind != RELOPT_BASEREL || rte->rtekind != RTE_RELATION ||
+		(rte->relkind != RELKIND_RELATION && rte->relkind != RELKIND_MATVIEW) ||
+		rte->inh || get_rel_relam(rte->relid) != HEAP_TABLE_AM_OID)
+		return;
+
+	/* group keys: byval bit-eq-safe types, non-volatile, local Vars */
+	if (list_length(agg_info->group_exprs) > DBBC_GRP_MAX_KEYS)
+		return;
+	foreach(lc, agg_info->group_exprs)
+	{
+		Node	   *g = (Node *) lfirst(lc);
+
+		if (!dbbc_grp_key_type_ok(exprType(g)) ||
+			contain_volatile_functions(g) ||
+			!dbbc_expr_vars_ok(g, rel->relid, &needcols))
+			return;
+	}
+	keyexprs = list_copy(agg_info->group_exprs);
+
+	/* pushed WHERE quals on the fact (applied below the agg) */
+	foreach(lc, rel->baserestrictinfo)
+	{
+		RestrictInfo *ri = lfirst_node(RestrictInfo, lc);
+		DbbcSkipQual probe;
+
+		if (ri->security_level > 0 || ri->pseudoconstant)
+			return;
+		if (!dbbc_extract_one_qual((Node *) ri->clause, rel->relid, &probe))
+			return;
+		quals = lappend(quals, ri->clause);
+		needcols = list_append_unique_int(needcols, probe.attno);
+	}
+
+	/* output map from the grouped target: group-key index, or -(agg index)-1 */
+	foreach(lc, agg_info->target->exprs)
+	{
+		Node	   *e = (Node *) lfirst(lc);
+
+		if (IsA(e, Aggref))
+		{
+			if (!dbbc_agg_trans_ok((Aggref *) e, rel->relid, true, &needcols))
+				return;
+			outmap = lappend_int(outmap, -(list_length(aggrefs)) - 1);
+			aggrefs = lappend(aggrefs, e);
+		}
+		else
+		{
+			int			k = 0;
+			bool		found = false;
+			ListCell   *lk;
+
+			foreach(lk, keyexprs)
+			{
+				if (equal(lfirst(lk), e))
+				{
+					found = true;
+					break;
+				}
+				k++;
+			}
+			if (!found)
+				return;
+			outmap = lappend_int(outmap, k);
+		}
+	}
+	if (outmap == NIL || aggrefs == NIL)
+		return;
+
+	ngroups = clamp_row_est(agg_info->grouped_rows);
+	if (ngroups > (double) DBBC_GRP_MAX_GROUPS)
+		return;
+
+	/* the store must cover every needed column */
+	version = dbbc_version_pin_tracked(rte->relid);
+	if (version == NULL)
+		return;
+	if (!DsaPointerIsValid(version->blockdir) || version->nblocks == 0)
+	{
+		dbbc_version_unpin_tracked(version);
+		return;
+	}
+	reg = (int16 *) dsa_get_address(dbbc_store_dsa(), version->attnums);
+	foreach(lc, needcols)
+	{
+		int			attno = lfirst_int(lc);
+		bool		found = false;
+		int			c;
+
+		for (c = 0; c < version->ncols; c++)
+			if (reg[c] == attno)
+			{
+				found = true;
+				break;
+			}
+		if (!found)
+		{
+			ok = false;
+			break;
+		}
+	}
+	dbbc_version_unpin_tracked(version);
+	if (!ok)
+		return;
+
+	tlist = make_tlist_from_pathtarget(agg_info->target);
+	apply_pathtarget_labeling_to_tlist(tlist, agg_info->target);
+
+	/* base run cost (mirrors the single-table grouped path, over the fact) */
+	surviving = clamp_row_est(rel->rows);
+	{
+		Relation	prel = table_open(rte->relid, NoLock);
+
+		dbbc_estimate_serve_fractions(prel, quals, rel->relid,
+									  &skip_frac, &vm_frac);
+		table_close(prel, NoLock);
+	}
+	decoded = clamp_row_est(rel->tuples * (1.0 - skip_frac));
+	run = seq_page_cost * rel->pages * (1.0 - vm_frac)
+		+ cpu_operator_cost * (rel->pages / DBBC_PAGES_PER_BLOCK + 1) * 2.0
+		+ decoded * (cpu_tuple_cost * 0.75
+					 + cpu_operator_cost * list_length(quals))
+		+ surviving * cpu_operator_cost * (list_length(aggrefs) + 1);
+
+	/* serial partial path */
+	add_path(grouped_rel, (Path *)
+			 dbbc_make_eager_cpath(rel, grouped_rel, rte, keyexprs, outmap,
+								   aggrefs, quals, tlist, agg_info->target,
+								   ngroups, run, 0));
+
+	/* parallel-aware partial path, when the scan is parallel-safe */
+	if (rel->consider_parallel && grouped_rel->consider_parallel &&
+		is_parallel_safe(root, (Node *) quals) &&
+		is_parallel_safe(root, (Node *) keyexprs))
+	{
+		int			workers = compute_parallel_worker(rel, rel->pages, -1,
+													  max_parallel_workers_per_gather);
+
+		if (workers > 0)
+			add_partial_path(grouped_rel, (Path *)
+							 dbbc_make_eager_cpath(rel, grouped_rel, rte, keyexprs,
+												   outmap, aggrefs, quals, tlist,
+												   agg_info->target, ngroups, run,
+												   workers));
+	}
 }
 
 static Plan *
@@ -3364,6 +3715,23 @@ dbbc_grp_begin(DbbcAggScanState *as, List *payload, EState *estate, int eflags)
 			fmgr_info(t->finalfn_oid, &t->finalfn);
 			fmgr_info_set_expr((Node *) finalfnexpr, &t->finalfn);
 		}
+
+		/*
+		 * Serialize function (INTERNAL-transtype aggregates). Resolved for every
+		 * grouped node; only invoked in partial mode (dbbc_grp_emit_group). Its
+		 * presence is also the parallel-eligibility signal - an INTERNAL-state
+		 * aggregate with no serialfn cannot cross a worker boundary.
+		 */
+		t->serialfn_oid = aggform->aggserialfn;
+		if (OidIsValid(t->serialfn_oid))
+		{
+			aclresult = object_aclcheck(ProcedureRelationId, t->serialfn_oid,
+										aggOwner, ACL_EXECUTE);
+			if (aclresult != ACLCHECK_OK)
+				aclcheck_error(aclresult, OBJECT_FUNCTION,
+							   get_func_name(t->serialfn_oid));
+			fmgr_info(t->serialfn_oid, &t->serialfn);
+		}
 		ReleaseSysCache(aggTuple);
 	}
 
@@ -3443,6 +3811,21 @@ dbbc_grp_begin(DbbcAggScanState *as, List *payload, EState *estate, int eflags)
 			u++;
 		}
 	}
+
+	/*
+	 * Bind the store version now (not lazily in dbbc_grp_build) so a parallel
+	 * leader can publish it to workers via DSM in InitializeDSMCustomScan. A
+	 * parallel worker leaves as->pscan NULL here and attaches the leader's exact
+	 * version in InitializeWorkerCustomScan instead - a concurrent repopulate
+	 * must not split participants across store versions.
+	 */
+	if (!IsParallelWorker())
+	{
+		DbbcRelVersion *v = (as->rel->rd_rel->relam == HEAP_TABLE_AM_OID)
+			? dbbc_version_pin_tracked(RelationGetRelid(as->rel)) : NULL;
+
+		dbbc_grp_bind(as, estate, v);
+	}
 }
 
 static void
@@ -3456,12 +3839,21 @@ dbbc_agg_begin(CustomScanState *node, EState *estate, int eflags)
 	ListCell   *lc;
 	int			i;
 
+	as->partial = (DBBC_AGG_PRIV_PARTIAL(cp) != 0);
+
 	if (DBBC_AGG_PRIV_MODE(cp) == 1)
 	{
-		/* grouped mode; the executor holds the range-table lock already */
+		/*
+		 * AccessShareLock, not NoLock: BeginCustomScan runs in every parallel
+		 * participant, but this node is scanrelid==0 so the executor does not
+		 * lock the relation on a worker's behalf - a worker has no local lock
+		 * entry and table_open(NoLock) would trip relation_open's assert. The
+		 * leader already holds the lock (from planning), so this is a harmless
+		 * refcount bump there; a worker acquires the group-granted lock.
+		 */
 		if (!(eflags & EXEC_FLAG_EXPLAIN_ONLY))
 		{
-			as->rel = table_open(reloid, NoLock);
+			as->rel = table_open(reloid, AccessShareLock);
 			as->rel_opened = true;
 		}
 		dbbc_grp_begin(as, items, estate, eflags);
@@ -3500,8 +3892,9 @@ dbbc_agg_begin(CustomScanState *node, EState *estate, int eflags)
 									   "dbblue_columnar agg result",
 									   ALLOCSET_SMALL_SIZES);
 
-	/* the executor already holds the range-table lock on this relation */
-	as->rel = table_open(reloid, NoLock);
+	/* AccessShareLock so table_close balances the grouped path; metadata mode
+	 * is leader-only, but keep the lock handling uniform (see grouped comment). */
+	as->rel = table_open(reloid, AccessShareLock);
 	as->rel_opened = true;
 }
 
@@ -4059,14 +4452,92 @@ dbbc_grp_consume_heap_range(DbbcAggScanState *as, DbbcScanState *s,
 	as->grp_ranges_heap++;
 }
 
+/*
+ * Bind the store version + block directory + heap range onto as->pscan, the
+ * persistent scan state the grouped input pass iterates. Done at Begin (leader)
+ * or InitializeWorkerCustomScan (worker) rather than lazily in dbbc_grp_build,
+ * so a parallel leader can publish its pinned version to workers via DSM.
+ */
+static void
+dbbc_grp_bind(DbbcAggScanState *as, EState *estate, DbbcRelVersion *v)
+{
+	List	   *needed = NIL;
+	int			u;
+
+	as->pscan = (DbbcScanState *) palloc0(sizeof(DbbcScanState));
+	as->pscan->css.ss.ss_currentRelation = as->rel;
+	dbbc_scan_common(as->pscan, as->rel, estate);
+	for (u = 0; u < as->nused; u++)
+		needed = lappend_int(needed, as->used_attnos[u]);
+	dbbc_scan_bind_version(as->pscan, as->rel, needed, as->qual_clauses,
+						   as->qual_varno, v, false);
+}
+
+/* claim the next block-directory slot: shared atomic cursor when parallel */
+static inline uint32
+dbbc_grp_claim_slot(DbbcAggScanState *as)
+{
+	if (as->pstate != NULL)
+		return pg_atomic_fetch_add_u32(&as->pstate->next_slot, 1);
+	return as->pscan->cur_slot++;
+}
+
+/* --- parallel DSM callbacks (grouped mode) --- */
+
+static Size
+dbbc_agg_estimate_dsm(CustomScanState *node, ParallelContext *pcxt)
+{
+	return sizeof(DbbcParallelState);
+}
+
+static void
+dbbc_agg_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
+						void *coordinate)
+{
+	DbbcAggScanState *as = (DbbcAggScanState *) node;
+	DbbcParallelState *p = (DbbcParallelState *) coordinate;
+
+	pg_atomic_init_u32(&p->next_slot, 0);
+	/* publish the leader's pinned version + range so workers match exactly */
+	p->version_dp = (as->pscan != NULL && as->pscan->version != NULL)
+		? as->pscan->version->self : InvalidDsaPointer;
+	p->heap_nblocks = (as->pscan != NULL) ? as->pscan->heap_nblocks : 0;
+	p->total_slots = (as->pscan != NULL) ? as->pscan->total_slots : 0;
+	as->pstate = p;
+}
+
+static void
+dbbc_agg_reinitialize_dsm(CustomScanState *node, ParallelContext *pcxt,
+						  void *coordinate)
+{
+	DbbcParallelState *p = (DbbcParallelState *) coordinate;
+
+	/* rescan: only the shared cursor resets; version/range are stable */
+	pg_atomic_write_u32(&p->next_slot, 0);
+}
+
+static void
+dbbc_agg_initialize_worker(CustomScanState *node, shm_toc *toc,
+						   void *coordinate)
+{
+	DbbcAggScanState *as = (DbbcAggScanState *) node;
+	DbbcParallelState *p = (DbbcParallelState *) coordinate;
+	DbbcRelVersion *v;
+
+	as->pstate = p;
+	v = dbbc_version_attach_tracked(p->version_dp);
+	dbbc_grp_bind(as, node->ss.ps.state, v);
+	/* use the leader's range so validity/extent checks agree exactly */
+	as->pscan->heap_nblocks = p->heap_nblocks;
+	as->pscan->total_slots = p->total_slots;
+}
+
 /* the single input pass: build the group hash from all sources */
 static void
 dbbc_grp_build(DbbcAggScanState *as, EState *estate)
 {
-	DbbcScanState scratch;
-	List	   *needed = NIL;
+	DbbcScanState *sc = as->pscan;
 	uint32		cur;
-	int			u;
 
 	if (as->groups == NULL)
 	{
@@ -4080,71 +4551,66 @@ dbbc_grp_build(DbbcAggScanState *as, EState *estate)
 								 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 	}
 
-	for (u = 0; u < as->nused; u++)
-		needed = lappend_int(needed, as->used_attnos[u]);
+	Assert(sc != NULL);			/* bound at Begin / InitializeWorkerCustomScan */
 
-	/* reuse the standard scan setup for version pin, dir, heap slot, etc.
-	 * (this node is never parallel: pin the current version here) */
-	memset(&scratch, 0, sizeof(scratch));
-	scratch.css.ss.ss_currentRelation = as->rel;
-	dbbc_scan_common(&scratch, as->rel, estate);
+	if (sc->whole_rel_mode)
 	{
-		DbbcRelVersion *v = (as->rel->rd_rel->relam == HEAP_TABLE_AM_OID)
-			? dbbc_version_pin_tracked(RelationGetRelid(as->rel)) : NULL;
-
-		dbbc_scan_bind_version(&scratch, as->rel, needed, as->qual_clauses,
-							   as->qual_varno, v, false);
+		/*
+		 * Non-heap-AM full scan: not partitioned across workers. Only one
+		 * participant runs it (the leader, or the sole participant when serial);
+		 * workers skip so rows are not counted more than once.
+		 */
+		if (!IsParallelWorker())
+			dbbc_grp_consume_heap_range(as, sc, 0, sc->heap_nblocks, false);
 	}
-
-	if (scratch.whole_rel_mode)
-		dbbc_grp_consume_heap_range(as, &scratch, 0, scratch.heap_nblocks,
-									false);
 	else
 	{
-		for (cur = 0; cur < scratch.total_slots; cur++)
+		while ((cur = dbbc_grp_claim_slot(as)) < sc->total_slots)
 		{
-			DbbcBlock  *block = dbbc_slot_block(&scratch, cur);
+			DbbcBlock  *block = dbbc_slot_block(sc, cur);
 			DbbcColumnChunk *chunks = NULL;
 
 			CHECK_FOR_INTERRUPTS();
 
-			if (block != NULL && dbbc_block_valid(&scratch, as->rel, block))
+			if (block != NULL && dbbc_block_valid(sc, as->rel, block))
 				chunks = (DbbcColumnChunk *)
-					dsa_get_address(scratch.dsa, block->chunks);
+					dsa_get_address(sc->dsa, block->chunks);
 
-			if (chunks != NULL && dbbc_grp_chunks_usable(as, &scratch, chunks))
+			if (chunks != NULL && dbbc_grp_chunks_usable(as, sc, chunks))
 			{
 				/*
 				 * Zone-map skip: a valid block provably containing no
 				 * qual-matching row contributes nothing to any group.
 				 */
-				if (scratch.nskipquals > 0 &&
-					dbbc_zone_block_skippable(scratch.skipquals,
-											  scratch.nskipquals,
-											  block, chunks, scratch.ncols))
+				if (sc->nskipquals > 0 &&
+					dbbc_zone_block_skippable(sc->skipquals,
+											  sc->nskipquals,
+											  block, chunks, sc->ncols))
 				{
 					as->grp_blocks_skipped++;
 					continue;
 				}
-				dbbc_grp_consume_block(as, &scratch, block, chunks);
+				dbbc_grp_consume_block(as, sc, block, chunks);
 				as->grp_blocks_served++;
 			}
 			else
 			{
 				BlockNumber start = cur * DBBC_PAGES_PER_BLOCK;
 				BlockNumber nblk = Min((BlockNumber) DBBC_PAGES_PER_BLOCK,
-									   scratch.heap_nblocks - start);
+									   sc->heap_nblocks - start);
 
 				/* limited: reached only with a valid heap version */
-				dbbc_grp_consume_heap_range(as, &scratch, start, nblk, true);
+				dbbc_grp_consume_heap_range(as, sc, start, nblk, true);
 			}
 		}
 	}
 
-	if (BufferIsValid(scratch.vm_check_buf))
-		ReleaseBuffer(scratch.vm_check_buf);
-	if (scratch.version != NULL)
-		dbbc_version_unpin_tracked(scratch.version);
+	if (BufferIsValid(sc->vm_check_buf))
+	{
+		ReleaseBuffer(sc->vm_check_buf);
+		sc->vm_check_buf = InvalidBuffer;
+	}
+	/* the store version stays pinned on as->pscan until dbbc_agg_end */
 
 	/* scalar aggregation over zero rows still yields one output row */
 	if (as->nkeys == 0 && hash_get_num_entries(as->groups) == 0)
@@ -4186,7 +4652,45 @@ dbbc_grp_emit_group(DbbcAggScanState *as, DbbcGroupEntry *grp)
 			DbbcAggTrans *t = &as->trans[a];
 			DbbcTransState *st = &grp->states[a];
 
-			if (OidIsValid(t->finalfn_oid))
+			if (as->partial)
+			{
+				/*
+				 * Parallel partial output (AGGSPLIT_INITIAL_SERIAL): emit the
+				 * transition state, serialized to bytea for INTERNAL-transtype
+				 * aggregates, so a core Finalize Aggregate above the Gather can
+				 * deserialize + combine it. This must match core's
+				 * finalize_partialaggregate rule exactly: serialize iff the
+				 * aggregate has a serialfn, else emit the raw transValue.
+				 */
+				if (st->transValueIsNull)
+				{
+					slot->tts_values[i] = (Datum) 0;
+					slot->tts_isnull[i] = true;
+				}
+				else if (OidIsValid(t->serialfn_oid))
+				{
+					LOCAL_FCINFO(fcinfo, 1);
+
+					InitFunctionCallInfoData(*fcinfo, &t->serialfn, 1,
+											 InvalidOid,
+											 (Node *) as->fake_aggstate, NULL);
+					fcinfo->args[0].value =
+						MakeExpandedObjectReadOnly(st->transValue, false,
+												   t->transtypeLen);
+					fcinfo->args[0].isnull = false;
+					fcinfo->isnull = false;
+					slot->tts_values[i] = FunctionCallInvoke(fcinfo);
+					slot->tts_isnull[i] = fcinfo->isnull;
+				}
+				else
+				{
+					slot->tts_values[i] =
+						MakeExpandedObjectReadOnly(st->transValue, false,
+												   t->transtypeLen);
+					slot->tts_isnull[i] = false;
+				}
+			}
+			else if (OidIsValid(t->finalfn_oid))
 			{
 				LOCAL_FCINFO(fcinfo, FUNC_MAX_ARGS);
 				bool		anynull = st->transValueIsNull;
@@ -4396,6 +4900,19 @@ dbbc_agg_end(CustomScanState *node)
 {
 	DbbcAggScanState *as = (DbbcAggScanState *) node;
 
+	/*
+	 * Release the store version pinned at Begin / InitializeWorkerCustomScan
+	 * (and the validity buffer, if dbbc_grp_build never ran to release it).
+	 */
+	if (as->pscan != NULL)
+	{
+		if (BufferIsValid(as->pscan->vm_check_buf))
+			ReleaseBuffer(as->pscan->vm_check_buf);
+		if (as->pscan->version != NULL)
+			dbbc_version_unpin_tracked(as->pscan->version);
+		as->pscan = NULL;
+	}
+
 	if (as->seq_active)
 	{
 		hash_seq_term(&as->seq);
@@ -4418,7 +4935,8 @@ dbbc_agg_end(CustomScanState *node)
 	}
 	if (as->rel_opened)
 	{
-		table_close(as->rel, NoLock);
+		/* release the AccessShareLock taken in dbbc_agg_begin */
+		table_close(as->rel, AccessShareLock);
 		as->rel_opened = false;
 	}
 	if (as->aggctx != NULL)
