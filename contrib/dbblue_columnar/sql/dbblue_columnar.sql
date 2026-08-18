@@ -124,6 +124,44 @@ RESET parallel_setup_cost;
 RESET parallel_tuple_cost;
 SET max_parallel_workers_per_gather = 0;
 
+-- ---- eager-aggregation fusion (aggregate-below-join): PG core's eager
+-- aggregation pushes a partial aggregate below a join; our fused
+-- DBBlueColumnarAgg should be that below-join aggregate. Force it and prove the
+-- results stay byte-identical to heap, including a many-to-many FAN-OUT join
+-- (the partial states are multiplied by the join, then a Finalize Aggregate
+-- above re-combines - the correctness-critical case). Uses grp (13 distinct,
+-- above min_eager_agg_group_size) as the join/group key so core offers it. ----
+CREATE TABLE dt (id int PRIMARY KEY, seq int);
+INSERT INTO dt SELECT g, g * 10 FROM generate_series(0, 12) g;			-- unique PK
+CREATE TABLE dtf (id int, seq int);
+INSERT INTO dtf SELECT g, g * 10 FROM generate_series(0, 12) g, generate_series(1, 2);	-- 2x fan-out
+ANALYZE dt;
+ANALYZE dtf;
+SET enable_eager_aggregate = on;
+SET max_parallel_workers_per_gather = 4;
+SET min_parallel_table_scan_size = 0;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET enable_seqscan = off;
+SET enable_hashagg = off;
+-- our fused node must be the below-join aggregate
+SELECT uses_node($$SELECT t.grp, dt.seq, sum(t.amt) FROM t LEFT JOIN dt ON dt.id = t.grp GROUP BY t.grp, dt.seq, dt.id$$,
+				 'Custom Scan (DBBlueColumnarAgg)') AS eager_fused_used;
+SELECT 'eager-leftjoin  ', agree($$SELECT t.grp, dt.seq, sum(t.amt) s, count(*) c, avg(t.amt) a FROM t LEFT JOIN dt ON dt.id = t.grp GROUP BY t.grp, dt.seq, dt.id ORDER BY t.grp$$);
+SELECT 'eager-innerjoin ', agree($$SELECT t.grp, dt.seq, min(t.amt) mn, max(t.amt) mx, count(*) c FROM t JOIN dt ON dt.id = t.grp GROUP BY t.grp, dt.seq, dt.id ORDER BY t.grp$$);
+SELECT 'eager-where     ', agree($$SELECT t.grp, sum(t.amt) s FROM t LEFT JOIN dt ON dt.id = t.grp WHERE t.k7 > 3 GROUP BY t.grp, dt.id ORDER BY t.grp$$);
+SELECT 'eager-fanout    ', agree($$SELECT t.grp, sum(t.amt) s, count(*) c FROM t JOIN dtf ON dtf.id = t.grp GROUP BY t.grp ORDER BY t.grp$$);
+SELECT 'eager-fanout-left', agree($$SELECT t.grp, count(*) c, sum(t.amt) s, avg(t.amt) a FROM t LEFT JOIN dtf ON dtf.id = t.grp GROUP BY t.grp ORDER BY t.grp$$);
+RESET enable_seqscan;
+RESET enable_hashagg;
+RESET min_parallel_table_scan_size;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET enable_eager_aggregate;
+SET max_parallel_workers_per_gather = 0;
+DROP TABLE dt;
+DROP TABLE dtf;
+
 DROP FUNCTION agree(text);
 DROP FUNCTION uses_node(text, text);
 DROP TABLE t;
