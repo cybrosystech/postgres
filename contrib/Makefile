@@ -23,6 +23,7 @@ SUBDIRS = \
 		file_fdw	\
 		fuzzystrmatch	\
 		hstore		\
+		hypopg		\
 		intagg		\
 		intarray	\
 		isn		\
