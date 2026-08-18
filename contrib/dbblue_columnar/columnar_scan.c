@@ -3134,12 +3134,16 @@ dbbc_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 		run = seq_page_cost * base_rel->pages * (1.0 - vm_frac)
 			+ cpu_operator_cost *
 			(base_rel->pages / DBBC_PAGES_PER_BLOCK + 1) * 2.0
-			/* decode every served row (per-tuple work, like the scan path's
-			 * cpu_tuple_cost*0.75) + evaluate its quals; only survivors reach
-			 * the transition calls */
-			+ decoded * (cpu_tuple_cost * 0.75
+			/* decode every served row + evaluate its quals; only survivors
+			 * reach the transition calls. The fused node reads each value
+			 * straight into the transition state - unlike the scan-serve path it
+			 * never materializes a per-row tuple slot for a parent Agg node, so
+			 * the per-row decode is cheaper (0.5 vs the scan path's 0.75). One
+			 * transition per aggregate per surviving row (the per-group finalize
+			 * is charged separately below, as cpu_tuple_cost * ngroups). */
+			+ decoded * (cpu_tuple_cost * 0.5
 						 + cpu_operator_cost * list_length(quals))
-			+ surviving * cpu_operator_cost * (list_length(aggrefs) + 1);
+			+ surviving * cpu_operator_cost * list_length(aggrefs);
 		/*
 		 * Partial path: the per-row scan/decode/qual/transition work is split
 		 * across participants (mirrors the parallel scan path's divisor). Core
@@ -3384,9 +3388,12 @@ dbbc_try_eager_agg(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	decoded = clamp_row_est(rel->tuples * (1.0 - skip_frac));
 	run = seq_page_cost * rel->pages * (1.0 - vm_frac)
 		+ cpu_operator_cost * (rel->pages / DBBC_PAGES_PER_BLOCK + 1) * 2.0
-		+ decoded * (cpu_tuple_cost * 0.75
+		/* fused decode is cheaper than scan-serve (no per-row parent tuple slot,
+		 * 0.5 vs 0.75); one transition per aggregate per surviving row (the
+		 * per-group finalize is charged separately as cpu_tuple_cost * ngroups) */
+		+ decoded * (cpu_tuple_cost * 0.5
 					 + cpu_operator_cost * list_length(quals))
-		+ surviving * cpu_operator_cost * (list_length(aggrefs) + 1);
+		+ surviving * cpu_operator_cost * list_length(aggrefs);
 
 	/* serial partial path */
 	add_path(grouped_rel, (Path *)

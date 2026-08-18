@@ -66,6 +66,10 @@ SET dbblue_columnar.enable_columnar_scan = on;
 SELECT uses_node($$SELECT id, amt FROM t WHERE k7 = 3$$, 'DBBlueColumnarScan') AS scan_used;
 SELECT uses_node($$SELECT grp, sum(amt) FROM t GROUP BY grp$$, 'DBBlueColumnarAgg') AS grouped_agg_used;
 SELECT uses_node($$SELECT count(*) FROM t$$, 'DBBlueColumnarAgg') AS meta_agg_used;
+-- global aggregate (zero GROUP BY) with a transition agg must use the fused
+-- node too, not fall back to scan-serve + a plain Aggregate (the plain Agg has
+-- no HashAgg overhead, so the fused cost must not be over-priced for it).
+SELECT uses_node($$SELECT sum(amt) FROM t WHERE k7 = 4$$, 'DBBlueColumnarAgg') AS scalar_agg_used;
 
 -- ---- scan: predicate pushdown (all extractable shapes) ----
 SELECT 'scan-eq       ', agree($$SELECT id, amt, txt FROM t WHERE k7 = 3 ORDER BY id$$);
