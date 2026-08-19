@@ -108,6 +108,9 @@ BufferManagerShmemRequest(void *arg)
 					   .size = NBuffers * sizeof(CkptSortItem),
 					   .ptr = (void **) &CkptBufferIds,
 		);
+
+	/* Odoo pinner: reserve the ring-buffer forced-relations table. */
+	RingBufferShmemRequest();
 }
 
 /*

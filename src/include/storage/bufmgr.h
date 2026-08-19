@@ -395,6 +395,7 @@ extern void FreeAccessStrategy(BufferAccessStrategy strategy);
 
 /* Odoo pinner: ring-buffer forced-relations table (shared memory) */
 extern Size RingBufferShmemSize(void);
+extern void RingBufferShmemRequest(void);
 extern void InitRingBufferTable(void);
 extern void RegisterRingBufferRelation(Oid relfileOid);
 extern void UnregisterRingBufferRelation(Oid relfileOid);
