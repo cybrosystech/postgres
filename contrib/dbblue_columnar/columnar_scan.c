@@ -4412,10 +4412,29 @@ dbbc_grp_consume_heap_range(DbbcAggScanState *as, DbbcScanState *s,
 		{
 			if (as->has_key_exprs)
 			{
-				/* the heap slot already holds all columns; point the expr
-				 * context at it directly (no separate scratch slot needed) */
+				/*
+				 * Populate the virtual scratch slot from the heap tuple, exactly
+				 * as the columnar-block path does from chunks. The key ExprState
+				 * is compiled for this virtual slot, so its EEOP_SCAN_FETCHSOME
+				 * is elided (a virtual slot is always fully deformed). Pointing
+				 * the expr context at the raw heap slot instead would leave it
+				 * un-deformed (tts_nvalid == 0) when EEOP_SCAN_VAR runs, tripping
+				 * its "attnum < tts_nvalid" assert / reading past the slot.
+				 */
+				int			j;
+
 				ResetExprContext(as->key_econtext);
-				as->key_econtext->ecxt_scantuple = s->heap_slot;
+				ExecClearTuple(as->key_slot);
+				for (j = 0; j < as->nkey_input; j++)
+				{
+					AttrNumber	at = as->key_input_attnos[j];
+
+					as->key_slot->tts_values[at - 1] =
+						slot_getattr(s->heap_slot, at,
+									 &as->key_slot->tts_isnull[at - 1]);
+				}
+				ExecStoreVirtualTuple(as->key_slot);
+				as->key_econtext->ecxt_scantuple = as->key_slot;
 			}
 			for (k = 0; k < as->nkeys; k++)
 			{

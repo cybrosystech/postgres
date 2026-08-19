@@ -351,6 +351,37 @@ RESET enable_eager_aggregate;
 SET max_parallel_workers_per_gather = 0;
 DROP TABLE dt;
 DROP TABLE dtf;
+-- ---- expression group key WITH heap fallback: dirty some rows so the fused
+-- node interleaves columnar blocks with heap-range fallback in one scan, and
+-- the per-row group-key expression is evaluated over BOTH. Regression for a
+-- crash where the heap path pointed the expr context at an un-deformed raw heap
+-- slot (EEOP_SCAN_VAR "attnum < tts_nvalid" assert) - the block path populated a
+-- virtual scratch slot but the heap path did not. Must not crash; the result
+-- must equal heap. (Runs last: the UPDATE invalidates blocks for t.) ----
+UPDATE t SET amt = amt WHERE id < 500;
+SET max_parallel_workers_per_gather = 4;
+SET min_parallel_table_scan_size = 0;
+SET parallel_setup_cost = 0;
+SET enable_seqscan = off;
+SET enable_hashagg = off;
+SELECT uses_node($$SELECT date_trunc('year', d) FROM t GROUP BY 1$$,
+				 'DBBlueColumnarAgg') AS exprkey_heapfb_fused;
+ exprkey_heapfb_fused 
+----------------------
+ t
+(1 row)
+
+SELECT 'exprkey-heapfb  ', agree($$SELECT date_trunc('year', d) y, count(*) c, sum(amt) s, min(amt) mn FROM t GROUP BY 1 ORDER BY 1$$);
+     ?column?     | agree 
+------------------+-------
+ exprkey-heapfb   | ok
+(1 row)
+
+RESET enable_seqscan;
+RESET enable_hashagg;
+RESET min_parallel_table_scan_size;
+RESET parallel_setup_cost;
+SET max_parallel_workers_per_gather = 0;
 DROP FUNCTION agree(text);
 DROP FUNCTION uses_node(text, text);
 DROP TABLE t;
