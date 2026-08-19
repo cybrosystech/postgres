@@ -45,6 +45,7 @@ SUBDIRS = \
 		pg_trgm		\
 		pgrowlocks	\
 		pgstattuple	\
+		pgvector \
 		pg_visibility	\
 		pg_walinspect	\
 		postgres_fdw	\
