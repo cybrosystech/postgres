@@ -125,22 +125,36 @@ RingBufferShmemSize(void)
 	return sizeof(RingBufferTable);
 }
 
+/*
+ * Reserve shared memory for the ring-buffer forced-relations table and assign
+ * the RingBufferRelations pointer.
+ *
+ * Called from BufferManagerShmemRequest() (the buffer manager's shmem
+ * request_fn) so this struct's size is properly accounted in the total
+ * shared-memory request, exactly like the other buffer-manager structures.
+ * Previously the table was self-allocated in InitRingBufferTable() via
+ * ShmemInitStruct() without its size ever being requested, so it only fit by
+ * consuming PostgreSQL's fixed shared-memory slack.
+ */
+void
+RingBufferShmemRequest(void)
+{
+	ShmemRequestStruct(.name = "RingBufferRelations",
+					   .size = RingBufferShmemSize(),
+					   .ptr = (void **) &RingBufferRelations);
+}
+
 void
 InitRingBufferTable(void)
 {
-	bool		found;
-
-	RingBufferRelations = (RingBufferTable *)
-		ShmemInitStruct("RingBufferRelations",
-						sizeof(RingBufferTable),
-						&found);
-
-	if (!found)
-	{
-		MemSet(RingBufferRelations, 0, sizeof(RingBufferTable));
-		LWLockInitialize(&RingBufferRelations->lock,
-						 LWTRANCHE_RING_BUFFER_TABLE);
-	}
+	/*
+	 * The shared memory is reserved and RingBufferRelations is assigned by
+	 * RingBufferShmemRequest(); here we only initialize its contents. This
+	 * runs once, on the shared-memory create path.
+	 */
+	MemSet(RingBufferRelations, 0, sizeof(RingBufferTable));
+	LWLockInitialize(&RingBufferRelations->lock,
+					 LWTRANCHE_RING_BUFFER_TABLE);
 }
 
 void
