@@ -9,7 +9,9 @@
  * DROP THIS FILE into: contrib/pg_prewarm/db_blue_pinner.c
  * Add it to contrib/pg_prewarm/Makefile OBJS list.
  *
- * REGISTRATION: Call DBBluePinnerRegister() from pg_prewarm's _PG_init().
+ * REGISTRATION: the worker is registered from core (DBBlueRegisterPinnerWorker
+ * in bufmgr.c), gated by dbblue_pinner_enabled — no shared_preload_libraries
+ * entry required. This library only needs to export DBBluePinnerMain.
  *-------------------------------------------------------------------------
  */
 
@@ -181,11 +183,11 @@ static int  prev_ring_buffer_count = 0;
 /* Public functions — declared in db_blue_pinner.h */
 PGDLLEXPORT void
 DBBluePinnerMain(Datum main_arg);
-void    DBBluePinnerRegister(void);
-void    DBBluePinnerRegisterGUCs(void);
 
 /* Private forward declarations */
 static void  PinnerRunCycle(void);
+static void  PinnerRunCycleSafe(void);
+static void  DBBluePinnerEnsureExtensions(void);
 static void  PinnerSetupRingBuffers(void);
 static int   ResolvePinEntries(PinEntry *entries, int max_entries);
 static void  SortEntriesByAccessCount(PinEntry *entries, int nentries);
@@ -200,9 +202,7 @@ static void  PinnerHandleSignals(void);
 static bool pinner_shutdown_requested = false;
 
 /* =========================================================================
- * GUC REGISTRATION
- *
- * Call DBBluePinnerRegisterGUCs() from _PG_init() in pg_prewarm.c
+ * INTERNAL HELPERS
  * =========================================================================
  */
 
@@ -233,58 +233,83 @@ GetRelFileNumber(Oid relid)
 }
 
 
-void
-DBBluePinnerRegisterGUCs(void)
-{
-    /*
-     * Nothing to register here anymore.
-     *
-     * The pinner parameters are now flat, core GUCs (dbblue_pinned_tables,
-     * dbblue_ring_buffer_tables, dbblue_pin_check_interval,
-     * dbblue_max_pin_size_percent, dbblue_pinner_database,
-     * dbblue_min_access_count), defined in
-     * src/backend/utils/misc/guc_parameters.dat with their backing variables
-     * (DBBluePinner_*) in src/backend/storage/buffer/bufmgr.c. A loadable
-     * module cannot register dotless core GUCs, so this worker only *reads*
-     * them via the extern declarations in storage/bufmgr.h.
-     *
-     * The function is kept (as a no-op) so the _PG_init() call site in
-     * autoprewarm.c does not have to change.
-     */
-}
-
-/* =========================================================================
- * BACKGROUND WORKER REGISTRATION
- * =========================================================================
- */
-void
-DBBluePinnerRegister(void)
-{
-    BackgroundWorker worker;
-
-    MemSet(&worker, 0, sizeof(worker));
-
-    worker.bgw_flags        = BGWORKER_SHMEM_ACCESS |
-                              BGWORKER_BACKEND_DATABASE_CONNECTION;
-    worker.bgw_start_time   = BgWorkerStart_RecoveryFinished;
-    worker.bgw_restart_time = 10;   /* restart 10s after crash */
-
-    strlcpy(worker.bgw_library_name, "pg_prewarm",
-            sizeof(worker.bgw_library_name));
-    strlcpy(worker.bgw_function_name, "DBBluePinnerMain",
-            sizeof(worker.bgw_function_name));
-    strlcpy(worker.bgw_name, "db_blue pinner",
-            sizeof(worker.bgw_name));
-    strlcpy(worker.bgw_type, "db_blue pinner",
-            sizeof(worker.bgw_type));
-
-    RegisterBackgroundWorker(&worker);
-}
-
 /* =========================================================================
  * WORKER MAIN LOOP
  * =========================================================================
  */
+/*
+ * DBBluePinnerEnsureExtensions — create the contrib extensions the pinner
+ * relies on (pg_prewarm for warming, pg_buffercache for the cache-ratio
+ * check) in the connected database, if not already present.
+ *
+ * Best-effort: runs in its own transaction and swallows any failure (missing
+ * privileges, extension files not installed, ...) with a WARNING, so
+ * provisioning can never take the worker down. Removes the need to run
+ * CREATE EXTENSION by hand in every pinner database.
+ */
+static void
+DBBluePinnerEnsureExtensions(void)
+{
+    MemoryContext ctx = CurrentMemoryContext;
+
+    PG_TRY();
+    {
+        StartTransactionCommand();
+        SPI_connect();
+        PushActiveSnapshot(GetTransactionSnapshot());
+
+        SPI_execute("CREATE EXTENSION IF NOT EXISTS pg_prewarm", false, 0);
+        SPI_execute("CREATE EXTENSION IF NOT EXISTS pg_buffercache", false, 0);
+
+        SPI_finish();
+        PopActiveSnapshot();
+        CommitTransactionCommand();
+
+        elog(LOG,
+             "db_blue pinner: ensured extensions pg_prewarm and pg_buffercache");
+    }
+    PG_CATCH();
+    {
+        MemoryContextSwitchTo(ctx);
+        EmitErrorReport();
+        FlushErrorState();
+        AbortCurrentTransaction();
+        elog(WARNING,
+             "db_blue pinner: could not auto-create pg_prewarm / "
+             "pg_buffercache; pinning is degraded until they are installed");
+    }
+    PG_END_TRY();
+}
+
+/*
+ * PinnerRunCycleSafe — run one maintenance cycle without ever letting an
+ * error kill the worker. On failure we log it, roll back, and return so the
+ * worker keeps running and retries on the next interval. (Previously an error
+ * such as a missing pg_buffercache extension propagated out and crash-looped
+ * the worker every bgw_restart_time seconds.)
+ */
+static void
+PinnerRunCycleSafe(void)
+{
+    MemoryContext ctx = CurrentMemoryContext;
+
+    PG_TRY();
+    {
+        PinnerRunCycle();
+    }
+    PG_CATCH();
+    {
+        MemoryContextSwitchTo(ctx);
+        EmitErrorReport();
+        FlushErrorState();
+        AbortCurrentTransaction();
+        elog(LOG,
+             "db_blue pinner: cycle failed; worker continues, will retry next "
+             "interval");
+    }
+    PG_END_TRY();
+}
+
 void
 DBBluePinnerMain(Datum main_arg)
 {
@@ -306,13 +331,16 @@ DBBluePinnerMain(Datum main_arg)
          DBBluePinner_check_interval,
          DBBluePinner_max_pin_percent);
 
+    /* Ensure the extensions we depend on exist in this database. */
+    DBBluePinnerEnsureExtensions();
+
     /*
      * First cycle — run immediately on startup.
      * This is the "cold start" prewarm.
      * For Odoo, this runs once when PostgreSQL starts, before any
      * user connections arrive, giving the best chance of a warm cache.
      */
-    PinnerRunCycle();
+    PinnerRunCycleSafe();
 
     /* Main loop */
     for (;;)
@@ -345,7 +373,7 @@ DBBluePinnerMain(Datum main_arg)
         if (pinner_shutdown_requested)
             break;
 
-        PinnerRunCycle();
+        PinnerRunCycleSafe();
     }
 
     proc_exit(0);
@@ -487,28 +515,6 @@ cycle_end:
     elog(DEBUG1,
          "db_blue pinner: cycle complete, %ldMB pinned",
          (long) (used_bytes / (1024 * 1024)));
-
-    /*
-     * Sanity warning: if the pinned set is small relative to the pool
-     * (< 1/4 of shared_buffers), the protection mechanism is unlikely to
-     * earn its overhead. Benchmarks show 3-7% throughput regression in
-     * deployments where the working set already fits comfortably and the
-     * pinner is therefore pinning a small fraction of the pool. Surface
-     * this once per cycle so operators can see it.
-     */
-    {
-        int64   pool_bytes = (int64) NBuffers * BLCKSZ;
-
-        if (used_bytes > 0 && used_bytes < pool_bytes / 4)
-            elog(LOG,
-                 "db_blue pinner: pinned set is %ldMB of %ldMB pool "
-                 "(%.1f%%) — the feature provides little benefit when the "
-                 "working set fits comfortably in shared_buffers; consider "
-                 "disabling db_blue.pinned_tables for higher throughput",
-                 (long) (used_bytes  / (1024 * 1024)),
-                 (long) (pool_bytes  / (1024 * 1024)),
-                 100.0 * used_bytes / pool_bytes);
-    }
 }
 
 /* =========================================================================

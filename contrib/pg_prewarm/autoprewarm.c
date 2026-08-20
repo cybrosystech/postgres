@@ -164,16 +164,12 @@ _PG_init(void)
 		apw_start_leader_worker();
 
 	/*
-	 * Register the dbblue soft-pin / ring-buffer pinner worker, but only when
-	 * dbblue_pinner_enabled is on. This lets pg_prewarm stay preloaded (for
-	 * autoprewarm and the pg_prewarm() function) while advanced caching stays
-	 * fully off by default — no worker, no pinning, no ring-buffer routing.
+	 * The dbblue soft-pin ("db_blue pinner") worker is now registered from the
+	 * postmaster in core (DBBlueRegisterPinnerWorker), gated by
+	 * dbblue_pinner_enabled — so it no longer requires pg_prewarm to be in
+	 * shared_preload_libraries, and we must NOT register it again here (that
+	 * would start two workers). Nothing to do from pg_prewarm's _PG_init.
 	 */
-	if (DBBluePinner_enabled)
-	{
-		DBBluePinnerRegisterGUCs();
-		DBBluePinnerRegister();
-	}
 }
 
 /*
