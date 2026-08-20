@@ -47,6 +47,7 @@
 #include "executor/instrument.h"
 #include "lib/binaryheap.h"
 #include "miscadmin.h"
+#include "postmaster/bgworker.h"
 #include "pg_trace.h"
 #include "pgstat.h"
 #include "postmaster/bgwriter.h"
@@ -155,6 +156,39 @@ InitRingBufferTable(void)
 	MemSet(RingBufferRelations, 0, sizeof(RingBufferTable));
 	LWLockInitialize(&RingBufferRelations->lock,
 					 LWTRANCHE_RING_BUFFER_TABLE);
+}
+
+/*
+ * DBBlueRegisterPinnerWorker — register the dbblue soft-pin background worker
+ * as a static bgworker, gated by the dbblue_pinner_enabled GUC.
+ *
+ * Called from the postmaster (PostmasterMain), before shared memory is set up,
+ * so the feature no longer needs pg_prewarm in shared_preload_libraries: the
+ * worker's code lives in the pg_prewarm library, loaded lazily when the worker
+ * process starts (bgw_library_name = "pg_prewarm"). Flip dbblue_pinner_enabled
+ * = on and restart — core brings the worker up.
+ */
+void
+DBBlueRegisterPinnerWorker(void)
+{
+	BackgroundWorker worker;
+
+	if (!DBBluePinner_enabled)
+		return;
+
+	MemSet(&worker, 0, sizeof(worker));
+	worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
+		BGWORKER_BACKEND_DATABASE_CONNECTION;
+	worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+	worker.bgw_restart_time = 10;
+	strlcpy(worker.bgw_library_name, "pg_prewarm",
+			sizeof(worker.bgw_library_name));
+	strlcpy(worker.bgw_function_name, "DBBluePinnerMain",
+			sizeof(worker.bgw_function_name));
+	strlcpy(worker.bgw_name, "db_blue pinner", sizeof(worker.bgw_name));
+	strlcpy(worker.bgw_type, "db_blue pinner", sizeof(worker.bgw_type));
+
+	RegisterBackgroundWorker(&worker);
 }
 
 void
