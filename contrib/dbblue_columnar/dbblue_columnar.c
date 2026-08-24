@@ -98,6 +98,10 @@ dbbc_refresh_cycle(void)
 		Oid			relid = lfirst_oid(lc);
 		MemoryContext oldcxt = CurrentMemoryContext;
 
+		/* yield promptly to a fast shutdown rather than finish the whole pass */
+		if (ShutdownRequestPending)
+			break;
+
 		BeginInternalSubTransaction(NULL);
 		PG_TRY();
 		{
