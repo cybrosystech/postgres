@@ -261,6 +261,7 @@ typedef struct DbbcScanState
 	uint64		rows_columnar;
 	uint64		rows_filtered;
 	uint64		blocks_vm_validated;	/* validity proven from the VM alone */
+	uint64		blocks_restamped;	/* fast-path VM stamp re-armed in place */
 } DbbcScanState;
 
 static void dbbc_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
@@ -846,21 +847,25 @@ dbbc_estimate_serve_fractions(Relation rel, List *clauses, Index varno,
 									  version->ncols))
 			skipped++;
 		/* lock-free approximation of the VM fast-path eligibility */
-		if (!XLogRecPtrIsInvalid(block->vm_lsn))
 		{
-			bool		av = true;
-			uint16		p;
+			XLogRecPtr	stamp = pg_atomic_read_u64(&block->vm_lsn);
 
-			for (p = 0; p < block->npages; p++)
-				if (!(visibilitymap_get_status(rel, block->first_page + p,
-											   &vmbuf) & VISIBILITYMAP_ALL_VISIBLE))
-				{
-					av = false;
-					break;
-				}
-			if (av && BufferIsValid(vmbuf) &&
-				BufferGetLSNAtomic(vmbuf) == block->vm_lsn)
-				vmvalid++;
+			if (!XLogRecPtrIsInvalid(stamp))
+			{
+				bool		av = true;
+				uint16		p;
+
+				for (p = 0; p < block->npages; p++)
+					if (!(visibilitymap_get_status(rel, block->first_page + p,
+												   &vmbuf) & VISIBILITYMAP_ALL_VISIBLE))
+					{
+						av = false;
+						break;
+					}
+				if (av && BufferIsValid(vmbuf) &&
+					BufferGetLSNAtomic(vmbuf) == stamp)
+					vmvalid++;
+			}
 		}
 	}
 	if (BufferIsValid(vmbuf))
@@ -1498,6 +1503,7 @@ dbbc_block_valid(DbbcScanState *s, Relation rel, DbbcBlock *block)
 {
 	BlockNumber range_end;
 	uint16		p;
+	XLogRecPtr	restamp_before = InvalidXLogRecPtr;
 
 	/*
 	 * The block must cover its range's ENTIRE current extent. A block
@@ -1525,6 +1531,34 @@ dbbc_block_valid(DbbcScanState *s, Relation rel, DbbcBlock *block)
 		return true;
 	}
 
+	/*
+	 * The cheap VM proof was unusable - typically because a vacuum bumped the
+	 * covering VM page's LSN past our stamp; because one VM page spans ~32k heap
+	 * pages, a single touched row there defeats the fast path for EVERY block
+	 * sharing that VM page. Prove validity the authoritative way (per heap page)
+	 * and, while we hold that proof, opportunistically RE-STAMP the block so the
+	 * next scan is fast again instead of paying these per-page reads forever.
+	 *
+	 * This is the serve-path PROOF for the shared re-stamp (dbbc_restamp_block):
+	 * bracket the per-page proof with two VM-page LSN captures. If the proof
+	 * succeeds AND the VM page LSN did not move across it (restamp_after ==
+	 * restamp_before), then no covered page had its VM bit cleared during the
+	 * proof - any change clears the bit and advances the VM page LSN - so the
+	 * block is still byte-identical to its build image and restamp_before is a
+	 * sound new stamp to adopt. The block cannot be freed underneath us: the
+	 * scan holds a pin on its version.
+	 *
+	 * Only attempt it for a block that HAD a valid stamp (so it is single-VM-
+	 * page eligible) but went stale - i.e. vm_lsn is valid yet the fast path
+	 * failed on the LSN compare. A built block whose vm_lsn is Invalid has a
+	 * range that crosses a VM page (a static property; the sole reason build
+	 * leaves it Invalid, since a block only builds when every page has a valid
+	 * LSN), so it can never use the fast path and re-stamping it is wasted work.
+	 */
+	if (dbblue_columnar_enable_restamp &&
+		!XLogRecPtrIsInvalid(pg_atomic_read_u64(&block->vm_lsn)))
+		restamp_before = dbbc_block_vm_capture(block, rel, &s->vm_check_buf);
+
 	for (p = 0; p < block->npages; p++)
 	{
 		Buffer		buf;
@@ -1540,6 +1574,16 @@ dbbc_block_valid(DbbcScanState *s, Relation rel, DbbcBlock *block)
 
 		if (!ok)
 			return false;
+	}
+
+	if (!XLogRecPtrIsInvalid(restamp_before))
+	{
+		XLogRecPtr	restamp_after = dbbc_block_vm_capture(block, rel,
+														  &s->vm_check_buf);
+
+		if (restamp_after == restamp_before &&
+			dbbc_restamp_block(block, restamp_before))
+			s->blocks_restamped++;
 	}
 	return true;
 }
@@ -2138,6 +2182,8 @@ dbbc_explain_scan(CustomScanState *node, List *ancestors, ExplainState *es)
 							   (int64) s->blocks_skipped, es);
 		ExplainPropertyInteger("Columnar VM-Validated Blocks", NULL,
 							   (int64) s->blocks_vm_validated, es);
+		ExplainPropertyInteger("Columnar Blocks Re-stamped", NULL,
+							   (int64) s->blocks_restamped, es);
 		ExplainPropertyInteger("Heap Fallback Ranges", NULL,
 							   (int64) s->ranges_heap, es);
 		ExplainPropertyInteger("Columnar Rows", NULL,
@@ -2284,6 +2330,19 @@ typedef struct DbbcGroupEntry
 } DbbcGroupEntry;
 
 /*
+ * One dimension row for the in-node dimension hash-join (DBBC_AGG_MODE_DIMJOIN).
+ * Keyed by the join key normalized to int64 (Phase 1 join keys are byval
+ * int/oid). vals[k]/nulls[k] hold the dim-sourced group key at key position k
+ * (only positions where key_from_dim[k]); values are byval, so no copy needed.
+ */
+typedef struct DbbcDimEntry
+{
+	int64		key;			/* hash key: must be first */
+	Datum		vals[DBBC_GRP_MAX_KEYS];
+	bool		nulls[DBBC_GRP_MAX_KEYS];
+} DbbcDimEntry;
+
+/*
  * custom_private layout (all copyObject-safe Node lists):
  *   [0] Integer holding the base relation OID (absolute; an RT index
  *       would be wrong - custom_private is opaque to setrefs, so it
@@ -2313,6 +2372,24 @@ typedef struct DbbcGroupEntry
  * built before this element existed (length 4) is a final-mode plan. */
 #define DBBC_AGG_PRIV_PARTIAL(cp)	(list_length(cp) >= 5 ? \
 									 (int) intVal(list_nth(cp, 4)) : 0)
+
+/* mode values for the [1] slot (DBBC_AGG_PRIV_MODE) */
+#define DBBC_AGG_MODE_METADATA	0
+#define DBBC_AGG_MODE_GROUPED	1
+#define DBBC_AGG_MODE_DIMJOIN	2	/* grouped + in-node dimension hash-join */
+/*
+ * Dim-join (mode 2) extends the grouped payload with a dimension tail; the
+ * first five elements stay grouped-compatible (keyexprs, outmap, aggrefs,
+ * quals, fact_relid) so dbbc_grp_begin reads them unchanged. keyexprs holds
+ * dim-sourced keys as Vars with varno == dim RT index. Tail (elements 5..8;
+ * see DESIGN_dimjoin_agg.md):
+ *   [5] Integer dim relation OID (absolute)   [6] Integer dim join-key attno
+ *   [7] Integer fact FK attno                 [8] Integer dim RT index
+ */
+#define DBBC_DJ_DIM_RELOID(pl)		((Oid) intVal(list_nth(pl, 5)))
+#define DBBC_DJ_DIM_KEY_ATTNO(pl)	((AttrNumber) intVal(list_nth(pl, 6)))
+#define DBBC_DJ_FK_ATTNO(pl)		((AttrNumber) intVal(list_nth(pl, 7)))
+#define DBBC_DJ_DIM_RELID(pl)		((Index) intVal(list_nth(pl, 8)))
 
 typedef struct DbbcAggScanState
 {
@@ -2373,6 +2450,21 @@ typedef struct DbbcAggScanState
 	uint64		grp_since_memcheck; /* new groups since the last memory probe */
 	HASH_SEQ_STATUS seq;		/* emission cursor over the hash */
 	bool		seq_active;
+
+	/* dim-join sub-mode (DBBC_AGG_MODE_DIMJOIN): in-node dimension hash-join */
+	bool		is_dimjoin;
+	Relation	dim_rel;
+	bool		dim_opened;
+	Oid			dim_reloid;
+	Index		dim_relid;		/* dim RT index; identifies dim Vars in keyexprs */
+	AttrNumber	dim_key_attno;	/* dim join key column (proven unique) */
+	AttrNumber	fk_attno;		/* fact FK column, read per row to probe */
+	bool		key_from_dim[DBBC_GRP_MAX_KEYS];
+	AttrNumber	key_dim_attno[DBBC_GRP_MAX_KEYS];
+	HTAB	   *dim_hash;
+	MemoryContext dim_ctx;
+	void	   *cur_dim;		/* probed dim entry for the current row, or NULL */
+	Oid			dj_keytype;		/* join key type (INT4/INT8/OID) for normalizing */
 
 	/* grouped-mode instrumentation (EXPLAIN ANALYZE) */
 	int64		grp_blocks_served;
@@ -2897,6 +2989,410 @@ dbbc_agg_grouped_classify(PlannerInfo *root, RelOptInfo *input_rel,
 	return true;
 }
 
+/*
+ * Dimension-join sub-mode (Phase 1, LEFT-only). Recognize an aggregate whose
+ * input is a fact LEFT JOIN a small unique-key dimension, and offer a fused
+ * DBBlueColumnarAgg (mode 2) that scans the fact column store, probes an
+ * in-memory dimension hash (built under the query snapshot at exec time) for
+ * the dimension-sourced group keys, and aggregates - avoiding the join. Strict
+ * prove-or-fall-back: on any unmet condition it adds NO path and PostgreSQL's
+ * normal plan runs, so an unsupported query is never made incorrect. See the
+ * eligibility gate in DESIGN_dimjoin_agg.md.
+ */
+static void
+dbbc_try_dimjoin_agg(PlannerInfo *root, UpperRelationKind stage,
+					 RelOptInfo *input_rel, RelOptInfo *output_rel,
+					 GroupPathExtraData *gextra, bool partial)
+{
+	Query	   *parse = root->parse;
+	int			m1,
+				m2;
+	int			fact_relid = 0,
+				dim_relid = 0;
+	RelOptInfo *fact_rel = NULL,
+			   *dim_rel = NULL;
+	RangeTblEntry *fact_rte = NULL,
+			   *dim_rte = NULL;
+	SpecialJoinInfo *sji = NULL;
+	AttrNumber	fk_attno = 0,
+				dim_key_attno = 0;
+	Oid			joinkeytype = InvalidOid;
+	List	   *keyexprs = NIL,
+			   *fact_keyexprs = NIL,
+			   *outmap = NIL,
+			   *aggrefs = NIL,
+			   *quals = NIL,
+			   *needcols = NIL;
+	double		ngroups = 1.0;
+	bool		unique = false;
+	int			parallel_workers = 0;
+	ListCell   *lc;
+	CustomPath *cpath;
+	List	   *tlist;
+	List	   *payload;
+
+	if (parse->groupingSets != NIL || parse->havingQual != NULL ||
+		(gextra != NULL && gextra->havingQual != NULL))
+		return;
+
+	/*
+	 * Collect the two base relations. In PG16+ an outer join contributes an
+	 * "outer-join relid" to the join rel's relids whose simple_rel_array entry
+	 * is NULL; skip those and any non-plain-relation member, and require exactly
+	 * two real base relations.
+	 */
+	{
+		int			r = -1;
+		int			nbase = 0;
+		int			base[2];
+
+		while ((r = bms_next_member(input_rel->relids, r)) >= 0)
+		{
+			if (r <= 0 || r > root->simple_rel_array_size)
+				continue;
+			if (root->simple_rel_array[r] == NULL)
+				continue;		/* outer-join relid, not a base rel */
+			if (root->simple_rte_array[r] == NULL ||
+				root->simple_rte_array[r]->rtekind != RTE_RELATION)
+				return;			/* a subquery/CTE/function member: bail */
+			if (nbase >= 2)
+				return;			/* more than two base relations */
+			base[nbase++] = r;
+		}
+		if (nbase != 2)
+			return;
+		m1 = base[0];
+		m2 = base[1];
+	}
+
+	/* exactly one side must be a built columnar heap rel = the fact */
+	for (int pass = 0; pass < 2; pass++)
+	{
+		int			r = (pass == 0) ? m1 : m2;
+		int			o = (pass == 0) ? m2 : m1;
+		RelOptInfo *rr = root->simple_rel_array[r];
+		RangeTblEntry *re = root->simple_rte_array[r];
+
+		if (rr == NULL || re->rtekind != RTE_RELATION || re->inh)
+			continue;
+		if (re->relkind != RELKIND_RELATION && re->relkind != RELKIND_MATVIEW)
+			continue;
+		if (get_rel_relam(re->relid) != HEAP_TABLE_AM_OID)
+			continue;
+		{
+			DbbcRelVersion *v = dbbc_version_pin(re->relid);
+
+			if (v == NULL)
+				continue;		/* not a built columnar store */
+			dbbc_version_unpin(v);
+		}
+		if (fact_relid != 0)
+			return;				/* two columnar rels: ambiguous, bail */
+		fact_relid = r;
+		fact_rel = rr;
+		fact_rte = re;
+		dim_relid = o;
+	}
+	if (fact_relid == 0)
+		return;
+	dim_rel = root->simple_rel_array[dim_relid];
+	dim_rte = root->simple_rte_array[dim_relid];
+	if (dim_rel == NULL || dim_rte->rtekind != RTE_RELATION)
+		return;
+
+	/* Phase 1: a LEFT join with the fact preserved and the dim nullable */
+	foreach(lc, root->join_info_list)
+	{
+		SpecialJoinInfo *s = (SpecialJoinInfo *) lfirst(lc);
+
+		if (s->jointype == JOIN_LEFT &&
+			bms_is_member(dim_relid, s->syn_righthand) &&
+			bms_is_member(fact_relid, s->syn_lefthand))
+		{
+			sji = s;
+			break;
+		}
+	}
+	if (sji == NULL)
+		return;					/* not a LEFT join of this shape (INNER = Phase 2) */
+
+	/* the dim carries no quals of its own (Phase 1) */
+	if (dim_rel->baserestrictinfo != NIL)
+		return;
+
+	/* the single equi-join clause fact.fk = dim.key, both plain Vars */
+	foreach(lc, fact_rel->joininfo)
+	{
+		RestrictInfo *ri = lfirst_node(RestrictInfo, lc);
+		OpExpr	   *op;
+		Node	   *l,
+				   *r;
+		Var		   *vfact,
+				   *vdim;
+
+		if (!bms_is_subset(ri->clause_relids, input_rel->relids))
+			continue;			/* clause to some other rel; ignore */
+		if (!IsA(ri->clause, OpExpr))
+			return;				/* a non-equi join clause between them: bail */
+		op = (OpExpr *) ri->clause;
+		if (list_length(op->args) != 2 || ri->mergeopfamilies == NIL)
+			return;
+		l = (Node *) linitial(op->args);
+		r = (Node *) lsecond(op->args);
+		while (l && IsA(l, RelabelType))
+			l = (Node *) ((RelabelType *) l)->arg;
+		while (r && IsA(r, RelabelType))
+			r = (Node *) ((RelabelType *) r)->arg;
+		if (l == NULL || r == NULL || !IsA(l, Var) || !IsA(r, Var))
+			return;
+		if (((Var *) l)->varno == (Index) fact_relid &&
+			((Var *) r)->varno == (Index) dim_relid)
+		{
+			vfact = (Var *) l;
+			vdim = (Var *) r;
+		}
+		else if (((Var *) r)->varno == (Index) fact_relid &&
+				 ((Var *) l)->varno == (Index) dim_relid)
+		{
+			vfact = (Var *) r;
+			vdim = (Var *) l;
+		}
+		else
+			return;
+		if (fk_attno != 0)
+			return;				/* more than one join clause: bail */
+		if (vfact->varattno <= 0 || vdim->varattno <= 0)
+			return;
+		fk_attno = vfact->varattno;
+		dim_key_attno = vdim->varattno;
+		joinkeytype = vfact->vartype;
+		/* Phase 1: identical byval integer join keys */
+		if (vfact->vartype != vdim->vartype ||
+			(joinkeytype != INT4OID && joinkeytype != INT8OID &&
+			 joinkeytype != OIDOID))
+			return;
+	}
+	if (fk_attno == 0)
+		return;					/* no usable equi-join clause found */
+
+	/* the dim join key must be provably UNIQUE (no fan-out) */
+	foreach(lc, dim_rel->indexlist)
+	{
+		IndexOptInfo *ind = (IndexOptInfo *) lfirst(lc);
+
+		if (ind->unique && ind->nkeycolumns == 1 &&
+			ind->indexkeys[0] == dim_key_attno && ind->indpred == NIL)
+		{
+			unique = true;
+			break;
+		}
+	}
+	if (!unique)
+		return;
+
+	/* the dim must be small enough to hash in memory */
+	if (dim_rel->rows > (double) dbblue_columnar_dimjoin_max_dim_rows)
+		return;
+
+	/* pushed WHERE quals on the fact (applied in the scan, below the agg) */
+	foreach(lc, fact_rel->baserestrictinfo)
+	{
+		RestrictInfo *ri = lfirst_node(RestrictInfo, lc);
+		DbbcSkipQual probe;
+
+		if (ri->security_level > 0 || ri->pseudoconstant)
+			return;
+		if (!dbbc_extract_one_qual((Node *) ri->clause, fact_relid, &probe))
+			return;
+		quals = lappend(quals, ri->clause);
+		needcols = list_append_unique_int(needcols, probe.attno);
+	}
+
+	/* group keys: fact Var, fact expression, or dim Var (reachable via key) */
+	foreach(lc, root->processed_groupClause)
+	{
+		SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+		Node	   *expr = get_sortgroupclause_expr(sgc, parse->targetList);
+		bool		from_dim = false;
+
+		if (IsA(expr, Var))
+		{
+			Var		   *v = (Var *) expr;
+
+			if (v->varlevelsup != 0 || v->varattno <= 0)
+				return;
+			if (v->varno == (Index) fact_relid)
+			{
+				if (!dbbc_grp_key_type_ok(v->vartype))
+					return;
+			}
+			else if (v->varno == (Index) dim_relid)
+			{
+				if (!dbbc_grp_key_type_ok(v->vartype))
+					return;		/* Phase 1: byval bit-eq dim key columns only */
+				from_dim = true;
+			}
+			else
+				return;
+		}
+		else
+		{
+			if (!dbbc_grp_key_type_ok(exprType(expr)) ||
+				contain_volatile_functions(expr) ||
+				!dbbc_expr_vars_ok(expr, fact_relid, &needcols))
+				return;			/* fact-only expression keys */
+		}
+
+		if (list_member(keyexprs, expr))
+			continue;
+		if (list_length(keyexprs) >= DBBC_GRP_MAX_KEYS)
+			return;
+		keyexprs = lappend(keyexprs, expr);
+		if (!from_dim)
+			fact_keyexprs = lappend(fact_keyexprs, expr);
+	}
+	if (keyexprs == NIL)
+		return;
+
+	/* aggregates + output map; aggregate inputs must be fact-only */
+	foreach(lc, output_rel->reltarget->exprs)
+	{
+		Node	   *expr = (Node *) lfirst(lc);
+
+		if (IsA(expr, Aggref))
+		{
+			if (!dbbc_agg_trans_ok((Aggref *) expr, fact_relid, partial,
+								   &needcols))
+				return;
+			outmap = lappend_int(outmap, -(list_length(aggrefs)) - 1);
+			aggrefs = lappend(aggrefs, expr);
+		}
+		else
+		{
+			int			k = 0;
+			bool		found = false;
+			ListCell   *lk;
+
+			foreach(lk, keyexprs)
+			{
+				if (equal(lfirst(lk), expr))
+				{
+					found = true;
+					break;
+				}
+				k++;
+			}
+			if (!found)
+			{
+				/*
+				 * An output column absent from the GROUP BY is legal only when
+				 * it is a dimension column functionally dependent on the unique
+				 * dim key (the planner drops such columns from the grouping).
+				 * Within a group the fact key fixes the fk, hence the one dim
+				 * row, so the column is single-valued - add it as an extra
+				 * dim-sourced key (no change to the group count).
+				 */
+				if (IsA(expr, Var) &&
+					((Var *) expr)->varno == (Index) dim_relid &&
+					((Var *) expr)->varattno > 0 &&
+					dbbc_grp_key_type_ok(((Var *) expr)->vartype) &&
+					list_length(keyexprs) < DBBC_GRP_MAX_KEYS)
+				{
+					k = list_length(keyexprs);
+					keyexprs = lappend(keyexprs, expr);
+				}
+				else
+					return;
+			}
+			outmap = lappend_int(outmap, k);
+		}
+	}
+	if (outmap == NIL)
+		return;
+
+	/* fact-side group-count estimate (dim keys are FD on the fk: no multiply) */
+	if (fact_keyexprs != NIL)
+	{
+		EstimationInfo estinfo;
+
+		memset(&estinfo, 0, sizeof(estinfo));
+		ngroups = estimate_num_groups(root, fact_keyexprs, fact_rel->rows,
+									  NULL, &estinfo);
+		if (ngroups > (double) DBBC_GRP_MAX_GROUPS ||
+			((estinfo.flags & SELFLAG_USED_DEFAULT) &&
+			 fact_rel->rows > (double) DBBC_GRP_MAX_GROUPS))
+			return;
+	}
+
+	/*
+	 * For the partial (parallel) stage, offer a parallel-aware path so the
+	 * planner can build Partial(dim-join) -> Gather -> Finalize. Each participant
+	 * builds its OWN dimension hash under the shared query snapshot (per D3), so
+	 * the node is parallel-safe as long as the pushed quals and group keys are.
+	 */
+	if (partial)
+	{
+		if (!is_parallel_safe(root, (Node *) quals) ||
+			!is_parallel_safe(root, (Node *) keyexprs))
+			return;
+		parallel_workers = compute_parallel_worker(fact_rel, fact_rel->pages,
+												   -1,
+												   max_parallel_workers_per_gather);
+		if (parallel_workers <= 0)
+			return;
+	}
+
+	/* build the fused mode-2 path */
+	tlist = make_tlist_from_pathtarget(output_rel->reltarget);
+	apply_pathtarget_labeling_to_tlist(tlist, output_rel->reltarget);
+
+	payload = list_make5(keyexprs, outmap, aggrefs, quals,
+						 makeInteger(fact_relid));
+	payload = lappend(payload, makeInteger((int) dim_rte->relid));
+	payload = lappend(payload, makeInteger((int) dim_key_attno));
+	payload = lappend(payload, makeInteger((int) fk_attno));
+	payload = lappend(payload, makeInteger((int) dim_relid));
+
+	cpath = makeNode(CustomPath);
+	cpath->path.pathtype = T_CustomScan;
+	cpath->path.parent = output_rel;
+	cpath->path.pathtarget = output_rel->reltarget;
+	cpath->path.param_info = NULL;
+	cpath->path.parallel_aware = partial;
+	cpath->path.parallel_safe = partial;
+	cpath->path.parallel_workers = partial ? parallel_workers : 0;
+	cpath->path.rows = clamp_row_est(ngroups);
+	cpath->path.pathkeys = NIL;
+
+	/*
+	 * Cost: aggregate the fact once (a columnar scan + one transition per
+	 * surviving fact row + a tiny dim-hash probe), then finalize per group.
+	 * Approximate; refined with real scan cost in a later pass. The partial
+	 * path divides the per-row work across the parallel workers.
+	 */
+	cpath->path.startup_cost = 0;
+	cpath->path.total_cost =
+		fact_rel->rows * (cpu_tuple_cost + cpu_operator_cost) +
+		cpu_tuple_cost * clamp_row_est(ngroups);
+	if (partial && parallel_workers > 0)
+		cpath->path.total_cost /= parallel_workers;
+
+	cpath->flags = 0;
+	cpath->custom_paths = NIL;
+	cpath->custom_private =
+		list_make5(makeInteger((int) fact_rte->relid),
+				   makeInteger(DBBC_AGG_MODE_DIMJOIN),
+				   payload,
+				   tlist,
+				   makeInteger(partial ? 1 : 0));
+	cpath->methods = &dbbc_agg_path_methods;
+
+	if (partial)
+		add_partial_path(output_rel, (Path *) cpath);
+	else
+		add_path(output_rel, (Path *) cpath);
+}
+
 static void
 dbbc_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 						RelOptInfo *input_rel, RelOptInfo *output_rel,
@@ -2939,6 +3435,19 @@ dbbc_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 		return;
 	if (!parse->hasAggs && parse->groupClause == NIL)
 		return;
+
+	/*
+	 * Dimension-join sub-mode: aggregate a fact joined to a small dimension.
+	 * The single-relation path below only handles a lone base rel; this branch
+	 * takes the multi-relation (join) input. Default-off GUC; the helper proves
+	 * the shape or falls back internally.
+	 */
+	if (dbblue_columnar_enable_dimjoin_agg &&
+		bms_membership(input_rel->relids) == BMS_MULTIPLE)
+	{
+		dbbc_try_dimjoin_agg(root, stage, input_rel, output_rel, gextra, partial);
+		return;
+	}
 
 	/* single plain heap base relation */
 	if (bms_membership(input_rel->relids) != BMS_SINGLETON)
@@ -3452,6 +3961,77 @@ dbbc_agg_create_scan_state(CustomScan *cscan)
  * and mirror ExecInitAgg's per-aggregate catalog setup (transition/final
  * FmgrInfos, initcond, ACL checks). The relation is already open (caller).
  */
+/* normalize a byval int/oid join key Datum to int64 (both join sides share it) */
+static int64
+dbbc_dj_keyval(Datum d, Oid typ)
+{
+	switch (typ)
+	{
+		case INT4OID:
+			return (int64) DatumGetInt32(d);
+		case INT8OID:
+			return DatumGetInt64(d);
+		case OIDOID:
+			return (int64) DatumGetObjectId(d);
+		default:
+			return DatumGetInt64(d);
+	}
+}
+
+/*
+ * Build the in-memory dimension hash for the dim-join sub-mode. Scanned under
+ * the query snapshot (estate->es_snapshot) exactly like a Hash Join's inner
+ * build, so visibility is identical and the dimension is never cached in the
+ * column store. Keyed by the join key normalized to int64 (Phase 1: byval
+ * int/oid, proven unique - one entry per key). Holds only the dim-sourced group
+ * keys (byval, no copy needed); lives in as->dim_ctx, freed in dbbc_agg_end.
+ */
+static void
+dbbc_dim_build(DbbcAggScanState *as, EState *estate)
+{
+	HASHCTL		ctl;
+	TableScanDesc scan;
+	TupleTableSlot *slot;
+
+	as->dj_keytype =
+		TupleDescAttr(RelationGetDescr(as->rel), as->fk_attno - 1)->atttypid;
+
+	as->dim_ctx = AllocSetContextCreate(CurrentMemoryContext,
+										"dbblue_columnar dim hash",
+										ALLOCSET_SMALL_SIZES);
+	memset(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(int64);
+	ctl.entrysize = sizeof(DbbcDimEntry);
+	ctl.hcxt = as->dim_ctx;
+	as->dim_hash = hash_create("dbblue_columnar dim", 256, &ctl,
+							   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+
+	slot = table_slot_create(as->dim_rel, NULL);
+	scan = table_beginscan(as->dim_rel, estate->es_snapshot, 0, NULL, 0);
+	while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+	{
+		bool		knull;
+		Datum		kd = slot_getattr(slot, as->dim_key_attno, &knull);
+		int64		hk;
+		DbbcDimEntry *e;
+		bool		found;
+		int			k;
+
+		if (knull)
+			continue;			/* a NULL dim key never matches an equi-join */
+		hk = dbbc_dj_keyval(kd, as->dj_keytype);
+		e = (DbbcDimEntry *) hash_search(as->dim_hash, &hk, HASH_ENTER, &found);
+		if (found)
+			continue;			/* unique key (gate G4): keep the first */
+		for (k = 0; k < as->nkeys; k++)
+			if (as->key_from_dim[k])
+				e->vals[k] = slot_getattr(slot, as->key_dim_attno[k],
+										  &e->nulls[k]);
+	}
+	table_endscan(scan);
+	ExecDropSingleTupleTableSlot(slot);
+}
+
 static void
 dbbc_grp_begin(DbbcAggScanState *as, List *payload, EState *estate, int eflags)
 {
@@ -3479,8 +4059,20 @@ dbbc_grp_begin(DbbcAggScanState *as, List *payload, EState *estate, int eflags)
 
 		if (IsA(kexpr, Var))
 		{
-			/* bare-Var key: read the column directly, no ExprState */
-			as->key_attnos[i] = ((Var *) kexpr)->varattno;
+			Var		   *kv = (Var *) kexpr;
+
+			if (as->is_dimjoin && kv->varno == as->dim_relid)
+			{
+				/* dim-sourced key: supplied by the per-row dim-hash probe */
+				as->key_from_dim[i] = true;
+				as->key_dim_attno[i] = kv->varattno;
+				as->key_attnos[i] = InvalidAttrNumber;
+			}
+			else
+			{
+				/* bare-Var fact key: read the column directly, no ExprState */
+				as->key_attnos[i] = kv->varattno;
+			}
 		}
 		else
 		{
@@ -3802,6 +4394,9 @@ dbbc_grp_begin(DbbcAggScanState *as, List *payload, EState *estate, int eflags)
 		}
 		for (a = 0; a < as->nskipquals; a++)
 			used = list_append_unique_int(used, as->skipquals[a].attno);
+		/* dim-join: the fact FK is read from a chunk per row to probe the dim */
+		if (as->is_dimjoin)
+			used = list_append_unique_int(used, as->fk_attno);
 
 		as->nused = list_length(used);
 		as->used_attnos = (AttrNumber *)
@@ -3848,8 +4443,18 @@ dbbc_agg_begin(CustomScanState *node, EState *estate, int eflags)
 
 	as->partial = (DBBC_AGG_PRIV_PARTIAL(cp) != 0);
 
-	if (DBBC_AGG_PRIV_MODE(cp) == 1)
+	if (DBBC_AGG_PRIV_MODE(cp) == DBBC_AGG_MODE_GROUPED ||
+		DBBC_AGG_PRIV_MODE(cp) == DBBC_AGG_MODE_DIMJOIN)
 	{
+		if (DBBC_AGG_PRIV_MODE(cp) == DBBC_AGG_MODE_DIMJOIN)
+		{
+			/* dim-join tail: identify the dimension and the probe columns */
+			as->is_dimjoin = true;
+			as->dim_reloid = DBBC_DJ_DIM_RELOID(items);
+			as->dim_key_attno = DBBC_DJ_DIM_KEY_ATTNO(items);
+			as->fk_attno = DBBC_DJ_FK_ATTNO(items);
+			as->dim_relid = DBBC_DJ_DIM_RELID(items);
+		}
 		/*
 		 * AccessShareLock, not NoLock: BeginCustomScan runs in every parallel
 		 * participant, but this node is scanrelid==0 so the executor does not
@@ -3862,8 +4467,15 @@ dbbc_agg_begin(CustomScanState *node, EState *estate, int eflags)
 		{
 			as->rel = table_open(reloid, AccessShareLock);
 			as->rel_opened = true;
+			if (as->is_dimjoin)
+			{
+				as->dim_rel = table_open(as->dim_reloid, AccessShareLock);
+				as->dim_opened = true;
+			}
 		}
 		dbbc_grp_begin(as, items, estate, eflags);
+		if (as->is_dimjoin && !(eflags & EXEC_FLAG_EXPLAIN_ONLY))
+			dbbc_dim_build(as, estate);
 		return;
 	}
 
@@ -4291,6 +4903,24 @@ dbbc_grp_consume_block(DbbcAggScanState *as, DbbcScanState *s,
 		}
 		if (pass)
 		{
+			if (as->is_dimjoin)
+			{
+				int			fkc = s->attno_to_col[as->fk_attno - 1];
+				bool		fknull;
+				Datum		fkd = dbbc_chunk_read(s, fkc, row, &fknull);
+
+				as->cur_dim = NULL;
+				if (!fknull)
+				{
+					int64		hk = dbbc_dj_keyval(fkd, as->dj_keytype);
+					bool		found;
+
+					as->cur_dim = hash_search(as->dim_hash, &hk,
+											  HASH_FIND, &found);
+					if (!found)
+						as->cur_dim = NULL;
+				}
+			}
 			if (as->has_key_exprs)
 			{
 				/* load the expr-key input columns into the scratch slot */
@@ -4312,7 +4942,22 @@ dbbc_grp_consume_block(DbbcAggScanState *as, DbbcScanState *s,
 			}
 			for (k = 0; k < as->nkeys; k++)
 			{
-				if (as->key_attnos[k] != InvalidAttrNumber)
+				if (as->key_from_dim[k])
+				{
+					DbbcDimEntry *d = (DbbcDimEntry *) as->cur_dim;
+
+					if (d != NULL)
+					{
+						keyvals[k] = d->vals[k];
+						keynulls[k] = d->nulls[k];
+					}
+					else
+					{
+						keyvals[k] = (Datum) 0;
+						keynulls[k] = true; /* LEFT join: unmatched fk -> NULL */
+					}
+				}
+				else if (as->key_attnos[k] != InvalidAttrNumber)
 				{
 					int			kc = s->attno_to_col[as->key_attnos[k] - 1];
 
@@ -4410,6 +5055,24 @@ dbbc_grp_consume_heap_range(DbbcAggScanState *as, DbbcScanState *s,
 		}
 		if (pass)
 		{
+			if (as->is_dimjoin)
+			{
+				bool		fknull;
+				Datum		fkd = slot_getattr(s->heap_slot, as->fk_attno,
+											   &fknull);
+
+				as->cur_dim = NULL;
+				if (!fknull)
+				{
+					int64		hk = dbbc_dj_keyval(fkd, as->dj_keytype);
+					bool		found;
+
+					as->cur_dim = hash_search(as->dim_hash, &hk,
+											  HASH_FIND, &found);
+					if (!found)
+						as->cur_dim = NULL;
+				}
+			}
 			if (as->has_key_exprs)
 			{
 				/*
@@ -4438,7 +5101,22 @@ dbbc_grp_consume_heap_range(DbbcAggScanState *as, DbbcScanState *s,
 			}
 			for (k = 0; k < as->nkeys; k++)
 			{
-				if (as->key_attnos[k] != InvalidAttrNumber)
+				if (as->key_from_dim[k])
+				{
+					DbbcDimEntry *d = (DbbcDimEntry *) as->cur_dim;
+
+					if (d != NULL)
+					{
+						keyvals[k] = d->vals[k];
+						keynulls[k] = d->nulls[k];
+					}
+					else
+					{
+						keyvals[k] = (Datum) 0;
+						keynulls[k] = true; /* LEFT join: unmatched fk -> NULL */
+					}
+				}
+				else if (as->key_attnos[k] != InvalidAttrNumber)
 					keyvals[k] = slot_getattr(s->heap_slot, as->key_attnos[k],
 											  &keynulls[k]);
 				else
@@ -4965,6 +5643,17 @@ dbbc_agg_end(CustomScanState *node)
 		table_close(as->rel, AccessShareLock);
 		as->rel_opened = false;
 	}
+	if (as->dim_opened)
+	{
+		table_close(as->dim_rel, AccessShareLock);
+		as->dim_opened = false;
+	}
+	if (as->dim_ctx != NULL)
+	{
+		MemoryContextDelete(as->dim_ctx);
+		as->dim_ctx = NULL;
+		as->dim_hash = NULL;
+	}
 	if (as->aggctx != NULL)
 	{
 		MemoryContextDelete(as->aggctx);
@@ -5025,7 +5714,10 @@ dbbc_agg_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 		return;
 	}
 
-	ExplainPropertyText("Columnar Aggregate", "grouped (transition pushdown)",
+	ExplainPropertyText("Columnar Aggregate",
+						as->is_dimjoin ?
+						"grouped (transition pushdown) + dimension join" :
+						"grouped (transition pushdown)",
 						es);
 	if (es->analyze)
 	{

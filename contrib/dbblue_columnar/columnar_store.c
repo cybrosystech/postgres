@@ -477,8 +477,9 @@ dbbc_block_vm_valid(DbbcBlock *block, Relation rel, Buffer *vmbuf)
 {
 	uint16		p;
 	bool		valid = true;
+	XLogRecPtr	stamp = pg_atomic_read_u64(&block->vm_lsn);
 
-	if (XLogRecPtrIsInvalid(block->vm_lsn))
+	if (XLogRecPtrIsInvalid(stamp))
 		return false;			/* no stamp: fast path ineligible */
 
 	/*
@@ -503,10 +504,102 @@ dbbc_block_vm_valid(DbbcBlock *block, Relation rel, Buffer *vmbuf)
 		}
 	}
 	if (valid)
-		valid = (BufferGetLSNAtomic(*vmbuf) == block->vm_lsn);
+		valid = (BufferGetLSNAtomic(*vmbuf) == stamp);
 	LockBuffer(*vmbuf, BUFFER_LOCK_UNLOCK);
 
 	return valid;
+}
+
+/*
+ * Re-derive the current visibility-map page LSN for a block whose heap range is
+ * about to be (or has just been) proven byte-for-byte unchanged, so the cheap
+ * fast path (dbbc_block_vm_valid) can be re-armed WITHOUT re-encoding the block.
+ * This is the capture half of an in-place re-stamp: the serve path brackets its
+ * authoritative per-page proof with two calls and only adopts the value when
+ * both agree - equality proves no covered page had its VM bit cleared across the
+ * proof, hence the block is still the image it was built from (see
+ * dbbc_block_valid).
+ *
+ * Returns the VM page LSN iff every covered heap page is ALL_VISIBLE in the VM
+ * AND the whole range shares one VM page (the exact eligibility the build-time
+ * capture enforces); InvalidXLogRecPtr otherwise (a cleared bit, a range that
+ * crosses a VM page, an absent VM page, or a VM page carrying no LSN).
+ *
+ * Eligibility is checked lock-free FIRST: visibilitymap_get_status may re-pin
+ * *vmbuf when a range spans VM pages, and re-pinning a share-locked buffer is
+ * illegal. Once the range is known to fit one VM page, the bits and the LSN are
+ * read together under the VM-buffer SHARE lock, exactly as dbbc_block_vm_valid
+ * does, so they are atomic w.r.t. a setter's [set bit ... PageSetLSN] window.
+ */
+XLogRecPtr
+dbbc_block_vm_capture(DbbcBlock *block, Relation rel, Buffer *vmbuf)
+{
+	uint16		p;
+	BlockNumber first_mapblk;
+	XLogRecPtr	lsn = InvalidXLogRecPtr;
+	bool		valid = true;
+
+	/* eligibility (lock-free): every covered page all-visible on ONE VM page */
+	(void) visibilitymap_get_status(rel, block->first_page, vmbuf);
+	if (!BufferIsValid(*vmbuf))
+		return InvalidXLogRecPtr;
+	first_mapblk = BufferGetBlockNumber(*vmbuf);
+	for (p = 0; p < block->npages; p++)
+	{
+		if (!(visibilitymap_get_status(rel, block->first_page + p, vmbuf) &
+			  VISIBILITYMAP_ALL_VISIBLE))
+			return InvalidXLogRecPtr;
+		if (BufferGetBlockNumber(*vmbuf) != first_mapblk)
+			return InvalidXLogRecPtr;	/* crosses a VM page: ineligible */
+	}
+
+	/*
+	 * The range fits one VM page, now pinned in *vmbuf. Re-read the bits and the
+	 * LSN under the SHARE lock; get_status never re-pins here (single page).
+	 */
+	LockBuffer(*vmbuf, BUFFER_LOCK_SHARE);
+	for (p = 0; p < block->npages; p++)
+	{
+		if (!(visibilitymap_get_status(rel, block->first_page + p, vmbuf) &
+			  VISIBILITYMAP_ALL_VISIBLE))
+		{
+			valid = false;
+			break;
+		}
+	}
+	if (valid)
+		lsn = BufferGetLSNAtomic(*vmbuf);
+	LockBuffer(*vmbuf, BUFFER_LOCK_UNLOCK);
+
+	return lsn;
+}
+
+/*
+ * Centralized re-stamp: adopt a freshly captured VM-page LSN onto a block the
+ * caller has ALREADY proven byte-for-byte valid, re-arming the cheap VM fast
+ * path (dbbc_block_vm_valid) without re-encoding. One mechanism, two callers -
+ * the serve path (dbbc_block_valid, after its bracketed per-page proof) and the
+ * refresh reuse path (dbbc_populate_relation, after dbbc_block_still_valid).
+ * The proofs differ; the re-stamp action is identical.
+ *
+ * This does NO proof of its own - it trusts the caller's - and only performs the
+ * write. The store is atomic because concurrent backends read block->vm_lsn
+ * lock-free w.r.t. the block: a reader sees the old value (its fast path fails
+ * -> the authoritative per-page proof, correct) or the new one (which the fast
+ * path accepts only while the live VM LSN still equals it, and the next change
+ * to any covered page advances that LSN past it). Returns true iff it wrote a
+ * new stamp, so each caller can bump its own counter. A no-op when the fresh LSN
+ * is Invalid (range crosses a VM page) or already the current stamp.
+ */
+bool
+dbbc_restamp_block(DbbcBlock *block, XLogRecPtr fresh)
+{
+	if (XLogRecPtrIsInvalid(fresh))
+		return false;
+	if (pg_atomic_read_u64(&block->vm_lsn) == fresh)
+		return false;
+	pg_atomic_write_u64(&block->vm_lsn, fresh);
+	return true;
 }
 
 /*
@@ -957,6 +1050,7 @@ dbbc_populate_relation(Oid relid)
 	volatile bool published = false;
 	volatile int blocks_built = 0;
 	volatile int blocks_reused = 0; /* of blocks_built, reused from prior ver */
+	volatile int blocks_restamped = 0;	/* of reused, VM fast path re-armed */
 	bool		budget_hit = false;
 	Buffer		vmbuf = InvalidBuffer;
 	MemoryContext blkcxt;
@@ -1200,6 +1294,20 @@ dbbc_populate_relation(Oid relid)
 				if (dbbc_block_still_valid(oldblk, rel, first_page, npages,
 										   &vmbuf))
 				{
+					/*
+					 * Self-heal on reuse: still_valid proved the block unchanged
+					 * since build, so adopt the fresh VM-page LSN captured just
+					 * above (vm_lsn) via the SAME re-stamp the serve path uses.
+					 * This re-arms the fast path for cold blocks a full populate
+					 * reuses, without waiting for a query to re-stamp them. Sound
+					 * because the proof is anchored to the build stamp and the VM
+					 * page LSN is monotonic: a future fast-path match can occur
+					 * only if nothing changed since this capture. A no-op when
+					 * the range crosses a VM page (vm_lsn Invalid).
+					 */
+					if (dbblue_columnar_enable_restamp &&
+						dbbc_restamp_block(oldblk, vm_lsn))
+						blocks_restamped++;
 					dbbc_block_ref(olddir[slot]);
 					newdir[slot] = olddir[slot];
 					blocks_built++;
@@ -1412,7 +1520,8 @@ dbbc_populate_relation(Oid relid)
 				block->first_page = first_page;
 				block->npages = npages;
 				block->nrows = (uint32) ntuples;
-				block->vm_lsn = vm_lsn; /* captured before the copies */
+				/* captured before the copies; init once before publish */
+				pg_atomic_init_u64(&block->vm_lsn, vm_lsn);
 				pg_atomic_init_u32(&block->refs, 1);	/* this version's ref */
 				memset(block->stamps, 0, sizeof(block->stamps));
 				memcpy(block->stamps, stamps, npages * sizeof(DbbcPageStamp));
@@ -1666,9 +1775,9 @@ dbbc_populate_relation(Oid relid)
 	if (reuse_src != NULL)
 		dbbc_version_unpin_tracked(reuse_src);
 
-	elog(DEBUG1, "dbblue_columnar: populated \"%s\": %d blocks (%d reused, %d rebuilt)",
+	elog(DEBUG1, "dbblue_columnar: populated \"%s\": %d blocks (%d reused, %d rebuilt, %d re-stamped)",
 		 RelationGetRelationName(rel), blocks_built, blocks_reused,
-		 blocks_built - blocks_reused);
+		 blocks_built - blocks_reused, blocks_restamped);
 
 	table_close(rel, ShareUpdateExclusiveLock);
 
