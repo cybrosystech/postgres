@@ -53,6 +53,9 @@ bool		dbblue_columnar_enabled = false;
 bool		dbblue_columnar_enable_columnar_scan = true;
 int			dbblue_columnar_memory_mb = 128;
 bool		dbblue_columnar_log_coverage_misses = true;
+bool		dbblue_columnar_enable_restamp = true;
+bool		dbblue_columnar_enable_dimjoin_agg = false;
+int			dbblue_columnar_dimjoin_max_dim_rows = 65536;
 static bool dbblue_columnar_auto_columnarize = false;
 
 /* auto-refresh worker settings */
@@ -469,6 +472,20 @@ _PG_init(void)
 							0,
 							NULL, NULL, NULL);
 
+	DefineCustomBoolVariable("dbblue_columnar.enable_restamp",
+							 "Re-arm the cheap VM-fork fast path after a vacuum "
+							 "moves a block's covering visibility-map page LSN.",
+							 "When a block is proven byte-for-byte unchanged by the "
+							 "authoritative per-page proof, refresh its VM stamp in "
+							 "place (no re-encode) so later scans skip the per-page "
+							 "reads. Off keeps such blocks on the slow proof until "
+							 "the next full re-populate.",
+							 &dbblue_columnar_enable_restamp,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
 	DefineCustomBoolVariable("dbblue_columnar.log_coverage_misses",
 							 "Log (LOG level) when a query bypasses the columnar "
 							 "store because a referenced column is not registered.",
@@ -479,6 +496,30 @@ _PG_init(void)
 							 PGC_SUSET,
 							 0,
 							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("dbblue_columnar.enable_dimjoin_agg",
+							 "Aggregate a fact joined to a small dimension inside "
+							 "DBBlueColumnarAgg (in-node dimension hash-join).",
+							 "Phase 1: one fact plus one small unique-key dimension, "
+							 "INNER/LEFT equi-join, fact-only aggregates. When the "
+							 "shape cannot be proven safe it falls back to the normal "
+							 "plan - it is never made incorrect.",
+							 &dbblue_columnar_enable_dimjoin_agg,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomIntVariable("dbblue_columnar.dimjoin_max_dim_rows",
+							"Maximum estimated dimension rows the in-node dimension "
+							"hash-join will build; larger dimensions fall back to the "
+							"normal plan.",
+							NULL,
+							&dbblue_columnar_dimjoin_max_dim_rows,
+							65536, 0, INT_MAX,
+							PGC_USERSET,
+							0,
+							NULL, NULL, NULL);
 
 	MarkGUCPrefixReserved("dbblue_columnar");
 

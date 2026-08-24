@@ -188,6 +188,129 @@ RESET min_parallel_table_scan_size;
 RESET parallel_setup_cost;
 SET max_parallel_workers_per_gather = 0;
 
+-- ---- M6 VM fast-path RE-STAMP: after a vacuum bumps a block's covering
+-- visibility-map page LSN, a byte-identical block fails the cheap VM proof and
+-- would pay the per-page proof on EVERY later scan. The serve path now re-arms
+-- (re-stamps) the VM stamp in place once it has proven the block unchanged, so
+-- the next scan is fast again. Deterministic: autovacuum off + explicit VACUUM
+-- fully control the VM state. Correctness never depends on the stamp. ----
+CREATE TABLE rs (id int, k int, amt numeric, d date) WITH (autovacuum_enabled = off);
+INSERT INTO rs SELECT g, g % 7, ((g % 100) + 1) * 1.25, DATE '2024-01-01' + (g % 365)
+FROM generate_series(1, 50000) g;
+VACUUM (DISABLE_PAGE_SKIPPING) rs;                       -- all pages all-visible
+SELECT dbblue_columnar_add('rs', ARRAY['id','k','amt','d']);
+SELECT dbblue_columnar_populate('rs') > 1 AS rs_multiblock;  -- need >1 block
+
+-- read three DBBlueColumnarScan counters from ONE EXPLAIN ANALYZE (a second
+-- scan would already see the re-stamp, so all three must come from one run)
+CREATE FUNCTION cstat(q text, OUT vm bigint, OUT restamped bigint, OUT heap bigint)
+LANGUAGE plpgsql AS $$
+DECLARE line text;
+BEGIN
+	vm := 0; restamped := 0; heap := 0;
+	FOR line IN EXECUTE
+		'EXPLAIN (ANALYZE, TIMING OFF, COSTS OFF, SUMMARY OFF) ' || q
+	LOOP
+		IF position('Columnar VM-Validated Blocks:' IN line) > 0 THEN
+			vm := substring(line from '([0-9]+)$')::bigint;
+		ELSIF position('Columnar Blocks Re-stamped:' IN line) > 0 THEN
+			restamped := substring(line from '([0-9]+)$')::bigint;
+		ELSIF position('Heap Fallback Ranges:' IN line) > 0 THEN
+			heap := substring(line from '([0-9]+)$')::bigint;
+		END IF;
+	END LOOP;
+END $$;
+
+SET enable_seqscan = off;                   -- force the columnar scan node
+SELECT uses_node($$SELECT id, amt FROM rs WHERE id >= 0$$,
+				 'DBBlueColumnarScan') AS rs_scan_used;
+
+-- baseline: freshly built + all-visible => every block proven by the cheap VM
+-- proof; nothing re-stamped, no heap fallback
+SELECT 'rs-baseline-fast ' t, vm > 0 AND restamped = 0 AND heap = 0 AS ok
+FROM cstat($q$SELECT id, amt FROM rs WHERE id >= 0$q$);
+
+-- touch ONE row + vacuum: re-sets all-visible but advances the shared VM page
+-- LSN, so EVERY block on that VM page fails the cheap proof (the fragility)
+UPDATE rs SET amt = amt WHERE id = 1;
+VACUUM (DISABLE_PAGE_SKIPPING) rs;
+
+-- first scan after invalidation: cheap proof fails for all (vm = 0); the block
+-- holding id=1 genuinely changed -> heap fallback; every other block is proven
+-- unchanged and RE-STAMPED in place
+SELECT 'rs-heal-run1     ' t, vm = 0 AND restamped > 0 AND heap > 0 AS ok
+FROM cstat($q$SELECT id, amt FROM rs WHERE id >= 0$q$);
+
+-- second scan: the re-stamped blocks pass the cheap proof again (vm > 0),
+-- nothing left to re-stamp; the changed block still falls back to heap
+SELECT 'rs-heal-run2     ' t, vm > 0 AND restamped = 0 AND heap > 0 AS ok
+FROM cstat($q$SELECT id, amt FROM rs WHERE id >= 0$q$);
+
+-- correctness never depends on the stamp: columnar == heap throughout
+SELECT 'rs-correct       ' t, agree($q$SELECT id, amt FROM rs WHERE id >= 0 ORDER BY id$q$) c;
+
+-- re-stamp OFF: the block stays on the slow proof, no recovery across scans
+SET dbblue_columnar.enable_restamp = off;
+UPDATE rs SET amt = amt WHERE id = 2;
+VACUUM (DISABLE_PAGE_SKIPPING) rs;
+SELECT 'rs-off-run1      ' t, vm = 0 AND restamped = 0 AS ok
+FROM cstat($q$SELECT id, amt FROM rs WHERE id >= 0$q$);
+SELECT 'rs-off-run2      ' t, vm = 0 AND restamped = 0 AS ok
+FROM cstat($q$SELECT id, amt FROM rs WHERE id >= 0$q$);
+-- turn it back on: healing resumes on the next scan
+SET dbblue_columnar.enable_restamp = on;
+SELECT 'rs-on-again      ' t, vm = 0 AND restamped > 0 AS ok
+FROM cstat($q$SELECT id, amt FROM rs WHERE id >= 0$q$);
+SELECT 'rs-on-recovered  ' t, vm > 0 AND restamped = 0 AS ok
+FROM cstat($q$SELECT id, amt FROM rs WHERE id >= 0$q$);
+
+-- SAME re-stamp on the refresh path: invalidate, then a POPULATE (not a query)
+-- must re-arm the cold blocks it reuses (dbbc_restamp_block, shared with the
+-- serve path), so the VERY FIRST scan afterwards is already fast - vm > 0 with
+-- nothing left for the serve path to re-stamp
+UPDATE rs SET amt = amt WHERE id = 3;
+VACUUM (DISABLE_PAGE_SKIPPING) rs;
+SELECT dbblue_columnar_populate('rs') > 0 AS rs_repopulated;
+SELECT 'rs-refresh-armed ' t, vm > 0 AND restamped = 0 AND heap = 0 AS ok
+FROM cstat($q$SELECT id, amt FROM rs WHERE id >= 0$q$);
+RESET enable_seqscan;
+
+DROP FUNCTION cstat(text);
+DROP TABLE rs;
+
+-- ---- in-node dimension hash-join (DBBlueColumnarAgg dim-join sub-mode) ----
+-- Aggregate a fact (t) LEFT JOIN a small unique-key dimension entirely in the
+-- engine (no join node); the dimension is probed live under the query snapshot.
+-- dj_dim covers only grp 0..6, so grp 7..12 exercise the LEFT-join NULL path;
+-- t carries stale blocks here (the earlier UPDATE), so the per-row probe runs on
+-- BOTH the columnar and heap-fallback paths in one scan. Differential vs the
+-- plain plan must be byte-identical. eager_aggregate off isolates the fused node.
+CREATE TABLE dj_dim (id int PRIMARY KEY, seq int);
+INSERT INTO dj_dim SELECT g, (g * 3) % 20 FROM generate_series(0, 6) g;
+ANALYZE dj_dim;
+SET dbblue_columnar.enable_dimjoin_agg = on;
+SET enable_eager_aggregate = off;
+SELECT uses_node($$SELECT t.grp, dj.seq, count(*) FROM t LEFT JOIN dj_dim dj ON dj.id = t.grp GROUP BY t.grp, dj.seq, dj.id$$,
+				 'DBBlueColumnarAgg') AS dimjoin_fires;
+SELECT 'dj-basic     ', agree($$SELECT t.grp, dj.seq, count(*) c, sum(t.amt) s FROM t LEFT JOIN dj_dim dj ON dj.id = t.grp GROUP BY t.grp, dj.seq, dj.id ORDER BY t.grp, dj.seq$$);
+SELECT 'dj-exprkey   ', agree($$SELECT date_trunc('month', t.d) m, t.grp, dj.seq, count(*) c, sum(t.amt) s FROM t LEFT JOIN dj_dim dj ON dj.id = t.grp WHERE t.k7 > 0 GROUP BY 1, t.grp, dj.seq, dj.id ORDER BY 1, t.grp$$);
+SELECT 'dj-filter    ', agree($$SELECT t.grp, dj.seq, count(*) FILTER (WHERE t.amt > 50) c, sum(t.amt) s FROM t LEFT JOIN dj_dim dj ON dj.id = t.grp GROUP BY t.grp, dj.seq, dj.id ORDER BY t.grp, dj.seq$$);
+SELECT 'dj-scalaragg ', agree($$SELECT dj.seq, sum(t.amt) s, count(*) c FROM t LEFT JOIN dj_dim dj ON dj.id = t.grp GROUP BY dj.seq, dj.id ORDER BY dj.seq$$);
+-- parallel: Finalize -> Gather -> Parallel Custom Scan (DBBlueColumnarAgg); each
+-- worker builds its own dim hash under the shared snapshot. Still byte-identical.
+SET max_parallel_workers_per_gather = 4;
+SET min_parallel_table_scan_size = 0;
+SET parallel_setup_cost = 0;
+SELECT uses_node($$SELECT t.grp, dj.seq, count(*), sum(t.amt) FROM t LEFT JOIN dj_dim dj ON dj.id = t.grp GROUP BY t.grp, dj.seq, dj.id$$,
+				 'DBBlueColumnarAgg') AS dimjoin_parallel_fires;
+SELECT 'dj-parallel  ', agree($$SELECT t.grp, dj.seq, count(*) c, sum(t.amt) s FROM t LEFT JOIN dj_dim dj ON dj.id = t.grp GROUP BY t.grp, dj.seq, dj.id ORDER BY t.grp, dj.seq$$);
+RESET min_parallel_table_scan_size;
+RESET parallel_setup_cost;
+SET max_parallel_workers_per_gather = 0;
+RESET enable_eager_aggregate;
+SET dbblue_columnar.enable_dimjoin_agg = off;
+DROP TABLE dj_dim;
+
 DROP FUNCTION agree(text);
 DROP FUNCTION uses_node(text, text);
 DROP TABLE t;

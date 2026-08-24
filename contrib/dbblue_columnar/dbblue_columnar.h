@@ -169,8 +169,15 @@ typedef struct DbbcBlock
 	 * must not be used for this block (range crosses a VM page boundary, or
 	 * the VM page had no LSN at build); the per-heap-page LSN proof below
 	 * remains the fallback and the authority.
+	 *
+	 * Stored as pg_atomic_uint64 because the serve path re-stamps it in place
+	 * (dbbc_block_valid) once a block is proven byte-identical, while other
+	 * backends read it lock-free w.r.t. the block - a plain load/store would be
+	 * a torn read on 32-bit platforms and a data race everywhere. The value is
+	 * still an LSN (0 == InvalidXLogRecPtr); read/write via pg_atomic_read_u64 /
+	 * pg_atomic_write_u64, initialized once at build with pg_atomic_init_u64.
 	 */
-	XLogRecPtr	vm_lsn;
+	pg_atomic_uint64 vm_lsn;
 	/*
 	 * Refcount: how many published (or in-flight) versions reference this
 	 * block. A block is shared when an incremental refresh reuses it from the
@@ -241,6 +248,9 @@ extern bool dbblue_columnar_enabled;
 extern bool dbblue_columnar_enable_columnar_scan;
 extern int	dbblue_columnar_memory_mb;
 extern bool dbblue_columnar_log_coverage_misses;
+extern bool dbblue_columnar_enable_restamp;
+extern bool dbblue_columnar_enable_dimjoin_agg;
+extern int	dbblue_columnar_dimjoin_max_dim_rows;
 
 /* columnar_store.c */
 extern void dbbc_store_attach(void);
@@ -261,6 +271,9 @@ extern bool dbbc_relation_needs_refresh(Oid relid, int threshold_pct);
 extern Datum dbbc_chunk_minmax_datum(DbbcColumnChunk *chunk, bool want_max);
 extern bool dbbc_block_vm_valid(DbbcBlock *block, Relation rel,
 								Buffer *vmbuf);
+extern XLogRecPtr dbbc_block_vm_capture(DbbcBlock *block, Relation rel,
+										Buffer *vmbuf);
+extern bool dbbc_restamp_block(DbbcBlock *block, XLogRecPtr fresh);
 
 /* columnar_scan.c */
 extern void dbbc_scan_init(void);
