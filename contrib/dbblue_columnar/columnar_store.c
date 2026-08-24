@@ -36,6 +36,7 @@
 #include "funcapi.h"
 #include "lib/dshash.h"
 #include "miscadmin.h"
+#include "postmaster/interrupt.h"	/* ShutdownRequestPending */
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
 #include "storage/dsm_registry.h"
@@ -1246,6 +1247,19 @@ dbbc_populate_relation(Oid relid)
 			BlockNumber vm_first_mapblk;
 
 			CHECK_FOR_INTERRUPTS();
+			/*
+			 * Yield promptly to a fast shutdown mid-populate. The auto-refresh
+			 * worker's SIGTERM handler only sets ShutdownRequestPending (not a
+			 * die interrupt CHECK_FOR_INTERRUPTS would catch), so without this a
+			 * long re-populate would hold PM_WAIT_BACKENDS for minutes. ERROR
+			 * (not FATAL) unwinds through this build's cleanup and the caller's
+			 * per-relation PG_CATCH; the worker loop then exits at its top.
+			 * Never set for a foreground SQL populate (SIGTERM -> die there).
+			 */
+			if (ShutdownRequestPending)
+				ereport(ERROR,
+						(errcode(ERRCODE_ADMIN_SHUTDOWN),
+						 errmsg("dbblue_columnar: aborting populate due to shutdown request")));
 
 			/*
 			 * Cheap pre-check: every page all-visible in the VM? Also capture
