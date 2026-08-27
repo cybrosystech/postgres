@@ -57,7 +57,8 @@ typedef struct
 	ObjectAddress reladdr;		/* address of rel, for ExecCreateTableAs */
 	CommandId	output_cid;		/* cmin to insert in output tuples */
 	uint32		ti_options;		/* table_tuple_insert performance options */
-	BulkInsertState bistate;	/* bulk insert state */
+	BulkInsertState bistate;	/* bulk insert state, if not using rawstate */
+	HeapRawBulkInsertState rawstate;	/* dbblue raw bulk insert state, if used */
 } DR_intorel;
 
 /* utility functions for CTAS definition creation */
@@ -565,9 +566,25 @@ intorel_startup(DestReceiver *self, int operation, TupleDesc typeinfo)
 	 * bulk inserts as there are no tuples to insert.
 	 */
 	if (!into->skipData)
-		myState->bistate = GetBulkInsertState();
+	{
+		if (RelationSupportsRawBulkInsert(intoRelationDesc))
+		{
+			myState->rawstate = heap_raw_bulk_insert_begin(intoRelationDesc,
+															myState->output_cid,
+															myState->ti_options);
+			myState->bistate = NULL;
+		}
+		else
+		{
+			myState->bistate = GetBulkInsertState();
+			myState->rawstate = NULL;
+		}
+	}
 	else
+	{
 		myState->bistate = NULL;
+		myState->rawstate = NULL;
+	}
 
 	/*
 	 * Valid smgr_targblock implies something already wrote to the relation.
@@ -587,19 +604,24 @@ intorel_receive(TupleTableSlot *slot, DestReceiver *self)
 	/* Nothing to insert if WITH NO DATA is specified. */
 	if (!myState->into->skipData)
 	{
-		/*
-		 * Note that the input slot might not be of the type of the target
-		 * relation. That's supported by table_tuple_insert(), but slightly
-		 * less efficient than inserting with the right slot - but the
-		 * alternative would be to copy into a slot of the right type, which
-		 * would not be cheap either. This also doesn't allow accessing per-AM
-		 * data (say a tuple's xmin), but since we don't do that here...
-		 */
-		table_tuple_insert(myState->rel,
-						   slot,
-						   myState->output_cid,
-						   myState->ti_options,
-						   myState->bistate);
+		if (myState->rawstate)
+			heap_raw_bulk_insert_tuple(myState->rawstate, slot);
+		else
+		{
+			/*
+			 * Note that the input slot might not be of the type of the target
+			 * relation. That's supported by table_tuple_insert(), but slightly
+			 * less efficient than inserting with the right slot - but the
+			 * alternative would be to copy into a slot of the right type, which
+			 * would not be cheap either. This also doesn't allow accessing per-AM
+			 * data (say a tuple's xmin), but since we don't do that here...
+			 */
+			table_tuple_insert(myState->rel,
+							   slot,
+							   myState->output_cid,
+							   myState->ti_options,
+							   myState->bistate);
+		}
 	}
 
 	/* We know this is a newly created relation, so there are no indexes */
@@ -618,8 +640,13 @@ intorel_shutdown(DestReceiver *self)
 
 	if (!into->skipData)
 	{
-		FreeBulkInsertState(myState->bistate);
-		table_finish_bulk_insert(myState->rel, myState->ti_options);
+		if (myState->rawstate)
+			heap_raw_bulk_insert_end(myState->rawstate);
+		else
+		{
+			FreeBulkInsertState(myState->bistate);
+			table_finish_bulk_insert(myState->rel, myState->ti_options);
+		}
 	}
 
 	/* close rel, but keep lock until commit */

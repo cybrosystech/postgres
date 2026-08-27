@@ -44,7 +44,10 @@
 #include "storage/smgr.h"
 #include "utils/rel.h"
 
-#define MAX_PENDING_WRITES XLR_MAX_BLOCK_ID
+/* GUC */
+int			dbblue_bulk_write_maxpages = 128;
+
+#define MAX_PENDING_WRITES DBBLUE_BULK_WRITE_MAX_PAGES
 
 static const PGIOAlignedBlock zero_buffer = {0};	/* worth BLCKSZ */
 
@@ -64,6 +67,15 @@ struct BulkWriteState
 	SMgrRelation smgr;
 	ForkNumber	forknum;
 	bool		use_wal;
+
+	/*
+	 * Number of pages to buffer before flushing (a snapshot of
+	 * dbblue_bulk_write_maxpages taken when the bulk write began, so a
+	 * concurrent change to the GUC can't affect an operation in progress).
+	 * WAL for a flush is still emitted in XLR_MAX_BLOCK_ID-sized chunks by
+	 * smgr_bulk_flush(), regardless of this value.
+	 */
+	int			maxpages;
 
 	/* We keep several writes queued, and WAL-log them in batches */
 	int			npending;
@@ -105,6 +117,8 @@ smgr_bulk_start_smgr(SMgrRelation smgr, ForkNumber forknum, bool use_wal)
 	state->smgr = smgr;
 	state->forknum = forknum;
 	state->use_wal = use_wal;
+
+	state->maxpages = Max(1, Min(dbblue_bulk_write_maxpages, DBBLUE_BULK_WRITE_MAX_PAGES));
 
 	state->npending = 0;
 	state->relsize = smgrnblocks(smgr, forknum);
@@ -329,7 +343,7 @@ smgr_bulk_write(BulkWriteState *bulkstate, BlockNumber blocknum, BulkWriteBuffer
 	w->blkno = blocknum;
 	w->page_std = page_std;
 
-	if (bulkstate->npending == MAX_PENDING_WRITES)
+	if (bulkstate->npending == bulkstate->maxpages)
 		smgr_bulk_flush(bulkstate);
 }
 

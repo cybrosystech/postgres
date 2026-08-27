@@ -37,8 +37,10 @@
 #include "access/multixact.h"
 #include "access/subtrans.h"
 #include "access/syncscan.h"
+#include "access/tableam.h"
 #include "access/valid.h"
 #include "access/visibilitymap.h"
+#include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_database_d.h"
@@ -46,6 +48,7 @@
 #include "executor/instrument_node.h"
 #include "pgstat.h"
 #include "port/pg_bitutils.h"
+#include "storage/bulk_write.h"
 #include "storage/lmgr.h"
 #include "storage/predicate.h"
 #include "storage/proc.h"
@@ -2686,6 +2689,237 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 		slots[i]->tts_tid = heaptuples[i]->t_self;
 
 	pgstat_count_heap_insert(relation, ntuples);
+}
+
+/*
+ * Private state for heap_raw_bulk_insert_begin() / _tuple() / _end().
+ */
+struct HeapRawBulkInsertStateData
+{
+	Relation	rel;
+	TransactionId xid;
+	CommandId	cid;
+	uint32		options;
+	Size		saveFreeSpace;	/* target free space per page, cached once */
+
+	BulkWriteState *bulkstate;
+	BulkWriteBuffer buffer;	/* page currently being built, or NULL */
+	BlockNumber blockno;	/* block where 'buffer' will go */
+};
+
+/*
+ * RelationSupportsRawBulkInsert - is it safe/appropriate to populate 'rel'
+ * via heap_raw_bulk_insert_begin()/_tuple()/_end() instead of
+ * table_tuple_insert(), for a CREATE TABLE AS or CREATE/REFRESH
+ * MATERIALIZED VIEW target?
+ *
+ * Callers must pass the relation actually being written to.  For REFRESH
+ * MATERIALIZED VIEW that is a transient plain table (RELKIND_RELATION,
+ * relpersistence inherited from the materialized view -- see
+ * make_new_heap() in repack.c), not the materialized view itself: it gets
+ * swapped into the materialized view's relfilenode afterward.  That
+ * transient table is therefore just as publishable (and hence just as
+ * exposed to logical decoding via a FOR ALL TABLES publication) as any
+ * plain CREATE TABLE AS target, so both callers share this same check.
+ */
+bool
+RelationSupportsRawBulkInsert(Relation rel)
+{
+	if (!dbblue_enable_tableam_multi_insert)
+		return false;
+
+	/* Only the built-in heap AM supports the raw bulk insert path. */
+	if (rel->rd_tableam != GetHeapamTableAmRoutine())
+		return false;
+
+	/*
+	 * Raw bulk-inserted pages carry no logical decoding information (they
+	 * are WAL-logged as full-page images only, via bulk_write.c).  Skip the
+	 * fast path whenever logical decoding info is being collected.
+	 */
+	if (XLogLogicalInfoActive())
+		return false;
+
+	return true;
+}
+
+/*
+ * heap_raw_bulk_insert_begin - start a raw bulk insert operation
+ *
+ * This is a fast path for populating the initial contents of a brand-new,
+ * private heap relation (CREATE TABLE AS SELECT, CREATE/REFRESH
+ * MATERIALIZED VIEW): tuples are packed onto private, backend-local pages
+ * and handed to the bulk_write.c facility, which extends the relation and
+ * WAL-logs the pages (as full-page images, via log_newpages()) in large
+ * batches, instead of going through RelationGetBufferForTuple()/the shared
+ * buffer pool and WAL-logging one row/page at a time.  This mirrors
+ * raw_heap_insert() in rewriteheap.c, which uses the same bulk_write.c
+ * facility for REPACK/VACUUM FULL.
+ *
+ * The pages written here carry no logical decoding information (they are
+ * FPI-only), and no visibility map bits are set even when
+ * HEAP_INSERT_FROZEN is requested (unlike heap_insert()/heap_multi_insert()
+ * with that option) -- a subsequent VACUUM will set them.  Callers must
+ * ensure this is an appropriate context to use this in: see
+ * RelationSupportsRawBulkInsert().
+ *
+ * The relation must not already have any blocks: this function always
+ * starts writing at block 0, on the assumption (enforced by the Assert
+ * below) that 'rel' is a brand-new, still-empty relation, as is the case
+ * for a freshly created CTAS/matview target.  It is not a general-purpose
+ * append facility.
+ */
+HeapRawBulkInsertState
+heap_raw_bulk_insert_begin(Relation rel, CommandId cid, uint32 options)
+{
+	HeapRawBulkInsertState state;
+
+	Assert(RelationGetNumberOfBlocks(rel) == 0);
+
+	state = palloc0_object(struct HeapRawBulkInsertStateData);
+	state->rel = rel;
+	state->xid = GetCurrentTransactionId();
+	state->cid = cid;
+	state->options = options;
+	state->saveFreeSpace = RelationGetTargetPageFreeSpace(rel,
+														   HEAP_DEFAULT_FILLFACTOR);
+	state->bulkstate = smgr_bulk_start_rel(rel, MAIN_FORKNUM);
+	state->buffer = NULL;
+	state->blockno = 0;
+
+	return state;
+}
+
+/*
+ * heap_raw_bulk_insert_tuple - insert one tuple via a raw bulk insert
+ * operation started with heap_raw_bulk_insert_begin()
+ */
+void
+heap_raw_bulk_insert_tuple(HeapRawBulkInsertState state, TupleTableSlot *slot)
+{
+	Relation	relation = state->rel;
+	HeapTuple	tuple;
+	HeapTuple	heaptup;
+	Size		len;
+	Page		page;
+	OffsetNumber newoff;
+
+	AssertHasSnapshotForToast(relation);
+
+	tuple = ExecFetchSlotHeapTuple(slot, true, NULL);
+	slot->tts_tableOid = RelationGetRelid(relation);
+	tuple->t_tableOid = slot->tts_tableOid;
+
+	/* Cheap, simplistic check that the tuple matches the rel's rowtype (as in heap_insert()) */
+	Assert(HeapTupleHeaderGetNatts(tuple->t_data) <=
+		   RelationGetNumberOfAttributes(relation));
+
+	/*
+	 * heap_prepare_insert() sets xmin/cmin and the visibility infomask, and
+	 * runs the toaster for out-of-line/oversized attributes.  Force
+	 * HEAP_INSERT_NO_LOGICAL for the toaster: the main-fork pages we write
+	 * below carry no logical decoding information, so the associated toast
+	 * rows must not either (same reasoning as rewriteheap.c's
+	 * raw_heap_insert()).
+	 */
+	heaptup = heap_prepare_insert(relation, tuple, state->xid, state->cid,
+								  state->options | HEAP_INSERT_NO_LOGICAL);
+
+	len = MAXALIGN(heaptup->t_len);
+	if (len > MaxHeapTupleSize)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("row is too big: size %zu, maximum size %zu",
+						len, MaxHeapTupleSize)));
+
+	/*
+	 * As in heap_insert(), check for a serializable conflict before doing
+	 * the actual insert.
+	 */
+	CheckForSerializableConflictIn(relation, NULL, InvalidBlockNumber);
+
+	page = (Page) state->buffer;
+	if (page)
+	{
+		Size		pageFreeSpace = PageGetHeapFreeSpace(page);
+
+		if (len + state->saveFreeSpace > pageFreeSpace)
+		{
+			/* Doesn't fit on the current page: flush it, start a new one */
+			smgr_bulk_write(state->bulkstate, state->blockno, state->buffer, true);
+			state->buffer = NULL;
+			page = NULL;
+			state->blockno++;
+		}
+	}
+
+	if (!page)
+	{
+		state->buffer = smgr_bulk_get_buf(state->bulkstate);
+		page = (Page) state->buffer;
+		PageInit(page, BLCKSZ, 0);
+	}
+
+	/*
+	 * Do not allow tuples with invalid combinations of hint bits to be
+	 * placed on a page; see the identical assertion in
+	 * RelationPutHeapTuple().
+	 */
+	Assert(!((heaptup->t_data->t_infomask & HEAP_XMAX_COMMITTED) &&
+			 (heaptup->t_data->t_infomask & HEAP_XMAX_IS_MULTI)));
+
+	newoff = PageAddItem(page, heaptup->t_data, heaptup->t_len,
+						 InvalidOffsetNumber, false, true);
+	if (newoff == InvalidOffsetNumber)
+		elog(ERROR, "failed to add tuple");
+
+	ItemPointerSet(&heaptup->t_self, state->blockno, newoff);
+
+	/*
+	 * Unlike raw_heap_insert() in rewriteheap.c, we must set t_ctid
+	 * unconditionally here, not only when it's currently invalid.  The
+	 * source slot's tuple can be a verbatim, header-and-all copy of a live
+	 * tuple from another relation (ExecFetchSlotHeapTuple() ->
+	 * heap_copytuple() memcpy's the whole header, t_ctid included, for a
+	 * BufferHeapTupleTableSlot, which is exactly what an unprojected
+	 * "SELECT * FROM src" scan produces).  Such a tuple's t_ctid is
+	 * typically already "valid" -- it's just wrong, pointing into the
+	 * *source* relation instead of self-referencing this newly inserted
+	 * tuple.  rewrite_heap_tuple() in rewriteheap.c avoids this by
+	 * explicitly calling ItemPointerSetInvalid() on t_ctid before ever
+	 * reaching this check; we have no such upstream step, so we can't rely
+	 * on the same conditional guard.  This matches RelationPutHeapTuple(),
+	 * which every other (non-raw) insert path uses and which always
+	 * overwrites t_ctid for a non-speculative insert.
+	 */
+	{
+		ItemId		newitemid = PageGetItemId(page, newoff);
+		HeapTupleHeader onpage_tup = (HeapTupleHeader) PageGetItem(page, newitemid);
+
+		onpage_tup->t_ctid = heaptup->t_self;
+	}
+
+	slot->tts_tid = heaptup->t_self;
+
+	if (heaptup != tuple)
+		heap_freetuple(heaptup);
+
+	pgstat_count_heap_insert(relation, 1);
+}
+
+/*
+ * heap_raw_bulk_insert_end - finish a raw bulk insert operation started
+ * with heap_raw_bulk_insert_begin(), freeing 'state'
+ */
+void
+heap_raw_bulk_insert_end(HeapRawBulkInsertState state)
+{
+	if (state->buffer != NULL)
+		smgr_bulk_write(state->bulkstate, state->blockno, state->buffer, true);
+
+	smgr_bulk_finish(state->bulkstate);
+
+	pfree(state);
 }
 
 /*
