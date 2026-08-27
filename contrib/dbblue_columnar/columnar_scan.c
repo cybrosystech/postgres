@@ -3992,6 +3992,7 @@ dbbc_dim_build(DbbcAggScanState *as, EState *estate)
 	HASHCTL		ctl;
 	TableScanDesc scan;
 	TupleTableSlot *slot;
+	int64		ndim = 0;
 
 	as->dj_keytype =
 		TupleDescAttr(RelationGetDescr(as->rel), as->fk_attno - 1)->atttypid;
@@ -4023,6 +4024,19 @@ dbbc_dim_build(DbbcAggScanState *as, EState *estate)
 		e = (DbbcDimEntry *) hash_search(as->dim_hash, &hk, HASH_ENTER, &found);
 		if (found)
 			continue;			/* unique key (gate G4): keep the first */
+		/*
+		 * Runtime cap. The planner only rejects the dim-join when the dim's
+		 * ESTIMATED rows exceed dimjoin_max_dim_rows; a stale under-estimate
+		 * (dim grown since ANALYZE) could otherwise build an unbounded hash -
+		 * once per parallel worker. Fail cleanly rather than risk an OOM; an
+		 * ANALYZE fixes the estimate and the planner then avoids this path.
+		 */
+		if (++ndim > (int64) dbblue_columnar_dimjoin_max_dim_rows)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("dbblue_columnar: dimension exceeds dbblue_columnar.dimjoin_max_dim_rows (%d) at runtime",
+							dbblue_columnar_dimjoin_max_dim_rows),
+					 errhint("ANALYZE the dimension so the planner sizes it correctly and does not choose the in-node dimension join.")));
 		for (k = 0; k < as->nkeys; k++)
 			if (as->key_from_dim[k])
 				e->vals[k] = slot_getattr(slot, as->key_dim_attno[k],
