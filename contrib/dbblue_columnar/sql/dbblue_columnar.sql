@@ -285,7 +285,7 @@ DROP TABLE rs;
 -- t carries stale blocks here (the earlier UPDATE), so the per-row probe runs on
 -- BOTH the columnar and heap-fallback paths in one scan. Differential vs the
 -- plain plan must be byte-identical. eager_aggregate off isolates the fused node.
-CREATE TABLE dj_dim (id int PRIMARY KEY, seq int);
+CREATE TABLE dj_dim (id int PRIMARY KEY, seq int) WITH (autovacuum_enabled = off);
 INSERT INTO dj_dim SELECT g, (g * 3) % 20 FROM generate_series(0, 6) g;
 ANALYZE dj_dim;
 SET dbblue_columnar.enable_dimjoin_agg = on;
@@ -307,6 +307,16 @@ SELECT 'dj-parallel  ', agree($$SELECT t.grp, dj.seq, count(*) c, sum(t.amt) s F
 RESET min_parallel_table_scan_size;
 RESET parallel_setup_cost;
 SET max_parallel_workers_per_gather = 0;
+-- runtime dim cap: a dimension whose planner estimate under-counts it must fail
+-- cleanly (not OOM). Force the estimate below a tiny cap via pg_class so the gate
+-- plans the dim-join; the build then overruns the cap and errors with a hint.
+-- (dj_dim has autovacuum off so the forced estimate is not re-ANALYZEd away.)
+SET dbblue_columnar.dimjoin_max_dim_rows = 3;
+UPDATE pg_class SET reltuples = 2 WHERE relname = 'dj_dim';
+SELECT t.grp, dj.seq, count(*) FROM t LEFT JOIN dj_dim dj ON dj.id = t.grp
+GROUP BY t.grp, dj.seq, dj.id;
+RESET dbblue_columnar.dimjoin_max_dim_rows;
+ANALYZE dj_dim;
 RESET enable_eager_aggregate;
 SET dbblue_columnar.enable_dimjoin_agg = off;
 DROP TABLE dj_dim;
