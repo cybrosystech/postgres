@@ -5968,6 +5968,27 @@ make_viewdef(StringInfo buf, HeapTuple ruletup, TupleDesc rulettc,
 }
 
 
+/*
+ * dbblue_deparse_query - DBblue: deparse a parsed Query to SQL text.
+ *
+ * Thin extern wrapper over the static get_query_def(), used by incremental
+ * materialized view maintenance to render a delta SELECT (whose source RTE has
+ * been swapped to a trigger transition-table ENR) back into SQL that SPI can
+ * re-parse.  Output column labels come from the query's own target list; the
+ * caller wraps the result with an explicit INSERT column list, so labels are
+ * not relied upon.  Emits non-pretty SQL.
+ */
+char *
+dbblue_deparse_query(Query *query)
+{
+	StringInfoData buf;
+
+	initStringInfo(&buf);
+	get_query_def(query, &buf, NIL, NULL, true, 0, -1, 0);
+	return buf.data;
+}
+
+
 /* ----------
  * get_query_def			- Parse back one query parsetree
  *
@@ -13262,6 +13283,19 @@ get_from_clause_item(Node *jtnode, Query *query, deparse_context *context)
 			case RTE_CTE:
 				appendStringInfoString(buf, quote_identifier(rte->ctename));
 				break;
+			case RTE_NAMEDTUPLESTORE:
+
+				/*
+				 * Ephemeral named relation (e.g. a trigger transition table).
+				 * Reference it by its bare ENR name; at execution time the
+				 * parser rebinds that name against the active query environment
+				 * (name_matches_visible_ENR).  Used by DBblue incremental
+				 * matview maintenance to deparse a delta query that scans the
+				 * transition tuplestore.  No existing core path renders an ENR
+				 * RTE through get_query_def, so this case is additive.
+				 */
+				appendStringInfoString(buf, quote_identifier(rte->enrname));
+				break;
 			default:
 				elog(ERROR, "unrecognized RTE kind: %d", (int) rte->rtekind);
 				break;
@@ -13468,6 +13502,18 @@ get_rte_alias(RangeTblEntry *rte, int varno, bool use_as,
 		 * conflict).
 		 */
 		if (strcmp(refname, rte->ctename) != 0)
+			printalias = true;
+	}
+	else if (rte->rtekind == RTE_NAMEDTUPLESTORE)
+	{
+		/*
+		 * The FROM item is rendered as the bare ENR name (enrname), but a
+		 * reference's columns are qualified by its refname.  When they differ
+		 * — e.g. a DBblue incremental-matview delta query that swaps a source
+		 * table aliased "s" for the transition tuplestore "__mv_newtable" —
+		 * print the refname as an alias so qualified Vars resolve.
+		 */
+		if (strcmp(refname, rte->enrname) != 0)
 			printalias = true;
 	}
 

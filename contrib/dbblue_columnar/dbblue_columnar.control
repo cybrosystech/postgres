@@ -1,0 +1,6 @@
+# DBblue Columnar Engine
+comment = 'DBblue Columnar Engine - in-memory columnar accelerator (Milestone 1 skeleton)'
+default_version = '1.1'
+module_pathname = '$libdir/dbblue_columnar'
+relocatable = false
+superuser = true

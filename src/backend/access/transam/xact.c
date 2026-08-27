@@ -64,6 +64,8 @@
 #include "storage/smgr.h"
 #include "utils/builtins.h"
 #include "utils/combocid.h"
+#include "utils/dbblue_countcache.h"
+#include "utils/dbblue_relmod.h"
 #include "utils/guc.h"
 #include "utils/inval.h"
 #include "utils/memutils.h"
@@ -2128,6 +2130,17 @@ StartTransaction(void)
 	s->state = TRANS_START;
 	s->fullTransactionId = InvalidFullTransactionId;	/* until assigned */
 
+	/*
+	 * DBblue: start from a clean per-transaction write set.  The list lives
+	 * in TopTransactionContext, so it is freed out from under us whenever the
+	 * previous transaction ended -- including via paths such as
+	 * PrepareTransaction() that do not run the normal commit tail.  Clearing
+	 * it here rather than relying on every exit path is what keeps a stale
+	 * pointer from reaching dbblue_relmod_bump_xact_rels().
+	 */
+	dbblue_relmod_reset_xact();
+	dbblue_countcache_reset_xact();
+
 	/* Determine if statements are logged in this transaction */
 	xact_is_sampled = log_xact_sample_rate != 0 &&
 		(log_xact_sample_rate == 1 ||
@@ -2387,6 +2400,15 @@ CommitTransaction(void)
 	AtEOXact_RelationMap(true, is_parallel_worker);
 
 	/*
+	 * DBblue: bump the shared modification stamp for every relation this
+	 * transaction wrote, before the commit becomes visible below.  Doing it
+	 * on this side of RecordTransactionCommit() guarantees that any backend
+	 * which can see our new rows also sees a changed stamp, so a COUNT
+	 * cached before our commit can never be served after it.
+	 */
+	dbblue_relmod_bump_xact_rels();
+
+	/*
 	 * set the current transaction state information appropriately during
 	 * commit processing
 	 */
@@ -2540,6 +2562,9 @@ CommitTransaction(void)
 	XactTopFullTransactionId = InvalidFullTransactionId;
 	nParallelCurrentXids = 0;
 
+	/* DBblue: the write set lived in TopTransactionContext; drop our pointer */
+	dbblue_relmod_reset_xact();
+
 	/*
 	 * done with commit processing, set current transaction state back to
 	 * default
@@ -2671,6 +2696,9 @@ PrepareTransaction(void)
 
 	/* Prevent cancel/die interrupt while cleaning up */
 	HOLD_INTERRUPTS();
+
+	/* DBblue: see the matching comment in CommitTransaction() */
+	dbblue_relmod_bump_xact_rels();
 
 	/*
 	 * set the current transaction state information appropriately during
@@ -2980,6 +3008,14 @@ AbortTransaction(void)
 	 * worker, skip this; the user backend must be the one to write the abort
 	 * record.
 	 */
+	/*
+	 * DBblue: bump written relations on the abort path too.  Nothing we wrote
+	 * becomes visible, so this is not required for correctness -- it just
+	 * costs one shared-memory store per relation and removes any dependence
+	 * on abort-vs-commit reasoning in the cache validity check.
+	 */
+	dbblue_relmod_bump_xact_rels();
+
 	if (!is_parallel_worker)
 		latestXid = RecordTransactionAbort(false);
 	else
@@ -3097,6 +3133,9 @@ CleanupTransaction(void)
 
 	XactTopFullTransactionId = InvalidFullTransactionId;
 	nParallelCurrentXids = 0;
+
+	/* DBblue: the write set lived in TopTransactionContext; drop our pointer */
+	dbblue_relmod_reset_xact();
 
 	/*
 	 * done with abort processing, set current transaction state back to

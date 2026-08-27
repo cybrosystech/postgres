@@ -129,3 +129,5 @@ test: lock-nowait
 test: for-portion-of
 test: ddl-dependency-locking
 test: pub-concurrent-drop
+test: dbblue-countcache
+test: dbblue-matview-skip

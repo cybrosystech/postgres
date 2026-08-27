@@ -628,12 +628,14 @@
   variable => 'dbblue_audit_enabled',
   boot_val => 'true',
 },
+
 { name => 'dbblue_audit_tables', type => 'string', context => 'PGC_USERSET', group => 'CUSTOM_OPTIONS',
   short_desc => 'Specifies the table names for the audit purposes',
   flags => 'GUC_LIST_INPUT | GUC_LIST_QUOTE',
   variable => 'dbblue_audit_tables',
   boot_val => '""',
 },
+
 { name => 'dbblue_auto_index_suggestion_database', type => 'string', context => 'PGC_POSTMASTER', group => 'STATS_MONITORING',
   short_desc => 'Database the dbblue index advisor connects to.',
   long_desc => 'pg_stat_statements is cluster-wide but parsing and EXPLAIN need a database connection. The advisor worker attaches to this database at server startup and analyses only its workload. Change requires a server restart.',
@@ -700,7 +702,6 @@
   min => '0.0',
   max => '1.0',
 },
-
 
 { name => 'dbblue_auto_index_suggestion_top_n_queries', type => 'int', context => 'PGC_SIGHUP', group => 'STATS_MONITORING',
   short_desc => 'How many top queries from pg_stat_statements to analyse per run.',
@@ -817,6 +818,22 @@
   boot_val => '"odoo"',
 },
 
+{ name => 'dbblue_count_cache', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
+  short_desc => 'Enables the DBblue session-local COUNT(*) result cache.',
+  flags => 'GUC_EXPLAIN',
+  variable => 'dbblue_count_cache',
+  boot_val => 'false',
+},
+
+{ name => 'dbblue_count_cache_ttl', type => 'int', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
+  short_desc => 'Sets the lifetime of DBblue COUNT cache entries.',
+  flags => 'GUC_EXPLAIN, GUC_UNIT_S',
+  variable => 'dbblue_countcache_ttl',
+  boot_val => '300',
+  min => '1',
+  max => '86400',
+},
+
 { name => 'dbblue_create_brin', type => 'bool', context => 'PGC_POSTMASTER', group => 'RESOURCES_WORKER_PROCESSES',
   short_desc => 'Enable automatic BRIN index creation for create_date columns.',
   long_desc => 'When enabled, a background worker periodically checks pg_stats and creates BRIN indexes on create_date columns with high correlation (>0.9).',
@@ -832,12 +849,43 @@
   boot_val => 'false',
 },
 
+{ name => 'dbblue_enable_fk_join_reduction', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
+  short_desc => 'Enables reducing outer joins to inner joins using foreign keys.',
+  long_desc => 'When a mandatory foreign key proves that every row of the preserved side has exactly one match on the nullable side, the outer join cannot produce null-extended rows, so it is planned as an inner join.',
+  flags => 'GUC_EXPLAIN',
+  variable => 'dbblue_enable_fk_join_reduction',
+  boot_val => 'true',
+},
+
 {name => 'dbblue_fillfactor_map', type => 'string', context => 'PGC_USERSET', group => 'CUSTOM_OPTIONS',
   short_desc => 'Specifies the fillfactor setting for specific models in dbblue',
   flags => '0',
   variable => 'dbblue_fillfactor_map',
   boot_val => '""',
   assign_hook => 'dbblue_fillfactor_assign_hook',
+},
+
+{ name => 'dbblue_ivm_deparse_delta', type => 'bool', context => 'PGC_USERSET', group => 'DEVELOPER_OPTIONS',
+  short_desc => 'DBblue: build incremental-matview delta SQL via the query-tree deparse core (on by default; set off only as a hand-builder escape hatch).',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'dbblue_ivm_deparse_delta',
+  boot_val => 'true',
+},
+
+{ name => 'dbblue_ivm_refresh_threshold', type => 'real', context => 'PGC_USERSET', group => 'DEVELOPER_OPTIONS',
+  short_desc => 'DBblue: rebuild an incremental matview with a full REFRESH when the rows a statement changes exceed this fraction of the source table estimated live tuples (0 disables the fallback).',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'dbblue_ivm_refresh_threshold',
+  boot_val => '0.5',
+  min => '0.0',
+  max => '1e12',
+},
+
+{ name => 'dbblue_matview_skip_unchanged', type => 'bool', context => 'PGC_SUSET', group => 'CLIENT_CONN_STATEMENT',
+  short_desc => 'Allows REFRESH MATERIALIZED VIEW to skip the rebuild when nothing the matview depends on has changed.',
+  long_desc => 'Only affects materialized views defined with auto_skip_unchanged=true. Turning this off makes every REFRESH rebuild unconditionally.',
+  variable => 'dbblue_matview_skip_unchanged',
+  boot_val => 'true',
 },
 
 { name => 'dbblue_max_pin_size_percent', type => 'int', context => 'PGC_SIGHUP', group => 'RESOURCES_MEM',
@@ -856,6 +904,13 @@
   boot_val => '100',
   min => '0',
   max => 'INT_MAX',
+},
+
+{ name => 'dbblue_offset_flip', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
+  short_desc => 'Enables the DBblue OFFSET-flip planner rewrite (requires dbblue_count_cache).',
+  flags => 'GUC_EXPLAIN',
+  variable => 'dbblue_offset_flip',
+  boot_val => 'false',
 },
 
 { name => 'dbblue_pin_check_interval', type => 'int', context => 'PGC_SIGHUP', group => 'RESOURCES_MEM',
@@ -972,6 +1027,14 @@
   flags => 'GUC_NOT_IN_SAMPLE',
   variable => 'dbblue_standby_user',
   boot_val => '""',
+},
+
+{ name => 'dbblue_track_relation_writes', type => 'bool', context => 'PGC_POSTMASTER', group => 'QUERY_TUNING_METHOD',
+  short_desc => 'Maintains per-relation write stamps, required by the DBblue COUNT cache.',
+  long_desc => 'Without this the COUNT cache cannot validate an entry and never serves one. Cannot be set per session: a session with it off would not record its writes while another cached counts against them.',
+  flags => 'GUC_EXPLAIN',
+  variable => 'dbblue_track_relation_writes',
+  boot_val => 'false',
 },
 
 { name => 'dbblue_wait_sampling_database', type => 'string', context => 'PGC_POSTMASTER', group => 'STATS_MONITORING',

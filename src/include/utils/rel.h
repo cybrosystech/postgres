@@ -356,6 +356,16 @@ typedef struct StdRdOptions
 	 * to freeze. 0 if disabled, -1 if unspecified.
 	 */
 	double		vacuum_max_eager_freeze_failure_rate;
+
+	/* DBblue: skip REFRESH when no source table has been written since last refresh */
+	bool		auto_skip_unchanged;
+
+	/* DBblue: maintain matview incrementally on source table writes */
+	bool		incremental_refresh;
+
+	/* DBblue: allow STABLE GROUP BY key expressions in an incremental matview
+	 * (opt-in; documented staleness on TimeZone/lc_time change until REFRESH) */
+	bool		allow_stable_keys;
 } StdRdOptions;
 
 #define HEAP_MIN_FILLFACTOR			10
@@ -410,6 +420,30 @@ typedef struct StdRdOptions
 #define RelationGetParallelWorkers(relation, defaultpw) \
 	((relation)->rd_options ? \
 	 ((StdRdOptions *) (relation)->rd_options)->parallel_workers : (defaultpw))
+
+/*
+ * RelationGetAutoSkipUnchanged
+ *		Returns true if the matview should skip REFRESH when source data is unchanged.
+ */
+#define RelationGetAutoSkipUnchanged(relation) \
+	((relation)->rd_options ? \
+	 ((StdRdOptions *) (relation)->rd_options)->auto_skip_unchanged : false)
+
+/*
+ * RelationGetIncrementalRefresh
+ *		Returns true if the matview should be maintained incrementally.
+ */
+#define RelationGetIncrementalRefresh(relation) \
+	((relation)->rd_options ? \
+	 ((StdRdOptions *) (relation)->rd_options)->incremental_refresh : false)
+
+/*
+ * RelationGetAllowStableKeys
+ *		Returns true if the incremental matview opted in to STABLE GROUP BY keys.
+ */
+#define RelationGetAllowStableKeys(relation) \
+	((relation)->rd_options ? \
+	 ((StdRdOptions *) (relation)->rd_options)->allow_stable_keys : false)
 
 /* ViewOptions->check_option values */
 typedef enum ViewOptCheckOption

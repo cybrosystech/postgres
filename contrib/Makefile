@@ -16,6 +16,7 @@ SUBDIRS = \
 		citext		\
 		cube		\
 		dbblue_partition \
+		dbblue_columnar	\
 		dblink		\
 		dict_int	\
 		dict_xsyn	\

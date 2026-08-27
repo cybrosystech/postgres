@@ -76,6 +76,7 @@ PG_SHMEM_SUBSYSTEM(SlotSyncShmemCallbacks)
 /* other modules that need some shared memory space */
 PG_SHMEM_SUBSYSTEM(BTreeShmemCallbacks)
 PG_SHMEM_SUBSYSTEM(SyncScanShmemCallbacks)
+PG_SHMEM_SUBSYSTEM(DBBlueRelModShmemCallbacks)
 PG_SHMEM_SUBSYSTEM(AsyncShmemCallbacks)
 PG_SHMEM_SUBSYSTEM(StatsShmemCallbacks)
 PG_SHMEM_SUBSYSTEM(WaitEventCustomShmemCallbacks)
@@ -88,3 +89,6 @@ PG_SHMEM_SUBSYSTEM(DataChecksumsShmemCallbacks)
 
 /* AIO subsystem. This delegates to the method-specific callbacks */
 PG_SHMEM_SUBSYSTEM(AioShmemCallbacks)
+
+/* DBblue: matview dirty-flag tracking for auto_skip_unchanged */
+PG_SHMEM_SUBSYSTEM(MatviewDirtyShmemCallbacks)

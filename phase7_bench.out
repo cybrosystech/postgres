@@ -1,0 +1,307 @@
+Timing is on.
+Output format is aligned.
+
+===== Warming shared buffers =====
+Time: 5472.698 ms (00:05.473)
+
+===== 1. COUNT under predicate (establishes N) =====
+Time: 1990.103 ms (00:01.990)
+N =  1950000
+
+╔══════════════════════════════════════════════════════════════════╗
+║  SHAPE B1: ORDER BY id DESC                                     ║
+╚══════════════════════════════════════════════════════════════════╝
+SET
+Time: 0.243 ms
+SET
+Time: 0.180 ms
+-- Seeding COUNT cache --
+  count  
+---------
+ 1950000
+(1 row)
+
+Time: 1975.932 ms (00:01.976)
+
+--- B1 ON (flip should fire): plan ---
+                                                                              QUERY PLAN                                                                              
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Sort  (cost=0.00..0.00 rows=0 width=0) (actual time=1.278..1.384 rows=80.00 loops=1)
+   Sort Key: id DESC
+   Sort Method: quicksort  Memory: 27kB
+   Buffers: shared hit=7 read=6
+   I/O Timings: shared read=0.766
+   ->  Limit  (cost=0.43..5.41 rows=80 width=14) (actual time=0.773..1.136 rows=80.00 loops=1)
+         Buffers: shared read=6
+         I/O Timings: shared read=0.766
+         ->  Index Scan using account_move_line_pkey on account_move_line  (cost=0.43..121364.53 rows=1949655 width=14) (actual time=0.769..0.932 rows=80.00 loops=1)
+               Filter: (((display_type)::text <> ALL ('{line_section,line_note}'::text[])) AND (company_id = 1))
+               Index Searches: 1
+               Buffers: shared read=6
+               I/O Timings: shared read=0.766
+ Planning:
+   Buffers: shared hit=34 read=1
+   I/O Timings: shared read=0.040
+ Planning Time: 0.363 ms
+ Execution Time: 1.517 ms
+(18 rows)
+
+Time: 2.682 ms
+
+--- B1 ON: 5 timing runs ---
+Time: 1.323 ms
+Time: 1.205 ms
+Time: 1.153 ms
+Time: 1.188 ms
+Time: 1.119 ms
+SET
+Time: 0.154 ms
+SET
+Time: 0.114 ms
+
+--- B1 OFF (baseline): plan ---
+                                                                                   QUERY PLAN                                                                                    
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=121364.53..121364.59 rows=1 width=14) (actual time=6577.060..6577.388 rows=80.00 loops=1)
+   Buffers: shared hit=566 read=57499
+   I/O Timings: shared read=929.675
+   ->  Index Scan Backward using account_move_line_pkey on account_move_line  (cost=0.43..121364.53 rows=1949655 width=14) (actual time=0.565..4092.824 rows=1950000.00 loops=1)
+         Filter: (((display_type)::text <> ALL ('{line_section,line_note}'::text[])) AND (company_id = 1))
+         Index Searches: 1
+         Buffers: shared hit=566 read=57499
+         I/O Timings: shared read=929.675
+ Planning:
+   Buffers: shared hit=9
+ Planning Time: 0.141 ms
+ Execution Time: 6577.587 ms
+(12 rows)
+
+Time: 6578.206 ms (00:06.578)
+
+--- B1 OFF: 5 timing runs ---
+Time: 5879.771 ms (00:05.880)
+Time: 5788.029 ms (00:05.788)
+Time: 5809.878 ms (00:05.810)
+Time: 5727.653 ms (00:05.728)
+Time: 5832.244 ms (00:05.832)
+
+╔══════════════════════════════════════════════════════════════════╗
+║  SHAPE B2: ORDER BY date DESC, id DESC                          ║
+╚══════════════════════════════════════════════════════════════════╝
+SET
+Time: 0.161 ms
+SET
+Time: 0.089 ms
+-- Seeding COUNT cache --
+  count  
+---------
+ 1950000
+(1 row)
+
+Time: 1940.364 ms (00:01.940)
+
+--- B2 ON (flip should fire): plan ---
+                                                                                            QUERY PLAN                                                                                            
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Sort  (cost=0.00..0.00 rows=0 width=0) (actual time=5.770..5.882 rows=80.00 loops=1)
+   Sort Key: date DESC, id DESC
+   Sort Method: quicksort  Memory: 27kB
+   Buffers: shared hit=33 read=74
+   I/O Timings: shared read=3.331
+   ->  Limit  (cost=327.61..343.31 rows=80 width=14) (actual time=5.312..5.613 rows=80.00 loops=1)
+         Buffers: shared hit=25 read=74
+         I/O Timings: shared read=3.331
+         ->  Incremental Sort  (cost=327.61..382985.48 rows=1949655 width=14) (actual time=5.309..5.407 rows=80.00 loops=1)
+               Sort Key: date, id
+               Presorted Key: date
+               Full-sort Groups: 1  Sort Method: quicksort  Average Memory: 28kB  Peak Memory: 28kB
+               Pre-sorted Groups: 1  Sort Method: top-N heapsort  Average Memory: 32kB  Peak Memory: 32kB
+               Buffers: shared hit=25 read=74
+               I/O Timings: shared read=3.331
+               ->  Index Scan Backward using account_move_line_date_name_id_idx on account_move_line  (cost=0.43..287216.70 rows=1949655 width=14) (actual time=2.488..4.461 rows=482.00 loops=1)
+                     Filter: (((display_type)::text <> ALL ('{line_section,line_note}'::text[])) AND (company_id = 1))
+                     Index Searches: 1
+                     Buffers: shared hit=22 read=74
+                     I/O Timings: shared read=3.331
+ Planning:
+   Buffers: shared hit=10 read=7
+   I/O Timings: shared read=0.048
+ Planning Time: 0.269 ms
+ Execution Time: 6.011 ms
+(25 rows)
+
+Time: 7.015 ms
+
+--- B2 ON: 5 timing runs ---
+Time: 2.679 ms
+Time: 2.651 ms
+Time: 2.565 ms
+Time: 2.532 ms
+Time: 2.524 ms
+SET
+Time: 0.144 ms
+SET
+Time: 0.120 ms
+
+--- B2 OFF (baseline): plan ---
+                                                                  QUERY PLAN                                                                  
+----------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=354447.10..354447.10 rows=1 width=14) (actual time=11388.981..11389.465 rows=80.00 loops=1)
+   Buffers: shared hit=13522 read=36478, temp read=11925 written=11959
+   I/O Timings: shared read=5.072, temp read=39.816 write=98.577
+   ->  Sort  (cost=349572.96..354447.10 rows=1949655 width=14) (actual time=6502.613..9024.817 rows=1950000.00 loops=1)
+         Sort Key: date DESC, id DESC
+         Sort Method: external merge  Disk: 47736kB
+         Buffers: shared hit=13522 read=36478, temp read=11925 written=11959
+         I/O Timings: shared read=5.072, temp read=39.816 write=98.577
+         ->  Seq Scan on account_move_line  (cost=0.00..79244.82 rows=1949655 width=14) (actual time=0.152..2916.722 rows=1950000.00 loops=1)
+               Filter: (((display_type)::text <> ALL ('{line_section,line_note}'::text[])) AND (company_id = 1))
+               Buffers: shared hit=13522 read=36478
+               I/O Timings: shared read=5.072
+ Planning:
+   Buffers: shared hit=9
+ Planning Time: 0.097 ms
+ Execution Time: 11403.287 ms
+(16 rows)
+
+Time: 11403.918 ms (00:11.404)
+
+--- B2 OFF: 5 timing runs ---
+Time: 11838.483 ms (00:11.838)
+Time: 11460.665 ms (00:11.461)
+Time: 11439.232 ms (00:11.439)
+Time: 11444.612 ms (00:11.445)
+Time: 11449.601 ms (00:11.450)
+
+╔══════════════════════════════════════════════════════════════════╗
+║  SHAPE B4: ORDER BY date DESC, move_name DESC, id ASC (Odoo)   ║
+╚══════════════════════════════════════════════════════════════════╝
+SET
+Time: 0.214 ms
+SET
+Time: 0.106 ms
+-- Seeding COUNT cache --
+  count  
+---------
+ 1950000
+(1 row)
+
+Time: 1956.714 ms (00:01.957)
+
+--- B4 ON (flip should fire): plan ---
+                                                                                        QUERY PLAN                                                                                         
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Sort  (cost=0.00..0.00 rows=0 width=0) (actual time=0.584..0.702 rows=80.00 loops=1)
+   Sort Key: date DESC, move_name DESC, id
+   Sort Method: quicksort  Memory: 27kB
+   Buffers: shared hit=27
+   ->  Limit  (cost=0.43..12.21 rows=80 width=46) (actual time=0.015..0.371 rows=80.00 loops=1)
+         Buffers: shared hit=19
+         ->  Index Scan Backward using account_move_line_date_name_id_idx on account_move_line  (cost=0.43..287216.70 rows=1949655 width=46) (actual time=0.011..0.163 rows=80.00 loops=1)
+               Filter: (((display_type)::text <> ALL ('{line_section,line_note}'::text[])) AND (company_id = 1))
+               Index Searches: 1
+               Buffers: shared hit=19
+ Planning:
+   Buffers: shared hit=16 read=4
+   I/O Timings: shared read=0.020
+ Planning Time: 0.270 ms
+ Execution Time: 0.825 ms
+(15 rows)
+
+Time: 1.673 ms
+
+--- B4 ON: 5 timing runs ---
+Time: 1.148 ms
+Time: 1.621 ms
+Time: 1.192 ms
+Time: 1.118 ms
+Time: 1.131 ms
+SET
+Time: 0.113 ms
+SET
+Time: 0.093 ms
+
+--- B4 OFF (baseline): plan ---
+                                                                                     QUERY PLAN                                                                                     
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=287216.70..287216.85 rows=1 width=46) (actual time=7734.955..7735.357 rows=80.00 loops=1)
+   Buffers: shared hit=89119 read=249392
+   I/O Timings: shared read=1486.099
+   ->  Index Scan using account_move_line_date_name_id_idx on account_move_line  (cost=0.43..287216.70 rows=1949655 width=46) (actual time=0.465..5255.686 rows=1950000.00 loops=1)
+         Filter: (((display_type)::text <> ALL ('{line_section,line_note}'::text[])) AND (company_id = 1))
+         Index Searches: 1
+         Buffers: shared hit=89119 read=249392
+         I/O Timings: shared read=1486.099
+ Planning:
+   Buffers: shared hit=9
+ Planning Time: 0.113 ms
+ Execution Time: 7735.548 ms
+(12 rows)
+
+Time: 7736.255 ms (00:07.736)
+
+--- B4 OFF: 5 timing runs ---
+Time: 7243.292 ms (00:07.243)
+Time: 7349.127 ms (00:07.349)
+Time: 7349.394 ms (00:07.349)
+Time: 7272.896 ms (00:07.273)
+Time: 7297.394 ms (00:07.297)
+
+╔══════════════════════════════════════════════════════════════════╗
+║  REGRESSION: first-page (K=0, must not flip)                   ║
+╚══════════════════════════════════════════════════════════════════╝
+SET
+Time: 0.295 ms
+SET
+Time: 0.174 ms
+-- Seeding COUNT cache --
+  count  
+---------
+ 1950000
+(1 row)
+
+Time: 1976.933 ms (00:01.977)
+
+--- First page ON (must NOT flip, K=0 <= N/2): plan ---
+                                                                               QUERY PLAN                                                                                
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.43..5.41 rows=80 width=14) (actual time=0.098..0.534 rows=80.00 loops=1)
+   Buffers: shared hit=2 read=4
+   I/O Timings: shared read=0.036
+   ->  Index Scan Backward using account_move_line_pkey on account_move_line  (cost=0.43..121364.53 rows=1949655 width=14) (actual time=0.093..0.269 rows=80.00 loops=1)
+         Filter: (((display_type)::text <> ALL ('{line_section,line_note}'::text[])) AND (company_id = 1))
+         Index Searches: 1
+         Buffers: shared hit=2 read=4
+         I/O Timings: shared read=0.036
+ Planning:
+   Buffers: shared hit=9
+ Planning Time: 0.324 ms
+ Execution Time: 0.698 ms
+(12 rows)
+
+Time: 3.583 ms
+
+--- Mid-page ON (K=N/2 exactly, boundary, must NOT flip): plan ---
+                                                                                   QUERY PLAN                                                                                   
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=60693.22..60698.20 rows=80 width=14) (actual time=2858.006..2858.335 rows=80.00 loops=1)
+   Buffers: shared hit=2517 read=25223
+   I/O Timings: shared read=105.092
+   ->  Index Scan Backward using account_move_line_pkey on account_move_line  (cost=0.43..121364.53 rows=1949655 width=14) (actual time=0.010..1639.031 rows=975080.00 loops=1)
+         Filter: (((display_type)::text <> ALL ('{line_section,line_note}'::text[])) AND (company_id = 1))
+         Index Searches: 1
+         Buffers: shared hit=2517 read=25223
+         I/O Timings: shared read=105.092
+ Planning:
+   Buffers: shared hit=9
+ Planning Time: 0.120 ms
+ Execution Time: 2858.534 ms
+(12 rows)
+
+Time: 2860.203 ms (00:02.860)
+
+===== Phase 7 complete =====
+SET
+Time: 0.227 ms
+SET
+Time: 0.156 ms

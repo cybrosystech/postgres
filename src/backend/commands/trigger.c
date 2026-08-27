@@ -27,6 +27,7 @@
 #include "catalog/objectaccess.h"
 #include "catalog/partition.h"
 #include "catalog/pg_constraint.h"
+#include "catalog/pg_dbblue_trusted_fkey.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_trigger.h"
@@ -6513,7 +6514,18 @@ AfterTriggerSaveEvent(EState *estate, ResultRelInfo *relinfo,
 			continue;
 		if (!TriggerEnabled(estate, relinfo, trigger, event,
 							modifiedCols, oldslot, newslot))
+		{
+			/*
+			 * A foreign key is enforced by exactly these triggers, so passing
+			 * one over means this change goes unchecked -- whether because the
+			 * trigger is disabled or because of the replication role.  Any
+			 * declaration that the constraint may be relied upon stops being
+			 * warranted, so withdraw it when this transaction commits.
+			 */
+			if (trigger->tgisinternal && OidIsValid(trigger->tgconstraint))
+				DbblueFkeyNoteBypass(trigger->tgconstraint);
 			continue;
+		}
 
 		if (relkind == RELKIND_FOREIGN_TABLE && row_trigger)
 		{

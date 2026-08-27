@@ -169,6 +169,17 @@ typedef struct PlannedStmt
 	ParseLoc	stmt_location;
 	/* length in bytes; 0 means "rest of string" */
 	ParseLoc	stmt_len;
+
+	/*
+	 * DBblue COUNT-cache routing.  When the planner detects a SELECT
+	 * against a single base relation with non-trivial quals, it computes
+	 * a value-sensitive fingerprint over Query->jointree->quals and
+	 * stashes it here so the executor can use it as a cache key without
+	 * having to recover the original quals from the (possibly mangled)
+	 * plan tree.  Zero / InvalidOid means "not a candidate; ignore".
+	 */
+	int64		dbblue_pred_fingerprint;
+	Oid			dbblue_pred_reloid;
 } PlannedStmt;
 
 /* macro for fetching the Plan associated with a SubPlan node */

@@ -26,14 +26,21 @@
  */
 #include "postgres.h"
 
+#include "access/genam.h"
+#include "access/htup_details.h"
 #include "access/table.h"
+#include "catalog/pg_constraint.h"
+#include "catalog/pg_dbblue_trusted_fkey.h"
+#include "catalog/pg_trigger.h"
 #include "catalog/pg_type.h"
+#include "commands/trigger.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/multibitmapset.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/clauses.h"
+#include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/placeholder.h"
 #include "optimizer/plancat.h"
@@ -44,7 +51,9 @@
 #include "parser/parsetree.h"
 #include "rewrite/rewriteHandler.h"
 #include "rewrite/rewriteManip.h"
+#include "utils/fmgroids.h"
 #include "utils/rel.h"
+#include "utils/syscache.h"
 
 
 typedef struct nullingrel_info
@@ -165,6 +174,16 @@ static void report_reduced_full_join(reduce_outer_joins_pass2_state *state2,
 									 int rtindex, Relids relids);
 static bool has_notnull_forced_var(PlannerInfo *root, List *forced_null_vars,
 								   reduce_outer_joins_pass1_state *right_state);
+static void fkey_collect_jointree_quals(Node *jtnode, JoinExpr *skip,
+										List **quals);
+static bool fkey_nullable_side_is_referenced(PlannerInfo *root, JoinExpr *j,
+											 int innerrelid);
+static bool fkey_triggers_disabled(Oid conoid);
+static bool fkey_proves_inner_join(PlannerInfo *root, JoinExpr *j,
+								   Node *innernode,
+								   reduce_outer_joins_pass1_state *outer_state,
+								   reduce_outer_joins_pass1_state *inner_state,
+								   List *forced_null_vars);
 static Node *remove_useless_results_recurse(PlannerInfo *root, Node *jtnode,
 											Relids baserels,
 											Node **parent_quals,
@@ -3501,9 +3520,17 @@ reduce_outer_joins_pass2(Node *jtnode,
 			case JOIN_LEFT:
 				if (bms_overlap(nonnullable_rels, right_state->relids))
 					jointype = JOIN_INNER;
+				else if (fkey_proves_inner_join(root, j, j->rarg,
+												left_state, right_state,
+												forced_null_vars))
+					jointype = JOIN_INNER;
 				break;
 			case JOIN_RIGHT:
 				if (bms_overlap(nonnullable_rels, left_state->relids))
+					jointype = JOIN_INNER;
+				else if (fkey_proves_inner_join(root, j, j->larg,
+												right_state, left_state,
+												forced_null_vars))
 					jointype = JOIN_INNER;
 				break;
 			case JOIN_FULL:
@@ -3826,6 +3853,502 @@ has_notnull_forced_var(PlannerInfo *root, List *forced_null_vars,
 	}
 
 	return false;
+}
+
+/*
+ * fkey_collect_jointree_quals
+ *		Gather every qual in the join tree except those of one JoinExpr.
+ */
+static void
+fkey_collect_jointree_quals(Node *jtnode, JoinExpr *skip, List **quals)
+{
+	if (jtnode == NULL || IsA(jtnode, RangeTblRef))
+		return;
+	if (IsA(jtnode, FromExpr))
+	{
+		FromExpr   *f = (FromExpr *) jtnode;
+		ListCell   *lc;
+
+		if (f->quals)
+			*quals = lappend(*quals, f->quals);
+		foreach(lc, f->fromlist)
+			fkey_collect_jointree_quals(lfirst(lc), skip, quals);
+	}
+	else if (IsA(jtnode, JoinExpr))
+	{
+		JoinExpr   *je = (JoinExpr *) jtnode;
+
+		if (je != skip && je->quals)
+			*quals = lappend(*quals, je->quals);
+		fkey_collect_jointree_quals(je->larg, skip, quals);
+		fkey_collect_jointree_quals(je->rarg, skip, quals);
+	}
+}
+
+/*
+ * fkey_nullable_side_is_referenced
+ *		Does anything but this join's own condition use the nullable side?
+ *
+ * If nothing does, the outer join is a candidate for removal altogether:
+ * remove_useless_joins() drops a LEFT JOIN whose inner side is unique on the
+ * join key and otherwise unused, and the foreign key guarantees that
+ * uniqueness.  Reducing to an inner join forfeits that, because an inner join
+ * can eliminate rows and so cannot simply be dropped -- turning a query that
+ * scanned one table into one that performs a join.  Object-relational mappers
+ * run exactly this shape to count rows for a pager, where it measurably lost.
+ *
+ * When the nullable side is unreferenced there is nothing for the reduction to
+ * gain either, since no ordering or filtering depends on it, so declining costs
+ * nothing.  Being unsure counts as unreferenced, which merely leaves the query
+ * planned the way PostgreSQL would have planned it anyway.
+ */
+static bool
+fkey_nullable_side_is_referenced(PlannerInfo *root, JoinExpr *j, int innerrelid)
+{
+	Query	   *parse = root->parse;
+	List	   *quals = NIL;
+	ListCell   *lc;
+	Relids		used;
+	bool		result;
+
+	used = pull_varnos(root, (Node *) parse->targetList);
+	used = bms_join(used, pull_varnos(root, parse->havingQual));
+	used = bms_join(used, pull_varnos(root, (Node *) parse->returningList));
+	used = bms_join(used, pull_varnos(root, parse->limitOffset));
+	used = bms_join(used, pull_varnos(root, parse->limitCount));
+
+	fkey_collect_jointree_quals((Node *) parse->jointree, j, &quals);
+	foreach(lc, quals)
+		used = bms_join(used, pull_varnos(root, (Node *) lfirst(lc)));
+
+	/* a LATERAL item can reference it from inside the range table */
+	foreach(lc, parse->rtable)
+	{
+		RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+
+		if (!rte->lateral)
+			continue;
+		switch (rte->rtekind)
+		{
+			case RTE_SUBQUERY:
+				used = bms_join(used, pull_varnos(root, (Node *) rte->subquery));
+				break;
+			case RTE_FUNCTION:
+				used = bms_join(used, pull_varnos(root, (Node *) rte->functions));
+				break;
+			case RTE_VALUES:
+				used = bms_join(used, pull_varnos(root, (Node *) rte->values_lists));
+				break;
+			case RTE_TABLEFUNC:
+				used = bms_join(used, pull_varnos(root, (Node *) rte->tablefunc));
+				break;
+			default:
+				break;
+		}
+	}
+
+	result = bms_is_member(innerrelid, used);
+	bms_free(used);
+	list_free(quals);
+
+	return result;
+}
+
+/*
+ * fkey_triggers_disabled
+ *		Are this constraint's referential-integrity triggers switched off?
+ *
+ * A foreign key is enforced by triggers, so while they are disabled -- by
+ * ALTER TABLE ... DISABLE TRIGGER, say -- writes can violate it freely.  The
+ * catalog still reports the constraint as validated and enforced throughout,
+ * so this has to be read from pg_trigger.
+ */
+static bool
+fkey_triggers_disabled(Oid conoid)
+{
+	Relation	rel;
+	SysScanDesc scan;
+	ScanKeyData skey;
+	HeapTuple	tup;
+	bool		disabled = false;
+
+	rel = table_open(TriggerRelationId, AccessShareLock);
+
+	ScanKeyInit(&skey, Anum_pg_trigger_tgconstraint,
+				BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(conoid));
+	scan = systable_beginscan(rel, TriggerConstraintIndexId, true,
+							  NULL, 1, &skey);
+
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_pg_trigger trg = (Form_pg_trigger) GETSTRUCT(tup);
+
+		if (trg->tgenabled != TRIGGER_FIRES_ALWAYS &&
+			trg->tgenabled != TRIGGER_FIRES_ON_ORIGIN)
+		{
+			disabled = true;
+			break;
+		}
+	}
+
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+
+	return disabled;
+}
+
+/*
+ * fkey_proves_inner_join
+ *		Can a foreign key prove that this outer join never null-extends?
+ *
+ * An outer join is equivalent to an inner join if every row of the preserved
+ * side is guaranteed to find exactly one match on the nullable side.  A
+ * FOREIGN KEY supplies "at least one" and the unique constraint it references
+ * supplies "at most one", so the pair is exactly what we need.  This catches
+ * the extremely common ORM-generated shape
+ *		FROM child LEFT JOIN parent ON child.parent_id = parent.id
+ * where parent_id is a NOT NULL column carrying a foreign key -- object-
+ * relational mappers emit LEFT JOIN unconditionally because they cannot know
+ * per query that the reference is mandatory.  Reducing to an inner join lets
+ * the planner drive the scan from the referenced side's index, which in turn
+ * makes ORDER BY ... LIMIT over the join stop early instead of sorting the
+ * entire join output.
+ *
+ * We insist on all of the following; each one is load-bearing:
+ *
+ *	- The nullable side is a single ordinary relation scanned in full.  Row
+ *	  level security or TABLESAMPLE could hide the referenced row, and an
+ *	  inheritance parent's children need not carry the referenced key.
+ *	- The join qual is exactly the FK's column equalities, using the FK's own
+ *	  equality operators, with no additional clauses.  Any extra qual -- on
+ *	  either side -- can reject the matching row and so reintroduce a
+ *	  null-extended row that an inner join would not produce.
+ *	- Every referencing column is NOT NULL.  Under MATCH SIMPLE a NULL in any
+ *	  FK column satisfies the constraint with no referenced row present.
+ *	- The referencing relation is not itself nullable by a lower outer join,
+ *	  which would let those NOT NULL columns read as NULL.
+ *	- The constraint is enforced and validated, and is NOT deferrable.  A
+ *	  deferred constraint may legally be violated in mid-transaction, which is
+ *	  precisely when the two join types would disagree.
+ */
+static bool
+fkey_proves_inner_join(PlannerInfo *root, JoinExpr *j, Node *innernode,
+					   reduce_outer_joins_pass1_state *outer_state,
+					   reduce_outer_joins_pass1_state *inner_state,
+					   List *forced_null_vars)
+{
+	Query	   *parse = root->parse;
+	RangeTblEntry *innerrte;
+	RangeTblEntry *outerrte;
+	int			innerrelid;
+	int			outerrelid = -1;
+	List	   *clauses;
+	ListCell   *lc;
+	Relation	rel;
+	bool		result = false;
+	int			nclauses;
+	AttrNumber	fkattnos[INDEX_MAX_KEYS];
+	AttrNumber	pkattnos[INDEX_MAX_KEYS];
+	Oid			eqopnos[INDEX_MAX_KEYS];
+
+	if (!dbblue_enable_fk_join_reduction)
+		return false;
+
+	/*
+	 * Referential integrity is enforced by triggers, so it is only as true as
+	 * those triggers.  In replica mode they do not fire at all, which is how a
+	 * logical replication subscriber applies changes, so a foreign key there
+	 * certifies nothing about the data.  Do not reason from one.
+	 */
+	if (SessionReplicationRole != SESSION_REPLICATION_ROLE_ORIGIN)
+		return false;
+
+	/*
+	 * If an upper qual forces a Var of the nullable side to be NULL, the query
+	 * is asking for the rows that did NOT match, and reduce_outer_joins_pass2
+	 * may be about to convert this join to an anti-join.  Never pre-empt that
+	 * with an inner join: an anti-join examines the data, whereas an inner
+	 * join lets the upper IS NULL qual const-fold to false.
+	 *
+	 * This is not merely a lost optimization.  RI_Initial_Check() validates a
+	 * foreign key with exactly this shape -- LEFT JOIN the referenced table,
+	 * WHERE referenced key IS NULL -- so reducing here would let the
+	 * constraint prove itself, and ALTER TABLE ... ADD FOREIGN KEY would
+	 * accept rows that violate it.  It is also the shape any user writes to
+	 * look for orphaned rows, which must keep reporting the truth.
+	 */
+	if (forced_null_vars != NIL)
+	{
+		int			varno = -1;
+
+		foreach_node(Bitmapset, attrs, forced_null_vars)
+		{
+			varno++;
+			if (bms_is_empty(attrs))
+				continue;
+			if (bms_is_member(varno, inner_state->relids))
+				return false;
+		}
+	}
+
+	/*
+	 * The nullable side must be a bare relation reference.  Testing the relid
+	 * set is not enough: pull_up_subqueries() splices a pulled-up subquery's
+	 * whole FromExpr in here, quals included, and remove_useless_result_rtes()
+	 * does not run until after us.  Such a qual sits below the join where we
+	 * never look at it, yet it can reject the row the foreign key promises and
+	 * so null-extend after all.
+	 */
+	if (!IsA(innernode, RangeTblRef))
+		return false;
+	innerrelid = ((RangeTblRef *) innernode)->rtindex;
+	Assert(bms_is_member(innerrelid, inner_state->relids));
+	if (bms_membership(inner_state->relids) != BMS_SINGLETON)
+		return false;
+	innerrte = rt_fetch(innerrelid, parse->rtable);
+	if (innerrte->rtekind != RTE_RELATION)
+		return false;
+
+	/*
+	 * The referenced row has to be somewhere the scan will actually read.
+	 *
+	 * For a partitioned table the rows live in its partitions, so the RTE must
+	 * be expanding to them: ONLY on a partitioned table (or one with no
+	 * partitions at all) reads no storage whatsoever, which would turn every
+	 * row into a null-extended one -- reducing then drops the entire result.
+	 * For a plain table the opposite holds: an inheritance parent's children
+	 * need not carry the referenced key, so it must not be expanding.
+	 */
+	if (innerrte->relkind == RELKIND_PARTITIONED_TABLE)
+	{
+		if (!innerrte->inh)
+			return false;
+	}
+	else if (innerrte->relkind == RELKIND_RELATION)
+	{
+		if (innerrte->inh)
+			return false;
+	}
+	else
+		return false;
+
+	/* A policy or sample could hide the row the FK promises us. */
+	if (innerrte->securityQuals != NIL || innerrte->tablesample != NULL)
+		return false;
+
+	/*
+	 * If nothing outside this join's own condition uses the nullable side, the
+	 * join can be removed outright rather than reduced, which is strictly
+	 * better.  Leave it alone and let remove_useless_joins() have it.
+	 */
+	if (!fkey_nullable_side_is_referenced(root, j, innerrelid))
+		return false;
+
+	/* The ON clause must be a plain conjunction of Var = Var. */
+	if (j->quals == NULL)
+		return false;
+	/*
+	 * By this point preprocess_qual_conditions() has put the quals into
+	 * implicit-AND list format, but cope with a bare expression too.
+	 */
+	if (IsA(j->quals, List))
+		clauses = (List *) j->quals;
+	else
+		clauses = make_ands_implicit((Expr *) j->quals);
+	nclauses = list_length(clauses);
+	if (nclauses == 0 || nclauses > INDEX_MAX_KEYS)
+		return false;
+
+	foreach(lc, clauses)
+	{
+		OpExpr	   *op = (OpExpr *) lfirst(lc);
+		Var		   *lvar;
+		Var		   *rvar;
+		Var		   *fkvar;
+		Var		   *pkvar;
+		int			i = foreach_current_index(lc);
+
+		if (!IsA(op, OpExpr) || list_length(op->args) != 2)
+			return false;
+		lvar = (Var *) linitial(op->args);
+		rvar = (Var *) lsecond(op->args);
+		if (!IsA(lvar, Var) || !IsA(rvar, Var))
+			return false;
+		if (lvar->varlevelsup != 0 || rvar->varlevelsup != 0)
+			return false;
+
+		/*
+		 * A Var nulled by a lower outer join can read NULL regardless of any
+		 * NOT NULL constraint, so neither side may carry nullingrels.
+		 */
+		if (!bms_is_empty(lvar->varnullingrels) ||
+			!bms_is_empty(rvar->varnullingrels))
+			return false;
+
+		/* Orient the clause: exactly one side is the nullable relation. */
+		if (lvar->varno == innerrelid && rvar->varno != innerrelid)
+		{
+			pkvar = lvar;
+			fkvar = rvar;
+		}
+		else if (rvar->varno == innerrelid && lvar->varno != innerrelid)
+		{
+			pkvar = rvar;
+			fkvar = lvar;
+		}
+		else
+			return false;
+
+		/* All referencing columns must come from one preserved-side rel. */
+		if (outerrelid < 0)
+		{
+			outerrelid = fkvar->varno;
+			if (!bms_is_member(outerrelid, outer_state->relids))
+				return false;
+			if (bms_is_member(outerrelid, outer_state->nullable_rels))
+				return false;
+		}
+		else if (fkvar->varno != outerrelid)
+			return false;
+
+		/* Whole-row and system columns are not FK material. */
+		if (fkvar->varattno <= 0 || pkvar->varattno <= 0)
+			return false;
+
+		fkattnos[i] = fkvar->varattno;
+		pkattnos[i] = pkvar->varattno;
+		eqopnos[i] = op->opno;
+	}
+
+	Assert(outerrelid > 0);
+	outerrte = rt_fetch(outerrelid, parse->rtable);
+	if (outerrte->rtekind != RTE_RELATION)
+		return false;
+	/* An inheritance parent's children need not carry the FK constraint. */
+	if (outerrte->inh && outerrte->relkind != RELKIND_PARTITIONED_TABLE)
+		return false;
+
+	/*
+	 * Look for a foreign key on the referencing relation that matches the
+	 * join clause exactly.  The relation is already locked -- every relation
+	 * RTE was opened by preprocess_relation_rtes() earlier in planning.
+	 */
+	rel = table_open(outerrte->relid, NoLock);
+
+	foreach(lc, RelationGetFKeyList(rel))
+	{
+		ForeignKeyCacheInfo *fk = (ForeignKeyCacheInfo *) lfirst(lc);
+		HeapTuple	tup;
+		Form_pg_constraint con;
+		Bitmapset  *notnullatts;
+		bool		matched[INDEX_MAX_KEYS];
+		bool		ok;
+
+		if (fk->confrelid != innerrte->relid || fk->nkeys != nclauses)
+			continue;
+		if (!fk->conenforced)
+			continue;
+
+		/* NOT VALID proves nothing; DEFERRABLE may be violated right now. */
+		tup = SearchSysCache1(CONSTROID, ObjectIdGetDatum(fk->conoid));
+		if (!HeapTupleIsValid(tup))
+			continue;
+		con = (Form_pg_constraint) GETSTRUCT(tup);
+		ok = con->convalidated && !con->condeferrable;
+
+		/*
+		 * Skip a constraint cloned down to a partition.  Such a clone
+		 * constrains only its own partition's rows, and may reference a single
+		 * leaf of the referenced side, so it is not a statement about either
+		 * table as a whole.  Only a constraint declared in its own right is.
+		 */
+		if (OidIsValid(con->conparentid))
+			ok = false;
+
+		/*
+		 * MATCH PARTIAL is not implemented by PostgreSQL, and any future match
+		 * type would need its own analysis, so accept only the two we reasoned
+		 * about.  (Under MATCH FULL the NOT NULL requirement below still does
+		 * the necessary work.)
+		 */
+		if (con->confmatchtype != FKCONSTR_MATCH_SIMPLE &&
+			con->confmatchtype != FKCONSTR_MATCH_FULL)
+			ok = false;
+
+		/*
+		 * The catalog says integrity checking is armed; it cannot say the data
+		 * satisfies it.  Require someone to have accepted responsibility for
+		 * this particular constraint.
+		 */
+		if (ok && !DbblueFkeyIsTrusted(fk->conoid, con->conrelid,
+									   NameStr(con->conname)))
+			ok = false;
+
+		ReleaseSysCache(tup);
+		if (!ok)
+			continue;
+
+		/*
+		 * Even a trusted constraint is not being enforced right now if its own
+		 * RI triggers are switched off, so anything written in this window can
+		 * violate it.  Refuse while that is the case.
+		 */
+		if (fkey_triggers_disabled(fk->conoid))
+			continue;
+
+		/* Every referencing column must be NOT NULL. */
+		notnullatts = find_relation_notnullatts(root, outerrte->relid);
+		for (int k = 0; k < fk->nkeys; k++)
+		{
+			if (!bms_is_member(fk->conkey[k], notnullatts))
+			{
+				ok = false;
+				break;
+			}
+		}
+		if (!ok)
+			continue;
+
+		/*
+		 * Pair every join clause with a distinct FK column, matching the
+		 * operator too.  Requiring a perfect one-to-one cover is what rules
+		 * out extra quals and repeated columns.
+		 */
+		memset(matched, 0, sizeof(matched));
+		for (int c = 0; c < nclauses; c++)
+		{
+			bool		found = false;
+
+			for (int k = 0; k < fk->nkeys; k++)
+			{
+				if (matched[k])
+					continue;
+				if (fk->conkey[k] == fkattnos[c] &&
+					fk->confkey[k] == pkattnos[c] &&
+					fk->conpfeqop[k] == eqopnos[c])
+				{
+					matched[k] = true;
+					found = true;
+					break;
+				}
+			}
+			if (!found)
+			{
+				ok = false;
+				break;
+			}
+		}
+
+		if (ok)
+		{
+			result = true;
+			break;
+		}
+	}
+
+	table_close(rel, NoLock);
+
+	return result;
 }
 
 

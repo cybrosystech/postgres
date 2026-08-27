@@ -1,0 +1,167 @@
+/*-------------------------------------------------------------------------
+ *
+ * matview_incr.h
+ *	  DBblue: incremental refresh for materialized views
+ *
+ * src/include/commands/matview_incr.h
+ *
+ *-------------------------------------------------------------------------
+ */
+#ifndef MATVIEW_INCR_H
+#define MATVIEW_INCR_H
+
+#include "fmgr.h"
+#include "nodes/parsenodes.h"
+#include "utils/relcache.h"
+
+/*
+ * GUC: when on, the plain single-table aggregate delta SQL is produced by the
+ * Query-tree deparse core (incr_build_delta_select_query + dbblue_deparse_query)
+ * instead of the hand-written string builders.  Default off; the two paths are
+ * proven equivalent by the dbblue_ivm suite run with this on and off.
+ */
+extern PGDLLIMPORT bool dbblue_ivm_deparse_delta;
+extern PGDLLIMPORT double dbblue_ivm_refresh_threshold;
+
+/*
+ * Hidden column names / prefixes used by the incremental refresh engine.
+ *
+ * __mv_count__          — source-row count per group (group is deleted when 0)
+ * __mv_avgsum_<col>__   — running SUM for an AVG output column named <col>
+ * __mv_avgcnt_<col>__   — running COUNT(x) for the same AVG column
+ *
+ * The avg / avgsum / avgcnt triple lets us maintain AVG incrementally:
+ *   visible_avg = running_sum / running_cnt   (recomputed after each delta)
+ */
+#define MATVIEW_INCR_COUNT_COL		"__mv_count__"
+#define MATVIEW_INCR_AVGSUM_PREFIX	"__mv_avgsum_"
+#define MATVIEW_INCR_AVGCNT_PREFIX	"__mv_avgcnt_"
+/*
+ * __mv_sumcnt_<col>__ — running COUNT(x) of non-NULL inputs to a SUM(x) output
+ * column named <col>.  Lets SUM show SQL-exact NULL (not 0) once a group's last
+ * non-NULL input is removed: visible_sum = (sumcnt = 0 ? NULL : running_sum).
+ * Maintained by the shared shells (single-table/INNER JOIN aggregates, DISTINCT,
+ * HAVING) and by the MIN/MAX builders (which keep SUM on delta arithmetic and
+ * use the counter only for display).  Self-joins skip it — their recompute path
+ * derives SUM directly, so an emptied non-NULL set already yields NULL.
+ */
+#define MATVIEW_INCR_SUMCNT_PREFIX	"__mv_sumcnt_"
+
+/*
+ * Hidden boolean column that tracks whether each group currently satisfies
+ * the HAVING condition.  Set to true on INSERT (new groups always start
+ * passing), then recomputed after every delta by the hav_sql step.
+ * Groups with __mv_having_ok__ = false are kept alive so their running
+ * totals survive until they pass HAVING again; a VIEW over the base table
+ * exposes only the passing rows to the user.
+ */
+#define MATVIEW_INCR_HAVING_COL		"__mv_having_ok__"
+
+/*
+ * Transition-table aliases used in the internal triggers.
+ * Must match the names embedded in the stored delta SQL.
+ */
+#define MATVIEW_INCR_NEWTABLE	"__mv_newtable"
+#define MATVIEW_INCR_OLDTABLE	"__mv_oldtable"
+
+/* OID of the matview_delta_apply trigger function (from pg_proc.dat) */
+#define MATVIEW_DELTA_APPLY_OID		8335
+
+/*
+ * Set up incremental refresh for a newly created matview.
+ * Called from ExecCreateTableAs after the matview is created and populated.
+ * __mv_count__ must already be present (injected by MatviewIncrAddCountTarget).
+ */
+extern void MatviewIncrSetup(Oid mvrelid, Query *viewQuery);
+
+/* Remove incremental-refresh infrastructure when a matview is dropped. */
+extern void MatviewIncrTeardown(Oid mvrelid);
+
+/*
+ * Raise an error if (relid, attnum) is a column used by an incremental
+ * materialized view.  Called from the column-rename path: the stored delta SQL
+ * is text keyed by column name, so a rename would break it; we refuse early
+ * with a clear message rather than fail later on the next write.
+ */
+extern void MatviewIncrCheckColumnRename(Oid relid, int attnum);
+
+/*
+ * Run one-time hidden-state backfills (HAVING failing-group seeding, UNION ALL
+ * dedup) after an incremental matview is populated by a full REFRESH.  Called
+ * from the REFRESH path; re-arms incremental maintenance for HAVING/UNION ALL
+ * matviews across a pg_dump/restore cycle.  No-op for non-incremental matviews
+ * and for plain single-table / JOIN aggregates.
+ */
+extern void MatviewIncrPostRefresh(Oid mvrelid, Query *viewQuery);
+
+/*
+ * Return true if incremental-refresh infrastructure (catalog rows) already
+ * exists for this matview.  Used by ExecCreateTableAs to make setup idempotent
+ * on the WITH NO DATA path that pg_dump/restore takes — the reloption is
+ * present but the triggers/catalog are not, and must be re-established.
+ */
+extern bool MatviewIncrIsSetUp(Oid mvrelid);
+
+/*
+ * Check whether the given Query is eligible for incremental refresh.
+ * Returns true if eligible; sets *reason to a human-readable explanation
+ * if not.
+ */
+extern bool MatviewIncrIsEligible(Query *viewQuery, const char **reason);
+
+/*
+ * Overlay/peel: split a view whose only blockers are non-immutable SELECT-list
+ * projections into a maintainable CORE query (returned) plus a read-time overlay
+ * view.  Returns true and sets *core_out when the peel applies; the original
+ * (pre-peel) query is handed to MatviewIncrSetOverlayOriginal so setup can build
+ * the overlay view after the core matview is renamed to its base name.
+ */
+extern bool MatviewIncrPeelProjection(Query *viewQuery, Query **core_out,
+									  const char **reason);
+extern void MatviewIncrSetOverlayOriginal(Query *original);
+
+/*
+ * Opt-in toggle consulted by MatviewIncrIsEligible: when true, a STABLE GROUP BY
+ * key expression is accepted (documented staleness on TimeZone/lc_time change
+ * until the next REFRESH) instead of rejected.  Set from the matview's
+ * allow_stable_keys reloption before each eligibility check.
+ */
+extern void MatviewIncrSetAllowStableKeys(bool allow);
+
+/*
+ * Append COUNT(*) AS __mv_count__ to q->targetList.
+ * Must be called for both the schema query and the view-definition query
+ * before the matview is created.
+ */
+extern void MatviewIncrAddCountTarget(Query *q);
+
+/*
+ * Rewrite  agg(x) FILTER (WHERE c)  ->  agg(CASE WHEN c THEN x END)  (SUM/COUNT/
+ * AVG) in place, across the SELECT list and HAVING, so the deparse delta core
+ * maintains FILTER with no delta-builder changes.  Call on both the schema and
+ * view queries, before eligibility and MatviewIncrAddCountTarget.
+ */
+extern void MatviewIncrRewriteAggFilters(Query *q);
+
+/*
+ * Inject "<key> IS NOT NULL" into the view query's WHERE for every nullable
+ * GROUP BY / DISTINCT key, so NULL-key rows stay outside the matview (writes
+ * are never blocked, and the matview stays consistent with a full REFRESH).
+ * Returns the list of filtered key column names (for a NOTICE), or NIL.
+ * Call before MatviewIncrAddCountTarget, on both the schema and view queries.
+ */
+extern List *MatviewIncrAddNotNullKeyFilters(Query *q);
+
+/*
+ * Normalize a view query by inlining CTEs and FROM-subqueries that can
+ * be resolved to forms the incremental refresh engine supports.
+ * Returns a new Query* if any transformation was applied, or viewQuery
+ * itself if nothing changed.
+ */
+extern Query *MatviewIncrNormalize(Query *viewQuery);
+extern void MatviewIncrConstFoldSublinks(Query *q);
+
+/* Trigger function — registered in pg_proc as matview_delta_apply */
+extern Datum matview_delta_apply(PG_FUNCTION_ARGS);
+
+#endif							/* MATVIEW_INCR_H */

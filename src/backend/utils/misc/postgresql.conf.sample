@@ -423,6 +423,7 @@
 
 # - Planner Method Configuration -
 
+#dbblue_enable_fk_join_reduction = on
 #enable_async_append = on
 #enable_bitmapscan = on
 #enable_gathermerge = on

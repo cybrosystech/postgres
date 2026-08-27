@@ -30,6 +30,8 @@ backend_sources += files(
   'indexcmds.c',
   'lockcmds.c',
   'matview.c',
+  'matview_dirty.c',
+  'matview_incr.c',
   'opclasscmds.c',
   'operatorcmds.c',
   'policy.c',

@@ -60,6 +60,8 @@
 #include "rewrite/rewriteManip.h"
 #include "utils/acl.h"
 #include "utils/backend_status.h"
+#include "utils/dbblue_countcache.h"
+#include "utils/dbblue_predfingerprint.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/selfuncs.h"
@@ -69,6 +71,7 @@ double		cursor_tuple_fraction = DEFAULT_CURSOR_TUPLE_FRACTION;
 int			debug_parallel_query = DEBUG_PARALLEL_OFF;
 bool		parallel_leader_participation = true;
 bool		enable_distinct_reordering = true;
+bool		dbblue_offset_flip = false; /* enable offset-flip planner rewrite */
 
 /* Hook for plugins to get control in planner() */
 planner_hook_type planner_hook = NULL;
@@ -342,6 +345,53 @@ planner(Query *parse, const char *query_string, int cursorOptions,
 	return result;
 }
 
+/*
+ * dbblue_extract_offset_int64 -- read INT4 or INT8 Const as int64.
+ * Returns -1 (caller treats as "unusable") on NULL or unknown type.
+ */
+static int64
+dbblue_extract_offset_int64(Node *node)
+{
+	Const	   *c;
+
+	if (node == NULL || !IsA(node, Const))
+		return -1;
+	c = (Const *) node;
+	if (c->constisnull)
+		return -1;
+	if (c->consttype == INT8OID)
+		return DatumGetInt64(c->constvalue);
+	if (c->consttype == INT4OID)
+		return (int64) DatumGetInt32(c->constvalue);
+	return -1;
+}
+
+/*
+ * dbblue_flip_sortclauses -- return a copy of sortcls with every
+ * sort operator replaced by its commutator and nulls_first toggled.
+ * This converts ORDER BY col ASC NULLS LAST to DESC NULLS FIRST, etc.
+ */
+static List *
+dbblue_flip_sortclauses(List *sortcls)
+{
+	List	   *result = NIL;
+	ListCell   *lc;
+
+	foreach(lc, sortcls)
+	{
+		SortGroupClause *sgc = copyObject(lfirst(lc));
+		Oid			rev = get_commutator(sgc->sortop);
+
+		if (!OidIsValid(rev))
+			return NIL;			/* can't flip; signal caller to abort */
+		sgc->sortop = rev;
+		sgc->reverse_sort = !sgc->reverse_sort;
+		sgc->nulls_first = !sgc->nulls_first;
+		result = lappend(result, sgc);
+	}
+	return result;
+}
+
 PlannedStmt *
 standard_planner(Query *parse, const char *query_string, int cursorOptions,
 				 ParamListInfo boundParams, ExplainState *es)
@@ -356,6 +406,11 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 	ListCell   *lp,
 			   *lr,
 			   *lc;
+	/* DBblue Phase 4: offset-flip state */
+	int64		dbblue_fp = INT64CONST(0);
+	Oid			dbblue_reloid = InvalidOid;
+	List	   *dbblue_orig_sortclause = NIL;
+	bool		dbblue_did_flip = false;
 
 	/*
 	 * Set up global state for this planner invocation.  This data is needed
@@ -528,6 +583,116 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 		(*planner_setup_hook) (glob, parse, query_string, cursorOptions,
 							   &tuple_fraction, es);
 
+	/*
+	 * DBblue Phase 4: offset-flip pre-planning rewrite.
+	 *
+	 * When Odoo's paginated SELECT has a large OFFSET K on a table whose
+	 * total row count N is already cached from the leading COUNT query in
+	 * the same request, and K > N/2, rewriting to OFFSET (N-K-L) with
+	 * flipped sort directions lets the planner use the "cheap end" of the
+	 * index.  We wrap the resulting plan with an outer Sort to restore the
+	 * original order for the small result set (≤ L rows).
+	 *
+	 * This block also computes dbblue_fp / dbblue_reloid for all
+	 * single-table SELECTs with non-trivial quals so that the PlannedStmt
+	 * is stamped for the COUNT-capture path even when no flip fires.
+	 */
+	if (parse->commandType == CMD_SELECT &&
+		list_length(parse->rtable) == 1 &&
+		parse->jointree != NULL &&
+		parse->jointree->quals != NULL)
+	{
+		RangeTblEntry *rte = linitial_node(RangeTblEntry, parse->rtable);
+
+		if (rte->rtekind == RTE_RELATION && OidIsValid(rte->relid))
+		{
+			int64		fp = dbblue_predicate_fingerprint(rte->relid,
+														  parse->jointree->quals);
+
+			if (fp != INT64CONST(0))
+			{
+				dbblue_fp = fp;
+				dbblue_reloid = rte->relid;
+
+				/* Try the offset-flip only when GUC enabled + sort + const OFFSET/LIMIT */
+				if (dbblue_offset_flip &&
+					parse->sortClause != NIL &&
+					parse->limitOffset != NULL &&
+					parse->limitCount != NULL)
+				{
+					/*
+					 * OFFSET/LIMIT are typically an int4 literal wrapped in
+					 * an int4→int8 cast at this point (eval_const_expressions
+					 * runs later inside subquery_planner).  Fold now so that
+					 * dbblue_extract_offset_int64 sees a plain Const.
+					 */
+					Node	   *folded_off =
+						eval_const_expressions(NULL, parse->limitOffset);
+					Node	   *folded_lim =
+						eval_const_expressions(NULL, parse->limitCount);
+					int64		K = dbblue_extract_offset_int64(folded_off);
+					int64		L = dbblue_extract_offset_int64(folded_lim);
+
+					if (K > 0 && L > 0)
+					{
+						const CountCacheEntry *ce =
+							dbblue_countcache_lookup(dbblue_reloid, dbblue_fp);
+
+						if (ce != NULL)
+						{
+							int64		N = ce->count;
+							int64		new_off = N - K - L;
+
+							/*
+							 * Flip when K is past the midpoint and there are
+							 * rows left to return (K < N).  When new_off < 0
+							 * we are on the last partial page: use OFFSET 0
+							 * with LIMIT clamped to the actual remaining rows
+							 * (N - K) so the reversed scan fetches exactly
+							 * the right tuples.
+							 */
+							if (K > N / 2 && K < N)
+							{
+								List	   *flipped =
+									dbblue_flip_sortclauses(parse->sortClause);
+
+								if (flipped != NIL)
+								{
+									int64		actual_off = (new_off >= 0) ? new_off : INT64CONST(0);
+									int64		actual_lim = (new_off >= 0) ? L : (N - K);
+
+									dbblue_orig_sortclause = parse->sortClause;
+									parse->sortClause = flipped;
+									parse->limitOffset =
+										(Node *) makeConst(INT8OID, -1,
+														   InvalidOid,
+														   sizeof(int64),
+														   Int64GetDatum(actual_off),
+														   false, true);
+									if (new_off < 0)
+										parse->limitCount =
+											(Node *) makeConst(INT8OID, -1,
+															   InvalidOid,
+															   sizeof(int64),
+															   Int64GetDatum(actual_lim),
+															   false, true);
+									dbblue_did_flip = true;
+									ereport(DEBUG1,
+											(errmsg("dbblue offset-flip: rel=%s N=%lld K=%lld L=%lld new_off=%lld",
+													get_rel_name(dbblue_reloid),
+													(long long) N,
+													(long long) K,
+													(long long) L,
+													(long long) actual_off)));
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
 	/* primary planning entry point (may recurse for subqueries) */
 	root = subquery_planner(glob, parse, NULL, NULL, NULL, false,
 							tuple_fraction, NULL);
@@ -537,6 +702,16 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 	best_path = get_cheapest_fractional_path(final_rel, tuple_fraction);
 
 	top_plan = create_plan(root, best_path);
+
+	/*
+	 * DBblue Phase 4: if we flipped the sort direction to reach the cheap
+	 * end of the index, wrap with an outer Sort that restores the original
+	 * order.  At this point top_plan delivers at most LIMIT rows, so the
+	 * Sort is essentially free.
+	 */
+	if (dbblue_did_flip)
+		top_plan = (Plan *) make_sort_from_sortclauses(dbblue_orig_sortclause,
+													   top_plan);
 
 	/*
 	 * If creating a plan for a scrollable cursor, make sure it can run
@@ -719,6 +894,10 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 		if (jit_tuple_deforming)
 			result->jitFlags |= PGJIT_DEFORM;
 	}
+
+	/* DBblue: stamp fingerprint computed above (or zero if non-candidate). */
+	result->dbblue_pred_fingerprint = dbblue_fp;
+	result->dbblue_pred_reloid = dbblue_reloid;
 
 	/* Allow plugins to take control before we discard "glob" */
 	if (planner_shutdown_hook)
@@ -7946,6 +8125,18 @@ create_partial_grouping_paths(PlannerInfo *root,
 										 input_rel, partially_grouped_rel,
 										 extra);
 	}
+
+	/*
+	 * Let extensions possibly add partially grouped paths (e.g. a custom-scan
+	 * provider that aggregates in parallel and emits partial transition
+	 * states).  This mirrors the UPPERREL_GROUP_AGG hook and the FDW seam just
+	 * above; it fires before the caller's gather_grouping_paths(), so a partial
+	 * path added here is Gathered and topped with a Finalize Aggregate by core.
+	 */
+	if (create_upper_paths_hook)
+		(*create_upper_paths_hook) (root, UPPERREL_PARTIAL_GROUP_AGG,
+									input_rel, partially_grouped_rel,
+									extra);
 
 	return partially_grouped_rel;
 }

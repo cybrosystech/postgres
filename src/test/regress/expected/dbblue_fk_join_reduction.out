@@ -1,0 +1,420 @@
+--
+-- DBBLUE_FK_JOIN_REDUCTION
+--
+-- Reducing an outer join to an inner join when a mandatory foreign key proves
+-- that every preserved-side row has exactly one match on the nullable side.
+--
+-- Each case checks two things: whether the reduction fired, and that the outer
+-- join still returns exactly what an outer join must.  A reduction that fires
+-- when it may not shows up as a row-count difference against the inner join.
+--
+-- Report whether the top join was reduced, without depending on plan shape.
+create function fk_plan_kind(q text) returns text language plpgsql as $$
+declare ln text;
+begin
+  for ln in execute 'explain (costs off) ' || q loop
+    if ln ~ 'Full Join' then return 'FULL (not reduced)'; end if;
+    if ln ~ 'Anti Join' then return 'ANTI (not reduced)'; end if;
+    if ln ~ 'Semi Join' then return 'SEMI (not reduced)'; end if;
+    if ln ~ 'Left Join' then return 'LEFT (not reduced)'; end if;
+    if ln ~ 'Right Join' then return 'RIGHT (not reduced)'; end if;
+    if ln ~ '(Hash|Merge|Nested Loop)' then return 'INNER (reduced)'; end if;
+  end loop;
+  return 'no join';
+end $$;
+-- The reduction applies only to constraints explicitly declared trustworthy,
+-- so each test grants trust after any constraint change.  A grant is reported
+-- as "trusted (verified)" only when scanning the data found no violating row.
+set dbblue_enable_fk_join_reduction = on;
+create table fkr_p (id int primary key, v int);
+create table fkr_c (id int primary key, pid int not null references fkr_p(id),
+                    tag text);
+insert into fkr_p select g, g * 10 from generate_series(1, 20) g;
+insert into fkr_c select g, 1 + (g % 20), 't' || g from generate_series(1, 60) g;
+analyze fkr_p, fkr_c;
+select action from dbblue_trust_foreign_keys('fkr_c'::regclass);
+       action       
+--------------------
+ trusted (verified)
+(1 row)
+
+-- mandatory FK: reduces, and the two join types agree
+select fk_plan_kind('select c.id, p.v from fkr_c c left join fkr_p p on c.pid = p.id') as plan,
+       (select count(*) from fkr_c c left join fkr_p p on c.pid = p.id) as outer_rows,
+       (select count(*) from fkr_c c join fkr_p p on c.pid = p.id) as inner_rows;
+      plan       | outer_rows | inner_rows 
+-----------------+------------+------------
+ INNER (reduced) |         60 |         60
+(1 row)
+
+-- the GUC turns it off
+set dbblue_enable_fk_join_reduction = off;
+select fk_plan_kind('select c.id, p.v from fkr_c c left join fkr_p p on c.pid = p.id') as plan;
+        plan        
+--------------------
+ LEFT (not reduced)
+(1 row)
+
+set dbblue_enable_fk_join_reduction = on;
+-- An upper qual forcing a nullable-side Var to NULL asks for the rows that did
+-- NOT match, so the join must not become inner.  RI_Initial_Check() validates a
+-- foreign key with exactly this shape, so reducing here would let a constraint
+-- prove itself valid; it is also how users look for orphaned rows.
+select fk_plan_kind('select c.id from fkr_c c left join fkr_p p on c.pid = p.id where p.id is null') as plan;
+        plan        
+--------------------
+ ANTI (not reduced)
+(1 row)
+
+-- ... so adding a foreign key over data that violates it must still fail
+create table fkr_bad_p (id int primary key);
+create table fkr_bad_c (id int primary key, pid int not null);
+insert into fkr_bad_p values (1);
+insert into fkr_bad_c values (10, 1), (11, 999);
+alter table fkr_bad_c add constraint fkr_bad_fk
+  foreign key (pid) references fkr_bad_p(id);
+ERROR:  insert or update on table "fkr_bad_c" violates foreign key constraint "fkr_bad_fk"
+DETAIL:  Key (pid)=(999) is not present in table "fkr_bad_p".
+-- and validating one separately must still fail
+alter table fkr_bad_c add constraint fkr_bad_fk2
+  foreign key (pid) references fkr_bad_p(id) not valid;
+alter table fkr_bad_c validate constraint fkr_bad_fk2;
+ERROR:  insert or update on table "fkr_bad_c" violates foreign key constraint "fkr_bad_fk2"
+DETAIL:  Key (pid)=(999) is not present in table "fkr_bad_p".
+drop table fkr_bad_c, fkr_bad_p;
+-- RIGHT JOIN is the mirror image and also reduces
+select fk_plan_kind('select c.id, p.v from fkr_p p right join fkr_c c on c.pid = p.id') as plan,
+       (select count(*) from fkr_p p right join fkr_c c on c.pid = p.id) as outer_rows,
+       (select count(*) from fkr_p p join fkr_c c on c.pid = p.id) as inner_rows;
+      plan       | outer_rows | inner_rows 
+-----------------+------------+------------
+ INNER (reduced) |         60 |         60
+(1 row)
+
+-- FULL JOIN cannot be reduced: both sides are nullable
+select fk_plan_kind('select c.id, p.v from fkr_c c full join fkr_p p on c.pid = p.id') as plan;
+        plan        
+--------------------
+ FULL (not reduced)
+(1 row)
+
+-- a nullable FK column proves nothing: a NULL satisfies MATCH SIMPLE with no
+-- referenced row present
+alter table fkr_c alter column pid drop not null;
+insert into fkr_c values (9001, null, 'null-fk');
+analyze fkr_c;
+select fk_plan_kind('select c.id, p.v from fkr_c c left join fkr_p p on c.pid = p.id') as plan,
+       (select count(*) from fkr_c c left join fkr_p p on c.pid = p.id) as outer_rows,
+       (select count(*) from fkr_c c join fkr_p p on c.pid = p.id) as inner_rows;
+        plan        | outer_rows | inner_rows 
+--------------------+------------+------------
+ LEFT (not reduced) |         61 |         60
+(1 row)
+
+delete from fkr_c where id = 9001;
+alter table fkr_c alter column pid set not null;
+-- no FK at all
+alter table fkr_c drop constraint fkr_c_pid_fkey;
+select fk_plan_kind('select c.id, p.v from fkr_c c left join fkr_p p on c.pid = p.id') as plan;
+        plan        
+--------------------
+ LEFT (not reduced)
+(1 row)
+
+-- A NOT VALID FK was never checked, so it proves nothing.  The data here is
+-- clean and trust is granted, isolating convalidated as the sole reason.
+alter table fkr_c add constraint fkr_c_pid_fkey foreign key (pid)
+  references fkr_p(id) not valid;
+analyze fkr_c;
+select action from dbblue_trust_foreign_keys('fkr_c'::regclass);
+       action       
+--------------------
+ trusted (verified)
+(1 row)
+
+select fk_plan_kind('select c.id, p.v from fkr_c c left join fkr_p p on c.pid = p.id') as plan;
+        plan        
+--------------------
+ LEFT (not reduced)
+(1 row)
+
+alter table fkr_c drop constraint fkr_c_pid_fkey;
+-- a DEFERRABLE FK may legally be violated in mid-transaction, which is exactly
+-- where the two join types diverge, so it must not be trusted
+alter table fkr_c add constraint fkr_c_pid_fkey foreign key (pid)
+  references fkr_p(id) deferrable initially deferred;
+analyze fkr_c;
+select action from dbblue_trust_foreign_keys('fkr_c'::regclass);
+       action       
+--------------------
+ trusted (verified)
+(1 row)
+
+select fk_plan_kind('select c.id, p.v from fkr_c c left join fkr_p p on c.pid = p.id') as plan;
+        plan        
+--------------------
+ LEFT (not reduced)
+(1 row)
+
+begin;
+  insert into fkr_c values (9003, 4242, 'deferred-orphan');
+  select count(*) as outer_rows from fkr_c c left join fkr_p p on c.pid = p.id;
+ outer_rows 
+------------
+         61
+(1 row)
+
+  select count(*) as inner_rows from fkr_c c join fkr_p p on c.pid = p.id;
+ inner_rows 
+------------
+         60
+(1 row)
+
+rollback;
+alter table fkr_c drop constraint fkr_c_pid_fkey;
+alter table fkr_c add constraint fkr_c_pid_fkey foreign key (pid)
+  references fkr_p(id);
+select action from dbblue_trust_foreign_keys('fkr_c'::regclass);
+       action       
+--------------------
+ trusted (verified)
+(1 row)
+
+-- any extra ON qual can reject the matching row, on either side
+select fk_plan_kind('select c.id, p.v from fkr_c c left join fkr_p p on c.pid = p.id and p.v > 100') as plan,
+       (select count(*) from fkr_c c left join fkr_p p on c.pid = p.id and p.v > 100) as outer_rows,
+       (select count(*) from fkr_c c join fkr_p p on c.pid = p.id and p.v > 100) as inner_rows;
+        plan        | outer_rows | inner_rows 
+--------------------+------------+------------
+ LEFT (not reduced) |         60 |         30
+(1 row)
+
+select fk_plan_kind($$select c.id, p.v from fkr_c c left join fkr_p p on c.pid = p.id and c.tag = 't5'$$) as plan,
+       (select count(*) from fkr_c c left join fkr_p p on c.pid = p.id and c.tag = 't5') as outer_rows,
+       (select count(*) from fkr_c c join fkr_p p on c.pid = p.id and c.tag = 't5') as inner_rows;
+        plan        | outer_rows | inner_rows 
+--------------------+------------+------------
+ LEFT (not reduced) |         60 |          1
+(1 row)
+
+-- the operator must be the FK's own equality operator
+select fk_plan_kind('select c.id, p.v from fkr_c c left join fkr_p p on c.pid >= p.id') as plan;
+        plan        
+--------------------
+ LEFT (not reduced)
+(1 row)
+
+-- the referencing side must not be nullable from a lower outer join, or its
+-- NOT NULL column can still read as NULL
+create table fkr_top (id int primary key, cid int);
+insert into fkr_top select g, case when g % 2 = 0 then g end
+  from generate_series(1, 20) g;
+analyze fkr_top;
+select fk_plan_kind('select t.id, p.v from fkr_top t left join fkr_c c on t.cid = c.id left join fkr_p p on c.pid = p.id') as plan,
+       (select count(*) from fkr_top t left join fkr_c c on t.cid = c.id left join fkr_p p on c.pid = p.id) as outer_rows,
+       (select count(*) from fkr_top t left join fkr_c c on t.cid = c.id join fkr_p p on c.pid = p.id) as inner_rows;
+        plan        | outer_rows | inner_rows 
+--------------------+------------+------------
+ LEFT (not reduced) |         20 |         10
+(1 row)
+
+-- composite foreign keys reduce when every column is covered ...
+create table fkr_pp (a int, b int, v int, primary key (a, b));
+create table fkr_cc (id int primary key, a int not null, b int not null,
+                     foreign key (a, b) references fkr_pp(a, b));
+insert into fkr_pp select g, g + 1, g * 7 from generate_series(1, 10) g;
+insert into fkr_cc select g, 1 + (g % 10), 2 + (g % 10) from generate_series(1, 40) g;
+analyze fkr_pp, fkr_cc;
+select action from dbblue_trust_foreign_keys('fkr_cc'::regclass);
+       action       
+--------------------
+ trusted (verified)
+(1 row)
+
+select fk_plan_kind('select cc.id, pp.v from fkr_cc cc left join fkr_pp pp on cc.a = pp.a and cc.b = pp.b') as plan,
+       (select count(*) from fkr_cc cc left join fkr_pp pp on cc.a = pp.a and cc.b = pp.b) as outer_rows,
+       (select count(*) from fkr_cc cc join fkr_pp pp on cc.a = pp.a and cc.b = pp.b) as inner_rows;
+      plan       | outer_rows | inner_rows 
+-----------------+------------+------------
+ INNER (reduced) |         40 |         40
+(1 row)
+
+-- ... but not when the ON clause covers only part of the key
+select fk_plan_kind('select cc.id, pp.v from fkr_cc cc left join fkr_pp pp on cc.a = pp.a') as plan;
+        plan        
+--------------------
+ LEFT (not reduced)
+(1 row)
+
+-- A qual BELOW the join is invisible to the ON-clause check: pull_up_subqueries
+-- splices a pulled-up subquery's FromExpr in as the join's arm, quals included,
+-- and such a qual can reject the row the foreign key promised.
+create table fkr_flag (id int primary key, v int, active boolean);
+create table fkr_ref (id int primary key, fid int not null references fkr_flag(id));
+insert into fkr_flag values (1, 10, true), (2, 20, false);
+insert into fkr_ref values (100, 1), (200, 2);
+analyze fkr_flag, fkr_ref;
+select action from dbblue_trust_foreign_keys('fkr_ref'::regclass);
+       action       
+--------------------
+ trusted (verified)
+(1 row)
+
+create view fkr_active as select * from fkr_flag where active;
+-- FROM-subquery, view, and CTE forms must all refuse
+select fk_plan_kind('select r.id, f.v from fkr_ref r left join (select * from fkr_flag where active) f on r.fid = f.id') as plan,
+       (select count(*) from fkr_ref r left join (select * from fkr_flag where active) f on r.fid = f.id) as outer_rows,
+       (select count(*) from fkr_ref r join (select * from fkr_flag where active) f on r.fid = f.id) as inner_rows;
+        plan        | outer_rows | inner_rows 
+--------------------+------------+------------
+ LEFT (not reduced) |          2 |          1
+(1 row)
+
+select fk_plan_kind('select r.id, f.v from fkr_ref r left join fkr_active f on r.fid = f.id') as plan,
+       (select count(*) from fkr_ref r left join fkr_active f on r.fid = f.id) as outer_rows;
+        plan        | outer_rows 
+--------------------+------------
+ LEFT (not reduced) |          2
+(1 row)
+
+-- control: no filter below the join, so this one may reduce
+select fk_plan_kind('select r.id, f.v from fkr_ref r left join (select * from fkr_flag) f on r.fid = f.id') as plan,
+       (select count(*) from fkr_ref r left join (select * from fkr_flag) f on r.fid = f.id) as outer_rows;
+      plan       | outer_rows 
+-----------------+------------
+ INNER (reduced) |          2
+(1 row)
+
+drop view fkr_active;
+drop table fkr_ref, fkr_flag;
+-- ONLY on a partitioned table reads no storage at all, so every row would be
+-- null-extended; reducing would drop the entire result.
+-- Note: these select a column of the nullable side, so that PostgreSQL's
+-- existing join removal cannot delete the join and leave the test vacuous.
+create table fkr_part (id int primary key, v int) partition by range (id);
+create table fkr_part_1 partition of fkr_part for values from (1) to (100);
+create table fkr_part_2 partition of fkr_part for values from (100) to (1000);
+create table fkr_pchild (id int primary key, pid int not null references fkr_part(id));
+insert into fkr_part values (1, 1), (2, 2), (500, 500);
+insert into fkr_pchild values (10, 1), (20, 2), (30, 500);
+analyze fkr_part, fkr_pchild;
+select action from dbblue_trust_foreign_keys('fkr_pchild'::regclass);
+       action       
+--------------------
+ trusted (verified)
+(1 row)
+
+select fk_plan_kind('select c.id, p.v from fkr_pchild c left join only fkr_part p on c.pid = p.id') as plan,
+       (select count(*) from fkr_pchild c left join only fkr_part p on c.pid = p.id) as outer_rows,
+       (select count(*) from fkr_pchild c join only fkr_part p on c.pid = p.id) as inner_rows;
+        plan        | outer_rows | inner_rows 
+--------------------+------------+------------
+ LEFT (not reduced) |          3 |          0
+(1 row)
+
+-- control: without ONLY the partitions are scanned, so this may reduce
+select fk_plan_kind('select c.id, p.v from fkr_pchild c left join fkr_part p on c.pid = p.id') as plan,
+       (select count(*) from fkr_pchild c left join fkr_part p on c.pid = p.id) as outer_rows,
+       (select count(*) from fkr_pchild c join fkr_part p on c.pid = p.id) as inner_rows;
+      plan       | outer_rows | inner_rows 
+-----------------+------------+------------
+ INNER (reduced) |          3 |          3
+(1 row)
+
+-- A constraint cloned to a partition constrains only that partition's rows and
+-- may reference a single leaf, so it is not a whole-table proof.  Child row 30
+-- references partition 2, so joining partition 1 alone must keep it.
+select fk_plan_kind('select c.id, p.v from fkr_pchild c left join fkr_part_1 p on c.pid = p.id') as plan,
+       (select count(*) from fkr_pchild c left join fkr_part_1 p on c.pid = p.id) as outer_rows,
+       (select count(*) from fkr_pchild c join fkr_part_1 p on c.pid = p.id) as inner_rows;
+        plan        | outer_rows | inner_rows 
+--------------------+------------+------------
+ LEFT (not reduced) |          3 |          2
+(1 row)
+
+drop table fkr_pchild, fkr_part;
+-- Trust is withdrawn automatically when enforcement is actually bypassed: the
+-- referential-integrity triggers are what enforce a foreign key, so passing one
+-- over means the change went unchecked.  No re-verification is needed for the
+-- withdrawal to take effect.
+create table fkr_rp (id int primary key, v int);
+create table fkr_rc (id int primary key, pid int not null references fkr_rp(id));
+insert into fkr_rp select g, g from generate_series(1, 10) g;
+insert into fkr_rc select g, 1 + (g % 10) from generate_series(1, 30) g;
+analyze fkr_rp, fkr_rc;
+select action from dbblue_trust_foreign_keys('fkr_rc'::regclass);
+       action       
+--------------------
+ trusted (verified)
+(1 row)
+
+select fk_plan_kind('select c.id, p.v from fkr_rc c left join fkr_rp p on c.pid = p.id') as plan_trusted;
+  plan_trusted   
+-----------------
+ INNER (reduced)
+(1 row)
+
+-- an unchecked write in replica mode withdraws it
+begin;
+  set session_replication_role = replica;
+  insert into fkr_rc values (9001, 4242);
+  reset session_replication_role;
+commit;
+select fk_plan_kind('select c.id, p.v from fkr_rc c left join fkr_rp p on c.pid = p.id') as plan_after_bypass,
+       (select count(*) from fkr_rc c left join fkr_rp p on c.pid = p.id) as outer_rows,
+       (select count(*) from fkr_rc c join fkr_rp p on c.pid = p.id) as inner_rows;
+ plan_after_bypass  | outer_rows | inner_rows 
+--------------------+------------+------------
+ LEFT (not reduced) |         31 |         30
+(1 row)
+
+-- a bypass that rolls back wrote nothing, so trust must survive it
+delete from fkr_rc where id = 9001;
+select action from dbblue_trust_foreign_keys('fkr_rc'::regclass);
+       action       
+--------------------
+ trusted (verified)
+(1 row)
+
+begin;
+  set session_replication_role = replica;
+  insert into fkr_rc values (9002, 8888);
+  reset session_replication_role;
+rollback;
+select fk_plan_kind('select c.id, p.v from fkr_rc c left join fkr_rp p on c.pid = p.id') as plan_after_rollback;
+ plan_after_rollback 
+---------------------
+ INNER (reduced)
+(1 row)
+
+-- and ordinary writes must not disturb it
+insert into fkr_rc values (9003, 5);
+update fkr_rc set pid = 6 where id = 9003;
+delete from fkr_rc where id = 9003;
+select fk_plan_kind('select c.id, p.v from fkr_rc c left join fkr_rp p on c.pid = p.id') as plan_after_normal_dml;
+ plan_after_normal_dml 
+-----------------------
+ INNER (reduced)
+(1 row)
+
+drop table fkr_rc, fkr_rp;
+-- When nothing outside the join condition uses the nullable side, PostgreSQL can
+-- drop the join outright, which beats reducing it: an inner join can eliminate
+-- rows and so cannot be dropped.  Counting rows over a join is exactly this
+-- shape, and reducing it turned a single scan back into a join.
+select fk_plan_kind('select count(*) from fkr_c c left join fkr_p p on c.pid = p.id') as plan_must_be_no_join,
+       (select count(*) from fkr_c c left join fkr_p p on c.pid = p.id) as rows;
+ plan_must_be_no_join | rows 
+----------------------+------
+ no join              |   60
+(1 row)
+
+-- referencing the nullable side makes removal impossible, so it reduces again
+select fk_plan_kind('select count(p.v) from fkr_c c left join fkr_p p on c.pid = p.id') as plan_must_reduce;
+ plan_must_reduce 
+------------------
+ INNER (reduced)
+(1 row)
+
+drop table fkr_cc, fkr_pp, fkr_top, fkr_c, fkr_p;
+drop function fk_plan_kind(text);

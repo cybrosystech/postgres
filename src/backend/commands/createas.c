@@ -26,12 +26,15 @@
 
 #include "access/heapam.h"
 #include "access/reloptions.h"
+#include "access/table.h"
 #include "access/tableam.h"
 #include "access/xact.h"
 #include "catalog/namespace.h"
 #include "catalog/toasting.h"
 #include "commands/createas.h"
+#include "commands/defrem.h"
 #include "commands/matview.h"
+#include "commands/matview_incr.h"
 #include "commands/prepare.h"
 #include "commands/tablecmds.h"
 #include "commands/view.h"
@@ -277,6 +280,146 @@ ExecCreateTableAs(ParseState *pstate, CreateTableAsStmt *stmt,
 		into->skipData = true;
 	}
 
+	/*
+	 * DBblue: if incremental_refresh is requested, validate eligibility and
+	 * inject COUNT(*) AS __mv_count__ into both the schema query and the
+	 * stored view-definition query.  Do this before create_ctas_nodata so
+	 * that the column is created as part of the matview schema and populated
+	 * naturally by the initial REFRESH — no ALTER TABLE needed afterward.
+	 *
+	 * This runs for the WITH NO DATA case too (do_refresh false), which is the
+	 * pg_dump/restore path.  There the stored query already carries the hidden
+	 * columns verbatim, so MatviewIncrNormalize is a no-op and
+	 * MatviewIncrAddCountTarget detects the existing __mv_count__ and skips
+	 * re-injection — leaving the schema correct either way.
+	 */
+	if (is_matview)
+	{
+		Query	   *vq = castNode(Query, into->viewQuery);
+		ListCell   *lc;
+		bool		want_incr = false;
+		bool		allow_stable_keys = false;
+
+		foreach(lc, into->options)
+		{
+			DefElem    *opt = lfirst_node(DefElem, lc);
+
+			if (strcmp(opt->defname, "incremental_refresh") == 0)
+				want_incr = defGetBoolean(opt);
+			else if (strcmp(opt->defname, "allow_stable_keys") == 0)
+				allow_stable_keys = defGetBoolean(opt);
+		}
+		/* consulted by MatviewIncrIsEligible (and the setup re-arm) */
+		MatviewIncrSetAllowStableKeys(allow_stable_keys);
+
+		if (want_incr)
+		{
+			const char *reason;
+			Query	   *norm;
+
+			/* Phase 16: inline CTEs and FROM-subqueries before eligibility check */
+			norm = MatviewIncrNormalize(vq);
+			if (norm != vq)
+			{
+				into->viewQuery			  = norm;
+				vq						  = norm;
+				/* Sync execution-query structure so the matview schema matches */
+				query->rtable			  = copyObject(norm->rtable);
+				query->rteperminfos		  = copyObject(norm->rteperminfos);
+				query->jointree			  = copyObject(norm->jointree);
+				query->targetList		  = copyObject(norm->targetList);
+				query->groupClause		  = copyObject(norm->groupClause);
+				query->havingQual		  = copyObject(norm->havingQual);
+				query->distinctClause	  = copyObject(norm->distinctClause);
+				query->hasAggs			  = norm->hasAggs;
+				query->hasSubLinks		  = norm->hasSubLinks;
+				query->hasWindowFuncs	  = norm->hasWindowFuncs;
+				query->hasGroupRTE		  = norm->hasGroupRTE;
+				query->cteList			  = NIL;
+				query->setOperations	  = copyObject(norm->setOperations);
+			}
+
+			/*
+			 * Rewrite agg(x) FILTER (WHERE c) -> agg(CASE WHEN c THEN x END) on
+			 * both the schema and stored view queries before eligibility, so the
+			 * deparse delta core maintains FILTER and the two queries agree.
+			 */
+			MatviewIncrRewriteAggFilters(vq);
+			MatviewIncrRewriteAggFilters(query);
+
+			/* Fold trivial "(SELECT <const>)" marker sublinks (e.g. Odoo's
+			 * "(SELECT 1) AS nbr") so they no longer trip the subquery gate. */
+			MatviewIncrConstFoldSublinks(vq);
+			MatviewIncrConstFoldSublinks(query);
+
+			if (!MatviewIncrIsEligible(vq, &reason))
+			{
+				Query	   *core = NULL;
+				const char *preason;
+
+				/*
+				 * Overlay/peel: if the only blockers are non-immutable SELECT-list
+				 * projections (now()/CURRENT_DATE/STABLE), split into a maintained
+				 * CORE matview plus a read-time VIEW that re-adds the peeled columns.
+				 * The core replaces the stored + executed query; the original
+				 * (pre-peel) output list is handed to setup for the overlay view.
+				 *
+				 * WITH DATA only: the base rename + overlay-view creation run in
+				 * MatviewIncrSetup on the populated path (like HAVING).  Under WITH
+				 * NO DATA they are skipped, which would leave a column-reduced core
+				 * matview, so do not peel there — fall through to the clean reject.
+				 */
+				if (do_refresh &&
+					MatviewIncrPeelProjection(vq, &core, &preason))
+				{
+					MatviewIncrSetOverlayOriginal(copyObject(vq));
+					into->viewQuery = core;
+					vq = core;
+					query->targetList = copyObject(core->targetList);
+					query->hasWindowFuncs = core->hasWindowFuncs;
+					query->windowClause = copyObject(core->windowClause);
+				}
+				else
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("cannot use incremental_refresh: %s", reason)));
+			}
+
+			/*
+			 * Keep NULL-key rows out of scope (writes to the source are never
+			 * blocked; the matview excludes NULL GROUP BY/DISTINCT keys and
+			 * stays consistent with REFRESH).  Apply to both the schema and the
+			 * stored view query so initial population, REFRESH, and deltas agree.
+			 */
+			{
+				List *filtered = MatviewIncrAddNotNullKeyFilters(vq);
+
+				(void) MatviewIncrAddNotNullKeyFilters(query);
+				if (filtered != NIL)
+				{
+					StringInfoData cols;
+					ListCell   *fc;
+					bool		first = true;
+
+					initStringInfo(&cols);
+					foreach(fc, filtered)
+					{
+						appendStringInfo(&cols, "%s%s", first ? "" : ", ",
+										 strVal(lfirst(fc)));
+						first = false;
+					}
+					ereport(NOTICE,
+							(errmsg("incremental matview excludes rows where %s IS NULL",
+									cols.data),
+							 errdetail("NULL group keys are not maintained incrementally; such rows are left out of the matview (source writes are unaffected).")));
+				}
+			}
+
+			MatviewIncrAddCountTarget(query);
+			MatviewIncrAddCountTarget(vq);
+		}
+	}
+
 	if (into->skipData)
 	{
 		/*
@@ -295,6 +438,67 @@ ExecCreateTableAs(ParseState *pstate, CreateTableAsStmt *stmt,
 		if (do_refresh)
 			RefreshMatViewByOid(address.objectId, true, false, false,
 								pstate->p_sourcetext, qc);
+
+		/*
+		 * DBblue: if incremental_refresh is enabled, set up the delta
+		 * triggers, unique index, and catalog rows.
+		 *
+		 * WITH DATA (do_refresh true): the RefreshMatViewByOid call above has
+		 * already populated the matview, so setup runs over populated data.
+		 *
+		 * WITH NO DATA (do_refresh false) is the pg_dump/restore path: the
+		 * dumped query carries the hidden columns, so the matview schema is
+		 * already correct.  Setup runs here on the freshly defined (empty)
+		 * matview — before it is in active use, which is essential because
+		 * setup issues CREATE INDEX, and that would conflict with the dump's
+		 * subsequent standalone REFRESH if attempted from inside it.  The
+		 * MatviewIncrIsSetUp guard keeps this idempotent.
+		 */
+		if (is_matview)
+		{
+			Relation	mvrel = table_open(address.objectId, AccessShareLock);
+			bool		incr = RelationGetIncrementalRefresh(mvrel);
+
+			table_close(mvrel, AccessShareLock);
+
+			if (incr && !MatviewIncrIsSetUp(address.objectId))
+			{
+				Query	   *vq = castNode(Query, into->viewQuery);
+
+				/*
+				 * A HAVING incremental matview is built as a renamed base
+				 * matview plus a user-facing filtering view.  On the
+				 * pg_dump/restore path both objects are dumped and the base
+				 * arrives already named "_dbblue_<oid>_base"; setup then wires
+				 * up the delta machinery and MatviewIncrPostRefresh seeds the
+				 * failing groups after the dump's REFRESH (mv_populated is
+				 * false here, so the rename/view/backfill are deferred).
+				 *
+				 * But a *fresh* CREATE ... WITH NO DATA + HAVING (not a restore,
+				 * so not base-named) cannot set up the filtering view over an
+				 * unpopulated matview.  That combination is unsupported: warn
+				 * and leave it as a plain matview rather than build a broken
+				 * half-state.  HAVING incremental matviews must be created
+				 * WITH DATA.  (UNION ALL and all other shapes set up fine on
+				 * both paths.)
+				 */
+				const char *nm = get_rel_name(address.objectId);
+				size_t		len = nm ? strlen(nm) : 0;
+				bool		is_having_base = (nm != NULL &&
+											  strncmp(nm, "_dbblue_", 8) == 0 &&
+											  len > 5 &&
+											  strcmp(nm + len - 5, "_base") == 0);
+
+				if (!do_refresh && vq->havingQual != NULL && !is_having_base)
+					ereport(WARNING,
+							(errmsg("incremental refresh not enabled for materialized view \"%s\"",
+									nm),
+							 errdetail("A HAVING incremental materialized view cannot be set up WITH NO DATA."),
+							 errhint("Create it WITH DATA to enable incremental refresh.")));
+				else
+					MatviewIncrSetup(address.objectId, vq);
+			}
+		}
 
 	}
 	else

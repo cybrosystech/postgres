@@ -1,0 +1,126 @@
+/* contrib/dbblue_columnar/dbblue_columnar--1.0.sql */
+
+-- complain if script is sourced in psql, rather than via CREATE EXTENSION
+\echo Use "CREATE EXTENSION dbblue_columnar" to load this file. \quit
+
+-- Registration catalog: which (relation, column) pairs are columnarized.
+--
+-- NB: this is an ordinary extension-owned table, not a bootstrapped system
+-- catalog, so it deliberately does NOT carry the reserved "pg_" prefix. The
+-- "pg_" prefix is for in-core catalogs (like the IVM engine's
+-- pg_dbblue_matview); a loadable module registers its state in a regular
+-- table. The column-block DATA lives only in memory and is never stored here;
+-- only the registrations (configuration) are persisted and dumped.
+CREATE TABLE dbblue_columnar_relations (
+	relid		regclass	NOT NULL,
+	attnum		smallint	NOT NULL,
+	auto_added	boolean		NOT NULL DEFAULT false,
+	added_by	name		NOT NULL DEFAULT current_user,
+	added_at	timestamptz	NOT NULL DEFAULT now(),
+	PRIMARY KEY (relid, attnum)
+);
+
+-- Persist registrations across dump/restore (but never any cache data).
+SELECT pg_catalog.pg_extension_config_dump('dbblue_columnar_relations', '');
+
+-- Register columns of a relation for columnarization.
+-- Milestone 1: this only records the registration; no column store is built.
+CREATE FUNCTION dbblue_columnar_add(rel regclass, columns text[])
+RETURNS integer
+AS 'MODULE_PATHNAME', 'dbblue_columnar_add'
+LANGUAGE C VOLATILE STRICT;
+
+-- Unregister columns of a relation (inverse of dbblue_columnar_add). Only
+-- edits the registry; the change takes effect on the next
+-- dbblue_columnar_populate. Returns the number of registrations removed.
+CREATE FUNCTION dbblue_columnar_remove(rel regclass, columns text[])
+RETURNS integer
+AS 'MODULE_PATHNAME', 'dbblue_columnar_remove'
+LANGUAGE C VOLATILE STRICT;
+
+-- Build (or rebuild) the in-memory column store for a registered relation.
+-- Returns the number of columnar blocks built. Only heap-page ranges that are
+-- entirely all-visible are built; the rest stay heap-only.
+CREATE FUNCTION dbblue_columnar_populate(rel regclass)
+RETURNS integer
+AS 'MODULE_PATHNAME', 'dbblue_columnar_populate'
+LANGUAGE C VOLATILE STRICT;
+
+-- Introspection: one row per (columnar block, column chunk).
+CREATE FUNCTION dbblue_columnar_blocks(rel regclass,
+	OUT block_index integer,
+	OUT first_page bigint,
+	OUT npages integer,
+	OUT nrows bigint,
+	OUT attnum smallint,
+	OUT encoding text,
+	OUT null_count bigint,
+	OUT zone_min text,
+	OUT zone_max text,
+	OUT bytes bigint)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME', 'dbblue_columnar_blocks'
+LANGUAGE C VOLATILE STRICT;
+
+-- Human-friendly status view. Resolves the column name (attnum is opaque) and
+-- joins live per-column store state from dbblue_columnar_blocks(): whether the
+-- store is built, how many columnar blocks, the stored row count, and the
+-- stored byte size (which reveals the codec effect - dict-compressed FK/enum
+-- columns are far smaller than PLAIN high-cardinality ones). Registered-but-
+-- unbuilt columns still appear (LEFT JOINs), with built=false and zeroed state.
+-- Defined after dbblue_columnar_blocks() because it references it.
+CREATE VIEW dbblue_columnar_status AS
+	SELECT r.relid,
+	       r.attnum,
+	       r.auto_added,
+	       r.added_by,
+	       r.added_at,
+	       a.attname                  AS column_name,
+	       (b.blocks IS NOT NULL)     AS built,
+	       COALESCE(b.blocks, 0)      AS blocks,
+	       COALESCE(b.store_rows, 0)  AS store_rows,
+	       COALESCE(b.store_bytes, 0) AS store_bytes,
+	       pg_catalog.pg_size_pretty(COALESCE(b.store_bytes, 0)) AS store_size
+	FROM dbblue_columnar_relations r
+	LEFT JOIN pg_catalog.pg_attribute a
+	       ON a.attrelid = r.relid AND a.attnum = r.attnum
+	LEFT JOIN LATERAL (
+	       SELECT count(*)      AS blocks,
+	              sum(bk.nrows) AS store_rows,
+	              sum(bk.bytes) AS store_bytes
+	       FROM dbblue_columnar_blocks(r.relid) bk
+	       WHERE bk.attnum = r.attnum
+	) b ON true
+	ORDER BY r.relid, r.attnum;
+
+-- Free the in-memory column store for a relation (works by OID even after
+-- DROP TABLE). Returns whether an entry existed. Registrations are kept.
+CREATE FUNCTION dbblue_columnar_drop(rel regclass)
+RETURNS boolean
+AS 'MODULE_PATHNAME', 'dbblue_columnar_drop'
+LANGUAGE C VOLATILE STRICT;
+
+-- Column-store memory accounting. used_bytes is the engine's logical
+-- accounting; dsa_total_bytes is the real shared-area size including
+-- allocator overhead.
+CREATE FUNCTION dbblue_columnar_memory(
+	OUT budget_mb integer,
+	OUT used_bytes bigint,
+	OUT dsa_total_bytes bigint)
+RETURNS record
+AS 'MODULE_PATHNAME', 'dbblue_columnar_memory'
+LANGUAGE C VOLATILE;
+
+-- Human-friendly memory view over dbblue_columnar_memory(): keeps the raw byte
+-- counts (for precision / arithmetic) and adds pg_size_pretty'd sizes plus
+-- percent-of-budget, so `SELECT * FROM dbblue_columnar_memory_status` is
+-- readable at a glance.
+CREATE VIEW dbblue_columnar_memory_status AS
+	SELECT m.budget_mb,
+	       m.used_bytes,
+	       pg_catalog.pg_size_pretty(m.used_bytes)      AS used,
+	       m.dsa_total_bytes,
+	       pg_catalog.pg_size_pretty(m.dsa_total_bytes) AS dsa_total,
+	       round(100.0 * m.used_bytes
+	             / (m.budget_mb::numeric * 1024 * 1024), 1) AS pct_of_budget
+	FROM dbblue_columnar_memory() m;
