@@ -48,6 +48,7 @@
 /* GUC variables */
 char	   *default_table_access_method = DEFAULT_TABLE_ACCESS_METHOD;
 bool		synchronize_seqscans = true;
+bool		dbblue_enable_tableam_multi_insert = false;
 
 
 /* ----------------------------------------------------------------------------

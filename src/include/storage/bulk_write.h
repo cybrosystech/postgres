@@ -17,6 +17,18 @@
 #include "storage/smgr.h"
 #include "utils/rel.h"
 
+/*
+ * Upper bound on dbblue_bulk_write_maxpages, and the fixed capacity of the
+ * pending-writes queue in BulkWriteState.  WAL for a batch is still emitted
+ * in XLR_MAX_BLOCK_ID-sized chunks regardless of this value; this only
+ * controls how many pages are buffered in backend-local memory before a
+ * relation extend + WAL flush happens.
+ */
+#define DBBLUE_BULK_WRITE_MAX_PAGES 512
+
+/* GUC: how many pages to buffer before flushing (dbblue_bulk_write_maxpages) */
+extern PGDLLIMPORT int dbblue_bulk_write_maxpages;
+
 /* Bulk writer state, contents are private to bulk_write.c */
 typedef struct BulkWriteState BulkWriteState;
 

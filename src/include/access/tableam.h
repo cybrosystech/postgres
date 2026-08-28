@@ -31,6 +31,7 @@
 /* GUCs */
 extern PGDLLIMPORT char *default_table_access_method;
 extern PGDLLIMPORT bool synchronize_seqscans;
+extern PGDLLIMPORT bool dbblue_enable_tableam_multi_insert;
 
 
 /* forward references in this file */
