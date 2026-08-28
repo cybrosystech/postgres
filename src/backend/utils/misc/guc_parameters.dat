@@ -817,6 +817,15 @@
   boot_val => '"odoo"',
 },
 
+{ name => 'dbblue_bulk_write_maxpages', type => 'int', context => 'PGC_USERSET', group => 'RESOURCES_IO',
+  short_desc => 'Sets the maximum number of pages to buffer in backend-local memory before flushing during dbblue bulk relation writes.',
+  flags => 'GUC_UNIT_BLOCKS',
+  variable => 'dbblue_bulk_write_maxpages',
+  boot_val => '128',
+  min => '1',
+  max => '512',
+},
+
 { name => 'dbblue_create_brin', type => 'bool', context => 'PGC_POSTMASTER', group => 'RESOURCES_WORKER_PROCESSES',
   short_desc => 'Enable automatic BRIN index creation for create_date columns.',
   long_desc => 'When enabled, a background worker periodically checks pg_stats and creates BRIN indexes on create_date columns with high correlation (>0.9).',
@@ -829,6 +838,12 @@
   long_desc => 'When enabled, a background worker provisions a standby of this cluster with pg_basebackup (if dbblue_standby_directory does not contain one yet), starts it on the first free port above this server\'s port, and keeps it running. The chosen port is reported in the server log and in the dbblue_standby.port file in the data directory, ready for Odoo\'s db_replica_port setting.',
   flags => 'GUC_NOT_IN_SAMPLE',
   variable => 'dbblue_create_standby',
+  boot_val => 'false',
+},
+
+{ name => 'dbblue_enable_tableam_multi_insert', type => 'bool', context => 'PGC_USERSET', group => 'RESOURCES_IO',
+  short_desc => 'Enables batched bulk-insert of initial data for CREATE TABLE AS, CREATE MATERIALIZED VIEW, and REFRESH MATERIALIZED VIEW.',
+  variable => 'dbblue_enable_tableam_multi_insert',
   boot_val => 'false',
 },
 
@@ -1039,21 +1054,6 @@
   short_desc => 'Sets whether backends that are not waiting on anything are also sampled.',
   variable => 'dbblue_wait_sampling_sample_cpu',
   boot_val => 'true',
-},
-
-{ name => 'dbblue_bulk_write_maxpages', type => 'int', context => 'PGC_USERSET', group => 'RESOURCES_IO',
-  short_desc => 'Sets the maximum number of pages to buffer in backend-local memory before flushing during dbblue bulk relation writes.',
-  flags => 'GUC_UNIT_BLOCKS',
-  variable => 'dbblue_bulk_write_maxpages',
-  boot_val => '128',
-  min => '1',
-  max => '512',
-},
-
-{ name => 'dbblue_enable_tableam_multi_insert', type => 'bool', context => 'PGC_USERSET', group => 'RESOURCES_IO',
-  short_desc => 'Enables batched bulk-insert of initial data for CREATE TABLE AS, CREATE MATERIALIZED VIEW, and REFRESH MATERIALIZED VIEW.',
-  variable => 'dbblue_enable_tableam_multi_insert',
-  boot_val => 'false',
 },
 
 # This is PGC_SUSET to prevent hiding from log_lock_waits.
