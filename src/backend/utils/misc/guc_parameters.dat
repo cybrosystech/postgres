@@ -1041,6 +1041,21 @@
   boot_val => 'true',
 },
 
+{ name => 'dbblue_bulk_write_maxpages', type => 'int', context => 'PGC_USERSET', group => 'RESOURCES_IO',
+  short_desc => 'Sets the maximum number of pages to buffer in backend-local memory before flushing during dbblue bulk relation writes.',
+  flags => 'GUC_UNIT_BLOCKS',
+  variable => 'dbblue_bulk_write_maxpages',
+  boot_val => '128',
+  min => '1',
+  max => '512',
+},
+
+{ name => 'dbblue_enable_tableam_multi_insert', type => 'bool', context => 'PGC_USERSET', group => 'RESOURCES_IO',
+  short_desc => 'Enables batched bulk-insert of initial data for CREATE TABLE AS, CREATE MATERIALIZED VIEW, and REFRESH MATERIALIZED VIEW.',
+  variable => 'dbblue_enable_tableam_multi_insert',
+  boot_val => 'false',
+},
+
 # This is PGC_SUSET to prevent hiding from log_lock_waits.
 { name => 'deadlock_timeout', type => 'int', context => 'PGC_SUSET', group => 'LOCK_MANAGEMENT',
   short_desc => 'Sets the time to wait on a lock before checking for deadlock.',

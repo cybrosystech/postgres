@@ -50,7 +50,8 @@ typedef struct
 	Relation	transientrel;	/* relation to write to */
 	CommandId	output_cid;		/* cmin to insert in output tuples */
 	uint32		ti_options;		/* table_tuple_insert performance options */
-	BulkInsertState bistate;	/* bulk insert state */
+	BulkInsertState bistate;	/* bulk insert state, if not using rawstate */
+	HeapRawBulkInsertState rawstate;	/* dbblue raw bulk insert state, if used */
 } DR_transientrel;
 
 static int	matview_maintenance_depth = 0;
@@ -492,7 +493,19 @@ transientrel_startup(DestReceiver *self, int operation, TupleDesc typeinfo)
 	myState->transientrel = transientrel;
 	myState->output_cid = GetCurrentCommandId(true);
 	myState->ti_options = TABLE_INSERT_SKIP_FSM | TABLE_INSERT_FROZEN;
-	myState->bistate = GetBulkInsertState();
+
+	if (RelationSupportsRawBulkInsert(transientrel))
+	{
+		myState->rawstate = heap_raw_bulk_insert_begin(transientrel,
+														myState->output_cid,
+														myState->ti_options);
+		myState->bistate = NULL;
+	}
+	else
+	{
+		myState->bistate = GetBulkInsertState();
+		myState->rawstate = NULL;
+	}
 
 	/*
 	 * Valid smgr_targblock implies something already wrote to the relation.
@@ -509,20 +522,25 @@ transientrel_receive(TupleTableSlot *slot, DestReceiver *self)
 {
 	DR_transientrel *myState = (DR_transientrel *) self;
 
-	/*
-	 * Note that the input slot might not be of the type of the target
-	 * relation. That's supported by table_tuple_insert(), but slightly less
-	 * efficient than inserting with the right slot - but the alternative
-	 * would be to copy into a slot of the right type, which would not be
-	 * cheap either. This also doesn't allow accessing per-AM data (say a
-	 * tuple's xmin), but since we don't do that here...
-	 */
+	if (myState->rawstate)
+		heap_raw_bulk_insert_tuple(myState->rawstate, slot);
+	else
+	{
+		/*
+		 * Note that the input slot might not be of the type of the target
+		 * relation. That's supported by table_tuple_insert(), but slightly
+		 * less efficient than inserting with the right slot - but the
+		 * alternative would be to copy into a slot of the right type, which
+		 * would not be cheap either. This also doesn't allow accessing per-AM
+		 * data (say a tuple's xmin), but since we don't do that here...
+		 */
 
-	table_tuple_insert(myState->transientrel,
-					   slot,
-					   myState->output_cid,
-					   myState->ti_options,
-					   myState->bistate);
+		table_tuple_insert(myState->transientrel,
+						   slot,
+						   myState->output_cid,
+						   myState->ti_options,
+						   myState->bistate);
+	}
 
 	/* We know this is a newly created relation, so there are no indexes */
 
@@ -537,9 +555,14 @@ transientrel_shutdown(DestReceiver *self)
 {
 	DR_transientrel *myState = (DR_transientrel *) self;
 
-	FreeBulkInsertState(myState->bistate);
+	if (myState->rawstate)
+		heap_raw_bulk_insert_end(myState->rawstate);
+	else
+	{
+		FreeBulkInsertState(myState->bistate);
 
-	table_finish_bulk_insert(myState->transientrel, myState->ti_options);
+		table_finish_bulk_insert(myState->transientrel, myState->ti_options);
+	}
 
 	/* close transientrel, but keep lock until commit */
 	table_close(myState->transientrel, NoLock);
