@@ -9549,6 +9549,8 @@ $as_echo "#define USE_LZ4 1" >>confdefs.h
 else
   with_lz4=yes
 
+$as_echo "#define USE_LZ4 1" >>confdefs.h
+
 fi
 
 
