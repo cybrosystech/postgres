@@ -42,6 +42,7 @@
 #include "access/visibilitymap.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
+#include "catalog/catalog.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_database_d.h"
 #include "commands/vacuum.h"
@@ -2721,6 +2722,13 @@ struct HeapRawBulkInsertStateData
  * transient table is therefore just as publishable (and hence just as
  * exposed to logical decoding via a FOR ALL TABLES publication) as any
  * plain CREATE TABLE AS target, so both callers share this same check.
+ *
+ * Both current callers only ever pass a relation they just created in this
+ * same transaction, which can never be a real system catalog.  The
+ * IsCatalogRelation() check below is defense-in-depth for any future
+ * caller: heap_raw_bulk_insert_tuple() does not perform the cache
+ * invalidation or combo-CID WAL logging that heap_insert() does, both of
+ * which matter for catalog relations.
  */
 bool
 RelationSupportsRawBulkInsert(Relation rel)
@@ -2738,6 +2746,14 @@ RelationSupportsRawBulkInsert(Relation rel)
 	 * fast path whenever logical decoding info is being collected.
 	 */
 	if (XLogLogicalInfoActive())
+		return false;
+
+	/*
+	 * heap_raw_bulk_insert_tuple() skips CacheInvalidateHeapTuple() and
+	 * log_heap_new_cid(), which heap_insert() performs for exactly this
+	 * case.  Never allow the fast path for a real system catalog.
+	 */
+	if (IsCatalogRelation(rel))
 		return false;
 
 	return true;
@@ -2764,17 +2780,23 @@ RelationSupportsRawBulkInsert(Relation rel)
  * RelationSupportsRawBulkInsert().
  *
  * The relation must not already have any blocks: this function always
- * starts writing at block 0, on the assumption (enforced by the Assert
- * below) that 'rel' is a brand-new, still-empty relation, as is the case
- * for a freshly created CTAS/matview target.  It is not a general-purpose
- * append facility.
+ * starts writing at block 0, on the assumption that 'rel' is a brand-new,
+ * still-empty relation, as is the case for a freshly created CTAS/matview
+ * target.  It is not a general-purpose append facility.  This is checked
+ * with a real, always-on error rather than an Assert(): getting it wrong
+ * means smgr_bulk_flush() takes the smgrwrite() (overwrite) branch instead
+ * of smgrextend() for block 0 onward, silently clobbering whatever was
+ * already there -- exactly the kind of mistake that must not depend on
+ * whether this happens to be a cassert build.
  */
 HeapRawBulkInsertState
 heap_raw_bulk_insert_begin(Relation rel, CommandId cid, uint32 options)
 {
 	HeapRawBulkInsertState state;
 
-	Assert(RelationGetNumberOfBlocks(rel) == 0);
+	if (RelationGetNumberOfBlocks(rel) != 0)
+		elog(ERROR, "heap_raw_bulk_insert_begin() requires an empty relation, but \"%s\" already has blocks",
+			 RelationGetRelationName(rel));
 
 	state = palloc0_object(struct HeapRawBulkInsertStateData);
 	state->rel = rel;
@@ -2803,10 +2825,11 @@ heap_raw_bulk_insert_tuple(HeapRawBulkInsertState state, TupleTableSlot *slot)
 	Size		len;
 	Page		page;
 	OffsetNumber newoff;
+	bool		shouldFree;
 
 	AssertHasSnapshotForToast(relation);
 
-	tuple = ExecFetchSlotHeapTuple(slot, true, NULL);
+	tuple = ExecFetchSlotHeapTuple(slot, true, &shouldFree);
 	slot->tts_tableOid = RelationGetRelid(relation);
 	tuple->t_tableOid = slot->tts_tableOid;
 
@@ -2903,6 +2926,8 @@ heap_raw_bulk_insert_tuple(HeapRawBulkInsertState state, TupleTableSlot *slot)
 
 	if (heaptup != tuple)
 		heap_freetuple(heaptup);
+	if (shouldFree)
+		heap_freetuple(tuple);
 
 	pgstat_count_heap_insert(relation, 1);
 }

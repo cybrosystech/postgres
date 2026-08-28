@@ -13,7 +13,7 @@
  * smgrextend() directly.  A downside is that the pages will need to be
  * re-read into shared buffers on first use after the build finishes.  That's
  * usually a good tradeoff for large relations, and for small relations, the
- * overhead isn't very significant compared to creating the relation in the
+ * overhead isn't v 	ery significant compared to creating the relation in the
  * first place.
  *
  * The pages are WAL-logged if needed.  To save on WAL header overhead, we
@@ -47,8 +47,6 @@
 /* GUC */
 int			dbblue_bulk_write_maxpages = 128;
 
-#define MAX_PENDING_WRITES DBBLUE_BULK_WRITE_MAX_PAGES
-
 static const PGIOAlignedBlock zero_buffer = {0};	/* worth BLCKSZ */
 
 typedef struct PendingWrite
@@ -77,9 +75,23 @@ struct BulkWriteState
 	 */
 	int			maxpages;
 
-	/* We keep several writes queued, and WAL-log them in batches */
+	/*
+	 * We keep several writes queued, and WAL-log them in batches.
+	 * pending_writes[], blknos[], and pages[] are all palloc'd, sized to
+	 * 'maxpages' entries, when the bulk write begins -- NOT to the compile-
+	 * time DBBLUE_BULK_WRITE_MAX_PAGES ceiling.  That way a caller who
+	 * doesn't touch dbblue_bulk_write_maxpages (e.g. CREATE INDEX or
+	 * VACUUM FULL/CLUSTER/REPACK, which also use this facility but predate
+	 * this GUC) doesn't pay for headroom it never asked for, and a session
+	 * that lowers the GUC actually gets a smaller buffer, not just a lower
+	 * flush threshold on top of a fixed-size allocation.
+	 */
 	int			npending;
-	PendingWrite pending_writes[MAX_PENDING_WRITES];
+	PendingWrite *pending_writes;
+
+	/* Scratch space for smgr_bulk_flush(), sized to 'maxpages' as well */
+	BlockNumber *blknos;
+	Page	   *pages;
 
 	/* Current size of the relation */
 	BlockNumber relsize;
@@ -121,6 +133,9 @@ smgr_bulk_start_smgr(SMgrRelation smgr, ForkNumber forknum, bool use_wal)
 	state->maxpages = Max(1, Min(dbblue_bulk_write_maxpages, DBBLUE_BULK_WRITE_MAX_PAGES));
 
 	state->npending = 0;
+	state->pending_writes = palloc_array(PendingWrite, state->maxpages);
+	state->blknos = palloc_array(BlockNumber, state->maxpages);
+	state->pages = palloc_array(Page, state->maxpages);
 	state->relsize = smgrnblocks(smgr, forknum);
 
 	state->start_RedoRecPtr = GetRedoRecPtr();
@@ -266,8 +281,8 @@ smgr_bulk_flush(BulkWriteState *bulkstate)
 
 	if (bulkstate->use_wal)
 	{
-		BlockNumber blknos[MAX_PENDING_WRITES];
-		Page		pages[MAX_PENDING_WRITES];
+		BlockNumber *blknos = bulkstate->blknos;
+		Page	   *pages = bulkstate->pages;
 		bool		page_std = true;
 
 		for (int i = 0; i < npending; i++)
