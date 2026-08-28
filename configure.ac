@@ -1181,7 +1181,12 @@ AC_SUBST(with_zlib)
 # LZ4
 #
 AC_MSG_CHECKING([whether to build with LZ4 support])
-PGAC_ARG_BOOL(with, lz4, no, [build with LZ4 support],
+dnl DBblue: LZ4 defaults to ON because wal_compression defaults to lz4 in this
+dnl fork; a build without LZ4 would default to an unsupported value and fail at
+dnl initdb.  Making --with-lz4 default to yes turns that into a clear, early
+dnl configure-time error ("library 'lz4' is required") instead of a broken
+dnl binary.  Use --without-lz4 only if you also change the wal_compression default.
+PGAC_ARG_BOOL(with, lz4, yes, [build with LZ4 support],
               [AC_DEFINE([USE_LZ4], 1, [Define to 1 to build with LZ4 support. (--with-lz4)])])
 AC_MSG_RESULT([$with_lz4])
 AC_SUBST(with_lz4)

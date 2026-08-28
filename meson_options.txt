@@ -121,8 +121,8 @@ option('libxslt', type: 'feature', value: 'auto',
 option('llvm', type: 'feature', value: 'disabled',
   description: 'LLVM support')
 
-option('lz4', type: 'feature', value: 'auto',
-  description: 'LZ4 support')
+option('lz4', type: 'feature', value: 'enabled',
+  description: 'LZ4 support (DBblue: enabled by default; wal_compression defaults to lz4)')
 
 option('nls', type: 'feature', value: 'auto',
   description: 'Native language support')
