@@ -3,7 +3,7 @@ Version: @VERSION@
 Section: database
 Priority: optional
 Architecture: @ARCH@
-Maintainer: Cybrosys Technologies <info@cybrosys.info>
+Maintainer: Cybrosys Technologies <dbblue@cybrosys.info>
 Depends: @DEPS@
 Homepage: https://github.com/cybrosystech/postgres
 Description: DBblue - Odoo-tuned PostgreSQL 19 database server

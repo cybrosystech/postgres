@@ -17,7 +17,7 @@ Do this once, on a machine you control, and keep the **private** key safe
 (only the public key is published):
 
 ```bash
-gpg --quick-generate-key "DBblue Packages <info@cybrosys.info>" default default never
+gpg --quick-generate-key "DBblue Packages <dbblue@cybrosys.info>" default default never
 ```
 
 `apt` refuses unsigned repositories, so this key is what proves your packages
@@ -28,7 +28,7 @@ are authentic.
 Build the `.deb` first (see `../deb/README.md`), then:
 
 ```bash
-GPG_KEY=info@cybrosys.info packaging/apt/build-repo.sh dist/*.deb
+GPG_KEY=dbblue@cybrosys.info packaging/apt/build-repo.sh dist/*.deb
 ```
 
 This creates/updates `./dbblue-apt/` with:
