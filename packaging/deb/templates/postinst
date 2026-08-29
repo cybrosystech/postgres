@@ -1,0 +1,50 @@
+#!/bin/sh
+set -e
+
+PREFIX=/opt/dbblue/19
+PGDATA=/var/lib/dbblue/19/data
+DBUSER=dbblue
+
+case "$1" in
+  configure)
+    # 1. system user to own the data + run the server
+    if ! getent passwd "$DBUSER" >/dev/null; then
+      adduser --system --group --home /var/lib/dbblue --shell /bin/bash \
+              --gecos "DBblue PostgreSQL" "$DBUSER"
+    fi
+    mkdir -p /var/lib/dbblue/19
+    chown -R "$DBUSER:$DBUSER" /var/lib/dbblue
+    chmod 700 /var/lib/dbblue/19
+
+    # 2. initialize the cluster on first install (skip if one already exists)
+    if [ ! -s "$PGDATA/PG_VERSION" ]; then
+      mkdir -p "$PGDATA"
+      chown "$DBUSER:$DBUSER" "$PGDATA"
+      chmod 700 "$PGDATA"
+      if ! su -s /bin/sh "$DBUSER" -c \
+          "$PREFIX/bin/initdb -D $PGDATA --encoding=UTF8 --locale=C.UTF-8 --auth-host=scram-sha-256"; then
+        su -s /bin/sh "$DBUSER" -c "$PREFIX/bin/initdb -D $PGDATA"
+      fi
+      # Safe defaults: local only. To let Odoo connect from another host/container,
+      # set listen_addresses='*' and add a pg_hba.conf rule for its network.
+      {
+        echo ""
+        echo "# --- DBblue package defaults ---"
+        echo "listen_addresses = 'localhost'"
+        echo "port = 5432"
+        echo "# To enable the columnar engine, uncomment the next two lines and restart:"
+        echo "#shared_preload_libraries = 'dbblue_columnar'"
+        echo "#dbblue_columnar.enabled = on"
+      } >> "$PGDATA/postgresql.conf"
+    fi
+
+    # 3. service
+    if [ -d /run/systemd/system ]; then
+      systemctl daemon-reload || true
+      systemctl enable dbblue.service || true
+      systemctl start dbblue.service || true
+    fi
+    ;;
+esac
+
+exit 0

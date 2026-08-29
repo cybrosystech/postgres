@@ -1,0 +1,22 @@
+[Unit]
+Description=DBblue PostgreSQL 19 (Odoo-tuned)
+Documentation=https://github.com/cybrosystech/postgres
+After=network.target
+
+[Service]
+Type=simple
+User=dbblue
+Group=dbblue
+Environment=PGDATA=/var/lib/dbblue/19/data
+# This fork is not built with --with-systemd, so we run postgres directly
+# (no sd_notify) under a simple service supervised by systemd.
+ExecStart=/opt/dbblue/19/bin/postgres -D /var/lib/dbblue/19/data
+ExecReload=/bin/kill -HUP $MAINPID
+KillMode=mixed
+KillSignal=SIGINT
+TimeoutStopSec=120
+Restart=on-failure
+OOMScoreAdjust=-900
+
+[Install]
+WantedBy=multi-user.target
