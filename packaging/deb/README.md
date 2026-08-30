@@ -48,10 +48,26 @@ service on `localhost:5432`.
 | version | `VERSION` env / default in `build-deb.sh` |
 | **`Depends:`** | **generated per build** by `dpkg-shlibdeps` — never hand-edit |
 
+## After install — management
+
+The package installs two convenience commands (on the system `PATH`):
+
+```bash
+sudo dbblue-status     # pg_lsclusters-style line: Ver / Cluster / Port / Status / Data dir
+sudo dbblue-psql       # connect as the dbblue superuser on whatever port it landed on
+```
+
+**Ports:** the install auto-picks the first free port from 5432 up (so it never
+clashes with an existing PostgreSQL); `dbblue-status` shows which one.
+
+**Logs:** file logs at `/var/log/dbblue/postgresql-YYYY-MM-DD.log`, and everything
+also goes to the systemd journal (`journalctl -u dbblue`).
+
 ## Files
 
 - `build-deb.sh` — the packager (staging → `.deb`)
 - `templates/control` — package metadata (`@VERSION@`/`@ARCH@`/`@DEPS@` filled in)
-- `templates/{postinst,prerm,postrm}` — install/remove scripts (user, initdb, service)
+- `templates/{postinst,prerm,postrm}` — install/remove scripts (user, initdb, service, port, logs)
 - `templates/systemd/dbblue.service` — the service unit
 - `templates/profile.d/dbblue.sh` — puts client tools on `PATH`
+- `templates/bin/{dbblue-status,dbblue-psql}` — management helper commands

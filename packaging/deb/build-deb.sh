@@ -40,9 +40,11 @@ fi
 mkdir -p "$OUTDIR"
 
 # --- 1. place packaged files into the stage tree -----------------------------
-install -d "$STAGE/DEBIAN" "$STAGE/lib/systemd/system" "$STAGE/etc/profile.d"
+install -d "$STAGE/DEBIAN" "$STAGE/lib/systemd/system" "$STAGE/etc/profile.d" "$STAGE/usr/bin"
 install -m 0644 "$TPL/systemd/dbblue.service" "$STAGE/lib/systemd/system/dbblue.service"
 install -m 0644 "$TPL/profile.d/dbblue.sh"    "$STAGE/etc/profile.d/dbblue.sh"
+install -m 0755 "$TPL/bin/dbblue-status"      "$STAGE/usr/bin/dbblue-status"
+install -m 0755 "$TPL/bin/dbblue-psql"        "$STAGE/usr/bin/dbblue-psql"
 
 # --- 2. compute dependencies automatically (scan ALL shipped ELF files) ------
 TMP="$(mktemp -d)"; mkdir -p "$TMP/debian"

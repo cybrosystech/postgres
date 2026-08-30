@@ -16,6 +16,11 @@ case "$1" in
     chown -R "$DBUSER:$DBUSER" /var/lib/dbblue
     chmod 700 /var/lib/dbblue/19
 
+    # log directory (file logs, in addition to the systemd journal)
+    mkdir -p /var/log/dbblue
+    chown "$DBUSER:$DBUSER" /var/log/dbblue
+    chmod 750 /var/log/dbblue
+
     # 2. initialize the cluster on first install (skip if one already exists)
     if [ ! -s "$PGDATA/PG_VERSION" ]; then
       mkdir -p "$PGDATA"
@@ -40,6 +45,9 @@ case "$1" in
         echo "# --- DBblue package defaults ---"
         echo "listen_addresses = 'localhost'"
         echo "port = $PORT"
+        echo "logging_collector = on"
+        echo "log_directory = '/var/log/dbblue'"
+        echo "log_filename = 'postgresql-%Y-%m-%d.log'"
         echo "# To enable the columnar engine, uncomment the next two lines and restart:"
         echo "#shared_preload_libraries = 'dbblue_columnar'"
         echo "#dbblue_columnar.enabled = on"

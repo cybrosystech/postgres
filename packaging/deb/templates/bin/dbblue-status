@@ -1,0 +1,25 @@
+#!/bin/sh
+# dbblue-status — show DBblue's cluster status, pg_lsclusters-style.
+# Run with sudo (needs to read the data dir): sudo dbblue-status
+set -e
+
+D=/var/lib/dbblue/19/data
+B=/opt/dbblue/19/bin
+
+if [ ! -s "$D/PG_VERSION" ]; then
+  echo "DBblue: no cluster found at $D"
+  exit 1
+fi
+
+VER="$("$B/postgres" --version | grep -oE '[0-9]+' | head -1)"
+PORT="$(sudo -u dbblue "$B/postgres" -D "$D" -C port 2>/dev/null)"
+[ -n "$PORT" ] || PORT="?"
+
+if sudo -u dbblue "$B/pg_ctl" -D "$D" status >/dev/null 2>&1; then
+  STATUS="online"
+else
+  STATUS="down"
+fi
+
+printf "%-4s %-8s %-6s %-7s %s\n" "Ver" "Cluster" "Port" "Status" "Data directory"
+printf "%-4s %-8s %-6s %-7s %s\n" "$VER" "dbblue" "$PORT" "$STATUS" "$D"
