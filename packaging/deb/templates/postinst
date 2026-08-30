@@ -25,17 +25,31 @@ case "$1" in
           "$PREFIX/bin/initdb -D $PGDATA --encoding=UTF8 --locale=C.UTF-8 --auth-host=scram-sha-256"; then
         su -s /bin/sh "$DBUSER" -c "$PREFIX/bin/initdb -D $PGDATA"
       fi
+      # Pick the first free TCP port starting at 5432, like the official
+      # PostgreSQL packages do, so an existing Postgres on 5432 does not block
+      # this install. Falls back to 5432 if `ss` is unavailable.
+      PORT=5432
+      while [ -n "$(ss -ltnH "sport = :$PORT" 2>/dev/null)" ]; do
+        PORT=$((PORT + 1))
+      done
+
       # Safe defaults: local only. To let Odoo connect from another host/container,
       # set listen_addresses='*' and add a pg_hba.conf rule for its network.
       {
         echo ""
         echo "# --- DBblue package defaults ---"
         echo "listen_addresses = 'localhost'"
-        echo "port = 5432"
+        echo "port = $PORT"
         echo "# To enable the columnar engine, uncomment the next two lines and restart:"
         echo "#shared_preload_libraries = 'dbblue_columnar'"
         echo "#dbblue_columnar.enabled = on"
       } >> "$PGDATA/postgresql.conf"
+
+      if [ "$PORT" != "5432" ]; then
+        echo "DBblue: port 5432 was in use; this instance is configured on port $PORT."
+      else
+        echo "DBblue: using port 5432."
+      fi
     fi
 
     # 3. service
