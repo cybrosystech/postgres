@@ -5,7 +5,8 @@ BIN=/opt/dbblue/19/bin
 CLUSTERS=/var/lib/dbblue/clusters
 VER="$("$BIN/postgres" --version 2>/dev/null | grep -oE '[0-9]+' | head -1)"
 
-printf "%-4s %-10s %-6s %-8s %s\n" "Ver" "Cluster" "Port" "Status" "Data directory"
+fmt="%-4s %-10s %-6s %-7s %-7s %-28s %s\n"
+printf "$fmt" "Ver" "Cluster" "Port" "Status" "Owner" "Data directory" "Log directory"
 
 found=0
 if [ -d "$CLUSTERS" ]; then
@@ -14,9 +15,19 @@ if [ -d "$CLUSTERS" ]; then
     [ -e "$data/PG_VERSION" ] || continue
     found=1
     name="$(basename "$data")"
+
     port="$(sudo -u dbblue "$BIN/postgres" -D "$data" -C port 2>/dev/null)"; [ -n "$port" ] || port="?"
     if sudo -u dbblue "$BIN/pg_ctl" -D "$data" status >/dev/null 2>&1; then st="online"; else st="down"; fi
-    printf "%-4s %-10s %-6s %-8s %s\n" "$VER" "$name" "$port" "$st" "$data"
+
+    # log location: the collector's directory, or "(journal)" if file logs are off
+    if [ "$(sudo -u dbblue "$BIN/postgres" -D "$data" -C logging_collector 2>/dev/null)" = "on" ]; then
+      logdir="$(sudo -u dbblue "$BIN/postgres" -D "$data" -C log_directory 2>/dev/null)"
+      case "$logdir" in /*) : ;; *) logdir="$data/$logdir" ;; esac
+    else
+      logdir="(journal)"
+    fi
+
+    printf "$fmt" "$VER" "$name" "$port" "$st" "dbblue" "$data" "$logdir"
   done
 fi
 
