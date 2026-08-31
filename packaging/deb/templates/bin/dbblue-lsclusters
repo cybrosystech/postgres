@@ -5,6 +5,9 @@ BIN=/opt/dbblue/19/bin
 CLUSTERS=/var/lib/dbblue/clusters
 VER="$("$BIN/postgres" --version 2>/dev/null | grep -oE '[0-9]+' | head -1)"
 
+# needs root to read the dbblue-owned cluster dirs
+if [ "$(id -u)" -ne 0 ]; then echo "run with sudo: sudo dbblue-lsclusters"; exit 1; fi
+
 fmt="%-4s %-10s %-6s %-7s %-7s %-28s %s\n"
 printf "$fmt" "Ver" "Cluster" "Port" "Status" "Owner" "Data directory" "Log directory"
 

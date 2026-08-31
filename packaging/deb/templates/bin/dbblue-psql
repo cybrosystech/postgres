@@ -9,6 +9,9 @@ set -e
 BIN=/opt/dbblue/19/bin
 CLUSTERS=/var/lib/dbblue/clusters
 
+# needs root to reach the dbblue-owned cluster + connect as the dbblue role
+if [ "$(id -u)" -ne 0 ]; then echo "run with sudo: sudo dbblue-psql [cluster]"; exit 1; fi
+
 # First arg is a cluster name only if it matches an existing cluster; else default 'main'.
 CLUSTER=main
 if [ -n "$1" ] && [ -e "$CLUSTERS/$1/PG_VERSION" ]; then CLUSTER="$1"; shift; fi
