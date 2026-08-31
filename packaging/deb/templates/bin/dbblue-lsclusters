@@ -1,0 +1,23 @@
+#!/bin/sh
+# dbblue-lsclusters — list all DBblue clusters (like pg_lsclusters).
+#   sudo dbblue-lsclusters
+BIN=/opt/dbblue/19/bin
+CLUSTERS=/var/lib/dbblue/clusters
+VER="$("$BIN/postgres" --version 2>/dev/null | grep -oE '[0-9]+' | head -1)"
+
+printf "%-4s %-10s %-6s %-8s %s\n" "Ver" "Cluster" "Port" "Status" "Data directory"
+
+found=0
+if [ -d "$CLUSTERS" ]; then
+  for d in "$CLUSTERS"/*/; do
+    data="${d%/}"
+    [ -e "$data/PG_VERSION" ] || continue
+    found=1
+    name="$(basename "$data")"
+    port="$(sudo -u dbblue "$BIN/postgres" -D "$data" -C port 2>/dev/null)"; [ -n "$port" ] || port="?"
+    if sudo -u dbblue "$BIN/pg_ctl" -D "$data" status >/dev/null 2>&1; then st="online"; else st="down"; fi
+    printf "%-4s %-10s %-6s %-8s %s\n" "$VER" "$name" "$port" "$st" "$data"
+  done
+fi
+
+[ "$found" = 1 ] || echo "(no clusters yet — create one with: sudo dbblue-createcluster main)"

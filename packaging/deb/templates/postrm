@@ -3,12 +3,17 @@ set -e
 
 case "$1" in
   purge)
-    if [ -d /run/systemd/system ]; then
-      systemctl disable dbblue.service || true
+    # disable every DBblue cluster instance
+    if [ -d /run/systemd/system ] && [ -d /var/lib/dbblue/clusters ]; then
+      for d in /var/lib/dbblue/clusters/*/; do
+        [ -e "$d/PG_VERSION" ] || continue
+        n="$(basename "$d")"
+        systemctl disable "dbblue@$n.service" 2>/dev/null || true
+      done
     fi
-    # NOTE: the database cluster in /var/lib/dbblue is deliberately NOT deleted
-    # on purge, to avoid accidental data loss. Remove it manually if intended:
-    #   sudo rm -rf /var/lib/dbblue
+    # NOTE: cluster data in /var/lib/dbblue is deliberately NOT deleted on purge,
+    # to avoid accidental data loss. Remove it manually if intended:
+    #   sudo rm -rf /var/lib/dbblue /var/log/dbblue
     ;;
 esac
 

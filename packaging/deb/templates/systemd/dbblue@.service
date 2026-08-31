@@ -1,5 +1,5 @@
 [Unit]
-Description=DBblue PostgreSQL 19 (Odoo-tuned)
+Description=DBblue PostgreSQL 19 cluster %i (Odoo-tuned)
 Documentation=https://github.com/cybrosystech/postgres
 After=network.target
 
@@ -7,10 +7,9 @@ After=network.target
 Type=simple
 User=dbblue
 Group=dbblue
-Environment=PGDATA=/var/lib/dbblue/19/data
-# This fork is not built with --with-systemd, so we run postgres directly
-# (no sd_notify) under a simple service supervised by systemd.
-ExecStart=/opt/dbblue/19/bin/postgres -D /var/lib/dbblue/19/data
+Environment=PGDATA=/var/lib/dbblue/clusters/%i
+# Not built with --with-systemd, so postgres runs directly (no sd_notify).
+ExecStart=/opt/dbblue/19/bin/postgres -D /var/lib/dbblue/clusters/%i
 ExecReload=/bin/kill -HUP $MAINPID
 KillMode=mixed
 KillSignal=SIGINT

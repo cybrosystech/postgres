@@ -37,8 +37,8 @@ sudo apt install ./dist/dbblue-postgres_*.deb
 ```
 
 `apt` pulls in the runtime dependencies (including `liblz4-1`) automatically,
-initializes a cluster in `/var/lib/dbblue/19/data`, and starts the `dbblue`
-service on `localhost:5432`.
+creates a default cluster named **`main`** in `/var/lib/dbblue/clusters/main`,
+picks a free port (5432 up), and starts it as `dbblue@main.service`.
 
 ## What's static vs generated
 
@@ -48,26 +48,34 @@ service on `localhost:5432`.
 | version | `VERSION` env / default in `build-deb.sh` |
 | **`Depends:`** | **generated per build** by `dpkg-shlibdeps` — never hand-edit |
 
-## After install — management
+## Managing clusters (like pg_createcluster)
 
-The package installs two convenience commands (on the system `PATH`):
+DBblue runs one or more **named clusters**, each with its own port, log dir,
+and systemd instance (`dbblue@<name>.service`). Commands (on the system `PATH`):
 
 ```bash
-sudo dbblue-status     # pg_lsclusters-style line: Ver / Cluster / Port / Status / Data dir
-sudo dbblue-psql       # connect as the dbblue superuser on whatever port it landed on
+sudo dbblue-createcluster main          # initdb + free port + start (done automatically on install)
+sudo dbblue-createcluster test 5440     # a second cluster on an explicit port
+sudo dbblue-lsclusters                  # Ver / Cluster / Port / Status / Data dir  (= dbblue-status)
+sudo dbblue-psql                        # connect to 'main' as the dbblue superuser
+sudo dbblue-psql test -c '\l'           # connect to another cluster, pass args to psql
+sudo dbblue-dropcluster test            # stop + permanently remove a cluster
 ```
 
-**Ports:** the install auto-picks the first free port from 5432 up (so it never
-clashes with an existing PostgreSQL); `dbblue-status` shows which one.
+Each cluster: data in `/var/lib/dbblue/clusters/<name>`, managed with
+`systemctl {start,stop,restart} dbblue@<name>`.
 
-**Logs:** file logs at `/var/log/dbblue/postgresql-YYYY-MM-DD.log`, and everything
-also goes to the systemd journal (`journalctl -u dbblue`).
+**Ports:** `dbblue-createcluster` auto-picks the first free port from 5432 up
+(so it never clashes with an existing PostgreSQL); `dbblue-lsclusters` shows it.
+
+**Logs:** file logs at `/var/log/dbblue/<name>/postgresql-YYYY-MM-DD.log`, plus
+the systemd journal (`journalctl -u dbblue@<name>`).
 
 ## Files
 
 - `build-deb.sh` — the packager (staging → `.deb`)
 - `templates/control` — package metadata (`@VERSION@`/`@ARCH@`/`@DEPS@` filled in)
-- `templates/{postinst,prerm,postrm}` — install/remove scripts (user, initdb, service, port, logs)
-- `templates/systemd/dbblue.service` — the service unit
+- `templates/{postinst,prerm,postrm}` — install/remove scripts (user, default cluster, service)
+- `templates/systemd/dbblue@.service` — the per-cluster service template
 - `templates/profile.d/dbblue.sh` — puts client tools on `PATH`
-- `templates/bin/{dbblue-status,dbblue-psql}` — management helper commands
+- `templates/bin/dbblue-{createcluster,dropcluster,lsclusters,status,psql}` — cluster management commands

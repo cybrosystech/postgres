@@ -1,0 +1,60 @@
+#!/bin/sh
+# dbblue-createcluster NAME [PORT]
+# Create, configure, and start a new DBblue cluster (like pg_createcluster).
+#   sudo dbblue-createcluster main          # auto-picks a free port
+#   sudo dbblue-createcluster test 5440     # explicit port
+set -e
+
+BIN=/opt/dbblue/19/bin
+CLUSTERS=/var/lib/dbblue/clusters
+LOGS=/var/log/dbblue
+
+NAME="$1"
+if [ -z "$NAME" ]; then echo "usage: dbblue-createcluster NAME [PORT]"; exit 1; fi
+case "$NAME" in
+  *[!a-zA-Z0-9_-]*) echo "cluster name may contain only letters, digits, '-' and '_'"; exit 1;;
+esac
+if [ "$(id -u)" -ne 0 ]; then echo "run with sudo"; exit 1; fi
+if ! getent passwd dbblue >/dev/null; then
+  echo "the 'dbblue' system user is missing — is the dbblue-postgres package installed?"; exit 1
+fi
+
+DATA="$CLUSTERS/$NAME"
+if [ -e "$DATA/PG_VERSION" ]; then echo "cluster '$NAME' already exists at $DATA"; exit 1; fi
+
+# port: explicit arg, else first free from 5432 up
+PORT="$2"
+if [ -z "$PORT" ]; then
+  PORT=5432
+  while [ -n "$(ss -ltnH "sport = :$PORT" 2>/dev/null)" ]; do PORT=$((PORT + 1)); done
+fi
+
+install -d -o dbblue -g dbblue -m 700 "$DATA"
+install -d -o dbblue -g dbblue -m 750 "$LOGS/$NAME"
+
+if ! su -s /bin/sh dbblue -c "$BIN/initdb -D '$DATA' --encoding=UTF8 --locale=C.UTF-8 --auth-host=scram-sha-256"; then
+  su -s /bin/sh dbblue -c "$BIN/initdb -D '$DATA'"
+fi
+
+{
+  echo ""
+  echo "# --- DBblue cluster: $NAME ---"
+  echo "listen_addresses = 'localhost'"
+  echo "port = $PORT"
+  echo "logging_collector = on"
+  echo "log_directory = '$LOGS/$NAME'"
+  echo "log_filename = 'postgresql-%Y-%m-%d.log'"
+  echo "# To enable the columnar engine, uncomment the next two lines and restart:"
+  echo "#shared_preload_libraries = 'dbblue_columnar'"
+  echo "#dbblue_columnar.enabled = on"
+} >> "$DATA/postgresql.conf"
+
+if [ -d /run/systemd/system ]; then
+  systemctl enable "dbblue@$NAME.service" >/dev/null 2>&1 || true
+  systemctl start  "dbblue@$NAME.service"
+fi
+
+echo "Created DBblue cluster '$NAME' on port $PORT"
+echo "  data: $DATA"
+echo "  logs: $LOGS/$NAME"
+echo "  connect: sudo dbblue-psql $NAME"

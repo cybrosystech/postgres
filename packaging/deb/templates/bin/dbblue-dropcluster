@@ -1,0 +1,27 @@
+#!/bin/sh
+# dbblue-dropcluster NAME
+# Stop and PERMANENTLY remove a DBblue cluster (like pg_dropcluster).
+#   sudo dbblue-dropcluster test
+set -e
+
+CLUSTERS=/var/lib/dbblue/clusters
+LOGS=/var/log/dbblue
+
+NAME="$1"
+if [ -z "$NAME" ]; then echo "usage: dbblue-dropcluster NAME"; exit 1; fi
+if [ "$(id -u)" -ne 0 ]; then echo "run with sudo"; exit 1; fi
+
+DATA="$CLUSTERS/$NAME"
+if [ ! -e "$DATA/PG_VERSION" ]; then echo "no DBblue cluster named '$NAME' at $DATA"; exit 1; fi
+
+printf "This will PERMANENTLY delete cluster '%s' and ALL its data (%s).\nContinue? [y/N] " "$NAME" "$DATA"
+read ans
+case "$ans" in y|Y|yes|YES) ;; *) echo "aborted"; exit 1;; esac
+
+if [ -d /run/systemd/system ]; then
+  systemctl stop    "dbblue@$NAME.service" 2>/dev/null || true
+  systemctl disable "dbblue@$NAME.service" 2>/dev/null || true
+fi
+
+rm -rf "$DATA" "$LOGS/$NAME"
+echo "Dropped DBblue cluster '$NAME'."

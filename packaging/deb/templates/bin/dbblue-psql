@@ -1,21 +1,25 @@
 #!/bin/sh
-# dbblue-psql — connect to DBblue on whatever port/socket it uses, as the
-# dbblue superuser. Extra args are passed through to psql.
-#   sudo dbblue-psql                 # opens the postgres database
-#   sudo dbblue-psql -d mydb -c '\l'
+# dbblue-psql [CLUSTER] [psql args...]
+# Connect to a DBblue cluster as the dbblue superuser (default cluster: main).
+#   sudo dbblue-psql                      # connect to 'main'
+#   sudo dbblue-psql test                 # connect to cluster 'test'
+#   sudo dbblue-psql main -c '\l'         # pass args through to psql
 set -e
 
-D=/var/lib/dbblue/19/data
-B=/opt/dbblue/19/bin
+BIN=/opt/dbblue/19/bin
+CLUSTERS=/var/lib/dbblue/clusters
 
-if [ ! -s "$D/PG_VERSION" ]; then
-  echo "DBblue: no cluster found at $D"
-  exit 1
+# First arg is a cluster name only if it matches an existing cluster; else default 'main'.
+CLUSTER=main
+if [ -n "$1" ] && [ -e "$CLUSTERS/$1/PG_VERSION" ]; then CLUSTER="$1"; shift; fi
+
+DATA="$CLUSTERS/$CLUSTER"
+if [ ! -e "$DATA/PG_VERSION" ]; then
+  echo "no DBblue cluster '$CLUSTER' at $DATA (see: sudo dbblue-lsclusters)"; exit 1
 fi
 
-PORT="$(sudo -u dbblue "$B/postgres" -D "$D" -C port 2>/dev/null)"
-[ -n "$PORT" ] || PORT=5432
-SOCK="$(sudo -u dbblue "$B/postgres" -D "$D" -C unix_socket_directories 2>/dev/null | cut -d, -f1 | tr -d ' ')"
+PORT="$(sudo -u dbblue "$BIN/postgres" -D "$DATA" -C port 2>/dev/null)"; [ -n "$PORT" ] || PORT=5432
+SOCK="$(sudo -u dbblue "$BIN/postgres" -D "$DATA" -C unix_socket_directories 2>/dev/null | cut -d, -f1 | tr -d ' ')"
 [ -n "$SOCK" ] || SOCK=/tmp
 
-exec sudo -u dbblue "$B/psql" -h "$SOCK" -p "$PORT" -d "${PGDATABASE:-postgres}" "$@"
+exec sudo -u dbblue "$BIN/psql" -h "$SOCK" -p "$PORT" -d "${PGDATABASE:-postgres}" "$@"

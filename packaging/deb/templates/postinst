@@ -1,70 +1,31 @@
 #!/bin/sh
 set -e
 
-PREFIX=/opt/dbblue/19
-PGDATA=/var/lib/dbblue/19/data
 DBUSER=dbblue
 
 case "$1" in
   configure)
-    # 1. system user to own the data + run the server
+    # 1. system user to own the clusters + run the servers
     if ! getent passwd "$DBUSER" >/dev/null; then
       adduser --system --group --home /var/lib/dbblue --shell /bin/bash \
               --gecos "DBblue PostgreSQL" "$DBUSER"
     fi
-    mkdir -p /var/lib/dbblue/19
-    chown -R "$DBUSER:$DBUSER" /var/lib/dbblue
-    chmod 700 /var/lib/dbblue/19
+    mkdir -p /var/lib/dbblue/clusters /var/log/dbblue
+    chown "$DBUSER:$DBUSER" /var/lib/dbblue /var/lib/dbblue/clusters /var/log/dbblue
+    chmod 750 /var/lib/dbblue/clusters /var/log/dbblue
 
-    # log directory (file logs, in addition to the systemd journal)
-    mkdir -p /var/log/dbblue
-    chown "$DBUSER:$DBUSER" /var/log/dbblue
-    chmod 750 /var/log/dbblue
-
-    # 2. initialize the cluster on first install (skip if one already exists)
-    if [ ! -s "$PGDATA/PG_VERSION" ]; then
-      mkdir -p "$PGDATA"
-      chown "$DBUSER:$DBUSER" "$PGDATA"
-      chmod 700 "$PGDATA"
-      if ! su -s /bin/sh "$DBUSER" -c \
-          "$PREFIX/bin/initdb -D $PGDATA --encoding=UTF8 --locale=C.UTF-8 --auth-host=scram-sha-256"; then
-        su -s /bin/sh "$DBUSER" -c "$PREFIX/bin/initdb -D $PGDATA"
-      fi
-      # Pick the first free TCP port starting at 5432, like the official
-      # PostgreSQL packages do, so an existing Postgres on 5432 does not block
-      # this install. Falls back to 5432 if `ss` is unavailable.
-      PORT=5432
-      while [ -n "$(ss -ltnH "sport = :$PORT" 2>/dev/null)" ]; do
-        PORT=$((PORT + 1))
-      done
-
-      # Safe defaults: local only. To let Odoo connect from another host/container,
-      # set listen_addresses='*' and add a pg_hba.conf rule for its network.
-      {
-        echo ""
-        echo "# --- DBblue package defaults ---"
-        echo "listen_addresses = 'localhost'"
-        echo "port = $PORT"
-        echo "logging_collector = on"
-        echo "log_directory = '/var/log/dbblue'"
-        echo "log_filename = 'postgresql-%Y-%m-%d.log'"
-        echo "# To enable the columnar engine, uncomment the next two lines and restart:"
-        echo "#shared_preload_libraries = 'dbblue_columnar'"
-        echo "#dbblue_columnar.enabled = on"
-      } >> "$PGDATA/postgresql.conf"
-
-      if [ "$PORT" != "5432" ]; then
-        echo "DBblue: port 5432 was in use; this instance is configured on port $PORT."
-      else
-        echo "DBblue: using port 5432."
-      fi
-    fi
-
-    # 3. service
+    # 2. make the template service known
     if [ -d /run/systemd/system ]; then
       systemctl daemon-reload || true
-      systemctl enable dbblue.service || true
-      systemctl start dbblue.service || true
+    fi
+
+    # 3. create the default 'main' cluster on first install
+    #    (dbblue-createcluster handles initdb + free port + config + start)
+    if [ ! -e /var/lib/dbblue/clusters/main/PG_VERSION ]; then
+      if ! dbblue-createcluster main; then
+        echo "DBblue: automatic 'main' cluster creation failed;"
+        echo "       run it manually with:  sudo dbblue-createcluster main"
+      fi
     fi
     ;;
 esac

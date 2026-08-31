@@ -3,8 +3,13 @@ set -e
 
 case "$1" in
   remove|deconfigure|upgrade)
-    if [ -d /run/systemd/system ]; then
-      systemctl stop dbblue.service || true
+    # stop every DBblue cluster instance
+    if [ -d /run/systemd/system ] && [ -d /var/lib/dbblue/clusters ]; then
+      for d in /var/lib/dbblue/clusters/*/; do
+        [ -e "$d/PG_VERSION" ] || continue
+        n="$(basename "$d")"
+        systemctl stop "dbblue@$n.service" 2>/dev/null || true
+      done
     fi
     ;;
 esac
