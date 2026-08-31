@@ -1,0 +1,119 @@
+# Build the dbblue-postgres .deb for each supported Ubuntu release and publish
+# them to the signed APT repo (cybrosystech/dbblue-apt, served via GitHub Pages).
+#
+# ── One-time setup (repository Settings → Secrets and variables → Actions) ──
+#   DBBLUE_GPG_PRIVATE_KEY  armored private signing key:
+#                             gpg --armor --export-secret-keys dbblue@cybrosys.info
+#                           (must be passphraseless — the same key used locally)
+#   DBBLUE_APT_TOKEN        a token with write access to cybrosystech/dbblue-apt
+#                           (fine-grained PAT: Contents = read/write on that repo)
+#
+# ── How to cut a release ──
+#   Manual:  Actions → "release-deb" → Run workflow (set the version), OR
+#   Tag:     git tag v19beta2-1 && git push origin v19beta2-1
+#
+# Each OS release builds its own .deb (dpkg-shlibdeps picks the right libicu/…
+# per release); the publish job files each into its codename pocket and signs.
+
+name: release-deb
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Package version (Debian format, e.g. 19~beta2-1)"
+        default: "19~beta2-1"
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            codename: jammy
+          - os: ubuntu-24.04
+            codename: noble
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config bison flex perl \
+            libreadline-dev zlib1g-dev libicu-dev liblz4-dev dpkg-dev fakeroot
+
+      - name: Configure + build DBblue
+        run: |
+          ./configure --prefix=/opt/dbblue/19 --with-lz4 CFLAGS="-O2"
+          make -j"$(nproc)"
+          make install            DESTDIR="$PWD/stage"
+          make -C contrib install DESTDIR="$PWD/stage"
+
+      - name: Package the .deb
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+        run: packaging/deb/build-deb.sh
+
+      - name: Upload the .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.codename }}
+          path: dist/*.deb
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the source (for the packaging scripts)
+        uses: actions/checkout@v4
+
+      - name: Install repo-building tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dpkg-dev apt-utils gnupg
+
+      - name: Download all built .debs
+        uses: actions/download-artifact@v4
+        with:
+          path: debs        # -> debs/deb-jammy/*.deb, debs/deb-noble/*.deb
+
+      - name: Import the signing key
+        run: |
+          printf '%s' "${{ secrets.DBBLUE_GPG_PRIVATE_KEY }}" | gpg --batch --import
+
+      - name: Check out the APT repo
+        uses: actions/checkout@v4
+        with:
+          repository: cybrosystech/dbblue-apt
+          token: ${{ secrets.DBBLUE_APT_TOKEN }}
+          path: dbblue-apt
+
+      - name: Assemble + sign the repo (per codename)
+        run: |
+          for d in debs/deb-*; do
+            cn="${d#debs/deb-}"
+            for deb in "$d"/*.deb; do
+              echo ">> adding $deb to pocket '$cn'"
+              CODENAME="$cn" GPG_KEY=dbblue@cybrosys.info REPO="$PWD/dbblue-apt" \
+                packaging/apt/build-repo.sh "$deb"
+            done
+          done
+          cp packaging/apt/setup-dbblue-repo.sh dbblue-apt/
+
+      - name: Commit + push the repo
+        run: |
+          cd dbblue-apt
+          git config user.name  "DBblue CI"
+          git config user.email "dbblue@cybrosys.info"
+          git add -A
+          git commit -m "publish ${GITHUB_REF_NAME:-manual} (jammy + noble)" \
+            || { echo "nothing to publish"; exit 0; }
+          git push
