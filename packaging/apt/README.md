@@ -69,10 +69,11 @@ curl -fsSL https://cybrosystech.github.io/dbblue-apt/setup-dbblue-repo.sh | sudo
 sudo apt install dbblue-postgres
 ```
 
-`apt` pulls in `liblz4-1` and the other dependencies automatically. Updates
-later are just `sudo apt update && sudo apt upgrade`.
+`apt` pulls in `liblz4-1` and the other dependencies automatically. To update
+just DBblue later: `sudo apt update && sudo apt install --only-upgrade dbblue-postgres`.
 
 ## Publishing a new version
 
 Build the new `.deb`, re-run `build-repo.sh` with it, and re-upload the
-`dbblue-apt/` folder. Users get it with a normal `apt upgrade`.
+`dbblue-apt/` folder. Users get it with
+`sudo apt update && sudo apt install --only-upgrade dbblue-postgres`.

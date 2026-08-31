@@ -87,7 +87,7 @@ GPG_KEY=dbblue@cybrosys.info \
 cd dbblue-apt && git add -A && git commit -m "release" && git push
 ```
 
-**Versioning rule:** the package version must increase for `apt upgrade` to
+**Versioning rule:** the package version must increase for an upgrade to
 reach installed users. Bump the revision (`-2`, `-3`) for packaging-only
 changes; bump the upstream part (`19~beta3`) when the database code changes.
 While there are no users, the version can stay the same across rebuilds.
@@ -115,7 +115,8 @@ curl -fsSL https://cybrosystech.github.io/dbblue-apt/setup-dbblue-repo.sh | sudo
 sudo apt install -y dbblue-postgres
 ```
 Works identically on every supported Ubuntu — the setup script detects the OS
-codename and `apt` pulls the matching build. Updates: `sudo apt update && sudo apt upgrade`.
+codename and `apt` pulls the matching build. Updates (DBblue only):
+`sudo apt update && sudo apt install --only-upgrade dbblue-postgres`.
 
 ---
 
