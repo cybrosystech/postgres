@@ -58,6 +58,7 @@
 #include "pgstat.h"
 #include "rewrite/rewriteHandler.h"
 #include "tcop/utility.h"
+#include "statistics/dbblue_autostats.h"
 #include "utils/acl.h"
 #include "utils/backend_status.h"
 #include "utils/lsyscache.h"
@@ -247,6 +248,13 @@ standard_ExecutorStart(QueryDesc *queryDesc, int eflags)
 	estate->es_snapshot = RegisterSnapshot(queryDesc->snapshot);
 	estate->es_crosscheck_snapshot = RegisterSnapshot(queryDesc->crosscheck_snapshot);
 	estate->es_top_eflags = eflags;
+	/*
+	 * dbblue: sampled executions count rows so the statistics advisor can
+	 * compare the planner's estimate against reality.  Rows only -- no timing.
+	 */
+	if (AutoStatsWantInstrumentation())
+		queryDesc->instrument_options |= INSTRUMENT_ROWS;
+
 	estate->es_instrument = queryDesc->instrument_options;
 	estate->es_jit_flags = queryDesc->plannedstmt->jitFlags;
 
@@ -494,6 +502,9 @@ standard_ExecutorEnd(QueryDesc *queryDesc)
 	estate = queryDesc->estate;
 
 	Assert(estate != NULL);
+
+	/* dbblue: confirm statistics-advisor candidates against actual rows */
+	AutoStatsNoteExec(queryDesc);
 
 	if (estate->es_parallel_workers_to_launch > 0)
 		pgstat_update_parallel_workers_stats((PgStat_Counter) estate->es_parallel_workers_to_launch,

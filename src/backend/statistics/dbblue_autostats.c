@@ -36,9 +36,12 @@
 #include "access/xact.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_class.h"
+#include "executor/executor.h"
+#include "executor/instrument.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
+#include "optimizer/optimizer.h"
 #include "parser/parsetree.h"
 #include "statistics/dbblue_autostats.h"
 #include "statistics/statistics.h"
@@ -56,9 +59,10 @@
 bool		dbblue_autostats_enabled = false;
 int			dbblue_autostats_max = 5000;
 int			dbblue_autostats_local_max = 512;
+int			dbblue_autostats_sample_rate = 10;
 
 /* number of output columns of dbblue_stats_advisor() */
-#define DBBLUE_ADVISOR_COLS		9
+#define DBBLUE_ADVISOR_COLS		14
 
 /*
  * Key identifying one observed column combination.
@@ -81,6 +85,19 @@ typedef struct AutoStatsEntry
 	AutoStatsKey key;			/* hash key, must be first */
 	uint64		plan_count;		/* times estimated independently */
 	bool		all_equality;	/* were all clauses equality-shaped? */
+	double		plan_est_rows;	/* most recent plan-time row estimate */
+
+	/*
+	 * Execution-side confirmation.  These are only populated for sampled
+	 * executions, and estimate/actual always come from the same scan node of
+	 * the same execution -- comparing a plan-time estimate against an actual
+	 * from some other query would be meaningless.
+	 */
+	uint64		exec_count;		/* confirmed measurements */
+	double		exec_est_rows;	/* estimate from the most recent measurement */
+	double		exec_act_rows;	/* actual from the most recent measurement */
+	double		max_error;		/* worst actual/estimate ratio seen */
+
 	TimestampTz first_seen;
 	TimestampTz last_seen;
 } AutoStatsEntry;
@@ -105,6 +122,11 @@ typedef struct AutoStatsLocalEntry
 {
 	AutoStatsKey key;			/* hash key, must be first */
 	uint32		pending;		/* unflushed plan count */
+	double		plan_est_rows;	/* most recent plan-time row estimate */
+	uint32		pending_exec;	/* unflushed confirmed measurements */
+	double		exec_est_rows;
+	double		exec_act_rows;
+	double		max_error;
 	bool		all_equality;
 	bool		is_dirty;
 	struct AutoStatsLocalEntry *next_dirty;
@@ -118,6 +140,8 @@ static void dbblue_autostats_shmem_request(void *arg);
 static void dbblue_autostats_shmem_init(void *arg);
 static void autostats_xact_callback(XactEvent event, void *arg);
 static void autostats_flush_local(void);
+static void autostats_note_local(const AutoStatsKey *key, bool all_equality,
+								 double plan_est_rows);
 static bool clause_is_equality_shaped(Node *clause);
 static char *autostats_live_attname(Oid relid, int16 attnum);
 static char *autostats_build_ddl(const AutoStatsKey *key, bool all_equality,
@@ -275,7 +299,8 @@ clause_is_equality_shaped(Node *clause)
  *		Bump the per-backend counter for one column combination.
  */
 static void
-autostats_note_local(const AutoStatsKey *key, bool all_equality)
+autostats_note_local(const AutoStatsKey *key, bool all_equality,
+					 double plan_est_rows)
 {
 	AutoStatsLocalEntry *entry;
 	bool		found;
@@ -310,7 +335,7 @@ autostats_note_local(const AutoStatsKey *key, bool all_equality)
 		hash_destroy(AutoStatsLocalHash);
 		AutoStatsLocalHash = NULL;
 		AutoStatsDirtyList = NULL;
-		autostats_note_local(key, all_equality);
+		autostats_note_local(key, all_equality, plan_est_rows);
 		return;
 	}
 
@@ -320,6 +345,10 @@ autostats_note_local(const AutoStatsKey *key, bool all_equality)
 	if (!found)
 	{
 		entry->pending = 0;
+		entry->pending_exec = 0;
+		entry->exec_est_rows = 0;
+		entry->exec_act_rows = 0;
+		entry->max_error = 0;
 		entry->all_equality = all_equality;
 		entry->is_dirty = false;
 		entry->next_dirty = NULL;
@@ -336,6 +365,7 @@ autostats_note_local(const AutoStatsKey *key, bool all_equality)
 	}
 
 	entry->pending++;
+	entry->plan_est_rows = plan_est_rows;
 
 	if (!entry->is_dirty)
 	{
@@ -388,12 +418,28 @@ autostats_flush_local(void)
 		{
 			shared->plan_count = 0;
 			shared->all_equality = local->all_equality;
+			shared->exec_count = 0;
+			shared->exec_est_rows = 0;
+			shared->exec_act_rows = 0;
+			shared->max_error = 0;
 			shared->first_seen = now;
 		}
 		else if (!local->all_equality)
 			shared->all_equality = false;
 
 		shared->plan_count += local->pending;
+		if (local->pending > 0)
+			shared->plan_est_rows = local->plan_est_rows;
+
+		if (local->pending_exec > 0)
+		{
+			shared->exec_count += local->pending_exec;
+			shared->exec_est_rows = local->exec_est_rows;
+			shared->exec_act_rows = local->exec_act_rows;
+			if (local->max_error > shared->max_error)
+				shared->max_error = local->max_error;
+		}
+
 		shared->last_seen = now;
 	}
 
@@ -405,6 +451,8 @@ autostats_flush_local(void)
 		AutoStatsLocalEntry *next = local->next_dirty;
 
 		local->pending = 0;
+		local->pending_exec = 0;
+		local->max_error = 0;
 		local->is_dirty = false;
 		local->next_dirty = NULL;
 		local = next;
@@ -444,7 +492,7 @@ autostats_xact_callback(XactEvent event, void *arg)
  */
 void
 AutoStatsNoteClauses(PlannerInfo *root, RelOptInfo *rel, List *clauses,
-					 Bitmapset *estimatedclauses)
+					 Bitmapset *estimatedclauses, double sel)
 {
 	RangeTblEntry *rte;
 	Bitmapset  *attnums = NULL;
@@ -523,7 +571,11 @@ AutoStatsNoteClauses(PlannerInfo *root, RelOptInfo *rel, List *clauses,
 	if (!autostats_init_key(&key, rte->relid, attnums))
 		return;
 
-	autostats_note_local(&key, all_equality);
+	/*
+	 * The planner's row estimate for this clause list: the selectivity it just
+	 * finished computing, applied to the relation's row count.
+	 */
+	autostats_note_local(&key, all_equality, clamp_row_est(sel * rel->tuples));
 }
 
 /*
@@ -620,6 +672,279 @@ autostats_build_ddl(const AutoStatsKey *key, bool all_equality,
 	return buf.data;
 }
 
+
+/* ----------------------------------------------------------------
+ * Execution-side confirmation
+ *
+ * Recording at plan time tells us where the planner had to guess, but not
+ * whether the guess was any good.  To learn that we have to compare the
+ * estimate against the rows the scan really produced, which means asking the
+ * executor to count rows -- something it does not do by default because it
+ * costs a little per tuple.
+ *
+ * So we sample: only a percentage of executions are counted, controlled by
+ * dbblue_autostats_sample_rate.  Row counting only (INSTRUMENT_ROWS), never
+ * timing, so there is no gettimeofday() per tuple.
+ * ----------------------------------------------------------------
+ */
+
+/*
+ * AutoStatsWantInstrumentation
+ *		Should this execution count rows?
+ *
+ * Deterministic rather than random, so a given rate produces exactly that
+ * proportion of sampled executions and behaviour is reproducible.
+ */
+bool
+AutoStatsWantInstrumentation(void)
+{
+	static int	accum = -1;
+
+	if (!dbblue_autostats_enabled || AutoStatsHash == NULL)
+		return false;
+
+	if (dbblue_autostats_sample_rate <= 0)
+		return false;
+	if (dbblue_autostats_sample_rate >= 100)
+		return true;
+
+	/*
+	 * Prime the accumulator so the very first execution is measured, then
+	 * every 1-in-N after that.  Otherwise a 10% rate means nine executions
+	 * produce nothing at all, and anyone testing by hand reasonably concludes
+	 * the feature is broken.
+	 */
+	if (accum < 0)
+		accum = 100 - dbblue_autostats_sample_rate;
+
+	accum += dbblue_autostats_sample_rate;
+	if (accum >= 100)
+	{
+		accum -= 100;
+		return true;
+	}
+
+	return false;
+}
+
+/*
+ * autostats_scan_quals
+ *		All qual expressions that filter a scan node's output.
+ *
+ * The planner may split one clause list across several places: with an index
+ * scan some conditions become index quals and only the rest remain as a
+ * filter.  We want the whole set, because the node's plan_rows reflects all of
+ * them together.
+ */
+static List *
+autostats_scan_quals(Plan *plan)
+{
+	List	   *quals = plan->qual;
+
+	switch (nodeTag(plan))
+	{
+		case T_IndexScan:
+			quals = list_concat_copy(quals, ((IndexScan *) plan)->indexqualorig);
+			break;
+		case T_IndexOnlyScan:
+			quals = list_concat_copy(quals, ((IndexOnlyScan *) plan)->indexqual);
+			break;
+		case T_BitmapHeapScan:
+			quals = list_concat_copy(quals,
+									 ((BitmapHeapScan *) plan)->bitmapqualorig);
+			break;
+		case T_SeqScan:
+		case T_TidScan:
+			break;
+		default:
+			return NIL;			/* not a scan we can interpret */
+	}
+
+	return quals;
+}
+
+/*
+ * autostats_record_actual
+ *		Fold one measurement into the per-backend entry.
+ *
+ * Deliberately updates the local cache rather than shared memory: the
+ * plan-time sighting for this same query has not been flushed yet (that
+ * happens at transaction end), so the combination does not exist in the
+ * shared hash while the query that produced it is still running.  Writing the
+ * measurement locally keeps estimate and actual together and lets both reach
+ * shared memory in the same flush.
+ */
+static void
+autostats_record_actual(Oid relid, Bitmapset *attnums,
+						double est_rows, double act_rows)
+{
+	AutoStatsKey key;
+	AutoStatsLocalEntry *entry;
+	double		error;
+
+	if (AutoStatsLocalHash == NULL)
+		return;
+
+	if (!autostats_init_key(&key, relid, attnums))
+		return;
+
+	/*
+	 * HASH_FIND, not HASH_ENTER: a scan whose column set we never recorded at
+	 * plan time is not a candidate, and inventing an entry here would report
+	 * combinations the planner handled perfectly well.
+	 */
+	entry = (AutoStatsLocalEntry *) hash_search(AutoStatsLocalHash, &key,
+												HASH_FIND, NULL);
+	if (entry == NULL)
+		return;
+
+	error = act_rows / Max(est_rows, 1.0);
+
+	entry->pending_exec++;
+	entry->exec_est_rows = est_rows;
+	entry->exec_act_rows = act_rows;
+	if (error > entry->max_error)
+		entry->max_error = error;
+
+	if (!entry->is_dirty)
+	{
+		entry->is_dirty = true;
+		entry->next_dirty = AutoStatsDirtyList;
+		AutoStatsDirtyList = entry;
+	}
+}
+
+/*
+ * autostats_exec_walker
+ *		Visit each scan node of a finished plan and compare estimate to actual.
+ */
+static bool
+autostats_exec_walker(PlanState *planstate, void *context)
+{
+	EState	   *estate = (EState *) context;
+	Plan	   *plan;
+	Scan	   *scan;
+	List	   *quals;
+	Bitmapset  *varattnos = NULL;
+	Bitmapset  *attnums = NULL;
+	RangeTblEntry *rte;
+	NodeInstrumentation *instr;
+	double		est_rows;
+	double		act_rows;
+	double		ntuples;
+	double		nloops;
+	int			x = -1;
+
+	if (planstate == NULL)
+		return false;
+
+	plan = planstate->plan;
+	instr = planstate->instrument;
+
+	if (instr == NULL || plan == NULL)
+		return planstate_tree_walker(planstate, autostats_exec_walker, context);
+
+	/* Finish any in-progress loop so ntuples/nloops are final. */
+	InstrEndLoop(instr);
+
+	quals = autostats_scan_quals(plan);
+	if (quals == NIL)
+		return planstate_tree_walker(planstate, autostats_exec_walker, context);
+
+	scan = (Scan *) plan;
+	rte = exec_rt_fetch(scan->scanrelid, estate);
+	if (rte == NULL || rte->rtekind != RTE_RELATION)
+		return planstate_tree_walker(planstate, autostats_exec_walker, context);
+
+	/*
+	 * Which columns of this relation does the filter reference?  Attnums come
+	 * back offset by FirstLowInvalidHeapAttributeNumber, so undo that.
+	 */
+	pull_varattnos((Node *) quals, scan->scanrelid, &varattnos);
+
+	while ((x = bms_next_member(varattnos, x)) >= 0)
+	{
+		int			attnum = x + FirstLowInvalidHeapAttributeNumber;
+
+		if (attnum > 0)
+			attnums = bms_add_member(attnums, attnum);
+	}
+
+	/*
+	 * Under a parallel plan the leader only counts the tuples it produced
+	 * itself, so fold in each worker's counters too.  Without this a parallel
+	 * scan reports roughly 1/Nth of the rows and the comparison is drawn from
+	 * a fraction of the evidence.
+	 */
+	ntuples = instr->ntuples;
+	nloops = instr->nloops;
+
+	if (planstate->worker_instrument != NULL)
+	{
+		int			w;
+
+		for (w = 0; w < planstate->worker_instrument->num_workers; w++)
+		{
+			NodeInstrumentation *winstr = &planstate->worker_instrument->instrument[w];
+
+			if (winstr->nloops <= 0)
+				continue;		/* worker never ran */
+
+			ntuples += winstr->ntuples;
+			nloops += winstr->nloops;
+		}
+	}
+
+	if (bms_num_members(attnums) >= 2 && nloops > 0)
+	{
+		/*
+		 * plan_rows is per iteration, while ntuples is the total across all
+		 * iterations.  On the inner side of a nested loop these differ by a
+		 * large factor, and forgetting to divide manufactures exactly the huge
+		 * fake underestimates this code exists to detect.
+		 *
+		 * Both sides are therefore per-iteration averages, which is also what
+		 * EXPLAIN ANALYZE reports.
+		 */
+		est_rows = plan->plan_rows;
+		act_rows = ntuples / nloops;
+
+		autostats_record_actual(rte->relid, attnums, est_rows, act_rows);
+	}
+
+	bms_free(varattnos);
+	bms_free(attnums);
+
+	return planstate_tree_walker(planstate, autostats_exec_walker, context);
+}
+
+/*
+ * AutoStatsNoteExec
+ *		Compare estimates against actuals for a finished, sampled execution.
+ */
+void
+AutoStatsNoteExec(QueryDesc *queryDesc)
+{
+	if (!dbblue_autostats_enabled || AutoStatsHash == NULL)
+		return;
+
+	if (queryDesc->planstate == NULL || queryDesc->estate == NULL)
+		return;
+
+	/*
+	 * Only executions that counted rows can be compared.  INSTRUMENT_TIMER
+	 * implies row counting (see InstrumentOption), and EXPLAIN ANALYZE sets
+	 * TIMER rather than ROWS whenever timing is on -- so testing for ROWS
+	 * alone would silently ignore every EXPLAIN ANALYZE, which is exactly what
+	 * someone checking the feature by hand will run.
+	 */
+	if ((queryDesc->estate->es_instrument &
+		 (INSTRUMENT_ROWS | INSTRUMENT_TIMER)) == 0)
+		return;
+
+	autostats_exec_walker(queryDesc->planstate, queryDesc->estate);
+}
+
 /*
  * dbblue_stats_advisor
  *		Report the column combinations estimated independently so far.
@@ -699,15 +1024,37 @@ dbblue_stats_advisor(PG_FUNCTION_ARGS)
 		values[3] = Int32GetDatum(entry->key.nattnums);
 		values[4] = Int64GetDatum((int64) entry->plan_count);
 		values[5] = BoolGetDatum(entry->all_equality);
-		values[6] = TimestampTzGetDatum(entry->first_seen);
-		values[7] = TimestampTzGetDatum(entry->last_seen);
+		values[6] = Int64GetDatum((int64) entry->plan_est_rows);
+
+		/*
+		 * Estimate and actual always come from the same scan node of the same
+		 * sampled execution.  Until one has been sampled there is nothing
+		 * honest to report, so leave them null rather than showing a zero that
+		 * looks like a measurement.
+		 */
+		if (entry->exec_count == 0)
+		{
+			nulls[7] = true;
+			nulls[8] = true;
+			nulls[9] = true;
+		}
+		else
+		{
+			values[7] = Int64GetDatum((int64) entry->exec_est_rows);
+			values[8] = Int64GetDatum((int64) entry->exec_act_rows);
+			values[9] = Float8GetDatum(entry->max_error);
+		}
+
+		values[10] = Int64GetDatum((int64) entry->exec_count);
+		values[11] = TimestampTzGetDatum(entry->first_seen);
+		values[12] = TimestampTzGetDatum(entry->last_seen);
 
 		ddl = autostats_build_ddl(&entry->key, entry->all_equality,
 								  nspname, relname);
 		if (ddl == NULL)
-			nulls[8] = true;
+			nulls[13] = true;
 		else
-			values[8] = CStringGetTextDatum(ddl);
+			values[13] = CStringGetTextDatum(ddl);
 
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}

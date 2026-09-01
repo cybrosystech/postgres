@@ -29,12 +29,14 @@
 #ifndef DBBLUE_AUTOSTATS_H
 #define DBBLUE_AUTOSTATS_H
 
+#include "executor/execdesc.h"
 #include "nodes/pathnodes.h"
 
 /* GUCs (defined in dbblue_autostats.c) */
 extern PGDLLIMPORT bool dbblue_autostats_enabled;
 extern PGDLLIMPORT int dbblue_autostats_max;
 extern PGDLLIMPORT int dbblue_autostats_local_max;
+extern PGDLLIMPORT int dbblue_autostats_sample_rate;
 
 /*
  * DBBlueAutoStatsShmemCallbacks is declared by storage/subsystems.h, which
@@ -43,10 +45,21 @@ extern PGDLLIMPORT int dbblue_autostats_local_max;
 
 /*
  * Record that 'clauses' (excluding those listed in 'estimatedclauses', which
- * extended statistics already handled) are about to be estimated
- * independently on 'rel'.  Called from clauselist_selectivity_ext().
+ * extended statistics already handled) were estimated independently on 'rel',
+ * producing overall selectivity 'sel'.  Called from
+ * clauselist_selectivity_ext().
  */
 extern void AutoStatsNoteClauses(PlannerInfo *root, RelOptInfo *rel,
-								 List *clauses, Bitmapset *estimatedclauses);
+								 List *clauses, Bitmapset *estimatedclauses,
+								 double sel);
+
+/*
+ * Executor-side confirmation.  AutoStatsWantInstrumentation() decides whether
+ * this execution should be sampled (and hence count rows); AutoStatsNoteExec()
+ * compares the planner's estimate against the rows actually produced.  Called
+ * from standard_ExecutorStart() / standard_ExecutorEnd().
+ */
+extern bool AutoStatsWantInstrumentation(void);
+extern void AutoStatsNoteExec(QueryDesc *queryDesc);
 
 #endif							/* DBBLUE_AUTOSTATS_H */

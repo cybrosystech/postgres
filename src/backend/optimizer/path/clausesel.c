@@ -159,15 +159,6 @@ clauselist_selectivity_ext(PlannerInfo *root,
 												&estimatedclauses, false);
 		}
 
-		/*
-		 * dbblue: whatever is left over is about to be estimated as if the
-		 * columns were independent.  Record the combination so the advisor
-		 * can report which extended statistics are missing.  Note this also
-		 * catches partial coverage, where statistics exist but the query
-		 * filters on a column outside them.
-		 */
-		if (dbblue_autostats_enabled)
-			AutoStatsNoteClauses(root, rel, clauses, estimatedclauses);
 	}
 
 	/*
@@ -352,6 +343,20 @@ clauselist_selectivity_ext(PlannerInfo *root,
 		pfree(rqlist);
 		rqlist = rqnext;
 	}
+
+	/*
+	 * dbblue: anything not handled by extended statistics above has now been
+	 * multiplied in as if the columns were independent.  Record the
+	 * combination, along with the row estimate that assumption produced, so
+	 * the advisor can report which extended statistics are missing.  This also
+	 * catches partial coverage, where statistics exist but the query filters
+	 * on a column outside them.
+	 *
+	 * Deliberately done here rather than earlier: s1 is only final now.
+	 */
+	if (dbblue_autostats_enabled &&
+		use_extended_stats && rel && rel->rtekind == RTE_RELATION)
+		AutoStatsNoteClauses(root, rel, clauses, estimatedclauses, s1);
 
 	return s1;
 }

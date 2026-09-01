@@ -1292,10 +1292,15 @@ dbblue_stats_advisor| SELECT schemaname,
     nattributes,
     plan_count,
     all_equality,
+    plan_est_rows,
+    est_rows,
+    actual_rows,
+    error_factor,
+    exec_count,
     first_seen,
     last_seen,
     suggestion
-   FROM dbblue_stats_advisor() dbblue_stats_advisor(schemaname, tablename, attnames, nattributes, plan_count, all_equality, first_seen, last_seen, suggestion)
+   FROM dbblue_stats_advisor() dbblue_stats_advisor(schemaname, tablename, attnames, nattributes, plan_count, all_equality, plan_est_rows, est_rows, actual_rows, error_factor, exec_count, first_seen, last_seen, suggestion)
   ORDER BY plan_count DESC;
 pg_aios| SELECT pid,
     io_id,

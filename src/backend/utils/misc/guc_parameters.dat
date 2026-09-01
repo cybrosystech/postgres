@@ -674,6 +674,16 @@
   max => 'INT_MAX',
 },
 
+{ name => 'dbblue_autostats_sample_rate', type => 'int', context => 'PGC_SUSET', group => 'STATS_MONITORING',
+  short_desc => 'Percentage of executions measured to confirm advisor candidates.',
+  long_desc => 'Sampled executions count rows (but are not timed) so the planner estimate can be compared against the rows actually produced. 0 disables confirmation, leaving detection only.',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'dbblue_autostats_sample_rate',
+  boot_val => '10',
+  min => '0',
+  max => '100',
+},
+
 { name => 'dbblue_max_pin_size_percent', type => 'int', context => 'PGC_SIGHUP', group => 'RESOURCES_MEM',
   short_desc => 'Max percentage of shared_buffers used for pinned tables.',
   flags => 'GUC_NOT_IN_SAMPLE',
