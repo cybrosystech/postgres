@@ -24,7 +24,7 @@ on:
         description: "Package version (Debian format, e.g. 19~beta2-1)"
         default: "19~beta2-1"
   push:
-    tags: ["v*"]
+    tags: ["v*", "rebuild-*"]
 
 permissions:
   contents: read
