@@ -32,8 +32,15 @@ fi
 install -d -o dbblue -g dbblue -m 700 "$DATA"
 install -d -o dbblue -g dbblue -m 750 "$LOGS/$NAME"
 
-if ! su -s /bin/sh dbblue -c "$BIN/initdb -D '$DATA' --encoding=UTF8 --locale=C.UTF-8 --auth-host=scram-sha-256"; then
-  su -s /bin/sh dbblue -c "$BIN/initdb -D '$DATA'"
+# initdb's own output (incl. its generic "start with pg_ctl" hint) goes to a
+# log, not the console — this cluster is managed by systemd, not pg_ctl.
+INITLOG="$LOGS/$NAME/initdb.log"
+if ! su -s /bin/sh dbblue -c "$BIN/initdb -D '$DATA' --encoding=UTF8 --locale=C.UTF-8 --auth-host=scram-sha-256 >'$INITLOG' 2>&1"; then
+  if ! su -s /bin/sh dbblue -c "$BIN/initdb -D '$DATA' >>'$INITLOG' 2>&1"; then
+    echo "dbblue-createcluster: initdb failed — see $INITLOG" >&2
+    tail -n 20 "$INITLOG" >&2
+    exit 1
+  fi
 fi
 
 {
@@ -57,4 +64,7 @@ fi
 echo "Created DBblue cluster '$NAME' on port $PORT"
 echo "  data: $DATA"
 echo "  logs: $LOGS/$NAME"
-echo "  connect: sudo dbblue-psql $NAME"
+echo ""
+echo "Success. You can now connect to the database server using:"
+echo ""
+echo "    sudo dbblue-psql $NAME"
