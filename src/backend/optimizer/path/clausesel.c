@@ -19,6 +19,7 @@
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/plancat.h"
+#include "statistics/dbblue_autostats.h"
 #include "statistics/statistics.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
@@ -142,17 +143,31 @@ clauselist_selectivity_ext(PlannerInfo *root,
 	 * it has extended statistics, try to apply those.
 	 */
 	rel = find_single_rel_for_clauses(root, clauses);
-	if (use_extended_stats && rel && rel->rtekind == RTE_RELATION && rel->statlist != NIL)
+	if (use_extended_stats && rel && rel->rtekind == RTE_RELATION)
 	{
+		if (rel->statlist != NIL)
+		{
+			/*
+			 * Estimate as many clauses as possible using extended statistics.
+			 *
+			 * 'estimatedclauses' is populated with the 0-based list position
+			 * index of clauses estimated here, and that should be ignored
+			 * below.
+			 */
+			s1 = statext_clauselist_selectivity(root, clauses, varRelid,
+												jointype, sjinfo, rel,
+												&estimatedclauses, false);
+		}
+
 		/*
-		 * Estimate as many clauses as possible using extended statistics.
-		 *
-		 * 'estimatedclauses' is populated with the 0-based list position
-		 * index of clauses estimated here, and that should be ignored below.
+		 * dbblue: whatever is left over is about to be estimated as if the
+		 * columns were independent.  Record the combination so the advisor
+		 * can report which extended statistics are missing.  Note this also
+		 * catches partial coverage, where statistics exist but the query
+		 * filters on a column outside them.
 		 */
-		s1 = statext_clauselist_selectivity(root, clauses, varRelid,
-											jointype, sjinfo, rel,
-											&estimatedclauses, false);
+		if (dbblue_autostats_enabled)
+			AutoStatsNoteClauses(root, rel, clauses, estimatedclauses);
 	}
 
 	/*

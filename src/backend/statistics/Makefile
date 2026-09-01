@@ -14,6 +14,7 @@ include $(top_builddir)/src/Makefile.global
 
 OBJS = \
 	attribute_stats.o \
+	dbblue_autostats.o \
 	dependencies.o \
 	extended_stats.o \
 	extended_stats_funcs.o \

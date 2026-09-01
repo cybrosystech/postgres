@@ -120,6 +120,9 @@ extern Selectivity statext_clauselist_selectivity(PlannerInfo *root,
 												  RelOptInfo *rel,
 												  Bitmapset **estimatedclauses,
 												  bool is_or);
+extern bool statext_is_compatible_clause(PlannerInfo *root, Node *clause,
+										 Index relid, Bitmapset **attnums,
+										 List **exprs);
 extern bool has_stats_of_kind(List *stats, char requiredkind);
 extern StatisticExtInfo *choose_best_statistics(List *stats, char requiredkind,
 												bool inh,

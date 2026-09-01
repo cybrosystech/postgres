@@ -1557,3 +1557,11 @@ CREATE VIEW pg_aios AS
     SELECT * FROM pg_get_aios();
 REVOKE ALL ON pg_aios FROM PUBLIC;
 GRANT SELECT ON pg_aios TO pg_read_all_stats;
+
+CREATE VIEW dbblue_stats_advisor AS
+    SELECT * FROM dbblue_stats_advisor() ORDER BY plan_count DESC;
+REVOKE ALL ON dbblue_stats_advisor FROM PUBLIC;
+GRANT SELECT ON dbblue_stats_advisor TO pg_read_all_stats;
+REVOKE EXECUTE ON FUNCTION dbblue_stats_advisor() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION dbblue_stats_advisor() TO pg_read_all_stats;
+REVOKE EXECUTE ON FUNCTION dbblue_stats_advisor_reset() FROM PUBLIC;
