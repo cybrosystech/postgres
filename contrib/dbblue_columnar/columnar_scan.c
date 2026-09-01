@@ -4879,43 +4879,41 @@ dbbc_grp_consume_block(DbbcAggScanState *as, DbbcScanState *s,
 	for (c = 0; c < s->ncols; c++)
 		dbbc_col_ptrs_set(s, c);
 
+	/*
+	 * Fuse the scan's predicate work into the aggregate: build this block's
+	 * row selection once - vectorized and dict-aware - via
+	 * dbbc_decode_and_select over the node's skipquals (bound onto s with its
+	 * decode buffers by dbbc_grp_bind). Rows the filter removes are skipped
+	 * entirely below, so they never pay the per-row MemoryContextReset, key
+	 * extraction, or transition. Exact: the fused node has no parent recheck,
+	 * and every skipqual column is columnar-served, so this selection is
+	 * identical to the old per-row dbbc_skipqual_test loop.
+	 */
+	if (s->nskipquals > 0)
+		dbbc_decode_and_select(s, block->nrows);
+
 	for (row = 0; row < block->nrows; row++)
 	{
 		Datum		keyvals[DBBC_GRP_MAX_KEYS];
 		bool		keynulls[DBBC_GRP_MAX_KEYS];
 		MemoryContext oldctx;
-		bool		pass = true;
-		int			i;
 		int			k;
 		int			a;
 
-		CHECK_FOR_INTERRUPTS();
+		if ((row & 0x3FF) == 0)
+			CHECK_FOR_INTERRUPTS();
+
+		if (s->nskipquals > 0 && !s->sel[row])
+			continue;			/* removed by the vectorized prefilter */
 
 		/*
-		 * Do the whole per-row evaluation in tmpctx: qual comparisons and
-		 * transition-function calls can detoast/allocate (bttextcmp,
-		 * numeric_*), and without this those allocations would accumulate in
-		 * the query context for the entire input pass. Transition STATE is
-		 * written to groupctx by the callees, so it survives the reset.
+		 * Per-surviving-row scratch in tmpctx: transition-function calls
+		 * detoast/allocate; transition STATE is written to groupctx by the
+		 * callees, so it survives the reset.
 		 */
 		MemoryContextReset(as->tmpctx);
 		oldctx = MemoryContextSwitchTo(as->tmpctx);
 
-		for (i = 0; i < as->nskipquals; i++)
-		{
-			DbbcSkipQual *q = &as->skipquals[i];
-			int			qc = s->attno_to_col[q->attno - 1];
-			bool		isnull;
-			Datum		v;
-
-			v = dbbc_chunk_read(s, qc, row, &isnull);
-			if (!dbbc_skipqual_test(q, v, isnull))
-			{
-				pass = false;
-				break;
-			}
-		}
-		if (pass)
 		{
 			if (as->is_dimjoin)
 			{
@@ -5188,7 +5186,7 @@ dbbc_grp_bind(DbbcAggScanState *as, EState *estate, DbbcRelVersion *v)
 	for (u = 0; u < as->nused; u++)
 		needed = lappend_int(needed, as->used_attnos[u]);
 	dbbc_scan_bind_version(as->pscan, as->rel, needed, as->qual_clauses,
-						   as->qual_varno, v, false);
+						   as->qual_varno, v, true);
 }
 
 /* claim the next block-directory slot: shared atomic cursor when parallel */
