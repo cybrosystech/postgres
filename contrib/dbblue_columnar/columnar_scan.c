@@ -4093,6 +4093,30 @@ dbbc_dj_keyval(Datum d, Oid typ)
 }
 
 /*
+ * Highest attribute number referenced by the dim-side quals, so the build loop
+ * deforms only up to that column (heap deform is sequential) instead of the
+ * whole - possibly very wide - dimension tuple. A whole-row (0) or system (<0)
+ * Var forces the full deform (signalled by leaving *maxp at -1).
+ */
+static bool
+dbbc_dim_qual_maxattno_walker(Node *node, AttrNumber *maxp)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Var))
+	{
+		AttrNumber	a = ((Var *) node)->varattno;
+
+		if (a <= 0)
+			*maxp = -1;			/* whole-row / system col: need the whole tuple */
+		else if (*maxp >= 0 && a > *maxp)
+			*maxp = a;
+		return false;
+	}
+	return expression_tree_walker(node, dbbc_dim_qual_maxattno_walker, maxp);
+}
+
+/*
  * Build the in-memory dimension hash for the dim-join sub-mode. Scanned under
  * the query snapshot (estate->es_snapshot) exactly like a Hash Join's inner
  * build, so visibility is identical and the dimension is never cached in the
@@ -4107,6 +4131,7 @@ dbbc_dim_build(DbbcAggScanState *as, EState *estate)
 	TableScanDesc scan;
 	TupleTableSlot *slot;
 	int64		ndim = 0;
+	AttrNumber	dim_qual_maxattno = 0;	/* deform the dim tuple only this far */
 
 	as->dj_keytype =
 		TupleDescAttr(RelationGetDescr(as->rel), as->fk_attno - 1)->atttypid;
@@ -4135,6 +4160,7 @@ dbbc_dim_build(DbbcAggScanState *as, EState *estate)
 		as->dim_econtext = CreateExprContext(estate);
 		as->dim_qual_state = ExecInitQual(as->dim_quals,
 										  (PlanState *) &as->css.ss.ps);
+		dbbc_dim_qual_maxattno_walker((Node *) as->dim_quals, &dim_qual_maxattno);
 	}
 
 	slot = table_slot_create(as->dim_rel, NULL);
@@ -4153,12 +4179,18 @@ dbbc_dim_build(DbbcAggScanState *as, EState *estate)
 		if (as->dim_qual_state != NULL)
 		{
 			/*
-			 * Deform every column first: the compiled qual reads the dim slot as
-			 * a fully-populated (virtual-style) tuple and does not re-deform, but
-			 * the key read above only advanced tts_nvalid to the key attno, so a
-			 * qual on a later column would otherwise read past tts_nvalid.
+			 * Deform the columns the qual reads before evaluating it: the
+			 * compiled qual reads the dim slot as a fully-populated (virtual-
+			 * style) tuple and does not re-deform, but the key read above only
+			 * advanced tts_nvalid to the key attno. Deform just up to the qual's
+			 * highest column (heap deform is sequential) rather than the whole,
+			 * possibly very wide, dimension row; a whole-row/system-col qual
+			 * (maxattno < 0) needs the full deform.
 			 */
-			slot_getallattrs(slot);
+			if (dim_qual_maxattno < 0)
+				slot_getallattrs(slot);
+			else
+				slot_getsomeattrs(slot, dim_qual_maxattno);
 			ResetExprContext(as->dim_econtext);
 			as->dim_econtext->ecxt_scantuple = slot;
 			if (!ExecQual(as->dim_qual_state, as->dim_econtext))
