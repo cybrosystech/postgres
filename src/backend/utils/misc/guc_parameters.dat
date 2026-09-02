@@ -623,6 +623,26 @@
   assign_hook => 'assign_datestyle',
 },
 
+{ name => 'dbblue_heap_bulk_extend_size', type => 'int', context => 'PGC_USERSET', group => 'RESOURCES_IO',
+  short_desc => 'Size of bulk extend for heap table.',
+  long_desc => '0 turns this feature off, -1 uses a size based on "shared_buffers".',
+  flags => 'GUC_UNIT_BLOCKS',
+  variable => 'dbblue_heap_bulk_extend_size',
+  boot_val => '0',
+  min => '-1',
+  max => '1024',
+},
+
+{ name => 'dbblue_index_bulk_extend_size', type => 'int', context => 'PGC_USERSET', group => 'RESOURCES_IO',
+  short_desc => 'Size of bulk extend for index table.',
+  long_desc => '0 turns this feature off, -1 uses a size based on "shared_buffers".',
+  flags => 'GUC_UNIT_BLOCKS',
+  variable => 'dbblue_index_bulk_extend_size',
+  boot_val => '0',
+  min => '-1',
+  max => '1024',
+},
+
 # This is PGC_SUSET to prevent hiding from log_lock_waits.
 { name => 'deadlock_timeout', type => 'int', context => 'PGC_SUSET', group => 'LOCK_MANAGEMENT',
   short_desc => 'Sets the time to wait on a lock before checking for deadlock.',
