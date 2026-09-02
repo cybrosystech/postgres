@@ -2390,6 +2390,8 @@ typedef struct DbbcDimEntry
 #define DBBC_DJ_DIM_KEY_ATTNO(pl)	((AttrNumber) intVal(list_nth(pl, 6)))
 #define DBBC_DJ_FK_ATTNO(pl)		((AttrNumber) intVal(list_nth(pl, 7)))
 #define DBBC_DJ_DIM_RELID(pl)		((Index) intVal(list_nth(pl, 8)))
+#define DBBC_DJ_DIM_QUALS(pl)		((List *) list_nth(pl, 9))
+#define DBBC_DJ_INNER(pl)			(intVal(list_nth(pl, 10)) != 0)
 
 typedef struct DbbcAggScanState
 {
@@ -2465,6 +2467,10 @@ typedef struct DbbcAggScanState
 	MemoryContext dim_ctx;
 	void	   *cur_dim;		/* probed dim entry for the current row, or NULL */
 	Oid			dj_keytype;		/* join key type (INT4/INT8/OID) for normalizing */
+	bool		dj_inner;		/* INNER: drop fact row on probe miss (else LEFT->NULL) */
+	List	   *dim_quals;		/* dim-side WHERE quals (Phase 2, INNER only) */
+	ExprState  *dim_qual_state; /* AND of dim_quals, evaluated per dim tuple at build */
+	ExprContext *dim_econtext;	/* its context; ecxt_scantuple = dim build slot */
 
 	/* grouped-mode instrumentation (EXPLAIN ANALYZE) */
 	int64		grp_blocks_served;
@@ -3025,6 +3031,8 @@ dbbc_try_dimjoin_agg(PlannerInfo *root, UpperRelationKind stage,
 			   *needcols = NIL;
 	double		ngroups = 1.0;
 	bool		unique = false;
+	bool		dj_inner = false;
+	List	   *dim_quals = NIL;
 	int			parallel_workers = 0;
 	ListCell   *lc;
 	CustomPath *cpath;
@@ -3100,7 +3108,13 @@ dbbc_try_dimjoin_agg(PlannerInfo *root, UpperRelationKind stage,
 	if (dim_rel == NULL || dim_rte->rtekind != RTE_RELATION)
 		return;
 
-	/* Phase 1: a LEFT join with the fact preserved and the dim nullable */
+	/*
+	 * Phase 1: a LEFT join, fact preserved (outer) and dim nullable (inner).
+	 * Phase 2: also a plain INNER join of exactly these two rels. A dimension
+	 * WHERE filter normally arrives this way - reduce_outer_joins collapses
+	 * "LEFT JOIN dim ... WHERE dim.x=V" into an inner join (the SpecialJoinInfo
+	 * is gone and dim.x=V lands in dim_rel->baserestrictinfo).
+	 */
 	foreach(lc, root->join_info_list)
 	{
 		SpecialJoinInfo *s = (SpecialJoinInfo *) lfirst(lc);
@@ -3114,13 +3128,110 @@ dbbc_try_dimjoin_agg(PlannerInfo *root, UpperRelationKind stage,
 		}
 	}
 	if (sji == NULL)
-		return;					/* not a LEFT join of this shape (INNER = Phase 2) */
+	{
+		/*
+		 * No LEFT join of this shape. Accept a clean INNER join, but only if no
+		 * other (non-inner) special join entangles the fact or the dim - their
+		 * nullability would then differ from a straight inner join. With just
+		 * two base rels any such SpecialJoinInfo must involve one of them.
+		 */
+		foreach(lc, root->join_info_list)
+		{
+			SpecialJoinInfo *s = (SpecialJoinInfo *) lfirst(lc);
 
-	/* the dim carries no quals of its own (Phase 1) */
+			if (s->jointype == JOIN_INNER)
+				continue;
+			if (bms_is_member(fact_relid, s->min_righthand) ||
+				bms_is_member(fact_relid, s->min_lefthand) ||
+				bms_is_member(dim_relid, s->min_righthand) ||
+				bms_is_member(dim_relid, s->min_lefthand))
+				return;			/* an outer join involves our rels: not clean */
+		}
+		dj_inner = true;
+	}
+
+	/*
+	 * Dimension-side quals. Phase 1 rejected any. Phase 2 accepts them for the
+	 * INNER case only: a passing dim row is kept, and a fact row whose fk matches
+	 * no passing dim row is dropped (INNER). For a preserved LEFT join a dim
+	 * filter (e.g. the "WHERE d.x IS NULL" anti-join idiom, which does not
+	 * reduce) has different semantics - keep rejecting it (Phase 2b).
+	 */
 	if (dim_rel->baserestrictinfo != NIL)
-		return;
+	{
+		if (!dj_inner)
+			return;				/* LEFT + dim filter: not modeled (Phase 2b) */
+		foreach(lc, dim_rel->baserestrictinfo)
+		{
+			RestrictInfo *ri = lfirst_node(RestrictInfo, lc);
+
+			if (ri->security_level > 0 || ri->pseudoconstant)
+				return;
+			/*
+			 * Reject a volatile qual: our build evaluates it once per dim row,
+			 * independently of the plain plan's inner scan, so a volatile result
+			 * (random(), nextval()) would diverge from REFRESH. A SubPlan/Param
+			 * qual is not modeled against this node's exec context. STABLE is
+			 * fine - it is fixed for the query, so both sides agree.
+			 */
+			if (contain_volatile_functions((Node *) ri->clause) ||
+				contain_subplans((Node *) ri->clause))
+				return;
+			dim_quals = lappend(dim_quals, ri->clause);
+		}
+	}
 
 	/* the single equi-join clause fact.fk = dim.key, both plain Vars */
+	if (dj_inner)
+	{
+		/*
+		 * An INNER equi-join condition is absorbed into an EquivalenceClass and
+		 * removed from joininfo (only outer-join quals stay there); recover
+		 * fact.fk = dim.key from the EC that links the two rels. EC membership
+		 * already implies a mergejoinable equality, so no opfamily re-check.
+		 */
+		foreach(lc, root->eq_classes)
+		{
+			EquivalenceClass *ec = lfirst_node(EquivalenceClass, lc);
+			Var		   *vfact = NULL,
+					   *vdim = NULL;
+			ListCell   *lm;
+
+			if (ec->ec_has_const || ec->ec_has_volatile || ec->ec_broken)
+				continue;
+			if (!bms_is_member(fact_relid, ec->ec_relids) ||
+				!bms_is_member(dim_relid, ec->ec_relids))
+				continue;
+			foreach(lm, ec->ec_members)
+			{
+				EquivalenceMember *em = lfirst_node(EquivalenceMember, lm);
+				Node	   *e = (Node *) em->em_expr;
+
+				if (em->em_is_child)
+					continue;
+				while (e && IsA(e, RelabelType))
+					e = (Node *) ((RelabelType *) e)->arg;
+				if (e == NULL || !IsA(e, Var) || ((Var *) e)->varattno <= 0)
+					continue;
+				if (((Var *) e)->varno == (Index) fact_relid)
+					vfact = (Var *) e;
+				else if (((Var *) e)->varno == (Index) dim_relid)
+					vdim = (Var *) e;
+			}
+			if (vfact == NULL || vdim == NULL)
+				continue;			/* this EC does not join fact to dim */
+			if (fk_attno != 0)
+				return;				/* two ECs join them: ambiguous, bail */
+			if (vfact->vartype != vdim->vartype ||
+				(vfact->vartype != INT4OID && vfact->vartype != INT8OID &&
+				 vfact->vartype != OIDOID))
+				return;				/* Phase 1: identical byval integer keys */
+			fk_attno = vfact->varattno;
+			dim_key_attno = vdim->varattno;
+			joinkeytype = vfact->vartype;
+		}
+	}
+	else
 	foreach(lc, fact_rel->joininfo)
 	{
 		RestrictInfo *ri = lfirst_node(RestrictInfo, lc);
@@ -3333,7 +3444,8 @@ dbbc_try_dimjoin_agg(PlannerInfo *root, UpperRelationKind stage,
 	if (partial)
 	{
 		if (!is_parallel_safe(root, (Node *) quals) ||
-			!is_parallel_safe(root, (Node *) keyexprs))
+			!is_parallel_safe(root, (Node *) keyexprs) ||
+			!is_parallel_safe(root, (Node *) dim_quals))
 			return;
 		parallel_workers = compute_parallel_worker(fact_rel, fact_rel->pages,
 												   -1,
@@ -3352,6 +3464,8 @@ dbbc_try_dimjoin_agg(PlannerInfo *root, UpperRelationKind stage,
 	payload = lappend(payload, makeInteger((int) dim_key_attno));
 	payload = lappend(payload, makeInteger((int) fk_attno));
 	payload = lappend(payload, makeInteger((int) dim_relid));
+	payload = lappend(payload, dim_quals);
+	payload = lappend(payload, makeInteger(dj_inner ? 1 : 0));
 
 	cpath = makeNode(CustomPath);
 	cpath->path.pathtype = T_CustomScan;
@@ -4007,6 +4121,22 @@ dbbc_dim_build(DbbcAggScanState *as, EState *estate)
 	as->dim_hash = hash_create("dbblue_columnar dim", 256, &ctl,
 							   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 
+	/*
+	 * Phase 2: a dim-side WHERE filter (INNER join only). Compile it once; only
+	 * dim rows that pass enter the hash, so a fact row whose fk matches no
+	 * passing dim row finds no entry and is dropped at probe time (INNER). The
+	 * quals are evaluated per dim tuple against the scan slot, exactly as a
+	 * Hash Join's inner scan applies them below the build.
+	 */
+	as->dim_qual_state = NULL;
+	as->dim_econtext = NULL;
+	if (as->dim_quals != NIL)
+	{
+		as->dim_econtext = CreateExprContext(estate);
+		as->dim_qual_state = ExecInitQual(as->dim_quals,
+										  (PlanState *) &as->css.ss.ps);
+	}
+
 	slot = table_slot_create(as->dim_rel, NULL);
 	scan = table_beginscan(as->dim_rel, estate->es_snapshot, 0, NULL, 0);
 	while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
@@ -4020,6 +4150,20 @@ dbbc_dim_build(DbbcAggScanState *as, EState *estate)
 
 		if (knull)
 			continue;			/* a NULL dim key never matches an equi-join */
+		if (as->dim_qual_state != NULL)
+		{
+			/*
+			 * Deform every column first: the compiled qual reads the dim slot as
+			 * a fully-populated (virtual-style) tuple and does not re-deform, but
+			 * the key read above only advanced tts_nvalid to the key attno, so a
+			 * qual on a later column would otherwise read past tts_nvalid.
+			 */
+			slot_getallattrs(slot);
+			ResetExprContext(as->dim_econtext);
+			as->dim_econtext->ecxt_scantuple = slot;
+			if (!ExecQual(as->dim_qual_state, as->dim_econtext))
+				continue;		/* dim row fails the WHERE filter: exclude it */
+		}
 		hk = dbbc_dj_keyval(kd, as->dj_keytype);
 		e = (DbbcDimEntry *) hash_search(as->dim_hash, &hk, HASH_ENTER, &found);
 		if (found)
@@ -4468,6 +4612,8 @@ dbbc_agg_begin(CustomScanState *node, EState *estate, int eflags)
 			as->dim_key_attno = DBBC_DJ_DIM_KEY_ATTNO(items);
 			as->fk_attno = DBBC_DJ_FK_ATTNO(items);
 			as->dim_relid = DBBC_DJ_DIM_RELID(items);
+			as->dim_quals = DBBC_DJ_DIM_QUALS(items);
+			as->dj_inner = DBBC_DJ_INNER(items);
 		}
 		/*
 		 * AccessShareLock, not NoLock: BeginCustomScan runs in every parallel
@@ -4937,6 +5083,12 @@ dbbc_grp_consume_block(DbbcAggScanState *as, DbbcScanState *s,
 					if (!found)
 						as->cur_dim = NULL;
 				}
+				if (as->cur_dim == NULL && as->dj_inner)
+				{
+					/* INNER join: fk matched no passing dim row - drop it */
+					MemoryContextSwitchTo(oldctx);
+					continue;
+				}
 			}
 			if (as->has_key_exprs)
 			{
@@ -5088,6 +5240,12 @@ dbbc_grp_consume_heap_range(DbbcAggScanState *as, DbbcScanState *s,
 											  HASH_FIND, &found);
 					if (!found)
 						as->cur_dim = NULL;
+				}
+				if (as->cur_dim == NULL && as->dj_inner)
+				{
+					/* INNER join: fk matched no passing dim row - drop it */
+					MemoryContextSwitchTo(oldctx);
+					continue;
 				}
 			}
 			if (as->has_key_exprs)

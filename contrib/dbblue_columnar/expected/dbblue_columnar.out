@@ -569,6 +569,57 @@ SELECT 'dj-scalaragg ', agree($$SELECT dj.seq, sum(t.amt) s, count(*) c FROM t L
  dj-scalaragg  | ok
 (1 row)
 
+-- Phase 2: INNER join + a dimension-side WHERE filter. Only passing dim rows
+-- enter the in-node hash; a fact row whose grp matches no passing dim row is
+-- dropped (INNER) - grp 7..12 (no dim at all) and a grp whose dim was filtered
+-- out alike. A "LEFT JOIN ... WHERE dj.col" reduces to the same inner join.
+-- At this fixture's tiny scale PG's plain HashAggregate over a Hash Join is
+-- cost-competitive (it collapses the FD group keys down to t.grp), so force the
+-- join methods off to exercise the fused node deterministically - at production
+-- scale the cost router picks it. Correctness is still the on-vs-off differential.
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_nestloop = off;
+SELECT uses_node($$SELECT t.grp, dj.seq, count(*) FROM t JOIN dj_dim dj ON dj.id = t.grp WHERE dj.seq > 5 GROUP BY t.grp, dj.seq, dj.id$$,
+				 'DBBlueColumnarAgg') AS dimjoin_filter_fires;
+ dimjoin_filter_fires 
+----------------------
+ t
+(1 row)
+
+SELECT 'dj2-inner-flt ', agree($$SELECT t.grp, dj.seq, count(*) c, sum(t.amt) s FROM t JOIN dj_dim dj ON dj.id = t.grp WHERE dj.seq > 5 GROUP BY t.grp, dj.seq, dj.id ORDER BY t.grp, dj.seq$$);
+    ?column?    | agree 
+----------------+-------
+ dj2-inner-flt  | ok
+(1 row)
+
+SELECT 'dj2-left-where', agree($$SELECT t.grp, dj.seq, count(*) c, sum(t.amt) s FROM t LEFT JOIN dj_dim dj ON dj.id = t.grp WHERE dj.seq > 5 GROUP BY t.grp, dj.seq, dj.id ORDER BY t.grp, dj.seq$$);
+    ?column?    | agree 
+----------------+-------
+ dj2-left-where | ok
+(1 row)
+
+SELECT 'dj2-keyrange  ', agree($$SELECT t.grp, dj.seq, sum(t.amt) s, count(*) c FROM t JOIN dj_dim dj ON dj.id = t.grp WHERE dj.id <= 3 GROUP BY t.grp, dj.seq, dj.id ORDER BY t.grp$$);
+    ?column?    | agree 
+----------------+-------
+ dj2-keyrange   | ok
+(1 row)
+
+SELECT 'dj2-twoquals  ', agree($$SELECT t.grp, sum(t.amt) s FROM t JOIN dj_dim dj ON dj.id = t.grp WHERE dj.seq > 3 AND dj.id < 6 GROUP BY t.grp, dj.id ORDER BY t.grp$$);
+    ?column?    | agree 
+----------------+-------
+ dj2-twoquals   | ok
+(1 row)
+
+SELECT 'dj2-empty     ', agree($$SELECT t.grp, dj.seq, count(*) c FROM t JOIN dj_dim dj ON dj.id = t.grp WHERE dj.seq > 999 GROUP BY t.grp, dj.seq, dj.id ORDER BY t.grp$$);
+    ?column?    | agree 
+----------------+-------
+ dj2-empty      | ok
+(1 row)
+
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_nestloop;
 -- parallel: Finalize -> Gather -> Parallel Custom Scan (DBBlueColumnarAgg); each
 -- worker builds its own dim hash under the shared snapshot. Still byte-identical.
 SET max_parallel_workers_per_gather = 4;
