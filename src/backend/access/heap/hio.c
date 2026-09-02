@@ -23,6 +23,12 @@
 #include "storage/freespace.h"
 #include "storage/lmgr.h"
 
+/*
+ * Size (in blocks) of bulk extend for heap tables. 0 disables our bulk
+ * extend, leaving upstream PostgreSQL's behaviour untouched; -1 derives the
+ * size from what the buffer manager can spare (i.e. from shared_buffers).
+ */
+int			dbblue_heap_bulk_extend_size = 0;
 
 /*
  * RelationPutHeapTuple - place tuple at specified page
@@ -219,10 +225,11 @@ GetVisibilityMapPins(Relation relation, Buffer buffer1, Buffer buffer2,
  * into the FSM. Typically there is no contention when we can't use the FSM.
  *
  * We do have to limit the number of pages to extend by to some value, as the
- * buffers for all the extended pages need to, temporarily, be pinned. For now
- * we define MAX_BUFFERS_TO_EXTEND_BY to be 64 buffers, it's hard to see
- * benefits with higher numbers. This partially is because copyfrom.c's
- * MAX_BUFFERED_TUPLES / MAX_BUFFERED_BYTES prevents larger multi_inserts.
+ * buffers for all the extended pages need to, temporarily, be pinned.
+ * MAX_BUFFERS_TO_EXTEND_BY is the hard ceiling (matching the maximum value of
+ * dbblue_heap_bulk_extend_size, which is what actually governs the target
+ * size). Note that bufmgr's LimitAdditionalPins() can grant fewer buffers than
+ * we ask for, when shared_buffers is small relative to max_connections.
  *
  * Returns a buffer for a newly extended block. If possible, the buffer is
  * returned exclusively locked. *did_unlock is set to true if the lock had to
@@ -236,7 +243,15 @@ static Buffer
 RelationAddBlocks(Relation relation, BulkInsertState bistate,
 				  int num_pages, bool use_fsm, bool *did_unlock)
 {
-#define MAX_BUFFERS_TO_EXTEND_BY 64
+	/*
+	 * Upper bound matches dbblue_heap_bulk_extend_size's max_val, so the GUC
+	 * alone (see below) determines how aggressively we bulk extend.
+	 */
+#define MAX_BUFFERS_TO_EXTEND_BY 1024
+	/* the ceiling upstream PostgreSQL uses, applied when our GUC is off */
+#define STOCK_MAX_BUFFERS_TO_EXTEND_BY 64
+	/* below this size a relation gains nothing from bulk extension */
+#define DBBLUE_MIN_BULK_EXTEND_BLOCKS 128
 	Buffer		victim_buffers[MAX_BUFFERS_TO_EXTEND_BY];
 	BlockNumber first_block = InvalidBlockNumber;
 	BlockNumber last_block = InvalidBlockNumber;
@@ -298,11 +313,48 @@ RelationAddBlocks(Relation relation, BulkInsertState bistate,
 		if (bistate)
 			extend_by_pages = Max(extend_by_pages, bistate->already_extended_by);
 
-		/*
-		 * Can't extend by more than MAX_BUFFERS_TO_EXTEND_BY, we need to pin
-		 * them all concurrently.
+		/* ---
+		 * dbblue_heap_bulk_extend_size is the target size of a bulk extend,
+		 * so extend by at least that many pages. The heuristics above can
+		 * still ask for more when there's contention.
+		 *
+		 * A setting of 0 turns our bulk extension off, leaving the upstream
+		 * heuristics (and the upstream ceiling) exactly as they are. -1 sizes
+		 * the extension from what the buffer manager can currently spare,
+		 * which is derived from shared_buffers.
+		 *
+		 * Don't bulk extend a small relation by much more than its current
+		 * size though. Extending a nearly empty table by e.g. 4MB would
+		 * balloon it, waste space in schemas with many small tables, and make
+		 * sequential scans read mostly empty pages. Growing proportionally
+		 * means a relation only reaches the full bulk extend size once it is
+		 * already about that large, which is where the syscall and
+		 * extension-lock savings actually matter.
+		 * ---
 		 */
-		extend_by_pages = Min(extend_by_pages, MAX_BUFFERS_TO_EXTEND_BY);
+		if (dbblue_heap_bulk_extend_size != 0 &&
+			RelationGetNumberOfBlocks(relation) >= DBBLUE_MIN_BULK_EXTEND_BLOCKS)
+		{
+			uint32		target;
+
+			if (dbblue_heap_bulk_extend_size < 0)
+				target = GetAdditionalPinLimit();
+			else
+				target = (uint32) dbblue_heap_bulk_extend_size;
+
+			target = Min(target, RelationGetNumberOfBlocks(relation));
+			extend_by_pages = Max(extend_by_pages, target);
+
+			/*
+			 * Can't extend by more than MAX_BUFFERS_TO_EXTEND_BY, we need to
+			 * pin them all concurrently. Note that bufmgr's
+			 * LimitAdditionalPins() may reduce this further still.
+			 */
+			extend_by_pages = Min(extend_by_pages, MAX_BUFFERS_TO_EXTEND_BY);
+		}
+		else
+			extend_by_pages = Min(extend_by_pages,
+								  STOCK_MAX_BUFFERS_TO_EXTEND_BY);
 	}
 
 	/*
@@ -332,9 +384,11 @@ RelationAddBlocks(Relation relation, BulkInsertState bistate,
 	 * so that we are sure that nobody has inserted into the page
 	 * concurrently.
 	 *
-	 * With the current MAX_BUFFERS_TO_EXTEND_BY there's no danger of
-	 * [auto]vacuum trying to truncate later pages as REL_TRUNCATE_MINIMUM is
-	 * way larger.
+	 * At the default dbblue_heap_bulk_extend_size there's no danger of
+	 * [auto]vacuum trying to truncate later pages, as REL_TRUNCATE_MINIMUM is
+	 * larger. Users who raise dbblue_heap_bulk_extend_size close to its
+	 * max_val (matching REL_TRUNCATE_MINIMUM) should be aware that a mostly
+	 * empty tail of that size can make autovacuum attempt a truncation.
 	 */
 	first_block = ExtendBufferedRelBy(BMR_REL(relation), MAIN_FORKNUM,
 									  bistate ? bistate->strategy : NULL,
@@ -428,6 +482,8 @@ RelationAddBlocks(Relation relation, BulkInsertState bistate,
 	}
 
 	return buffer;
+#undef DBBLUE_MIN_BULK_EXTEND_BLOCKS
+#undef STOCK_MAX_BUFFERS_TO_EXTEND_BY
 #undef MAX_BUFFERS_TO_EXTEND_BY
 }
 

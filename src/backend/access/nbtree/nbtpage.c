@@ -30,6 +30,7 @@
 #include "access/xloginsert.h"
 #include "common/int.h"
 #include "miscadmin.h"
+#include "storage/freespace.h"
 #include "storage/indexfsm.h"
 #include "storage/predicate.h"
 #include "storage/procarray.h"
@@ -37,6 +38,20 @@
 #include "utils/memdebug.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
+
+/*
+ * Size (in blocks) of bulk extend for btree indexes. 0 disables bulk extend,
+ * falling back to upstream's one-block-at-a-time behaviour; -1 derives the
+ * size from what the buffer manager can spare (i.e. from shared_buffers).
+ */
+int			dbblue_index_bulk_extend_size = 0;
+
+/*
+ * Below this size a relation gains nothing from bulk extension, and
+ * pre-allocating whole megabytes onto a tiny index would only waste space and
+ * skew planner estimates. Keep in sync with hio.c.
+ */
+#define DBBLUE_MIN_BULK_EXTEND_BLOCKS 128
 
 static BTMetaPageData *_bt_getmeta(Relation rel, Buffer metabuf);
 static void _bt_delitems_delete(Relation rel, Buffer buf,
@@ -954,12 +969,93 @@ _bt_allocbuf(Relation rel, Relation heaprel)
 	}
 
 	/*
-	 * Extend the relation by one page. Need to use RBM_ZERO_AND_LOCK or we
-	 * risk a race condition against btvacuumscan --- see comments therein.
-	 * This forces us to repeat the valgrind request that _bt_lockbuf()
-	 * otherwise would make, as we can't use _bt_lockbuf() without introducing
-	 * a race.
+	 * Extend the relation. Need to use RBM_ZERO_AND_LOCK or we risk a race
+	 * condition against btvacuumscan --- see comments therein. This forces
+	 * us to repeat the valgrind request that _bt_lockbuf() otherwise would
+	 * make, as we can't use _bt_lockbuf() without introducing a race.
+	 *
+	 * If dbblue_index_bulk_extend_size is set, extend by that many pages in
+	 * one go (like RelationAddBlocks() does for heap, in hio.c). We keep the
+	 * first page for the caller and hand the rest to the index FSM, so later
+	 * callers of GetFreeIndexPage() find them instead of triggering another
+	 * relation extension.
 	 */
+	if (dbblue_index_bulk_extend_size != 0 &&
+		RelationGetNumberOfBlocks(rel) >= DBBLUE_MIN_BULK_EXTEND_BLOCKS)
+	{
+#define MAX_INDEX_BUFFERS_TO_EXTEND_BY 1024
+		Buffer		victim_buffers[MAX_INDEX_BUFFERS_TO_EXTEND_BY];
+		BlockNumber first_block;
+		BlockNumber last_block;
+		uint32		extend_by_pages;
+
+		/*
+		 * -1 sizes the extension from what the buffer manager can currently
+		 * spare, which is derived from shared_buffers.
+		 *
+		 * Don't bulk extend a small index by much more than its current size
+		 * (same reasoning as RelationAddBlocks() in hio.c): an index only
+		 * reaches the full bulk extend size once it is already about that
+		 * large. Always extend by at least one page.
+		 */
+		if (dbblue_index_bulk_extend_size < 0)
+			extend_by_pages = GetAdditionalPinLimit();
+		else
+			extend_by_pages = (uint32) dbblue_index_bulk_extend_size;
+
+		extend_by_pages = Min(extend_by_pages,
+							  MAX_INDEX_BUFFERS_TO_EXTEND_BY);
+		extend_by_pages = Min(extend_by_pages,
+							  RelationGetNumberOfBlocks(rel));
+		extend_by_pages = Max(extend_by_pages, 1);
+
+		first_block = ExtendBufferedRelBy(BMR_REL(rel), MAIN_FORKNUM, NULL,
+										  EB_LOCK_FIRST,
+										  extend_by_pages,
+										  victim_buffers,
+										  &extend_by_pages);
+		buf = victim_buffers[0];
+		last_block = first_block + (extend_by_pages - 1);
+		Assert(first_block == BufferGetBlockNumber(buf));
+
+		if (!RelationUsesLocalBuffers(rel))
+			VALGRIND_MAKE_MEM_DEFINED(BufferGetPage(buf), BLCKSZ);
+
+		/* Initialize the page we're keeping before returning it */
+		page = BufferGetPage(buf);
+		Assert(PageIsNew(page));
+		_bt_pageinit(page, BufferGetPageSize(buf));
+
+		if (extend_by_pages > 1)
+		{
+			/*
+			 * Don't do FSM I/O while holding a buffer lock. Nobody else can
+			 * find this page (it's not yet in the FSM, and the relation
+			 * extension lock has already been released by
+			 * ExtendBufferedRelBy()), so there's no race in unlocking and
+			 * relocking it.
+			 */
+			_bt_unlockbuf(rel, buf);
+
+			for (uint32 i = 1; i < extend_by_pages; i++)
+			{
+				BlockNumber curblock = first_block + i;
+
+				Assert(curblock == BufferGetBlockNumber(victim_buffers[i]));
+				ReleaseBuffer(victim_buffers[i]);
+				RecordFreeIndexPage(rel, curblock);
+			}
+
+			FreeSpaceMapVacuumRange(rel, first_block + 1, last_block);
+
+			_bt_lockbuf(rel, buf, BT_WRITE);
+		}
+
+		return buf;
+#undef MAX_INDEX_BUFFERS_TO_EXTEND_BY
+	}
+
+	/* Extend the relation by one page. */
 	buf = ExtendBufferedRel(BMR_REL(rel), MAIN_FORKNUM, NULL, EB_LOCK_FIRST);
 	if (!RelationUsesLocalBuffers(rel))
 		VALGRIND_MAKE_MEM_DEFINED(BufferGetPage(buf), BLCKSZ);

@@ -50,6 +50,8 @@ typedef struct BulkInsertStateData
 	uint32		already_extended_by;
 } BulkInsertStateData;
 
+/* GUC: dbblue_heap_bulk_extend_size, in blocks; 0 disables bulk extend */
+extern PGDLLIMPORT int dbblue_heap_bulk_extend_size;
 
 extern void RelationPutHeapTuple(Relation relation, Buffer buffer,
 								 HeapTuple tuple, bool token);
