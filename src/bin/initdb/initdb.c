@@ -1232,10 +1232,7 @@ test_config_settings(void)
 	}
 	n_buffers = test_buffs;
 
-	if ((n_buffers * (BLCKSZ / 1024)) % 1024 == 0)
-		printf("%dMB\n", (n_buffers * (BLCKSZ / 1024)) / 1024);
-	else
-		printf("%dkB\n", n_buffers * (BLCKSZ / 1024));
+	printf("%s\n", format_kb(n_buffers * (BLCKSZ / 1024)));
 
 	printf(_("selecting default time zone ... "));
 	fflush(stdout);
@@ -1424,14 +1421,9 @@ setup_config(void)
 	conflines = replace_guc_value(conflines, "autovacuum_worker_slots",
 								  repltok, false);
 
-	if ((n_buffers * (BLCKSZ / 1024)) % 1024 == 0)
-		snprintf(repltok, sizeof(repltok), "%dMB",
-				 (n_buffers * (BLCKSZ / 1024)) / 1024);
-	else
-		snprintf(repltok, sizeof(repltok), "%dkB",
-				 n_buffers * (BLCKSZ / 1024));
 	conflines = replace_guc_value(conflines, "shared_buffers",
-								  repltok, false);
+								  format_kb(n_buffers * (BLCKSZ / 1024)),
+								  false);
 
 	conflines = replace_guc_value(conflines, "lc_messages",
 								  lc_messages, false);

@@ -6,8 +6,9 @@
  * Detection covers Linux/macOS (POSIX sysconf) and Windows
  * (GlobalMemoryStatusEx / GetSystemInfo).  Formulas are tuned for Odoo
  * workloads: many concurrent short transactions from the ORM, with the
- * occasional heavier report.  Memory values are produced in kilobytes so
- * initdb can format them with a "kB"/"MB"/"GB" suffix.
+ * occasional heavier report.  Memory values are produced in kilobytes,
+ * rounded to a whole megabyte, so initdb can format them with an "MB"/"GB"
+ * suffix.
  *
  * src/bin/initdb/auto_tune.c
  *
@@ -129,13 +130,30 @@ clamp_int(int v, int lo, int hi)
 }
 
 /*
- * Round a kB value down to the nearest 8 kB boundary so that shared_buffers
- * (which must be a multiple of BLCKSZ, typically 8 kB) is always valid.
+ * Round a kB value to a unit a human reads at a glance: whole gigabytes
+ * once the value reaches 1 GB, whole megabytes below that (never below
+ * 1 MB).  Every tuned memory setting goes through this so initdb reports
+ * and writes them as "<n>GB"/"<n>MB" rather than an unwieldy raw kB count.
+ *
+ * Sub-GB values round down, so a formula's result is never inflated past
+ * what the host can back.  At or above 1 GB we round to the *nearest* GB
+ * instead: flooring there would throw away up to 1023 MB, which on the
+ * settings this tunes (shared_buffers, maintenance_work_mem) is a real
+ * loss rather than a rounding artifact.
+ *
+ * Both a whole MB and a whole GB are multiples of BLCKSZ (8 kB), which
+ * shared_buffers requires.
  */
 static int
-round_down_8kb(int kb)
+round_memory_kb(int kb)
 {
-	return (kb / 8) * 8;
+	if (kb < KB_PER_MB)
+		return KB_PER_MB;
+	if (kb < KB_PER_GB)
+		return (kb / KB_PER_MB) * KB_PER_MB;
+
+	/* int64 so the rounding bias cannot overflow near INT_MAX kB. */
+	return (int) ((((int64) kb + KB_PER_GB / 2) / KB_PER_GB) * KB_PER_GB);
 }
 
 AutoTuneSettings
@@ -184,17 +202,18 @@ auto_tune_compute(int max_connections)
 	shared_kb = ram_kb / 4;
 	if (shared_kb < 128 * KB_PER_MB)
 		shared_kb = 128 * KB_PER_MB;
-	s.shared_buffers_kb = round_down_8kb(shared_kb);
+	s.shared_buffers_kb = round_memory_kb(shared_kb);
 
 	/* Planner hint: combined OS + PG cache. */
-	s.effective_cache_size_kb = (int) ((int64) ram_kb * 3 / 4);
+	s.effective_cache_size_kb = round_memory_kb((int) ((int64) ram_kb * 3 / 4));
 
 	/*
 	 * maintenance_work_mem: governs VACUUM, CREATE INDEX, ALTER TABLE.
 	 * Odoo's module updates create/rebuild many indexes, so be generous.
 	 * RAM/16 capped at 2 GB matches PGTune.
 	 */
-	s.maintenance_work_mem_kb = clamp_int(ram_kb / 16, 64, 2 * KB_PER_GB);
+	s.maintenance_work_mem_kb = round_memory_kb(clamp_int(ram_kb / 16, KB_PER_MB,
+														2 * KB_PER_GB));
 
 	/*
 	 * Parallelism.  Odoo rarely benefits from very wide parallel workers
@@ -234,7 +253,7 @@ auto_tune_compute(int max_connections)
 		work_mem_kb = (ram_kb - s.shared_buffers_kb) / divisor;
 		if (work_mem_kb < 4 * KB_PER_MB)
 			work_mem_kb = 4 * KB_PER_MB;	/* never below upstream default */
-		s.work_mem_kb = work_mem_kb;
+		s.work_mem_kb = round_memory_kb(work_mem_kb);
 	}
 
 	/* Storage cost model. */
