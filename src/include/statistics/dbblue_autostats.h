@@ -37,6 +37,8 @@ extern PGDLLIMPORT bool dbblue_autostats_enabled;
 extern PGDLLIMPORT int dbblue_autostats_max;
 extern PGDLLIMPORT int dbblue_autostats_local_max;
 extern PGDLLIMPORT int dbblue_autostats_sample_rate;
+extern PGDLLIMPORT double dbblue_autostats_min_error;
+extern PGDLLIMPORT int dbblue_autostats_min_rows;
 
 /*
  * DBBlueAutoStatsShmemCallbacks is declared by storage/subsystems.h, which

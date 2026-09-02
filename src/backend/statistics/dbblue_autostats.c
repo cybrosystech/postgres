@@ -60,6 +60,8 @@ bool		dbblue_autostats_enabled = false;
 int			dbblue_autostats_max = 5000;
 int			dbblue_autostats_local_max = 512;
 int			dbblue_autostats_sample_rate = 10;
+double		dbblue_autostats_min_error = 0.0;
+int			dbblue_autostats_min_rows = 0;
 
 /* number of output columns of dbblue_stats_advisor() */
 #define DBBLUE_ADVISOR_COLS		14
@@ -107,6 +109,15 @@ typedef struct AutoStatsSharedState
 {
 	LWLock		lock;			/* protects the hash table */
 	uint64		n_dropped;		/* combinations lost to a full hash */
+
+	/*
+	 * Bumped by dbblue_stats_advisor_reset().  Backends compare this against
+	 * their own copy when flushing and throw away anything they accumulated
+	 * before the reset -- otherwise every connection with a populated cache
+	 * would re-report its pending sightings at its next commit, and the reset
+	 * would appear not to have worked.
+	 */
+	uint64		reset_generation;
 } AutoStatsSharedState;
 
 static AutoStatsSharedState *AutoStatsShared = NULL;
@@ -124,6 +135,7 @@ typedef struct AutoStatsLocalEntry
 	uint32		pending;		/* unflushed plan count */
 	double		plan_est_rows;	/* most recent plan-time row estimate */
 	uint32		pending_exec;	/* unflushed confirmed measurements */
+	bool		ever_measured;	/* has this combination ever been measured? */
 	double		exec_est_rows;
 	double		exec_act_rows;
 	double		max_error;
@@ -135,11 +147,22 @@ typedef struct AutoStatsLocalEntry
 static HTAB *AutoStatsLocalHash = NULL;
 static AutoStatsLocalEntry *AutoStatsDirtyList = NULL;
 static bool AutoStatsXactCallbackSet = false;
+static uint64 AutoStatsLocalGeneration = 0;
+
+/*
+ * Set during planning when a combination that has never been measured is
+ * recorded.  Planning always precedes execution, so this lets the very next
+ * execution be measured regardless of the sampling rate -- otherwise a 10%
+ * rate means most combinations sit in the view with no estimate/actual for a
+ * long time, which is what an operator notices first.
+ */
+static bool AutoStatsForceMeasure = false;
 
 static void dbblue_autostats_shmem_request(void *arg);
 static void dbblue_autostats_shmem_init(void *arg);
 static void autostats_xact_callback(XactEvent event, void *arg);
 static void autostats_flush_local(void);
+static void autostats_discard_local(void);
 static void autostats_note_local(const AutoStatsKey *key, bool all_equality,
 								 double plan_est_rows);
 static bool clause_is_equality_shaped(Node *clause);
@@ -182,6 +205,7 @@ dbblue_autostats_shmem_init(void *arg)
 {
 	LWLockInitialize(&AutoStatsShared->lock, LWTRANCHE_DBBLUE_AUTOSTATS);
 	AutoStatsShared->n_dropped = 0;
+	AutoStatsShared->reset_generation = 0;
 }
 
 /*
@@ -316,6 +340,17 @@ autostats_note_local(const AutoStatsKey *key, bool all_equality,
 		AutoStatsLocalHash = hash_create("dbblue autostats local cache",
 										 64, &ctl,
 										 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+
+		/*
+		 * Adopt the current reset generation.  A backend that started life
+		 * after somebody reset the advisor has nothing stale to throw away,
+		 * and must not mistake "I have never flushed" for "my data predates a
+		 * reset" -- otherwise every new connection would silently discard its
+		 * first batch of findings.
+		 */
+		LWLockAcquire(&AutoStatsShared->lock, LW_SHARED);
+		AutoStatsLocalGeneration = AutoStatsShared->reset_generation;
+		LWLockRelease(&AutoStatsShared->lock);
 	}
 
 	if (!AutoStatsXactCallbackSet)
@@ -332,9 +367,7 @@ autostats_note_local(const AutoStatsKey *key, bool all_equality,
 	if (hash_get_num_entries(AutoStatsLocalHash) >= dbblue_autostats_local_max)
 	{
 		autostats_flush_local();
-		hash_destroy(AutoStatsLocalHash);
-		AutoStatsLocalHash = NULL;
-		AutoStatsDirtyList = NULL;
+		autostats_discard_local();
 		autostats_note_local(key, all_equality, plan_est_rows);
 		return;
 	}
@@ -349,6 +382,7 @@ autostats_note_local(const AutoStatsKey *key, bool all_equality,
 		entry->exec_est_rows = 0;
 		entry->exec_act_rows = 0;
 		entry->max_error = 0;
+		entry->ever_measured = false;
 		entry->all_equality = all_equality;
 		entry->is_dirty = false;
 		entry->next_dirty = NULL;
@@ -366,6 +400,10 @@ autostats_note_local(const AutoStatsKey *key, bool all_equality,
 
 	entry->pending++;
 	entry->plan_est_rows = plan_est_rows;
+
+	/* nothing measured for this combination yet -- measure this execution */
+	if (!entry->ever_measured)
+		AutoStatsForceMeasure = true;
 
 	if (!entry->is_dirty)
 	{
@@ -394,6 +432,18 @@ autostats_flush_local(void)
 	now = GetCurrentTimestamp();
 
 	LWLockAcquire(&AutoStatsShared->lock, LW_EXCLUSIVE);
+
+	/*
+	 * If somebody reset the advisor since we last flushed, everything we are
+	 * holding predates the reset.  Drop it rather than resurrecting it.
+	 */
+	if (AutoStatsShared->reset_generation != AutoStatsLocalGeneration)
+	{
+		AutoStatsLocalGeneration = AutoStatsShared->reset_generation;
+		LWLockRelease(&AutoStatsShared->lock);
+		autostats_discard_local();
+		return;
+	}
 
 	for (local = AutoStatsDirtyList; local != NULL; local = local->next_dirty)
 	{
@@ -458,6 +508,20 @@ autostats_flush_local(void)
 		local = next;
 	}
 
+	AutoStatsDirtyList = NULL;
+}
+
+/*
+ * autostats_discard_local
+ *		Throw away everything this backend has cached.
+ */
+static void
+autostats_discard_local(void)
+{
+	if (AutoStatsLocalHash != NULL)
+		hash_destroy(AutoStatsLocalHash);
+
+	AutoStatsLocalHash = NULL;
 	AutoStatsDirtyList = NULL;
 }
 
@@ -703,6 +767,16 @@ AutoStatsWantInstrumentation(void)
 	if (!dbblue_autostats_enabled || AutoStatsHash == NULL)
 		return false;
 
+	/*
+	 * A combination we have never measured takes priority over the sampling
+	 * rate: one measurement is worth far more than a strictly even sample.
+	 */
+	if (AutoStatsForceMeasure)
+	{
+		AutoStatsForceMeasure = false;
+		return true;
+	}
+
 	if (dbblue_autostats_sample_rate <= 0)
 		return false;
 	if (dbblue_autostats_sample_rate >= 100)
@@ -797,6 +871,28 @@ autostats_record_actual(Oid relid, Bitmapset *attnums,
 												HASH_FIND, NULL);
 	if (entry == NULL)
 		return;
+
+	/*
+	 * Mark the combination as attempted before applying the row floor below.
+	 * Otherwise one whose scans never reach the floor keeps looking "never
+	 * measured", and would request row counting on every single execution for
+	 * the life of the backend.
+	 */
+	entry->ever_measured = true;
+
+	/*
+	 * Ignore scans that produced too few rows to matter.  Odoo issues a great
+	 * many single-row lookups, and on those the ratio is both meaningless and
+	 * wildly unstable: estimating 1 row and finding 15 is a factor of 15, but
+	 * 14 rows never changed anybody's plan.  Left at 0 every measurement
+	 * counts, which keeps the default behaviour unchanged.
+	 */
+	if (act_rows < (double) dbblue_autostats_min_rows)
+	{
+		elog(DEBUG1, "autostats: ignoring %.0f actual rows, below min_rows %d",
+			 act_rows, dbblue_autostats_min_rows);
+		return;
+	}
 
 	error = act_rows / Max(est_rows, 1.0);
 
@@ -986,6 +1082,17 @@ dbblue_stats_advisor(PG_FUNCTION_ARGS)
 		if (entry->key.dbid != MyDatabaseId)
 			continue;
 
+		/*
+		 * Only report combinations the planner actually got wrong by at least
+		 * the configured factor.  A combination with no measurement yet has no
+		 * evidence either way, so it is withheld too -- reporting it would
+		 * defeat the point of asking for a threshold.
+		 */
+		if (dbblue_autostats_min_error > 0.0 &&
+			(entry->exec_count == 0 ||
+			 entry->max_error < dbblue_autostats_min_error))
+			continue;
+
 		relname = get_rel_name(entry->key.relid);
 		if (relname == NULL)
 			continue;			/* table dropped since we recorded it */
@@ -1086,8 +1193,13 @@ dbblue_stats_advisor_reset(PG_FUNCTION_ARGS)
 		hash_search(AutoStatsHash, &entry->key, HASH_REMOVE, NULL);
 
 	AutoStatsShared->n_dropped = 0;
+	AutoStatsShared->reset_generation++;
+	AutoStatsLocalGeneration = AutoStatsShared->reset_generation;
 
 	LWLockRelease(&AutoStatsShared->lock);
+
+	/* our own cache predates the reset as well */
+	autostats_discard_local();
 
 	PG_RETURN_VOID();
 }
