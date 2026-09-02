@@ -4817,7 +4817,12 @@ dbbc_grp_advance(DbbcAggScanState *as, DbbcGroupEntry *grp)
 		if (t->transfn.fn_strict && st->transValueIsNull)
 			continue;
 
-		oldctx = MemoryContextSwitchTo(as->tmpctx);
+		/*
+		 * We are already in tmpctx (the block/heap consumer switched there for
+		 * this row), so the transfn's scratch lands in tmpctx and is reset per
+		 * row without a redundant per-agg switch. Only the by-ref state copy
+		 * below needs to leave tmpctx, and it switches back itself.
+		 */
 		fcinfo->args[0].value = st->transValue;
 		fcinfo->args[0].isnull = st->transValueIsNull;
 		fcinfo->isnull = false; /* just in case the transfn doesn't set it */
@@ -4837,6 +4842,7 @@ dbbc_grp_advance(DbbcAggScanState *as, DbbcGroupEntry *grp)
 			{
 				MemoryContextSwitchTo(as->groupctx);
 				newVal = datumCopy(newVal, false, t->transtypeLen);
+				MemoryContextSwitchTo(as->tmpctx);
 			}
 			else
 				newVal = (Datum) 0;
@@ -4845,7 +4851,6 @@ dbbc_grp_advance(DbbcAggScanState *as, DbbcGroupEntry *grp)
 		}
 		st->transValue = newVal;
 		st->transValueIsNull = fcinfo->isnull;
-		MemoryContextSwitchTo(oldctx);
 	}
 }
 
