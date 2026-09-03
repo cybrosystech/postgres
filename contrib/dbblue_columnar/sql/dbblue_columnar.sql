@@ -103,6 +103,25 @@ SELECT 'grp-textkey   ', agree($$SELECT txt, sum(amt) s, count(*) c FROM t GROUP
 SELECT 'grp-text+int  ', agree($$SELECT k7, txt, sum(amt) s FROM t GROUP BY k7, txt ORDER BY k7, txt$$);
 SELECT 'grp-textexpr  ', agree($$SELECT upper(txt) u, count(*) c FROM t GROUP BY upper(txt) ORDER BY 1$$);
 SELECT 'grp-textfilter', agree($$SELECT txt, sum(amt) s FROM t WHERE k7 > 2 GROUP BY txt ORDER BY txt$$);
+-- memory-aware gate: the grouped agg has no spill, so it must DECLINE when the
+-- estimated groups would not fit hash_mem (work_mem * hash_mem_multiplier) and
+-- let a spill-capable HashAgg run - not error at runtime. Self-contained + ANALYZEd
+-- so the group-count estimate is accurate; a small work_mem makes the 20000-distinct
+-- id key overflow deterministically while the 50-distinct key still fits and uses
+-- the node. (Without the gate the high-card query ERRORs with a numeric sum.)
+CREATE TABLE mg (id int, lc int, amt numeric) WITH (autovacuum_enabled = off);
+INSERT INTO mg SELECT g, g % 50, g * 1.5 FROM generate_series(1, 20000) g;
+VACUUM (DISABLE_PAGE_SKIPPING) mg;
+SELECT dbblue_columnar_add('mg', ARRAY['id','lc','amt']);
+SELECT dbblue_columnar_populate('mg') > 0 AS mg_built;
+ANALYZE mg;
+SET work_mem = '1MB';
+SELECT uses_node($$SELECT id, sum(amt) FROM mg GROUP BY id$$, 'DBBlueColumnarAgg') AS highcard_declines;
+SELECT 'mg-highcard   ', agree($$SELECT id, sum(amt) s FROM mg GROUP BY id ORDER BY id$$);
+SELECT uses_node($$SELECT lc, sum(amt) FROM mg GROUP BY lc$$, 'DBBlueColumnarAgg') AS lowcard_still_used;
+SELECT 'mg-lowcard    ', agree($$SELECT lc, sum(amt) s FROM mg GROUP BY lc ORDER BY lc$$);
+RESET work_mem;
+DROP TABLE mg;
 
 -- ---- correctness under a rescan (LATERAL nestloop, columnar agg on inner) ----
 SELECT 'rescan        ', agree($$SELECT o.k, g.s FROM (VALUES (1),(3),(5)) o(k)

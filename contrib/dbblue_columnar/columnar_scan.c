@@ -58,6 +58,7 @@
 #include "commands/explain.h"
 #include "commands/explain_format.h"
 #include "executor/executor.h"
+#include "executor/nodeAgg.h"
 #include "miscadmin.h"
 #include "nodes/extensible.h"
 #include "nodes/makefuncs.h"
@@ -2699,6 +2700,59 @@ dbbc_grp_key_ok(Oid typid, Oid collid)
 }
 
 /*
+ * The grouped-agg builds an in-memory hash and does NOT spill. Decline it when
+ * the estimated groups would not fit the hash-memory budget (hash_mem_multiplier
+ * * work_mem) - exactly where a HashAgg with the same groups would start
+ * spilling - so a spill-capable plan is used instead of erroring at runtime. The
+ * per-group size is estimated with core's own hash_agg_entry_size (group-key
+ * tuple width + one transition slot per aggregate + the catalog transition-space
+ * estimate), matching the boundary HashAgg itself uses. A safety divisor leaves
+ * headroom for allocator rounding, the dynahash directory, and the text intern
+ * table, since our runtime backstop is a hard error rather than a spill.
+ */
+static bool
+dbbc_grp_fits_hashmem(double ngroups, List *keyexprs, List *aggrefs)
+{
+	Size		tuple_width = 0;
+	Size		trans_space = 0;
+	Size		entry_size;
+	ListCell   *lc;
+
+	foreach(lc, keyexprs)
+	{
+		Node	   *k = (Node *) lfirst(lc);
+
+		tuple_width += get_typavgwidth(exprType(k), exprTypmod(k));
+	}
+	foreach(lc, aggrefs)
+	{
+		Aggref	   *a = lfirst_node(Aggref, lc);
+		HeapTuple	tup = SearchSysCache1(AGGFNOID,
+										  ObjectIdGetDatum(a->aggfnoid));
+
+		if (HeapTupleIsValid(tup))
+		{
+			trans_space += ((Form_pg_aggregate) GETSTRUCT(tup))->aggtransspace;
+			ReleaseSysCache(tup);
+		}
+	}
+	entry_size = hash_agg_entry_size(list_length(aggrefs), tuple_width,
+									 trans_space);
+	/*
+	 * Require the estimate to fit in HALF the budget. hash_agg_entry_size is a
+	 * lower bound - aggtransspace under-counts the real per-group state (a
+	 * numeric sum's NumericAggState with its digit buffers runs well past its
+	 * 128-byte catalog figure) - and HashAgg copes by spilling where we cannot.
+	 * The 2x headroom absorbs that under-count plus allocator rounding, the
+	 * dynahash directory and the text intern table; the runtime cap is only a
+	 * backstop. Erring toward the (correct, spill-capable) fallback is the safe
+	 * bias for a no-spill node.
+	 */
+	return ngroups * (double) entry_size <=
+		0.5 * (double) get_hash_memory_limit();
+}
+
+/*
  * Decompose an aggregate FILTER (WHERE ...) expression into an AND-list of
  * simple comparisons over relation `relid`, reusing dbbc_extract_one_qual (the
  * same Var op Const / Var = ANY / IS [NOT] NULL machinery as the WHERE
@@ -3010,11 +3064,11 @@ dbbc_agg_grouped_classify(PlannerInfo *root, RelOptInfo *input_rel,
 		memset(&estinfo, 0, sizeof(estinfo));
 		*ngroups_out = estimate_num_groups(root, keyexprs,
 										   input_rel->rows, NULL, &estinfo);
-		if (*ngroups_out > (double) DBBC_GRP_MAX_GROUPS)
-			return false;
+		if (!dbbc_grp_fits_hashmem(*ngroups_out, keyexprs, aggrefs))
+			return false;			/* would overflow the no-spill hash */
 		if ((estinfo.flags & SELFLAG_USED_DEFAULT) &&
 			input_rel->rows > (double) DBBC_GRP_MAX_GROUPS)
-			return false;
+			return false;			/* untrustworthy default estimate on a big table */
 	}
 
 	*keyexprs_out = keyexprs;
@@ -3458,7 +3512,7 @@ dbbc_try_dimjoin_agg(PlannerInfo *root, UpperRelationKind stage,
 		memset(&estinfo, 0, sizeof(estinfo));
 		ngroups = estimate_num_groups(root, fact_keyexprs, fact_rel->rows,
 									  NULL, &estinfo);
-		if (ngroups > (double) DBBC_GRP_MAX_GROUPS ||
+		if (!dbbc_grp_fits_hashmem(ngroups, keyexprs, aggrefs) ||
 			((estinfo.flags & SELFLAG_USED_DEFAULT) &&
 			 fact_rel->rows > (double) DBBC_GRP_MAX_GROUPS))
 			return;
@@ -3990,8 +4044,9 @@ dbbc_try_eager_agg(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 		return;
 
 	ngroups = clamp_row_est(agg_info->grouped_rows);
-	if (ngroups > (double) DBBC_GRP_MAX_GROUPS)
-		return;
+	if (!dbbc_grp_fits_hashmem(ngroups, keyexprs, aggrefs))
+		return;					/* would overflow the no-spill hash (eager-agg groups
+								 * by the join key -> high-cardinality is common here) */
 
 	/* the store must cover every needed column */
 	version = dbbc_version_pin_tracked(rte->relid);
