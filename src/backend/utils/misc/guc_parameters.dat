@@ -841,6 +841,13 @@
   boot_val => 'false',
 },
 
+{ name => 'dbblue_default_builtin_locale', type => 'bool', context => 'PGC_USERSET', group => 'CLIENT_CONN_LOCALE',
+  short_desc => 'Gives a CREATE DATABASE with no locale or encoding options the builtin C.UTF-8 locale.',
+  long_desc => 'When on, CREATE DATABASE with no TEMPLATE, ENCODING, LOCALE, COLLATE, CTYPE or LOCALE_PROVIDER option creates the database from template0 with UTF8 encoding and the builtin C.UTF-8 locale, which is what Odoo expects and sorts considerably faster than libc. The same applies to an explicit LC_COLLATE of "C" with UTF8 encoding and template0. Because such a database is cloned from template0, template1 and anything the administrator has put in it are not used; a NOTICE is emitted whenever this happens. Turn this off for standard PostgreSQL behaviour, where CREATE DATABASE inherits template1.',
+  variable => 'dbblue_default_builtin_locale',
+  boot_val => 'true',
+},
+
 { name => 'dbblue_enable_tableam_multi_insert', type => 'bool', context => 'PGC_USERSET', group => 'RESOURCES_IO',
   short_desc => 'Enables batched bulk-insert of initial data for CREATE TABLE AS, CREATE MATERIALIZED VIEW, and REFRESH MATERIALIZED VIEW.',
   variable => 'dbblue_enable_tableam_multi_insert',

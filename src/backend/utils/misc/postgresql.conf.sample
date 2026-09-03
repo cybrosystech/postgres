@@ -859,6 +859,12 @@
 #icu_validation_level = warning         # report ICU locale validation
                                         # errors at the given level
 
+#dbblue_default_builtin_locale = on     # give a CREATE DATABASE with no locale
+                                        # or encoding options the builtin
+                                        # C.UTF-8 locale, from template0;
+                                        # off restores standard template1
+                                        # inheritance
+
 # default configuration for text search
 #default_text_search_config = 'pg_catalog.simple'
 

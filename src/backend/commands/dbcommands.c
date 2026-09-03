@@ -143,6 +143,16 @@ static void CreateDatabaseUsingFileCopy(Oid src_dboid, Oid dst_dboid,
 										Oid src_tsid, Oid dst_tsid);
 static void recovery_create_dbdir(char *path, bool only_tblspc);
 
+
+/*
+ * dbblue: when on, a CREATE DATABASE that does not ask for any particular
+ * encoding or locale is given the builtin C.UTF-8 collation and UTF8
+ * encoding, cloned from template0.  Odoo wants that combination, and the
+ * builtin provider sorts far faster than libc.  Set it off to get stock
+ * PostgreSQL behaviour, where such a CREATE DATABASE inherits template1.
+ */
+bool		dbblue_default_builtin_locale = true;
+
 /*
  * Create a new database using the WAL_LOG strategy.
  *
@@ -1032,7 +1042,8 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 	 *
 	 * Skip this for template databases being created during initdb.
 	 */
-	if (strcmp(dbname, "template0") != 0 && strcmp(dbname, "template1") != 0 &&
+	if (dbblue_default_builtin_locale &&
+		strcmp(dbname, "template0") != 0 && strcmp(dbname, "template1") != 0 &&
 		strcmp(dbname, "postgres") != 0)
 	{
 		if (templateEl == NULL && encodingEl == NULL &&
@@ -1070,6 +1081,21 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 		/* Clear the collateEl so it doesn't override our defaults */
 		collateEl = NULL;
 		dbcollate = NULL;
+
+		/*
+		 * Say so.  Stock PostgreSQL would have cloned template1 here, so
+		 * anything the administrator put in template1 -- a customised
+		 * locale, but also extensions, schemas and seed data -- is not
+		 * carried into this database.  Silently diverging from the
+		 * documented template1 behaviour is the kind of thing an
+		 * administrator should find out now rather than from a query that
+		 * sorts unexpectedly a month later.
+		 */
+		ereport(NOTICE,
+				(errmsg("database \"%s\" will use the builtin \"C.UTF-8\" locale with UTF8 encoding",
+						dbname),
+				 errdetail("It is created from template0, so template1 and its contents are not used."),
+				 errhint("Set dbblue_default_builtin_locale to off, or name a TEMPLATE, LOCALE or ENCODING explicitly, to get the standard behaviour.")));
 	}
 
 	if (!dbtemplate)

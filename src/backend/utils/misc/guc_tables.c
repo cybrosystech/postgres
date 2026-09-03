@@ -46,6 +46,7 @@
 #include "catalog/storage.h"
 #include "commands/async.h"
 #include "commands/extension.h"
+#include "commands/dbcommands.h"
 #include "commands/event_trigger.h"
 #include "commands/tablespace.h"
 #include "commands/trigger.h"
