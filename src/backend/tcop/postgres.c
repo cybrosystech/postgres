@@ -839,6 +839,19 @@ pg_rewrite_query(Query *query)
 	if (log_parser_stats)
 		ShowUsage("REWRITER STATISTICS");
 
+	/*
+	 * dbblue: re-check safe mode against what the rewriter produced.  Rules
+	 * can replace the statement the user wrote with one that touches every
+	 * row, so the parse-time check alone is not enough.
+	 */
+	if (dbblue_safe_mode)
+	{
+		ListCell   *lc;
+
+		foreach(lc, querytree_list)
+			dbblue_safe_mode_check_rewritten(lfirst_node(Query, lc));
+	}
+
 #ifdef DEBUG_NODE_TESTS_ENABLED
 
 	/* Optional debugging check: pass querytree through copyObject() */
