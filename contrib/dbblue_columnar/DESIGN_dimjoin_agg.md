@@ -95,7 +95,7 @@ Phase-1 gate (all must hold, else bail):
 | G3 | Join is a single **equality** condition `fact.fk = dim.key`, INNER or LEFT (fact on the outer side) | Anything else changes row semantics |
 | G4 | `dim.key` is **provably UNIQUE** (PK or unique constraint/index) | Guarantees many-to-one → **no fan-out** → a single hash entry per key is correct |
 | G5 | Dimension is **small**: `dim` estimated rows ≤ `dimjoin_max_dim_rows` (proposed default 65536) | Bounds the in-memory hash; else fall back |
-| G6 | **No dimension-side quals** — no `WHERE dim.x = …`, no extra `ON dim.active` predicate (Phase 1) | A dim filter changes LEFT-JOIN semantics / turns it into a different join |
+| G6 | **Dimension-side `WHERE` quals** — allowed for **INNER** joins (Phase 2): applied per dim row at build, so a fact row whose fk matches no *passing* dim row is dropped. Still rejected for a preserved LEFT join (the `WHERE d.x IS NULL` anti-join idiom that does not reduce — Phase 2b). Volatile / SubPlan quals rejected. | A `WHERE dim.x` normally reduces `LEFT` to `INNER`; INNER-drop-on-miss is the correct semantics |
 | G7 | **Aggregate inputs are fact-only** — no `sum(dim.col)` etc. | Phase 1 feeds transitions from fact chunks only |
 | G8 | The join key **`fact.fk` is a registered columnar column** | The node reads it from the store to probe the hash |
 | G9 | Group keys: each is either a fact column, a supported fact **expression** (existing `dbbc_expr_vars_ok` / non-volatile / allowed type), the **fk**, or a **dim column reachable through the join key** | Fact keys drive the hash; dim keys are attached from the probe |
@@ -111,10 +111,29 @@ Phase-1 gate (all must hold, else bail):
 ## 4. Non-goals (Phase 1)
 
 - Fan-out joins (non-unique dim key) — rejected by G4.
-- Dimension-side quals / filtered joins — rejected by G6.
+- ~~Dimension-side quals / filtered joins~~ — **shipped in Phase 2** (INNER only, see below).
 - Aggregates over dimension columns — rejected by G7.
 - Multiple dimensions / snowflake chains — rejected by G2 (Phase 2).
 - RIGHT/FULL joins, non-equi joins — rejected by G3.
+
+### Phase 2 (shipped): INNER joins + dimension-side `WHERE` filters
+
+A dimension filter almost always arrives as an **INNER** join — `reduce_outer_joins`
+collapses `fact LEFT JOIN dim … WHERE dim.x = V` before the grouping hook runs (the
+`SpecialJoinInfo` disappears and `dim.x = V` lands in `dim_rel->baserestrictinfo`). Phase 2:
+
+- **INNER detection:** accept `sji == NULL` when no non-inner special join entangles the
+  fact or dim. The equi-join `fact.fk = dim.key` is recovered from the **EquivalenceClass**
+  that links the two rels (inner-join equalities are absorbed into ECs and removed from
+  `joininfo`, unlike outer-join ON-clauses).
+- **Dim quals at build:** `dim_rel->baserestrictinfo` is compiled to an `ExprState` and
+  evaluated per dim tuple in `dbbc_dim_build`; only passing rows enter the hash. Volatile /
+  SubPlan quals are rejected (would diverge from a plain plan / are not modeled here).
+- **Drop-on-miss:** a fact-row probe that finds no (passing) dim entry is dropped for INNER
+  (vs. the LEFT NULL-extension). Applied on both the columnar-block and heap-fallback paths.
+- Still deferred (**Phase 2b**): a *preserved* LEFT join carrying a dim filter (anti-join
+  idiom); grouping by a dimension **non-key** column without the dim key in `GROUP BY` (a
+  pre-existing limitation shared with Phase 1, orthogonal to filters).
 
 ---
 

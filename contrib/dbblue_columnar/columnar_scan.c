@@ -58,6 +58,7 @@
 #include "commands/explain.h"
 #include "commands/explain_format.h"
 #include "executor/executor.h"
+#include "executor/nodeAgg.h"
 #include "miscadmin.h"
 #include "nodes/extensible.h"
 #include "nodes/makefuncs.h"
@@ -82,6 +83,7 @@
 #include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "common/hashfn.h"
 #include "utils/datum.h"
 #include "utils/expandeddatum.h"
 #include "utils/fmgroids.h"
@@ -2390,6 +2392,8 @@ typedef struct DbbcDimEntry
 #define DBBC_DJ_DIM_KEY_ATTNO(pl)	((AttrNumber) intVal(list_nth(pl, 6)))
 #define DBBC_DJ_FK_ATTNO(pl)		((AttrNumber) intVal(list_nth(pl, 7)))
 #define DBBC_DJ_DIM_RELID(pl)		((Index) intVal(list_nth(pl, 8)))
+#define DBBC_DJ_DIM_QUALS(pl)		((List *) list_nth(pl, 9))
+#define DBBC_DJ_INNER(pl)			(intVal(list_nth(pl, 10)) != 0)
 
 typedef struct DbbcAggScanState
 {
@@ -2412,6 +2416,15 @@ typedef struct DbbcAggScanState
 	DbbcScanState *pscan;		/* persistently bound scan (version/dir/range) */
 	int			nkeys;
 	AttrNumber	key_attnos[DBBC_GRP_MAX_KEYS];	/* bare-Var key: the column; else Invalid */
+	/*
+	 * Text group keys (text/varchar, deterministic collation only). The raw-bits
+	 * group hash needs byte-comparable fixed slots, so a text key value is first
+	 * canonicalized through key_intern to a single stable groupctx pointer (equal
+	 * bytes -> same pointer); the fast byval path never touches this.
+	 */
+	bool		key_is_text[DBBC_GRP_MAX_KEYS];
+	bool		has_varlena_key;	/* any key_is_text[]: build key_intern */
+	HTAB	   *key_intern;			/* text value -> canonical groupctx pointer */
 
 	/*
 	 * Expression group keys (e.g. date_trunc('month', datecol)). key_exprstate[k]
@@ -2465,6 +2478,10 @@ typedef struct DbbcAggScanState
 	MemoryContext dim_ctx;
 	void	   *cur_dim;		/* probed dim entry for the current row, or NULL */
 	Oid			dj_keytype;		/* join key type (INT4/INT8/OID) for normalizing */
+	bool		dj_inner;		/* INNER: drop fact row on probe miss (else LEFT->NULL) */
+	List	   *dim_quals;		/* dim-side WHERE quals (Phase 2, INNER only) */
+	ExprState  *dim_qual_state; /* AND of dim_quals, evaluated per dim tuple at build */
+	ExprContext *dim_econtext;	/* its context; ecxt_scantuple = dim build slot */
 
 	/* grouped-mode instrumentation (EXPLAIN ANALYZE) */
 	int64		grp_blocks_served;
@@ -2641,7 +2658,11 @@ dbbc_agg_classify(Node *expr, Index relid, DbbcAggItem *item, List **needcols)
  * Group keys are hashed on their raw Datum bits, so only types whose bit
  * equality IS SQL equality qualify. Floats are excluded on purpose: their
  * comparison treats -0.0 = +0.0 and groups NaNs together, neither of which
- * holds for bit equality.
+ * holds for bit equality. text/varchar are supported too, but not by bit
+ * equality: their values are canonicalized through key_intern (see
+ * dbbc_intern_text) so equal strings share one pointer and the fixed key stays
+ * byte-comparable. That only matches SQL equality under a DETERMINISTIC
+ * collation (equal iff byte-identical) - dbbc_grp_key_ok enforces that.
  */
 static bool
 dbbc_grp_key_type_ok(Oid typid)
@@ -2658,9 +2679,117 @@ dbbc_grp_key_type_ok(Oid typid)
 		case TIMEOID:
 		case TIMESTAMPOID:
 		case TIMESTAMPTZOID:
+		case TEXTOID:
+		case VARCHAROID:
 			return true;
 	}
 	return false;
+}
+
+/* true iff the type is a supported group-key type AND, for text/varchar, the
+ * collation is deterministic (so byte equality == the grouping equality core
+ * HashAgg would use). Non-deterministic collations fall back. */
+static bool
+dbbc_grp_key_ok(Oid typid, Oid collid)
+{
+	if (!dbbc_grp_key_type_ok(typid))
+		return false;
+	if (typid == TEXTOID || typid == VARCHAROID)
+		return OidIsValid(collid) && get_collation_isdeterministic(collid);
+	return true;
+}
+
+/*
+ * The grouped-agg builds an in-memory hash and does NOT spill. Decline it when
+ * the estimated groups would not fit the hash-memory budget (hash_mem_multiplier
+ * * work_mem) - exactly where a HashAgg with the same groups would start
+ * spilling - so a spill-capable plan is used instead of erroring at runtime. The
+ * per-group size is estimated with core's own hash_agg_entry_size (group-key
+ * tuple width + one transition slot per aggregate + the catalog transition-space
+ * estimate), matching the boundary HashAgg itself uses. A safety divisor leaves
+ * headroom for allocator rounding, the dynahash directory, and the text intern
+ * table, since our runtime backstop is a hard error rather than a spill.
+ */
+static bool
+dbbc_grp_fits_hashmem(PlannerInfo *root, double ngroups, List *keyexprs,
+					  List *aggrefs)
+{
+	Size		tuple_width = 0;
+	Size		trans_space = 0;
+	Size		entry_size;
+	ListCell   *lc;
+
+	foreach(lc, keyexprs)
+	{
+		Node	   *k = (Node *) lfirst(lc);
+		int32		w = 0;
+
+		/*
+		 * For a base-column key use the ANALYZEd average width - essential for
+		 * wide text/varchar, where get_typavgwidth returns only a 32-byte
+		 * fallback (unbounded types have no type_maximum_size) and would
+		 * under-count a long-string key several-fold. Expression keys and
+		 * unanalyzed columns fall back to the type estimate.
+		 */
+		if (IsA(k, Var))
+		{
+			Var		   *v = (Var *) k;
+
+			if (v->varno > 0 && v->varno <= root->simple_rel_array_size &&
+				root->simple_rte_array[v->varno] != NULL &&
+				root->simple_rte_array[v->varno]->rtekind == RTE_RELATION &&
+				v->varattno > 0)
+				w = get_attavgwidth(root->simple_rte_array[v->varno]->relid,
+									v->varattno);
+		}
+		if (w <= 0)
+			w = get_typavgwidth(exprType(k), exprTypmod(k));
+		tuple_width += (Size) w;
+	}
+	foreach(lc, aggrefs)
+	{
+		Aggref	   *a = lfirst_node(Aggref, lc);
+		HeapTuple	tup = SearchSysCache1(AGGFNOID,
+										  ObjectIdGetDatum(a->aggfnoid));
+
+		if (HeapTupleIsValid(tup))
+		{
+			Form_pg_aggregate agg = (Form_pg_aggregate) GETSTRUCT(tup);
+			int32		ats = agg->aggtransspace;	/* SIGNED; -1 for array_agg */
+			Size		sp = (ats > 0) ? (Size) ats : 0;
+
+			/*
+			 * aggtransspace is 0 (or -1) for many byref/internal transition types
+			 * whose real per-group state is non-trivial: max/min(text) hold the
+			 * current value, array_agg/string_agg accumulate and can grow without
+			 * bound. Floor those so the gate does not admit a hash it cannot hold
+			 * (the unbounded accumulators still rely on the runtime backstop).
+			 * NB: aggtransspace is a signed int32 and MUST be read as such - a raw
+			 * assignment of -1 into a Size wraps to SIZE_MAX and overflows
+			 * hash_agg_entry_size.
+			 */
+			if (sp == 0 &&
+				(agg->aggtranstype == INTERNALOID ||
+				 !get_typbyval(agg->aggtranstype)))
+				sp = 128;
+			trans_space += sp;
+			ReleaseSysCache(tup);
+		}
+	}
+	entry_size = hash_agg_entry_size(list_length(aggrefs), tuple_width,
+									 trans_space);
+	/*
+	 * Require the estimate to fit in HALF the budget. hash_agg_entry_size is a
+	 * lower bound - aggtransspace under-counts the real per-group state (a
+	 * numeric sum's NumericAggState with its digit buffers runs well past its
+	 * 128-byte catalog figure) - and HashAgg copes by spilling where we cannot.
+	 * The 2x headroom absorbs that under-count plus allocator rounding, the
+	 * dynahash directory and the text intern table; the runtime cap is only a
+	 * backstop. Erring toward the (correct, spill-capable) fallback is the safe
+	 * bias for a no-spill node.
+	 */
+	return ngroups * (double) entry_size <=
+		0.5 * (double) get_hash_memory_limit();
 }
 
 /*
@@ -2898,13 +3027,13 @@ dbbc_agg_grouped_classify(PlannerInfo *root, RelOptInfo *input_rel,
 			if (var->varno != relid || var->varlevelsup != 0 ||
 				var->varattno <= 0)
 				return false;
-			if (!dbbc_grp_key_type_ok(var->vartype))
+			if (!dbbc_grp_key_ok(var->vartype, var->varcollid))
 				return false;
 			*needcols = list_append_unique_int(*needcols, var->varattno);
 		}
 		else
 		{
-			if (!dbbc_grp_key_type_ok(exprType(expr)))
+			if (!dbbc_grp_key_ok(exprType(expr), exprCollation(expr)))
 				return false;
 			if (contain_volatile_functions(expr))
 				return false;
@@ -2975,8 +3104,15 @@ dbbc_agg_grouped_classify(PlannerInfo *root, RelOptInfo *input_rel,
 		memset(&estinfo, 0, sizeof(estinfo));
 		*ngroups_out = estimate_num_groups(root, keyexprs,
 										   input_rel->rows, NULL, &estinfo);
-		if (*ngroups_out > (double) DBBC_GRP_MAX_GROUPS)
-			return false;
+		if (!dbbc_grp_fits_hashmem(root, *ngroups_out, keyexprs, aggrefs))
+			return false;			/* would overflow the no-spill hash */
+		/*
+		 * A defaulted estimate on a big table is the least trustworthy case
+		 * (estimate_num_groups returns 200 for an unanalyzed column); refuse it
+		 * rather than build an unbounded hash. We cannot distinguish low- from
+		 * high-cardinality without stats, so smaller unanalyzed tables lean on
+		 * the runtime backstop (ANALYZE closes the gap for them).
+		 */
 		if ((estinfo.flags & SELFLAG_USED_DEFAULT) &&
 			input_rel->rows > (double) DBBC_GRP_MAX_GROUPS)
 			return false;
@@ -3025,6 +3161,8 @@ dbbc_try_dimjoin_agg(PlannerInfo *root, UpperRelationKind stage,
 			   *needcols = NIL;
 	double		ngroups = 1.0;
 	bool		unique = false;
+	bool		dj_inner = false;
+	List	   *dim_quals = NIL;
 	int			parallel_workers = 0;
 	ListCell   *lc;
 	CustomPath *cpath;
@@ -3100,7 +3238,13 @@ dbbc_try_dimjoin_agg(PlannerInfo *root, UpperRelationKind stage,
 	if (dim_rel == NULL || dim_rte->rtekind != RTE_RELATION)
 		return;
 
-	/* Phase 1: a LEFT join with the fact preserved and the dim nullable */
+	/*
+	 * Phase 1: a LEFT join, fact preserved (outer) and dim nullable (inner).
+	 * Phase 2: also a plain INNER join of exactly these two rels. A dimension
+	 * WHERE filter normally arrives this way - reduce_outer_joins collapses
+	 * "LEFT JOIN dim ... WHERE dim.x=V" into an inner join (the SpecialJoinInfo
+	 * is gone and dim.x=V lands in dim_rel->baserestrictinfo).
+	 */
 	foreach(lc, root->join_info_list)
 	{
 		SpecialJoinInfo *s = (SpecialJoinInfo *) lfirst(lc);
@@ -3114,13 +3258,119 @@ dbbc_try_dimjoin_agg(PlannerInfo *root, UpperRelationKind stage,
 		}
 	}
 	if (sji == NULL)
-		return;					/* not a LEFT join of this shape (INNER = Phase 2) */
+	{
+		/*
+		 * No LEFT join of this shape. Accept a clean INNER join, but only if no
+		 * other (non-inner) special join entangles the fact or the dim - their
+		 * nullability would then differ from a straight inner join. With just
+		 * two base rels any such SpecialJoinInfo must involve one of them.
+		 */
+		foreach(lc, root->join_info_list)
+		{
+			SpecialJoinInfo *s = (SpecialJoinInfo *) lfirst(lc);
 
-	/* the dim carries no quals of its own (Phase 1) */
+			if (s->jointype == JOIN_INNER)
+				continue;
+			if (bms_is_member(fact_relid, s->min_righthand) ||
+				bms_is_member(fact_relid, s->min_lefthand) ||
+				bms_is_member(dim_relid, s->min_righthand) ||
+				bms_is_member(dim_relid, s->min_lefthand))
+				return;			/* an outer join involves our rels: not clean */
+		}
+		dj_inner = true;
+	}
+
+	/*
+	 * Dimension-side quals. Phase 1 rejected any. Phase 2 accepts them for the
+	 * INNER case only: a passing dim row is kept, and a fact row whose fk matches
+	 * no passing dim row is dropped (INNER). For a preserved LEFT join a dim
+	 * filter (e.g. the "WHERE d.x IS NULL" anti-join idiom, which does not
+	 * reduce) has different semantics - keep rejecting it (Phase 2b).
+	 */
 	if (dim_rel->baserestrictinfo != NIL)
-		return;
+	{
+		if (!dj_inner)
+			return;				/* LEFT + dim filter: not modeled (Phase 2b) */
+		foreach(lc, dim_rel->baserestrictinfo)
+		{
+			RestrictInfo *ri = lfirst_node(RestrictInfo, lc);
+
+			if (ri->security_level > 0 || ri->pseudoconstant)
+				return;
+			/*
+			 * Reject a volatile qual: our build evaluates it once per dim row,
+			 * independently of the plain plan's inner scan, so a volatile result
+			 * (random(), nextval()) would diverge from REFRESH. A SubPlan/Param
+			 * qual is not modeled against this node's exec context. STABLE is
+			 * fine - it is fixed for the query, so both sides agree.
+			 */
+			if (contain_volatile_functions((Node *) ri->clause) ||
+				contain_subplans((Node *) ri->clause))
+				return;
+			/*
+			 * A correlated PARAM_EXEC would make the qual depend on an outer row,
+			 * but the dim hash is built once and never rebuilt on rescan - it
+			 * would freeze to a stale param. (Such clauses normally live in the
+			 * parameterized path's ppi_clauses, not baserestrictinfo, so this is
+			 * defensive.) Extern params are constant per execution and fine.
+			 */
+			if (!bms_is_empty(pull_paramids(ri->clause)))
+				return;
+			dim_quals = lappend(dim_quals, ri->clause);
+		}
+	}
 
 	/* the single equi-join clause fact.fk = dim.key, both plain Vars */
+	if (dj_inner)
+	{
+		/*
+		 * An INNER equi-join condition is absorbed into an EquivalenceClass and
+		 * removed from joininfo (only outer-join quals stay there); recover
+		 * fact.fk = dim.key from the EC that links the two rels. EC membership
+		 * already implies a mergejoinable equality, so no opfamily re-check.
+		 */
+		foreach(lc, root->eq_classes)
+		{
+			EquivalenceClass *ec = lfirst_node(EquivalenceClass, lc);
+			Var		   *vfact = NULL,
+					   *vdim = NULL;
+			ListCell   *lm;
+
+			if (ec->ec_has_const || ec->ec_has_volatile || ec->ec_broken)
+				continue;
+			if (!bms_is_member(fact_relid, ec->ec_relids) ||
+				!bms_is_member(dim_relid, ec->ec_relids))
+				continue;
+			foreach(lm, ec->ec_members)
+			{
+				EquivalenceMember *em = lfirst_node(EquivalenceMember, lm);
+				Node	   *e = (Node *) em->em_expr;
+
+				if (em->em_is_child)
+					continue;
+				while (e && IsA(e, RelabelType))
+					e = (Node *) ((RelabelType *) e)->arg;
+				if (e == NULL || !IsA(e, Var) || ((Var *) e)->varattno <= 0)
+					continue;
+				if (((Var *) e)->varno == (Index) fact_relid)
+					vfact = (Var *) e;
+				else if (((Var *) e)->varno == (Index) dim_relid)
+					vdim = (Var *) e;
+			}
+			if (vfact == NULL || vdim == NULL)
+				continue;			/* this EC does not join fact to dim */
+			if (fk_attno != 0)
+				return;				/* two ECs join them: ambiguous, bail */
+			if (vfact->vartype != vdim->vartype ||
+				(vfact->vartype != INT4OID && vfact->vartype != INT8OID &&
+				 vfact->vartype != OIDOID))
+				return;				/* Phase 1: identical byval integer keys */
+			fk_attno = vfact->varattno;
+			dim_key_attno = vdim->varattno;
+			joinkeytype = vfact->vartype;
+		}
+	}
+	else
 	foreach(lc, fact_rel->joininfo)
 	{
 		RestrictInfo *ri = lfirst_node(RestrictInfo, lc);
@@ -3223,13 +3473,13 @@ dbbc_try_dimjoin_agg(PlannerInfo *root, UpperRelationKind stage,
 				return;
 			if (v->varno == (Index) fact_relid)
 			{
-				if (!dbbc_grp_key_type_ok(v->vartype))
+				if (!dbbc_grp_key_ok(v->vartype, v->varcollid))
 					return;
 			}
 			else if (v->varno == (Index) dim_relid)
 			{
-				if (!dbbc_grp_key_type_ok(v->vartype))
-					return;		/* Phase 1: byval bit-eq dim key columns only */
+				if (!dbbc_grp_key_ok(v->vartype, v->varcollid))
+					return;		/* dim key: byval bit-eq or deterministic-collation text */
 				from_dim = true;
 			}
 			else
@@ -3237,7 +3487,7 @@ dbbc_try_dimjoin_agg(PlannerInfo *root, UpperRelationKind stage,
 		}
 		else
 		{
-			if (!dbbc_grp_key_type_ok(exprType(expr)) ||
+			if (!dbbc_grp_key_ok(exprType(expr), exprCollation(expr)) ||
 				contain_volatile_functions(expr) ||
 				!dbbc_expr_vars_ok(expr, fact_relid, &needcols))
 				return;			/* fact-only expression keys */
@@ -3295,7 +3545,7 @@ dbbc_try_dimjoin_agg(PlannerInfo *root, UpperRelationKind stage,
 				if (IsA(expr, Var) &&
 					((Var *) expr)->varno == (Index) dim_relid &&
 					((Var *) expr)->varattno > 0 &&
-					dbbc_grp_key_type_ok(((Var *) expr)->vartype) &&
+					dbbc_grp_key_ok(((Var *) expr)->vartype, ((Var *) expr)->varcollid) &&
 					list_length(keyexprs) < DBBC_GRP_MAX_KEYS)
 				{
 					k = list_length(keyexprs);
@@ -3310,17 +3560,34 @@ dbbc_try_dimjoin_agg(PlannerInfo *root, UpperRelationKind stage,
 	if (outmap == NIL)
 		return;
 
-	/* fact-side group-count estimate (dim keys are FD on the fk: no multiply) */
-	if (fact_keyexprs != NIL)
+	/*
+	 * Group-count estimate + no-spill fit check. Fact keys drive the count (dim
+	 * keys are FD on the fk, no multiply); with ONLY dim-sourced keys the count
+	 * is bounded by the dimension's distinct group-key values. Always apply the
+	 * memory gate - the earlier code skipped it entirely when fact_keyexprs was
+	 * NIL, leaving a dim-only GROUP BY (e.g. "GROUP BY d.region") ungated.
+	 */
 	{
 		EstimationInfo estinfo;
+		double		bigrows;
 
 		memset(&estinfo, 0, sizeof(estinfo));
-		ngroups = estimate_num_groups(root, fact_keyexprs, fact_rel->rows,
-									  NULL, &estinfo);
-		if (ngroups > (double) DBBC_GRP_MAX_GROUPS ||
+		if (fact_keyexprs != NIL)
+		{
+			ngroups = estimate_num_groups(root, fact_keyexprs, fact_rel->rows,
+										  NULL, &estinfo);
+			bigrows = fact_rel->rows;
+		}
+		else
+		{
+			/* all keys dim-sourced: at most one group per dim row */
+			ngroups = estimate_num_groups(root, keyexprs, dim_rel->rows,
+										  NULL, &estinfo);
+			bigrows = dim_rel->rows;
+		}
+		if (!dbbc_grp_fits_hashmem(root, ngroups, keyexprs, aggrefs) ||
 			((estinfo.flags & SELFLAG_USED_DEFAULT) &&
-			 fact_rel->rows > (double) DBBC_GRP_MAX_GROUPS))
+			 bigrows > (double) DBBC_GRP_MAX_GROUPS))
 			return;
 	}
 
@@ -3333,7 +3600,8 @@ dbbc_try_dimjoin_agg(PlannerInfo *root, UpperRelationKind stage,
 	if (partial)
 	{
 		if (!is_parallel_safe(root, (Node *) quals) ||
-			!is_parallel_safe(root, (Node *) keyexprs))
+			!is_parallel_safe(root, (Node *) keyexprs) ||
+			!is_parallel_safe(root, (Node *) dim_quals))
 			return;
 		parallel_workers = compute_parallel_worker(fact_rel, fact_rel->pages,
 												   -1,
@@ -3352,6 +3620,8 @@ dbbc_try_dimjoin_agg(PlannerInfo *root, UpperRelationKind stage,
 	payload = lappend(payload, makeInteger((int) dim_key_attno));
 	payload = lappend(payload, makeInteger((int) fk_attno));
 	payload = lappend(payload, makeInteger((int) dim_relid));
+	payload = lappend(payload, dim_quals);
+	payload = lappend(payload, makeInteger(dj_inner ? 1 : 0));
 
 	cpath = makeNode(CustomPath);
 	cpath->path.pathtype = T_CustomScan;
@@ -3790,7 +4060,7 @@ dbbc_try_eager_agg(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	{
 		Node	   *g = (Node *) lfirst(lc);
 
-		if (!dbbc_grp_key_type_ok(exprType(g)) ||
+		if (!dbbc_grp_key_ok(exprType(g), exprCollation(g)) ||
 			contain_volatile_functions(g) ||
 			!dbbc_expr_vars_ok(g, rel->relid, &needcols))
 			return;
@@ -3847,8 +4117,9 @@ dbbc_try_eager_agg(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 		return;
 
 	ngroups = clamp_row_est(agg_info->grouped_rows);
-	if (ngroups > (double) DBBC_GRP_MAX_GROUPS)
-		return;
+	if (!dbbc_grp_fits_hashmem(root, ngroups, keyexprs, aggrefs))
+		return;					/* would overflow the no-spill hash (eager-agg groups
+								 * by the join key -> high-cardinality is common here) */
 
 	/* the store must cover every needed column */
 	version = dbbc_version_pin_tracked(rte->relid);
@@ -3979,6 +4250,30 @@ dbbc_dj_keyval(Datum d, Oid typ)
 }
 
 /*
+ * Highest attribute number referenced by the dim-side quals, so the build loop
+ * deforms only up to that column (heap deform is sequential) instead of the
+ * whole - possibly very wide - dimension tuple. A whole-row (0) or system (<0)
+ * Var forces the full deform (signalled by leaving *maxp at -1).
+ */
+static bool
+dbbc_dim_qual_maxattno_walker(Node *node, AttrNumber *maxp)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Var))
+	{
+		AttrNumber	a = ((Var *) node)->varattno;
+
+		if (a <= 0)
+			*maxp = -1;			/* whole-row / system col: need the whole tuple */
+		else if (*maxp >= 0 && a > *maxp)
+			*maxp = a;
+		return false;
+	}
+	return expression_tree_walker(node, dbbc_dim_qual_maxattno_walker, maxp);
+}
+
+/*
  * Build the in-memory dimension hash for the dim-join sub-mode. Scanned under
  * the query snapshot (estate->es_snapshot) exactly like a Hash Join's inner
  * build, so visibility is identical and the dimension is never cached in the
@@ -3993,6 +4288,7 @@ dbbc_dim_build(DbbcAggScanState *as, EState *estate)
 	TableScanDesc scan;
 	TupleTableSlot *slot;
 	int64		ndim = 0;
+	AttrNumber	dim_qual_maxattno = 0;	/* deform the dim tuple only this far */
 
 	as->dj_keytype =
 		TupleDescAttr(RelationGetDescr(as->rel), as->fk_attno - 1)->atttypid;
@@ -4007,6 +4303,23 @@ dbbc_dim_build(DbbcAggScanState *as, EState *estate)
 	as->dim_hash = hash_create("dbblue_columnar dim", 256, &ctl,
 							   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 
+	/*
+	 * Phase 2: a dim-side WHERE filter (INNER join only). Compile it once; only
+	 * dim rows that pass enter the hash, so a fact row whose fk matches no
+	 * passing dim row finds no entry and is dropped at probe time (INNER). The
+	 * quals are evaluated per dim tuple against the scan slot, exactly as a
+	 * Hash Join's inner scan applies them below the build.
+	 */
+	as->dim_qual_state = NULL;
+	as->dim_econtext = NULL;
+	if (as->dim_quals != NIL)
+	{
+		as->dim_econtext = CreateExprContext(estate);
+		as->dim_qual_state = ExecInitQual(as->dim_quals,
+										  (PlanState *) &as->css.ss.ps);
+		dbbc_dim_qual_maxattno_walker((Node *) as->dim_quals, &dim_qual_maxattno);
+	}
+
 	slot = table_slot_create(as->dim_rel, NULL);
 	scan = table_beginscan(as->dim_rel, estate->es_snapshot, 0, NULL, 0);
 	while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
@@ -4020,6 +4333,26 @@ dbbc_dim_build(DbbcAggScanState *as, EState *estate)
 
 		if (knull)
 			continue;			/* a NULL dim key never matches an equi-join */
+		if (as->dim_qual_state != NULL)
+		{
+			/*
+			 * Deform the columns the qual reads before evaluating it: the
+			 * compiled qual reads the dim slot as a fully-populated (virtual-
+			 * style) tuple and does not re-deform, but the key read above only
+			 * advanced tts_nvalid to the key attno. Deform just up to the qual's
+			 * highest column (heap deform is sequential) rather than the whole,
+			 * possibly very wide, dimension row; a whole-row/system-col qual
+			 * (maxattno < 0) needs the full deform.
+			 */
+			if (dim_qual_maxattno < 0)
+				slot_getallattrs(slot);
+			else
+				slot_getsomeattrs(slot, dim_qual_maxattno);
+			ResetExprContext(as->dim_econtext);
+			as->dim_econtext->ecxt_scantuple = slot;
+			if (!ExecQual(as->dim_qual_state, as->dim_econtext))
+				continue;		/* dim row fails the WHERE filter: exclude it */
+		}
 		hk = dbbc_dj_keyval(kd, as->dj_keytype);
 		e = (DbbcDimEntry *) hash_search(as->dim_hash, &hk, HASH_ENTER, &found);
 		if (found)
@@ -4039,8 +4372,26 @@ dbbc_dim_build(DbbcAggScanState *as, EState *estate)
 					 errhint("ANALYZE the dimension so the planner sizes it correctly and does not choose the in-node dimension join.")));
 		for (k = 0; k < as->nkeys; k++)
 			if (as->key_from_dim[k])
-				e->vals[k] = slot_getattr(slot, as->key_dim_attno[k],
-										  &e->nulls[k]);
+			{
+				Datum		v = slot_getattr(slot, as->key_dim_attno[k],
+											 &e->nulls[k]);
+
+				/*
+				 * A text dim key must outlive the scan slot (freed as the scan
+				 * advances) and any toast, so copy it flat into the dim context.
+				 * byval keys are stored as-is. The value is later canonicalized
+				 * through key_intern at group-probe time.
+				 */
+				if (!e->nulls[k] && as->key_is_text[k])
+				{
+					MemoryContext old = MemoryContextSwitchTo(as->dim_ctx);
+
+					v = PointerGetDatum(pg_detoast_datum_copy((struct varlena *)
+															  DatumGetPointer(v)));
+					MemoryContextSwitchTo(old);
+				}
+				e->vals[k] = v;
+			}
 	}
 	table_endscan(scan);
 	ExecDropSingleTupleTableSlot(slot);
@@ -4066,10 +4417,15 @@ dbbc_grp_begin(DbbcAggScanState *as, List *payload, EState *estate, int eflags)
 	as->key_exprstate = (ExprState **)
 		palloc0(Max(as->nkeys, 1) * sizeof(ExprState *));
 	as->has_key_exprs = false;
+	as->has_varlena_key = false;
 	i = 0;
 	foreach(lc, keyexprs)
 	{
 		Node	   *kexpr = (Node *) lfirst(lc);
+		Oid			ktype = exprType(kexpr);
+
+		as->key_is_text[i] = (ktype == TEXTOID || ktype == VARCHAROID);
+		as->has_varlena_key |= as->key_is_text[i];
 
 		if (IsA(kexpr, Var))
 		{
@@ -4468,6 +4824,8 @@ dbbc_agg_begin(CustomScanState *node, EState *estate, int eflags)
 			as->dim_key_attno = DBBC_DJ_DIM_KEY_ATTNO(items);
 			as->fk_attno = DBBC_DJ_FK_ATTNO(items);
 			as->dim_relid = DBBC_DJ_DIM_RELID(items);
+			as->dim_quals = DBBC_DJ_DIM_QUALS(items);
+			as->dj_inner = DBBC_DJ_INNER(items);
 		}
 		/*
 		 * AccessShareLock, not NoLock: BeginCustomScan runs in every parallel
@@ -4690,6 +5048,61 @@ dbbc_skipqual_test(DbbcSkipQual *q, Datum value, bool isnull)
 	}
 }
 
+/*
+ * key_intern: a homogeneous text-value hash. Its key is a Datum pointing at a
+ * FLAT (detoasted) text; hash and equality run on the bytes, matching text
+ * grouping under a deterministic collation. dbbc_intern_text canonicalizes each
+ * text key value to one stable groupctx pointer, so the fixed group key stays
+ * byte-comparable (equal strings -> identical pointer). No per-column context is
+ * needed - the table holds only text - so plain dynahash callbacks suffice.
+ */
+static uint32
+dbbc_textintern_hash(const void *key, Size keysize)
+{
+	text	   *t = DatumGetTextPP(*(const Datum *) key);
+
+	return hash_bytes((const unsigned char *) VARDATA_ANY(t),
+					  VARSIZE_ANY_EXHDR(t));
+}
+
+static int
+dbbc_textintern_match(const void *key1, const void *key2, Size keysize)
+{
+	text	   *a = DatumGetTextPP(*(const Datum *) key1);
+	text	   *b = DatumGetTextPP(*(const Datum *) key2);
+	int			la = VARSIZE_ANY_EXHDR(a);
+	int			lb = VARSIZE_ANY_EXHDR(b);
+
+	if (la != lb)
+		return 1;
+	return memcmp(VARDATA_ANY(a), VARDATA_ANY(b), la);
+}
+
+/*
+ * Canonicalize a (possibly toasted, transient) text Datum to a single stable
+ * pointer living in groupctx: equal byte strings return the identical pointer.
+ * Detoast once into the caller's short-lived context so the callbacks never
+ * re-detoast; the first occurrence is copied flat into groupctx and reused.
+ */
+static Datum
+dbbc_intern_text(DbbcAggScanState *as, Datum d)
+{
+	Datum		flat = PointerGetDatum(pg_detoast_datum((struct varlena *)
+													   DatumGetPointer(d)));
+	Datum	   *slot;
+	bool		found;
+
+	slot = (Datum *) hash_search(as->key_intern, &flat, HASH_ENTER, &found);
+	if (!found)
+	{
+		MemoryContext old = MemoryContextSwitchTo(as->groupctx);
+
+		*slot = datumCopy(flat, false, -1);		/* flat text: typbyval=f typlen=-1 */
+		MemoryContextSwitchTo(old);
+	}
+	return *slot;
+}
+
 /* find-or-create the group for the current row's key values */
 static DbbcGroupEntry *
 dbbc_grp_lookup(DbbcAggScanState *as, Datum *keyvals, bool *keynulls)
@@ -4705,6 +5118,8 @@ dbbc_grp_lookup(DbbcAggScanState *as, Datum *keyvals, bool *keynulls)
 	{
 		if (keynulls[k])
 			key.nullmask |= ((uint32) 1) << k;
+		else if (as->key_is_text[k])
+			key.vals[k] = dbbc_intern_text(as, keyvals[k]);
 		else
 			key.vals[k] = keyvals[k];
 	}
@@ -4817,7 +5232,12 @@ dbbc_grp_advance(DbbcAggScanState *as, DbbcGroupEntry *grp)
 		if (t->transfn.fn_strict && st->transValueIsNull)
 			continue;
 
-		oldctx = MemoryContextSwitchTo(as->tmpctx);
+		/*
+		 * We are already in tmpctx (the block/heap consumer switched there for
+		 * this row), so the transfn's scratch lands in tmpctx and is reset per
+		 * row without a redundant per-agg switch. Only the by-ref state copy
+		 * below needs to leave tmpctx, and it switches back itself.
+		 */
 		fcinfo->args[0].value = st->transValue;
 		fcinfo->args[0].isnull = st->transValueIsNull;
 		fcinfo->isnull = false; /* just in case the transfn doesn't set it */
@@ -4837,6 +5257,7 @@ dbbc_grp_advance(DbbcAggScanState *as, DbbcGroupEntry *grp)
 			{
 				MemoryContextSwitchTo(as->groupctx);
 				newVal = datumCopy(newVal, false, t->transtypeLen);
+				MemoryContextSwitchTo(as->tmpctx);
 			}
 			else
 				newVal = (Datum) 0;
@@ -4845,7 +5266,6 @@ dbbc_grp_advance(DbbcAggScanState *as, DbbcGroupEntry *grp)
 		}
 		st->transValue = newVal;
 		st->transValueIsNull = fcinfo->isnull;
-		MemoryContextSwitchTo(oldctx);
 	}
 }
 
@@ -4931,6 +5351,12 @@ dbbc_grp_consume_block(DbbcAggScanState *as, DbbcScanState *s,
 											  HASH_FIND, &found);
 					if (!found)
 						as->cur_dim = NULL;
+				}
+				if (as->cur_dim == NULL && as->dj_inner)
+				{
+					/* INNER join: fk matched no passing dim row - drop it */
+					MemoryContextSwitchTo(oldctx);
+					continue;
 				}
 			}
 			if (as->has_key_exprs)
@@ -5083,6 +5509,12 @@ dbbc_grp_consume_heap_range(DbbcAggScanState *as, DbbcScanState *s,
 											  HASH_FIND, &found);
 					if (!found)
 						as->cur_dim = NULL;
+				}
+				if (as->cur_dim == NULL && as->dj_inner)
+				{
+					/* INNER join: fk matched no passing dim row - drop it */
+					MemoryContextSwitchTo(oldctx);
+					continue;
 				}
 			}
 			if (as->has_key_exprs)
@@ -5265,6 +5697,22 @@ dbbc_grp_build(DbbcAggScanState *as, EState *estate)
 		ctl.hcxt = as->groupctx;
 		as->groups = hash_create("dbblue_columnar groups", 256, &ctl,
 								 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+
+	/* text group keys: build the canonicalizing intern table (in groupctx, so it
+	 * is reset/freed together with the groups). */
+	if (as->has_varlena_key && as->key_intern == NULL)
+	{
+		HASHCTL		ictl;
+
+		ictl.keysize = sizeof(Datum);
+		ictl.entrysize = sizeof(Datum);
+		ictl.hcxt = as->groupctx;
+		ictl.hash = dbbc_textintern_hash;
+		ictl.match = dbbc_textintern_match;
+		as->key_intern = hash_create("dbblue_columnar key intern", 256, &ictl,
+									 HASH_ELEM | HASH_FUNCTION | HASH_COMPARE |
+									 HASH_CONTEXT);
 	}
 
 	Assert(sc != NULL);			/* bound at Begin / InitializeWorkerCustomScan */

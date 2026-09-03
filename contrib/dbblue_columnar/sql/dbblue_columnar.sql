@@ -95,6 +95,39 @@ SELECT 'grp-zero-rows ', agree($$SELECT sum(amt) s, min(d) m, count(*) c FROM t 
 SELECT 'grp-zero-grp  ', agree($$SELECT grp, sum(amt) FROM t WHERE id < 0 GROUP BY grp$$);
 SELECT 'grp-nogby-agg ', agree($$SELECT grp FROM t GROUP BY grp ORDER BY grp$$);
 SELECT 'grp-saop      ', agree($$SELECT grp, count(*) c FROM t WHERE k7 = ANY(ARRAY[1,3,5]) GROUP BY grp ORDER BY grp$$);
+-- text/varchar group keys: not bit-equal, so each value is canonicalized through
+-- the intern table (equal bytes -> one pointer) and the fixed hash key stays
+-- byte-comparable. Matches core HashAgg under the (deterministic) DB collation.
+SELECT uses_node($$SELECT txt, sum(amt) FROM t GROUP BY txt$$, 'DBBlueColumnarAgg') AS text_key_agg_used;
+SELECT 'grp-textkey   ', agree($$SELECT txt, sum(amt) s, count(*) c FROM t GROUP BY txt ORDER BY txt$$);
+SELECT 'grp-text+int  ', agree($$SELECT k7, txt, sum(amt) s FROM t GROUP BY k7, txt ORDER BY k7, txt$$);
+SELECT 'grp-textexpr  ', agree($$SELECT upper(txt) u, count(*) c FROM t GROUP BY upper(txt) ORDER BY 1$$);
+SELECT 'grp-textfilter', agree($$SELECT txt, sum(amt) s FROM t WHERE k7 > 2 GROUP BY txt ORDER BY txt$$);
+-- memory-aware gate: the grouped agg has no spill, so it must DECLINE when the
+-- estimated groups would not fit hash_mem (work_mem * hash_mem_multiplier) and
+-- let a spill-capable HashAgg run - not error at runtime. Self-contained + ANALYZEd
+-- so the group-count estimate is accurate; a small work_mem makes the 20000-distinct
+-- id key overflow deterministically while the 50-distinct key still fits and uses
+-- the node. (Without the gate the high-card query ERRORs with a numeric sum.)
+CREATE TABLE mg (id int, lc int, amt numeric) WITH (autovacuum_enabled = off);
+INSERT INTO mg SELECT g, g % 50, g * 1.5 FROM generate_series(1, 20000) g;
+VACUUM (DISABLE_PAGE_SKIPPING) mg;
+SELECT dbblue_columnar_add('mg', ARRAY['id','lc','amt']);
+SELECT dbblue_columnar_populate('mg') > 0 AS mg_built;
+ANALYZE mg;
+SET work_mem = '1MB';
+SELECT uses_node($$SELECT id, sum(amt) FROM mg GROUP BY id$$, 'DBBlueColumnarAgg') AS highcard_declines;
+SELECT 'mg-highcard   ', agree($$SELECT id, sum(amt) s FROM mg GROUP BY id ORDER BY id$$);
+SELECT uses_node($$SELECT lc, sum(amt) FROM mg GROUP BY lc$$, 'DBBlueColumnarAgg') AS lowcard_still_used;
+SELECT 'mg-lowcard    ', agree($$SELECT lc, sum(amt) s FROM mg GROUP BY lc ORDER BY lc$$);
+RESET work_mem;
+-- array_agg/string_agg have aggtransspace = -1 (not 0); the memory-gate size
+-- estimate must read it as a SIGNED int32 - a raw Size assignment wraps -1 to
+-- SIZE_MAX and crashes hash_agg_entry_size (pg_nextpower2). Just planning these
+-- exercises the gate; agree() also checks the result.
+SELECT 'mg-arrayagg   ', agree($$SELECT lc, array_agg(id ORDER BY id) a FROM mg GROUP BY lc ORDER BY lc$$);
+SELECT 'mg-stringagg  ', agree($$SELECT lc, string_agg(id::text, ',' ORDER BY id) s FROM mg GROUP BY lc ORDER BY lc$$);
+DROP TABLE mg;
 
 -- ---- correctness under a rescan (LATERAL nestloop, columnar agg on inner) ----
 SELECT 'rescan        ', agree($$SELECT o.k, g.s FROM (VALUES (1),(3),(5)) o(k)
@@ -285,8 +318,8 @@ DROP TABLE rs;
 -- t carries stale blocks here (the earlier UPDATE), so the per-row probe runs on
 -- BOTH the columnar and heap-fallback paths in one scan. Differential vs the
 -- plain plan must be byte-identical. eager_aggregate off isolates the fused node.
-CREATE TABLE dj_dim (id int PRIMARY KEY, seq int) WITH (autovacuum_enabled = off);
-INSERT INTO dj_dim SELECT g, (g * 3) % 20 FROM generate_series(0, 6) g;
+CREATE TABLE dj_dim (id int PRIMARY KEY, seq int, label text) WITH (autovacuum_enabled = off);
+INSERT INTO dj_dim SELECT g, (g * 3) % 20, 'lbl' || (g % 3) FROM generate_series(0, 6) g;
 ANALYZE dj_dim;
 SET dbblue_columnar.enable_dimjoin_agg = on;
 SET enable_eager_aggregate = off;
@@ -296,6 +329,32 @@ SELECT 'dj-basic     ', agree($$SELECT t.grp, dj.seq, count(*) c, sum(t.amt) s F
 SELECT 'dj-exprkey   ', agree($$SELECT date_trunc('month', t.d) m, t.grp, dj.seq, count(*) c, sum(t.amt) s FROM t LEFT JOIN dj_dim dj ON dj.id = t.grp WHERE t.k7 > 0 GROUP BY 1, t.grp, dj.seq, dj.id ORDER BY 1, t.grp$$);
 SELECT 'dj-filter    ', agree($$SELECT t.grp, dj.seq, count(*) FILTER (WHERE t.amt > 50) c, sum(t.amt) s FROM t LEFT JOIN dj_dim dj ON dj.id = t.grp GROUP BY t.grp, dj.seq, dj.id ORDER BY t.grp, dj.seq$$);
 SELECT 'dj-scalaragg ', agree($$SELECT dj.seq, sum(t.amt) s, count(*) c FROM t LEFT JOIN dj_dim dj ON dj.id = t.grp GROUP BY dj.seq, dj.id ORDER BY dj.seq$$);
+-- Phase 2: INNER join + a dimension-side WHERE filter. Only passing dim rows
+-- enter the in-node hash; a fact row whose grp matches no passing dim row is
+-- dropped (INNER) - grp 7..12 (no dim at all) and a grp whose dim was filtered
+-- out alike. A "LEFT JOIN ... WHERE dj.col" reduces to the same inner join.
+-- At this fixture's tiny scale PG's plain HashAggregate over a Hash Join is
+-- cost-competitive (it collapses the FD group keys down to t.grp), so force the
+-- join methods off to exercise the fused node deterministically - at production
+-- scale the cost router picks it. Correctness is still the on-vs-off differential.
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_nestloop = off;
+SELECT uses_node($$SELECT t.grp, dj.seq, count(*) FROM t JOIN dj_dim dj ON dj.id = t.grp WHERE dj.seq > 5 GROUP BY t.grp, dj.seq, dj.id$$,
+				 'DBBlueColumnarAgg') AS dimjoin_filter_fires;
+SELECT 'dj2-inner-flt ', agree($$SELECT t.grp, dj.seq, count(*) c, sum(t.amt) s FROM t JOIN dj_dim dj ON dj.id = t.grp WHERE dj.seq > 5 GROUP BY t.grp, dj.seq, dj.id ORDER BY t.grp, dj.seq$$);
+SELECT 'dj2-left-where', agree($$SELECT t.grp, dj.seq, count(*) c, sum(t.amt) s FROM t LEFT JOIN dj_dim dj ON dj.id = t.grp WHERE dj.seq > 5 GROUP BY t.grp, dj.seq, dj.id ORDER BY t.grp, dj.seq$$);
+SELECT 'dj2-keyrange  ', agree($$SELECT t.grp, dj.seq, sum(t.amt) s, count(*) c FROM t JOIN dj_dim dj ON dj.id = t.grp WHERE dj.id <= 3 GROUP BY t.grp, dj.seq, dj.id ORDER BY t.grp$$);
+SELECT 'dj2-twoquals  ', agree($$SELECT t.grp, sum(t.amt) s FROM t JOIN dj_dim dj ON dj.id = t.grp WHERE dj.seq > 3 AND dj.id < 6 GROUP BY t.grp, dj.id ORDER BY t.grp$$);
+SELECT 'dj2-empty     ', agree($$SELECT t.grp, dj.seq, count(*) c FROM t JOIN dj_dim dj ON dj.id = t.grp WHERE dj.seq > 999 GROUP BY t.grp, dj.seq, dj.id ORDER BY t.grp$$);
+-- group by a TEXT dimension column (FD on the dim key, not in GROUP BY): the
+-- probe supplies the label, interned so equal labels across dims share a group.
+SELECT uses_node($$SELECT dj.label, sum(t.amt) FROM t JOIN dj_dim dj ON dj.id = t.grp WHERE dj.seq > 3 GROUP BY dj.label$$,
+				 'DBBlueColumnarAgg') AS dimjoin_textkey_fires;
+SELECT 'dj2-dimtext   ', agree($$SELECT dj.label, sum(t.amt) s, count(*) c FROM t JOIN dj_dim dj ON dj.id = t.grp WHERE dj.seq > 3 GROUP BY dj.label ORDER BY dj.label$$);
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_nestloop;
 -- parallel: Finalize -> Gather -> Parallel Custom Scan (DBBlueColumnarAgg); each
 -- worker builds its own dim hash under the shared snapshot. Still byte-identical.
 SET max_parallel_workers_per_gather = 4;
