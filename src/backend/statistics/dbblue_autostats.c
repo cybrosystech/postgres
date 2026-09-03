@@ -60,8 +60,22 @@ bool		dbblue_autostats_enabled = false;
 int			dbblue_autostats_max = 5000;
 int			dbblue_autostats_local_max = 512;
 int			dbblue_autostats_sample_rate = 10;
-double		dbblue_autostats_min_error = 0.0;
+double		dbblue_autostats_min_error_factor = 0.0;
 int			dbblue_autostats_min_rows = 0;
+
+/*
+ * How many executions of a single combination to measure before falling back
+ * to plain sampling, and how many executions to inspect while trying.
+ */
+#define DBBLUE_AUTOSTATS_TARGET_SAMPLES		10
+#define DBBLUE_AUTOSTATS_MAX_ATTEMPTS		50
+
+/*
+ * How many combinations to evict in one pass when the tracking table fills.
+ * Evicting a batch rather than a single entry amortises the scan over many
+ * subsequent insertions, so a full table does not mean a scan per insert.
+ */
+#define DBBLUE_AUTOSTATS_EVICT_BATCH		64
 
 /* number of output columns of dbblue_stats_advisor() */
 #define DBBLUE_ADVISOR_COLS		14
@@ -108,7 +122,8 @@ typedef struct AutoStatsEntry
 typedef struct AutoStatsSharedState
 {
 	LWLock		lock;			/* protects the hash table */
-	uint64		n_dropped;		/* combinations lost to a full hash */
+	uint64		n_dropped;		/* combinations lost despite eviction */
+	uint64		n_evicted;		/* combinations evicted to make room */
 
 	/*
 	 * Bumped by dbblue_stats_advisor_reset().  Backends compare this against
@@ -135,7 +150,8 @@ typedef struct AutoStatsLocalEntry
 	uint32		pending;		/* unflushed plan count */
 	double		plan_est_rows;	/* most recent plan-time row estimate */
 	uint32		pending_exec;	/* unflushed confirmed measurements */
-	bool		ever_measured;	/* has this combination ever been measured? */
+	uint32		measure_count;	/* measurements taken for this combination */
+	uint32		attempt_count;	/* executions inspected, including skipped */
 	double		exec_est_rows;
 	double		exec_act_rows;
 	double		max_error;
@@ -163,6 +179,7 @@ static void dbblue_autostats_shmem_init(void *arg);
 static void autostats_xact_callback(XactEvent event, void *arg);
 static void autostats_flush_local(void);
 static void autostats_discard_local(void);
+static void autostats_evict_locked(void);
 static void autostats_note_local(const AutoStatsKey *key, bool all_equality,
 								 double plan_est_rows);
 static bool clause_is_equality_shaped(Node *clause);
@@ -205,6 +222,7 @@ dbblue_autostats_shmem_init(void *arg)
 {
 	LWLockInitialize(&AutoStatsShared->lock, LWTRANCHE_DBBLUE_AUTOSTATS);
 	AutoStatsShared->n_dropped = 0;
+	AutoStatsShared->n_evicted = 0;
 	AutoStatsShared->reset_generation = 0;
 }
 
@@ -382,7 +400,8 @@ autostats_note_local(const AutoStatsKey *key, bool all_equality,
 		entry->exec_est_rows = 0;
 		entry->exec_act_rows = 0;
 		entry->max_error = 0;
-		entry->ever_measured = false;
+		entry->measure_count = 0;
+		entry->attempt_count = 0;
 		entry->all_equality = all_equality;
 		entry->is_dirty = false;
 		entry->next_dirty = NULL;
@@ -401,8 +420,21 @@ autostats_note_local(const AutoStatsKey *key, bool all_equality,
 	entry->pending++;
 	entry->plan_est_rows = plan_est_rows;
 
-	/* nothing measured for this combination yet -- measure this execution */
-	if (!entry->ever_measured)
+	/*
+	 * Keep measuring until we have a few samples of this combination.
+	 *
+	 * One sample is not enough.  The first execution of a shape is often an
+	 * unrepresentative one -- a narrow lookup returning a handful of rows --
+	 * while the execution that actually hurts is a much larger scan later on.
+	 * With only the first sample taken and the sampling rate rarely picking
+	 * the same combination again, the recorded error stays near 1.0 and the
+	 * damaging cases are never seen.
+	 *
+	 * attempt_count bounds the work, so a combination whose scans are always
+	 * skipped (below the row floor) cannot request instrumentation forever.
+	 */
+	if (entry->measure_count < DBBLUE_AUTOSTATS_TARGET_SAMPLES &&
+		entry->attempt_count < DBBLUE_AUTOSTATS_MAX_ATTEMPTS)
 		AutoStatsForceMeasure = true;
 
 	if (!entry->is_dirty)
@@ -460,8 +492,21 @@ autostats_flush_local(void)
 
 		if (shared == NULL)
 		{
-			AutoStatsShared->n_dropped++;
-			continue;
+			/*
+			 * Full.  Rather than discarding this new combination -- which
+			 * might be the badly misestimated one we most want to know about
+			 * -- throw out the least interesting entries and try once more.
+			 */
+			autostats_evict_locked();
+
+			shared = (AutoStatsEntry *) hash_search(AutoStatsHash, &local->key,
+													HASH_ENTER_NULL, &found);
+
+			if (shared == NULL)
+			{
+				AutoStatsShared->n_dropped++;
+				continue;
+			}
 		}
 
 		if (!found)
@@ -483,11 +528,19 @@ autostats_flush_local(void)
 
 		if (local->pending_exec > 0)
 		{
-			shared->exec_count += local->pending_exec;
-			shared->exec_est_rows = local->exec_est_rows;
-			shared->exec_act_rows = local->exec_act_rows;
-			if (local->max_error > shared->max_error)
+			/*
+			 * Same rule across the flush boundary: only adopt this backend's
+			 * estimate/actual pair when it beats what shared memory already
+			 * holds, so the three columns stay consistent with each other.
+			 */
+			if (shared->exec_count == 0 || local->max_error > shared->max_error)
+			{
 				shared->max_error = local->max_error;
+				shared->exec_est_rows = local->exec_est_rows;
+				shared->exec_act_rows = local->exec_act_rows;
+			}
+
+			shared->exec_count += local->pending_exec;
 		}
 
 		shared->last_seen = now;
@@ -523,6 +576,86 @@ autostats_discard_local(void)
 
 	AutoStatsLocalHash = NULL;
 	AutoStatsDirtyList = NULL;
+}
+
+/*
+ * autostats_evict_locked
+ *		Make room by discarding the least interesting combinations.
+ *
+ * "Least interesting" means the smallest error factor: a combination the
+ * planner estimated accurately is not worth remembering, while one it got
+ * badly wrong is the whole point of the feature.  Combinations not yet
+ * measured score zero and so go first -- they carry no evidence, and a
+ * genuinely interesting one will be re-detected and measured again within a
+ * few executions.  Ties are broken by age, oldest first.
+ *
+ * Caller must hold AutoStatsShared->lock exclusively.
+ */
+static void
+autostats_evict_locked(void)
+{
+	HASH_SEQ_STATUS hash_seq;
+	AutoStatsEntry *entry;
+	AutoStatsKey victim_key[DBBLUE_AUTOSTATS_EVICT_BATCH];
+	double		victim_score[DBBLUE_AUTOSTATS_EVICT_BATCH];
+	TimestampTz victim_seen[DBBLUE_AUTOSTATS_EVICT_BATCH];
+	int			nvictims = 0;
+	int			batch;
+	int			i;
+
+	batch = Min(DBBLUE_AUTOSTATS_EVICT_BATCH,
+				Max(1, dbblue_autostats_max / 20));
+
+	/*
+	 * One pass, keeping the 'batch' worst-scoring entries seen so far in a
+	 * small array sorted ascending.  The array is tiny, so insertion sort
+	 * costs less than allocating and sorting the whole table -- which matters
+	 * because this runs inside a transaction callback.
+	 */
+	hash_seq_init(&hash_seq, AutoStatsHash);
+	while ((entry = (AutoStatsEntry *) hash_seq_search(&hash_seq)) != NULL)
+	{
+		double		score = entry->max_error;
+		TimestampTz seen = entry->last_seen;
+		int			pos;
+
+		/* Is this entry uninteresting enough to be a candidate? */
+		if (nvictims == batch &&
+			(score > victim_score[nvictims - 1] ||
+			 (score == victim_score[nvictims - 1] &&
+			  seen >= victim_seen[nvictims - 1])))
+			continue;
+
+		/* find the insertion point */
+		for (pos = 0; pos < nvictims; pos++)
+		{
+			if (score < victim_score[pos] ||
+				(score == victim_score[pos] && seen < victim_seen[pos]))
+				break;
+		}
+
+		/* shift the tail down, dropping the last element if we are full */
+		for (i = Min(nvictims, batch - 1); i > pos; i--)
+		{
+			victim_key[i] = victim_key[i - 1];
+			victim_score[i] = victim_score[i - 1];
+			victim_seen[i] = victim_seen[i - 1];
+		}
+
+		victim_key[pos] = entry->key;
+		victim_score[pos] = score;
+		victim_seen[pos] = seen;
+
+		if (nvictims < batch)
+			nvictims++;
+	}
+
+	for (i = 0; i < nvictims; i++)
+		hash_search(AutoStatsHash, &victim_key[i], HASH_REMOVE, NULL);
+
+	AutoStatsShared->n_evicted += nvictims;
+
+	elog(DEBUG1, "autostats: evicted %d combinations to make room", nvictims);
 }
 
 /*
@@ -873,12 +1006,11 @@ autostats_record_actual(Oid relid, Bitmapset *attnums,
 		return;
 
 	/*
-	 * Mark the combination as attempted before applying the row floor below.
-	 * Otherwise one whose scans never reach the floor keeps looking "never
-	 * measured", and would request row counting on every single execution for
-	 * the life of the backend.
+	 * Count the attempt before applying the row floor below, so a combination
+	 * whose scans never reach the floor eventually stops asking to be
+	 * instrumented instead of doing so on every execution forever.
 	 */
-	entry->ever_measured = true;
+	entry->attempt_count++;
 
 	/*
 	 * Ignore scans that produced too few rows to matter.  Odoo issues a great
@@ -897,10 +1029,23 @@ autostats_record_actual(Oid relid, Bitmapset *attnums,
 	error = act_rows / Max(est_rows, 1.0);
 
 	entry->pending_exec++;
-	entry->exec_est_rows = est_rows;
-	entry->exec_act_rows = act_rows;
-	if (error > entry->max_error)
+	entry->measure_count++;
+
+	/*
+	 * Keep the estimate and actual from the measurement that produced the
+	 * worst ratio, not from the most recent one.  Now that a combination is
+	 * sampled several times, the newest measurement is often not the damaging
+	 * one, and reporting the newest pair beside the worst ratio would give
+	 * three columns that cannot be reconciled -- dividing actual by estimated
+	 * would not reproduce error_factor.  The worst case is also the one an
+	 * operator is deciding about.
+	 */
+	if (entry->measure_count == 1 || error > entry->max_error)
+	{
 		entry->max_error = error;
+		entry->exec_est_rows = est_rows;
+		entry->exec_act_rows = act_rows;
+	}
 
 	if (!entry->is_dirty)
 	{
@@ -1088,9 +1233,9 @@ dbblue_stats_advisor(PG_FUNCTION_ARGS)
 		 * evidence either way, so it is withheld too -- reporting it would
 		 * defeat the point of asking for a threshold.
 		 */
-		if (dbblue_autostats_min_error > 0.0 &&
+		if (dbblue_autostats_min_error_factor > 0.0 &&
 			(entry->exec_count == 0 ||
-			 entry->max_error < dbblue_autostats_min_error))
+			 entry->max_error < dbblue_autostats_min_error_factor))
 			continue;
 
 		relname = get_rel_name(entry->key.relid);
@@ -1172,6 +1317,53 @@ dbblue_stats_advisor(PG_FUNCTION_ARGS)
 }
 
 /*
+ * dbblue_stats_advisor_status
+ *		How full is the tracking table, and what has been lost?
+ *
+ * When the shared hash fills up, new column combinations are dropped rather
+ * than evicting existing ones, so without this an operator has no way to tell
+ * that the advisor stopped noticing anything new.
+ */
+Datum
+dbblue_stats_advisor_status(PG_FUNCTION_ARGS)
+{
+	TupleDesc	tupdesc;
+	Datum		values[5];
+	bool		nulls[5];
+	HeapTuple	tuple;
+	int64		tracked;
+	int64		dropped;
+	int64		evicted;
+
+	if (AutoStatsHash == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("dbblue autostats shared memory is not initialized")));
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+
+	LWLockAcquire(&AutoStatsShared->lock, LW_SHARED);
+	tracked = (int64) hash_get_num_entries(AutoStatsHash);
+	dropped = (int64) AutoStatsShared->n_dropped;
+	evicted = (int64) AutoStatsShared->n_evicted;
+	LWLockRelease(&AutoStatsShared->lock);
+
+	memset(nulls, 0, sizeof(nulls));
+	values[0] = Int64GetDatum(tracked);
+	values[1] = Int32GetDatum(dbblue_autostats_max);
+	values[2] = Int64GetDatum(evicted);
+	values[3] = Int64GetDatum(dropped);
+	values[4] = Float8GetDatum(dbblue_autostats_max > 0
+							   ? (100.0 * tracked) / dbblue_autostats_max
+							   : 0.0);
+
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+
+	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
+}
+
+/*
  * dbblue_stats_advisor_reset
  *		Discard everything recorded so far.
  */
@@ -1193,6 +1385,7 @@ dbblue_stats_advisor_reset(PG_FUNCTION_ARGS)
 		hash_search(AutoStatsHash, &entry->key, HASH_REMOVE, NULL);
 
 	AutoStatsShared->n_dropped = 0;
+	AutoStatsShared->n_evicted = 0;
 	AutoStatsShared->reset_generation++;
 	AutoStatsLocalGeneration = AutoStatsShared->reset_generation;
 

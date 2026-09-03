@@ -37,7 +37,7 @@ extern PGDLLIMPORT bool dbblue_autostats_enabled;
 extern PGDLLIMPORT int dbblue_autostats_max;
 extern PGDLLIMPORT int dbblue_autostats_local_max;
 extern PGDLLIMPORT int dbblue_autostats_sample_rate;
-extern PGDLLIMPORT double dbblue_autostats_min_error;
+extern PGDLLIMPORT double dbblue_autostats_min_error_factor;
 extern PGDLLIMPORT int dbblue_autostats_min_rows;
 
 /*

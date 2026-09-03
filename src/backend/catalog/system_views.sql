@@ -1565,3 +1565,10 @@ GRANT SELECT ON dbblue_stats_advisor TO pg_read_all_stats;
 REVOKE EXECUTE ON FUNCTION dbblue_stats_advisor() FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION dbblue_stats_advisor() TO pg_read_all_stats;
 REVOKE EXECUTE ON FUNCTION dbblue_stats_advisor_reset() FROM PUBLIC;
+
+CREATE VIEW dbblue_stats_advisor_status AS
+    SELECT * FROM dbblue_stats_advisor_status();
+REVOKE ALL ON dbblue_stats_advisor_status FROM PUBLIC;
+GRANT SELECT ON dbblue_stats_advisor_status TO pg_read_all_stats;
+REVOKE EXECUTE ON FUNCTION dbblue_stats_advisor_status() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION dbblue_stats_advisor_status() TO pg_read_all_stats;

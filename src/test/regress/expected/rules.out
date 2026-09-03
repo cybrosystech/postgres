@@ -1302,6 +1302,12 @@ dbblue_stats_advisor| SELECT schemaname,
     suggestion
    FROM dbblue_stats_advisor() dbblue_stats_advisor(schemaname, tablename, attnames, nattributes, plan_count, all_equality, plan_est_rows, est_rows, actual_rows, error_factor, exec_count, first_seen, last_seen, suggestion)
   ORDER BY plan_count DESC;
+dbblue_stats_advisor_status| SELECT combinations_tracked,
+    capacity,
+    combinations_evicted,
+    combinations_dropped,
+    percent_full
+   FROM dbblue_stats_advisor_status() dbblue_stats_advisor_status(combinations_tracked, capacity, combinations_evicted, combinations_dropped, percent_full);
 pg_aios| SELECT pid,
     io_id,
     io_generation,
