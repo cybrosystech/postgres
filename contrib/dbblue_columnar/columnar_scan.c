@@ -2711,7 +2711,8 @@ dbbc_grp_key_ok(Oid typid, Oid collid)
  * table, since our runtime backstop is a hard error rather than a spill.
  */
 static bool
-dbbc_grp_fits_hashmem(double ngroups, List *keyexprs, List *aggrefs)
+dbbc_grp_fits_hashmem(PlannerInfo *root, double ngroups, List *keyexprs,
+					  List *aggrefs)
 {
 	Size		tuple_width = 0;
 	Size		trans_space = 0;
@@ -2721,8 +2722,29 @@ dbbc_grp_fits_hashmem(double ngroups, List *keyexprs, List *aggrefs)
 	foreach(lc, keyexprs)
 	{
 		Node	   *k = (Node *) lfirst(lc);
+		int32		w = 0;
 
-		tuple_width += get_typavgwidth(exprType(k), exprTypmod(k));
+		/*
+		 * For a base-column key use the ANALYZEd average width - essential for
+		 * wide text/varchar, where get_typavgwidth returns only a 32-byte
+		 * fallback (unbounded types have no type_maximum_size) and would
+		 * under-count a long-string key several-fold. Expression keys and
+		 * unanalyzed columns fall back to the type estimate.
+		 */
+		if (IsA(k, Var))
+		{
+			Var		   *v = (Var *) k;
+
+			if (v->varno > 0 && v->varno <= root->simple_rel_array_size &&
+				root->simple_rte_array[v->varno] != NULL &&
+				root->simple_rte_array[v->varno]->rtekind == RTE_RELATION &&
+				v->varattno > 0)
+				w = get_attavgwidth(root->simple_rte_array[v->varno]->relid,
+									v->varattno);
+		}
+		if (w <= 0)
+			w = get_typavgwidth(exprType(k), exprTypmod(k));
+		tuple_width += (Size) w;
 	}
 	foreach(lc, aggrefs)
 	{
@@ -2732,7 +2754,25 @@ dbbc_grp_fits_hashmem(double ngroups, List *keyexprs, List *aggrefs)
 
 		if (HeapTupleIsValid(tup))
 		{
-			trans_space += ((Form_pg_aggregate) GETSTRUCT(tup))->aggtransspace;
+			Form_pg_aggregate agg = (Form_pg_aggregate) GETSTRUCT(tup);
+			int32		ats = agg->aggtransspace;	/* SIGNED; -1 for array_agg */
+			Size		sp = (ats > 0) ? (Size) ats : 0;
+
+			/*
+			 * aggtransspace is 0 (or -1) for many byref/internal transition types
+			 * whose real per-group state is non-trivial: max/min(text) hold the
+			 * current value, array_agg/string_agg accumulate and can grow without
+			 * bound. Floor those so the gate does not admit a hash it cannot hold
+			 * (the unbounded accumulators still rely on the runtime backstop).
+			 * NB: aggtransspace is a signed int32 and MUST be read as such - a raw
+			 * assignment of -1 into a Size wraps to SIZE_MAX and overflows
+			 * hash_agg_entry_size.
+			 */
+			if (sp == 0 &&
+				(agg->aggtranstype == INTERNALOID ||
+				 !get_typbyval(agg->aggtranstype)))
+				sp = 128;
+			trans_space += sp;
 			ReleaseSysCache(tup);
 		}
 	}
@@ -3064,11 +3104,18 @@ dbbc_agg_grouped_classify(PlannerInfo *root, RelOptInfo *input_rel,
 		memset(&estinfo, 0, sizeof(estinfo));
 		*ngroups_out = estimate_num_groups(root, keyexprs,
 										   input_rel->rows, NULL, &estinfo);
-		if (!dbbc_grp_fits_hashmem(*ngroups_out, keyexprs, aggrefs))
+		if (!dbbc_grp_fits_hashmem(root, *ngroups_out, keyexprs, aggrefs))
 			return false;			/* would overflow the no-spill hash */
+		/*
+		 * A defaulted estimate on a big table is the least trustworthy case
+		 * (estimate_num_groups returns 200 for an unanalyzed column); refuse it
+		 * rather than build an unbounded hash. We cannot distinguish low- from
+		 * high-cardinality without stats, so smaller unanalyzed tables lean on
+		 * the runtime backstop (ANALYZE closes the gap for them).
+		 */
 		if ((estinfo.flags & SELFLAG_USED_DEFAULT) &&
 			input_rel->rows > (double) DBBC_GRP_MAX_GROUPS)
-			return false;			/* untrustworthy default estimate on a big table */
+			return false;
 	}
 
 	*keyexprs_out = keyexprs;
@@ -3259,6 +3306,15 @@ dbbc_try_dimjoin_agg(PlannerInfo *root, UpperRelationKind stage,
 			 */
 			if (contain_volatile_functions((Node *) ri->clause) ||
 				contain_subplans((Node *) ri->clause))
+				return;
+			/*
+			 * A correlated PARAM_EXEC would make the qual depend on an outer row,
+			 * but the dim hash is built once and never rebuilt on rescan - it
+			 * would freeze to a stale param. (Such clauses normally live in the
+			 * parameterized path's ppi_clauses, not baserestrictinfo, so this is
+			 * defensive.) Extern params are constant per execution and fine.
+			 */
+			if (!bms_is_empty(pull_paramids(ri->clause)))
 				return;
 			dim_quals = lappend(dim_quals, ri->clause);
 		}
@@ -3504,17 +3560,34 @@ dbbc_try_dimjoin_agg(PlannerInfo *root, UpperRelationKind stage,
 	if (outmap == NIL)
 		return;
 
-	/* fact-side group-count estimate (dim keys are FD on the fk: no multiply) */
-	if (fact_keyexprs != NIL)
+	/*
+	 * Group-count estimate + no-spill fit check. Fact keys drive the count (dim
+	 * keys are FD on the fk, no multiply); with ONLY dim-sourced keys the count
+	 * is bounded by the dimension's distinct group-key values. Always apply the
+	 * memory gate - the earlier code skipped it entirely when fact_keyexprs was
+	 * NIL, leaving a dim-only GROUP BY (e.g. "GROUP BY d.region") ungated.
+	 */
 	{
 		EstimationInfo estinfo;
+		double		bigrows;
 
 		memset(&estinfo, 0, sizeof(estinfo));
-		ngroups = estimate_num_groups(root, fact_keyexprs, fact_rel->rows,
-									  NULL, &estinfo);
-		if (!dbbc_grp_fits_hashmem(ngroups, keyexprs, aggrefs) ||
+		if (fact_keyexprs != NIL)
+		{
+			ngroups = estimate_num_groups(root, fact_keyexprs, fact_rel->rows,
+										  NULL, &estinfo);
+			bigrows = fact_rel->rows;
+		}
+		else
+		{
+			/* all keys dim-sourced: at most one group per dim row */
+			ngroups = estimate_num_groups(root, keyexprs, dim_rel->rows,
+										  NULL, &estinfo);
+			bigrows = dim_rel->rows;
+		}
+		if (!dbbc_grp_fits_hashmem(root, ngroups, keyexprs, aggrefs) ||
 			((estinfo.flags & SELFLAG_USED_DEFAULT) &&
-			 fact_rel->rows > (double) DBBC_GRP_MAX_GROUPS))
+			 bigrows > (double) DBBC_GRP_MAX_GROUPS))
 			return;
 	}
 
@@ -4044,7 +4117,7 @@ dbbc_try_eager_agg(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 		return;
 
 	ngroups = clamp_row_est(agg_info->grouped_rows);
-	if (!dbbc_grp_fits_hashmem(ngroups, keyexprs, aggrefs))
+	if (!dbbc_grp_fits_hashmem(root, ngroups, keyexprs, aggrefs))
 		return;					/* would overflow the no-spill hash (eager-agg groups
 								 * by the join key -> high-cardinality is common here) */
 

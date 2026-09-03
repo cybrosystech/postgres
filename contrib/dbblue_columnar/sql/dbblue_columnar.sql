@@ -121,6 +121,12 @@ SELECT 'mg-highcard   ', agree($$SELECT id, sum(amt) s FROM mg GROUP BY id ORDER
 SELECT uses_node($$SELECT lc, sum(amt) FROM mg GROUP BY lc$$, 'DBBlueColumnarAgg') AS lowcard_still_used;
 SELECT 'mg-lowcard    ', agree($$SELECT lc, sum(amt) s FROM mg GROUP BY lc ORDER BY lc$$);
 RESET work_mem;
+-- array_agg/string_agg have aggtransspace = -1 (not 0); the memory-gate size
+-- estimate must read it as a SIGNED int32 - a raw Size assignment wraps -1 to
+-- SIZE_MAX and crashes hash_agg_entry_size (pg_nextpower2). Just planning these
+-- exercises the gate; agree() also checks the result.
+SELECT 'mg-arrayagg   ', agree($$SELECT lc, array_agg(id ORDER BY id) a FROM mg GROUP BY lc ORDER BY lc$$);
+SELECT 'mg-stringagg  ', agree($$SELECT lc, string_agg(id::text, ',' ORDER BY id) s FROM mg GROUP BY lc ORDER BY lc$$);
 DROP TABLE mg;
 
 -- ---- correctness under a rescan (LATERAL nestloop, columnar agg on inner) ----
