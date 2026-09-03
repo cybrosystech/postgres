@@ -84,6 +84,7 @@
 #include "parser/parse_expr.h"
 #include "parser/parse_relation.h"
 #include "parser/parse_type.h"
+#include "parser/analyze.h"
 #include "parser/parse_utilcmd.h"
 #include "parser/parser.h"
 #include "partitioning/partbounds.h"
@@ -1967,6 +1968,17 @@ ExecuteTruncate(TruncateStmt *stmt)
 	List	   *relids = NIL;
 	List	   *relids_logged = NIL;
 	ListCell   *cell;
+
+	/*
+	 * dbblue: TRUNCATE has no restricting clause to inspect -- it always
+	 * removes every row -- so safe mode refuses it outright.
+	 */
+	if (dbblue_safe_mode)
+		ereport(ERROR,
+				errcode(ERRCODE_RESTRICT_VIOLATION),
+				errmsg("TRUNCATE is not allowed because dbblue_safe_mode is enabled"),
+				errdetail("TRUNCATE always removes every row of a table."),
+				errhint("Use DELETE with a WHERE clause selecting the rows to remove, or ask a superuser to turn dbblue_safe_mode off."));
 
 	/*
 	 * Open, exclusive-lock, and check all the explicitly-specified relations
