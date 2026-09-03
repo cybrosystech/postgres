@@ -1406,19 +1406,55 @@ advisor_process_entry(WorkloadEntry *entry)
 	}
 	PG_END_TRY();
 
-	/* Drop candidates an existing index already covers. */
+	/*
+	 * Drop candidates an existing index already covers.
+	 *
+	 * This queries the catalogs through SPI, so it runs
+	 * subtransaction-protected like every other fallible step of the pass.
+	 * Without that, an error here would longjmp all the way out to the
+	 * worker's main loop, skipping not just this entry but every remaining
+	 * statement in the pass and the stale-suggestion prune at the end of
+	 * it.  On failure we keep the unfiltered list: a redundant suggestion
+	 * costs the user a glance, whereas losing the pass costs the interval.
+	 */
 	if (candidates != NIL)
 	{
-		List	   *kept = NIL;
-
-		foreach(lc, candidates)
+		BeginInternalSubTransaction(NULL);
+		PG_TRY();
 		{
-			IndexCandidate *cand = (IndexCandidate *) lfirst(lc);
+			List	   *kept = NIL;
 
-			if (!existing_index_covers(cand->relid, cand->nkeys, cand->keys))
-				kept = lappend(kept, cand);
+			foreach(lc, candidates)
+			{
+				IndexCandidate *cand = (IndexCandidate *) lfirst(lc);
+
+				if (!existing_index_covers(cand->relid, cand->nkeys,
+										   cand->keys))
+					kept = lappend(kept, cand);
+			}
+			candidates = kept;
+
+			ReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(oldcxt);
+			CurrentResourceOwner = oldowner;
 		}
-		candidates = kept;
+		PG_CATCH();
+		{
+			ErrorData  *edata;
+
+			MemoryContextSwitchTo(oldcxt);
+			edata = CopyErrorData();
+			FlushErrorState();
+			RollbackAndReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(oldcxt);
+			CurrentResourceOwner = oldowner;
+
+			ereport(DEBUG1,
+					(errmsg("dbblue index advisor: queryid %lld redundancy check failed, keeping all candidates: %s",
+							(long long) entry->queryid, edata->message)));
+			FreeErrorData(edata);
+		}
+		PG_END_TRY();
 	}
 
 	if (candidates != NIL)
