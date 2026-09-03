@@ -25,6 +25,8 @@ typedef struct AutoTuneSettings
 
 	/* Detected system specs */
 	uint64		total_ram_bytes;
+	/* True if total_ram_bytes came from a cgroup limit, not physical RAM. */
+	bool		ram_from_cgroup;
 	int			cpu_count;
 	bool		ssd_storage;
 
