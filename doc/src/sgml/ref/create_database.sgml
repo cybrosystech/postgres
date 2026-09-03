@@ -70,6 +70,36 @@ CREATE DATABASE <replaceable class="parameter">name</replaceable>
    any installation-local objects that might have been added to
    <literal>template1</literal>.
   </para>
+
+  <note>
+   <para>
+    <productname>DBblue</productname> departs from this default.  When
+    <varname>dbblue_default_builtin_locale</varname> is on (the default)
+    and the command names no <literal>TEMPLATE</literal>,
+    <literal>ENCODING</literal>, <literal>LOCALE</literal>,
+    <literal>LC_COLLATE</literal>, <literal>LC_CTYPE</literal> or
+    <literal>LOCALE_PROVIDER</literal>, the new database is cloned from
+    <literal>template0</literal> with <literal>UTF8</literal> encoding and
+    the builtin <literal>C.UTF-8</literal> locale instead of being cloned
+    from <literal>template1</literal>.  The same substitution is made for
+    <literal>LC_COLLATE = 'C'</literal> combined with
+    <literal>UTF8</literal> encoding and
+    <literal>TEMPLATE template0</literal>.  This is the combination Odoo
+    expects, and the builtin provider sorts considerably faster than
+    <literal>libc</literal>.
+   </para>
+
+   <para>
+    Because such a database is cloned from <literal>template0</literal>,
+    nothing that has been added to <literal>template1</literal> -- a
+    customised locale, but equally any extensions, schemas or seed data --
+    is carried into it.  A <literal>NOTICE</literal> is emitted whenever
+    this substitution happens.  Set
+    <varname>dbblue_default_builtin_locale</varname> to <literal>off</literal>,
+    or name any of the options above explicitly, for the standard
+    <literal>template1</literal> behaviour described above.
+   </para>
+  </note>
  </refsect1>
 
  <refsect1>

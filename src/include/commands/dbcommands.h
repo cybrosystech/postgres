@@ -17,6 +17,8 @@
 #include "catalog/objectaddress.h"
 #include "parser/parse_node.h"
 
+extern PGDLLIMPORT bool dbblue_default_builtin_locale;
+
 extern Oid	createdb(ParseState *pstate, const CreatedbStmt *stmt);
 extern void dropdb(const char *dbname, bool missing_ok, bool force);
 extern void DropDatabase(ParseState *pstate, DropdbStmt *stmt);
