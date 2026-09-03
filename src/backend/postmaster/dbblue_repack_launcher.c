@@ -775,6 +775,14 @@ repack_one_table(const char *schema, const char *table, Oid relid,
 {
 	bool		success = false;
 
+	/*
+	 * Set once the repack has committed, so the error path below can tell a
+	 * failed repack from a failed post-repack ANALYZE -- by then the repack
+	 * is already durable and must not be reported as a failure.  volatile
+	 * because it is written in the PG_TRY and read in the PG_CATCH.
+	 */
+	volatile bool repacked = false;
+
 	StartTransactionCommand();
 
 	PG_TRY();
@@ -809,6 +817,7 @@ repack_one_table(const char *schema, const char *table, Oid relid,
 		else
 		{
 			ClusterParams params = {0};
+			VacuumParams analyze_params = {0};
 
 			params.options = CLUOPT_CONCURRENT | CLUOPT_RECHECK;
 
@@ -830,33 +839,62 @@ repack_one_table(const char *schema, const char *table, Oid relid,
 			/* cluster_rel closes rel, but keeps the lock until commit. */
 			PopActiveSnapshot();
 
+			record_repack_history(schema, table, relid, bloat_ratio);
+
+			/*
+			 * Commit before analysing.
+			 *
+			 * cluster_rel() escalated to AccessExclusiveLock to swap the
+			 * relation files, and that lock is held until this transaction
+			 * commits (see the comment above cluster_rel() in repack.c) --
+			 * the ShareUpdateExclusiveLock we opened the relation with is
+			 * long gone.  Analysing here would therefore keep every reader
+			 * and writer of the table blocked for the whole ANALYZE, which
+			 * defeats the point of asking for CLUOPT_CONCURRENT: the
+			 * exclusive window is meant to be just the swap.
+			 *
+			 * So commit first and analyse in a fresh transaction, exactly
+			 * as REPACK's own ANALYZE path does (repack.c).  The repack is
+			 * durable at this point, which is why it is also reported here
+			 * rather than after the ANALYZE.
+			 */
+			CommitTransactionCommand();
+			repacked = true;
+
+			ereport(LOG,
+					(errmsg("dbblue repack launcher: repacked \"%s.%s\" (bloat ratio %.2f)",
+							schema, table, bloat_ratio)));
+
 			/*
 			 * The rewrite invalidates the planner's statistics -- most
 			 * notably attribute correlation, which changes completely
 			 * once the table is physically reordered -- even though
 			 * pg_class.relpages/reltuples were already fixed up by the
 			 * rewrite itself.  Run a plain ANALYZE the same way VACUUM
-			 * ANALYZE does, by calling analyze_rel() directly under the
-			 * ShareUpdateExclusiveLock already held, so pg_statistic and
-			 * pg_stat_user_tables reflect the repacked table immediately
-			 * instead of waiting on the next autovacuum analyze.
+			 * ANALYZE does, by calling analyze_rel() directly, so
+			 * pg_statistic and pg_stat_user_tables reflect the repacked
+			 * table immediately instead of waiting on the next autovacuum
+			 * analyze.  analyze_rel() takes its own
+			 * ShareUpdateExclusiveLock, which readers and writers do not
+			 * block on.
+			 *
+			 * in_outer_xact is false because this ANALYZE owns its
+			 * transaction, which lets vac_update_relstats() advance the
+			 * frozen xid as a standalone ANALYZE would.
 			 */
-			{
-				VacuumParams analyze_params = {0};
+			StartTransactionCommand();
+			SetCurrentStatementStartTimestamp();
+			pgstat_report_activity(STATE_RUNNING,
+								   psprintf("dbblue repack launcher: analyzing %s.%s",
+											schema, table));
 
-				analyze_params.options = VACOPT_ANALYZE;
-				analyze_params.log_analyze_min_duration = -1;
+			analyze_params.options = VACOPT_ANALYZE;
+			analyze_params.log_analyze_min_duration = -1;
 
-				PushActiveSnapshot(GetTransactionSnapshot());
-				analyze_rel(relid, NULL, &analyze_params, NIL, false, NULL);
-				PopActiveSnapshot();
-			}
+			PushActiveSnapshot(GetTransactionSnapshot());
+			analyze_rel(relid, NULL, &analyze_params, NIL, false, NULL);
+			PopActiveSnapshot();
 
-			record_repack_history(schema, table, relid, bloat_ratio);
-
-			ereport(LOG,
-					(errmsg("dbblue repack launcher: repacked \"%s.%s\" (bloat ratio %.2f)",
-							schema, table, bloat_ratio)));
 			success = true;
 		}
 
@@ -870,11 +908,17 @@ repack_one_table(const char *schema, const char *table, Oid relid,
 		AbortOutOfAnyTransaction();
 		MemoryContextSwitchTo(launcher_cxt);
 
-		ereport(WARNING,
-				(errmsg("dbblue repack launcher: repacking \"%s.%s\" failed: %s",
-						schema, table, edata->message)));
+		if (repacked)
+			ereport(WARNING,
+					(errmsg("dbblue repack launcher: post-repack ANALYZE of \"%s.%s\" failed: %s",
+							schema, table, edata->message),
+					 errdetail("The repack itself committed; statistics will be refreshed by the next autovacuum analyze.")));
+		else
+			ereport(WARNING,
+					(errmsg("dbblue repack launcher: repacking \"%s.%s\" failed: %s",
+							schema, table, edata->message)));
 		FreeErrorData(edata);
-		success = false;
+		success = repacked;
 	}
 	PG_END_TRY();
 
