@@ -209,6 +209,39 @@ SELECT 'grp-saop      ', agree($$SELECT grp, count(*) c FROM t WHERE k7 = ANY(AR
  grp-saop       | ok
 (1 row)
 
+-- text/varchar group keys: not bit-equal, so each value is canonicalized through
+-- the intern table (equal bytes -> one pointer) and the fixed hash key stays
+-- byte-comparable. Matches core HashAgg under the (deterministic) DB collation.
+SELECT uses_node($$SELECT txt, sum(amt) FROM t GROUP BY txt$$, 'DBBlueColumnarAgg') AS text_key_agg_used;
+ text_key_agg_used 
+-------------------
+ t
+(1 row)
+
+SELECT 'grp-textkey   ', agree($$SELECT txt, sum(amt) s, count(*) c FROM t GROUP BY txt ORDER BY txt$$);
+    ?column?    | agree 
+----------------+-------
+ grp-textkey    | ok
+(1 row)
+
+SELECT 'grp-text+int  ', agree($$SELECT k7, txt, sum(amt) s FROM t GROUP BY k7, txt ORDER BY k7, txt$$);
+    ?column?    | agree 
+----------------+-------
+ grp-text+int   | ok
+(1 row)
+
+SELECT 'grp-textexpr  ', agree($$SELECT upper(txt) u, count(*) c FROM t GROUP BY upper(txt) ORDER BY 1$$);
+    ?column?    | agree 
+----------------+-------
+ grp-textexpr   | ok
+(1 row)
+
+SELECT 'grp-textfilter', agree($$SELECT txt, sum(amt) s FROM t WHERE k7 > 2 GROUP BY txt ORDER BY txt$$);
+    ?column?    | agree 
+----------------+-------
+ grp-textfilter | ok
+(1 row)
+
 -- ---- correctness under a rescan (LATERAL nestloop, columnar agg on inner) ----
 SELECT 'rescan        ', agree($$SELECT o.k, g.s FROM (VALUES (1),(3),(5)) o(k)
 	JOIN LATERAL (SELECT k7 kk, sum(amt) s FROM t GROUP BY k7) g ON g.kk = o.k ORDER BY o.k$$);
@@ -533,8 +566,8 @@ DROP TABLE rs;
 -- t carries stale blocks here (the earlier UPDATE), so the per-row probe runs on
 -- BOTH the columnar and heap-fallback paths in one scan. Differential vs the
 -- plain plan must be byte-identical. eager_aggregate off isolates the fused node.
-CREATE TABLE dj_dim (id int PRIMARY KEY, seq int) WITH (autovacuum_enabled = off);
-INSERT INTO dj_dim SELECT g, (g * 3) % 20 FROM generate_series(0, 6) g;
+CREATE TABLE dj_dim (id int PRIMARY KEY, seq int, label text) WITH (autovacuum_enabled = off);
+INSERT INTO dj_dim SELECT g, (g * 3) % 20, 'lbl' || (g % 3) FROM generate_series(0, 6) g;
 ANALYZE dj_dim;
 SET dbblue_columnar.enable_dimjoin_agg = on;
 SET enable_eager_aggregate = off;
@@ -615,6 +648,21 @@ SELECT 'dj2-empty     ', agree($$SELECT t.grp, dj.seq, count(*) c FROM t JOIN dj
     ?column?    | agree 
 ----------------+-------
  dj2-empty      | ok
+(1 row)
+
+-- group by a TEXT dimension column (FD on the dim key, not in GROUP BY): the
+-- probe supplies the label, interned so equal labels across dims share a group.
+SELECT uses_node($$SELECT dj.label, sum(t.amt) FROM t JOIN dj_dim dj ON dj.id = t.grp WHERE dj.seq > 3 GROUP BY dj.label$$,
+				 'DBBlueColumnarAgg') AS dimjoin_textkey_fires;
+ dimjoin_textkey_fires 
+-----------------------
+ t
+(1 row)
+
+SELECT 'dj2-dimtext   ', agree($$SELECT dj.label, sum(t.amt) s, count(*) c FROM t JOIN dj_dim dj ON dj.id = t.grp WHERE dj.seq > 3 GROUP BY dj.label ORDER BY dj.label$$);
+    ?column?    | agree 
+----------------+-------
+ dj2-dimtext    | ok
 (1 row)
 
 RESET enable_hashjoin;

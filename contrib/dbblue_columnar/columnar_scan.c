@@ -82,6 +82,7 @@
 #include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "common/hashfn.h"
 #include "utils/datum.h"
 #include "utils/expandeddatum.h"
 #include "utils/fmgroids.h"
@@ -2414,6 +2415,15 @@ typedef struct DbbcAggScanState
 	DbbcScanState *pscan;		/* persistently bound scan (version/dir/range) */
 	int			nkeys;
 	AttrNumber	key_attnos[DBBC_GRP_MAX_KEYS];	/* bare-Var key: the column; else Invalid */
+	/*
+	 * Text group keys (text/varchar, deterministic collation only). The raw-bits
+	 * group hash needs byte-comparable fixed slots, so a text key value is first
+	 * canonicalized through key_intern to a single stable groupctx pointer (equal
+	 * bytes -> same pointer); the fast byval path never touches this.
+	 */
+	bool		key_is_text[DBBC_GRP_MAX_KEYS];
+	bool		has_varlena_key;	/* any key_is_text[]: build key_intern */
+	HTAB	   *key_intern;			/* text value -> canonical groupctx pointer */
 
 	/*
 	 * Expression group keys (e.g. date_trunc('month', datecol)). key_exprstate[k]
@@ -2647,7 +2657,11 @@ dbbc_agg_classify(Node *expr, Index relid, DbbcAggItem *item, List **needcols)
  * Group keys are hashed on their raw Datum bits, so only types whose bit
  * equality IS SQL equality qualify. Floats are excluded on purpose: their
  * comparison treats -0.0 = +0.0 and groups NaNs together, neither of which
- * holds for bit equality.
+ * holds for bit equality. text/varchar are supported too, but not by bit
+ * equality: their values are canonicalized through key_intern (see
+ * dbbc_intern_text) so equal strings share one pointer and the fixed key stays
+ * byte-comparable. That only matches SQL equality under a DETERMINISTIC
+ * collation (equal iff byte-identical) - dbbc_grp_key_ok enforces that.
  */
 static bool
 dbbc_grp_key_type_ok(Oid typid)
@@ -2664,9 +2678,24 @@ dbbc_grp_key_type_ok(Oid typid)
 		case TIMEOID:
 		case TIMESTAMPOID:
 		case TIMESTAMPTZOID:
+		case TEXTOID:
+		case VARCHAROID:
 			return true;
 	}
 	return false;
+}
+
+/* true iff the type is a supported group-key type AND, for text/varchar, the
+ * collation is deterministic (so byte equality == the grouping equality core
+ * HashAgg would use). Non-deterministic collations fall back. */
+static bool
+dbbc_grp_key_ok(Oid typid, Oid collid)
+{
+	if (!dbbc_grp_key_type_ok(typid))
+		return false;
+	if (typid == TEXTOID || typid == VARCHAROID)
+		return OidIsValid(collid) && get_collation_isdeterministic(collid);
+	return true;
 }
 
 /*
@@ -2904,13 +2933,13 @@ dbbc_agg_grouped_classify(PlannerInfo *root, RelOptInfo *input_rel,
 			if (var->varno != relid || var->varlevelsup != 0 ||
 				var->varattno <= 0)
 				return false;
-			if (!dbbc_grp_key_type_ok(var->vartype))
+			if (!dbbc_grp_key_ok(var->vartype, var->varcollid))
 				return false;
 			*needcols = list_append_unique_int(*needcols, var->varattno);
 		}
 		else
 		{
-			if (!dbbc_grp_key_type_ok(exprType(expr)))
+			if (!dbbc_grp_key_ok(exprType(expr), exprCollation(expr)))
 				return false;
 			if (contain_volatile_functions(expr))
 				return false;
@@ -3334,13 +3363,13 @@ dbbc_try_dimjoin_agg(PlannerInfo *root, UpperRelationKind stage,
 				return;
 			if (v->varno == (Index) fact_relid)
 			{
-				if (!dbbc_grp_key_type_ok(v->vartype))
+				if (!dbbc_grp_key_ok(v->vartype, v->varcollid))
 					return;
 			}
 			else if (v->varno == (Index) dim_relid)
 			{
-				if (!dbbc_grp_key_type_ok(v->vartype))
-					return;		/* Phase 1: byval bit-eq dim key columns only */
+				if (!dbbc_grp_key_ok(v->vartype, v->varcollid))
+					return;		/* dim key: byval bit-eq or deterministic-collation text */
 				from_dim = true;
 			}
 			else
@@ -3348,7 +3377,7 @@ dbbc_try_dimjoin_agg(PlannerInfo *root, UpperRelationKind stage,
 		}
 		else
 		{
-			if (!dbbc_grp_key_type_ok(exprType(expr)) ||
+			if (!dbbc_grp_key_ok(exprType(expr), exprCollation(expr)) ||
 				contain_volatile_functions(expr) ||
 				!dbbc_expr_vars_ok(expr, fact_relid, &needcols))
 				return;			/* fact-only expression keys */
@@ -3406,7 +3435,7 @@ dbbc_try_dimjoin_agg(PlannerInfo *root, UpperRelationKind stage,
 				if (IsA(expr, Var) &&
 					((Var *) expr)->varno == (Index) dim_relid &&
 					((Var *) expr)->varattno > 0 &&
-					dbbc_grp_key_type_ok(((Var *) expr)->vartype) &&
+					dbbc_grp_key_ok(((Var *) expr)->vartype, ((Var *) expr)->varcollid) &&
 					list_length(keyexprs) < DBBC_GRP_MAX_KEYS)
 				{
 					k = list_length(keyexprs);
@@ -3904,7 +3933,7 @@ dbbc_try_eager_agg(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	{
 		Node	   *g = (Node *) lfirst(lc);
 
-		if (!dbbc_grp_key_type_ok(exprType(g)) ||
+		if (!dbbc_grp_key_ok(exprType(g), exprCollation(g)) ||
 			contain_volatile_functions(g) ||
 			!dbbc_expr_vars_ok(g, rel->relid, &needcols))
 			return;
@@ -4215,8 +4244,26 @@ dbbc_dim_build(DbbcAggScanState *as, EState *estate)
 					 errhint("ANALYZE the dimension so the planner sizes it correctly and does not choose the in-node dimension join.")));
 		for (k = 0; k < as->nkeys; k++)
 			if (as->key_from_dim[k])
-				e->vals[k] = slot_getattr(slot, as->key_dim_attno[k],
-										  &e->nulls[k]);
+			{
+				Datum		v = slot_getattr(slot, as->key_dim_attno[k],
+											 &e->nulls[k]);
+
+				/*
+				 * A text dim key must outlive the scan slot (freed as the scan
+				 * advances) and any toast, so copy it flat into the dim context.
+				 * byval keys are stored as-is. The value is later canonicalized
+				 * through key_intern at group-probe time.
+				 */
+				if (!e->nulls[k] && as->key_is_text[k])
+				{
+					MemoryContext old = MemoryContextSwitchTo(as->dim_ctx);
+
+					v = PointerGetDatum(pg_detoast_datum_copy((struct varlena *)
+															  DatumGetPointer(v)));
+					MemoryContextSwitchTo(old);
+				}
+				e->vals[k] = v;
+			}
 	}
 	table_endscan(scan);
 	ExecDropSingleTupleTableSlot(slot);
@@ -4242,10 +4289,15 @@ dbbc_grp_begin(DbbcAggScanState *as, List *payload, EState *estate, int eflags)
 	as->key_exprstate = (ExprState **)
 		palloc0(Max(as->nkeys, 1) * sizeof(ExprState *));
 	as->has_key_exprs = false;
+	as->has_varlena_key = false;
 	i = 0;
 	foreach(lc, keyexprs)
 	{
 		Node	   *kexpr = (Node *) lfirst(lc);
+		Oid			ktype = exprType(kexpr);
+
+		as->key_is_text[i] = (ktype == TEXTOID || ktype == VARCHAROID);
+		as->has_varlena_key |= as->key_is_text[i];
 
 		if (IsA(kexpr, Var))
 		{
@@ -4868,6 +4920,61 @@ dbbc_skipqual_test(DbbcSkipQual *q, Datum value, bool isnull)
 	}
 }
 
+/*
+ * key_intern: a homogeneous text-value hash. Its key is a Datum pointing at a
+ * FLAT (detoasted) text; hash and equality run on the bytes, matching text
+ * grouping under a deterministic collation. dbbc_intern_text canonicalizes each
+ * text key value to one stable groupctx pointer, so the fixed group key stays
+ * byte-comparable (equal strings -> identical pointer). No per-column context is
+ * needed - the table holds only text - so plain dynahash callbacks suffice.
+ */
+static uint32
+dbbc_textintern_hash(const void *key, Size keysize)
+{
+	text	   *t = DatumGetTextPP(*(const Datum *) key);
+
+	return hash_bytes((const unsigned char *) VARDATA_ANY(t),
+					  VARSIZE_ANY_EXHDR(t));
+}
+
+static int
+dbbc_textintern_match(const void *key1, const void *key2, Size keysize)
+{
+	text	   *a = DatumGetTextPP(*(const Datum *) key1);
+	text	   *b = DatumGetTextPP(*(const Datum *) key2);
+	int			la = VARSIZE_ANY_EXHDR(a);
+	int			lb = VARSIZE_ANY_EXHDR(b);
+
+	if (la != lb)
+		return 1;
+	return memcmp(VARDATA_ANY(a), VARDATA_ANY(b), la);
+}
+
+/*
+ * Canonicalize a (possibly toasted, transient) text Datum to a single stable
+ * pointer living in groupctx: equal byte strings return the identical pointer.
+ * Detoast once into the caller's short-lived context so the callbacks never
+ * re-detoast; the first occurrence is copied flat into groupctx and reused.
+ */
+static Datum
+dbbc_intern_text(DbbcAggScanState *as, Datum d)
+{
+	Datum		flat = PointerGetDatum(pg_detoast_datum((struct varlena *)
+													   DatumGetPointer(d)));
+	Datum	   *slot;
+	bool		found;
+
+	slot = (Datum *) hash_search(as->key_intern, &flat, HASH_ENTER, &found);
+	if (!found)
+	{
+		MemoryContext old = MemoryContextSwitchTo(as->groupctx);
+
+		*slot = datumCopy(flat, false, -1);		/* flat text: typbyval=f typlen=-1 */
+		MemoryContextSwitchTo(old);
+	}
+	return *slot;
+}
+
 /* find-or-create the group for the current row's key values */
 static DbbcGroupEntry *
 dbbc_grp_lookup(DbbcAggScanState *as, Datum *keyvals, bool *keynulls)
@@ -4883,6 +4990,8 @@ dbbc_grp_lookup(DbbcAggScanState *as, Datum *keyvals, bool *keynulls)
 	{
 		if (keynulls[k])
 			key.nullmask |= ((uint32) 1) << k;
+		else if (as->key_is_text[k])
+			key.vals[k] = dbbc_intern_text(as, keyvals[k]);
 		else
 			key.vals[k] = keyvals[k];
 	}
@@ -5460,6 +5569,22 @@ dbbc_grp_build(DbbcAggScanState *as, EState *estate)
 		ctl.hcxt = as->groupctx;
 		as->groups = hash_create("dbblue_columnar groups", 256, &ctl,
 								 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+
+	/* text group keys: build the canonicalizing intern table (in groupctx, so it
+	 * is reset/freed together with the groups). */
+	if (as->has_varlena_key && as->key_intern == NULL)
+	{
+		HASHCTL		ictl;
+
+		ictl.keysize = sizeof(Datum);
+		ictl.entrysize = sizeof(Datum);
+		ictl.hcxt = as->groupctx;
+		ictl.hash = dbbc_textintern_hash;
+		ictl.match = dbbc_textintern_match;
+		as->key_intern = hash_create("dbblue_columnar key intern", 256, &ictl,
+									 HASH_ELEM | HASH_FUNCTION | HASH_COMPARE |
+									 HASH_CONTEXT);
 	}
 
 	Assert(sc != NULL);			/* bound at Begin / InitializeWorkerCustomScan */
