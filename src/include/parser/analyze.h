@@ -29,6 +29,7 @@ extern PGDLLIMPORT bool dbblue_safe_mode;
 
 extern void dbblue_safe_mode_check(const char *cmd, const char *restriction,
 								   Node *qual);
+extern void dbblue_safe_mode_check_rewritten(Query *query);
 
 
 extern Query *parse_analyze_fixedparams(RawStmt *parseTree, const char *sourceText,
