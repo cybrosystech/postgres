@@ -4,7 +4,10 @@
  *	  Hardware detection and tuning formulas for initdb's auto-tune feature.
  *
  * Detection covers Linux/macOS (POSIX sysconf) and Windows
- * (GlobalMemoryStatusEx / GetSystemInfo).  Formulas are tuned for Odoo
+ * (GlobalMemoryStatusEx / GetSystemInfo), and on Linux honours a cgroup
+ * memory limit when one confines us -- initdb is very often run inside a
+ * container, where the host's physical RAM is the wrong number to size a
+ * cluster from.  Formulas are tuned for Odoo
  * workloads: many concurrent short transactions from the ORM, with the
  * occasional heavier report.  Memory values are produced in kilobytes,
  * rounded to a whole megabyte, so initdb can format them with an "MB"/"GB"
@@ -33,7 +36,7 @@
  * Detect total physical RAM.  Returns 0 on failure.
  */
 static uint64
-detect_total_ram(void)
+detect_physical_ram(void)
 {
 #ifdef WIN32
 	MEMORYSTATUSEX status;
@@ -52,6 +55,243 @@ detect_total_ram(void)
 #endif
 	return 0;
 #endif
+}
+
+#if defined(__linux__)
+
+/*
+ * Read a byte count out of a cgroup control file.  Returns false if the
+ * file is absent, unreadable, or does not start with a plain number --
+ * which is how cgroup v2 spells "no limit" (the literal string "max").
+ */
+static bool
+read_cgroup_limit(const char *path, uint64 *limit)
+{
+	FILE	   *fp;
+	char		buf[64];
+	unsigned long long val;
+
+	fp = fopen(path, "r");
+	if (fp == NULL)
+		return false;
+	if (fgets(buf, sizeof(buf), fp) == NULL)
+	{
+		fclose(fp);
+		return false;
+	}
+	fclose(fp);
+
+	if (sscanf(buf, "%llu", &val) != 1 || val == 0)
+		return false;
+
+	*limit = (uint64) val;
+	return true;
+}
+
+/*
+ * Find this process's path within a cgroup hierarchy by parsing
+ * /proc/self/cgroup, whose lines are "<id>:<controllers>:<path>".  Pass
+ * controller = NULL for the cgroup v2 unified hierarchy (the line with an
+ * empty controller field, "0::<path>"), or a controller name such as
+ * "memory" for a v1 hierarchy.  Returns false if there is no such line.
+ */
+static bool
+find_cgroup_path(const char *controller, char *relpath, size_t relpath_size)
+{
+	FILE	   *fp;
+	char		line[MAXPGPATH];
+	bool		found = false;
+
+	fp = fopen("/proc/self/cgroup", "r");
+	if (fp == NULL)
+		return false;
+
+	while (!found && fgets(line, sizeof(line), fp) != NULL)
+	{
+		char	   *controllers;
+		char	   *path;
+
+		/* Split "<id>:<controllers>:<path>" in place. */
+		controllers = strchr(line, ':');
+		if (controllers == NULL)
+			continue;
+		*controllers++ = '\0';
+		path = strchr(controllers, ':');
+		if (path == NULL)
+			continue;
+		*path++ = '\0';
+		path[strcspn(path, "\n")] = '\0';
+
+		if (controller == NULL)
+		{
+			/* v2 unified hierarchy: the controller field is empty. */
+			if (controllers[0] != '\0')
+				continue;
+		}
+		else
+		{
+			/*
+			 * v1: the field is a comma-separated controller list, so match
+			 * a whole element rather than a substring ("memory" must not
+			 * match "hugetlb,memory_foo").
+			 */
+			char	   *tok = controllers;
+			bool		match = false;
+
+			while (*tok != '\0')
+			{
+				size_t		len = strcspn(tok, ",");
+
+				if (strncmp(tok, controller, len) == 0 &&
+					controller[len] == '\0')
+				{
+					match = true;
+					break;
+				}
+				tok += len;
+				if (*tok == ',')
+					tok++;
+			}
+			if (!match)
+				continue;
+		}
+
+		strlcpy(relpath, path, relpath_size);
+		found = true;
+	}
+
+	fclose(fp);
+	return found;
+}
+
+/*
+ * Look for a memory limit in one cgroup hierarchy.  root is where the
+ * hierarchy is mounted, filename the control file holding the limit, and
+ * relpath this process's cgroup within it.
+ *
+ * A limit set on any ancestor cgroup binds this process just as tightly as
+ * one set on its own, so walk up to the root and keep the smallest value
+ * found.  Returns false if no cgroup on the path carries a limit.
+ */
+static bool
+scan_cgroup_hierarchy(const char *root, const char *filename,
+					  char *relpath, uint64 *limit)
+{
+	char		path[MAXPGPATH];
+	bool		found = false;
+	uint64		best = 0;
+
+	for (;;)
+	{
+		char	   *slash;
+		uint64		val;
+
+		snprintf(path, MAXPGPATH, "%s%s/%s", root, relpath, filename);
+		if (read_cgroup_limit(path, &val) && (!found || val < best))
+		{
+			best = val;
+			found = true;
+		}
+
+		/* Stop once we have just examined the hierarchy root itself. */
+		if (relpath[0] == '\0')
+			break;
+		slash = strrchr(relpath, '/');
+		if (slash == NULL)
+			break;
+		*slash = '\0';
+	}
+
+	if (found)
+		*limit = best;
+	return found;
+}
+
+/*
+ * Detect the cgroup memory limit applying to this process, if any.
+ * Returns false when unconfined or when the limit cannot be determined.
+ *
+ * This matters because initdb is very often run inside a memory-limited
+ * container.  sysconf(_SC_PHYS_PAGES) reports the *host's* RAM there, and
+ * sizing shared_buffers off that would hand the postmaster far more memory
+ * than the cgroup permits -- the shared_buffers probe would still pass
+ * (Linux overcommits the mapping) and the cluster would then be OOM-killed
+ * once the workload touched those pages.
+ */
+static bool
+detect_cgroup_memory_limit(uint64 *limit)
+{
+	char		relpath[MAXPGPATH];
+
+	/*
+	 * cgroup v2.  Inside a cgroup namespace /proc/self/cgroup reports a
+	 * path relative to the namespace root, which is exactly how the
+	 * hierarchy is mounted, so the two compose directly.
+	 */
+	if (find_cgroup_path(NULL, relpath, sizeof(relpath)))
+	{
+		if (scan_cgroup_hierarchy("/sys/fs/cgroup", "memory.max",
+								  relpath, limit))
+			return true;
+	}
+
+	/* cgroup v1, whose memory controller mounts in its own subdirectory. */
+	if (find_cgroup_path("memory", relpath, sizeof(relpath)))
+	{
+		if (scan_cgroup_hierarchy("/sys/fs/cgroup/memory",
+								  "memory.limit_in_bytes", relpath, limit))
+			return true;
+	}
+
+	/*
+	 * Last resort: some container runtimes bind-mount the container's own
+	 * cgroup directory at the hierarchy root without a matching
+	 * /proc/self/cgroup entry.
+	 */
+	if (read_cgroup_limit("/sys/fs/cgroup/memory.max", limit))
+		return true;
+	if (read_cgroup_limit("/sys/fs/cgroup/memory/memory.limit_in_bytes", limit))
+		return true;
+
+	return false;
+}
+
+#endif							/* __linux__ */
+
+/*
+ * Detect the amount of RAM this cluster may actually use: physical RAM, or
+ * the cgroup memory limit when one applies and is the tighter of the two.
+ * Sets *from_cgroup so initdb can say which it used.  Returns 0 on failure.
+ *
+ * Note the cgroup limit is not compared against MemAvailable or any other
+ * momentary free-memory figure: auto-tune is sizing a long-lived cluster,
+ * so the ceiling is what matters, not what happens to be free during
+ * initdb.
+ */
+static uint64
+detect_total_ram(bool *from_cgroup)
+{
+	uint64		ram = detect_physical_ram();
+
+	*from_cgroup = false;
+
+#if defined(__linux__)
+	{
+		uint64		limit;
+
+		/*
+		 * An unconfined v1 cgroup reports a huge sentinel rather than
+		 * absence, so take the limit only when it really is tighter.
+		 */
+		if (detect_cgroup_memory_limit(&limit) && (ram == 0 || limit < ram))
+		{
+			*from_cgroup = true;
+			return limit;
+		}
+	}
+#endif
+
+	return ram;
 }
 
 /*
@@ -161,6 +401,7 @@ auto_tune_compute(int max_connections)
 {
 	AutoTuneSettings s;
 	uint64		ram_bytes;
+	bool		ram_from_cgroup;
 	int			cpus;
 	bool		ssd;
 	int			ram_kb;
@@ -169,7 +410,7 @@ auto_tune_compute(int max_connections)
 
 	memset(&s, 0, sizeof(s));
 
-	ram_bytes = detect_total_ram();
+	ram_bytes = detect_total_ram(&ram_from_cgroup);
 	cpus = detect_cpu_count();
 	ssd = detect_ssd();
 
@@ -180,13 +421,14 @@ auto_tune_compute(int max_connections)
 	}
 
 	s.total_ram_bytes = ram_bytes;
+	s.ram_from_cgroup = ram_from_cgroup;
 	s.cpu_count = cpus;
 	s.ssd_storage = ssd;
 
 	/*
-	 * Convert RAM to kB up front.  Cap at INT_MAX kB (~2 TB) so the int
-	 * arithmetic below cannot overflow on enormous machines; the formulas
-	 * still produce sensible values at the cap.
+	 * Convert the memory budget to kB up front.  Cap at INT_MAX kB (~2 TB)
+	 * so the int arithmetic below cannot overflow on enormous machines; the
+	 * formulas still produce sensible values at the cap.
 	 */
 	if (ram_bytes / 1024 > (uint64) INT_MAX)
 		ram_kb = INT_MAX;
