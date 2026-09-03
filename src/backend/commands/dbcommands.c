@@ -772,6 +772,7 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 	CreateDBStrategy dbstrategy = CREATEDB_WAL_LOG;
 	createdb_failure_params fparms;
 	bool		use_builtin_default = false;
+	bool		replaced_template1 = false;
 	char	   *collate_str;
 
 	/* Report error if name has \n or \r character. */
@@ -1051,6 +1052,7 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 			collateEl == NULL && ctypeEl == NULL && locproviderEl == NULL)
 		{
 			use_builtin_default = true;
+			replaced_template1 = true;
 		}
 		/* Odoo pattern: LC_COLLATE='C' with optional ENCODING='utf8' and TEMPLATE='template0' */
 		else if (localeEl == NULL && builtinlocaleEl == NULL && iculocaleEl == NULL &&
@@ -1083,19 +1085,38 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 		dbcollate = NULL;
 
 		/*
-		 * Say so.  Stock PostgreSQL would have cloned template1 here, so
-		 * anything the administrator put in template1 -- a customised
-		 * locale, but also extensions, schemas and seed data -- is not
-		 * carried into this database.  Silently diverging from the
-		 * documented template1 behaviour is the kind of thing an
-		 * administrator should find out now rather than from a query that
-		 * sorts unexpectedly a month later.
+		 * Report what was substituted.  The two branches above are different
+		 * events and need different messages.
+		 *
+		 * With no options at all, stock PostgreSQL would have cloned
+		 * template1, so anything the administrator installed there -- a
+		 * customised locale, but equally extensions, schemas and seed data
+		 * -- is silently absent from this database.  That is an undocumented
+		 * divergence usually discovered long afterwards, when a query fails
+		 * on a missing extension, so it warrants a WARNING: NOTICE sits
+		 * below the default log_min_messages of "warning" and would leave
+		 * nothing in the server log for anyone to find.
+		 *
+		 * The LC_COLLATE='C' form is a different matter.  The caller already
+		 * asked for template0, so nothing was taken away and template1 is
+		 * beside the point; what changed is the collation provider, from
+		 * libc to builtin.  That is the form Odoo emits for every database
+		 * it creates, so it is reported at NOTICE -- a WARNING per
+		 * provisioning would be noise, and one repeating a claim about
+		 * template1 that does not apply here would be worse than noise.
 		 */
-		ereport(NOTICE,
-				(errmsg("database \"%s\" will use the builtin \"C.UTF-8\" locale with UTF8 encoding",
-						dbname),
-				 errdetail("It is created from template0, so template1 and its contents are not used."),
-				 errhint("Set dbblue_default_builtin_locale to off, or name a TEMPLATE, LOCALE or ENCODING explicitly, to get the standard behaviour.")));
+		if (replaced_template1)
+			ereport(WARNING,
+					(errmsg("database \"%s\" will use the builtin \"C.UTF-8\" locale with UTF8 encoding",
+							dbname),
+					 errdetail("It is created from template0, so template1 and anything installed in it (extensions, schemas, seed data) are not copied."),
+					 errhint("Set dbblue_default_builtin_locale to off, or name a TEMPLATE, LOCALE or ENCODING explicitly, to get the standard behaviour.")));
+		else
+			ereport(NOTICE,
+					(errmsg("database \"%s\" will use the builtin \"C.UTF-8\" locale instead of the requested libc \"C\" collation",
+							dbname),
+					 errdetail("The builtin locale orders text the same way but applies Unicode case and character rules, where libc \"C\" is limited to ASCII."),
+					 errhint("Set dbblue_default_builtin_locale to off, or name LOCALE_PROVIDER explicitly, to keep the requested collation.")));
 	}
 
 	if (!dbtemplate)
