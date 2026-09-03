@@ -52,8 +52,17 @@
 #include "parallel.h"
 #include "pg_backup_utils.h"
 
+/*
+ * Upper bound on the number of jobs pg_restore picks for itself when -j was
+ * not given.  Parallel restore opens one connection per job, so an
+ * unbounded default would swamp max_connections on a large host for very
+ * little extra throughput.  An explicit -j is honoured up to PG_MAX_JOBS.
+ */
+#define DEFAULT_MAX_RESTORE_JOBS 8
+
 static void usage(const char *progname);
 static void read_restore_filters(const char *filename, RestoreOptions *opts);
+static int	default_restore_jobs(void);
 
 int
 main(int argc, char **argv)
@@ -61,7 +70,7 @@ main(int argc, char **argv)
 	RestoreOptions *opts;
 	int			c;
 	int			exit_code;
-	int			numWorkers = 1;
+	int			numWorkers = 0;	/* 0 means "-j not given"; see below */
 	Archive    *AH;
 	char	   *inputFileSpec;
 	bool		data_only = false;
@@ -507,14 +516,35 @@ main(int argc, char **argv)
 	if (opts->tocFile)
 		SortTocFromFile(AH);
 
-	if (numWorkers <= 1)
-   {
-       numWorkers = (int) sysconf(_SC_NPROCESSORS_ONLN);
-   }
+	/*
+	 * Choose a degree of parallelism if the user did not.  Only go above one
+	 * worker where parallel restore actually works: it needs an archive
+	 * format whose workers can reopen the input independently (custom and
+	 * directory can; tar and plain text cannot), a connection to a database
+	 * rather than a script on our output, and no --single-transaction.
+	 *
+	 * Getting that wrong is not merely a slow restore: RestoreArchive()
+	 * rejects a parallel request the format cannot serve with a fatal error,
+	 * so defaulting to more than one worker unconditionally would break
+	 * plain "pg_restore -d db backup.tar" on every multi-core host.
+	 *
+	 * An explicit -j is always obeyed, including "-j 1".
+	 */
+	if (numWorkers == 0)
+	{
+		ArchiveHandle *AHX = (ArchiveHandle *) AH;
 
-   pg_log_warning("restoring database \"%s\" to target server using %d parallel workers",
-                  opts->cparams.dbname,
-                  numWorkers);
+		if (opts->useDB && !opts->single_txn &&
+			AHX->ClonePtr != NULL && AHX->ReopenPtr != NULL)
+			numWorkers = default_restore_jobs();
+		else
+			numWorkers = 1;
+
+		if (numWorkers > 1)
+			pg_log_info("restoring with %d parallel jobs; use -j/--jobs to choose a different number",
+						numWorkers);
+	}
+
 	AH->numWorkers = numWorkers;
 
 	if (opts->tocSummary)
@@ -535,6 +565,36 @@ main(int argc, char **argv)
 	CloseArchive(AH);
 
 	return exit_code;
+}
+
+/*
+ * default_restore_jobs
+ *		How many parallel jobs to use when -j was not given.
+ *
+ * Returns 1 when the CPU count cannot be determined, which keeps the
+ * upstream default on any platform this does not know how to ask.
+ */
+static int
+default_restore_jobs(void)
+{
+	int			ncpus = 0;
+
+#ifdef WIN32
+	SYSTEM_INFO si;
+
+	GetSystemInfo(&si);
+	ncpus = (int) si.dwNumberOfProcessors;
+#elif defined(_SC_NPROCESSORS_ONLN)
+	long		n = sysconf(_SC_NPROCESSORS_ONLN);
+
+	if (n > 0)
+		ncpus = (int) n;
+#endif
+
+	if (ncpus <= 1)
+		return 1;
+
+	return Min(ncpus, DEFAULT_MAX_RESTORE_JOBS);
 }
 
 static void
