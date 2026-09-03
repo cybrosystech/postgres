@@ -986,9 +986,9 @@
   boot_val => '""',
 },
 
-{ name => 'dbblue_safe_mode', type => 'bool', context => 'PGC_USERSET', group => 'CLIENT_CONN_STATEMENT',
-  short_desc => 'Rejects UPDATE and DELETE statements that have no WHERE clause.',
-  long_desc => 'Guards against accidentally modifying or removing every row in a table by requiring an explicit WHERE clause on UPDATE and DELETE statements.',
+{ name => 'dbblue_safe_mode', type => 'bool', context => 'PGC_SUSET', group => 'CLIENT_CONN_STATEMENT',
+  short_desc => 'Rejects UPDATE, DELETE, MERGE and TRUNCATE statements that would change every row.',
+  long_desc => 'Guards against accidentally modifying or removing every row in a table. UPDATE and DELETE must carry a WHERE clause, and a MERGE action that updates or deletes must be restricted by its ON or WHEN condition; a restriction that reduces to a constant true does not count. TRUNCATE is refused outright. This is PGC_SUSET so an unprivileged session cannot simply turn it off, and it is a guard against mistakes rather than a privilege boundary: a restriction that is true for every row but does not fold to a constant, such as a subquery, is not detected.',
   variable => 'dbblue_safe_mode',
   boot_val => 'false',
 },

@@ -76,6 +76,68 @@ post_parse_analyze_hook_type post_parse_analyze_hook = NULL;
 /* GUC: reject UPDATE/DELETE statements that have no WHERE clause */
 bool		dbblue_safe_mode = false;
 
+/*
+ * dbblue_safe_mode_check
+ *		Refuse a statement that would change every row of a table.
+ *
+ * "qual" is the *transformed* restriction limiting which rows the command
+ * touches -- the WHERE clause of an UPDATE or DELETE, or for MERGE the ON
+ * condition combined with the action's own WHEN condition -- or NULL when
+ * the statement carries no restriction at all.  "cmd" and "restriction"
+ * name the command and its restricting clause in the error message.
+ *
+ * Testing the transformed expression rather than the raw parse tree lets the
+ * guard constant-fold it first, so a predicate written purely to satisfy the
+ * guard ("WHERE true", "WHERE 1=1") is refused as well as an omitted one.
+ *
+ * That fold is necessarily incomplete: whether an arbitrary predicate matches
+ * every row cannot be decided without running it, so anything that does not
+ * reduce to a constant is allowed through -- "WHERE (SELECT 1) = 1" still
+ * gets past.  This is a guard against changing every row by accident, not a
+ * sandbox against someone determined to do it deliberately; for that, do not
+ * grant the privilege in the first place.
+ */
+void
+dbblue_safe_mode_check(const char *cmd, const char *restriction, Node *qual)
+{
+	if (!dbblue_safe_mode)
+		return;
+
+	if (qual == NULL)
+		ereport(ERROR,
+				errcode(ERRCODE_RESTRICT_VIOLATION),
+				errmsg("%s requires a %s because dbblue_safe_mode is enabled",
+					   cmd, restriction),
+				errdetail("Safe mode refuses statements that would change every row of a table."),
+				errhint("Add a %s selecting the rows to change, or ask a superuser to turn dbblue_safe_mode off.",
+						restriction));
+
+	/*
+	 * eval_const_expressions() accepts a NULL PlannerInfo, and this is the
+	 * same folding the planner is about to do to this expression anyway.
+	 */
+	qual = eval_const_expressions(NULL, qual);
+
+	if (IsA(qual, Const))
+	{
+		Const	   *con = (Const *) qual;
+
+		/*
+		 * A restriction of NULL matches no rows at all, so it is not a
+		 * whole-table change; only a constant true is.
+		 */
+		if (!con->constisnull && DatumGetBool(con->constvalue))
+			ereport(ERROR,
+					errcode(ERRCODE_RESTRICT_VIOLATION),
+					errmsg("%s with an always-true %s is not allowed because dbblue_safe_mode is enabled",
+						   cmd, restriction),
+					errdetail("The %s reduces to true, so the statement would change every row of a table.",
+							  restriction),
+					errhint("Use a %s selecting the rows to change, or ask a superuser to turn dbblue_safe_mode off.",
+							restriction));
+	}
+}
+
 static Query *transformOptionalSelectInto(ParseState *pstate, Node *parseTree);
 static Query *transformDeleteStmt(ParseState *pstate, DeleteStmt *stmt);
 static Query *transformInsertStmt(ParseState *pstate, InsertStmt *stmt);
@@ -584,13 +646,6 @@ transformDeleteStmt(ParseState *pstate, DeleteStmt *stmt)
 
 	qry->commandType = CMD_DELETE;
 
-	/* dbblue: block DELETE with no WHERE clause when safe mode is on */
-	if (dbblue_safe_mode && stmt->whereClause == NULL)
-		ereport(ERROR,
-				errcode(ERRCODE_RESTRICT_VIOLATION),
-				errmsg("DELETE requires a WHERE clause because dbblue_safe_mode is enabled"),
-				errhint("Add a WHERE clause to the DELETE, or run \"SET dbblue_safe_mode = off\" for this session if you really intend to delete every row."));
-
 	/* process the WITH clause independently of all else */
 	if (stmt->withClause)
 	{
@@ -657,6 +712,14 @@ transformDeleteStmt(ParseState *pstate, DeleteStmt *stmt)
 	qry->hasAggs = pstate->p_hasAggs;
 
 	assign_query_collations(pstate, qry);
+
+	/*
+	 * dbblue: refuse a DELETE that would remove every row.  This must follow
+	 * assign_query_collations(), because the check constant-folds the qual
+	 * and folding a collatable comparison before its collation is resolved
+	 * fails ("could not determine which collation to use").
+	 */
+	dbblue_safe_mode_check("DELETE", "WHERE clause", qual);
 
 	/* this must be done after collations, for reliable comparison of exprs */
 	if (pstate->p_hasAggs)
@@ -2866,13 +2929,6 @@ transformUpdateStmt(ParseState *pstate, UpdateStmt *stmt)
 
 	qry->commandType = CMD_UPDATE;
 
-	/* dbblue: block UPDATE with no WHERE clause when safe mode is on */
-	if (dbblue_safe_mode && stmt->whereClause == NULL)
-		ereport(ERROR,
-				errcode(ERRCODE_RESTRICT_VIOLATION),
-				errmsg("UPDATE requires a WHERE clause because dbblue_safe_mode is enabled"),
-				errhint("Add a WHERE clause to the UPDATE, or run \"SET dbblue_safe_mode = off\" for this session if you really intend to update every row."));
-
 	/* process the WITH clause independently of all else */
 	if (stmt->withClause)
 	{
@@ -2938,6 +2994,9 @@ transformUpdateStmt(ParseState *pstate, UpdateStmt *stmt)
 	qry->hasSubLinks = pstate->p_hasSubLinks;
 
 	assign_query_collations(pstate, qry);
+
+	/* see the matching comment in transformDeleteStmt */
+	dbblue_safe_mode_check("UPDATE", "WHERE clause", qual);
 
 	return qry;
 }
