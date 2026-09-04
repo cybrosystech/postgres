@@ -105,6 +105,7 @@
 #include "postmaster/bgworker_internals.h"
 #include "postmaster/dbblue_create_standby.h"
 #include "postmaster/dbblue_index_advisor.h"
+#include "postmaster/dbblue_audit_pruner.h"
 #include "postmaster/dbblue_repack_launcher.h"
 #include "postmaster/dbblue_backup_launcher.h"
 #include "postmaster/pgarch.h"
@@ -951,6 +952,13 @@ PostmasterMain(int argc, char *argv[])
 	 * at runtime by dbblue_repack_enabled.
 	 */
 	RepackLauncherRegister();
+
+	/*
+	 * One worker per database named in dbblue_audit_database, so audit log
+	 * retention is enforced on a timer rather than only when something is
+	 * writing to an audited table.
+	 */
+	DbblueAuditPrunerRegister();
 	/*
 	 * Register the dbblue wait sampling collector.  Unlike ApplyLauncher,
 	 * this one always runs; whether it actually samples anything is

@@ -1319,6 +1319,14 @@ ExecInsert(ModifyTableContext *context,
 	ExecARInsertTriggers(estate, resultRelInfo, slot, recheckIndexes,
 						 ar_insert_trig_tcs);
 
+	/*
+	 * dbblue dedicated audit log: record this row's post-image.  Runs once
+	 * per inserted row, after the AFTER ROW triggers, so only rows that
+	 * actually survived constraints and triggers are logged.  Whether
+	 * INSERT is captured at all is decided by dbblue_audit_operations.
+	 */
+	dbblue_audit_capture_insert(resultRelInfo, slot);
+
 	list_free(recheckIndexes);
 
 	/*

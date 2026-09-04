@@ -22,6 +22,7 @@
 #include "postmaster/bgworker_internals.h"
 #include "postmaster/datachecksum_state.h"
 #include "postmaster/dbblue_create_standby.h"
+#include "postmaster/dbblue_audit_pruner.h"
 #include "postmaster/dbblue_index_advisor.h"
 #include "postmaster/dbblue_repack_launcher.h"
 #include "postmaster/dbblue_backup_launcher.h"
@@ -144,6 +145,10 @@ static const struct
 	{
 		.fn_name = "DbblueIndexAdvisorMain",
 		.fn_addr = DbblueIndexAdvisorMain
+	},
+	{
+		.fn_name = "AuditPrunerMain",
+		.fn_addr = AuditPrunerMain
 	},
 	{
 		.fn_name = "ApplyWorkerMain",
