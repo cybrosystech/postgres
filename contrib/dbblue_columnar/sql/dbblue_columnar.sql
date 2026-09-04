@@ -129,6 +129,28 @@ SELECT 'mg-arrayagg   ', agree($$SELECT lc, array_agg(id ORDER BY id) a FROM mg 
 SELECT 'mg-stringagg  ', agree($$SELECT lc, string_agg(id::text, ',' ORDER BY id) s FROM mg GROUP BY lc ORDER BY lc$$);
 DROP TABLE mg;
 
+-- ---- multi-pass hash-partition spill (serial) ----
+-- When a low row estimate lets the columnar agg be chosen but the store actually
+-- holds far more distinct groups than fit a small work_mem, the node must SPILL -
+-- re-scan the store aggregating one hash-partition per pass - not error. Force it:
+-- lie about reltuples (autovacuum off) so the plan-time gate passes, then a small
+-- work_mem overflows on the real cardinality. Byte-identical to core HashAgg.
+CREATE TABLE sp (g int, t text, amt numeric) WITH (autovacuum_enabled = off);
+INSERT INTO sp SELECT i, 'k' || i, (i % 100) * 1.5 FROM generate_series(1, 60000) i;
+VACUUM (DISABLE_PAGE_SKIPPING) sp;
+SELECT dbblue_columnar_add('sp', ARRAY['g','t','amt']);
+SELECT dbblue_columnar_populate('sp') > 0 AS sp_built;
+ANALYZE sp;
+UPDATE pg_class SET reltuples = 500 WHERE relname = 'sp';
+SET work_mem = '256kB';
+SELECT uses_node($$SELECT g, sum(amt) FROM sp GROUP BY g$$, 'DBBlueColumnarAgg') AS spill_fires;
+SELECT 'sp-int-spill  ', agree($$SELECT g, sum(amt) s, count(*) c, avg(amt) a FROM sp GROUP BY g ORDER BY g$$);
+SELECT 'sp-text-spill ', agree($$SELECT t, sum(amt) s, count(*) c FROM sp GROUP BY t ORDER BY t$$);
+SELECT 'sp-multi-spill', agree($$SELECT g, t, count(*) c FROM sp GROUP BY g, t ORDER BY g, t$$);
+SELECT 'sp-minmax-spl ', agree($$SELECT g % 3000 m, min(t) a, max(t) b, sum(amt) s FROM sp GROUP BY g % 3000 ORDER BY 1$$);
+RESET work_mem;
+DROP TABLE sp;
+
 -- ---- correctness under a rescan (LATERAL nestloop, columnar agg on inner) ----
 SELECT 'rescan        ', agree($$SELECT o.k, g.s FROM (VALUES (1),(3),(5)) o(k)
 	JOIN LATERAL (SELECT k7 kk, sum(amt) s FROM t GROUP BY k7) g ON g.kk = o.k ORDER BY o.k$$);
