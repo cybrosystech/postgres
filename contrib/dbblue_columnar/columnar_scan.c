@@ -2270,6 +2270,8 @@ typedef struct DbbcAggItem
 #define DBBC_GRP_MAX_KEYS		4
 /* plan-time dNumGroups gate: the group hash has no spill path */
 #define DBBC_GRP_MAX_GROUPS		100000
+/* multi-pass spill: max hash bits used to partition (2^24 leaf partitions) */
+#define DBBC_SPILL_MAX_DEPTH	24
 
 /* one aggregate computed by real transition functions */
 typedef struct DbbcAggTrans
@@ -2459,10 +2461,26 @@ typedef struct DbbcAggScanState
 	MemoryContext groupctx;		/* group hash + transition states */
 	MemoryContext tmpctx;		/* per-row transfn call scratch */
 	AggState   *fake_aggstate;	/* satisfies AggCheckCallContext */
-	Size		grp_mem_limit;	/* hard runtime cap on groupctx (no spill) */
+	Size		grp_mem_limit;	/* per-partition hash budget (hash_mem) */
 	uint64		grp_since_memcheck; /* new groups since the last memory probe */
 	HASH_SEQ_STATUS seq;		/* emission cursor over the hash */
 	bool		seq_active;
+
+	/*
+	 * Multi-pass hash-partition spill (serial). When a pass overflows grp_mem_
+	 * limit, split the current partition and re-scan the store, aggregating only
+	 * one hash-partition per pass so each pass's hash fits. Zero cost when it
+	 * fits (spill_active stays false, single pass, no per-row partition filter).
+	 */
+	bool		grp_spillable;	/* serial: multi-pass spill (else error on overflow) */
+	bool		spill_active;	/* apply the per-row partition filter */
+	bool		part_building;	/* between build and emit of a partition */
+	bool		part_overflow;	/* current pass overflowed -> must split */
+	int			part_cur_nbits; /* low hash bits routing the current partition */
+	uint32		part_cur_val;	/* the current partition's value */
+	int			part_stk_top;	/* DFS stack of pending (sub)partitions */
+	int			part_stk_nbits[DBBC_SPILL_MAX_DEPTH + 1];
+	uint32		part_stk_val[DBBC_SPILL_MAX_DEPTH + 1];
 
 	/* dim-join sub-mode (DBBC_AGG_MODE_DIMJOIN): in-node dimension hash-join */
 	bool		is_dimjoin;
@@ -5103,6 +5121,38 @@ dbbc_intern_text(DbbcAggScanState *as, Datum d)
 	return *slot;
 }
 
+/*
+ * Content hash of the group key, stable across passes (independent of the
+ * per-pass text interning - it hashes the text bytes, not the interned pointer).
+ * Used only while spilling to route each row to one hash-partition; equal keys
+ * always land in the same partition, so a row is aggregated in exactly one pass.
+ */
+static uint32
+dbbc_grp_parthash(DbbcAggScanState *as, Datum *keyvals, bool *keynulls)
+{
+	uint32		h = 0;
+	int			k;
+
+	for (k = 0; k < as->nkeys; k++)
+	{
+		uint32		kh;
+
+		if (keynulls[k])
+			kh = 0x9e3779b9;
+		else if (as->key_is_text[k])
+		{
+			text	   *t = DatumGetTextPP(keyvals[k]);
+
+			kh = hash_bytes((const unsigned char *) VARDATA_ANY(t),
+							VARSIZE_ANY_EXHDR(t));
+		}
+		else
+			kh = hash_bytes((const unsigned char *) &keyvals[k], sizeof(Datum));
+		h = hash_combine(h, kh);
+	}
+	return h;
+}
+
 /* find-or-create the group for the current row's key values */
 static DbbcGroupEntry *
 dbbc_grp_lookup(DbbcAggScanState *as, Datum *keyvals, bool *keynulls)
@@ -5112,6 +5162,15 @@ dbbc_grp_lookup(DbbcAggScanState *as, Datum *keyvals, bool *keynulls)
 	bool		found;
 	int			k;
 	int			a;
+
+	/* spilling: skip rows whose key is not in the partition being built now */
+	if (as->spill_active)
+	{
+		uint32		ph = dbbc_grp_parthash(as, keyvals, keynulls);
+
+		if ((ph & ((((uint32) 1) << as->part_cur_nbits) - 1)) != as->part_cur_val)
+			return NULL;
+	}
 
 	memset(&key, 0, sizeof(key));
 	for (k = 0; k < as->nkeys; k++)
@@ -5151,19 +5210,28 @@ dbbc_grp_lookup(DbbcAggScanState *as, Datum *keyvals, bool *keynulls)
 		}
 
 		/*
-		 * Runtime memory backstop (no spill path). Probe the group context
-		 * periodically - MemoryContextMemAllocated recurses, so amortize it -
-		 * and refuse rather than grow unboundedly toward an OOM.
+		 * When this partition's hash outgrows the budget, signal the scan to
+		 * stop: the exec state machine (dbbc_grp_exec) then splits the current
+		 * hash-partition and re-scans its halves, so each pass fits (multi-pass
+		 * spill). Whatever was aggregated this pass is discarded when groupctx is
+		 * reset, so bailing now is safe. Probe periodically - MemoryContextMem-
+		 * Allocated recurses - so a partition can overshoot the budget by up to
+		 * ~1024 groups before the split; that is bounded and only costs a re-scan.
 		 */
 		if (++as->grp_since_memcheck >= 1024)
 		{
 			as->grp_since_memcheck = 0;
 			if (MemoryContextMemAllocated(as->groupctx, true) >
 				as->grp_mem_limit)
-				ereport(ERROR,
-						(errcode(ERRCODE_OUT_OF_MEMORY),
-						 errmsg("dbblue_columnar: grouped aggregate exceeded the hash memory limit"),
-						 errhint("Too many groups for the in-node aggregate (it does not spill). ANALYZE the table, raise hash_mem_multiplier/work_mem, or SET dbblue_columnar.enable_columnar_scan = off.")));
+			{
+				if (as->grp_spillable)
+					as->part_overflow = true;
+				else
+					ereport(ERROR,
+							(errcode(ERRCODE_OUT_OF_MEMORY),
+							 errmsg("dbblue_columnar: grouped aggregate exceeded the hash memory limit"),
+							 errhint("A parallel partial aggregate does not spill. ANALYZE the table, raise hash_mem_multiplier/work_mem, or SET max_parallel_workers_per_gather = 0.")));
+			}
 		}
 	}
 	return entry;
@@ -5183,6 +5251,9 @@ static void
 dbbc_grp_advance(DbbcAggScanState *as, DbbcGroupEntry *grp)
 {
 	int			a;
+
+	if (grp == NULL)
+		return;					/* row skipped: not in the current spill partition */
 
 	for (a = 0; a < as->ntrans; a++)
 	{
@@ -5435,6 +5506,11 @@ dbbc_grp_consume_block(DbbcAggScanState *as, DbbcScanState *s,
 			}
 			dbbc_grp_advance(as, dbbc_grp_lookup(as, keyvals, keynulls));
 			as->grp_rows++;
+			if (as->part_overflow)		/* spill: abort this pass, split + re-scan */
+			{
+				MemoryContextSwitchTo(oldctx);
+				break;
+			}
 		}
 		MemoryContextSwitchTo(oldctx);
 	}
@@ -5593,6 +5669,11 @@ dbbc_grp_consume_heap_range(DbbcAggScanState *as, DbbcScanState *s,
 			}
 			dbbc_grp_advance(as, dbbc_grp_lookup(as, keyvals, keynulls));
 			as->grp_rows++;
+			if (as->part_overflow)	/* spill: abort this pass, split + re-scan */
+			{
+				MemoryContextSwitchTo(oldctx);
+				break;
+			}
 		}
 		MemoryContextSwitchTo(oldctx);
 	}
@@ -5733,6 +5814,9 @@ dbbc_grp_build(DbbcAggScanState *as, EState *estate)
 		{
 			DbbcBlock  *block = dbbc_slot_block(sc, cur);
 			DbbcColumnChunk *chunks = NULL;
+
+			if (as->part_overflow)	/* spill: stop this pass, exec will split */
+				break;
 
 			CHECK_FOR_INTERRUPTS();
 
@@ -5909,6 +5993,91 @@ dbbc_grp_emit_group(DbbcAggScanState *as, DbbcGroupEntry *grp)
 	return slot;
 }
 
+/*
+ * Grouped emission with multi-pass hash-partition spill (serial). Each partition
+ * is built (a full re-scan aggregating only that hash-partition), then its groups
+ * are emitted, before the next partition is built - so at most one partition's
+ * hash lives at a time. A partition that overflows the budget is split in two and
+ * its halves re-scanned (DFS via part_stk). Common case: the root partition fits,
+ * spill_active never turns on, exactly one pass, no per-row partition filter.
+ */
+static TupleTableSlot *
+dbbc_grp_exec(DbbcAggScanState *as, EState *estate)
+{
+	DbbcGroupEntry *grp;
+
+	if (!as->executed)
+	{
+		as->executed = true;
+		/*
+		 * Spill is serial-only: a parallel participant claims blocks from a
+		 * shared atomic cursor, so it cannot re-scan its slice by itself, and a
+		 * partitioned re-scan would need a cross-worker barrier. Parallel partial
+		 * aggregation therefore keeps the single-pass behaviour and errors on
+		 * overflow (the plan-time gate is its guard); a serial node spills.
+		 */
+		as->grp_spillable = (as->pstate == NULL);
+		as->spill_active = false;
+		as->part_cur_nbits = 0;
+		as->part_cur_val = 0;
+		as->part_stk_top = 0;
+		as->part_building = true;
+	}
+
+	for (;;)
+	{
+		if (as->part_building)
+		{
+			/* fresh per-partition hash; re-scan the store from the top */
+			if (as->groups != NULL)
+			{
+				MemoryContextReset(as->groupctx);
+				as->groups = NULL;
+				as->key_intern = NULL;
+			}
+			as->part_overflow = false;
+			as->grp_since_memcheck = 0;
+			as->pscan->cur_slot = 0;	/* serial re-scan */
+			dbbc_grp_build(as, estate);
+
+			if (as->part_overflow)
+			{
+				/* split the current partition; re-scan each half */
+				if (as->part_cur_nbits >= DBBC_SPILL_MAX_DEPTH)
+					ereport(ERROR,
+							(errcode(ERRCODE_OUT_OF_MEMORY),
+							 errmsg("dbblue_columnar: grouped aggregate cannot partition further"),
+							 errhint("Raise work_mem or hash_mem_multiplier.")));
+				as->spill_active = true;
+				/* push the high-bit-1 sibling; build the high-bit-0 half now */
+				as->part_stk_nbits[as->part_stk_top] = as->part_cur_nbits + 1;
+				as->part_stk_val[as->part_stk_top] =
+					as->part_cur_val | (((uint32) 1) << as->part_cur_nbits);
+				as->part_stk_top++;
+				as->part_cur_nbits++;
+				continue;			/* rebuild the (now finer) current partition */
+			}
+
+			hash_seq_init(&as->seq, as->groups);
+			as->seq_active = true;
+			as->part_building = false;
+		}
+
+		grp = (DbbcGroupEntry *) hash_seq_search(&as->seq);
+		if (grp != NULL)
+			return dbbc_grp_emit_group(as, grp);
+
+		/* partition exhausted; move to the next pending one, else done */
+		as->seq_active = false;
+		if (as->part_stk_top == 0)
+			return NULL;
+		as->part_stk_top--;
+		as->part_cur_nbits = as->part_stk_nbits[as->part_stk_top];
+		as->part_cur_val = as->part_stk_val[as->part_stk_top];
+		as->part_building = true;
+	}
+}
+
 static TupleTableSlot *
 dbbc_agg_exec(CustomScanState *node)
 {
@@ -5921,26 +6090,7 @@ dbbc_agg_exec(CustomScanState *node)
 	List	   *needed = NIL;
 
 	if (as->grouped)
-	{
-		DbbcGroupEntry *grp;
-
-		if (!as->executed)
-		{
-			dbbc_grp_build(as, node->ss.ps.state);
-			hash_seq_init(&as->seq, as->groups);
-			as->seq_active = true;
-			as->executed = true;
-		}
-		if (!as->seq_active)
-			return NULL;
-		grp = (DbbcGroupEntry *) hash_seq_search(&as->seq);
-		if (grp == NULL)
-		{
-			as->seq_active = false;
-			return NULL;
-		}
-		return dbbc_grp_emit_group(as, grp);
-	}
+		return dbbc_grp_exec(as, node->ss.ps.state);
 
 	if (as->executed)
 		return NULL;
@@ -6130,23 +6280,27 @@ dbbc_agg_rescan(CustomScanState *node)
 	if (as->grouped)
 	{
 		/*
-		 * The grouped node's output depends on no parameter (only Const
-		 * quals, plain-column keys/inputs), so a rescan yields identical
-		 * groups. Keep the built hash and just rewind the emission cursor
-		 * rather than rebuilding (like Material). Rebuilding would re-pin the
-		 * version and register a fresh heap slot in es_tupleTable on every
-		 * rescan - an unbounded leak under an unmaterialized nestloop inner.
+		 * The grouped node's output depends on no parameter (only Const quals,
+		 * plain-column keys/inputs), so a rescan yields identical groups. When it
+		 * did NOT spill, the whole hash is retained, so just rewind the emission
+		 * cursor rather than rebuilding (like Material) - rebuilding re-runs the
+		 * scan loop unnecessarily. When it DID spill, only the last partition is
+		 * retained, so the multi-pass machine must be restarted (it re-scans the
+		 * store, exactly as it did the first time - no version re-pin or slot
+		 * registration, those live on the Begin-bound pscan).
 		 */
 		if (as->seq_active)
 		{
 			hash_seq_term(&as->seq);
 			as->seq_active = false;
 		}
-		if (as->executed && as->groups != NULL)
+		if (!as->spill_active && as->executed && as->groups != NULL)
 		{
 			hash_seq_init(&as->seq, as->groups);
 			as->seq_active = true;
 		}
+		else
+			as->executed = false;	/* spilled or not built: rebuild next exec */
 		return;
 	}
 
