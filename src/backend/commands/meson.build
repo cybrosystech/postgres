@@ -15,6 +15,7 @@ backend_sources += files(
   'copyfromparse.c',
   'copyto.c',
   'createas.c',
+  'dbblue_brin_worker.c',
   'dbcommands.c',
   'define.c',
   'discard.c',
