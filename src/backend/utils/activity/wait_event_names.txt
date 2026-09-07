@@ -62,6 +62,7 @@ DBBLUE_INDEX_ADVISOR_MAIN	"Waiting in main loop of dbblue index advisor process.
 DBBLUE_REPACK_LAUNCHER_MAIN	"Waiting in main loop of dbblue repack launcher process."
 DBBLUE_BACKUP_LAUNCHER_MAIN	"Waiting in main loop of dbblue backup launcher process."
 DBBLUE_AUDIT_PRUNER_MAIN	"Waiting in main loop of dbblue audit log pruner process."
+DBBLUE_BRIN_WORKER_MAIN	"Waiting in main loop of dbblue BRIN index worker process."
 IO_WORKER_MAIN	"Waiting in main loop of IO Worker process."
 LOGICAL_APPLY_MAIN	"Waiting in main loop of logical replication apply process."
 LOGICAL_LAUNCHER_MAIN	"Waiting in main loop of logical replication launcher process."

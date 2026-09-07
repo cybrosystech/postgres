@@ -933,7 +933,9 @@ PostmasterMain(int argc, char *argv[])
 	ApplyLauncherRegister();
 
 	/*
-	 * Register the BRIN worker for automatic BRIN index creation
+	 * Register the BRIN worker for automatic BRIN index creation.  Like the
+	 * index advisor, this one always runs; whether it actually creates any
+	 * index is controlled at runtime by dbblue_create_brin.
 	 */
 	DBBlueBrinWorkerRegister();
 	/*
