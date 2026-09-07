@@ -872,11 +872,12 @@
   max => 'INT_MAX / 1000',
 },
 
-{ name => 'dbblue_brin_database', type => 'string', context => 'PGC_POSTMASTER', group => 'RESOURCES_WORKER_PROCESSES',
+{ name => 'dbblue_brin_database', type => 'string', context => 'PGC_SIGHUP', group => 'RESOURCES_WORKER_PROCESSES',
   short_desc => 'Database name for automatic BRIN index creation.',
-  long_desc => 'The background worker created by dbblue_create_brin will connect to this database to create BRIN indexes.',
+  long_desc => 'The background worker enabled by dbblue_create_brin attaches to this database at the moment the feature is first switched on, and only creates BRIN indexes on tables that live in it. Changing this value takes effect on reload: because a running worker cannot re-point its database connection, the worker exits and is restarted a few seconds later against the new database.',
   variable => 'dbblue_brin_database',
   boot_val => '"odoo"',
+  check_hook => 'dbblue_check_brin_database',
 },
 
 { name => 'dbblue_bulk_write_maxpages', type => 'int', context => 'PGC_USERSET', group => 'RESOURCES_IO',
@@ -888,11 +889,12 @@
   max => '512',
 },
 
-{ name => 'dbblue_create_brin', type => 'bool', context => 'PGC_POSTMASTER', group => 'RESOURCES_WORKER_PROCESSES',
+{ name => 'dbblue_create_brin', type => 'bool', context => 'PGC_SIGHUP', group => 'RESOURCES_WORKER_PROCESSES',
   short_desc => 'Enable automatic BRIN index creation for create_date columns.',
-  long_desc => 'When enabled, a background worker periodically checks pg_stats and creates BRIN indexes on create_date columns with high correlation (>0.9).',
+  long_desc => 'When enabled, a background worker periodically checks pg_stats and creates BRIN indexes on create_date columns with high correlation (>0.9). The worker is always running, so this can be switched on and off at runtime; it starts scanning dbblue_brin_database on the next cycle after the change is reloaded.',
   variable => 'dbblue_create_brin',
   boot_val => 'false',
+  check_hook => 'dbblue_check_create_brin',
 },
 
 { name => 'dbblue_create_standby', type => 'bool', context => 'PGC_SIGHUP', group => 'REPLICATION_PRIMARY',
