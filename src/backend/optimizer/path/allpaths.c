@@ -84,6 +84,7 @@ int			geqo_threshold;
 double		min_eager_agg_group_size;
 int			min_parallel_table_scan_size;
 int			min_parallel_index_scan_size;
+double		dbblue_parallel_growth_factor;
 
 /* Hook for plugins to get control in set_rel_pathlist() */
 set_rel_pathlist_hook_type set_rel_pathlist_hook = NULL;
@@ -4819,7 +4820,7 @@ compute_parallel_worker(RelOptInfo *rel, double heap_pages, double index_pages,
 
 		if (heap_pages >= 0)
 		{
-			int			heap_parallel_threshold;
+			double		heap_parallel_threshold;
 			int			heap_parallel_workers = 1;
 
 			/*
@@ -4828,13 +4829,20 @@ compute_parallel_worker(RelOptInfo *rel, double heap_pages, double index_pages,
 			 * sophisticated, but we need something here for now.  Note that
 			 * the upper limit of the min_parallel_table_scan_size GUC is
 			 * chosen to prevent overflow here.
+			 *
+			 * dbblue: upstream hardcodes a growth factor of 3, which on a
+			 * many-core host leaves most cores idle for mid-sized relations.
+			 * The factor is a GUC here so a reporting session can request a
+			 * steeper ramp with SET LOCAL without affecting OLTP backends.
+			 * The threshold is kept as a double so that factors close to 1
+			 * still make progress instead of spinning on integer truncation.
 			 */
 			heap_parallel_threshold = Max(min_parallel_table_scan_size, 1);
-			while (heap_pages >= (BlockNumber) (heap_parallel_threshold * 3))
+			while (heap_pages >= heap_parallel_threshold * dbblue_parallel_growth_factor)
 			{
 				heap_parallel_workers++;
-				heap_parallel_threshold *= 3;
-				if (heap_parallel_threshold > INT_MAX / 3)
+				heap_parallel_threshold *= dbblue_parallel_growth_factor;
+				if (heap_parallel_threshold > (double) INT_MAX / dbblue_parallel_growth_factor)
 					break;		/* avoid overflow */
 			}
 
@@ -4844,15 +4852,15 @@ compute_parallel_worker(RelOptInfo *rel, double heap_pages, double index_pages,
 		if (index_pages >= 0)
 		{
 			int			index_parallel_workers = 1;
-			int			index_parallel_threshold;
+			double		index_parallel_threshold;
 
 			/* same calculation as for heap_pages above */
 			index_parallel_threshold = Max(min_parallel_index_scan_size, 1);
-			while (index_pages >= (BlockNumber) (index_parallel_threshold * 3))
+			while (index_pages >= index_parallel_threshold * dbblue_parallel_growth_factor)
 			{
 				index_parallel_workers++;
-				index_parallel_threshold *= 3;
-				if (index_parallel_threshold > INT_MAX / 3)
+				index_parallel_threshold *= dbblue_parallel_growth_factor;
+				if (index_parallel_threshold > (double) INT_MAX / dbblue_parallel_growth_factor)
 					break;		/* avoid overflow */
 			}
 

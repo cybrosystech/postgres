@@ -623,6 +623,16 @@
   assign_hook => 'assign_datestyle',
 },
 
+{ name => 'dbblue_parallel_growth_factor', type => 'real', context => 'PGC_USERSET', group => 'QUERY_TUNING_COST',
+  short_desc => 'Growth factor for the size-based parallel worker heuristic.',
+  long_desc => 'The planner adds one parallel worker each time the scanned relation grows by this factor beyond min_parallel_table_scan_size. Upstream PostgreSQL hardcodes 3; lower values ramp up workers faster on many-core hosts.',
+  flags => 'GUC_EXPLAIN',
+  variable => 'dbblue_parallel_growth_factor',
+  boot_val => '3.0',
+  min => '1.1',
+  max => '100.0',
+},
+
 # This is PGC_SUSET to prevent hiding from log_lock_waits.
 { name => 'deadlock_timeout', type => 'int', context => 'PGC_SUSET', group => 'LOCK_MANAGEMENT',
   short_desc => 'Sets the time to wait on a lock before checking for deadlock.',

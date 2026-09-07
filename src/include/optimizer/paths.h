@@ -26,6 +26,7 @@ extern PGDLLIMPORT int geqo_threshold;
 extern PGDLLIMPORT double min_eager_agg_group_size;
 extern PGDLLIMPORT int min_parallel_table_scan_size;
 extern PGDLLIMPORT int min_parallel_index_scan_size;
+extern PGDLLIMPORT double dbblue_parallel_growth_factor;
 extern PGDLLIMPORT bool enable_group_by_reordering;
 
 /* Hooks for plugins to get control in set_rel_pathlist() */
