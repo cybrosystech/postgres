@@ -675,7 +675,8 @@
 
 { name => 'dbblue_audit_require_write', type => 'bool', context => 'PGC_SUSET', group => 'CUSTOM_OPTIONS',
   short_desc => 'Rejects a change that cannot be written to the dedicated audit log.',
-  long_desc => 'The audit row is written in its own subtransaction, so a failure there (the log table dropped, its tablespace full) does not abort the statement being audited. On by default: a failure rejects the change, so no audited table can be modified without a record of it, and the write costs nothing extra. Turning it off keeps the application available by reporting the failure as a WARNING and letting the change proceed unaudited, but that mode needs a subtransaction per audited row, which overflows the backend subxid cache on bulk writes and slows visibility checks cluster-wide.',
+  long_desc => 'Decides what happens when the audit row cannot be written -- the log table dropped, its tablespace full, a constraint or trigger rejecting it. On (the default) lets the error through, so the statement being audited fails and no audited table can be modified without a record of it; this costs nothing extra. Off reports the failure as a WARNING and lets the change proceed unaudited, keeping the application available at the price of a gap in the trail. Only the off path needs a subtransaction per audited row to contain the error, and that overflows the backend subxid cache on bulk writes, which slows visibility checks cluster-wide; on uses no subtransaction at all.',
+  flags => 'GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE',
   variable => 'dbblue_audit_require_write',
   boot_val => 'true',
 },
@@ -691,7 +692,7 @@
 
 { name => 'dbblue_audit_tables', type => 'string', context => 'PGC_SUSET', group => 'CUSTOM_OPTIONS',
   short_desc => 'Specifies the table names for the audit purposes',
-  flags => 'GUC_LIST_INPUT | GUC_LIST_QUOTE',
+  flags => 'GUC_LIST_INPUT',
   variable => 'dbblue_audit_tables',
   boot_val => '""',
 },

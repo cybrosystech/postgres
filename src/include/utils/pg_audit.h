@@ -60,7 +60,8 @@ extern void  dbblue_audit_write(Relation rel,
 
 /* Check if a table is in the dbblue_audit_tables list */
 extern bool  dbblue_audit_table_is_tracked(Relation rel,
-                                           const char **schema_out);
+                                           const char **schema_out,
+                                           const char **name_out);
 
 
 /*
