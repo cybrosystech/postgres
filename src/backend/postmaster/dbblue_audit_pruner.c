@@ -288,7 +288,7 @@ AuditPrunerMain(Datum main_arg)
 		(void) WaitLatch(MyLatch,
 						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
 						 sleep_ms,
-						 WAIT_EVENT_PG_SLEEP);
+						 WAIT_EVENT_DBBLUE_AUDIT_PRUNER_MAIN);
 		ResetLatch(MyLatch);
 	}
 

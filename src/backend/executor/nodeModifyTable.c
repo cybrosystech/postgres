@@ -2631,7 +2631,8 @@ lreplace:
 static void
 ExecUpdateEpilogue(ModifyTableContext *context, UpdateContext *updateCxt,
 				   ResultRelInfo *resultRelInfo, ItemPointer tupleid,
-				   HeapTuple oldtuple, TupleTableSlot *slot)
+				   HeapTuple oldtuple, TupleTableSlot *oldSlot,
+				   TupleTableSlot *slot)
 {
 	ModifyTableState *mtstate = context->mtstate;
 	List	   *recheckIndexes = NIL;
@@ -2679,11 +2680,14 @@ ExecUpdateEpilogue(ModifyTableContext *context, UpdateContext *updateCxt,
 
 	/*
 	 * dbblue dedicated audit log: record this row's old/new image.  Runs
-	 * once per updated row, so every affected row is captured.  ri_oldTupleSlot
-	 * holds the pre-image the executor fetched before applying the update.
+	 * once per updated row, so every affected row is captured.  oldSlot is
+	 * the pre-image our caller worked from: ri_oldTupleSlot for a plain
+	 * UPDATE or MERGE, but ri_onConflict->oc_Existing for the UPDATE arm of
+	 * INSERT ... ON CONFLICT DO UPDATE, which never populates
+	 * ri_oldTupleSlot.  Reading ri_oldTupleSlot directly here would silently
+	 * skip every upsert.
 	 */
-	dbblue_audit_capture_update(resultRelInfo,
-								resultRelInfo->ri_oldTupleSlot, slot);
+	dbblue_audit_capture_update(resultRelInfo, oldSlot, slot);
 }
 
 /*
@@ -3034,7 +3038,7 @@ redo_act:
 		(estate->es_processed)++;
 
 	ExecUpdateEpilogue(context, &updateCxt, resultRelInfo, tupleid, oldtuple,
-					   slot);
+					   oldSlot, slot);
 
 	/* Process RETURNING if present */
 	if (resultRelInfo->ri_projectReturning)
@@ -3744,7 +3748,9 @@ lmerge_matched:
 				if (result == TM_Ok)
 				{
 					ExecUpdateEpilogue(context, &updateCxt, resultRelInfo,
-									   tupleid, NULL, newslot);
+									   tupleid, NULL,
+									   resultRelInfo->ri_oldTupleSlot,
+									   newslot);
 					mtstate->mt_merge_updated += 1;
 				}
 				break;

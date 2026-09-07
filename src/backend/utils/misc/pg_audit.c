@@ -2,6 +2,8 @@
 #include "access/htup_details.h"
 #include "access/tableam.h"
 #include "access/xact.h"
+#include "catalog/partition.h"
+#include "commands/trigger.h"   /* SessionReplicationRole */
 #include "catalog/pg_authid.h"
 #include "catalog/pg_type.h"
 #include "executor/executor.h"
@@ -1032,6 +1034,19 @@ dbblue_audit_active(int op)
        return false;
    if (!dbblue_audit_enabled)
        return false;
+
+   /*
+    * session_replication_role = replica marks DML that is data movement
+    * rather than user activity: a replication apply worker, a bulk reload,
+    * or dbblue_partition's batch migration, which sets it precisely so the
+    * migrated rows are not treated as new data.  Auditing those would bury
+    * the real trail -- converting one Odoo table writes an audit row per
+    * existing row -- and would record a migration as though a user had
+    * typed it.  Setting this role is superuser-only, and a superuser can
+    * already turn auditing off outright, so skipping here weakens nothing.
+    */
+   if (SessionReplicationRole == SESSION_REPLICATION_ROLE_REPLICA)
+       return false;
    if (dbblue_audit_tables == NULL || dbblue_audit_tables[0] == '\0')
        return false;
    if (!dbblue_audit_operation_is_tracked(op))
@@ -1048,31 +1063,72 @@ dbblue_audit_active(int op)
 * Always returns false for the audit log table itself to prevent
 * recursive audit logging.
 * ---------------------------------------------------------------- */
+/*
+* Match one relation name against the parsed dbblue_audit_tables list.
+*
+* schema_inout caches the namespace name so a configuration written with
+* bare names never pays for the lookup: only a schema-qualified entry
+* needs it.
+*/
+static bool
+audit_match_name(List *elemlist, Oid nspoid, const char *table_name,
+                 const char **schema_inout)
+{
+   ListCell   *lc;
+
+   foreach(lc, elemlist)
+   {
+      const char *item = (const char *) lfirst(lc);
+      const char *dot = strchr(item, '.');
+
+      if (dot != NULL)
+      {
+         size_t      slen = (size_t) (dot - item);
+
+         if (*schema_inout == NULL)
+            *schema_inout = get_namespace_name(nspoid);
+
+         if (*schema_inout != NULL &&
+             strlen(*schema_inout) == slen &&
+             strncmp(item, *schema_inout, slen) == 0 &&
+             strcmp(dot + 1, table_name) == 0)
+            return true;
+      }
+      else if (strcmp(item, table_name) == 0)
+         return true;
+   }
+
+   return false;
+}
+
+
 bool
-dbblue_audit_table_is_tracked(Relation rel, const char **schema_out)
+dbblue_audit_table_is_tracked(Relation rel, const char **schema_out,
+                              const char **name_out)
 {
    const char *table_name = RelationGetRelationName(rel);
    const char *schema_name = NULL;     /* resolved only if actually needed */
+   const char *matched_name = NULL;
+   Oid         matched_nsp = InvalidOid;
    char       *rawstring;
    List       *elemlist;
-   ListCell   *lc;
    bool        tracked = false;
 
    if (!dbblue_audit_enabled)
-       return false;
+      return false;
    if (dbblue_audit_tables == NULL || dbblue_audit_tables[0] == '\0')
-       return false;
+      return false;
 
    /* Never audit the audit table itself */
    if (strcmp(table_name, "dbblue_audit_log") == 0)
-       return false;
+      return false;
 
    rawstring = pstrdup(dbblue_audit_tables);
    if (!SplitIdentifierString(rawstring, ',', &elemlist))
    {
-       pfree(rawstring);
-       list_free(elemlist);
-       return false;
+      pfree(rawstring);
+      list_free(elemlist);
+      return false;
    }
 
    /*
@@ -1081,48 +1137,70 @@ dbblue_audit_table_is_tracked(Relation rel, const char **schema_out)
     * matches the table in any schema, which is what entries written before
     * schema support meant, so existing configurations keep working.
     */
-   foreach(lc, elemlist)
+   if (audit_match_name(elemlist, RelationGetNamespace(rel), table_name,
+                        &schema_name))
    {
-       const char *item = (const char *) lfirst(lc);
-       const char *dot = strchr(item, '.');
+      tracked = true;
+      matched_name = table_name;
+      matched_nsp = RelationGetNamespace(rel);
+   }
+   else if (rel->rd_rel->relispartition)
+   {
+      /*
+       * A partition is audited when any ancestor is listed.  Without this,
+       * partitioning an audited table silently stops auditing it: DML is
+       * routed to the leaf, whose name is not the one that was configured.
+       * dbblue_partition does exactly that -- it renames the original away
+       * and creates the partitioned parent under the original name -- so a
+       * conversion would otherwise disable the audit trail on the busiest
+       * tables, with no error and no warning.
+       *
+       * The row is recorded under the matched ancestor's name rather than
+       * the leaf's, so the trail stays continuous across a conversion and
+       * queries written against the configured name keep working.  Only a
+       * partition reaches this path, so an ordinary table pays nothing.
+       */
+      List       *ancestors = get_partition_ancestors(RelationGetRelid(rel));
+      ListCell   *alc;
 
-       if (dot != NULL)
-       {
-           size_t      slen = (size_t) (dot - item);
+      foreach(alc, ancestors)
+      {
+         Oid         aoid = lfirst_oid(alc);
+         char       *aname = get_rel_name(aoid);
+         const char *aschema = NULL;
 
-           /*
-            * Only a schema-qualified entry needs the namespace, and
-            * resolving it costs a syscache lookup plus a palloc.  Defer it
-            * until one is actually seen, so a configuration written with
-            * bare names never pays for it.
-            */
-           if (schema_name == NULL)
-               schema_name = get_namespace_name(RelationGetNamespace(rel));
+         if (aname == NULL)
+            continue;         /* ancestor dropped concurrently */
 
-           if (schema_name != NULL &&
-               strlen(schema_name) == slen &&
-               strncmp(item, schema_name, slen) == 0 &&
-               strcmp(dot + 1, table_name) == 0)
-           {
-               tracked = true;
-               break;
-           }
-       }
-       else if (strcmp(item, table_name) == 0)
-       {
-           tracked = true;
-           break;
-       }
+         if (audit_match_name(elemlist, get_rel_namespace(aoid), aname,
+                              &aschema))
+         {
+            tracked = true;
+            matched_name = aname;
+            matched_nsp = get_rel_namespace(aoid);
+            schema_name = aschema;
+            break;
+         }
+
+         pfree(aname);
+      }
+
+      list_free(ancestors);
    }
 
    pfree(rawstring);
    list_free(elemlist);
 
-   if (tracked && schema_out != NULL)
+   if (tracked)
    {
-       if (schema_name == NULL)
-           schema_name = get_namespace_name(RelationGetNamespace(rel));
-       *schema_out = schema_name;
+      if (schema_out != NULL)
+      {
+         if (schema_name == NULL)
+            schema_name = get_namespace_name(matched_nsp);
+         *schema_out = schema_name;
+      }
+      if (name_out != NULL)
+         *name_out = matched_name;
    }
    return tracked;
 }
@@ -1148,7 +1226,6 @@ typedef struct AuditExcludeEntry
    char       *schema;         /* NULL when the entry is unqualified */
    char       *table;          /* "*" matches every audited table */
    char       *column;
-   bool        matched;        /* has it ever redacted anything */
    bool        validated;      /* has its column been checked to exist */
 } AuditExcludeEntry;
 
@@ -1353,7 +1430,6 @@ dbblue_audit_column_is_excluded(const char *schema_name,
        if (strcmp(e->table, "*") != 0 && strcmp(e->table, table_name) != 0)
            continue;
 
-       e->matched = true;
        return true;
    }
 
@@ -1795,7 +1871,6 @@ dbblue_audit_write(Relation rel,
    AuditPriv   priv;
    MemoryContext oldcxt;
    ResourceOwner oldowner;
-   volatile bool wrote = false;
    Bitmapset  *keepcols = NULL;
    HeapTuple   counterpart_old = NULL;
    HeapTuple   counterpart_new = NULL;
@@ -1925,7 +2000,6 @@ dbblue_audit_write(Relation rel,
        ReleaseCurrentSubTransaction();
        MemoryContextSwitchTo(oldcxt);
        CurrentResourceOwner = oldowner;
-       wrote = true;
    }
    PG_CATCH();
    {
@@ -1970,8 +2044,6 @@ dbblue_audit_write(Relation rel,
        FreeErrorData(edata);
    }
    PG_END_TRY();
-
-   (void) wrote;
 }
 /* ----------------------------------------------------------------
 * dbblue_audit_capture_update
@@ -2006,9 +2078,8 @@ dbblue_audit_capture_update(ResultRelInfo *rri,
 
 
    rel = rri->ri_RelationDesc;
-   if (!dbblue_audit_table_is_tracked(rel, &nspname))
+   if (!dbblue_audit_table_is_tracked(rel, &nspname, &relname))
        return;
-   relname = RelationGetRelationName(rel);
 
 
    tupdesc = RelationGetDescr(rel);
@@ -2060,9 +2131,8 @@ dbblue_audit_capture_delete(ResultRelInfo *rri,
 
 
    rel = rri->ri_RelationDesc;
-   if (!dbblue_audit_table_is_tracked(rel, &nspname))
+   if (!dbblue_audit_table_is_tracked(rel, &nspname, &relname))
        return;
-   relname = RelationGetRelationName(rel);
 
 
    tupdesc = RelationGetDescr(rel);
@@ -2128,9 +2198,8 @@ dbblue_audit_capture_insert(ResultRelInfo *rri, TupleTableSlot *newslot)
 
 
    rel = rri->ri_RelationDesc;
-   if (!dbblue_audit_table_is_tracked(rel, &nspname))
+   if (!dbblue_audit_table_is_tracked(rel, &nspname, &relname))
        return;
-   relname = RelationGetRelationName(rel);
 
 
    tupdesc = RelationGetDescr(rel);
