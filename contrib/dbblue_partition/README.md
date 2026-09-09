@@ -25,13 +25,10 @@ data move, retention, background maintenance) is delegated to pg_partman.
 
 | Call | Purpose |
 |---|---|
-| `CALL dbblue_partition_model(model, control, interval, schema, premake, batch_interval, single_transaction, analyze, odoo_compat)` | Convert a table. Only the first argument is required; defaults are `create_date`, `1 month`, `public`, 4 premade partitions. Finishes by configuring the Odoo compatibility view for the database owner (opt out with `p_odoo_compat => false`). |
+| `CALL dbblue_partition_model(model, control, interval, schema, premake, batch_interval, single_transaction, analyze)` | Convert a table. Only the first argument is required; defaults are `create_date`, `1 month`, `public`, 4 premade partitions. |
 | `SELECT * FROM dbblue_partition_status([model])` | Progress/inspection: state, rows moved, partition count, DEFAULT-partition rows, backup state. Never throws for dropped objects. |
 | `SELECT dbblue_partition_drop_backup(model)` | Drop `<table>_old` once the conversion is complete and the backup is empty (`p_force => true` overrides). |
 | `CALL dbblue_partition_undo(model)` | Restore the original plain table while the backup still exists. Single transaction, atomic. |
-| `SELECT dbblue_partition_odoo_compat(role)` | Make an unmodified Odoo accept partitioned model tables: per-role catalog-shadowing view (see trade-off 6). |
-| `SELECT dbblue_partition_odoo_compat_remove(role)` | Undo the above. Pass the role, or the role keeps a search_path pointing at the dropped schema. |
-| `SELECT * FROM dbblue_partition_odoo_compat_check()` | Is the Odoo compatibility layer actually in effect? Run it after every restore (see below). |
 
 `model` accepts an Odoo model name (`'sale.order'`) or a table name
 (`'sale_order'`, `'Part Case'` — case and spaces preserved).
@@ -127,50 +124,14 @@ them here.
    column must stay NOT NULL as part of the PK.  The catalog is never
    falsified — the statement is declined, not faked.
 
-6. **Odoo ORM recognition** — solved database-side, no Odoo change needed.
-   Odoo's schema introspection reads relkind from the *unqualified* name
-   `pg_class` and only accepts `'r'`, so a partitioned model table looks
-   missing and module updates try to `CREATE TABLE` over it.  relkind can
-   never be faked in the real catalog (the planner, pg_dump and pg_partman
-   branch on it), but it can be translated for Odoo's eyes only:
-
-   `dbblue_partition_model()` configures this automatically at the end of
-   every conversion, targeting the database owner (an Odoo database is
-   always owned by the Odoo db_user) — restart Odoo afterwards so its
-   connections pick it up.  It can also be run by hand for another role:
-
-   ```sql
-   SELECT dbblue_partition_odoo_compat('odoo_role');   -- then restart Odoo
-   ```
-
-   Either way it creates a `dbblue_compat.pg_class` view reporting `'r'` for tables
-   range-partitioned on a single `create_date` column, and sets that
-   role's search_path to `"$user", public, dbblue_compat, pg_catalog` in
-   the current database.  Because `pg_catalog` is listed explicitly, the
-   view shadows the catalog for that role only — the planner, pg_dump,
-   psql `\d` and pg_partman (whose functions pin their own search_path)
-   all keep seeing the truth.  `dbblue_partition_odoo_compat_remove(role)`
-   undoes it — pass the role, or it keeps a search_path pointing at the
-   dropped schema.
-
-   **Re-apply it after any restore.**  The view is an ordinary object that
-   `pg_dump` carries, but the per-role search_path lives in
-   `pg_db_role_setting`, which plain `pg_dump` does not carry — and it is
-   keyed by database *name*, so it does not apply to a restore under a
-   different name either.  A restored Odoo database keeps its partitions
-   but loses the illusion, and module updates start failing again with
-   *relation already exists*.  Diagnose and fix with:
-
-   ```sql
-   SELECT * FROM dbblue_partition_odoo_compat_check();  -- verdict says what to run
-   ```
-
-   One consequence to be aware of: listing `pg_catalog` explicitly is what
-   allows the view to shadow the catalog, and it necessarily places
-   `pg_catalog` *after* `public` for that role.  Anything in `public`
-   sharing a name with a builtin function, operator or type would then win
-   name resolution there; both compat functions report such objects when
-   they find any.
+6. **Odoo ORM recognition** — no longer a trade-off.  Older Odoo releases
+   read relkind from `pg_class` and only accepted `'r'`, so a partitioned
+   model table looked missing and module updates tried to `CREATE TABLE`
+   over it.  Odoo's schema introspection now understands `relkind = 'p'`
+   natively, so a table converted by this extension is simply reported as
+   the partitioned table it is — nothing needs to be translated or masked
+   for Odoo's benefit, and no catalog-shadowing layer exists in this
+   extension any more.
 
 ## Known small print
 
@@ -235,13 +196,12 @@ updated.
   table, the helper functions and `dbblue_partition_drop_backup()`, which
   have not changed since.  Like every released version script it is
   immutable: fixes go into a new update script, never here.
-- `dbblue_partition--1.0--1.1.sql`, `--1.1--1.2.sql`, `--1.2--1.3.sql` —
-  update scripts.  **The newest one is authoritative** for anything it
-  redefines: `--1.2--1.3.sql` currently holds `dbblue_partition_convert()`,
-  `_model()`, `_status()`, `_undo()`, the Odoo compatibility functions and
-  `_odoo_compat_check()`.  A fresh `CREATE EXTENSION` runs the whole chain,
-  so both a new install and an upgrade end on identical definitions; after
-  changing a version script, confirm that with
+- `dbblue_partition--1.0--1.1.sql`, `--1.1--1.2.sql`, `--1.2--1.3.sql`,
+  `--1.3--1.4.sql` — pre-release upgrade scripts, not part of the active
+  install path: `default_version` in `dbblue_partition.control` stays at
+  `1.0`, so `CREATE EXTENSION`/`ALTER EXTENSION ... UPDATE` never reads
+  them.  A fresh install runs only `dbblue_partition--1.0.sql`; after
+  changing that script, confirm the deployed definitions match with
 
   ```sql
   -- in two databases, then diff the output
