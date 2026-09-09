@@ -53,10 +53,47 @@
 #include "dbblue_columnar.h"
 
 /* shared control: memory accounting for the whole column store */
+/*
+ * One database's share of the column store. dboid == InvalidOid marks a free
+ * slot; a slot is returned to the pool when its last byte is released, so
+ * DBBC_MAX_DATABASES bounds the number of databases holding a store at once,
+ * not the number of databases in the cluster.
+ */
+typedef struct DbbcDbAccount
+{
+	Oid			dboid;
+	int64		bytes_used;
+
+	/*
+	 * Per-database denial counters. These belong HERE, not in DbbcControl: a
+	 * cluster-wide counter would show one tenant the denials caused by
+	 * another, which in a feature whose whole point is per-tenant isolation
+	 * is precisely the wrong answer - an operator would raise the quota of a
+	 * database that never hit it.
+	 */
+	int64		denials_db_quota;
+	int64		denials_cluster;
+} DbbcDbAccount;
+
 typedef struct DbbcControl
 {
 	LWLock		lck;
-	int64		bytes_used;
+	int64		bytes_used;		/* cluster total across all databases */
+
+	/*
+	 * Reservations refused, split by which limit said no, so an operator can
+	 * tell "this tenant hit its own quota" (raise database_memory_mb) from
+	 * "the server is full" (raise memory_mb) from "too many databases are
+	 * using the store at once" (raise DBBC_MAX_DATABASES and rebuild).
+	 */
+	/*
+	 * Only the no-slot denial is cluster-scoped: by definition it happens
+	 * when no per-database account could be claimed, so there is nothing to
+	 * charge it to. The other two live in DbbcDbAccount.
+	 */
+	int64		denials_no_slot;
+
+	DbbcDbAccount db[DBBC_MAX_DATABASES];
 } DbbcControl;
 
 static DbbcControl *dbbc_control = NULL;
@@ -100,7 +137,43 @@ typedef struct DbbcColBuild
 
 static void dbbc_init_control(void *ptr, void *arg);
 static bool dbbc_try_reserve(Size nbytes);
-static void dbbc_release_bytes(int64 nbytes);
+static void dbbc_release_bytes(int64 nbytes, Oid dboid);
+static DbbcDbAccount *dbbc_db_account(Oid dboid, bool create);
+
+/*
+ * Which limit refused the most recent dbbc_try_reserve, so the NOTICE the
+ * populate emits can name the limit the operator actually has to change.
+ * Backend-local and read immediately after the failing call.
+ */
+typedef enum DbbcDenial
+{
+	DBBC_DENIAL_NONE = 0,
+	DBBC_DENIAL_DB_QUOTA,		/* dbblue_columnar.database_memory_mb */
+	DBBC_DENIAL_CLUSTER,		/* dbblue_columnar.memory_mb */
+	DBBC_DENIAL_NO_SLOT,		/* DBBC_MAX_DATABASES */
+} DbbcDenial;
+
+static DbbcDenial dbbc_last_denial = DBBC_DENIAL_NONE;
+
+/* the limit that refused the last reservation, for error messages */
+static const char *
+dbbc_denial_detail(void)
+{
+	switch (dbbc_last_denial)
+	{
+		case DBBC_DENIAL_DB_QUOTA:
+			return psprintf("this database's dbblue_columnar.database_memory_mb quota (%d MB) is full",
+							dbblue_columnar_database_memory_mb);
+		case DBBC_DENIAL_CLUSTER:
+			return psprintf("the server-wide dbblue_columnar.memory_mb budget (%d MB) is full",
+							dbblue_columnar_memory_mb);
+		case DBBC_DENIAL_NO_SLOT:
+			return psprintf("all %d per-database store slots are in use",
+							DBBC_MAX_DATABASES);
+		default:
+			return "the memory budget is full";
+	}
+}
 static int	dbbc_registered_attnums(Oid relid, int16 **attnums_out);
 static void dbbc_version_free(DbbcRelVersion *version);
 static dsa_pointer dbbc_copy_to_dsa(const void *src, Size len, Size *acct);
@@ -147,6 +220,8 @@ dbbc_init_control(void *ptr, void *arg)
 
 	LWLockInitialize(&control->lck, LWLockNewTrancheId("dbblue_columnar"));
 	control->bytes_used = 0;
+	control->denials_no_slot = 0;
+	memset(control->db, 0, sizeof(control->db));	/* InvalidOid == 0 */
 }
 
 dsa_area *
@@ -163,6 +238,22 @@ dbbc_store_hash(void)
 	return dbbc_hash;
 }
 
+/* bytes charged to one database's account (0 if it holds no store) */
+int64
+dbbc_store_db_bytes_used(Oid dboid)
+{
+	DbbcDbAccount *acct;
+	int64		result = 0;
+
+	dbbc_store_attach();
+	LWLockAcquire(&dbbc_control->lck, LW_SHARED);
+	acct = dbbc_db_account(dboid, false);
+	if (acct != NULL)
+		result = acct->bytes_used;
+	LWLockRelease(&dbbc_control->lck);
+	return result;
+}
+
 int64
 dbbc_store_bytes_used(void)
 {
@@ -176,29 +267,139 @@ dbbc_store_bytes_used(void)
 }
 
 /*
- * Reserve nbytes against the dbblue_columnar.memory_mb budget; false if the
- * budget would be exceeded (caller stops building, never errors).
+ * Find this database's account, claiming a free slot if it has none yet.
+ * Caller must hold dbbc_control->lck. Returns NULL when every slot is taken
+ * by another database.
+ */
+static DbbcDbAccount *
+dbbc_db_account(Oid dboid, bool create)
+{
+	DbbcDbAccount *freeslot = NULL;
+	DbbcDbAccount *idle = NULL;
+	int			i;
+
+	for (i = 0; i < DBBC_MAX_DATABASES; i++)
+	{
+		DbbcDbAccount *a = &dbbc_control->db[i];
+
+		if (a->dboid == dboid)
+			return a;
+		if (freeslot == NULL && !OidIsValid(a->dboid))
+			freeslot = a;
+		/*
+		 * A database that holds no bytes right now. Its slot is reusable,
+		 * but only as a LAST resort: keeping it lets its denial counters
+		 * survive a drop-and-repopulate, which is exactly the window in
+		 * which an operator is trying to work out why the store stopped
+		 * growing.
+		 */
+		else if (idle == NULL && a->bytes_used == 0)
+			idle = a;
+	}
+	if (!create)
+		return NULL;
+	if (freeslot == NULL)
+		freeslot = idle;
+	if (freeslot == NULL)
+		return NULL;
+
+	freeslot->dboid = dboid;
+	freeslot->bytes_used = 0;
+	freeslot->denials_db_quota = 0;
+	freeslot->denials_cluster = 0;
+	return freeslot;
+}
+
+/*
+ * Reserve nbytes for MyDatabaseId's store. False if either limit would be
+ * exceeded (the caller stops building; this is never an error, the store is a
+ * cache).
+ *
+ * TWO limits, deliberately:
+ *   dbblue_columnar.memory_mb          - the CLUSTER ceiling, what the server
+ *                                        can afford in total.
+ *   dbblue_columnar.database_memory_mb - this database's own quota (0 = none).
+ *
+ * The per-database quota is the point of the split. With a single cluster
+ * counter, whichever database populated first took whatever it wanted and
+ * every other database on the server silently got a degraded store - so
+ * tuning the engine for one tenant was not isolated from the rest, and the
+ * only symptom was other tenants' scans quietly falling back to heap.
  */
 static bool
 dbbc_try_reserve(Size nbytes)
 {
-	int64		budget = (int64) dbblue_columnar_memory_mb * 1024 * 1024;
-	bool		ok;
+	int64		cluster_budget = (int64) dbblue_columnar_memory_mb * 1024 * 1024;
+	int64		db_budget = (int64) dbblue_columnar_database_memory_mb * 1024 * 1024;
+	DbbcDbAccount *acct;
+	bool		ok = false;
 
 	LWLockAcquire(&dbbc_control->lck, LW_EXCLUSIVE);
-	ok = (dbbc_control->bytes_used + (int64) nbytes <= budget);
+
+	acct = dbbc_db_account(MyDatabaseId, true);
+	if (acct == NULL)
+	{
+		dbbc_control->denials_no_slot++;
+		dbbc_last_denial = DBBC_DENIAL_NO_SLOT;
+		LWLockRelease(&dbbc_control->lck);
+		return false;
+	}
+
+	if (dbbc_control->bytes_used + (int64) nbytes > cluster_budget)
+	{
+		acct->denials_cluster++;
+		dbbc_last_denial = DBBC_DENIAL_CLUSTER;
+	}
+	else if (db_budget > 0 && acct->bytes_used + (int64) nbytes > db_budget)
+	{
+		acct->denials_db_quota++;
+		dbbc_last_denial = DBBC_DENIAL_DB_QUOTA;
+	}
+	else
+	{
+		ok = true;
+		dbbc_last_denial = DBBC_DENIAL_NONE;
+	}
+
 	if (ok)
+	{
 		dbbc_control->bytes_used += (int64) nbytes;
+		acct->bytes_used += (int64) nbytes;
+	}
+
 	LWLockRelease(&dbbc_control->lck);
 	return ok;
 }
 
+/*
+ * Release nbytes previously reserved by database `dboid`.
+ *
+ * The owning database is passed in rather than read from MyDatabaseId: the
+ * release must land on the account that was charged, or a tenant's quota
+ * would drift upward until it could never build again.
+ */
 static void
-dbbc_release_bytes(int64 nbytes)
+dbbc_release_bytes(int64 nbytes, Oid dboid)
 {
+	DbbcDbAccount *acct;
+
 	LWLockAcquire(&dbbc_control->lck, LW_EXCLUSIVE);
+
 	dbbc_control->bytes_used -= nbytes;
 	Assert(dbbc_control->bytes_used >= 0);
+
+	acct = dbbc_db_account(dboid, false);
+	if (acct != NULL)
+	{
+		acct->bytes_used -= nbytes;
+		Assert(acct->bytes_used >= 0);
+		/*
+		 * The slot is deliberately NOT released at zero bytes; it is reused
+		 * on demand by dbbc_db_account so the denial counters outlive a
+		 * dropped store.
+		 */
+	}
+
 	LWLockRelease(&dbbc_control->lck);
 }
 
@@ -405,7 +606,7 @@ dbbc_chunk_fetch_minmax(DbbcColumnChunk *chunk, dsa_pointer ptr)
  * (dbbc_block_ref), so the block outlives every version that points at it.
  */
 static void
-dbbc_block_unref(dsa_pointer blockptr, int ncols)
+dbbc_block_unref(dsa_pointer blockptr, int ncols, Oid dboid)
 {
 	DbbcBlock  *block = (DbbcBlock *) dsa_get_address(dbbc_dsa, blockptr);
 	DbbcColumnChunk *chunks;
@@ -439,7 +640,7 @@ dbbc_block_unref(dsa_pointer blockptr, int ncols)
 	}
 
 	/* release this block's whole reservation exactly once, at physical free */
-	dbbc_release_bytes((int64) block->block_bytes);
+	dbbc_release_bytes((int64) block->block_bytes, dboid);
 	dsa_free(dbbc_dsa, blockptr);
 }
 
@@ -660,7 +861,7 @@ dbbc_version_free(DbbcRelVersion *version)
 		for (i = 0; i < version->ndirslots; i++)
 		{
 			if (DsaPointerIsValid(dir[i]))
-				dbbc_block_unref(dir[i], version->ncols);
+				dbbc_block_unref(dir[i], version->ncols, version->dboid);
 		}
 		dsa_free(dbbc_dsa, version->blockdir);
 	}
@@ -675,7 +876,7 @@ dbbc_version_free(DbbcRelVersion *version)
 	 * the version struct). Block bytes are released per block in
 	 * dbbc_block_unref, so shared blocks are accounted exactly once.
 	 */
-	dbbc_release_bytes((int64) meta);
+	dbbc_release_bytes((int64) meta, version->dboid);
 }
 
 /*
@@ -1511,8 +1712,9 @@ dbbc_populate_relation(Oid relid)
 				budget_hit = true;
 				MemoryContextSwitchTo(oldcxt);
 				ereport(NOTICE,
-						(errmsg("dbblue_columnar: memory budget (%d MB) reached after %d blocks",
-								dbblue_columnar_memory_mb, blocks_built)));
+						(errmsg("dbblue_columnar: memory budget reached after %d blocks",
+								blocks_built),
+						 errdetail("%s", dbbc_denial_detail())));
 				break;
 			}
 			inflight_bytes = block_total;
@@ -1637,18 +1839,19 @@ dbbc_populate_relation(Oid relid)
 						 * still carries block_bytes == block_total, so unref
 						 * releases exactly the reservation we hold.
 						 */
-						dbbc_block_unref(blockptr, ncols);
+						dbbc_block_unref(blockptr, ncols, MyDatabaseId);
 						newdir[slot] = InvalidDsaPointer;
 						budget_hit = true;
 						MemoryContextSwitchTo(oldcxt);
 						ereport(NOTICE,
-								(errmsg("dbblue_columnar: memory budget (%d MB) reached after %d blocks",
-										dbblue_columnar_memory_mb, blocks_built)));
+								(errmsg("dbblue_columnar: memory budget reached after %d blocks",
+										blocks_built),
+								 errdetail("%s", dbbc_denial_detail())));
 						break;
 					}
 				}
 				else if (acct < block_total)
-					dbbc_release_bytes((int64) (block_total - acct));
+					dbbc_release_bytes((int64) (block_total - acct), MyDatabaseId);
 
 				block->block_bytes = acct;	/* exact; released once at unref */
 				blocks_built++;
@@ -1700,6 +1903,7 @@ dbbc_populate_relation(Oid relid)
 			version->magic = DBBC_VERSION_MAGIC;
 			pg_atomic_init_u32(&version->pins, 1);	/* the entry's own pin */
 			version->self = version_dsa;
+			version->dboid = MyDatabaseId;	/* the account to refund on free */
 			version->ncols = ncols;
 			version->attnums = attnums_dsa;
 			version->ndirslots = ndirslots;
@@ -1765,7 +1969,7 @@ dbbc_populate_relation(Oid relid)
 			for (ci = 0; ci < ndirslots; ci++)
 			{
 				if (DsaPointerIsValid(newdir[ci]))
-					dbbc_block_unref(newdir[ci], ncols);
+					dbbc_block_unref(newdir[ci], ncols, MyDatabaseId);
 			}
 			if (DsaPointerIsValid(attnums_dsa))
 				dsa_free(dbbc_dsa, attnums_dsa);
@@ -1773,7 +1977,7 @@ dbbc_populate_relation(Oid relid)
 				dsa_free(dbbc_dsa, blockdir_dsa);
 			if (DsaPointerIsValid(version_dsa))
 				dsa_free(dbbc_dsa, version_dsa);
-			dbbc_release_bytes((int64) (inflight_bytes + meta_resv));
+			dbbc_release_bytes((int64) (inflight_bytes + meta_resv), MyDatabaseId);
 		}
 		PG_RE_THROW();
 	}
@@ -2073,6 +2277,71 @@ dbblue_columnar_memory(PG_FUNCTION_ARGS)
 	values[0] = Int32GetDatum(dbblue_columnar_memory_mb);
 	values[1] = Int64GetDatum(dbbc_store_bytes_used());
 	values[2] = Int64GetDatum((int64) dsa_get_total_size(dbbc_dsa));
+
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
+/*
+ * dbblue_columnar_database_memory()
+ *		-> (database_quota_mb, database_used_bytes, cluster_budget_mb,
+ *		    cluster_used_bytes, denials_db_quota, denials_cluster,
+ *		    denials_no_slot, databases_tracked, max_databases)
+ *
+ * The per-database view of the budget. dbblue_columnar_memory() reports the
+ * cluster totals; this reports THIS database's share plus the three denial
+ * counters, which is what distinguishes the three reasons a store stops
+ * growing:
+ *
+ *   denials_db_quota  - this database hit dbblue_columnar.database_memory_mb.
+ *                       Raise that (per database) if this tenant needs more.
+ *   denials_cluster   - the server-wide dbblue_columnar.memory_mb is full.
+ *                       Some database has to give something up.
+ *   denials_no_slot   - more than DBBC_MAX_DATABASES databases are holding a
+ *                       store at once. Needs a rebuild with a larger ceiling.
+ *
+ * Without this split, a tenant whose store stopped building looked identical
+ * whether the cause was its own quota or another tenant's consumption - and
+ * those have opposite fixes.
+ */
+PG_FUNCTION_INFO_V1(dbblue_columnar_database_memory);
+
+Datum
+dbblue_columnar_database_memory(PG_FUNCTION_ARGS)
+{
+	TupleDesc	tupdesc;
+	Datum		values[9];
+	bool		nulls[9];
+	int			tracked = 0;
+	int			i;
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+
+	memset(nulls, false, sizeof(nulls));
+	dbbc_store_attach();
+
+	LWLockAcquire(&dbbc_control->lck, LW_SHARED);
+	for (i = 0; i < DBBC_MAX_DATABASES; i++)
+	{
+		if (OidIsValid(dbbc_control->db[i].dboid) &&
+			dbbc_control->db[i].bytes_used > 0)
+			tracked++;
+	}
+	{
+		DbbcDbAccount *self = dbbc_db_account(MyDatabaseId, false);
+
+		values[4] = Int64GetDatum(self ? self->denials_db_quota : 0);
+		values[5] = Int64GetDatum(self ? self->denials_cluster : 0);
+	}
+	values[6] = Int64GetDatum(dbbc_control->denials_no_slot);
+	LWLockRelease(&dbbc_control->lck);
+
+	values[0] = Int32GetDatum(dbblue_columnar_database_memory_mb);
+	values[1] = Int64GetDatum(dbbc_store_db_bytes_used(MyDatabaseId));
+	values[2] = Int32GetDatum(dbblue_columnar_memory_mb);
+	values[3] = Int64GetDatum(dbbc_store_bytes_used());
+	values[7] = Int32GetDatum(tracked);
+	values[8] = Int32GetDatum(DBBC_MAX_DATABASES);
 
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }

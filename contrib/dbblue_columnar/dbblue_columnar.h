@@ -62,6 +62,19 @@
 /* heap pages per columnar block */
 #define DBBC_PAGES_PER_BLOCK	32
 
+/*
+ * How many databases can hold a column store at once.
+ *
+ * The store is a single cluster-wide DSA shared by every database, but its
+ * memory must be accounted PER DATABASE: without that, one database's store
+ * consumes budget that another database's store then cannot get, so tuning the
+ * engine for one tenant silently degrades every other tenant on the same
+ * server. Each database that builds a store claims one of these slots; a slot
+ * is released when its last byte is freed, so slots are recycled and this is a
+ * ceiling on CONCURRENT store-holding databases, not on databases per cluster.
+ */
+#define DBBC_MAX_DATABASES	64
+
 /* offset sentinel for NULL rows in varlena chunks */
 #define DBBC_VAR_NULL_OFFSET	PG_UINT32_MAX
 
@@ -225,6 +238,18 @@ typedef struct DbbcRelVersion
 	uint32		magic;			/* DBBC_VERSION_MAGIC live / POISON freed */
 	pg_atomic_uint32 pins;		/* 1 while current + 1 per active reader */
 	dsa_pointer self;			/* this struct's own dsa_pointer */
+
+	/*
+	 * The database this version's relation belongs to. Carried explicitly so
+	 * the free path charges the byte release back to the SAME per-database
+	 * account that reserved it, rather than to whichever backend happens to
+	 * drop the final pin. Today only same-database backends can pin a version
+	 * (lookups are keyed on MyDatabaseId), so MyDatabaseId would coincide -
+	 * but a future cross-database sweeper would silently corrupt the
+	 * accounting, and a wrong quota is worse than a wrong number: it would
+	 * refuse a tenant's builds forever.
+	 */
+	Oid			dboid;
 	int			ncols;
 	dsa_pointer attnums;		/* int16[ncols], ascending */
 	uint32		ndirslots;		/* directory length */
@@ -370,6 +395,7 @@ typedef struct DbbcSuggControl
 extern bool dbblue_columnar_enabled;
 extern bool dbblue_columnar_enable_columnar_scan;
 extern int	dbblue_columnar_memory_mb;
+extern int	dbblue_columnar_database_memory_mb;
 extern bool dbblue_columnar_log_coverage_misses;
 extern bool dbblue_columnar_enable_restamp;
 extern bool dbblue_columnar_enable_dimjoin_agg;
@@ -384,6 +410,7 @@ extern void dbbc_store_attach(void);
 extern dsa_area *dbbc_store_dsa(void);
 extern dshash_table *dbbc_store_hash(void);
 extern int64 dbbc_store_bytes_used(void);
+extern int64 dbbc_store_db_bytes_used(Oid dboid);
 extern char *dbbc_registry_table_name(void);
 extern DbbcRelVersion *dbbc_version_pin(Oid reloid);
 extern void dbbc_version_unpin(DbbcRelVersion *version);

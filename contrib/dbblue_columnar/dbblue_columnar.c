@@ -53,6 +53,7 @@ PG_MODULE_MAGIC;
 bool		dbblue_columnar_enabled = false;
 bool		dbblue_columnar_enable_columnar_scan = true;
 int			dbblue_columnar_memory_mb = 128;
+int			dbblue_columnar_database_memory_mb = 0;
 bool		dbblue_columnar_log_coverage_misses = true;
 bool		dbblue_columnar_enable_restamp = true;
 bool		dbblue_columnar_enable_dimjoin_agg = false;
@@ -452,7 +453,7 @@ _PG_init(void)
 							 NULL,
 							 &dbblue_columnar_enabled,
 							 false,
-							 PGC_POSTMASTER,
+							 PGC_SUSET,
 							 0,
 							 NULL, NULL, NULL);
 
@@ -471,9 +472,25 @@ _PG_init(void)
 							 NULL,
 							 &dbblue_columnar_auto_columnarize,
 							 false,
-							 PGC_SIGHUP,
+							 PGC_SUSET,
 							 0,
 							 NULL, NULL, NULL);
+
+	/*
+	 * Per-database quota. memory_mb above stays the CLUSTER ceiling (what the
+	 * server can afford in total); this is one database's share of it, so
+	 * configuring the engine for one tenant cannot quietly starve the others
+	 * on the same server. 0 = no per-database limit, i.e. the historical
+	 * behaviour where the first database to populate could take the lot.
+	 */
+	DefineCustomIntVariable("dbblue_columnar.database_memory_mb",
+							"Per-database column store quota, in MB (0 = unlimited).",
+							"Bounds one database's share of dbblue_columnar.memory_mb. Set it per tenant with ALTER DATABASE so that one database's store cannot consume the budget another database needs.",
+							&dbblue_columnar_database_memory_mb,
+							0, 0, INT_MAX,
+							PGC_SUSET,
+							GUC_UNIT_MB,
+							NULL, NULL, NULL);
 
 	DefineCustomIntVariable("dbblue_columnar.memory_mb",
 							"Memory budget for the column store, in megabytes.",
@@ -498,7 +515,7 @@ _PG_init(void)
 							NULL,
 							&dbblue_columnar_naptime,
 							60, 1, 86400,
-							PGC_SIGHUP,
+							PGC_SUSET,
 							GUC_UNIT_S,
 							NULL, NULL, NULL);
 
@@ -507,7 +524,7 @@ _PG_init(void)
 							NULL,
 							&dbblue_columnar_refresh_threshold,
 							20, 1, 100,
-							PGC_SIGHUP,
+							PGC_SUSET,
 							0,
 							NULL, NULL, NULL);
 

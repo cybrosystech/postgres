@@ -27,21 +27,22 @@ repopulate (or let the auto-refresh worker rebuild) before relying on it.
 
 | GUC | Type | Default | Set via / takes effect | What it does |
 |-----|------|---------|------------------------|--------------|
-| `dbblue_columnar.enabled` | bool | `off` | postgresql.conf / `ALTER SYSTEM` → **restart** | Master switch. Off = engine inert (no store, no paths). |
-| `dbblue_columnar.memory_mb` | int (MB) | `128` (min 128) | postgresql.conf / `ALTER SYSTEM` → **restart** | Memory budget for the column store (DSA). Blocks stop building once hit. |
+| `dbblue_columnar.enabled` | bool | `off` | superuser `SET` / **`ALTER DATABASE`** / `ALTER SYSTEM` → reload | Master switch, **per database**. Off = engine inert for that database (no store, no paths). |
+| `dbblue_columnar.memory_mb` | int (MB) | `128` (min 128) | postgresql.conf / `ALTER SYSTEM` → **restart** | **Cluster** ceiling for the column store (DSA), shared by all databases. |
+| `dbblue_columnar.database_memory_mb` | int (MB) | `0` (unlimited) | superuser `SET` / **`ALTER DATABASE`** → reload | **One database's quota** within `memory_mb`. Set per tenant so one database cannot consume the memory another needs. |
 | `dbblue_columnar.autorefresh_database` | string | `''` (off) | postgresql.conf / `ALTER SYSTEM` → **restart** | The one database whose registered tables the background worker auto-**populates** and maintains (see "Auto-populate" below). Empty = worker idle → you must `dbblue_columnar_populate` manually. |
 | `dbblue_columnar.enable_columnar_scan` | bool | `on` | `SET` / `ALTER DATABASE` / `ALTER ROLE` → **new connections** | Lets the planner read the store. Off = engine stays loaded + store kept, but queries use heap. **Use this to A/B columnar vs heap.** |
 | `dbblue_columnar.log_coverage_misses` | bool | `on` | superuser `SET` / `ALTER SYSTEM` → reload | Emits a `LOG` naming the unregistered column(s) when a query on a registered table falls back to heap. Silence = full coverage. Dedup: once per table per backend. |
-| `dbblue_columnar.auto_columnarize` | bool | `off` | postgresql.conf / `ALTER SYSTEM` → **reload** (`pg_reload_conf()`) | Let the engine auto-pick columns to columnarize (vs manual `_add`). |
-| `dbblue_columnar.naptime` | int (s) | `60` (1–86400) | postgresql.conf / `ALTER SYSTEM` → **reload** | Seconds between auto-populate/refresh passes. |
-| `dbblue_columnar.refresh_threshold` | int (%) | `20` (1–100) | postgresql.conf / `ALTER SYSTEM` → **reload** | How far a table's all-visible page count may drift from its build-time baseline before the worker rebuilds it. |
+| `dbblue_columnar.auto_columnarize` | bool | `off` | superuser `SET` / **`ALTER DATABASE`** → reload | Let the engine auto-pick columns to columnarize (vs manual `_add`). Not yet implemented. |
+| `dbblue_columnar.naptime` | int (s) | `60` (1–86400) | superuser `SET` / **`ALTER DATABASE`** → reload | Seconds between auto-populate/refresh passes. |
+| `dbblue_columnar.refresh_threshold` | int (%) | `20` (1–100) | superuser `SET` / **`ALTER DATABASE`** → reload | How far a table's all-visible page count may drift from its build-time baseline before the worker rebuilds it. |
 | `dbblue_columnar.suggestions` | bool | `off` | superuser `SET` / `ALTER ROLE` / `ALTER SYSTEM` → reload | Collect workload evidence for the suggestion engine. **Independent of `enabled`** — advice can be gathered before the engine is switched on. |
 | `dbblue_columnar.suggestion_slots` | int | `4096` (0–1048576) | postgresql.conf / `ALTER SYSTEM` → **restart** | Query-shape bundles the advisor can track (~144 bytes each in main shared memory). `0` disables it and reserves nothing. |
 | `dbblue_columnar.suggest_min_pages` | int (pages) | `1024` (8 MB) | superuser `SET` / `ALTER SYSTEM` → reload | Smallest relation the advisor will suggest. Below this the heap is already fast enough to not be worth store budget. |
 
 ### "Takes effect" legend (PostgreSQL GUC context)
-- **restart** (`PGC_POSTMASTER`): `enabled`, `memory_mb`, `autorefresh_database`, `suggestion_slots` — read once at server start.
-- **reload** (`PGC_SIGHUP`): `auto_columnarize`, `naptime`, `refresh_threshold` — `pg_ctl reload` or `SELECT pg_reload_conf()`.
+- **restart** (`PGC_POSTMASTER`): `memory_mb`, `autorefresh_database`, `suggestion_slots` — read once at server start. These are the only genuinely server-wide settings left.
+- **superuser set, per database** (`PGC_SUSET`): `enabled`, `database_memory_mb`, `auto_columnarize`, `naptime`, `refresh_threshold`, `log_coverage_misses`, `suggestions`, `suggest_min_pages` — `SET` in-session, or `ALTER DATABASE db SET ...` to scope them to one database.
 - **new connections** (`PGC_USERSET`): `enable_columnar_scan` — any user; `SET` in-session, or `ALTER DATABASE db SET ...` / `ALTER ROLE r SET ...` for persistence (existing/pooled connections keep the old value until they reconnect).
 - **superuser set** (`PGC_SUSET`): `log_coverage_misses`, `suggestions`, `suggest_min_pages` — superuser `SET`, or `ALTER SYSTEM` + reload.
 
@@ -165,6 +166,67 @@ per column.
 - Evidence lives in **main shared memory** and is wiped on restart, like the column store. Flush before a planned restart to keep it. Unlike registrations, suggestions are **not** dumped by `pg_dump`: they describe one server's workload, and restoring another host's advice would present evidence that was never earned there.
 - The advisor costs one boolean load per planned relation when off, and one bounded, non-waiting stripe-lock acquisition when on. It never allocates and never delays a query.
 - Partitioned tables are reported on the **parent** (`eligibility = 'partitioned'`); per-partition columnar acceleration is future work.
+
+## Running several databases on one server
+
+Everything except three settings is **per database**. On a host with more than
+one database (the normal Odoo case) this matters twice over: you can enable the
+engine for one database without touching the others, and you can stop one
+database's store from consuming the memory another one needs.
+
+```sql
+-- turn the engine on for one tenant only; the rest stay untouched
+ALTER DATABASE odoo_prod SET dbblue_columnar.enabled = on;
+
+-- and cap what each may hold, within the server-wide memory_mb ceiling
+ALTER DATABASE odoo_prod  SET dbblue_columnar.database_memory_mb = 6144;
+ALTER DATABASE odoo_small SET dbblue_columnar.database_memory_mb = 512;
+```
+
+Pooled connections keep the old value until they reconnect, so **restart the
+app** (Odoo) after an `ALTER DATABASE`.
+
+### The two memory limits
+
+| Setting | Scope | Meaning |
+|---------|-------|---------|
+| `memory_mb` | server (restart) | Total the column store may hold across **all** databases. |
+| `database_memory_mb` | database | This database's share of it. `0` = no per-database limit. |
+
+Both are enforced on every reservation, so a build stops at whichever binds
+first. **With `database_memory_mb` left at 0, databases compete**: whichever
+populates first takes what it wants, and the others get a degraded store whose
+only symptom is scans quietly falling back to heap. Set a quota per tenant if
+more than one database uses the engine.
+
+A quota bounds new reservations; it does **not** evict a store already built
+before the quota was lowered. Drop and repopulate to shrink an existing one.
+
+### Which limit is stopping a build?
+
+```sql
+SELECT * FROM dbblue_columnar_database_memory_status;
+```
+The three denial counters have opposite fixes, and `verdict` says which applies:
+
+| Counter | Meaning | Fix |
+|---------|---------|-----|
+| `denials_db_quota` | This database hit its own quota. | Raise `database_memory_mb` **for this database**. |
+| `denials_cluster` | The server-wide budget is full. | Raise `memory_mb` (restart), or free some in another database. |
+| `denials_no_slot` | More than 64 databases hold a store at once. | Raise `DBBC_MAX_DATABASES` and rebuild. |
+
+`denials_db_quota` and `denials_cluster` are **per database** — you see your own,
+not another tenant's. `dbblue_columnar_memory_status` remains the cluster-wide
+view.
+
+### Still server-wide
+- `memory_mb` — the cluster ceiling by definition.
+- `suggestion_slots` — sizes a fixed shared-memory area at postmaster start.
+- `autorefresh_database` — names the single database the background worker
+  services. So automatic populate/refresh and the automatic suggestion flush
+  still cover **one** database; elsewhere call `dbblue_columnar_populate` and
+  `dbblue_columnar_suggestions_flush()` directly. A per-database launcher is
+  future work.
 
 ## Operational notes / gotchas
 - **Ephemeral store.** DSA-backed, never WAL-logged, wiped on restart. Repopulate after every restart (or configure `autorefresh_database` so the worker rebuilds it).

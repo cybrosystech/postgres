@@ -1204,6 +1204,92 @@ SELECT dbblue_columnar_suggestions_flush() >= 0 AS flush_after_drop;
 
 DROP TABLE adv_small;
 RESET dbblue_columnar.suggestions;
+-- ---------------------------------------------------------------------------
+-- Per-database budget isolation. The store is one cluster-wide area, so its
+-- memory must be accounted per database: otherwise one database's store
+-- consumes budget another database's store then cannot get, and tuning the
+-- engine for one tenant silently degrades every other tenant on the server.
+-- True cross-database isolation needs two databases and cannot be expressed
+-- here, so this covers the mechanism: the GUCs are now per-database settable,
+-- the quota is enforced, and the denial is attributed to the right limit.
+-- ---------------------------------------------------------------------------
+-- enabled and the worker cadence became PGC_SUSET, so a superuser can scope
+-- them per database (ALTER DATABASE) instead of per server. A plain SET
+-- proves the context changed; under PGC_POSTMASTER/PGC_SIGHUP these error.
+SET dbblue_columnar.enabled = on;
+SET dbblue_columnar.naptime = 30;
+SET dbblue_columnar.refresh_threshold = 10;
+SET dbblue_columnar.auto_columnarize = off;
+RESET dbblue_columnar.naptime;
+RESET dbblue_columnar.refresh_threshold;
+RESET dbblue_columnar.auto_columnarize;
+-- with no quota, this database competes with the others for memory_mb
+SELECT database_quota_mb, verdict
+FROM dbblue_columnar_database_memory_status;
+ database_quota_mb |                                     verdict                                      
+-------------------+----------------------------------------------------------------------------------
+                 0 | no per-database quota set - this database competes with the others for memory_mb
+(1 row)
+
+-- A 1 MB quota must stop this database's build, and the denial must be charged
+-- to the quota rather than to the server-wide budget - those have opposite
+-- fixes, so mis-attributing one sends an operator to change the wrong limit.
+--
+-- NB a quota bounds new RESERVATIONS; it does not retroactively evict a store
+-- that was already charged before the quota was lowered (same as memory_mb).
+-- So database_used_bytes may legitimately exceed the quota here, and the
+-- assertions below deliberately do not claim otherwise.
+SELECT dbblue_columnar_drop('t');
+ dbblue_columnar_drop 
+----------------------
+ t
+(1 row)
+
+SET dbblue_columnar.database_memory_mb = 1;
+SET client_min_messages = warning;   -- the block count in the NOTICE varies
+SELECT dbblue_columnar_populate('t') AS blocks_under_quota;
+ blocks_under_quota 
+--------------------
+                  0
+(1 row)
+
+RESET client_min_messages;
+SELECT database_quota_mb,
+       database_used_bytes > 0 AS charged_to_this_database,
+       denials_db_quota > 0    AS hit_own_quota,
+       denials_cluster         AS blamed_on_server,
+       verdict
+FROM dbblue_columnar_database_memory_status;
+ database_quota_mb | charged_to_this_database | hit_own_quota | blamed_on_server |                                     verdict                                     
+-------------------+--------------------------+---------------+------------------+---------------------------------------------------------------------------------
+                 1 | t                        | t             |                0 | this database hit its own database_memory_mb quota - raise it for this database
+(1 row)
+
+-- lifting the quota lets the same relation build out fully again, and the
+-- release must land back on this database's account
+RESET dbblue_columnar.database_memory_mb;
+SELECT dbblue_columnar_drop('t');
+ dbblue_columnar_drop 
+----------------------
+ t
+(1 row)
+
+SET client_min_messages = warning;
+SELECT dbblue_columnar_populate('t') > 0 AS rebuilt_without_a_quota;
+ rebuilt_without_a_quota 
+-------------------------
+ t
+(1 row)
+
+RESET client_min_messages;
+-- and the denial counter is this database's own, not the cluster's
+SELECT denials_cluster AS still_not_blamed_on_server
+FROM dbblue_columnar_database_memory_status;
+ still_not_blamed_on_server 
+----------------------------
+                          0
+(1 row)
+
 DROP FUNCTION agree(text);
 DROP FUNCTION uses_node(text, text);
 DROP TABLE t;
