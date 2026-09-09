@@ -192,16 +192,12 @@ updated.
 
 ## Files
 
-- `dbblue_partition--1.0.sql` — the original base script, plus the catalog
-  table, the helper functions and `dbblue_partition_drop_backup()`, which
-  have not changed since.  Like every released version script it is
-  immutable: fixes go into a new update script, never here.
-- `dbblue_partition--1.0--1.1.sql`, `--1.1--1.2.sql`, `--1.2--1.3.sql`,
-  `--1.3--1.4.sql` — pre-release upgrade scripts, not part of the active
-  install path: `default_version` in `dbblue_partition.control` stays at
-  `1.0`, so `CREATE EXTENSION`/`ALTER EXTENSION ... UPDATE` never reads
-  them.  A fresh install runs only `dbblue_partition--1.0.sql`; after
-  changing that script, confirm the deployed definitions match with
+- `dbblue_partition--1.0.sql` — the whole extension, in one script.
+  `default_version` in `dbblue_partition.control` stays at `1.0`, so
+  `CREATE EXTENSION`/`ALTER EXTENSION ... UPDATE` reads only this file; a
+  fresh install runs nothing else.  Like every released version script it
+  is immutable: fixes go into a new update script, never here.  After
+  changing it, confirm the deployed definitions match with
 
   ```sql
   -- in two databases, then diff the output
