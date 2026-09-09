@@ -14,15 +14,13 @@
  *
  * Nothing here was retyped.  Every definition was extracted verbatim from the
  * development script that last changed it, and the result was verified by
- * diffing pg_get_functiondef() for all 16 objects against a database built by
- * replaying the full chain -- byte for byte identical.  The internal
+ * diffing pg_get_functiondef() for all the objects against a database built
+ * by replaying the full chain -- byte for byte identical.  The internal
  * provenance, kept because it records which development revision each object
  * settled in:
  *
  *		dbblue_partition_catalog          1.0 (+ the 1.4 column, inlined)
- *		dbblue_partition_compat_state     1.6
  *		dbblue_partition_enabled_check    1.0
- *		dbblue_partition_shadowed_objects 1.6
  *		dbblue_partition_partman_schema   1.0
  *		dbblue_partition_resolve_table    1.0
  *		dbblue_partition_dependent_views  1.0
@@ -30,18 +28,12 @@
  *		dbblue_partition_status           1.4
  *		dbblue_partition_drop_backup      1.0
  *		dbblue_partition_undo             1.4
- *		dbblue_partition_odoo_compat      1.6
- *		dbblue_partition_odoo_compat_remove 1.6
- *		dbblue_partition_odoo_provision   1.6
- *		dbblue_partition_odoo_deprovision 1.6
- *		dbblue_partition_odoo_reconnect   1.6
- *		dbblue_partition_odoo_compat_check 1.6
- *		dbblue_partition_model            1.4 (+ the auto-reconnect block, spliced)
+ *		dbblue_partition_model            1.4
  *
- * A fresh install also provisions the Odoo role automatically; see the
- * auto-provisioning block at the foot of this file for what that does, why
- * it is the only way to make conversions restart-free, and how to turn it
- * off.
+ * Odoo's own Python code now understands relkind = 'p' natively, so this
+ * script carries no Odoo compatibility layer: every table dbblue_partition
+ * converts is simply a partitioned table, reported as such by the real
+ * pg_catalog.
  */
 /* ------------------------------------------------------------------------
  * State catalog: one row per converted table.
@@ -70,33 +62,6 @@ CREATE TABLE @extschema@.dbblue_partition_catalog (
 SELECT pg_catalog.pg_extension_config_dump('dbblue_partition_catalog', '');
 
 /* ------------------------------------------------------------------------
- * dbblue_partition_compat_state
- *
- * When, and at what scope, each role's search_path was pointed at
- * dbblue_compat.  PostgreSQL does not record when a pg_db_role_setting row
- * was written, and without that timestamp "which live connections predate
- * the setting?" is unanswerable -- which is exactly the question that
- * matters, because such a connection cannot see the compatibility views and
- * will make Odoo fail.
- *
- * Registered with pg_extension_config_dump so pg_dump carries it, like
- * dbblue_partition_catalog.  Note the table is per-database while
- * cluster-wide provisioning is not, so a row may legitimately be absent in a
- * database that is nevertheless covered; the check function treats an absent
- * row as "unknown" rather than "none".
- * ------------------------------------------------------------------------
- */
-CREATE TABLE @extschema@.dbblue_partition_compat_state (
-	role_name		name NOT NULL PRIMARY KEY,
-	scope			text NOT NULL,
-	configured_at	timestamptz NOT NULL,
-	CONSTRAINT dbblue_partition_compat_state_scope_check
-		CHECK (scope IN ('cluster', 'database'))
-);
-
-SELECT pg_catalog.pg_extension_config_dump('@extschema@.dbblue_partition_compat_state', '');
-
-/* ------------------------------------------------------------------------
  * dbblue_partition_enabled_check
  *
  * All mutating entry points refuse to run unless the operator has set
@@ -117,58 +82,6 @@ BEGIN
 	END IF;
 END
 $$;
-
-/* ------------------------------------------------------------------------
- * dbblue_partition_shadowed_objects
- *
- * Internal helper.  Listing pg_catalog explicitly in search_path is what
- * lets dbblue_compat shadow the catalog, but it also stops pg_catalog from
- * being searched first for everything else, so an object in public sharing a
- * builtin's name can start winning resolution.  The search_path order is
- * forced (current_schema must stay public, and dbblue_compat must precede
- * pg_catalog), so report such objects rather than silently changing
- * semantics.
- *
- * Factored out here because three callers now need it.  Behaviour is
- * unchanged from 1.5: matching is by *name*, so it over-reports for
- * overloads that differ in signature -- pg_trgm's "%" (text,text) and "<->"
- * (text,text) never actually capture pg_catalog's numeric modulo or
- * geometric distance operators, because PostgreSQL resolves operators by
- * argument type across all visible candidates.
- * ------------------------------------------------------------------------
- */
-CREATE FUNCTION @extschema@.dbblue_partition_shadowed_objects()
-RETURNS text
-LANGUAGE sql
-STABLE
-SET search_path = pg_catalog, pg_temp
-AS $$
-	SELECT string_agg(DISTINCT sh, ', ')
-	FROM (
-		SELECT p.proname AS sh
-		FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-		WHERE n.nspname = 'public'
-		  AND EXISTS (SELECT 1 FROM pg_proc p2
-					  JOIN pg_namespace n2 ON n2.oid = p2.pronamespace
-					  WHERE n2.nspname = 'pg_catalog' AND p2.proname = p.proname)
-		UNION ALL
-		SELECT o.oprname
-		FROM pg_operator o JOIN pg_namespace n ON n.oid = o.oprnamespace
-		WHERE n.nspname = 'public'
-		  AND EXISTS (SELECT 1 FROM pg_operator o2
-					  JOIN pg_namespace n2 ON n2.oid = o2.oprnamespace
-					  WHERE n2.nspname = 'pg_catalog' AND o2.oprname = o.oprname)
-		UNION ALL
-		SELECT t.typname
-		FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
-		WHERE n.nspname = 'public'
-		  AND EXISTS (SELECT 1 FROM pg_type t2
-					  JOIN pg_namespace n2 ON n2.oid = t2.typnamespace
-					  WHERE n2.nspname = 'pg_catalog' AND t2.typname = t.typname)
-	) s
-$$;
-
-REVOKE ALL ON FUNCTION @extschema@.dbblue_partition_shadowed_objects() FROM PUBLIC;
 
 /* ------------------------------------------------------------------------
  * dbblue_partition_partman_schema
@@ -863,6 +776,19 @@ BEGIN
 	INTO v_min_control;
 
 	/*
+	 * An empty table has no oldest row to anchor on.  Left NULL,
+	 * pg_partman's own default kicks in -- CURRENT_TIMESTAMP - (interval *
+	 * p_premake) -- which backfills p_premake *historical* partitions on
+	 * top of the p_premake future ones, even though there is no data to put
+	 * in them.  Anchor on now() instead, so an empty table gets only the
+	 * current partition plus p_premake ahead, exactly like p_premake alone
+	 * would suggest.
+	 */
+	IF v_min_control IS NULL THEN
+		v_min_control := now()::text;
+	END IF;
+
+	/*
 	 * pg_partman materializes one partition per interval from
 	 * p_start_partition all the way to now + premake, with no cap, and it
 	 * does it inside this transaction while the table is locked.  A single
@@ -871,21 +797,19 @@ BEGIN
 	 * thousands of child tables and their index sets before the conversion
 	 * could finish.  Refuse instead, and name the row that caused it.
 	 */
-	IF v_min_control IS NOT NULL THEN
-		v_span := (SELECT count(*) FROM generate_series(
-					   date_trunc('day', v_min_control::timestamptz),
-					   now(), p_interval::interval));
-		IF v_span > 2000 THEN
-			RAISE EXCEPTION 'partitioning %.% by % of % would create % partitions (oldest value is %)',
-				p_schema, p_table, p_interval, p_control, v_span, v_min_control
-				USING HINT = 'Use a coarser interval, or correct out-of-range values in the control column first: SELECT min('
-					|| quote_ident(p_control) || ') FROM ' || v_qualified || ';',
-					 ERRCODE = 'invalid_parameter_value';
-		ELSIF v_span > 200 THEN
-			RAISE WARNING 'partitioning %.% creates % partitions (oldest % value is %)',
-				p_schema, p_table, v_span, p_control, v_min_control
-				USING HINT = 'A coarser p_interval keeps the partition count manageable.';
-		END IF;
+	v_span := (SELECT count(*) FROM generate_series(
+				   date_trunc('day', v_min_control::timestamptz),
+				   now(), p_interval::interval));
+	IF v_span > 2000 THEN
+		RAISE EXCEPTION 'partitioning %.% by % of % would create % partitions (oldest value is %)',
+			p_schema, p_table, p_interval, p_control, v_span, v_min_control
+			USING HINT = 'Use a coarser interval, or correct out-of-range values in the control column first: SELECT min('
+				|| quote_ident(p_control) || ') FROM ' || v_qualified || ';',
+				 ERRCODE = 'invalid_parameter_value';
+	ELSIF v_span > 200 THEN
+		RAISE WARNING 'partitioning %.% creates % partitions (oldest % value is %)',
+			p_schema, p_table, v_span, p_control, v_min_control
+			USING HINT = 'A coarser p_interval keeps the partition count manageable.';
 	END IF;
 
 	EXECUTE format(
@@ -1737,652 +1661,6 @@ $$;
 REVOKE ALL ON PROCEDURE @extschema@.dbblue_partition_undo(text, text) FROM PUBLIC;
 
 /* ------------------------------------------------------------------------
- * dbblue_partition_odoo_compat
- *
- * Create the compatibility views, and configure the role's search_path only
- * if it is not already effective.
- *
- * The views are the half that reaches live sessions: search_path holds
- * names, resolved per query, so creating dbblue_compat makes it visible to
- * every already-open session that names it.  Where the role is provisioned
- * (see dbblue_partition_odoo_provision) this function therefore has nothing
- * to say about restarting, and says so -- the 1.5 behaviour of always
- * telling the operator to restart Odoo was wrong in the good case and easy
- * to ignore in the bad one.
- * ------------------------------------------------------------------------
- */
-CREATE FUNCTION @extschema@.dbblue_partition_odoo_compat(p_role name DEFAULT NULL)
-RETURNS void
-LANGUAGE plpgsql
-SET search_path = pg_catalog, pg_temp
-AS $$
-DECLARE
-	v_cols			text;
-	v_shadow		text;
-	v_db_cfg		text;
-	v_cluster_cfg	text;
-	v_effective		text;
-	v_already		boolean;
-BEGIN
-	PERFORM @extschema@.dbblue_partition_enabled_check();
-
-	-- Build the column list dynamically so the view survives pg_class
-	-- layout changes across PostgreSQL versions.  Only relkind is
-	-- translated, and only for single-column range partitioning on
-	-- "create_date" — the shape dbblue_partition_model() creates.
-	SELECT string_agg(
-		CASE WHEN a.attname = 'relkind' THEN
-			'CASE WHEN c.relkind = ''p'' AND COALESCE(pt.ok, false) '
-			'THEN ''r''::"char" ELSE c.relkind END AS relkind'
-		ELSE 'c.' || quote_ident(a.attname) END,
-		', ' ORDER BY a.attnum)
-	INTO v_cols
-	FROM pg_attribute a
-	WHERE a.attrelid = 'pg_catalog.pg_class'::regclass
-	  AND a.attnum > 0 AND NOT a.attisdropped;
-
-	CREATE SCHEMA IF NOT EXISTS dbblue_compat;
-	GRANT USAGE ON SCHEMA dbblue_compat TO PUBLIC;
-
-	-- DROP + CREATE rather than CREATE OR REPLACE: replacing a view can
-	-- only append columns, so a pg_class layout change (typically after a
-	-- major-version upgrade) would make the replace fail and leave a stale
-	-- view in place.
-	DROP VIEW IF EXISTS dbblue_compat.pg_class;
-
-	EXECUTE format(
-		'CREATE VIEW dbblue_compat.pg_class AS '
-		'SELECT %s FROM pg_catalog.pg_class c '
-		'LEFT JOIN LATERAL ('
-		'    SELECT true AS ok '
-		'    FROM pg_catalog.pg_partitioned_table pt '
-		'    JOIN pg_catalog.pg_attribute pa '
-		'      ON pa.attrelid = pt.partrelid AND pa.attnum = pt.partattrs[0] '
-		'    WHERE pt.partrelid = c.oid '
-		'      AND pt.partstrat = ''r'' '
-		'      AND pt.partnatts = 1 '
-		'      AND pa.attname = ''create_date'''
-		') pt ON true', v_cols);
-
-	EXECUTE 'GRANT SELECT ON dbblue_compat.pg_class TO PUBLIC';
-
-	/*
-	 * Hide the per-partition child rows of a foreign key that touches a
-	 * DBblue-partitioned table, so Odoo sees exactly the foreign-key
-	 * topology it created: one row per constrained column.  See the 1.5
-	 * script for the full rationale.
-	 */
-	DROP VIEW IF EXISTS dbblue_compat.pg_constraint;
-
-	CREATE VIEW dbblue_compat.pg_constraint AS
-	SELECT c.*
-	FROM pg_catalog.pg_constraint c
-	WHERE c.conparentid = 0			-- top-level constraints: always visible
-	   OR c.contype <> 'f'			-- only foreign-key inheritance is masked
-	   OR NOT EXISTS (				-- ...and only for DBblue-shaped tables
-			SELECT 1
-			FROM pg_catalog.pg_inherits i
-			JOIN pg_catalog.pg_partitioned_table pt
-			  ON pt.partrelid = i.inhparent
-			JOIN pg_catalog.pg_attribute pa
-			  ON pa.attrelid = pt.partrelid
-			 AND pa.attnum = pt.partattrs[0]
-			WHERE i.inhrelid IN (c.conrelid, c.confrelid)
-			  AND pt.partstrat = 'r'
-			  AND pt.partnatts = 1
-			  AND pa.attname = 'create_date');
-
-	GRANT SELECT ON dbblue_compat.pg_constraint TO PUBLIC;
-
-	IF p_role IS NULL THEN
-		RAISE NOTICE 'dbblue_partition: compatibility views dbblue_compat.pg_class and dbblue_compat.pg_constraint are in place; provision a role once with SELECT dbblue_partition_odoo_provision(''<odoo role>'')';
-		RETURN;
-	END IF;
-
-	IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = p_role) THEN
-		RAISE EXCEPTION 'role "%" does not exist', p_role;
-	END IF;
-
-	/*
-	 * Effective search_path default for this role in this database.  A
-	 * per-database row overrides the cluster-wide one entirely, so check
-	 * precedence rather than merely looking for any row mentioning
-	 * dbblue_compat: a per-database override that does *not* mention it
-	 * beats a cluster-wide default that does.
-	 */
-	SELECT array_to_string(s.setconfig, ' ') INTO v_db_cfg
-	FROM pg_db_role_setting s
-	JOIN pg_roles r ON r.oid = s.setrole
-	JOIN pg_database d ON d.oid = s.setdatabase
-	WHERE r.rolname = p_role AND d.datname = current_database();
-
-	SELECT array_to_string(s.setconfig, ' ') INTO v_cluster_cfg
-	FROM pg_db_role_setting s
-	JOIN pg_roles r ON r.oid = s.setrole
-	WHERE r.rolname = p_role AND s.setdatabase = 0;
-
-	v_effective := coalesce(v_db_cfg, v_cluster_cfg);
-	v_already := v_effective IS NOT NULL
-			 AND v_effective LIKE '%dbblue_compat%'
-			 AND v_effective LIKE '%pg_catalog%';
-
-	IF v_already THEN
-		/*
-		 * Nothing to change, and nothing to restart: the views just created
-		 * are already reachable through the search_path this role's sessions
-		 * started with, including sessions opened long before this call.
-		 */
-		RAISE NOTICE 'dbblue_partition: role "%" already resolves dbblue_compat, so its existing connections can see the compatibility views immediately -- no reconnect needed',
-			p_role;
-		RETURN;
-	END IF;
-
-	v_shadow := @extschema@.dbblue_partition_shadowed_objects();
-	IF v_shadow IS NOT NULL THEN
-		RAISE WARNING 'schema public contains object(s) whose name also exists in pg_catalog: %', v_shadow
-			USING DETAIL = 'Role "' || p_role || '" resolves public before pg_catalog, so these now shadow the builtin of the same name.',
-				  HINT = 'Move them to another schema, or schema-qualify their callers.';
-	END IF;
-
-	EXECUTE format(
-		'ALTER ROLE %I IN DATABASE %I SET search_path = "$user", public, dbblue_compat, pg_catalog',
-		p_role, current_database());
-
-	INSERT INTO @extschema@.dbblue_partition_compat_state AS st
-		(role_name, scope, configured_at)
-	VALUES (p_role, 'database', clock_timestamp())
-	ON CONFLICT (role_name) DO UPDATE
-		SET scope = EXCLUDED.scope, configured_at = EXCLUDED.configured_at;
-
-	/*
-	 * A WARNING, not a NOTICE: this is the one path that genuinely requires
-	 * operator action, and as a NOTICE among seven other lines it was
-	 * routinely missed -- leaving Odoo issuing CREATE TABLE over a live
-	 * partitioned table.
-	 */
-	RAISE WARNING 'role "%" was not provisioned in advance, so its already-open connections cannot see the compatibility views', p_role
-		USING DETAIL = 'ALTER ROLE ... SET search_path applies at session start only. Until those connections are replaced, Odoo reports: relation "..." already exists.',
-			  HINT = 'Run SELECT dbblue_partition_odoo_reconnect(); and, to avoid this on future conversions, SELECT dbblue_partition_odoo_provision(''' || p_role || ''');';
-END
-$$;
-
-REVOKE ALL ON FUNCTION @extschema@.dbblue_partition_odoo_compat(name) FROM PUBLIC;
-
-/* ------------------------------------------------------------------------
- * dbblue_partition_odoo_compat_remove
- *
- * Unchanged in scope -- one database -- but it must now also delete the
- * recorded per-database state, or a later check would keep dating stale
- * connections from a configuration that no longer exists.  The cluster-wide
- * default is deliberately left alone; use
- * dbblue_partition_odoo_deprovision() for that.
- * ------------------------------------------------------------------------
- */
-CREATE FUNCTION @extschema@.dbblue_partition_odoo_compat_remove(p_role name DEFAULT NULL)
-RETURNS void
-LANGUAGE plpgsql
-SET search_path = pg_catalog, pg_temp
-AS $$
-DECLARE
-	v_left	text;
-BEGIN
-	PERFORM @extschema@.dbblue_partition_enabled_check();
-
-	IF p_role IS NOT NULL THEN
-		IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = p_role) THEN
-			RAISE EXCEPTION 'role "%" does not exist', p_role;
-		END IF;
-		EXECUTE format('ALTER ROLE %I IN DATABASE %I RESET search_path',
-					   p_role, current_database());
-		DELETE FROM @extschema@.dbblue_partition_compat_state
-		WHERE role_name = p_role AND scope = 'database';
-	END IF;
-
-	DROP VIEW IF EXISTS dbblue_compat.pg_constraint;
-	DROP VIEW IF EXISTS dbblue_compat.pg_class;
-	DROP SCHEMA IF EXISTS dbblue_compat;
-
-	SELECT string_agg(quote_ident(r.rolname), ', ') INTO v_left
-	FROM pg_db_role_setting s
-	JOIN pg_database d ON d.oid = s.setdatabase
-	JOIN pg_roles r ON r.oid = s.setrole
-	WHERE d.datname = current_database()
-	  AND array_to_string(s.setconfig, ' ') LIKE '%dbblue_compat%';
-	IF v_left IS NOT NULL THEN
-		RAISE WARNING 'role(s) % still list dbblue_compat in search_path for database "%"',
-			v_left, current_database()
-			USING HINT = 'Reset each one with SELECT dbblue_partition_odoo_compat_remove(''<role>''), or cluster-wide with SELECT dbblue_partition_odoo_deprovision(''<role>'').';
-	END IF;
-
-	RAISE NOTICE 'dbblue_partition: Odoo compatibility views removed%',
-		CASE WHEN p_role IS NOT NULL
-			 THEN format('; per-database search_path of role "%s" reset', p_role) ELSE '' END;
-END
-$$;
-
-REVOKE ALL ON FUNCTION @extschema@.dbblue_partition_odoo_compat_remove(name) FROM PUBLIC;
-
-/* ------------------------------------------------------------------------
- * dbblue_partition_odoo_provision
- *
- * Point a role's search_path at dbblue_compat cluster-wide, once, before
- * Odoo connects.  This is the step that removes the restart requirement for
- * every later conversion; see the header of this script for why.
- *
- * Run it from any database in the cluster -- it only writes a role setting,
- * so the extension does not need to be installed anywhere else:
- *
- *		SELECT dbblue_partition_odoo_provision('odoo');
- *
- * With no argument it provisions the current database's owner, which in a
- * normal Odoo deployment is the Odoo db_user.
- *
- * A per-database setting overrides a cluster-wide one *entirely*, so a
- * leftover per-database row from a pre-1.6 conversion would mask this one
- * and freeze that database on whatever it says.  p_clear_per_database (on by
- * default) removes those rows for this role wherever they mention
- * dbblue_compat, leaving one cluster-wide setting as the single source of
- * truth.
- *
- * Existing sessions keep the search_path they started with -- that is
- * unavoidable and is precisely why this runs at provisioning time.  If Odoo
- * is already connected when you run this, reconnect it once with
- * dbblue_partition_odoo_reconnect(); from then on nothing needs restarting
- * again.
- * ------------------------------------------------------------------------
- */
-CREATE FUNCTION @extschema@.dbblue_partition_odoo_provision(
-	p_role name DEFAULT NULL,
-	p_clear_per_database boolean DEFAULT true)
-RETURNS void
-LANGUAGE plpgsql
-SET search_path = pg_catalog, pg_temp
-AS $$
-DECLARE
-	v_role		name;
-	v_shadow	text;
-	v_cleared	text;
-BEGIN
-	PERFORM @extschema@.dbblue_partition_enabled_check();
-
-	IF p_role IS NULL THEN
-		SELECT pg_get_userbyid(d.datdba) INTO v_role
-		FROM pg_database d WHERE d.datname = current_database();
-	ELSE
-		v_role := p_role;
-	END IF;
-
-	IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = v_role) THEN
-		RAISE EXCEPTION 'role "%" does not exist', v_role;
-	END IF;
-
-	v_shadow := @extschema@.dbblue_partition_shadowed_objects();
-	IF v_shadow IS NOT NULL THEN
-		RAISE WARNING 'schema public contains object(s) whose name also exists in pg_catalog: %', v_shadow
-			USING DETAIL = 'Role "' || v_role || '" resolves public before pg_catalog, so these now shadow the builtin of the same name.',
-				  HINT = 'Move them to another schema, or schema-qualify their callers.';
-	END IF;
-
-	/*
-	 * No IN DATABASE: this must cover databases that do not exist yet,
-	 * because Odoo creates its own from the web UI.  dbblue_compat is
-	 * allowed to be absent -- an unresolvable search_path entry is silently
-	 * skipped, so the setting is inert until an extension creates the schema.
-	 */
-	EXECUTE format(
-		'ALTER ROLE %I SET search_path = "$user", public, dbblue_compat, pg_catalog',
-		v_role);
-
-	IF p_clear_per_database THEN
-		SELECT string_agg(quote_ident(d.datname), ', ' ORDER BY d.datname)
-		INTO v_cleared
-		FROM pg_db_role_setting s
-		JOIN pg_database d ON d.oid = s.setdatabase
-		JOIN pg_roles r ON r.oid = s.setrole
-		WHERE r.rolname = v_role
-		  AND array_to_string(s.setconfig, ' ') LIKE '%dbblue_compat%';
-
-		IF v_cleared IS NOT NULL THEN
-			-- Cannot be done set-wise: ALTER ROLE takes one database at a time.
-			DECLARE
-				r record;
-			BEGIN
-				FOR r IN
-					SELECT d.datname
-					FROM pg_db_role_setting s
-					JOIN pg_database d ON d.oid = s.setdatabase
-					JOIN pg_roles ro ON ro.oid = s.setrole
-					WHERE ro.rolname = v_role
-					  AND array_to_string(s.setconfig, ' ') LIKE '%dbblue_compat%'
-				LOOP
-					EXECUTE format('ALTER ROLE %I IN DATABASE %I RESET search_path',
-								   v_role, r.datname);
-				END LOOP;
-			END;
-			RAISE NOTICE 'dbblue_partition: removed per-database search_path override(s) for role "%" in %; the cluster-wide setting now applies everywhere',
-				v_role, v_cleared;
-		END IF;
-	END IF;
-
-	INSERT INTO @extschema@.dbblue_partition_compat_state AS st
-		(role_name, scope, configured_at)
-	VALUES (v_role, 'cluster', clock_timestamp())
-	ON CONFLICT (role_name) DO UPDATE
-		SET scope = EXCLUDED.scope, configured_at = EXCLUDED.configured_at;
-
-	RAISE NOTICE 'dbblue_partition: role "%" is provisioned cluster-wide; every database it connects to from now on -- including ones created later -- will see DBblue-partitioned tables as regular tables, with no restart needed after a conversion',
-		v_role;
-
-	IF EXISTS (SELECT 1 FROM pg_stat_activity a
-			   WHERE a.usename = v_role AND a.pid <> pg_backend_pid()) THEN
-		RAISE WARNING 'role "%" already has open session(s) that keep the search_path they started with', v_role
-			USING DETAIL = 'Sessions opened before this call cannot see dbblue_compat, so Odoo would still fail on a partitioned table.',
-				  HINT = 'Reconnect them once with SELECT dbblue_partition_odoo_reconnect(); after that no further reconnects are needed.';
-	END IF;
-END
-$$;
-
-REVOKE ALL ON FUNCTION @extschema@.dbblue_partition_odoo_provision(name, boolean) FROM PUBLIC;
-
-/* ------------------------------------------------------------------------
- * dbblue_partition_odoo_deprovision
- *
- * Undo dbblue_partition_odoo_provision(): drop the cluster-wide search_path
- * default for the role.  Deliberately separate from
- * dbblue_partition_odoo_compat_remove(), which is scoped to one database --
- * silently resetting a cluster-wide setting from a per-database call would
- * affect every other database behind the operator's back.
- *
- * Leaves the views alone: a search_path naming a schema that no longer
- * exists is harmless, and other databases may still need them.
- * ------------------------------------------------------------------------
- */
-CREATE FUNCTION @extschema@.dbblue_partition_odoo_deprovision(
-	p_role name DEFAULT NULL)
-RETURNS void
-LANGUAGE plpgsql
-SET search_path = pg_catalog, pg_temp
-AS $$
-DECLARE
-	v_role	name;
-BEGIN
-	PERFORM @extschema@.dbblue_partition_enabled_check();
-
-	IF p_role IS NULL THEN
-		SELECT pg_get_userbyid(d.datdba) INTO v_role
-		FROM pg_database d WHERE d.datname = current_database();
-	ELSE
-		v_role := p_role;
-	END IF;
-
-	IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = v_role) THEN
-		RAISE EXCEPTION 'role "%" does not exist', v_role;
-	END IF;
-
-	EXECUTE format('ALTER ROLE %I RESET search_path', v_role);
-
-	DELETE FROM @extschema@.dbblue_partition_compat_state
-	WHERE role_name = v_role AND scope = 'cluster';
-
-	RAISE NOTICE 'dbblue_partition: cluster-wide search_path default removed for role "%"; its new sessions will no longer see dbblue_compat',
-		v_role;
-END
-$$;
-
-REVOKE ALL ON FUNCTION @extschema@.dbblue_partition_odoo_deprovision(name) FROM PUBLIC;
-
-/* ------------------------------------------------------------------------
- * dbblue_partition_odoo_reconnect
- *
- * Force a role's stale pooled connections to be re-established, so a
- * deployment that was not provisioned in advance can pick up the
- * compatibility layer without stopping Odoo.
- *
- * This is not an Odoo restart and does not need one.  Odoo's
- * ConnectionPool.borrow() calls reset() on every candidate connection and,
- * on OperationalError, closes and discards it before opening a fresh one --
- * so a terminated backend is replaced transparently on the next request,
- * with the correct search_path.
- *
- * By default only *provably* stale connections are terminated: those that
- * started before the search_path was configured (dbblue_partition_compat_state,
- * falling back to the most recent conversion's completed_at).  When neither
- * timestamp is known the function refuses rather than guess; pass
- * p_force => true to terminate every other session of that role in this
- * database.
- *
- * Filtering is by role, not by application_name: Odoo's db_app_name is
- * configurable, so matching 'odoo%' would silently miss renamed deployments.
- * ------------------------------------------------------------------------
- */
-CREATE FUNCTION @extschema@.dbblue_partition_odoo_reconnect(
-	p_role name DEFAULT NULL,
-	p_force boolean DEFAULT false)
-RETURNS bigint
-LANGUAGE plpgsql
-SET search_path = pg_catalog, pg_temp
-AS $$
-DECLARE
-	v_role	name;
-	v_since	timestamptz;
-	v_n		bigint;
-BEGIN
-	PERFORM @extschema@.dbblue_partition_enabled_check();
-
-	IF p_role IS NULL THEN
-		SELECT pg_get_userbyid(d.datdba) INTO v_role
-		FROM pg_database d WHERE d.datname = current_database();
-	ELSE
-		v_role := p_role;
-	END IF;
-
-	IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = v_role) THEN
-		RAISE EXCEPTION 'role "%" does not exist', v_role;
-	END IF;
-
-	SELECT st.configured_at INTO v_since
-	FROM @extschema@.dbblue_partition_compat_state st
-	WHERE st.role_name = v_role;
-
-	IF v_since IS NULL THEN
-		SELECT max(c.completed_at) INTO v_since
-		FROM @extschema@.dbblue_partition_catalog c;
-	END IF;
-
-	IF v_since IS NULL AND NOT p_force THEN
-		RAISE EXCEPTION 'cannot tell which connections are stale: no recorded search_path configuration and no completed conversion in this database'
-			USING HINT = 'Run SELECT dbblue_partition_odoo_reconnect(NULL, true) to terminate every other session of this role in this database.',
-				  ERRCODE = 'object_not_in_prerequisite_state';
-	END IF;
-
-	SELECT count(*) INTO v_n
-	FROM (
-		SELECT pg_terminate_backend(a.pid)
-		FROM pg_stat_activity a
-		WHERE a.datname = current_database()
-		  AND a.usename = v_role
-		  AND a.pid <> pg_backend_pid()
-		  AND (p_force OR a.backend_start < v_since)
-	) t;
-
-	IF v_n = 0 THEN
-		RAISE NOTICE 'dbblue_partition: no stale connections for role "%" in database "%"',
-			v_role, current_database();
-	ELSE
-		RAISE NOTICE 'dbblue_partition: terminated % connection(s) for role "%" in database "%"; the client pool reconnects on its next request and will see the compatibility views',
-			v_n, v_role, current_database();
-	END IF;
-
-	RETURN v_n;
-END
-$$;
-
-REVOKE ALL ON FUNCTION @extschema@.dbblue_partition_odoo_reconnect(name, boolean) FROM PUBLIC;
-
-/* ------------------------------------------------------------------------
- * dbblue_partition_odoo_compat_check
- *
- * Report whether the Odoo compatibility layer is actually in effect --
- * including for the clients that are connected right now, which 1.5 could
- * not see.  It reported "active" for a database where every Odoo connection
- * predated the search_path change and was therefore certain to fail.
- *
- * Run it after any restore, upgrade, provisioning or conversion:
- *
- *		SELECT * FROM dbblue_partition_odoo_compat_check();
- *
- * Recreated rather than replaced because 1.6 adds output columns.
- * ------------------------------------------------------------------------
- */
-
-CREATE FUNCTION @extschema@.dbblue_partition_odoo_compat_check(
-	p_role name DEFAULT NULL)
-RETURNS TABLE (
-	checked_role			name,
-	compat_view_present		boolean,
-	role_configured			boolean,
-	provisioning_scope		text,
-	stale_connections		bigint,
-	masked_tables			bigint,
-	masked_fk_children		bigint,
-	shadowed_objects		text,
-	verdict					text)
-LANGUAGE plpgsql
-STABLE
-SET search_path = pg_catalog, pg_temp
-AS $$
-DECLARE
-	v_db_cfg		text;
-	v_cluster_cfg	text;
-	v_effective		text;
-	v_class_view	boolean;
-	v_con_view		boolean;
-	v_since			timestamptz;
-BEGIN
-	IF p_role IS NULL THEN
-		SELECT pg_get_userbyid(d.datdba) INTO checked_role
-		FROM pg_database d WHERE d.datname = current_database();
-	ELSE
-		checked_role := p_role;
-	END IF;
-
-	v_class_view := to_regclass('dbblue_compat.pg_class') IS NOT NULL;
-	v_con_view   := to_regclass('dbblue_compat.pg_constraint') IS NOT NULL;
-	compat_view_present := v_class_view AND v_con_view;
-
-	-- Precedence: a per-database row overrides the cluster-wide one.
-	SELECT array_to_string(s.setconfig, ' ') INTO v_db_cfg
-	FROM pg_db_role_setting s
-	JOIN pg_roles r ON r.oid = s.setrole
-	JOIN pg_database d ON d.oid = s.setdatabase
-	WHERE r.rolname = checked_role AND d.datname = current_database();
-
-	SELECT array_to_string(s.setconfig, ' ') INTO v_cluster_cfg
-	FROM pg_db_role_setting s
-	JOIN pg_roles r ON r.oid = s.setrole
-	WHERE r.rolname = checked_role AND s.setdatabase = 0;
-
-	v_effective := coalesce(v_db_cfg, v_cluster_cfg);
-
-	role_configured := v_effective IS NOT NULL
-		AND v_effective LIKE '%dbblue_compat%'
-		AND v_effective LIKE '%pg_catalog%';
-
-	provisioning_scope := CASE
-		WHEN NOT role_configured THEN 'none'
-		WHEN v_db_cfg IS NOT NULL THEN 'database'
-		ELSE 'cluster'
-	END;
-
-	-- Tables the views are there to mask: range-partitioned on create_date.
-	SELECT count(*) INTO masked_tables
-	FROM pg_partitioned_table pt
-	JOIN pg_attribute pa ON pa.attrelid = pt.partrelid
-						AND pa.attnum = pt.partattrs[0]
-	WHERE pt.partstrat = 'r' AND pt.partnatts = 1
-	  AND pa.attname = 'create_date';
-
-	-- Inherited foreign-key rows the pg_constraint view hides.  Grows with
-	-- every new partition and every new foreign key, which is why this is a
-	-- view and not a one-time repair.
-	SELECT count(*) INTO masked_fk_children
-	FROM pg_constraint c
-	WHERE c.contype = 'f' AND c.conparentid <> 0
-	  AND EXISTS (
-			SELECT 1
-			FROM pg_inherits i
-			JOIN pg_partitioned_table pt ON pt.partrelid = i.inhparent
-			JOIN pg_attribute pa ON pa.attrelid = pt.partrelid
-								AND pa.attnum = pt.partattrs[0]
-			WHERE i.inhrelid IN (c.conrelid, c.confrelid)
-			  AND pt.partstrat = 'r' AND pt.partnatts = 1
-			  AND pa.attname = 'create_date');
-
-	/*
-	 * Connections that provably cannot see the views: they started before
-	 * the search_path was configured, and a session never re-reads its
-	 * defaults.  PostgreSQL does not timestamp pg_db_role_setting, hence
-	 * dbblue_partition_compat_state; fall back to the newest conversion when
-	 * no row exists (e.g. provisioning was done from another database), and
-	 * report NULL rather than 0 when neither is known, because "none" and
-	 * "cannot tell" are very different answers here.
-	 */
-	SELECT st.configured_at INTO v_since
-	FROM @extschema@.dbblue_partition_compat_state st
-	WHERE st.role_name = checked_role;
-
-	IF v_since IS NULL THEN
-		SELECT max(c.completed_at) INTO v_since
-		FROM @extschema@.dbblue_partition_catalog c;
-	END IF;
-
-	IF v_since IS NULL THEN
-		stale_connections := NULL;
-	ELSE
-		SELECT count(*) INTO stale_connections
-		FROM pg_stat_activity a
-		WHERE a.datname = current_database()
-		  AND a.usename = checked_role
-		  AND a.pid <> pg_backend_pid()
-		  AND a.backend_start < v_since;
-	END IF;
-
-	shadowed_objects := @extschema@.dbblue_partition_shadowed_objects();
-
-	verdict := CASE
-		WHEN masked_tables = 0 THEN
-			'no DBblue-partitioned tables in this database; the compatibility layer is not needed'
-		WHEN v_class_view AND NOT v_con_view THEN
-			'INCOMPLETE: dbblue_compat.pg_class is present but dbblue_compat.pg_constraint is not, so Odoo still sees one foreign key per partition and will fail with "cannot drop inherited constraint"; run SELECT ' ||
-			'dbblue_partition_odoo_compat(' || quote_literal(checked_role) || ')'
-		WHEN NOT compat_view_present THEN
-			'INACTIVE: the compatibility views do not exist; run SELECT dbblue_partition_odoo_compat(' ||
-			quote_literal(checked_role) || ')'
-		WHEN NOT role_configured THEN
-			'INACTIVE: role ' || quote_ident(checked_role) ||
-			' has no search_path naming dbblue_compat (typical after a restore, which does not carry pg_db_role_setting); run SELECT ' ||
-			'dbblue_partition_odoo_provision(' || quote_literal(checked_role) || ')'
-		WHEN coalesce(stale_connections, 0) > 0 THEN
-			'INACTIVE FOR RUNNING CLIENTS: everything is in place, but ' ||
-			stale_connections || ' connection(s) by ' || quote_ident(checked_role) ||
-			' opened before the search_path was configured and cannot see the views; Odoo will fail with ' ||
-			'"relation already exists" until they are replaced. Run SELECT dbblue_partition_odoo_reconnect(' ||
-			quote_literal(checked_role) || ')'
-		WHEN provisioning_scope = 'database' THEN
-			'active for this database, but configured per-database only: a conversion in a database created later will need a reconnect. Run SELECT ' ||
-			'dbblue_partition_odoo_provision(' || quote_literal(checked_role) ||
-			') to make it cluster-wide and restart-free everywhere'
-		ELSE
-			'active and provisioned cluster-wide: Odoo sees partitioned tables as regular tables with one foreign-key row per column, and future conversions need no reconnect'
-	END;
-
-	RETURN NEXT;
-END
-$$;
-
-REVOKE ALL ON FUNCTION @extschema@.dbblue_partition_odoo_compat_check(name) FROM PUBLIC;
-
-/* ------------------------------------------------------------------------
  * dbblue_partition_model
  *
  * The one call an Odoo user makes:
@@ -2408,8 +1686,7 @@ CREATE OR REPLACE PROCEDURE @extschema@.dbblue_partition_model(
 	p_premake int DEFAULT 4,
 	p_batch_interval interval DEFAULT NULL,
 	p_single_transaction boolean DEFAULT true,
-	p_analyze boolean DEFAULT true,
-	p_odoo_compat boolean DEFAULT true)
+	p_analyze boolean DEFAULT true)
 LANGUAGE plpgsql
 AS $$
 DECLARE
@@ -2430,7 +1707,6 @@ DECLARE
 	v_old_rowsec	text;
 	v_old_datestyle	text;
 	v_can_replica	boolean := true;
-	v_db_owner		name;
 	v_move_error	text;
 	v_moved_total	bigint;
 	r				record;
@@ -2686,209 +1962,9 @@ BEGIN
 		EXECUTE pg_catalog.format('ANALYZE %I.%I', p_schema, v_table);
 	END IF;
 
-	----------------------------------------------------------------------
-	-- DBblue serves Odoo.  Two things have to happen here, in this order:
-	--
-	--   1. create the compatibility views, so pg_class reports relkind 'r'
-	--      for this table and pg_constraint hides the per-partition foreign
-	--      key children PostgreSQL just created;
-	--   2. make sure the Odoo role's connections can actually reach them.
-	--
-	-- (2) is the step that used to be left to the operator, and the reason
-	-- a conversion could appear to succeed and still break Odoo.  A session
-	-- reads its search_path default exactly once, at startup, so a
-	-- connection opened before the role was configured can never see
-	-- dbblue_compat: it keeps reading the real pg_catalog.pg_class, sees
-	-- relkind 'p', concludes the model's table is missing, and issues
-	-- CREATE TABLE over the table this procedure has just partitioned --
-	--
-	--     psycopg2.errors.DuplicateTable: relation "..." already exists
-	--
-	-- Terminating those connections is the only cure, and this is the right
-	-- moment for it: the conversion is finished, and any Odoo request
-	-- touching this table was already blocked behind our ACCESS EXCLUSIVE
-	-- lock, so less is in flight now than at any later point.  Odoo treats
-	-- a dead pooled connection as routine -- ConnectionPool.borrow() resets
-	-- each candidate and discards the ones that raise -- so it reconnects on
-	-- its next request with the correct search_path.  This is not, and does
-	-- not need, an Odoo restart.
-	--
-	-- Where the role was provisioned before Odoo ever connected (see
-	-- dbblue_partition_odoo_provision) nothing is stale and both steps are
-	-- silent no-ops.  Where staleness cannot be dated -- no recorded
-	-- configuration and no earlier conversion in this database -- the
-	-- reconnect declines rather than guess, and says so.
-	--
-	-- Neither step may fail the conversion: this transaction also carries
-	-- the foreign-key validations and the state update, so an error here
-	-- would wedge the conversion in 'migrating' on every retry.
-	----------------------------------------------------------------------
-	IF p_odoo_compat THEN
-		v_db_owner := nullif(
-			pg_catalog.current_setting('dbblue_partition.odoo_role', true), '');
-		IF v_db_owner IS NULL THEN
-			SELECT pg_catalog.pg_get_userbyid(d.datdba) INTO v_db_owner
-			FROM pg_catalog.pg_database d
-			WHERE d.datname = pg_catalog.current_database();
-		END IF;
-
-		BEGIN
-			PERFORM @extschema@.dbblue_partition_odoo_compat(v_db_owner);
-		EXCEPTION WHEN OTHERS THEN
-			RAISE WARNING 'dbblue_partition: could not configure Odoo compatibility for role "%" automatically: %; run SELECT dbblue_partition_odoo_compat(...) manually',
-				v_db_owner, SQLERRM;
-		END;
-
-		IF coalesce(nullif(
-				pg_catalog.current_setting('dbblue_partition.auto_reconnect', true), ''),
-				'on')::boolean
-		THEN
-			BEGIN
-				PERFORM @extschema@.dbblue_partition_odoo_reconnect(v_db_owner);
-			EXCEPTION WHEN OTHERS THEN
-				RAISE WARNING 'dbblue_partition: could not re-establish stale connections for role "%" automatically: %', v_db_owner, SQLERRM
-					USING HINT = 'Odoo may fail with "relation already exists" until you run SELECT dbblue_partition_odoo_reconnect().';
-			END;
-		END IF;
-	END IF;
-
 	RAISE NOTICE 'dbblue_partition: % complete; % row(s) moved in % batch(es); backup kept as %; drop it with dbblue_partition_drop_backup(%)',
 		v_qualified, v_total_moved, v_batches, v_backup_raw, p_model;
 END
 $$;
 
-REVOKE ALL ON PROCEDURE @extschema@.dbblue_partition_model(text, text, text, text, int, interval, boolean, boolean, boolean) FROM PUBLIC;
-
-
-/* ------------------------------------------------------------------------
- * Automatic provisioning on fresh install
- *
- * The compatibility layer has two halves with very different timing, and
- * getting that wrong is the single most common way to break an Odoo
- * database with this extension:
- *
- *	- the views (dbblue_compat.pg_class, .pg_constraint) are visible to
- *	  every *already open* session the moment they are created, because
- *	  search_path holds names that are resolved per query and a name that
- *	  resolves to nothing is silently skipped;
- *	- the search_path itself is read only when a session starts, so it can
- *	  never be pushed into a connection that is already open.
- *
- * So the search_path must be in place before Odoo connects.  If it is set
- * later -- which is what happens when the conversion configures it -- every
- * pooled Odoo connection keeps the old one, keeps reading the real
- * pg_catalog.pg_class, sees relkind 'p', decides the model's table is
- * missing and issues CREATE TABLE over the live partitioned table:
- *
- *		psycopg2.errors.DuplicateTable: relation "sale_order" already exists
- *
- * Hence this block: installing the extension is the earliest moment the
- * extension can act, so it sets the role's search_path here, cluster-wide.
- * The dbblue_compat schema does not exist yet and does not need to -- it is
- * ignored until a conversion creates it, and picked up live at that moment.
- *
- * Cluster-wide (ALTER ROLE without IN DATABASE) is deliberate: Odoo creates
- * its own databases from the web UI, and you cannot target a database that
- * does not exist yet.  A cluster-wide default is inherited by every database
- * the role ever connects to, including future ones.
- *
- * Recommended deployment, which needs no restart at any point:
- *
- *		-- before Odoo is started, as superuser:
- *		ALTER SYSTEM SET dbblue_partition.odoo_role = 'odoo';
- *		SELECT pg_reload_conf();
- *		psql -d template1 -c 'CREATE EXTENSION dbblue_partition CASCADE'
- *		-- and in odoo.conf:    db_template = template1
- *
- * Every database Odoo then creates already carries this extension and an
- * already-provisioned role, so conversions are transparent from the first
- * one.  (Odoo defaults db_template to template0, which is why that setting
- * is needed; note it also drops Odoo's LC_COLLATE 'C', so make that choice
- * deliberately.)
- *
- * Settings, both read here and both optional:
- *
- *	dbblue_partition.odoo_role       role to provision.  Defaults to the
- *	                                 owner of the database being installed
- *	                                 into, which is right for a normal Odoo
- *	                                 deployment but wrong for template1,
- *	                                 whose owner is usually postgres -- so
- *	                                 set it explicitly for the template1
- *	                                 route.
- *	dbblue_partition.auto_provision  set to off to skip this entirely and
- *	                                 provision by hand later with
- *	                                 dbblue_partition_odoo_provision().
- *
- * Two things this block deliberately does not do.  It does not consult
- * dbblue_partition.enabled: that guard exists to stop conversions from
- * running unintentionally, and at install time it is invariably off, so
- * honouring it here would mean this never runs.  And it does not create the
- * dbblue_compat schema or its views, because every object an extension
- * script creates is recorded as a member of the extension and could then
- * never be dropped by dbblue_partition_odoo_compat_remove().  Writing a row
- * into our own table is fine.
- *
- * Nothing here can fail the install: a missing role or insufficient
- * privileges downgrade to a WARNING naming the manual command.
- * ------------------------------------------------------------------------
- */
-DO $dbblue_auto$
-DECLARE
-	v_role	name;
-	v_auto	text;
-BEGIN
-	v_auto := nullif(
-		pg_catalog.current_setting('dbblue_partition.auto_provision', true), '');
-
-	IF v_auto IS NOT NULL AND NOT v_auto::boolean THEN
-		RAISE NOTICE 'dbblue_partition: auto-provisioning is off; run SELECT dbblue_partition_odoo_provision(''<odoo role>'') before starting Odoo, or conversions will need a reconnect';
-		RETURN;
-	END IF;
-
-	v_role := nullif(
-		pg_catalog.current_setting('dbblue_partition.odoo_role', true), '');
-
-	IF v_role IS NULL THEN
-		SELECT pg_catalog.pg_get_userbyid(d.datdba) INTO v_role
-		FROM pg_catalog.pg_database d
-		WHERE d.datname = pg_catalog.current_database();
-	END IF;
-
-	IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles r WHERE r.rolname = v_role) THEN
-		RAISE WARNING 'dbblue_partition: role "%" does not exist, so the Odoo search_path was not configured', v_role
-			USING HINT = 'Set dbblue_partition.odoo_role, or run SELECT dbblue_partition_odoo_provision(''<odoo role>'') once the role exists.';
-		RETURN;
-	END IF;
-
-	BEGIN
-		EXECUTE pg_catalog.format(
-			'ALTER ROLE %I SET search_path = "$user", public, dbblue_compat, pg_catalog',
-			v_role);
-	EXCEPTION WHEN insufficient_privilege THEN
-		RAISE WARNING 'dbblue_partition: not permitted to set the search_path of role "%"', v_role
-			USING DETAIL = 'ALTER ROLE ... SET requires superuser, or the role altering itself.',
-				  HINT = 'Run SELECT dbblue_partition_odoo_provision(''' || v_role || '''); as a superuser before starting Odoo.';
-		RETURN;
-	END;
-
-	INSERT INTO @extschema@.dbblue_partition_compat_state AS st
-		(role_name, scope, configured_at)
-	VALUES (v_role, 'cluster', pg_catalog.clock_timestamp())
-	ON CONFLICT (role_name) DO UPDATE
-		SET scope = EXCLUDED.scope, configured_at = EXCLUDED.configured_at;
-
-	RAISE NOTICE 'dbblue_partition: role "%" provisioned cluster-wide; it will see DBblue-partitioned tables as regular tables in every database it connects to, and conversions will not need Odoo to be restarted',
-		v_role;
-
-	/*
-	 * The one case that still needs action: the role is already connected,
-	 * and those sessions keep the search_path they started with.
-	 */
-	IF EXISTS (SELECT 1 FROM pg_catalog.pg_stat_activity a
-			   WHERE a.usename = v_role
-				 AND a.pid <> pg_catalog.pg_backend_pid()) THEN
-		RAISE NOTICE 'dbblue_partition: role "%" already has open session(s), which cannot see a search_path set after they started; they will be re-established automatically at the end of the first conversion, so no action is needed now',
-			v_role;
-	END IF;
-END
-$dbblue_auto$;
+REVOKE ALL ON PROCEDURE @extschema@.dbblue_partition_model(text, text, text, text, int, interval, boolean, boolean) FROM PUBLIC;
