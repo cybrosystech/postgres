@@ -31,6 +31,39 @@
  *
  * The worker never creates real indexes; it only records suggestions.
  *
+ * The advisor is enabled per database.  dbblue_auto_index_suggestion_enabled
+ * is PGC_SUSET, so each database carries its own value:
+ *
+ *	   ALTER DATABASE odoo_1 SET dbblue_auto_index_suggestion_enabled = on;
+ *	   ALTER DATABASE odoo_2 SET dbblue_auto_index_suggestion_enabled = off;
+ *
+ * Turning it off for odoo_2 leaves odoo_1 being analysed, which one
+ * cluster-wide setting plus one target database could not do: pointing the
+ * old single-database advisor at another database stopped the first one.
+ * The cluster-wide value remains the default for any database with no
+ * setting of its own, exactly as GUC precedence implies.
+ *
+ * Two kinds of process implement that, the same split the dbblue BRIN
+ * feature and autovacuum use.  A launcher, always running, holds *no*
+ * database connection: it lists the cluster's databases out of the shared
+ * catalog pg_database and starts one short-lived dynamic worker in each in
+ * turn, waiting for each to finish.  Each worker connects, and because
+ * InitPostgres has applied that database's own ALTER DATABASE settings by
+ * then, its dbblue_auto_index_suggestion_enabled is already the effective
+ * value there -- so the worker itself decides whether to analyse, and a
+ * disabled database costs one immediate exit.
+ *
+ * Letting the worker decide is what keeps the semantics honest: a process
+ * with no database can only read the handful of shared catalogs nailed
+ * into the relcache before a database is selected, and pg_db_role_setting
+ * is not one of them.  It also means one worker slot covers any number of
+ * databases, and nothing is held open between passes, so DROP DATABASE on
+ * an analysed database is never blocked.
+ *
+ * dbblue_auto_index_suggestion_interval is the time between two sweeps of
+ * the whole cluster, not per database: one sweep visits every enabled
+ * database in turn, then the launcher sleeps for the remainder.
+ *
  * Copyright (c) 2026, dbblue / Cybrosys Technologies
  *
  * IDENTIFICATION
@@ -40,6 +73,9 @@
  */
 #include "postgres.h"
 
+#include "access/heapam.h"
+#include "access/htup_details.h"
+#include "access/tableam.h"
 #include "access/transam.h"
 #include "access/xact.h"
 #include "catalog/pg_am.h"
@@ -154,16 +190,27 @@ static MemoryContext advisor_cxt = NULL;
 static bool advisor_env_ready = false;
 
 /*
- * Set once BackgroundWorkerInitializeConnection has attached the worker to
- * its database.  The connection is deferred until the feature is first
- * enabled, so a cluster that never turns the advisor on neither pins the
- * database (which would block DROP DATABASE) nor holds a connection for a
- * feature doing nothing.
+ * One database the launcher will start a worker in this sweep.  The name is
+ * carried alongside the OID only for log messages; the worker is addressed by
+ * OID, which stays correct even if the database is renamed mid-sweep.
  */
-static bool advisor_connected = false;
+typedef struct AdvisorDatabase
+{
+	Oid			dboid;
+	char	   *dbname;
+} AdvisorDatabase;
 
-/* Time the last analysis pass started; 0 forces a pass on next wakeup. */
-static TimestampTz advisor_last_pass = 0;
+/* How long to keep polling a worker the postmaster has not started. */
+#define ADVISOR_STARTUP_TIMEOUT		60000	/* 1 minute in ms */
+
+/* Poll granularity while waiting for a per-database worker to finish. */
+#define ADVISOR_POLL_INTERVAL		1000	/* 1 second in ms */
+
+/*
+ * The database this worker is analysing, for log messages.  Points into
+ * MyBgworkerEntry->bgw_extra, which the launcher filled in.
+ */
+static const char *advisor_dbname = "";
 
 /*
  * Start time of the pass currently running.  Read by advisor_store_suggestion
@@ -172,6 +219,10 @@ static TimestampTz advisor_last_pass = 0;
  */
 static TimestampTz advisor_pass_start = 0;
 
+static List *advisor_get_database_list(void);
+static void advisor_run_one_database(const AdvisorDatabase *db);
+static void advisor_wait_for_worker(BackgroundWorkerHandle *handle,
+									const AdvisorDatabase *db);
 static void advisor_ensure_environment(void);
 static bool advisor_exec_in_subxact(const char *sql, const char *what);
 static void advisor_run_pass(void);
@@ -239,21 +290,240 @@ dbblue_check_advisor_enabled(bool *newval, void **extra, GucSource source)
 				 errdetail("The dbblue index advisor reads its workload from pg_stat_statements, which collects statistics only when preloaded."),
 				 errhint("Add pg_stat_statements to shared_preload_libraries and restart the server.")));
 
-	if (dbblue_auto_index_suggestion_database == NULL ||
-		dbblue_auto_index_suggestion_database[0] == '\0')
-		ereport(WARNING,
-				(errmsg("dbblue_auto_index_suggestion_enabled is on, but dbblue_auto_index_suggestion_database is not set"),
-				 errdetail("With no database configured the advisor worker is not registered and will not run."),
-				 errhint("Set dbblue_auto_index_suggestion_database to an existing database and restart the server.")));
-	else if (!OidIsValid(get_database_oid(dbblue_auto_index_suggestion_database,
-										  true)))
-		ereport(WARNING,
-				(errmsg("dbblue index advisor database \"%s\" does not exist",
-						dbblue_auto_index_suggestion_database),
-				 errdetail("The advisor worker will fail to start and will be retried every 60 seconds until the database exists."),
-				 errhint("Create the database, or point dbblue_auto_index_suggestion_database at an existing one (changing it requires a server restart).")));
+	/*
+	 * No database to validate any more: the value is per database, and the
+	 * database it applies to is the one it is being set on.
+	 */
+	return true;
+}
+
+/*
+ * dbblue_check_advisor_database
+ *		GUC check hook for dbblue_auto_index_suggestion_database.
+ *
+ * Now that this is reloadable, pointing it at a database that does not
+ * exist puts the worker into a connect-FATAL/restart loop rather than
+ * simply doing nothing, so warn as soon as the name is set -- whether or
+ * not the advisor happens to be enabled at that moment.  Warning only
+ * while the feature is on would miss the ordinary way this is configured,
+ * which is to set the database first and switch the feature on afterwards:
+ * neither step would say anything.
+ *
+ * The name is deliberately not rejected, for the same reason
+ * dbblue_check_advisor_enabled only warns.  A check hook cannot be
+ * authoritative here: at server start it runs in the postmaster, which has
+ * no catalog access, so a bad name in postgresql.conf is accepted
+ * regardless and erroring out in a backend would only make the two paths
+ * disagree.  Nor can the check stay true -- DROP DATABASE can invalidate an
+ * already-accepted setting at any time -- which is why the worker treats a
+ * missing database as a retryable condition at connect time rather than
+ * trusting this.  Rejecting would also break the legitimate ordering of
+ * configuring the setting before creating the database.
+ */
+bool
+dbblue_check_advisor_database(char **newval, void **extra, GucSource source)
+{
+	if (*newval == NULL || **newval == '\0')
+		return true;
+
+	ereport(WARNING,
+			(errmsg("dbblue_auto_index_suggestion_database is obsolete and is ignored"),
+			 errdetail("The index advisor is now enabled per database."),
+			 errhint("Use ALTER DATABASE %s SET dbblue_auto_index_suggestion_enabled = on instead, and remove dbblue_auto_index_suggestion_database.",
+					 *newval)));
 
 	return true;
+}
+
+/*
+ * advisor_get_database_list
+ *		List the databases the launcher will start a worker in this sweep.
+ *
+ * pg_database is one of the shared catalogs nailed into the relcache before
+ * a database is selected, so the connectionless launcher can read it; this
+ * follows get_database_list() in autovacuum.c.  Whether the advisor is
+ * actually enabled for a database is not decided here -- see the file
+ * header -- so this is only the list of databases that can be connected to.
+ *
+ * The result is allocated in the caller's context so it survives the commit.
+ */
+static List *
+advisor_get_database_list(void)
+{
+	List	   *result = NIL;
+	Relation	dbrel;
+	TableScanDesc scan;
+	HeapTuple	tup;
+	MemoryContext resultcxt = CurrentMemoryContext;
+
+	StartTransactionCommand();
+
+	dbrel = table_open(DatabaseRelationId, AccessShareLock);
+	scan = table_beginscan_catalog(dbrel, 0, NULL);
+
+	while (HeapTupleIsValid(tup = heap_getnext(scan, ForwardScanDirection)))
+	{
+		Form_pg_database pgdatabase = (Form_pg_database) GETSTRUCT(tup);
+		AdvisorDatabase *db;
+		MemoryContext oldcxt;
+
+		/* A half-dropped database cannot be connected to at all. */
+		if (database_is_invalid_form(pgdatabase))
+			continue;
+
+		/*
+		 * Templates and databases marked as rejecting connections are
+		 * skipped: connecting to a template blocks CREATE DATABASE from it,
+		 * and datallowconn = false is an explicit instruction that background
+		 * work has no business overriding.
+		 */
+		if (pgdatabase->datistemplate || !pgdatabase->datallowconn)
+			continue;
+
+		/*
+		 * Allocate the result outside the transaction's context, inside the
+		 * loop, so the leaky scan machinery is not run in a long-lived one.
+		 */
+		oldcxt = MemoryContextSwitchTo(resultcxt);
+		db = palloc_object(AdvisorDatabase);
+		db->dboid = pgdatabase->oid;
+		db->dbname = pstrdup(NameStr(pgdatabase->datname));
+		result = lappend(result, db);
+		MemoryContextSwitchTo(oldcxt);
+	}
+
+	table_endscan(scan);
+	table_close(dbrel, AccessShareLock);
+
+	CommitTransactionCommand();
+
+	/* CommitTransactionCommand() leaves us in TopMemoryContext. */
+	MemoryContextSwitchTo(resultcxt);
+
+	return result;
+}
+
+/*
+ * advisor_wait_for_worker
+ *		Block until one per-database worker has finished.
+ *
+ * One database at a time, so the advisor costs a single worker slot however
+ * many databases are enabled.  It also bounds the cost of the pass itself:
+ * a pass plans the top-N queries with hypothetical indexes, and running
+ * several databases' worth of that concurrently would be a large, bursty
+ * load on the planner.
+ *
+ * WaitForBackgroundWorkerShutdown() is not used because it only returns once
+ * the worker is gone, which on SIGTERM would hold shutdown for the rest of a
+ * pass; here a shutdown request terminates the worker instead.  The startup
+ * timeout covers the case where the postmaster never starts the worker at
+ * all, so the launcher cannot get stuck on one database forever.
+ */
+static void
+advisor_wait_for_worker(BackgroundWorkerHandle *handle,
+						const AdvisorDatabase *db)
+{
+	TimestampTz startup_deadline;
+	bool		started = false;
+	bool		terminated = false;
+
+	startup_deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+												   ADVISOR_STARTUP_TIMEOUT);
+
+	for (;;)
+	{
+		BgwHandleStatus status;
+		pid_t		pid;
+
+		CHECK_FOR_INTERRUPTS();
+
+		status = GetBackgroundWorkerPid(handle, &pid);
+
+		if (status == BGWH_STOPPED || status == BGWH_POSTMASTER_DIED)
+			break;
+
+		if (status == BGWH_STARTED)
+			started = true;
+
+		if (ShutdownRequestPending && !terminated)
+		{
+			TerminateBackgroundWorker(handle);
+			terminated = true;
+		}
+
+		if (!started && !terminated &&
+			GetCurrentTimestamp() >= startup_deadline)
+		{
+			ereport(WARNING,
+					(errmsg("dbblue index advisor: worker for database \"%s\" did not start",
+							db->dbname),
+					 errdetail("Giving up on it for this sweep."),
+					 errhint("Check max_worker_processes.")));
+			TerminateBackgroundWorker(handle);
+			terminated = true;
+		}
+
+		(void) WaitLatch(MyLatch,
+						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						 ADVISOR_POLL_INTERVAL,
+						 WAIT_EVENT_DBBLUE_INDEX_ADVISOR_LAUNCHER_MAIN);
+		ResetLatch(MyLatch);
+	}
+}
+
+/*
+ * advisor_run_one_database
+ *		Start a one-shot worker in the given database and wait for it.
+ *
+ * Addressed by OID rather than by name, so a rename between building the
+ * list and starting the worker cannot send it to the wrong database; if the
+ * database was dropped meanwhile the worker fails to connect, which
+ * BGW_NEVER_RESTART turns into a single logged failure rather than a restart
+ * loop.
+ */
+static void
+advisor_run_one_database(const AdvisorDatabase *db)
+{
+	BackgroundWorker bgw;
+	BackgroundWorkerHandle *handle;
+
+	memset(&bgw, 0, sizeof(bgw));
+	bgw.bgw_flags = BGWORKER_SHMEM_ACCESS |
+		BGWORKER_BACKEND_DATABASE_CONNECTION;
+	bgw.bgw_start_time = BgWorkerStart_RecoveryFinished;
+
+	/* One pass and done: a failed sweep is retried by the next one. */
+	bgw.bgw_restart_time = BGW_NEVER_RESTART;
+	snprintf(bgw.bgw_library_name, MAXPGPATH, "postgres");
+	snprintf(bgw.bgw_function_name, BGW_MAXLEN, "DbblueIndexAdvisorMain");
+	snprintf(bgw.bgw_name, BGW_MAXLEN, "dbblue index advisor (%s)",
+			 db->dbname);
+	snprintf(bgw.bgw_type, BGW_MAXLEN, "dbblue index advisor");
+	bgw.bgw_main_arg = ObjectIdGetDatum(db->dboid);
+
+	/*
+	 * The name comes along for log messages only.  The worker cannot resolve
+	 * its own OID to a name between transactions, and every suggestion it
+	 * reports needs to say which database it came from.
+	 */
+	strlcpy(bgw.bgw_extra, db->dbname, BGW_EXTRALEN);
+
+	/* So our latch is set when it starts and stops. */
+	bgw.bgw_notify_pid = MyProcPid;
+
+	if (!RegisterDynamicBackgroundWorker(&bgw, &handle))
+	{
+		ereport(WARNING,
+				(errmsg("dbblue index advisor: no free background worker slot for database \"%s\"",
+						db->dbname),
+				 errdetail("The database will be retried on the next sweep."),
+				 errhint("Consider raising max_worker_processes.")));
+		return;
+	}
+
+	advisor_wait_for_worker(handle, db);
+
+	pfree(handle);
 }
 
 /*
@@ -294,8 +564,8 @@ advisor_exec_in_subxact(const char *sql, const char *what)
 		CurrentResourceOwner = oldowner;
 
 		ereport(WARNING,
-				(errmsg("dbblue index advisor: %s failed: %s",
-						what, edata->message)));
+				(errmsg("dbblue index advisor: %s failed in database \"%s\": %s",
+						what, advisor_dbname, edata->message)));
 		FreeErrorData(edata);
 	}
 	PG_END_TRY();
@@ -400,11 +670,23 @@ advisor_ensure_environment(void)
 		{
 			int			spi_ret;
 
+			/*
+			 * read_only = false, deliberately.  A read-only SPI query reuses
+			 * the ActiveSnapshot pushed at the top of this function, which
+			 * predates the CREATE TABLE above -- so on the very first pass in
+			 * a database, where the table and its constraint are created
+			 * here, the new pg_constraint row is invisible.  The probe then
+			 * reported "no constraint", the ALTER TABLE below failed with
+			 * "already exists", and the whole environment was marked not
+			 * ready: the first pass after enabling the advisor in a database
+			 * silently produced nothing.  Passing false makes SPI increment
+			 * the command counter and take a fresh snapshot.
+			 */
 			spi_ret = SPI_execute(
 								  "SELECT 1 FROM pg_catalog.pg_constraint "
 								  "WHERE conname = 'dbblue_index_suggestions_ddl_unique' "
 								  "AND conrelid = 'public." ADVISOR_RESULT_TABLE "'::regclass",
-								  true, 1);
+								  false, 1);
 			has_constraint = (spi_ret == SPI_OK_SELECT && SPI_processed > 0);
 
 			ReleaseCurrentSubTransaction();
@@ -435,8 +717,8 @@ advisor_ensure_environment(void)
 			if (!added)
 			{
 				ereport(WARNING,
-						(errmsg("dbblue index advisor: results table public.%s exists but lacks the required unique constraint",
-								ADVISOR_RESULT_TABLE),
+						(errmsg("dbblue index advisor: results table public.%s in database \"%s\" exists but lacks the required unique constraint",
+								ADVISOR_RESULT_TABLE, advisor_dbname),
 						 errhint("Drop or rename the conflicting table so the advisor can recreate it.")));
 				table_ok = false;
 			}
@@ -451,10 +733,9 @@ advisor_ensure_environment(void)
 	advisor_env_ready = pgss_ok && hypopg_ok && table_ok;
 
 	if (advisor_env_ready)
-		ereport(LOG,
+		ereport(DEBUG1,
 				(errmsg("dbblue index advisor: ready (pg_stat_statements, hypopg and public.%s verified in database \"%s\")",
-						ADVISOR_RESULT_TABLE,
-						dbblue_auto_index_suggestion_database)));
+						ADVISOR_RESULT_TABLE, advisor_dbname)));
 }
 
 /*
@@ -1272,8 +1553,8 @@ advisor_evaluate_candidate(WorkloadEntry *entry, IndexCandidate *cand,
 				advisor_store_suggestion(entry, cand, baseline, hypo_cost,
 										 reduction);
 				ereport(LOG,
-						(errmsg("dbblue index advisor: suggestion recorded: %s (cost %.2f -> %.2f, %.1f%% reduction, queryid %lld)",
-								cand->ddl, baseline, hypo_cost,
+						(errmsg("dbblue index advisor: suggestion recorded for database \"%s\": %s (cost %.2f -> %.2f, %.1f%% reduction, queryid %lld)",
+								advisor_dbname, cand->ddl, baseline, hypo_cost,
 								reduction * 100.0,
 								(long long) entry->queryid)));
 			}
@@ -1299,8 +1580,8 @@ advisor_evaluate_candidate(WorkloadEntry *entry, IndexCandidate *cand,
 		CurrentResourceOwner = oldowner;
 
 		ereport(LOG,
-				(errmsg("dbblue index advisor: evaluating candidate \"%s\" failed: %s",
-						cand->ddl, edata->message)));
+				(errmsg("dbblue index advisor: evaluating candidate \"%s\" in database \"%s\" failed: %s",
+						cand->ddl, advisor_dbname, edata->message)));
 		FreeErrorData(edata);
 	}
 	PG_END_TRY();
@@ -1643,8 +1924,8 @@ advisor_prune_stale(TimestampTz pass_start)
 
 	if (ret == SPI_OK_DELETE && SPI_processed > 0)
 		ereport(LOG,
-				(errmsg("dbblue index advisor: removed " UINT64_FORMAT " stale suggestion(s)",
-						(uint64) SPI_processed)));
+				(errmsg("dbblue index advisor: removed " UINT64_FORMAT " stale suggestion(s) from database \"%s\"",
+						(uint64) SPI_processed, advisor_dbname)));
 
 	SPI_finish();
 	PopActiveSnapshot();
@@ -1668,8 +1949,8 @@ advisor_run_pass(void)
 	entries = advisor_load_workload();
 
 	ereport(LOG,
-			(errmsg("dbblue index advisor: analysing %d statement(s) from pg_stat_statements",
-					list_length(entries))));
+			(errmsg("dbblue index advisor: analysing %d statement(s) from pg_stat_statements in database \"%s\"",
+					list_length(entries), advisor_dbname)));
 
 	foreach(lc, entries)
 	{
@@ -1704,28 +1985,32 @@ advisor_run_pass(void)
 
 /*
  * DbblueIndexAdvisorMain
- *		Background worker entry point.
+ *		Per-database worker: connect to the database whose OID the launcher
+ *		passed, run one analysis pass, exit.
+ *
+ * The launcher passes every database it could connect to, not only the
+ * enabled ones, because it cannot read the per-database settings itself.
+ * InitPostgres has applied this database's ALTER DATABASE settings by the
+ * time this runs, so the check below is reading this database's effective
+ * dbblue_auto_index_suggestion_enabled: that is what makes the feature
+ * per-database, and a disabled database costs one connect-and-exit.
+ *
+ * Being short-lived is the point: nothing is held open between sweeps, so
+ * DROP DATABASE on an analysed database is never blocked.
  */
 void
 DbblueIndexAdvisorMain(Datum main_arg)
 {
+	Oid			dboid = DatumGetObjectId(main_arg);
 	sigjmp_buf	local_sigjmp_buf;
 
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
 	BackgroundWorkerUnblockSignals();
 
-	/*
-	 * The database connection is deferred to the main loop and opened the
-	 * first time the feature is seen enabled (see advisor_connected).  A
-	 * cluster that never enables the advisor therefore never attaches to the
-	 * database, so DROP DATABASE on it is not blocked by this worker.
-	 */
-	ereport(LOG,
-			(errmsg("dbblue index advisor started (database \"%s\", %s)",
-					dbblue_auto_index_suggestion_database,
-					dbblue_auto_index_suggestion_enabled ?
-					"enabled" : "disabled")));
+	advisor_dbname = MyBgworkerEntry->bgw_extra;
+
+	BackgroundWorkerInitializeConnectionByOid(dboid, InvalidOid, 0);
 
 	advisor_cxt = AllocSetContextCreate(TopMemoryContext,
 										"dbblue index advisor",
@@ -1733,10 +2018,124 @@ DbblueIndexAdvisorMain(Datum main_arg)
 	MemoryContextSwitchTo(advisor_cxt);
 
 	/*
-	 * Recover here after any unexpected error: report it, clean up
-	 * whatever transaction state is left, and go back to the main loop.
-	 * The wait at the end of the loop keeps a persistent failure from
-	 * turning into a busy loop.
+	 * One shot, so an unexpected error ends this worker rather than being
+	 * recovered from: the launcher starts a fresh one next sweep.  Report it
+	 * and unwind the transaction and SPI state first, so nothing is left
+	 * half-open at exit.
+	 */
+	if (sigsetjmp(local_sigjmp_buf, 1) != 0)
+	{
+		/* Since not using PG_TRY, must reset error stack by hand. */
+		error_context_stack = NULL;
+
+		HOLD_INTERRUPTS();
+
+		EmitErrorReport();
+		FlushErrorState();
+
+		AbortOutOfAnyTransaction();
+		MemoryContextSwitchTo(TopMemoryContext);
+		MemoryContextReset(advisor_cxt);
+
+		pgstat_report_activity(STATE_IDLE, NULL);
+
+		RESUME_INTERRUPTS();
+
+		proc_exit(1);
+	}
+	PG_exception_stack = &local_sigjmp_buf;
+
+	/* This is where the feature is actually switched on or off. */
+	if (!dbblue_auto_index_suggestion_enabled)
+	{
+		ereport(DEBUG1,
+				(errmsg("dbblue index advisor: disabled in database \"%s\", nothing to do",
+						advisor_dbname)));
+		proc_exit(0);
+	}
+
+	/* The advisor writes its suggestions, so it cannot run on a standby. */
+	if (RecoveryInProgress())
+		proc_exit(0);
+
+	if (ShutdownRequestPending)
+		proc_exit(0);
+
+	/*
+	 * Keep the advisor's own statements (EXPLAINs, hypopg calls, the
+	 * result-table upserts) out of pg_stat_statements.  Without this, every
+	 * pass roughly doubles the extension's entry count, evicts genuine
+	 * workload queries from its fixed-size hash table, and the advisor
+	 * eventually starts analysing its own queries.  The setting is
+	 * session-local to this worker; client backends are unaffected.
+	 */
+	SetConfigOption("pg_stat_statements.track", "none",
+					PGC_SUSET, PGC_S_SESSION);
+
+	/*
+	 * Bound how long the advisor will wait for a lock.  Planning an
+	 * EXPLAINed UPDATE/DELETE takes RowExclusiveLock on the target table at
+	 * parse-analysis time; if that queues behind an ACCESS EXCLUSIVE waiter
+	 * (ALTER TABLE, VACUUM FULL, ...), the worker would wait indefinitely and
+	 * stall everything queued behind it.  On timeout the statement errors and
+	 * the candidate is skipped by its subtransaction.  lock_timeout is
+	 * honoured in ProcSleep regardless of the command path, unlike
+	 * statement_timeout, which is armed only by the normal client command
+	 * loop this worker does not use.
+	 */
+	SetConfigOption("lock_timeout", "5s", PGC_SUSET, PGC_S_SESSION);
+
+	advisor_ensure_environment();
+
+	if (!advisor_env_ready)
+	{
+		/*
+		 * pg_stat_statements, hypopg or the results table could not be set up
+		 * here.  advisor_ensure_environment() has already warned with the
+		 * reason; exit quietly rather than analysing half-configured.
+		 */
+		proc_exit(0);
+	}
+
+	advisor_run_pass();
+
+	proc_exit(0);
+}
+
+/*
+ * DbblueIndexAdvisorLauncherMain
+ *		Main entry point for the launcher process.
+ */
+void
+DbblueIndexAdvisorLauncherMain(Datum main_arg)
+{
+	sigjmp_buf	local_sigjmp_buf;
+
+	/* volatile: assigned in the error handler below and read after it. */
+	volatile TimestampTz next_run = 0;
+
+	pqsignal(SIGHUP, SignalHandlerForConfigReload);
+	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
+	BackgroundWorkerUnblockSignals();
+
+	/*
+	 * No database.  pg_database is a shared catalog, so this is enough to
+	 * list the cluster's databases, and it means the launcher never counts as
+	 * a connection to any of them -- DROP DATABASE on an analysed database is
+	 * not blocked by the advisor being enabled.
+	 */
+	BackgroundWorkerInitializeConnection(NULL, NULL, 0);
+
+	ereport(LOG, (errmsg("dbblue index advisor launcher started")));
+
+	advisor_cxt = AllocSetContextCreate(TopMemoryContext,
+										"dbblue index advisor launcher",
+										ALLOCSET_DEFAULT_SIZES);
+	MemoryContextSwitchTo(advisor_cxt);
+
+	/*
+	 * Recover here after any unexpected error: report it, unwind whatever
+	 * transaction state was left behind, and go back to the main loop.
 	 */
 	if (sigsetjmp(local_sigjmp_buf, 1) != 0)
 	{
@@ -1753,10 +2152,16 @@ DbblueIndexAdvisorMain(Datum main_arg)
 		MemoryContextReset(advisor_cxt);
 		MemoryContextSwitchTo(advisor_cxt);
 
-		/* Re-verify the environment before the next pass. */
-		advisor_env_ready = false;
-
 		pgstat_report_activity(STATE_IDLE, NULL);
+
+		/*
+		 * Defer the next sweep.  The error aborted this one part-way through,
+		 * so next_run still holds whatever it did before -- typically 0, on
+		 * the very first sweep -- and jumping straight back into the loop
+		 * would retry immediately and spin on a persistent failure.
+		 */
+		next_run = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+											   (int64) dbblue_auto_index_suggestion_interval * 1000);
 
 		RESUME_INTERRUPTS();
 	}
@@ -1776,108 +2181,104 @@ DbblueIndexAdvisorMain(Datum main_arg)
 		{
 			ConfigReloadPending = false;
 			ProcessConfigFile(PGC_SIGHUP);
+
+			/*
+			 * The cluster-wide dbblue_auto_index_suggestion_enabled is the
+			 * default for every database without a setting of its own, and
+			 * the interval itself may have changed, so re-evaluate at once
+			 * rather than at the end of the current interval.
+			 */
+			next_run = 0;
 		}
 
 		interval_ms = (int64) dbblue_auto_index_suggestion_interval * 1000;
 
-		if (dbblue_auto_index_suggestion_enabled)
+		/*
+		 * The advisor writes suggestions, so nothing can run on a standby;
+		 * not starting the workers at all keeps a standby from spawning one
+		 * per database for no reason.
+		 */
+		if (RecoveryInProgress())
 		{
-			if (!advisor_connected)
-			{
-				BackgroundWorkerInitializeConnection(
-									dbblue_auto_index_suggestion_database,
-									NULL, 0);
-
-				/*
-				 * Keep the advisor's own statements (EXPLAINs, hypopg calls,
-				 * the result-table upserts) out of pg_stat_statements.
-				 * Without this, every pass roughly doubles the extension's
-				 * entry count, evicts genuine workload queries from its
-				 * fixed-size hash table, and the advisor eventually starts
-				 * analysing its own queries.  The setting is session-local to
-				 * this worker; client backends are unaffected.
-				 */
-				SetConfigOption("pg_stat_statements.track", "none",
-								PGC_SUSET, PGC_S_SESSION);
-
-				/*
-				 * Bound how long the advisor will wait for a lock.  Planning
-				 * an EXPLAINed UPDATE/DELETE takes RowExclusiveLock on the
-				 * target table at parse-analysis time; if that queues behind
-				 * an ACCESS EXCLUSIVE waiter (ALTER TABLE, VACUUM FULL, ...),
-				 * the worker would wait indefinitely and stall everything
-				 * queued behind it.  On timeout the statement errors and the
-				 * candidate is skipped by its subtransaction.  lock_timeout is
-				 * honoured in ProcSleep regardless of the command path, unlike
-				 * statement_timeout, which is armed only by the normal client
-				 * command loop this worker does not use.
-				 */
-				SetConfigOption("lock_timeout", "5s",
-								PGC_SUSET, PGC_S_SESSION);
-
-				advisor_connected = true;
-			}
-
-			if (!advisor_env_ready)
-				advisor_ensure_environment();
-
-			if (advisor_env_ready)
-			{
-				TimestampTz now = GetCurrentTimestamp();
-
-				if (advisor_last_pass == 0 ||
-					TimestampDifferenceExceeds(advisor_last_pass, now,
-											   interval_ms))
-				{
-					advisor_last_pass = now;
-					advisor_run_pass();
-				}
-
-				/* Sleep only for the remainder of the interval. */
-				sleep_ms = interval_ms -
-					TimestampDifferenceMilliseconds(advisor_last_pass,
-													GetCurrentTimestamp());
-				sleep_ms = Max(sleep_ms, 1000);
-			}
-			else
-				sleep_ms = interval_ms;
+			next_run = 0;
+			sleep_ms = (long) interval_ms;
 		}
 		else
 		{
-			/* Disabled: re-run promptly once re-enabled. */
-			advisor_env_ready = false;
-			advisor_last_pass = 0;
-			sleep_ms = interval_ms;
+			/*
+			 * Paced by next_run rather than by having woken up: the
+			 * per-database workers set our latch as they start and stop, and
+			 * without this the last one of a sweep would trigger an
+			 * immediate extra sweep.
+			 */
+			if (next_run == 0 || GetCurrentTimestamp() >= next_run)
+			{
+				List	   *databases;
+				ListCell   *lc;
+
+				/*
+				 * Re-read every sweep, so a database created since the last
+				 * one is picked up and one dropped since simply drops out of
+				 * the list.  An ALTER DATABASE ... SET
+				 * dbblue_auto_index_suggestion_enabled needs nothing more
+				 * than this either: the value is read by the worker, at
+				 * connect time, on every sweep.
+				 */
+				databases = advisor_get_database_list();
+
+				foreach(lc, databases)
+				{
+					if (ShutdownRequestPending)
+						break;
+
+					advisor_run_one_database((AdvisorDatabase *) lfirst(lc));
+				}
+
+				/* Discard this sweep's database list. */
+				MemoryContextSwitchTo(TopMemoryContext);
+				MemoryContextReset(advisor_cxt);
+				MemoryContextSwitchTo(advisor_cxt);
+
+				next_run = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+													   interval_ms);
+			}
+
+			sleep_ms = (long) ((next_run - GetCurrentTimestamp()) / 1000);
+			sleep_ms = Max(sleep_ms, 1000);
 		}
+
+		if (ShutdownRequestPending)
+			break;
 
 		(void) WaitLatch(MyLatch,
 						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
 						 sleep_ms,
-						 WAIT_EVENT_DBBLUE_INDEX_ADVISOR_MAIN);
+						 WAIT_EVENT_DBBLUE_INDEX_ADVISOR_LAUNCHER_MAIN);
 		ResetLatch(MyLatch);
 	}
 
-	ereport(LOG, (errmsg("dbblue index advisor shutting down")));
+	ereport(LOG, (errmsg("dbblue index advisor launcher shutting down")));
 
 	/*
 	 * Exit non-zero on SIGTERM.  A background worker that exits 0 is treated
 	 * by the postmaster as "terminate and forget" (rw_terminate), so a
-	 * pg_terminate_backend() on this worker would remove it until the next
+	 * pg_terminate_backend() on the launcher would remove it until the next
 	 * server restart even while the feature is still enabled.  Exiting 1 is
 	 * not treated as a crash (no cluster-wide restart), but it does let
-	 * bgw_restart_time bring the worker back after an individual terminate.
-	 * During a full cluster shutdown the postmaster is going down anyway and
-	 * will not restart it regardless of the exit code.
+	 * bgw_restart_time bring the launcher back.
 	 */
 	proc_exit(1);
 }
 
 /*
  * DbblueIndexAdvisorRegister
- *		Register the advisor as a static background worker at postmaster
- *		startup.  The worker is always registered (its GUCs are SIGHUP
- *		context, so the feature can be switched on without a restart);
- *		while disabled it only sleeps.
+ *		Register the advisor launcher at postmaster startup.
+ *
+ * Always registered, and just the one worker: which databases are analysed
+ * is decided per sweep by the launcher, from each database's own
+ * dbblue_auto_index_suggestion_enabled.  Nothing here depends on a setting
+ * read at startup, which is what removes the restart the old single-database
+ * advisor needed to be re-pointed.
  */
 void
 DbblueIndexAdvisorRegister(void)
@@ -1887,19 +2288,16 @@ DbblueIndexAdvisorRegister(void)
 	if (IsBinaryUpgrade)
 		return;
 
-	if (dbblue_auto_index_suggestion_database == NULL ||
-		dbblue_auto_index_suggestion_database[0] == '\0')
-		return;
-
 	memset(&bgw, 0, sizeof(bgw));
 	bgw.bgw_flags = BGWORKER_SHMEM_ACCESS |
 		BGWORKER_BACKEND_DATABASE_CONNECTION;
 	bgw.bgw_start_time = BgWorkerStart_RecoveryFinished;
 	snprintf(bgw.bgw_library_name, MAXPGPATH, "postgres");
-	snprintf(bgw.bgw_function_name, BGW_MAXLEN, "DbblueIndexAdvisorMain");
-	snprintf(bgw.bgw_name, BGW_MAXLEN, "dbblue index advisor");
-	snprintf(bgw.bgw_type, BGW_MAXLEN, "dbblue index advisor");
-	bgw.bgw_restart_time = 60;
+	snprintf(bgw.bgw_function_name, BGW_MAXLEN,
+			 "DbblueIndexAdvisorLauncherMain");
+	snprintf(bgw.bgw_name, BGW_MAXLEN, "dbblue index advisor launcher");
+	snprintf(bgw.bgw_type, BGW_MAXLEN, "dbblue index advisor launcher");
+	bgw.bgw_restart_time = 5;
 	bgw.bgw_notify_pid = 0;
 	bgw.bgw_main_arg = (Datum) 0;
 

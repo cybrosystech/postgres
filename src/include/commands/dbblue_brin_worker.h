@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * dbblue_brin_worker.h
- *    Background worker for automatic BRIN index creation
+ *    Background workers for automatic BRIN index creation
  *
  * Copyright (c) 2026, Cybrosys Technologies
  *
@@ -15,14 +15,14 @@
 
 #include "utils/guc.h"
 
+/* Launcher: always running, holds no database connection. */
+extern void DBBlueBrinLauncherMain(Datum main_arg);
+extern void DBBlueBrinLauncherRegister(void);
+
+/* Per-database scan worker, started dynamically by the launcher. */
 extern void DBBlueBrinWorkerMain(Datum main_arg);
-extern void DBBlueBrinWorkerRegister(void);
 
-/* GUC check hook for dbblue_create_brin */
-extern bool dbblue_check_create_brin(bool *newval, void **extra,
-									 GucSource source);
-
-/* GUC check hook for dbblue_brin_database */
+/* GUC check hook for the obsolete dbblue_brin_database */
 extern bool dbblue_check_brin_database(char **newval, void **extra,
 									   GucSource source);
 

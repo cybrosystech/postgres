@@ -933,11 +933,13 @@ PostmasterMain(int argc, char *argv[])
 	ApplyLauncherRegister();
 
 	/*
-	 * Register the BRIN worker for automatic BRIN index creation.  Like the
-	 * index advisor, this one always runs; whether it actually creates any
-	 * index is controlled at runtime by dbblue_create_brin.
+	 * Register the BRIN launcher for automatic BRIN index creation.  It
+	 * always runs and holds no database connection; which databases it
+	 * actually creates indexes in is controlled by the per-database
+	 * dbblue_create_brin, which it re-reads on every cycle.
 	 */
-	DBBlueBrinWorkerRegister();
+	DBBlueBrinLauncherRegister();
+
 	/*
 	 * Register the dbblue create standby worker.  Like the apply launcher,
 	 * this is done before any external preloaded library has a chance to
@@ -956,9 +958,11 @@ PostmasterMain(int argc, char *argv[])
 	RepackLauncherRegister();
 
 	/*
-	 * One worker per database named in dbblue_audit_database, so audit log
-	 * retention is enforced on a timer rather than only when something is
-	 * writing to an audited table.
+	 * Register the dbblue audit prune launcher, so audit log retention is
+	 * enforced on a timer rather than only when something is writing to an
+	 * audited table.  It always runs and holds no database connection; which
+	 * databases it sweeps is re-read every cycle from
+	 * dbblue_audit_database.
 	 */
 	DbblueAuditPrunerRegister();
 	/*

@@ -25,10 +25,17 @@ extern PGDLLIMPORT double dbblue_auto_index_suggestion_min_baseline_cost;
 extern PGDLLIMPORT char *dbblue_auto_index_suggestion_database;
 
 extern void DbblueIndexAdvisorRegister(void);
+
+/* Launcher: always running, holds no database connection. */
+extern void DbblueIndexAdvisorLauncherMain(Datum main_arg);
+
+/* Per-database analysis worker, started dynamically by the launcher. */
 extern void DbblueIndexAdvisorMain(Datum main_arg);
 
-/* GUC check hook for dbblue_auto_index_suggestion_enabled */
+/* GUC check hooks */
 extern bool dbblue_check_advisor_enabled(bool *newval, void **extra,
 										 GucSource source);
+extern bool dbblue_check_advisor_database(char **newval, void **extra,
+										  GucSource source);
 
 #endif							/* DBBLUE_INDEX_ADVISOR_H */

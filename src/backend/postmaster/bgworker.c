@@ -143,8 +143,16 @@ static const struct
 		.fn_addr = ApplyLauncherMain
 	},
 	{
+		.fn_name = "DbblueIndexAdvisorLauncherMain",
+		.fn_addr = DbblueIndexAdvisorLauncherMain
+	},
+	{
 		.fn_name = "DbblueIndexAdvisorMain",
 		.fn_addr = DbblueIndexAdvisorMain
+	},
+	{
+		.fn_name = "DbblueAuditPruneLauncherMain",
+		.fn_addr = DbblueAuditPruneLauncherMain
 	},
 	{
 		.fn_name = "AuditPrunerMain",
@@ -185,6 +193,10 @@ static const struct
 	{
 		.fn_name = "DataChecksumsWorkerMain",
 		.fn_addr = DataChecksumsWorkerMain
+	},
+	{
+		.fn_name = "DBBlueBrinLauncherMain",
+		.fn_addr = DBBlueBrinLauncherMain
 	},
 	{
 		.fn_name = "DBBlueBrinWorkerMain",
