@@ -18,6 +18,11 @@
 extern PGDLLIMPORT int dbblue_audit_prune_naptime;
 
 extern void DbblueAuditPrunerRegister(void);
+
+/* Launcher: always running, holds no database connection. */
+extern void DbblueAuditPruneLauncherMain(Datum main_arg);
+
+/* Per-database sweep worker, started dynamically by the launcher. */
 extern void AuditPrunerMain(Datum main_arg);
 
 #endif							/* DBBLUE_AUDIT_PRUNER_H */
