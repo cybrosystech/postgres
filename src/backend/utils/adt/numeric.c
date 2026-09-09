@@ -8001,6 +8001,141 @@ int128_to_numericvar(INT128 val, NumericVar *var)
 }
 
 /*
+ * numeric_to_int64_scaled - extract a numeric as a scaled int64.
+ *
+ * *scale is in/out: pass -1 to adopt the value's own dscale (returned in *scale);
+ * pass a fixed common scale to extract at it. On success *result = value * 10^*scale
+ * as an exact integer (exact because dscale <= *scale). Returns false - so the
+ * caller falls back to full numeric arithmetic - when the input is NaN/Inf,
+ * carries more fractional precision than *scale (dscale > *scale; the caller must
+ * raise the common scale), or does not fit int64. Used by the DBblue columnar
+ * grouped aggregate to sum fixed-scale numerics (money) via an int128 accumulator
+ * instead of per-row numeric_add.
+ */
+bool
+numeric_to_int64_scaled(Numeric num, int *scale, int64 *result)
+{
+	NumericVar	var;
+	NumericDigit *digits;
+	int			ndigits;
+	int			weight;
+	int			i;
+	int			shift;
+	int64		val;
+	bool		neg;
+
+	if (NUMERIC_IS_SPECIAL(num))
+		return false;			/* NaN / +-Inf */
+
+	init_var_from_num(num, &var);
+
+	if (*scale < 0)
+		*scale = var.dscale;	/* adopt this value's scale as the common scale */
+	else if (var.dscale > *scale)
+		return false;			/* needs a higher common scale (caller rescales) */
+
+	ndigits = var.ndigits;
+	if (ndigits == 0)
+	{
+		*result = 0;
+		return true;
+	}
+	weight = var.weight;
+	digits = var.digits;
+	neg = (var.sign == NUMERIC_NEG);
+
+	/* build the base-NBASE digits into one integer (the coefficient) */
+	val = digits[0];
+	for (i = 1; i < ndigits; i++)
+	{
+		if (unlikely(pg_mul_s64_overflow(val, NBASE, &val)))
+			return false;
+		if (unlikely(pg_add_s64_overflow(val, digits[i], &val)))
+			return false;
+	}
+
+	/*
+	 * value = coefficient * 10^(DEC_DIGITS*(weight-ndigits+1)); the wanted result
+	 * is value * 10^scale. The shift is >= 0 unless dscale > scale (rejected
+	 * above), and when it is < 0 the coefficient is exactly divisible.
+	 */
+	shift = DEC_DIGITS * (weight - ndigits + 1) + *scale;
+	if (shift >= 0)
+	{
+		for (; shift > 0; shift--)
+			if (unlikely(pg_mul_s64_overflow(val, INT64CONST(10), &val)))
+				return false;
+	}
+	else
+	{
+		for (; shift < 0; shift++)
+			val /= 10;			/* exact: value fits at dscale <= scale */
+	}
+
+	*result = neg ? -val : val;
+	return true;
+}
+
+/*
+ * numeric_from_int128_scaled - build a Numeric from a scaled int128 accumulator.
+ *
+ * Returns a Numeric equal to acc / 10^scale, carrying exactly `scale` display
+ * digits - matching numeric_sum's result dscale (= the max input dscale, which
+ * for the fixed-scale fast path is the common scale). The inverse of
+ * numeric_to_int64_scaled's accumulation.
+ */
+Numeric
+numeric_from_int128_scaled(INT128 acc, int scale)
+{
+	NumericVar	intg;
+	NumericVar	powv;
+	NumericVar	result;
+	Numeric		res;
+
+	init_var(&intg);
+	init_var(&result);
+
+	int128_to_numericvar(acc, &intg);	/* intg = acc, an integer (dscale 0) */
+
+	if (scale <= 0)
+	{
+		res = make_result(&intg);
+		free_var(&intg);
+		return res;
+	}
+
+	/* powv = 10^scale, then result = intg / powv with `scale` display digits */
+	init_var(&powv);
+	int64_to_numericvar(INT64CONST(1), &powv);
+	{
+		int			s = scale;
+
+		/* 10^scale as a NumericVar (scale is small for money; large scales still
+		 * work, just via repeated *10) */
+		while (s-- > 0)
+		{
+			NumericVar	ten;
+			NumericVar	tmp;
+
+			init_var(&ten);
+			init_var(&tmp);
+			int64_to_numericvar(INT64CONST(10), &ten);
+			mul_var(&powv, &ten, &tmp, 0);
+			set_var_from_var(&tmp, &powv);
+			free_var(&ten);
+			free_var(&tmp);
+		}
+	}
+	div_var(&intg, &powv, &result, scale, true, true);
+
+	res = make_result(&result);
+	free_var(&intg);
+	free_var(&powv);
+	free_var(&result);
+	return res;
+}
+
+/*
  * Convert a NumericVar to float8; if out of range, return +/- HUGE_VAL
  */
 static double

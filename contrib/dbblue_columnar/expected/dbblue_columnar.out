@@ -363,6 +363,228 @@ SELECT 'sp-minmax-spl ', agree($$SELECT g % 3000 m, min(t) a, max(t) b, sum(amt)
 
 RESET work_mem;
 DROP TABLE sp;
+-- ---- fast SUM(numeric): scaled-int128 accumulation ----
+-- Serial sum(numeric) accumulates into a per-group scaled int128 instead of
+-- per-row numeric_avg_accum; values that don't fit the fast lane (higher scale
+-- than the group's, NaN/Inf, int64-overflowing coefficient) fall back to a side
+-- numeric_avg_accum state, combined at finalize. Must be byte-identical to core
+-- INCLUDING display scale, so these cases compare sum(amt)::TEXT (agree() alone
+-- compares numeric VALUES, which ignore dscale). Each case is run twice - with
+-- the fast lane on (default) and off - so heap, the int128 lane, and the generic
+-- lane are all cross-checked. Deterministic data: mixed scales, negatives,
+-- zeros, a scale-escalating group, a NaN, and a coefficient too big for int64.
+CREATE TABLE ns (g int, amt numeric) WITH (autovacuum_enabled = off);
+INSERT INTO ns
+SELECT g % 11,
+	   (ARRAY[ (g % 100)::numeric / 100,		-- scale 2 (money)
+			   (g % 100)::numeric / 1000,		-- scale 3
+			   (g % 7)::numeric,				-- scale 0 (integer)
+			   (g % 50)::numeric / 10000,		-- scale 4
+			   -((g % 30)::numeric / 100) ])[1 + g % 5]		-- negative, scale 2
+FROM generate_series(1, 30000) g;
+-- adversarial fixed rows into groups that ALSO hold fast-lane values above
+INSERT INTO ns VALUES
+	(0, 'NaN'), (1, 0.00), (2, 0), (3, -0.01),
+	(4, 123456789012345678901234567890.12),		-- coeff > int64 -> fallback lane
+	(5, 1.0), (5, 2.00), (5, 3.0000), (5, 4.000000), (5, 5.00);	-- scale escalation
+VACUUM (DISABLE_PAGE_SKIPPING) ns;
+SELECT dbblue_columnar_add('ns', ARRAY['g','amt']);
+ dbblue_columnar_add 
+---------------------
+                   2
+(1 row)
+
+SELECT dbblue_columnar_populate('ns') > 0 AS ns_built;
+ ns_built 
+----------
+ t
+(1 row)
+
+SELECT uses_node($$SELECT g, sum(amt) FROM ns GROUP BY g$$, 'DBBlueColumnarAgg') AS numsum_fires;
+ numsum_fires 
+--------------
+ t
+(1 row)
+
+-- fast lane on (default): heap vs int128
+SELECT 'ns-grouped-f  ', agree($$SELECT g, sum(amt)::text s, count(*) c FROM ns GROUP BY g ORDER BY g$$);
+    ?column?    | agree 
+----------------+-------
+ ns-grouped-f   | ok
+(1 row)
+
+SELECT 'ns-scalar-f   ', agree($$SELECT sum(amt)::text s FROM ns$$);
+    ?column?    | agree 
+----------------+-------
+ ns-scalar-f    | ok
+(1 row)
+
+SELECT 'ns-filter-f   ', agree($$SELECT g, (sum(amt) FILTER (WHERE amt > 0))::text s FROM ns GROUP BY g ORDER BY g$$);
+    ?column?    | agree 
+----------------+-------
+ ns-filter-f    | ok
+(1 row)
+
+SELECT 'ns-where-f    ', agree($$SELECT g, sum(amt)::text s FROM ns WHERE amt <> 0 GROUP BY g ORDER BY g$$);
+    ?column?    | agree 
+----------------+-------
+ ns-where-f     | ok
+(1 row)
+
+-- avg(numeric) shares numeric_avg_accum but is NOT the fast lane (finalfn differs)
+SELECT 'ns-avg-untouch', agree($$SELECT g, avg(amt)::text a, sum(amt)::text s FROM ns GROUP BY g ORDER BY g$$);
+    ?column?    | agree 
+----------------+-------
+ ns-avg-untouch | ok
+(1 row)
+
+-- fast lane off: heap vs generic numeric_avg_accum (must also match, hence match
+-- the fast lane). The GUC flip proves the fast path introduces no divergence.
+SET dbblue_columnar.enable_int128_sum = off;
+SELECT 'ns-grouped-g  ', agree($$SELECT g, sum(amt)::text s, count(*) c FROM ns GROUP BY g ORDER BY g$$);
+    ?column?    | agree 
+----------------+-------
+ ns-grouped-g   | ok
+(1 row)
+
+SELECT 'ns-scalar-g   ', agree($$SELECT sum(amt)::text s FROM ns$$);
+    ?column?    | agree 
+----------------+-------
+ ns-scalar-g    | ok
+(1 row)
+
+SELECT 'ns-filter-g   ', agree($$SELECT g, (sum(amt) FILTER (WHERE amt > 0))::text s FROM ns GROUP BY g ORDER BY g$$);
+    ?column?    | agree 
+----------------+-------
+ ns-filter-g    | ok
+(1 row)
+
+RESET dbblue_columnar.enable_int128_sum;
+DROP TABLE ns;
+-- ---- numeric & float GROUP BY keys ----
+-- The raw-bits group hash cannot compare these by bytes: numeric 1.0 == 1.00 and
+-- float -0.0 == +0.0 / every NaN groups together. numeric keys are value-interned
+-- to the FIRST-SEEN representation, so the emitted key keeps core HashAgg's
+-- byte-identical display scale (hence these cases compare the key ::text). float
+-- keys are normalized in place (-0.0 -> +0.0, one canonical NaN) - float group
+-- ordering/representation is a documented non-defect, so float cases compare by
+-- value via agree(). Deterministic data mixes value-equal numeric scales and the
+-- float zero-sign / NaN edges.
+CREATE TABLE nk (id int, nk numeric, f8 float8, f4 float4, amt numeric)
+	WITH (autovacuum_enabled = off);
+INSERT INTO nk
+SELECT g,
+	   (ARRAY[1.0, 1.00, 2.5, 2.50, 2.500, 3, 3.0, 1.000])[1 + g % 8],
+	   (ARRAY[0.0::float8, -0.0, 1.5, 2.5, 'NaN', '-0'])[1 + g % 6],
+	   (ARRAY[0.0::float4, -0.0, 1.25, 'NaN'])[1 + g % 4],
+	   (g % 100) * 1.5
+FROM generate_series(1, 20000) g;
+VACUUM (DISABLE_PAGE_SKIPPING) nk;
+SELECT dbblue_columnar_add('nk', ARRAY['id','nk','f8','f4','amt']);
+ dbblue_columnar_add 
+---------------------
+                   5
+(1 row)
+
+SELECT dbblue_columnar_populate('nk') > 0 AS nk_built;
+ nk_built 
+----------
+ t
+(1 row)
+
+SELECT uses_node($$SELECT nk, count(*) FROM nk GROUP BY nk$$, 'DBBlueColumnarAgg') AS numkey_fires;
+ numkey_fires 
+--------------
+ t
+(1 row)
+
+SELECT uses_node($$SELECT f8, count(*) FROM nk GROUP BY f8$$, 'DBBlueColumnarAgg') AS fltkey_fires;
+ fltkey_fires 
+--------------
+ t
+(1 row)
+
+-- numeric key: byte-identical INCLUDING display scale (compare key ::text)
+SELECT 'nk-numkey     ', agree($$SELECT nk::text k, sum(amt)::text s, count(*) c FROM nk GROUP BY nk ORDER BY 1$$);
+    ?column?    | agree 
+----------------+-------
+ nk-numkey      | ok
+(1 row)
+
+SELECT 'nk-num+int    ', agree($$SELECT id % 7 g, nk::text k, count(*) c FROM nk GROUP BY id % 7, nk ORDER BY 1, 2$$);
+    ?column?    | agree 
+----------------+-------
+ nk-num+int     | ok
+(1 row)
+
+SELECT 'nk-num-expr   ', agree($$SELECT round(amt, 0)::text r, count(*) c FROM nk GROUP BY round(amt, 0) ORDER BY 1$$);
+    ?column?    | agree 
+----------------+-------
+ nk-num-expr    | ok
+(1 row)
+
+SELECT 'nk-num-aggs   ', agree($$SELECT nk::text k, sum(amt)::text s, avg(amt)::text a, min(amt)::text mn, max(amt)::text mx FROM nk GROUP BY nk ORDER BY 1$$);
+    ?column?    | agree 
+----------------+-------
+ nk-num-aggs    | ok
+(1 row)
+
+-- float keys: value-based grouping (agree() compares values; -0/+0 & NaN fold)
+SELECT 'nk-f8key      ', agree($$SELECT f8, count(*) c, sum(amt)::text s FROM nk GROUP BY f8 ORDER BY f8$$);
+    ?column?    | agree 
+----------------+-------
+ nk-f8key       | ok
+(1 row)
+
+SELECT 'nk-f4key      ', agree($$SELECT f4, count(*) c FROM nk GROUP BY f4 ORDER BY f4$$);
+    ?column?    | agree 
+----------------+-------
+ nk-f4key       | ok
+(1 row)
+
+SELECT 'nk-f8+int     ', agree($$SELECT id % 5 g, f8, count(*) c FROM nk GROUP BY id % 5, f8 ORDER BY 1, 2$$);
+    ?column?    | agree 
+----------------+-------
+ nk-f8+int      | ok
+(1 row)
+
+DROP TABLE nk;
+-- forced multi-pass spill on a NUMERIC key: a low reltuples lie lets the columnar
+-- agg be chosen, then the real 40000 distinct numeric keys overflow a small
+-- work_mem and the node spills (re-scans, aggregating one hash-partition per
+-- pass). The content parthash routes by numeric VALUE, stable across passes.
+CREATE TABLE nsp (nk numeric, amt numeric) WITH (autovacuum_enabled = off);
+INSERT INTO nsp SELECT g::numeric / 100, (g % 50) * 1.5 FROM generate_series(1, 40000) g;
+VACUUM (DISABLE_PAGE_SKIPPING) nsp;
+SELECT dbblue_columnar_add('nsp', ARRAY['nk','amt']);
+ dbblue_columnar_add 
+---------------------
+                   2
+(1 row)
+
+SELECT dbblue_columnar_populate('nsp') > 0 AS nsp_built;
+ nsp_built 
+-----------
+ t
+(1 row)
+
+ANALYZE nsp;
+UPDATE pg_class SET reltuples = 400 WHERE relname = 'nsp';
+SET work_mem = '256kB';
+SELECT uses_node($$SELECT nk, sum(amt) FROM nsp GROUP BY nk$$, 'DBBlueColumnarAgg') AS numspill_fires;
+ numspill_fires 
+----------------
+ t
+(1 row)
+
+SELECT 'nk-num-spill  ', agree($$SELECT nk::text k, sum(amt)::text s, count(*) c FROM nsp GROUP BY nk ORDER BY 1$$);
+    ?column?    | agree 
+----------------+-------
+ nk-num-spill   | ok
+(1 row)
+
+RESET work_mem;
+DROP TABLE nsp;
 -- ---- correctness under a rescan (LATERAL nestloop, columnar agg on inner) ----
 SELECT 'rescan        ', agree($$SELECT o.k, g.s FROM (VALUES (1),(3),(5)) o(k)
 	JOIN LATERAL (SELECT k7 kk, sum(amt) s FROM t GROUP BY k7) g ON g.kk = o.k ORDER BY o.k$$);

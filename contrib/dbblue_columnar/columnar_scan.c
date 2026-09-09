@@ -86,11 +86,14 @@
 #include "common/hashfn.h"
 #include "utils/datum.h"
 #include "utils/expandeddatum.h"
+#include "utils/float.h"
 #include "utils/fmgroids.h"
+#include "utils/fmgrprotos.h"
 #include "utils/hsearch.h"
 #include "lib/stringinfo.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/numeric.h"
 #include "utils/rel.h"
 #include "utils/selfuncs.h"
 #include "utils/snapmgr.h"
@@ -2266,8 +2269,21 @@ typedef struct DbbcAggItem
 
 /* ---- grouped mode (M5) ---- */
 
-/* group keys are hashed on raw Datum bits: bounded count, byval types only */
+/* group keys are hashed on raw Datum bits: bounded count, canonicalized first */
 #define DBBC_GRP_MAX_KEYS		4
+
+/*
+ * Per-key canonicalization needed to make the raw-bits group hash agree with
+ * core HashAgg's grouping equality (see key_kind[] in DbbcAggScanState).
+ */
+typedef enum DbbcGrpKeyKind
+{
+	DBBC_KEY_BYVAL = 0,			/* int/date/bool/oid/time*: raw bits are the key */
+	DBBC_KEY_TEXT,				/* text/varchar: byte-intern (determ. collation) */
+	DBBC_KEY_NUMERIC,			/* numeric: value-intern, first-seen canonical */
+	DBBC_KEY_FLOAT4,			/* float4: normalize -0.0/+0.0 and NaN in place */
+	DBBC_KEY_FLOAT8				/* float8: normalize -0.0/+0.0 and NaN in place */
+} DbbcGrpKeyKind;
 /* plan-time dNumGroups gate: the group hash has no spill path */
 #define DBBC_GRP_MAX_GROUPS		100000
 /* multi-pass spill: max hash bits used to partition (2^24 leaf partitions) */
@@ -2310,7 +2326,43 @@ typedef struct DbbcAggTrans
 	 */
 	DbbcSkipQual *filter;
 	int			nfilter;
+
+	/*
+	 * Fast SUM(numeric): the generic path runs numeric_avg_accum (an INTERNAL
+	 * NumericAggState) per row, i.e. one numeric_add of variable-length digit
+	 * arrays for every input. When this is a plain serial sum(numeric)
+	 * (F_SUM_NUMERIC, non-partial), we instead accumulate into a per-group
+	 * scaled int128 (DbbcNumSum): extract each fixed-scale value to a scaled
+	 * int64 and int128_add it, finalizing once at emit. Values that don't fit
+	 * the fast lane (higher scale, NaN/Inf, int64-overflowing coefficient) fall
+	 * back to a side numeric_avg_accum state, combined at finalize - so the
+	 * result stays byte-identical to core sum(numeric). Serial only: partial
+	 * (parallel) mode must emit a serialize-able NumericAggState, so is_numsum
+	 * stays false there and the generic transfn path runs.
+	 */
+	bool		is_numsum;
 } DbbcAggTrans;
+
+/*
+ * Per-group accumulator for the fast SUM(numeric) path. Stored (by pointer) in
+ * the group's DbbcTransState.transValue, lazily allocated in the group context
+ * on the group's first non-NULL input. `scale` is the common scale, adopted
+ * from the first value's dscale and never lowered; any later value carrying
+ * MORE fractional digits than `scale` (or NaN/Inf, or too large for int64) is
+ * routed to `fallback` (a standard numeric_avg_accum state) instead of the
+ * int128 lane. At finalize, result = numeric_from_int128_scaled(acc, scale)
+ * plus (if used) the finalized fallback - numeric_add's max-dscale rule makes
+ * the combined display scale match core's max-input-dscale exactly.
+ */
+typedef struct DbbcNumSum
+{
+	INT128		acc;			/* running sum, scaled by 10^scale (palloc0 => 0) */
+	int			scale;			/* common scale; -1 until the first value sets it */
+	bool		used_fast;		/* at least one value entered the int128 lane */
+	bool		used_fallback;	/* at least one value went to the fallback state */
+	Datum		fallback;		/* NumericAggState* (INTERNAL), or 0 */
+	bool		fallback_isnull;
+} DbbcNumSum;
 
 /* per-group per-aggregate running state (mirrors AggStatePerGroupData) */
 typedef struct DbbcTransState
@@ -2419,23 +2471,33 @@ typedef struct DbbcAggScanState
 	int			nkeys;
 	AttrNumber	key_attnos[DBBC_GRP_MAX_KEYS];	/* bare-Var key: the column; else Invalid */
 	/*
-	 * Text group keys (text/varchar, deterministic collation only). The raw-bits
-	 * group hash needs byte-comparable fixed slots, so a text key value is first
-	 * canonicalized through key_intern to a single stable groupctx pointer (equal
-	 * bytes -> same pointer); the fast byval path never touches this.
+	 * Group-key kind per column. The group hash compares raw Datum bits, so a
+	 * key type whose SQL grouping equality is NOT bit equality must be
+	 * canonicalized to a byte-comparable fixed slot first (dbbc_grp_lookup):
+	 *   TEXT    - text/varchar under a deterministic collation: byte-interned to
+	 *             one stable groupctx pointer (equal bytes -> same pointer).
+	 *   NUMERIC - value-interned (1.0 == 1.00, NaN == NaN) to the FIRST-SEEN
+	 *             representation's pointer, so the emitted key keeps core
+	 *             HashAgg's byte-identical display scale.
+	 *   FLOAT4/8- normalized in place (byval): -0.0 -> +0.0 and every NaN -> one
+	 *             canonical NaN, matching the float hash opclass's grouping.
+	 * BYVAL keys (int/date/bool/...) go straight in. TEXT/NUMERIC are varlena and
+	 * must also be flat-copied off the transient scan slot before interning.
 	 */
-	bool		key_is_text[DBBC_GRP_MAX_KEYS];
-	bool		has_varlena_key;	/* any key_is_text[]: build key_intern */
+	DbbcGrpKeyKind key_kind[DBBC_GRP_MAX_KEYS];
+	bool		has_text_key;	/* any TEXT key: build key_intern */
+	bool		has_numeric_key;	/* any NUMERIC key: build key_intern_num */
 	HTAB	   *key_intern;			/* text value -> canonical groupctx pointer */
+	HTAB	   *key_intern_num;		/* numeric value -> canonical groupctx pointer */
 
 	/*
 	 * Expression group keys (e.g. date_trunc('month', datecol)). key_exprstate[k]
 	 * is NULL for a bare-Var key (read the column directly via key_attnos[k]),
 	 * else the compiled expression, evaluated per row over key_slot (populated
 	 * with the referenced columns; econtext->ecxt_scantuple = key_slot). The
-	 * result type is byval + bit-equality-safe (validated at plan time), so the
-	 * Datum goes straight into the raw-bits group hash. The input columns are in
-	 * the used/used_types set so the per-block type-identity gate covers them.
+	 * result Datum is canonicalized by key_kind (dbbc_grp_key_canon) before it
+	 * enters the raw-bits group hash. The input columns are in the used/used_types
+	 * set so the per-block type-identity gate covers them.
 	 */
 	bool		has_key_exprs;
 	ExprState **key_exprstate;	/* [nkeys], entry NULL for a bare-Var key */
@@ -2699,9 +2761,32 @@ dbbc_grp_key_type_ok(Oid typid)
 		case TIMESTAMPTZOID:
 		case TEXTOID:
 		case VARCHAROID:
+		case NUMERICOID:
+		case FLOAT4OID:
+		case FLOAT8OID:
 			return true;
 	}
 	return false;
+}
+
+/* the canonicalization kind for a supported group-key type (see DbbcGrpKeyKind) */
+static DbbcGrpKeyKind
+dbbc_grp_key_kind(Oid typid)
+{
+	switch (typid)
+	{
+		case TEXTOID:
+		case VARCHAROID:
+			return DBBC_KEY_TEXT;
+		case NUMERICOID:
+			return DBBC_KEY_NUMERIC;
+		case FLOAT4OID:
+			return DBBC_KEY_FLOAT4;
+		case FLOAT8OID:
+			return DBBC_KEY_FLOAT8;
+		default:
+			return DBBC_KEY_BYVAL;
+	}
 }
 
 /* true iff the type is a supported group-key type AND, for text/varchar, the
@@ -3026,9 +3111,12 @@ dbbc_agg_grouped_classify(PlannerInfo *root, RelOptInfo *input_rel,
 	}
 
 	/*
-	 * Group keys: a bare Var, or a non-volatile expression whose result type is
-	 * bit-equality-safe by-value (hashed on raw Datum bits) and whose input Vars
-	 * are all live columns of this relation (e.g. date_trunc('month', datecol)).
+	 * Group keys: a bare Var, or a non-volatile expression whose result type is a
+	 * supported group-key type (dbbc_grp_key_ok) and whose input Vars are all
+	 * live columns of this relation (e.g. date_trunc('month', datecol)). The key
+	 * value is hashed on raw Datum bits after per-kind canonicalization
+	 * (dbbc_grp_key_canon): byval types go straight in; text/numeric are interned
+	 * and float normalized so bit equality matches core's grouping equality.
 	 * Deduplicated by equal(); the per-key expression is stored and, at Begin,
 	 * either read directly (bare Var) or compiled to an ExprState.
 	 */
@@ -4395,12 +4483,15 @@ dbbc_dim_build(DbbcAggScanState *as, EState *estate)
 											 &e->nulls[k]);
 
 				/*
-				 * A text dim key must outlive the scan slot (freed as the scan
-				 * advances) and any toast, so copy it flat into the dim context.
-				 * byval keys are stored as-is. The value is later canonicalized
-				 * through key_intern at group-probe time.
+				 * A varlena dim key (text or numeric) must outlive the scan slot
+				 * (freed as the scan advances) and any toast, so copy it flat into
+				 * the dim context. byval keys (incl. float) are stored as-is. The
+				 * value is later canonicalized through the intern tables at
+				 * group-probe time.
 				 */
-				if (!e->nulls[k] && as->key_is_text[k])
+				if (!e->nulls[k] &&
+					(as->key_kind[k] == DBBC_KEY_TEXT ||
+					 as->key_kind[k] == DBBC_KEY_NUMERIC))
 				{
 					MemoryContext old = MemoryContextSwitchTo(as->dim_ctx);
 
@@ -4435,15 +4526,17 @@ dbbc_grp_begin(DbbcAggScanState *as, List *payload, EState *estate, int eflags)
 	as->key_exprstate = (ExprState **)
 		palloc0(Max(as->nkeys, 1) * sizeof(ExprState *));
 	as->has_key_exprs = false;
-	as->has_varlena_key = false;
+	as->has_text_key = false;
+	as->has_numeric_key = false;
 	i = 0;
 	foreach(lc, keyexprs)
 	{
 		Node	   *kexpr = (Node *) lfirst(lc);
 		Oid			ktype = exprType(kexpr);
 
-		as->key_is_text[i] = (ktype == TEXTOID || ktype == VARCHAROID);
-		as->has_varlena_key |= as->key_is_text[i];
+		as->key_kind[i] = dbbc_grp_key_kind(ktype);
+		as->has_text_key |= (as->key_kind[i] == DBBC_KEY_TEXT);
+		as->has_numeric_key |= (as->key_kind[i] == DBBC_KEY_NUMERIC);
 
 		if (IsA(kexpr, Var))
 		{
@@ -4596,6 +4689,17 @@ dbbc_grp_begin(DbbcAggScanState *as, List *payload, EState *estate, int eflags)
 			t->input_attno = ((Var *) arg)->varattno;
 			t->numTransInputs = 1;
 		}
+
+		/*
+		 * Fast SUM(numeric) lane (serial only). Wired further below in
+		 * dbbc_grp_advance / dbbc_grp_emit_group; needs the single Var input we
+		 * just resolved. Partial mode keeps the generic numeric_avg_accum path
+		 * (its state must serialize across the worker boundary).
+		 */
+		t->is_numsum = (dbblue_columnar_enable_int128_sum &&
+						!as->partial &&
+						aggref->aggfnoid == F_SUM_NUMERIC &&
+						t->numTransInputs == 1);
 
 		/*
 		 * FILTER (WHERE ...): rebuild the per-agg qual list from the Aggref
@@ -5122,10 +5226,102 @@ dbbc_intern_text(DbbcAggScanState *as, Datum d)
 }
 
 /*
+ * key_intern_num: a numeric-VALUE hash. Unlike text, numeric grouping equality
+ * is NOT byte equality (1.0 == 1.00, and every NaN groups together), so the
+ * callbacks run the builtin hash_numeric / numeric_eq rather than hashing bytes.
+ * The canonical pointer is the FIRST-SEEN representation, so the emitted group
+ * key carries the same display scale core HashAgg would output (which likewise
+ * keeps the first tuple's value) - byte-identical given the shared scan order.
+ */
+static uint32
+dbbc_numintern_hash(const void *key, Size keysize)
+{
+	return DatumGetUInt32(DirectFunctionCall1(hash_numeric, *(const Datum *) key));
+}
+
+static int
+dbbc_numintern_match(const void *key1, const void *key2, Size keysize)
+{
+	return DatumGetBool(DirectFunctionCall2(numeric_eq,
+											*(const Datum *) key1,
+											*(const Datum *) key2)) ? 0 : 1;
+}
+
+/* numeric analogue of dbbc_intern_text: value-equal numerics share one pointer */
+static Datum
+dbbc_intern_numeric(DbbcAggScanState *as, Datum d)
+{
+	Datum		flat = PointerGetDatum(pg_detoast_datum((struct varlena *)
+													   DatumGetPointer(d)));
+	Datum	   *slot;
+	bool		found;
+
+	slot = (Datum *) hash_search(as->key_intern_num, &flat, HASH_ENTER, &found);
+	if (!found)
+	{
+		MemoryContext old = MemoryContextSwitchTo(as->groupctx);
+
+		*slot = datumCopy(flat, false, -1);		/* flat numeric: typbyval=f typlen=-1 */
+		MemoryContextSwitchTo(old);
+	}
+	return *slot;
+}
+
+/*
+ * Normalize a float group-key Datum so bit equality matches the float hash
+ * opclass's grouping: fold -0.0 to +0.0 (they compare equal) and collapse every
+ * NaN bit pattern to one canonical NaN (all NaNs group together). byval, so the
+ * normalized Datum drops straight into the raw-bits group hash - no intern table.
+ */
+static inline Datum
+dbbc_norm_float8(Datum d)
+{
+	float8		v = DatumGetFloat8(d);
+
+	if (unlikely(isnan(v)))
+		return Float8GetDatum(get_float8_nan());
+	if (v == 0.0)				/* also matches -0.0 */
+		return Float8GetDatum(0.0);
+	return d;
+}
+
+static inline Datum
+dbbc_norm_float4(Datum d)
+{
+	float4		v = DatumGetFloat4(d);
+
+	if (unlikely(isnan(v)))
+		return Float4GetDatum(get_float4_nan());
+	if (v == 0.0f)				/* also matches -0.0 */
+		return Float4GetDatum(0.0f);
+	return d;
+}
+
+/* canonicalize one non-NULL group-key Datum per its kind (see DbbcGrpKeyKind) */
+static inline Datum
+dbbc_grp_key_canon(DbbcAggScanState *as, int k, Datum v)
+{
+	switch (as->key_kind[k])
+	{
+		case DBBC_KEY_TEXT:
+			return dbbc_intern_text(as, v);
+		case DBBC_KEY_NUMERIC:
+			return dbbc_intern_numeric(as, v);
+		case DBBC_KEY_FLOAT4:
+			return dbbc_norm_float4(v);
+		case DBBC_KEY_FLOAT8:
+			return dbbc_norm_float8(v);
+		case DBBC_KEY_BYVAL:
+			break;
+	}
+	return v;
+}
+
+/*
  * Content hash of the group key, stable across passes (independent of the
- * per-pass text interning - it hashes the text bytes, not the interned pointer).
- * Used only while spilling to route each row to one hash-partition; equal keys
- * always land in the same partition, so a row is aggregated in exactly one pass.
+ * per-pass interning - it hashes the value, not the interned pointer). Used only
+ * while spilling to route each row to one hash-partition; equal keys always land
+ * in the same partition, so a row is aggregated in exactly one pass.
  */
 static uint32
 dbbc_grp_parthash(DbbcAggScanState *as, Datum *keyvals, bool *keynulls)
@@ -5139,12 +5335,22 @@ dbbc_grp_parthash(DbbcAggScanState *as, Datum *keyvals, bool *keynulls)
 
 		if (keynulls[k])
 			kh = 0x9e3779b9;
-		else if (as->key_is_text[k])
+		else if (as->key_kind[k] == DBBC_KEY_TEXT)
 		{
 			text	   *t = DatumGetTextPP(keyvals[k]);
 
 			kh = hash_bytes((const unsigned char *) VARDATA_ANY(t),
 							VARSIZE_ANY_EXHDR(t));
+		}
+		else if (as->key_kind[k] == DBBC_KEY_NUMERIC)
+			kh = DatumGetUInt32(DirectFunctionCall1(hash_numeric, keyvals[k]));
+		else if (as->key_kind[k] == DBBC_KEY_FLOAT4 ||
+				 as->key_kind[k] == DBBC_KEY_FLOAT8)
+		{
+			/* hash the NORMALIZED bits so -0.0/+0.0 and all NaNs co-locate */
+			Datum		nv = dbbc_grp_key_canon(as, k, keyvals[k]);
+
+			kh = hash_bytes((const unsigned char *) &nv, sizeof(Datum));
 		}
 		else
 			kh = hash_bytes((const unsigned char *) &keyvals[k], sizeof(Datum));
@@ -5177,10 +5383,8 @@ dbbc_grp_lookup(DbbcAggScanState *as, Datum *keyvals, bool *keynulls)
 	{
 		if (keynulls[k])
 			key.nullmask |= ((uint32) 1) << k;
-		else if (as->key_is_text[k])
-			key.vals[k] = dbbc_intern_text(as, keyvals[k]);
 		else
-			key.vals[k] = keyvals[k];
+			key.vals[k] = dbbc_grp_key_canon(as, k, keyvals[k]);
 	}
 	entry = (DbbcGroupEntry *) hash_search(as->groups, &key,
 										   HASH_ENTER, &found);
@@ -5238,6 +5442,30 @@ dbbc_grp_lookup(DbbcAggScanState *as, Datum *keyvals, bool *keynulls)
 }
 
 /*
+ * Fast SUM(numeric): route one value that did not fit the int128 lane (higher
+ * scale than the group's, NaN/Inf, or an int64-overflowing coefficient) through
+ * the standard numeric_avg_accum transition, maintaining a side NumericAggState
+ * in ns->fallback. numeric_avg_accum is non-strict and builds its state on the
+ * first call (args[0] NULL); the INTERNAL state is pass-by-value (a pointer) and
+ * self-manages its memory in groupctx via AggCheckCallContext, so no by-ref copy
+ * is needed here. `value` is the raw, non-NULL input Datum.
+ */
+static inline void
+dbbc_numsum_fallback(DbbcAggTrans *t, DbbcNumSum *ns, Datum value)
+{
+	FunctionCallInfo fcinfo = t->trans_fcinfo;
+
+	fcinfo->args[0].value = ns->fallback;
+	fcinfo->args[0].isnull = ns->fallback_isnull;
+	fcinfo->args[1].value = value;
+	fcinfo->args[1].isnull = false;
+	fcinfo->isnull = false;
+	ns->fallback = FunctionCallInvoke(fcinfo);
+	ns->fallback_isnull = fcinfo->isnull;
+	ns->used_fallback = true;
+}
+
+/*
  * Advance every aggregate's transition state for the current row (inputs in
  * as->in_vals/in_nulls). Mirrors the EEOP_AGG_PLAIN_TRANS* interpreter steps:
  * strict transfns skip NULL inputs and NULL states; strict aggregates with a
@@ -5259,9 +5487,54 @@ dbbc_grp_advance(DbbcAggScanState *as, DbbcGroupEntry *grp)
 	{
 		DbbcAggTrans *t = &as->trans[a];
 		DbbcTransState *st = &grp->states[a];
+		DbbcNumSum *ns;
+		Numeric		num;
+		int64		val;
+
+		if (!t->is_numsum)
+			continue;			/* generic aggregates handled in the loop below */
+
+		/* FILTER: this row does not contribute to this aggregate */
+		if (t->nfilter > 0 && !as->in_filterpass[a])
+			continue;
+		if (as->in_nulls[a])
+			continue;			/* sum ignores NULL inputs */
+
+		/* lazily create the per-group int128 accumulator in the group context */
+		ns = (DbbcNumSum *) DatumGetPointer(st->transValue);
+		if (ns == NULL)
+		{
+			MemoryContext oldctx = MemoryContextSwitchTo(as->groupctx);
+
+			ns = (DbbcNumSum *) palloc0(sizeof(DbbcNumSum));
+			ns->scale = -1;			/* adopt the first value's dscale */
+			ns->fallback = (Datum) 0;
+			ns->fallback_isnull = true;
+			MemoryContextSwitchTo(oldctx);
+			st->transValue = PointerGetDatum(ns);
+			st->transValueIsNull = false;
+		}
+
+		num = DatumGetNumeric(as->in_vals[a]);
+		if (numeric_to_int64_scaled(num, &ns->scale, &val))
+		{
+			int128_add_int64(&ns->acc, val);
+			ns->used_fast = true;
+		}
+		else
+			dbbc_numsum_fallback(t, ns, as->in_vals[a]);
+	}
+
+	for (a = 0; a < as->ntrans; a++)
+	{
+		DbbcAggTrans *t = &as->trans[a];
+		DbbcTransState *st = &grp->states[a];
 		FunctionCallInfo fcinfo = t->trans_fcinfo;
 		MemoryContext oldctx;
 		Datum		newVal;
+
+		if (t->is_numsum)
+			continue;			/* handled in the fast SUM(numeric) loop above */
 
 		/*
 		 * FILTER (WHERE ...): this row does not contribute to this aggregate.
@@ -5780,9 +6053,10 @@ dbbc_grp_build(DbbcAggScanState *as, EState *estate)
 								 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 	}
 
-	/* text group keys: build the canonicalizing intern table (in groupctx, so it
-	 * is reset/freed together with the groups). */
-	if (as->has_varlena_key && as->key_intern == NULL)
+	/* text/numeric group keys: build the canonicalizing intern tables (in
+	 * groupctx, so they are reset/freed together with the groups). Text interns
+	 * by bytes; numeric interns by value (own hash/match callbacks). */
+	if (as->has_text_key && as->key_intern == NULL)
 	{
 		HASHCTL		ictl;
 
@@ -5794,6 +6068,20 @@ dbbc_grp_build(DbbcAggScanState *as, EState *estate)
 		as->key_intern = hash_create("dbblue_columnar key intern", 256, &ictl,
 									 HASH_ELEM | HASH_FUNCTION | HASH_COMPARE |
 									 HASH_CONTEXT);
+	}
+	if (as->has_numeric_key && as->key_intern_num == NULL)
+	{
+		HASHCTL		ictl;
+
+		ictl.keysize = sizeof(Datum);
+		ictl.entrysize = sizeof(Datum);
+		ictl.hcxt = as->groupctx;
+		ictl.hash = dbbc_numintern_hash;
+		ictl.match = dbbc_numintern_match;
+		as->key_intern_num = hash_create("dbblue_columnar numeric key intern",
+										 256, &ictl,
+										 HASH_ELEM | HASH_FUNCTION | HASH_COMPARE |
+										 HASH_CONTEXT);
 	}
 
 	Assert(sc != NULL);			/* bound at Begin / InitializeWorkerCustomScan */
@@ -5900,7 +6188,55 @@ dbbc_grp_emit_group(DbbcAggScanState *as, DbbcGroupEntry *grp)
 			DbbcAggTrans *t = &as->trans[a];
 			DbbcTransState *st = &grp->states[a];
 
-			if (as->partial)
+			if (t->is_numsum)
+			{
+				/*
+				 * Fast SUM(numeric) finalize (serial only). Combine the int128
+				 * lane with any fallback numeric_avg_accum remainder. ns == NULL
+				 * means the group had no non-NULL input -> SQL sum is NULL. The
+				 * combine uses numeric_add, whose max-dscale rule reproduces
+				 * core's "result scale = max input dscale" byte for byte.
+				 */
+				DbbcNumSum *ns = (DbbcNumSum *) DatumGetPointer(st->transValue);
+
+				if (ns == NULL)
+				{
+					slot->tts_values[i] = (Datum) 0;
+					slot->tts_isnull[i] = true;
+				}
+				else
+				{
+					Numeric		fastnum = NULL;
+					Numeric		fbnum = NULL;
+					Numeric		resnum;
+
+					if (ns->used_fast)
+						fastnum = numeric_from_int128_scaled(ns->acc, ns->scale);
+					if (ns->used_fallback)
+					{
+						LOCAL_FCINFO(fcinfo, 1);
+
+						InitFunctionCallInfoData(*fcinfo, &t->finalfn, 1,
+												 t->aggref->inputcollid,
+												 (Node *) as->fake_aggstate, NULL);
+						fcinfo->args[0].value = ns->fallback;
+						fcinfo->args[0].isnull = ns->fallback_isnull;
+						fcinfo->isnull = false;
+						fbnum = DatumGetNumeric(FunctionCallInvoke(fcinfo));
+					}
+
+					if (fastnum && fbnum)
+						resnum = numeric_add_safe(fastnum, fbnum, NULL);
+					else
+						resnum = fastnum ? fastnum : fbnum;
+
+					slot->tts_values[i] =
+						MakeExpandedObjectReadOnly(NumericGetDatum(resnum),
+												   false, t->resulttypeLen);
+					slot->tts_isnull[i] = false;
+				}
+			}
+			else if (as->partial)
 			{
 				/*
 				 * Parallel partial output (AGGSPLIT_INITIAL_SERIAL): emit the
@@ -6034,6 +6370,7 @@ dbbc_grp_exec(DbbcAggScanState *as, EState *estate)
 				MemoryContextReset(as->groupctx);
 				as->groups = NULL;
 				as->key_intern = NULL;
+				as->key_intern_num = NULL;
 			}
 			as->part_overflow = false;
 			as->grp_since_memcheck = 0;

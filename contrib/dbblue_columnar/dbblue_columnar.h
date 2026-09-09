@@ -250,6 +250,7 @@ extern int	dbblue_columnar_memory_mb;
 extern bool dbblue_columnar_log_coverage_misses;
 extern bool dbblue_columnar_enable_restamp;
 extern bool dbblue_columnar_enable_dimjoin_agg;
+extern bool dbblue_columnar_enable_int128_sum;
 extern int	dbblue_columnar_dimjoin_max_dim_rows;
 
 /* columnar_store.c */

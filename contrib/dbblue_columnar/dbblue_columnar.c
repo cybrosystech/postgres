@@ -55,6 +55,7 @@ int			dbblue_columnar_memory_mb = 128;
 bool		dbblue_columnar_log_coverage_misses = true;
 bool		dbblue_columnar_enable_restamp = true;
 bool		dbblue_columnar_enable_dimjoin_agg = false;
+bool		dbblue_columnar_enable_int128_sum = true;
 int			dbblue_columnar_dimjoin_max_dim_rows = 65536;
 static bool dbblue_columnar_auto_columnarize = false;
 
@@ -510,6 +511,19 @@ _PG_init(void)
 							 "plan - it is never made incorrect.",
 							 &dbblue_columnar_enable_dimjoin_agg,
 							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("dbblue_columnar.enable_int128_sum",
+							 "Accumulate serial SUM(numeric) into a scaled int128 "
+							 "instead of per-row numeric_avg_accum.",
+							 "Fixed-scale values sum in an int128 lane; higher-scale/"
+							 "NaN/overflowing values fall back to numeric_avg_accum, "
+							 "combined at finalize - byte-identical to core sum(numeric). "
+							 "Off restores the generic transition path.",
+							 &dbblue_columnar_enable_int128_sum,
+							 true,
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);
