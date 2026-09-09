@@ -48,11 +48,14 @@
 #include "postgres.h"
 
 #include "access/xlogdefs.h"
+#include "datatype/timestamp.h"
 #include "lib/dshash.h"
+#include "nodes/pathnodes.h"
 #include "nodes/pg_list.h"
 #include "port/atomics.h"
 #include "storage/block.h"
 #include "storage/buf.h"
+#include "storage/lwlock.h"
 #include "utils/dsa.h"
 #include "utils/relcache.h"
 
@@ -243,6 +246,126 @@ typedef struct DbbcRelEntry
 	dsa_pointer version;		/* DbbcRelVersion, Invalid if none */
 } DbbcRelEntry;
 
+/*
+ * ---------------------------------------------------------------------------
+ * Workload advisor (columnar_suggest.c)
+ *
+ * The advisor answers "which columns of which table should be columnarized?"
+ * from the actual workload, instead of making the admin guess. Two planner
+ * hooks record evidence into the fixed-size shared table below; a flush drains
+ * it into the dbblue_columnar_suggestions tables, where an admin reviews it.
+ *
+ * The unit of advice is a BUNDLE: one (relation, query shape) pair together
+ * with the complete set of columns that shape touches. It has to be atomic,
+ * because dbbc_rel_ready() disqualifies a columnar scan when ANY referenced
+ * column is unregistered - so registering 8 of a shape's 9 columns buys
+ * exactly zero speedup. A per-column suggestion list would invite precisely
+ * that mistake.
+ *
+ * Two properties of this shared table are load-bearing:
+ *
+ * 1. It is in MAIN shared memory (RegisterShmemCallbacks), reserved at
+ *    postmaster start, NOT in the column store's DSA. Collector bytes must
+ *    never be drawn from the dbblue_columnar.memory_mb budget: that budget is
+ *    the store's, dbblue_columnar_memory_status divides by it, and charging
+ *    advice against it would make pct_of_budget lie. Main shmem also cannot
+ *    fail to allocate at runtime, whereas a lazily-created DSM segment could
+ *    ereport inside a user's planner.
+ *
+ * 2. It NEVER allocates and NEVER waits. Entries are fixed-size slots claimed
+ *    by linear probing under a stripe lock taken with
+ *    LWLockConditionalAcquire: a contended or full table drops the
+ *    observation and bumps a counter rather than delaying a query. Advice is
+ *    best-effort by definition; a query is not.
+ * ---------------------------------------------------------------------------
+ */
+
+/*
+ * Width of the per-bundle column bitmap. Attnums are never reused (a dropped
+ * column keeps its attnum), so this is a ceiling on a table's lifetime column
+ * count, not its live one - hence 512 rather than something snug around the
+ * ~100-200 columns of a wide Odoo table. Bundles that reference an attnum
+ * past this set att_overflow and are reported but never auto-applied.
+ */
+#define DBBC_SUGG_ATTBITS	512
+#define DBBC_SUGG_ATTWORDS	(DBBC_SUGG_ATTBITS / 64)
+
+/* stripe count (power of two) and how far a claim may probe within a stripe */
+#define DBBC_SUGG_NSTRIPES	64
+#define DBBC_SUGG_PROBE		8
+
+/* why a shape can never be accelerated (0 = eligible); mirrors dbbc_rel_shape */
+#define DBBC_SUGG_OK			0
+#define DBBC_SUGG_UNSUP_RELKIND	1	/* not a plain table or matview */
+#define DBBC_SUGG_UNSUP_INH		2	/* inheritance/partition parent */
+#define DBBC_SUGG_UNSUP_AM		3	/* not the heap AM */
+#define DBBC_SUGG_UNSUP_SYSCOL	4	/* system column or whole-row ref */
+#define DBBC_SUGG_UNSUP_PERSIST	5	/* unlogged or temporary */
+#define DBBC_SUGG_UNSUP_SAMPLE	6	/* TABLESAMPLE */
+#define DBBC_SUGG_UNSUP_LATERAL	7	/* laterally-dependent */
+#define DBBC_SUGG_UNSUP_PARTED	8	/* partitioned table (the parent) */
+
+/*
+ * One bundle's accumulated evidence. Sums (not averages) are stored so the
+ * flush can divide by nplans at any cadence without losing precision, and so
+ * two observation points can add into the same slot without coordinating.
+ *
+ * Deliberately absent: any score. Scoring weights are still being calibrated
+ * against real Odoo workloads, so the score is computed in the
+ * dbblue_columnar_suggestion_status view from these raw columns - which means
+ * retuning it is a view replacement, not a catalog migration.
+ */
+typedef struct DbbcSuggEntry
+{
+	/* 8-byte members first, so the struct needs no internal padding */
+	int64		queryid;		/* root->parse->queryId; 0 is never stored */
+	int64		nplans;			/* how many plans referenced this bundle */
+	int64		rows_sum;		/* Sum of rel->rows: post-filter estimate */
+	int64		tuples_sum;		/* Sum of rel->tuples: table cardinality */
+	int64		pages_sum;		/* Sum of rel->pages */
+	int64		width_sum;		/* Sum of the bundle's projected byte width */
+	uint64		attmap[DBBC_SUGG_ATTWORDS];		/* referenced attnums, 1-based */
+	uint64		filtmap[DBBC_SUGG_ATTWORDS];	/* subset read by a restriction */
+	TimestampTz first_seen;
+	TimestampTz last_seen;
+
+	Oid			dboid;
+	Oid			reloid;
+	uint32		allvisfrac_ppm;	/* last rel->allvisfrac, parts per million */
+	uint32		gen_last_seen;	/* control->generation when last touched */
+	uint32		nagg;			/* observations via create_upper_paths_hook */
+	uint16		nquals_last;	/* list_length(rel->baserestrictinfo) */
+
+	bool		inuse;
+	bool		att_overflow;	/* referenced an attnum >= DBBC_SUGG_ATTBITS */
+	bool		has_rls;		/* a qual carried a non-zero security level */
+	uint8		unsupported;	/* DBBC_SUGG_UNSUP_*, or DBBC_SUGG_OK */
+	uint8		pad[1];
+} DbbcSuggEntry;
+
+/*
+ * Shared control for the advisor. The counters are atomics rather than
+ * lock-protected fields so the hot path can report a drop without having
+ * acquired anything - the drop paths are exactly the ones that failed to get
+ * a lock.
+ */
+typedef struct DbbcSuggControl
+{
+	pg_atomic_uint64 observations;	/* offered to the collector */
+	pg_atomic_uint64 recorded;		/* successfully accumulated */
+	pg_atomic_uint64 contended_drops;	/* stripe lock was held */
+	pg_atomic_uint64 full_drops;		/* no claimable slot in the window */
+	pg_atomic_uint64 noqueryid_drops;	/* compute_query_id produced no id */
+	pg_atomic_uint32 generation;		/* bumped by each flush */
+
+	uint32		nslots;			/* 0 = advisor unavailable this startup */
+	uint32		slots_per_stripe;
+	TimestampTz last_reset;
+
+	LWLockPadded stripe[DBBC_SUGG_NSTRIPES];
+	DbbcSuggEntry slots[FLEXIBLE_ARRAY_MEMBER];
+} DbbcSuggControl;
+
 /* GUCs (defined in dbblue_columnar.c) */
 extern bool dbblue_columnar_enabled;
 extern bool dbblue_columnar_enable_columnar_scan;
@@ -252,6 +375,9 @@ extern bool dbblue_columnar_enable_restamp;
 extern bool dbblue_columnar_enable_dimjoin_agg;
 extern bool dbblue_columnar_enable_int128_sum;
 extern int	dbblue_columnar_dimjoin_max_dim_rows;
+extern bool dbblue_columnar_suggestions;
+extern int	dbblue_columnar_suggestion_slots;
+extern int	dbblue_columnar_suggest_min_pages;
 
 /* columnar_store.c */
 extern void dbbc_store_attach(void);
@@ -278,5 +404,13 @@ extern bool dbbc_restamp_block(DbbcBlock *block, XLogRecPtr fresh);
 
 /* columnar_scan.c */
 extern void dbbc_scan_init(void);
+
+/* workload advisor (columnar_suggest.c) */
+extern void dbbc_sugg_shmem_init_request(void);
+extern void dbbc_sugg_observe_scan(PlannerInfo *root, RelOptInfo *rel,
+								   RangeTblEntry *rte, Bitmapset *attrs,
+								   bool shape_ok, int unsupported);
+extern void dbbc_sugg_observe_agg(PlannerInfo *root, RelOptInfo *input_rel);
+extern int64 dbbc_sugg_flush(void);
 
 #endif							/* DBBLUE_COLUMNAR_H */

@@ -35,12 +35,15 @@ repopulate (or let the auto-refresh worker rebuild) before relying on it.
 | `dbblue_columnar.auto_columnarize` | bool | `off` | postgresql.conf / `ALTER SYSTEM` → **reload** (`pg_reload_conf()`) | Let the engine auto-pick columns to columnarize (vs manual `_add`). |
 | `dbblue_columnar.naptime` | int (s) | `60` (1–86400) | postgresql.conf / `ALTER SYSTEM` → **reload** | Seconds between auto-populate/refresh passes. |
 | `dbblue_columnar.refresh_threshold` | int (%) | `20` (1–100) | postgresql.conf / `ALTER SYSTEM` → **reload** | How far a table's all-visible page count may drift from its build-time baseline before the worker rebuilds it. |
+| `dbblue_columnar.suggestions` | bool | `off` | superuser `SET` / `ALTER ROLE` / `ALTER SYSTEM` → reload | Collect workload evidence for the suggestion engine. **Independent of `enabled`** — advice can be gathered before the engine is switched on. |
+| `dbblue_columnar.suggestion_slots` | int | `4096` (0–1048576) | postgresql.conf / `ALTER SYSTEM` → **restart** | Query-shape bundles the advisor can track (~144 bytes each in main shared memory). `0` disables it and reserves nothing. |
+| `dbblue_columnar.suggest_min_pages` | int (pages) | `1024` (8 MB) | superuser `SET` / `ALTER SYSTEM` → reload | Smallest relation the advisor will suggest. Below this the heap is already fast enough to not be worth store budget. |
 
 ### "Takes effect" legend (PostgreSQL GUC context)
-- **restart** (`PGC_POSTMASTER`): `enabled`, `memory_mb`, `autorefresh_database` — read once at server start.
+- **restart** (`PGC_POSTMASTER`): `enabled`, `memory_mb`, `autorefresh_database`, `suggestion_slots` — read once at server start.
 - **reload** (`PGC_SIGHUP`): `auto_columnarize`, `naptime`, `refresh_threshold` — `pg_ctl reload` or `SELECT pg_reload_conf()`.
 - **new connections** (`PGC_USERSET`): `enable_columnar_scan` — any user; `SET` in-session, or `ALTER DATABASE db SET ...` / `ALTER ROLE r SET ...` for persistence (existing/pooled connections keep the old value until they reconnect).
-- **superuser set** (`PGC_SUSET`): `log_coverage_misses` — superuser `SET`, or `ALTER SYSTEM` + reload.
+- **superuser set** (`PGC_SUSET`): `log_coverage_misses`, `suggestions`, `suggest_min_pages` — superuser `SET`, or `ALTER SYSTEM` + reload.
 
 ## Auto-populate via the background worker
 
@@ -90,6 +93,78 @@ resolves the opaque `attnum` to a `column_name` and joins live store state
 `store_size`); `dbblue_columnar_memory_status` pretties the byte counts and adds
 `pct_of_budget`. The underlying `dbblue_columnar_relations` table and
 `dbblue_columnar_memory()` function stay the precise primitives (raw bytes).
+
+## The suggestion engine (advisor) — what to columnarize
+
+Registering columns by hand means guessing, then finding out one table at a
+time from `log_coverage_misses`. The advisor answers the question from the
+workload instead: two planner hooks record which columns each query shape
+actually reads, and a flush lands the evidence in a reviewable table.
+
+```sql
+-- 1. collect. Independent of dbblue_columnar.enabled, so you can gather advice
+--    BEFORE adopting the engine. Scope it to the reporting role if you only
+--    care about reports:
+ALTER SYSTEM SET dbblue_columnar.suggestions = on;   SELECT pg_reload_conf();
+--    or:  ALTER ROLE odoo_reports SET dbblue_columnar.suggestions = on;
+
+-- 2. run the workload (a day of real reports beats any synthetic guess)
+
+-- 3. drain the accumulator into the tables. The background worker does this
+--    every naptime seconds when autorefresh_database is set; this works
+--    anywhere, including an install with no worker configured.
+SELECT dbblue_columnar_suggestions_flush();
+
+-- 4. review, best first
+SELECT relid, columns, filter_columns, score, aggregate_shape,
+       selectivity, projected_size, eligibility
+FROM dbblue_columnar_suggestion_status LIMIT 20;
+
+-- 5. apply a bundle - WHOLE, never partially (see below)
+SELECT dbblue_columnar_add('account_move_line',
+       (SELECT columns FROM dbblue_columnar_suggestion_status
+        WHERE relid = 'account_move_line'::regclass ORDER BY score DESC LIMIT 1));
+```
+
+### Apply the whole bundle or none of it
+
+A suggestion is a **bundle**: one query shape plus the complete set of columns
+it touches. A columnar scan is disqualified when *any* column it references is
+unregistered, so registering 8 of a 9-column bundle buys **exactly zero**
+speedup — not 8/9 of it. This is why advice is stored per bundle rather than
+per column.
+
+### Reading the output
+
+| Column | Meaning |
+|--------|---------|
+| `columns` | The bundle. Pass it straight to `dbblue_columnar_add`. |
+| `filter_columns` | The subset read by a `WHERE` clause — these are what make zone-map block skipping work. |
+| `score` | Benefit per byte of store budget. Relative, not an absolute prediction. |
+| `aggregate_shape` | Seen under a grouped aggregate, so it can reach the large `DBBlueColumnarAgg` win rather than only row-serve. |
+| `selectivity` | ~1.0 = full scan; near 0 = indexed point lookup, which columnar cannot help. |
+| `allvisfrac` | Fraction of pages all-visible. **The one to check before applying:** only all-visible ranges are ever built, so a churning table (`mail_message`, `stock_move`) scores low here and will not benefit however attractive the shape looks. Page-granular, so it *over*-states buildability — one modified page disqualifies its whole 32-page block. |
+| `projected_size` | Estimated store footprint for the bundle. Weigh against `memory_mb`. |
+| `eligibility` | `eligible`, or why this shape can *never* be accelerated: `partitioned`, `system_column`, `access_method`, `tablesample`, `lateral`, `inheritance`. |
+
+### Why is the list empty?
+
+`dbblue_columnar_suggestion_stats()` exists so silence is always diagnosable:
+
+| Reading | Meaning |
+|---------|---------|
+| `collecting = false` | The GUC is off in the session that ran the workload. |
+| `observations = 0` | The hooks saw no qualifying relation — usually `suggest_min_pages` is above your tables' size. |
+| `noqueryid_drops > 0` | No query fingerprint. The module calls `EnableQueryId()`, so this only happens with `compute_query_id = off` explicitly set. |
+| `contended_drops > 0` | Stripe-lock contention. Harmless (the advisor never waits on a planner), but evidence is being sampled rather than fully counted. |
+| `full_drops > 0` | `suggestion_slots` is too small for the number of distinct query shapes. |
+
+`observations` should always equal `recorded` plus the three drop counters.
+
+### Notes
+- Evidence lives in **main shared memory** and is wiped on restart, like the column store. Flush before a planned restart to keep it. Unlike registrations, suggestions are **not** dumped by `pg_dump`: they describe one server's workload, and restoring another host's advice would present evidence that was never earned there.
+- The advisor costs one boolean load per planned relation when off, and one bounded, non-waiting stripe-lock acquisition when on. It never allocates and never delays a query.
+- Partitioned tables are reported on the **parent** (`eligibility = 'partitioned'`); per-partition columnar acceleration is future work.
 
 ## Operational notes / gotchas
 - **Ephemeral store.** DSA-backed, never WAL-logged, wiped on restart. Repopulate after every restart (or configure `autorefresh_database` so the worker rebuilds it).

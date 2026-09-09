@@ -271,8 +271,11 @@ typedef struct DbbcScanState
 
 static void dbbc_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 								  Index rti, RangeTblEntry *rte);
+static bool dbbc_rel_shape(PlannerInfo *root, RelOptInfo *rel,
+						   RangeTblEntry *rte, Bitmapset **attrs_out,
+						   List **needed_out, int *reason);
 static bool dbbc_rel_ready(PlannerInfo *root, RelOptInfo *rel,
-						   RangeTblEntry *rte, List **needed_out);
+						   RangeTblEntry *rte, List *needed);
 static void dbbc_try_eager_agg(PlannerInfo *root, RelOptInfo *rel,
 							   RangeTblEntry *rte);
 /* eligibility helpers defined later, reused by the eager-agg fusion path */
@@ -896,31 +899,50 @@ dbbc_estimate_serve_fractions(Relation rel, List *clauses, Index varno,
 static List *dbbc_logged_coverage_misses = NIL;
 
 /*
- * Can this base relation's scan be served by the column store? On success,
- * *needed_out receives the (possibly empty) list of user attnos the scan
- * references, for re-validation at executor startup.
+ * Shape half of the readiness test: everything that depends only on the
+ * relation and the query, not on whether a column store exists. Split out of
+ * dbbc_rel_ready so the workload advisor can evaluate exactly the same gates
+ * without a second, drifting copy of them - and so it can report WHY a shape
+ * is ineligible via *reason (a DBBC_SUGG_UNSUP_* code), which the scan path
+ * itself has no use for and ignores.
+ *
+ * On success *attrs_out receives the raw pull_varattnos bitmap and
+ * *needed_out the list of user attnos, both of which the caller owns.
  */
 static bool
-dbbc_rel_ready(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
-			   List **needed_out)
+dbbc_rel_shape(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
+			   Bitmapset **attrs_out, List **needed_out, int *reason)
 {
 	Bitmapset  *attrs = NULL;
 	List	   *needed = NIL;
-	List	   *missing = NIL;
 	ListCell   *lc;
 	int			x;
-	DbbcRelVersion *version;
-	int16	   *reg;
-	bool		ok = true;
+
+	*attrs_out = NULL;
+	*needed_out = NIL;
+	*reason = DBBC_SUGG_OK;
 
 	if (rel->reloptkind != RELOPT_BASEREL)
 		return false;
 	if (rte->rtekind != RTE_RELATION)
 		return false;
 	if (rte->relkind != RELKIND_RELATION && rte->relkind != RELKIND_MATVIEW)
+	{
+		/*
+		 * Name partitioned tables specifically. They reach here before the
+		 * rte->inh gate below (their relkind is 'p', not 'r'), and a bare
+		 * "relkind" verdict in the advisor's output would leave an admin who
+		 * partitioned a large table with no idea why it is never accelerated.
+		 */
+		*reason = (rte->relkind == RELKIND_PARTITIONED_TABLE)
+			? DBBC_SUGG_UNSUP_PARTED : DBBC_SUGG_UNSUP_RELKIND;
 		return false;
+	}
 	if (rte->tablesample != NULL)
+	{
+		*reason = DBBC_SUGG_UNSUP_SAMPLE;
 		return false;
+	}
 
 	/*
 	 * Inheritance/partition parent (rte->inh): this baserel stands for an
@@ -930,7 +952,10 @@ dbbc_rel_ready(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 	 * acceleration is future work.)
 	 */
 	if (rte->inh)
+	{
+		*reason = DBBC_SUGG_UNSUP_INH;
 		return false;
+	}
 
 	/*
 	 * Laterally-dependent rels would need a parameterized path (their
@@ -938,11 +963,17 @@ dbbc_rel_ready(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 	 * build unparameterized paths, so stay out entirely.
 	 */
 	if (!bms_is_empty(rel->lateral_relids))
+	{
+		*reason = DBBC_SUGG_UNSUP_LATERAL;
 		return false;
+	}
 
 	/* the block format and the range-limited fallback are heap-AM-only */
 	if (get_rel_relam(rte->relid) != HEAP_TABLE_AM_OID)
+	{
+		*reason = DBBC_SUGG_UNSUP_AM;
 		return false;
+	}
 
 	/* every column the scan must produce or filter on */
 	pull_varattnos((Node *) rel->reltarget->exprs, rel->relid, &attrs);
@@ -969,9 +1000,32 @@ dbbc_rel_ready(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 		 * check without handling EPQ explicitly.
 		 */
 		if (attno <= 0)
+		{
+			*reason = DBBC_SUGG_UNSUP_SYSCOL;
 			return false;
+		}
 		needed = lappend_int(needed, attno);
 	}
+
+	*attrs_out = attrs;
+	*needed_out = needed;
+	return true;
+}
+
+/*
+ * Store half: can this base relation's scan actually be served right now?
+ * Takes the `needed` list dbbc_rel_shape produced and checks it against the
+ * published column store. Callers must have run dbbc_rel_shape first.
+ */
+static bool
+dbbc_rel_ready(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
+			   List *needed)
+{
+	List	   *missing = NIL;
+	ListCell   *lc;
+	DbbcRelVersion *version;
+	int16	   *reg;
+	bool		ok = true;
 
 	/*
 	 * Is a populated store present and does it cover the needed columns?
@@ -1045,7 +1099,6 @@ dbbc_rel_ready(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 		return false;
 	}
 
-	*needed_out = needed;
 	return true;
 }
 
@@ -1061,14 +1114,31 @@ dbbc_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 	CustomPath *cpath;
 	QualCost	qcost;
 	bool		prefilter_unsafe = false;
+	Bitmapset  *attrs = NULL;
+	int			shape_reason = DBBC_SUGG_OK;
+	bool		shape_ok;
 
 	if (prev_set_rel_pathlist_hook)
 		prev_set_rel_pathlist_hook(root, rel, rti, rte);
 
+	shape_ok = dbbc_rel_shape(root, rel, rte, &attrs, &needed, &shape_reason);
+
+	/*
+	 * Feed the workload advisor BEFORE the engine gates below. This ordering
+	 * is the feature: dbblue_columnar.enabled defaults to off, so collecting
+	 * only after that check would give an admin who has not adopted the engine
+	 * yet - exactly the person deciding whether to - no evidence at all.
+	 */
+	if (dbblue_columnar_suggestions)
+		dbbc_sugg_observe_scan(root, rel, rte, attrs, shape_ok, shape_reason);
+
 	if (!dbblue_columnar_enabled || !dbblue_columnar_enable_columnar_scan)
 		return;
 
-	if (!dbbc_rel_ready(root, rel, rte, &needed))
+	if (!shape_ok)
+		return;
+
+	if (!dbbc_rel_ready(root, rel, rte, needed))
 		return;
 
 	/*
@@ -3802,6 +3872,17 @@ dbbc_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	if (stage != UPPERREL_GROUP_AGG && stage != UPPERREL_PARTIAL_GROUP_AGG)
 		return;
 	partial = (stage == UPPERREL_PARTIAL_GROUP_AGG);
+
+	/*
+	 * Advisor: record that this relation was read by a grouped-aggregate
+	 * shape, which is what separates a report that could reach aggregate
+	 * pushdown from one that could only be row-served. Before the enabled
+	 * gate, for the same reason as in dbbc_set_rel_pathlist. Only the
+	 * non-partial stage is counted so a parallel plan is not double-counted.
+	 */
+	if (dbblue_columnar_suggestions && !partial)
+		dbbc_sugg_observe_agg(root, input_rel);
+
 	if (!dbblue_columnar_enabled || !dbblue_columnar_enable_columnar_scan)
 		return;
 

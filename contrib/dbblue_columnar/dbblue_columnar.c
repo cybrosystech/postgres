@@ -33,6 +33,7 @@
 #include "optimizer/paths.h"
 #include "optimizer/pathnode.h"
 #include "pgstat.h"
+#include "nodes/queryjumble.h"
 #include "postmaster/bgworker.h"
 #include "postmaster/interrupt.h"
 #include "storage/ipc.h"
@@ -201,6 +202,39 @@ dbblue_columnar_worker_main(Datum main_arg)
 			PG_TRY();
 			{
 				dbbc_refresh_cycle();
+			}
+			PG_CATCH();
+			{
+				HOLD_INTERRUPTS();
+				EmitErrorReport();
+				FlushErrorState();
+				AbortOutOfAnyTransaction();
+				pgstat_report_activity(STATE_IDLE, NULL);
+				RESUME_INTERRUPTS();
+			}
+			PG_END_TRY();
+		}
+
+		/*
+		 * The suggestion flush sits OUTSIDE the dbblue_columnar_enabled block
+		 * above, and that placement is the point: enabled defaults to off, so
+		 * folding the flush into the refresh cycle would mean an admin who has
+		 * not adopted the engine yet - precisely the person the advisor is
+		 * for - never sees a single suggestion.
+		 */
+		if (dbblue_columnar_suggestions)
+		{
+			PG_TRY();
+			{
+				SetCurrentStatementStartTimestamp();
+				StartTransactionCommand();
+				PushActiveSnapshot(GetTransactionSnapshot());
+				pgstat_report_activity(STATE_RUNNING,
+									   "dbblue_columnar suggestion flush");
+				(void) dbbc_sugg_flush();
+				PopActiveSnapshot();
+				CommitTransactionCommand();
+				pgstat_report_activity(STATE_IDLE, NULL);
 			}
 			PG_CATCH();
 			{
@@ -539,7 +573,61 @@ _PG_init(void)
 							0,
 							NULL, NULL, NULL);
 
+	/*
+	 * Workload advisor. Collection is PGC_SUSET, not PGC_POSTMASTER: advice
+	 * has to be switchable on a running server, and per-role scoping is
+	 * genuinely useful (ALTER ROLE reporting_user SET
+	 * dbblue_columnar.suggestions = on collects from the reports and ignores
+	 * the transactional traffic). Only the slot count needs a restart,
+	 * because the shared area is sized once at postmaster start and a later
+	 * change would make every backend's attach mismatch its size.
+	 */
+	DefineCustomBoolVariable("dbblue_columnar.suggestions",
+							 "Collect workload evidence for columnar suggestions.",
+							 "Records which columns each query shape reads, for review in dbblue_columnar_suggestion_status. Independent of dbblue_columnar.enabled, so advice can be gathered before the engine is switched on.",
+							 &dbblue_columnar_suggestions,
+							 false,
+							 PGC_SUSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomIntVariable("dbblue_columnar.suggestion_slots",
+							"Number of query-shape bundles the advisor can track.",
+							"Sized once at server start. Rounded down to a multiple of the stripe count; 0 disables the advisor entirely and reserves no shared memory.",
+							&dbblue_columnar_suggestion_slots,
+							4096, 0, 1048576,
+							PGC_POSTMASTER,
+							0,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("dbblue_columnar.suggest_min_pages",
+							"Smallest relation, in pages, the advisor will suggest.",
+							"Below this the heap is already fast enough that a column store would spend memory budget for no gain.",
+							&dbblue_columnar_suggest_min_pages,
+							1024, 0, INT_MAX,
+							PGC_SUSET,
+							0,
+							NULL, NULL, NULL);
+
 	MarkGUCPrefixReserved("dbblue_columnar");
+
+	/*
+	 * Reserve the advisor's shared area at postmaster start. Main shared
+	 * memory rather than a DSM segment on purpose: the collector must never
+	 * draw on the dbblue_columnar.memory_mb store budget (which
+	 * dbblue_columnar_memory_status divides by, and would then misreport),
+	 * and a lazily-created segment could fail to allocate inside a user's
+	 * planner.
+	 */
+	dbbc_sugg_shmem_init_request();
+
+	/*
+	 * The advisor keys evidence by query fingerprint. Under the default
+	 * compute_query_id = auto nothing computes one unless a module asks, and
+	 * a zero id would collapse every distinct report on a table into a single
+	 * over-wide bundle - so ask.
+	 */
+	EnableQueryId();
 
 	/* planner hook + CustomScan provider (columnar_scan.c) */
 	dbbc_scan_init();

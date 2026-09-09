@@ -497,6 +497,89 @@ RESET enable_eager_aggregate;
 SET dbblue_columnar.enable_dimjoin_agg = off;
 DROP TABLE dj_dim;
 
+-- ---------------------------------------------------------------------------
+-- Workload advisor. Asserts STRUCTURAL facts only: which columns each query
+-- shape bundles, which of those are filter columns, and whether the shape was
+-- seen under a grouped aggregate. Scores, widths, queryids and timestamps are
+-- all environment-dependent and deliberately not compared.
+-- ---------------------------------------------------------------------------
+SET dbblue_columnar.suggestions = on;
+SET dbblue_columnar.suggest_min_pages = 1;
+
+CREATE TABLE adv (a int, b int, c int, d text, e numeric);
+INSERT INTO adv SELECT g, g % 7, g % 13, 'x' || (g % 5), (g % 11) * 1.5
+FROM generate_series(1, 20000) g;
+VACUUM (ANALYZE, DISABLE_PAGE_SKIPPING) adv;
+
+-- shape 1: aggregate, projects a+e, filters on b
+SELECT a, sum(e) FROM adv WHERE b = 3 GROUP BY a ORDER BY a LIMIT 1;
+SELECT a, sum(e) FROM adv WHERE b = 3 GROUP BY a ORDER BY a LIMIT 1;
+-- shape 2: no aggregate, different columns, filters on d
+SELECT c FROM adv WHERE d = 'x2' ORDER BY c LIMIT 1;
+
+SELECT dbblue_columnar_suggestions_flush() > 0 AS flushed;
+
+-- exactly two bundles, each with exactly the columns its shape touches
+SELECT ncolumns, columns, filter_columns, aggregate_shape, eligibility, nplans
+FROM dbblue_columnar_suggestion_status
+WHERE relid = 'adv'::regclass
+ORDER BY aggregate_shape DESC;
+
+-- the collector's own accounting must reconcile: every observation either
+-- landed or is explained by a drop counter
+SELECT collecting,
+       observations > 0 AS saw_something,
+       observations = recorded + noqueryid_drops + contended_drops + full_drops
+           AS accounting_balances
+FROM dbblue_columnar_suggestion_stats();
+
+-- a partitioned table can never be accelerated. The advisor must say so on
+-- the PARENT (which is what the admin queried) and must NOT emit a
+-- zero-column row per partition.
+CREATE TABLE advp (id int, k int) PARTITION BY RANGE (id);
+CREATE TABLE advp1 PARTITION OF advp FOR VALUES FROM (0) TO (10000);
+CREATE TABLE advp2 PARTITION OF advp FOR VALUES FROM (10000) TO (40000);
+INSERT INTO advp SELECT g, g % 7 FROM generate_series(1, 30000) g;
+VACUUM (ANALYZE, DISABLE_PAGE_SKIPPING) advp;
+SELECT k, count(*) FROM advp WHERE id > 50 GROUP BY k ORDER BY k LIMIT 1;
+SELECT dbblue_columnar_suggestions_flush() > 0 AS flushed_parted;
+SELECT relid::text, eligibility, ncolumns
+FROM dbblue_columnar_suggestion_status
+WHERE relid::text LIKE 'advp%' ORDER BY relid::text;
+DROP TABLE advp;
+
+-- a relation below the size floor must produce no advice at all
+SET dbblue_columnar.suggest_min_pages = 100000;
+CREATE TABLE adv_small (a int);
+INSERT INTO adv_small SELECT generate_series(1, 10);
+VACUUM (ANALYZE) adv_small;
+SELECT a FROM adv_small WHERE a = 5;
+SELECT dbblue_columnar_suggestions_flush() >= 0 AS flushed_again;
+SELECT count(*) AS small_table_bundles
+FROM dbblue_columnar_suggestions WHERE relid = 'adv_small'::regclass;
+RESET dbblue_columnar.suggest_min_pages;
+
+-- flushing twice must be idempotent, not a primary-key collision: the second
+-- pass has existing column rows to replace
+SELECT a, sum(e) FROM adv WHERE b = 3 GROUP BY a ORDER BY a LIMIT 1;
+SELECT dbblue_columnar_suggestions_flush() > 0 AS reflushed;
+SELECT ncolumns, columns FROM dbblue_columnar_suggestion_status
+WHERE relid = 'adv'::regclass AND aggregate_shape ORDER BY ncolumns;
+
+-- deleting a bundle cascades its column rows away
+DELETE FROM dbblue_columnar_suggestions WHERE relid = 'adv'::regclass;
+SELECT count(*) AS columns_after_bundle_delete
+FROM dbblue_columnar_suggestion_columns WHERE relid = 'adv'::regclass;
+
+-- DROP TABLE leaves nothing behind to strand, because relid is a plain
+-- regclass with no pg_depend edge: the flush skips vanished relations rather
+-- than writing rows whose relid renders as a bare OID
+DROP TABLE adv;
+SELECT dbblue_columnar_suggestions_flush() >= 0 AS flush_after_drop;
+
+DROP TABLE adv_small;
+RESET dbblue_columnar.suggestions;
+
 DROP FUNCTION agree(text);
 DROP FUNCTION uses_node(text, text);
 DROP TABLE t;

@@ -5,10 +5,12 @@ OBJS = \
 	$(WIN32RES) \
 	columnar_scan.o \
 	columnar_store.o \
+	columnar_suggest.o \
 	dbblue_columnar.o
 
 EXTENSION = dbblue_columnar
-DATA = dbblue_columnar--1.0.sql dbblue_columnar--1.1.sql dbblue_columnar--1.0--1.1.sql
+DATA = dbblue_columnar--1.0.sql dbblue_columnar--1.1.sql dbblue_columnar--1.2.sql \
+	dbblue_columnar--1.0--1.1.sql dbblue_columnar--1.1--1.2.sql
 PGFILEDESC = "dbblue_columnar - DBblue Columnar Engine (skeleton)"
 
 # Differential regression test (columnar results must equal heap results).
