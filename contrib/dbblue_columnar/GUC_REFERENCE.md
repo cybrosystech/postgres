@@ -86,6 +86,11 @@ SELECT * FROM dbblue_columnar_memory();                 -- raw: budget_mb, used_
 SELECT * FROM dbblue_columnar_memory_status;            -- readable: adds pg_size_pretty'd used /
                                                         --   dsa_total + pct_of_budget
 SELECT count(*) FROM dbblue_columnar_blocks('account_move_line');   -- block count / zone maps
+
+-- find/fix a store that has drifted from the registrations (v1.4+; see "When
+-- the store and the registrations disagree" below)
+SELECT * FROM dbblue_columnar_store_status WHERE NOT registered;
+SELECT dbblue_columnar_reset_database();                -- reclaim all of this database's store
 ```
 
 The `_status` views are the readable layer (v1.1+): `dbblue_columnar_status`
@@ -227,6 +232,52 @@ view.
   still cover **one** database; elsewhere call `dbblue_columnar_populate` and
   `dbblue_columnar_suggestions_flush()` directly. A per-database launcher is
   future work.
+
+## When the store and the registrations disagree
+
+`dbblue_columnar_relations` is an ordinary heap table owned by the extension.
+The column store lives in raw shared memory, entirely outside the extension's
+SQL objects. **`DROP EXTENSION dbblue_columnar` empties the table but does not
+touch the store** — so if you ever drop and recreate the extension instead of
+upgrading it, the tables you had registered before the drop keep their store,
+now completely invisible: `dbblue_columnar_status` shows nothing (correctly —
+it can only show what is registered), yet the planner still serves those
+tables from the old store, still charged against the memory budget.
+
+**Prevention: never `DROP EXTENSION` to change versions.** Use
+`ALTER EXTENSION dbblue_columnar UPDATE TO 'x.y';` — it is the only path that
+is guaranteed to leave the store and the registrations consistent, and every
+release of this extension is tested through it.
+
+**As of version 1.4, a fresh `CREATE EXTENSION` self-heals.** If the drop
+already happened, creating the extension again automatically reclaims any
+store left behind for this database — the same guarantee a server restart
+already gives (store starts empty), just scoped to the one database being
+(re)created rather than the whole cluster. `ALTER EXTENSION ... UPDATE`
+deliberately never does this reclaim on its own — it must not risk a live
+install's real, currently-registered stores — so on an existing 1.x install
+that already has the orphan, `ALTER EXTENSION UPDATE TO '1.4'` will surface it
+(see below) but leave it in place until you act.
+
+**Finding one directly, at any time:**
+```sql
+SELECT * FROM dbblue_columnar_store_status WHERE NOT registered;
+```
+This reads the shared store directly, independent of the registration table —
+it is what a `dbblue_columnar_status` cannot see. `relation_name` is `NULL`
+when the underlying table was also dropped (not just the extension), which is
+still worth seeing since it is still consuming budget.
+
+**Reclaiming it:**
+```sql
+SELECT dbblue_columnar_reset_database();  -- drops every version for THIS database
+```
+Returns how many it dropped, and emits a `NOTICE` naming the count — except
+when called automatically during `CREATE EXTENSION`, where PostgreSQL forces
+`client_min_messages` to `WARNING` for the whole script (this is standard
+extension-script behaviour, not specific to this function); check
+`dbblue_columnar_store_status` before/after if you want to confirm what a
+fresh create actually did.
 
 ## Operational notes / gotchas
 - **Ephemeral store.** DSA-backed, never WAL-logged, wiped on restart. Repopulate after every restart (or configure `autorefresh_database` so the worker rebuilds it).

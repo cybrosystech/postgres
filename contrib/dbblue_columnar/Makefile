@@ -10,9 +10,9 @@ OBJS = \
 
 EXTENSION = dbblue_columnar
 DATA = dbblue_columnar--1.0.sql dbblue_columnar--1.1.sql dbblue_columnar--1.2.sql \
-	dbblue_columnar--1.3.sql \
+	dbblue_columnar--1.3.sql dbblue_columnar--1.4.sql \
 	dbblue_columnar--1.0--1.1.sql dbblue_columnar--1.1--1.2.sql \
-	dbblue_columnar--1.2--1.3.sql
+	dbblue_columnar--1.2--1.3.sql dbblue_columnar--1.3--1.4.sql
 PGFILEDESC = "dbblue_columnar - DBblue Columnar Engine (skeleton)"
 
 # Differential regression test (columnar results must equal heap results).

@@ -2345,3 +2345,209 @@ dbblue_columnar_database_memory(PG_FUNCTION_ARGS)
 
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }
+
+/* one row of dbblue_columnar_store_status, copied out while the dshash entry
+ * lock is held so the SRF's output formatting never runs under that lock */
+typedef struct DbbcStoreStatusRow
+{
+	Oid			reloid;
+	int32		ncols;
+	uint32		nblocks;
+	uint32		ndirslots;
+	uint32		av_at_build;
+	int64		total_bytes;
+} DbbcStoreStatusRow;
+
+/*
+ * dbblue_columnar_store_status() -> setof record
+ *
+ * Lists every relation of the CURRENT database that has a live version in the
+ * shared column store, read directly from the shared hash - independent of
+ * dbblue_columnar_relations.
+ *
+ * Why this needs to exist at all: the store and the registration table are
+ * two separate things that can drift apart. DROP EXTENSION dbblue_columnar
+ * (rather than the supported ALTER EXTENSION ... UPDATE path) removes the
+ * registration table - an ordinary heap table owned by the extension - but
+ * has NO effect on the store, which lives in raw shared memory outside any
+ * extension's SQL objects. The result is an ORPHANED version: still resident,
+ * still being served by the planner (dbbc_rel_ready looks the store up by
+ * reloid directly and does not consult the registration table at all), still
+ * charged against the memory budget, but invisible to dbblue_columnar_status
+ * and every other view that joins off the registrations. Before this
+ * function, finding one meant probing candidate tables one at a time with
+ * dbblue_columnar_blocks(regclass) - which is how the first orphan of this
+ * kind was actually found.
+ *
+ * Scoped to this database only: the store is cluster-wide but a reloid is
+ * only meaningful within the database that minted it.
+ */
+PG_FUNCTION_INFO_V1(dbblue_columnar_store_status);
+
+Datum
+dbblue_columnar_store_status(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	dshash_seq_status seqstat;
+	DbbcRelEntry *entry;
+	DbbcStoreStatusRow *rows;
+	int			nrows = 0;
+	int			cap = 64;
+	int			i;
+
+	InitMaterializedSRF(fcinfo, 0);
+	dbbc_store_attach();
+
+	/*
+	 * Phase 1: walk the shared hash under dshash's own per-partition locks,
+	 * copying out scalar fields only. dshash forbids holding an entry lock
+	 * across another lookup (documented at every existing dshash_find call
+	 * site in this file), so nothing here may call dbbc_version_pin or any
+	 * other function that itself calls dshash_find - the version's fields
+	 * are read directly through the pointer the scan already holds locked,
+	 * exactly as dbbc_version_pin does internally, just without a second
+	 * acquisition. No catalog access here either, to keep the locked window
+	 * short; name resolution happens in SQL after this function returns.
+	 */
+	rows = (DbbcStoreStatusRow *) palloc(cap * sizeof(DbbcStoreStatusRow));
+
+	dshash_seq_init(&seqstat, dbbc_hash, false);
+	while ((entry = (DbbcRelEntry *) dshash_seq_next(&seqstat)) != NULL)
+	{
+		DbbcRelVersion *version;
+
+		if (entry->key.dboid != MyDatabaseId)
+			continue;
+		if (!DsaPointerIsValid(entry->version))
+			continue;
+
+		version = (DbbcRelVersion *) dsa_get_address(dbbc_dsa, entry->version);
+
+		/* same liveness guard as dbbc_version_pin; never trips in practice */
+		if (unlikely(version->magic != DBBC_VERSION_MAGIC))
+			continue;
+
+		if (nrows == cap)
+		{
+			cap *= 2;
+			rows = (DbbcStoreStatusRow *) repalloc(rows, cap * sizeof(DbbcStoreStatusRow));
+		}
+		rows[nrows].reloid = entry->key.reloid;
+		rows[nrows].ncols = version->ncols;
+		rows[nrows].nblocks = version->nblocks;
+		rows[nrows].ndirslots = version->ndirslots;
+		rows[nrows].av_at_build = version->av_at_build;
+		rows[nrows].total_bytes = version->total_bytes;
+		nrows++;
+	}
+	dshash_seq_term(&seqstat);
+
+	/* Phase 2: format output. No lock is held from here on. */
+	for (i = 0; i < nrows; i++)
+	{
+		Datum		values[6];
+		bool		nulls[6];
+
+		memset(nulls, 0, sizeof(nulls));
+		values[0] = ObjectIdGetDatum(rows[i].reloid);
+		values[1] = Int32GetDatum(rows[i].ncols);
+		values[2] = Int64GetDatum((int64) rows[i].nblocks);
+		values[3] = Int64GetDatum((int64) rows[i].ndirslots);
+		values[4] = Int64GetDatum((int64) rows[i].av_at_build);
+		values[5] = Int64GetDatum(rows[i].total_bytes);
+
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+
+	pfree(rows);
+	return (Datum) 0;
+}
+
+/*
+ * dbblue_columnar_reset_database() -> integer
+ *
+ * Drop every store version belonging to the CURRENT database, regardless of
+ * whether it is currently registered. Returns how many were dropped.
+ *
+ * This exists to give a fresh CREATE EXTENSION the same guarantee a server
+ * restart already gives: the store starts EMPTY. Without it, DROP EXTENSION
+ * dbblue_columnar (instead of the supported ALTER EXTENSION ... UPDATE path)
+ * removes dbblue_columnar_relations - an ordinary heap table owned by the
+ * extension - but has no effect on the store, which lives in raw shared
+ * memory outside any extension's SQL objects. A subsequent CREATE EXTENSION
+ * then starts with an empty registration table pointing at NOTHING, while the
+ * old store versions sit there orphaned: still resident, still being served
+ * (dbbc_rel_ready looks the store up by reloid directly, never consulting the
+ * registration table), still charged against the memory budget, but
+ * permanently invisible to dbblue_columnar_status and every other view that
+ * joins off the registrations.
+ *
+ * Called automatically by a fresh install (see dbblue_columnar--1.4.sql) at a
+ * point where dbblue_columnar_relations does not exist yet, so anything still
+ * in the store for this database at that instant is definitionally an orphan
+ * from before this create - nothing could have legitimately built it through
+ * an extension that had not been created yet. It is intentionally NOT called
+ * from any --X--Y.sql upgrade delta: ALTER EXTENSION ... UPDATE preserves a
+ * live install's real, currently-registered stores, and must keep doing so.
+ */
+PG_FUNCTION_INFO_V1(dbblue_columnar_reset_database);
+
+Datum
+dbblue_columnar_reset_database(PG_FUNCTION_ARGS)
+{
+	dshash_seq_status seqstat;
+	DbbcRelEntry *entry;
+	dsa_pointer *victims;
+	int			nvictims = 0;
+	int			cap = 64;
+	int			i;
+
+	dbbc_store_attach();
+
+	/*
+	 * Phase 1: remove every matching entry from the hash under its own
+	 * per-partition locks (dshash_delete_current, which requires the
+	 * exclusive scan mode used here), collecting the version pointers to
+	 * unpin afterwards. Nothing here calls dshash_find/dbbc_version_pin - the
+	 * seq scan already holds the lock this entry needs, and re-acquiring it
+	 * would violate the "no lookup while an entry lock is held" rule every
+	 * other dshash_find call site in this file documents.
+	 */
+	victims = (dsa_pointer *) palloc(cap * sizeof(dsa_pointer));
+
+	dshash_seq_init(&seqstat, dbbc_hash, true);
+	while ((entry = (DbbcRelEntry *) dshash_seq_next(&seqstat)) != NULL)
+	{
+		if (entry->key.dboid != MyDatabaseId)
+			continue;
+
+		if (DsaPointerIsValid(entry->version))
+		{
+			if (nvictims == cap)
+			{
+				cap *= 2;
+				victims = (dsa_pointer *) repalloc(victims, cap * sizeof(dsa_pointer));
+			}
+			victims[nvictims++] = entry->version;
+		}
+		dshash_delete_current(&seqstat);
+	}
+	dshash_seq_term(&seqstat);
+
+	/*
+	 * Phase 2: unpin (and, at zero remaining pins, free) each version. No
+	 * dshash lock is held here - unpin only touches the version's own DSA
+	 * structures and the memory-budget accounting, both independent locks.
+	 */
+	for (i = 0; i < nvictims; i++)
+		dbbc_version_unpin((DbbcRelVersion *) dsa_get_address(dbbc_dsa, victims[i]));
+
+	pfree(victims);
+
+	if (nvictims > 0)
+		ereport(NOTICE,
+				(errmsg("dbblue_columnar: reclaimed %d orphaned store version(s) for this database",
+						nvictims)));
+
+	PG_RETURN_INT32(nvictims);
+}

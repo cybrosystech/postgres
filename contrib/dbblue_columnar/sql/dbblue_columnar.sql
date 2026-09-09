@@ -636,6 +636,78 @@ RESET client_min_messages;
 SELECT denials_cluster AS still_not_blamed_on_server
 FROM dbblue_columnar_database_memory_status;
 
+-- ---------------------------------------------------------------------------
+-- Orphan recovery. DROP EXTENSION removes dbblue_columnar_relations (an
+-- ordinary heap table owned by the extension) but has NO effect on the
+-- column store, which lives in raw shared memory outside any extension's SQL
+-- objects - so a store built before the drop survives it, unregistered and
+-- invisible to dbblue_columnar_status, while still being served. This is a
+-- self-contained section on its own throwaway table, run last so the
+-- DROP/CREATE EXTENSION here cannot disturb anything earlier in the file; it
+-- ends with the extension freshly (re)created so the trailing teardown below
+-- still finds it installed.
+-- ---------------------------------------------------------------------------
+CREATE TABLE orph (a int, b int);
+INSERT INTO orph SELECT g, g % 11 FROM generate_series(1, 20000) g;
+VACUUM (ANALYZE, DISABLE_PAGE_SKIPPING) orph;
+SELECT dbblue_columnar_add('orph', ARRAY['a','b']);
+SELECT dbblue_columnar_populate('orph') > 0 AS built;
+
+-- reproduce: DROP EXTENSION CASCADE leaves the store live but unregistered
+DROP EXTENSION dbblue_columnar CASCADE;
+CREATE EXTENSION dbblue_columnar VERSION '1.3';
+SELECT count(*) AS registrations_after_recreate FROM dbblue_columnar_relations;
+-- still being served, despite zero registrations - the orphan
+SELECT uses_node('SELECT count(*) FROM orph', 'Custom Scan') AS orphan_still_served;
+
+-- upgrading to 1.4 must not silently disturb it - the admin decides
+ALTER EXTENSION dbblue_columnar UPDATE TO '1.4';
+SELECT reloid::regclass::text, registered
+FROM dbblue_columnar_store_status WHERE reloid = 'orph'::regclass;
+SELECT uses_node('SELECT count(*) FROM orph', 'Custom Scan') AS still_served_after_alter_update;
+
+-- manual reclaim finds and clears exactly the orphan, nothing else
+SET client_min_messages = warning;   -- the reclaimed count varies by test order
+SELECT dbblue_columnar_reset_database() >= 1 AS reclaimed_at_least_the_orphan;
+RESET client_min_messages;
+SELECT count(*) FROM dbblue_columnar_store_status WHERE reloid = 'orph'::regclass;
+SELECT uses_node('SELECT count(*) FROM orph', 'Seq Scan') AS heap_after_reclaim;
+
+-- a FRESH create (the reproduction again, but landing on the new default 1.4)
+-- must auto-heal: no registrations, no store, no leftover orphan - the exact
+-- state you would see after a server restart, just scoped to this database
+SELECT dbblue_columnar_add('orph', ARRAY['a','b']);
+SET client_min_messages = warning;
+SELECT dbblue_columnar_populate('orph') > 0 AS rebuilt;
+RESET client_min_messages;
+DROP EXTENSION dbblue_columnar CASCADE;
+CREATE EXTENSION dbblue_columnar;   -- picks up the new default_version, 1.4
+SELECT extversion FROM pg_extension WHERE extname = 'dbblue_columnar';
+SELECT count(*) FROM dbblue_columnar_relations;
+SELECT count(*) FROM dbblue_columnar_store_status;
+SELECT uses_node('SELECT count(*) FROM orph', 'Seq Scan') AS auto_healed_to_heap;
+
+-- and a LEGITIMATE store must never be touched by an ordinary upgrade: the
+-- auto-heal only ever runs from a genuinely fresh CREATE EXTENSION, never
+-- from an --X--Y.sql delta, so ALTER EXTENSION UPDATE on a live install is
+-- exercised throughout this whole file (every earlier ALTER EXTENSION UPDATE
+-- TO '1.x' left t's real store intact) - reconfirmed here for orph too.
+SELECT dbblue_columnar_add('orph', ARRAY['a','b']);
+SET client_min_messages = warning;
+SELECT dbblue_columnar_populate('orph') > 0 AS rebuilt_again;
+RESET client_min_messages;
+DROP EXTENSION dbblue_columnar;
+CREATE EXTENSION dbblue_columnar VERSION '1.3';
+SELECT dbblue_columnar_add('orph', ARRAY['a','b']);
+SET client_min_messages = warning;
+SELECT dbblue_columnar_populate('orph') > 0 AS rebuilt_at_13;
+RESET client_min_messages;
+ALTER EXTENSION dbblue_columnar UPDATE TO '1.4';
+SELECT registered FROM dbblue_columnar_store_status WHERE reloid = 'orph'::regclass;
+SELECT uses_node('SELECT count(*) FROM orph', 'Custom Scan') AS legit_store_survives_upgrade;
+
+DROP TABLE orph;
+
 DROP FUNCTION agree(text);
 DROP FUNCTION uses_node(text, text);
 DROP TABLE t;
