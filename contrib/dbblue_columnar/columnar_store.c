@@ -2497,57 +2497,82 @@ dbblue_columnar_reset_database(PG_FUNCTION_ARGS)
 {
 	dshash_seq_status seqstat;
 	DbbcRelEntry *entry;
-	dsa_pointer *victims;
+	Oid		   *victims;
 	int			nvictims = 0;
 	int			cap = 64;
 	int			i;
+	int			ndropped = 0;
 
 	dbbc_store_attach();
 
 	/*
-	 * Phase 1: remove every matching entry from the hash under its own
-	 * per-partition locks (dshash_delete_current, which requires the
-	 * exclusive scan mode used here), collecting the version pointers to
-	 * unpin afterwards. Nothing here calls dshash_find/dbbc_version_pin - the
-	 * seq scan already holds the lock this entry needs, and re-acquiring it
-	 * would violate the "no lookup while an entry lock is held" rule every
-	 * other dshash_find call site in this file documents.
+	 * Phase 1: a READ-ONLY (shared-mode) scan to collect the reloids to drop.
+	 * Deliberately does NOT mutate the hash while scanning: an earlier
+	 * version deleted entries mid-scan via dshash_delete_current, which
+	 * caused an unreproduced crash in production (dbbc_grp_begin, an
+	 * unrelated query-executor function, faulted moments later - consistent
+	 * with stack/return-address corruption from a bug in that mutate-during-
+	 * scan path that code review alone could not pin down and this sandbox
+	 * could not reproduce under a debugger). Collecting first and deleting
+	 * after, one key at a time via the primitive every other write path in
+	 * this file already uses successfully, avoids the untested combination
+	 * entirely rather than trying to prove it safe after the fact.
 	 */
-	victims = (dsa_pointer *) palloc(cap * sizeof(dsa_pointer));
+	victims = (Oid *) palloc(cap * sizeof(Oid));
 
-	dshash_seq_init(&seqstat, dbbc_hash, true);
+	dshash_seq_init(&seqstat, dbbc_hash, false);
 	while ((entry = (DbbcRelEntry *) dshash_seq_next(&seqstat)) != NULL)
 	{
 		if (entry->key.dboid != MyDatabaseId)
 			continue;
+		if (!DsaPointerIsValid(entry->version))
+			continue;
 
-		if (DsaPointerIsValid(entry->version))
+		if (nvictims == cap)
 		{
-			if (nvictims == cap)
-			{
-				cap *= 2;
-				victims = (dsa_pointer *) repalloc(victims, cap * sizeof(dsa_pointer));
-			}
-			victims[nvictims++] = entry->version;
+			cap *= 2;
+			victims = (Oid *) repalloc(victims, cap * sizeof(Oid));
 		}
-		dshash_delete_current(&seqstat);
+		victims[nvictims++] = entry->key.reloid;
 	}
 	dshash_seq_term(&seqstat);
 
 	/*
-	 * Phase 2: unpin (and, at zero remaining pins, free) each version. No
-	 * dshash lock is held here - unpin only touches the version's own DSA
-	 * structures and the memory-budget accounting, both independent locks.
+	 * Phase 2: drop each victim exactly as dbblue_columnar_drop() does -
+	 * dshash_find(exclusive) for this ONE key, dshash_delete_entry (which
+	 * releases the lock itself), then unpin. No dshash lock is held across
+	 * more than a single key lookup at any point, matching the discipline
+	 * every dshash_find call site in this file already documents.
 	 */
 	for (i = 0; i < nvictims; i++)
-		dbbc_version_unpin((DbbcRelVersion *) dsa_get_address(dbbc_dsa, victims[i]));
+	{
+		DbbcRelKey	key;
+		dsa_pointer oldv;
+
+		key.dboid = MyDatabaseId;
+		key.reloid = victims[i];
+
+		entry = (DbbcRelEntry *) dshash_find(dbbc_hash, &key, true);
+		if (entry == NULL)
+			continue;			/* raced with a concurrent drop; fine */
+
+		oldv = entry->version;
+		dshash_delete_entry(dbbc_hash, entry);
+
+		if (DsaPointerIsValid(oldv))
+		{
+			dbbc_version_unpin((DbbcRelVersion *)
+							   dsa_get_address(dbbc_dsa, oldv));
+			ndropped++;
+		}
+	}
 
 	pfree(victims);
 
-	if (nvictims > 0)
+	if (ndropped > 0)
 		ereport(NOTICE,
 				(errmsg("dbblue_columnar: reclaimed %d orphaned store version(s) for this database",
-						nvictims)));
+						ndropped)));
 
-	PG_RETURN_INT32(nvictims);
+	PG_RETURN_INT32(ndropped);
 }
