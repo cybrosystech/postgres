@@ -272,7 +272,7 @@ _PG_init(void)
 							 "Allow dbblue_partition's table conversion functions to run.",
 							 NULL,
 							 &dbblue_partition_enabled,
-							 false,
+							 true,
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);

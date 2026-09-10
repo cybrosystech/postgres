@@ -6,8 +6,8 @@
  * A deliberately simple, "cron job" style scheduler for REPACK, not an
  * autovacuum-parity dynamic scanner: REPACK rewrites the whole table and
  * every index (up to 2x disk space, a brief AccessExclusiveLock at the
- * heap swap, a much bigger WAL spike than VACUUM), so this worker only
- * ever considers the fixed, operator-curated table list named by
+ * heap swap, a much bigger WAL spike than VACUUM), so a worker only ever
+ * considers the fixed, operator-curated table list named by
  * dbblue_repack_tables, on a naptime of dbblue_repack_naptime, gated by a
  * physical bloat ratio (dbblue_repack_threshold) and a per-table cooldown
  * (dbblue_repack_min_interval).
@@ -24,10 +24,49 @@
  * REPACK cannot be run through SPI: ExecRepack() unconditionally calls
  * PreventInTransactionBlock(), which rejects any nested (isTopLevel =
  * false) execution -- the same restriction that blocks VACUUM from SPI.
- * This worker instead calls cluster_rel() directly, the same lower-level,
+ * The worker instead calls cluster_rel() directly, the same lower-level,
  * parsenode-free API vacuum.c uses for VACUUM FULL, processing each
  * configured table in its own transaction exactly the way REPACK's own
  * multi-relation path does.
+ *
+ * The feature is enabled per database.  dbblue_repack_enabled,
+ * dbblue_repack_tables, dbblue_repack_threshold and
+ * dbblue_repack_min_interval are all PGC_SUSET, so each database carries
+ * its own values:
+ *
+ *     ALTER DATABASE odoo_1 SET dbblue_repack_enabled = on;
+ *     ALTER DATABASE odoo_1 SET dbblue_repack_tables = 'public.sale_order';
+ *     ALTER DATABASE odoo_2 SET dbblue_repack_enabled = off;
+ *
+ * dbblue_repack_database is the exception: it stays a plain cluster-wide
+ * PGC_SIGHUP string and is deliberately not retired the way the analogous
+ * dbblue_brin_database/dbblue_auto_index_suggestion_database GUCs were
+ * when those features went per-database.  Left empty (the default), every
+ * connectable database is considered, each gated by its own
+ * dbblue_repack_enabled.  Set to a name, it restricts the whole feature to
+ * that one database only, whatever any other database's
+ * dbblue_repack_enabled says -- useful to pin REPACK, which is far more
+ * expensive than a BRIN scan or an index suggestion pass, to a single
+ * known database while leaving the per-database knobs in place for later.
+ *
+ * Two kinds of process implement that, mirroring the autovacuum
+ * launcher/worker split (and this fork's own dbblue_brin_worker.c, the
+ * template this file follows).  A launcher, always running, holds *no*
+ * database connection: it lists the cluster's databases out of the shared
+ * catalog pg_database (applying the dbblue_repack_database filter, if
+ * any), and starts one short-lived dynamic worker in each in turn.  Each
+ * worker connects, and because InitPostgres has applied that database's
+ * own ALTER DATABASE settings by then, its dbblue_repack_enabled is
+ * already the effective value for that database -- so the worker itself
+ * decides whether to run, and a disabled database costs one immediate
+ * exit.  The launcher cannot read the per-database settings itself:
+ * pg_db_role_setting is not one of the shared catalogs available to a
+ * connectionless process.
+ *
+ * Workers run one at a time, so the feature costs one worker slot no
+ * matter how many databases have it enabled, and nothing is held open
+ * between cycles -- DROP DATABASE on an enabled database is never blocked
+ * by this feature.
  *
  * Copyright (c) 2026, dbblue / Cybrosys Technologies
  *
@@ -40,8 +79,11 @@
 
 #include <math.h>
 
+#include "access/heapam.h"
+#include "access/htup_details.h"
 #include "access/relation.h"
 #include "access/table.h"
+#include "access/tableam.h"
 #include "access/xact.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_database.h"
@@ -64,6 +106,7 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+#include "utils/syscache.h"
 #include "utils/timestamp.h"
 #include "utils/varlena.h"
 #include "utils/wait_event.h"
@@ -90,6 +133,23 @@ char	   *dbblue_repack_database = NULL;
 /* Heuristic per-tuple overhead: heap tuple header + line pointer, MAXALIGN'd. */
 #define DBBLUE_REPACK_TUPLE_OVERHEAD		28.0
 
+/* How long to keep polling a worker that the postmaster has not started. */
+#define DBBLUE_REPACK_WORKER_STARTUP_TIMEOUT	60000	/* 1 minute in ms */
+
+/* Poll granularity while waiting for a per-database worker to finish. */
+#define DBBLUE_REPACK_WORKER_POLL_INTERVAL	1000	/* 1 second in ms */
+
+/*
+ * Sleep between passes while nothing can be done at all (recovery) or right
+ * after an unexpected error, independent of dbblue_repack_naptime -- that
+ * GUC can legitimately be set very large, since REPACK is far more
+ * expensive per table than a BRIN scan or an index-advisor pass, but a
+ * standby promotion or a transient error should still be noticed quickly
+ * rather than waiting out whatever cadence the operator picked for normal
+ * cycles.  Mirrors BRIN_LAUNCHER_IDLE_INTERVAL in dbblue_brin_worker.c.
+ */
+#define DBBLUE_REPACK_IDLE_INTERVAL			60000	/* 1 minute in ms */
+
 /* One entry from dbblue_repack_tables, before bloat is checked. */
 typedef struct RepackTableSpec
 {
@@ -108,27 +168,27 @@ typedef struct RepackCandidate
 } RepackCandidate;
 
 /*
- * Worker-lifetime memory context; holds the specs/candidates of the cycle
- * currently running and is reset at the end of each cycle (and by the
- * error recovery path).
+ * One database the launcher will start a worker in this cycle.  The name is
+ * carried alongside the OID purely for log messages; the worker is addressed
+ * by OID, which stays correct even if the database is renamed mid-cycle.
+ */
+typedef struct RepackDatabase
+{
+	Oid			dboid;
+	char	   *dbname;
+} RepackDatabase;
+
+/*
+ * Process-lifetime memory context: holds the launcher's database list, or
+ * the worker's specs/candidates, for the duration of one cycle.  Reset at
+ * the end of every cycle and by the error recovery path.
  */
 static MemoryContext launcher_cxt = NULL;
 
-/*
- * Set once dbblue_repack_history has been verified to exist after the
- * feature was switched on; cleared when it is switched off so a later
- * re-enable re-checks it.
- */
-static bool schema_ready = false;
-
-/*
- * Set once BackgroundWorkerInitializeConnection has attached the worker to
- * its database.  Deferred until the feature is first enabled, so a
- * cluster that never turns the launcher on never attaches to the database
- * (which would otherwise block DROP DATABASE on it).
- */
-static bool launcher_connected = false;
-
+static List *repack_get_database_list(void);
+static void repack_wait_for_worker(BackgroundWorkerHandle *handle,
+									const RepackDatabase *db);
+static void repack_scan_one_database(const RepackDatabase *db);
 static bool ensure_schema(void);
 static List *parse_configured_tables(void);
 static List *load_bloat_candidates(List *specs);
@@ -139,42 +199,52 @@ static void record_repack_history(const char *schema, const char *table,
 								  Oid relid, double bloat_ratio);
 
 /*
- * dbblue_check_repack_enabled
- *		GUC check hook for dbblue_repack_enabled.
+ * dbblue_check_repack_database
+ *		GUC check hook for dbblue_repack_database.
  *
- * The launcher cannot start at all when dbblue_repack_database does not
- * name an existing database: BackgroundWorkerInitializeConnection() would
- * FATAL every time, and with bgw_restart_time = 5 that becomes a silent
- * crash loop with no operator-facing warning.  Rather than rejecting the
- * setting (the operator may be preparing configuration for the next
- * restart, before the database exists), warn loudly at the moment the
- * feature is switched on -- the same convention dbblue_check_advisor_enabled
- * uses for the analogous index-advisor GUC.
- *
- * Only runs on an actual off->on transition in a backend with catalog
- * access and settled GUC state, for the same reasons documented on
- * dbblue_check_advisor_enabled.
+ * Best-effort only: warn, don't reject, when the named database is not
+ * currently something the launcher could ever pick.  The operator may be
+ * preparing configuration ahead of creating the database, so this must
+ * not block the SET itself -- it only makes a dead-on-arrival filter
+ * visible immediately instead of as a silent, permanent no-op.
  */
 bool
-dbblue_check_repack_enabled(bool *newval, void **extra, GucSource source)
+dbblue_check_repack_database(char **newval, void **extra, GucSource source)
 {
-	if (!*newval || dbblue_repack_enabled)
+	Oid			dboid;
+	Form_pg_database form;
+	HeapTuple	tuple;
+
+	if (*newval == NULL || **newval == '\0')
 		return true;
 
 	if (!IsUnderPostmaster || !IsTransactionState())
 		return true;
 
-	if (dbblue_repack_database == NULL || dbblue_repack_database[0] == '\0')
-		ereport(WARNING,
-				(errmsg("dbblue_repack_enabled is on, but dbblue_repack_database is not set"),
-				 errdetail("With no database configured the repack launcher worker will fail to connect."),
-				 errhint("Set dbblue_repack_database to an existing database (changing it requires a server restart).")));
-	else if (!OidIsValid(get_database_oid(dbblue_repack_database, true)))
+	dboid = get_database_oid(*newval, true);
+	if (!OidIsValid(dboid))
+	{
 		ereport(WARNING,
 				(errmsg("dbblue repack launcher database \"%s\" does not exist",
-						dbblue_repack_database),
-				 errdetail("The launcher worker will fail to connect and will be retried every 5 seconds until the database exists."),
-				 errhint("Create the database, or point dbblue_repack_database at an existing one (changing it requires a server restart).")));
+						*newval),
+				 errdetail("No database will be repacked until a database by this name exists."),
+				 errhint("Create the database, or clear dbblue_repack_database to consider every database instead.")));
+		return true;
+	}
+
+	tuple = SearchSysCache1(DATABASEOID, ObjectIdGetDatum(dboid));
+	if (!HeapTupleIsValid(tuple))
+		return true;
+
+	form = (Form_pg_database) GETSTRUCT(tuple);
+	if (form->datistemplate || !form->datallowconn)
+		ereport(WARNING,
+				(errmsg("dbblue repack launcher database \"%s\" cannot be connected to",
+						*newval),
+				 errdetail("It is a template database, or does not allow connections."),
+				 errhint("No database will be repacked until this is corrected.")));
+
+	ReleaseSysCache(tuple);
 
 	return true;
 }
@@ -236,9 +306,11 @@ dbblue_check_repack_tables(char **newval, void **extra, GucSource source)
  *		other dbblue workers are, since this is core functionality, not
  *		something an extension's _PG_init() has to opt into.
  *
- * Always registered, since dbblue_repack_enabled is PGC_SIGHUP context
- * and the feature must be switchable on without a restart; while
- * disabled the worker only sleeps.
+ * Always registered, since dbblue_repack_enabled is a per-database
+ * PGC_SUSET setting: no cluster-wide value read at startup can tell
+ * whether some database will have it on, and ALTER DATABASE must take
+ * effect without a restart.  While no database has it on the launcher
+ * only sleeps, and it holds no database connection either way.
  */
 void
 RepackLauncherRegister(void)
@@ -277,18 +349,214 @@ RepackLauncherRegister(void)
 }
 
 /*
+ * repack_get_database_list
+ *		List the databases the launcher should start a worker in this
+ *		cycle.
+ *
+ * pg_database is one of the shared catalogs nailed into the relcache
+ * before a database is selected, so a connectionless launcher can read
+ * it; this follows get_database_list() in autovacuum.c and
+ * brin_get_database_list() in dbblue_brin_worker.c.  Whether the feature
+ * is actually on for a given database is not decided here -- that is up
+ * to dbblue_repack_enabled, read by the worker after it connects -- this
+ * is only the list of databases that can be considered at all, filtered
+ * by dbblue_repack_database when that is set.
+ *
+ * The result is allocated in the caller's context so it survives the
+ * commit below.
+ */
+static List *
+repack_get_database_list(void)
+{
+	List	   *result = NIL;
+	Relation	dbrel;
+	TableScanDesc scan;
+	HeapTuple	tup;
+	MemoryContext resultcxt = CurrentMemoryContext;
+	bool		restrict_to_one = (dbblue_repack_database != NULL &&
+								   dbblue_repack_database[0] != '\0');
+
+	StartTransactionCommand();
+
+	dbrel = table_open(DatabaseRelationId, AccessShareLock);
+	scan = table_beginscan_catalog(dbrel, 0, NULL);
+
+	while (HeapTupleIsValid(tup = heap_getnext(scan, ForwardScanDirection)))
+	{
+		Form_pg_database pgdatabase = (Form_pg_database) GETSTRUCT(tup);
+		RepackDatabase *db;
+		MemoryContext oldcxt;
+
+		/* A half-dropped database cannot be connected to at all. */
+		if (database_is_invalid_form(pgdatabase))
+			continue;
+
+		/*
+		 * Templates and databases marked as rejecting connections are
+		 * skipped whatever they are set to, for the same reasons
+		 * brin_get_database_list() skips them.
+		 */
+		if (pgdatabase->datistemplate || !pgdatabase->datallowconn)
+			continue;
+
+		if (restrict_to_one &&
+			strcmp(NameStr(pgdatabase->datname), dbblue_repack_database) != 0)
+			continue;
+
+		oldcxt = MemoryContextSwitchTo(resultcxt);
+		db = palloc_object(RepackDatabase);
+		db->dboid = pgdatabase->oid;
+		db->dbname = pstrdup(NameStr(pgdatabase->datname));
+		result = lappend(result, db);
+		MemoryContextSwitchTo(oldcxt);
+
+		/* Once the single named database is found, nothing else qualifies. */
+		if (restrict_to_one)
+			break;
+	}
+
+	table_endscan(scan);
+	table_close(dbrel, AccessShareLock);
+
+	CommitTransactionCommand();
+
+	/* CommitTransactionCommand() leaves us in TopMemoryContext. */
+	MemoryContextSwitchTo(resultcxt);
+
+	return result;
+}
+
+/*
+ * repack_wait_for_worker
+ *		Block until one per-database repack worker has finished.
+ *
+ * Waiting rather than firing off every database at once is what bounds
+ * the feature to a single worker slot: with many databases enabled,
+ * launching them in parallel would exhaust max_worker_processes and
+ * starve everything else that needs a slot.  Mirrors
+ * brin_wait_for_worker() in dbblue_brin_worker.c.
+ */
+static void
+repack_wait_for_worker(BackgroundWorkerHandle *handle, const RepackDatabase *db)
+{
+	TimestampTz startup_deadline;
+	bool		started = false;
+	bool		terminated = false;
+
+	startup_deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+												   DBBLUE_REPACK_WORKER_STARTUP_TIMEOUT);
+
+	for (;;)
+	{
+		BgwHandleStatus status;
+		pid_t		pid;
+
+		CHECK_FOR_INTERRUPTS();
+
+		status = GetBackgroundWorkerPid(handle, &pid);
+
+		if (status == BGWH_STOPPED || status == BGWH_POSTMASTER_DIED)
+			break;
+
+		if (status == BGWH_STARTED)
+			started = true;
+
+		if (ShutdownRequestPending && !terminated)
+		{
+			TerminateBackgroundWorker(handle);
+			terminated = true;
+		}
+
+		if (!started && !terminated &&
+			GetCurrentTimestamp() >= startup_deadline)
+		{
+			ereport(WARNING,
+					(errmsg("dbblue repack launcher: worker for database \"%s\" did not start",
+							db->dbname),
+					 errdetail("Giving up on it for this cycle."),
+					 errhint("Check max_worker_processes.")));
+			TerminateBackgroundWorker(handle);
+			terminated = true;
+		}
+
+		(void) WaitLatch(MyLatch,
+						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						 DBBLUE_REPACK_WORKER_POLL_INTERVAL,
+						 WAIT_EVENT_DBBLUE_REPACK_LAUNCHER_MAIN);
+		ResetLatch(MyLatch);
+	}
+}
+
+/*
+ * repack_scan_one_database
+ *		Start a one-shot worker in the given database and wait for it.
+ *
+ * The worker decides for itself whether the feature is on there, so this
+ * is called for every database repack_get_database_list() returned, not
+ * only ones known to be enabled.
+ */
+static void
+repack_scan_one_database(const RepackDatabase *db)
+{
+	BackgroundWorker worker;
+	BackgroundWorkerHandle *handle;
+
+	memset(&worker, 0, sizeof(worker));
+	worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
+	worker.bgw_start_time = BgWorkerStart_ConsistentState;
+
+	/* One cycle and done: a failed attempt is retried by the next cycle. */
+	worker.bgw_restart_time = BGW_NEVER_RESTART;
+	snprintf(worker.bgw_library_name, MAXPGPATH, "postgres");
+	snprintf(worker.bgw_function_name, BGW_MAXLEN, "DbblueRepackWorkerMain");
+	snprintf(worker.bgw_name, BGW_MAXLEN, "dbblue repack worker (%s)", db->dbname);
+	snprintf(worker.bgw_type, BGW_MAXLEN, "dbblue repack worker");
+	worker.bgw_main_arg = ObjectIdGetDatum(db->dboid);
+
+	/* So our latch is set when it starts and stops. */
+	worker.bgw_notify_pid = MyProcPid;
+
+	if (!RegisterDynamicBackgroundWorker(&worker, &handle))
+	{
+		ereport(WARNING,
+				(errmsg("dbblue repack launcher: no free background worker slot for database \"%s\"",
+						db->dbname),
+				 errdetail("The database will be retried on the next cycle."),
+				 errhint("Consider raising max_worker_processes.")));
+		return;
+	}
+
+	repack_wait_for_worker(handle, db);
+
+	pfree(handle);
+}
+
+/*
  * RepackLauncherMain
- *		Background worker entry point.
+ *		Launcher entry point.  Holds no database connection; lists the
+ *		databases to consider and starts one short-lived worker in each,
+ *		one at a time.
  */
 void
 RepackLauncherMain(Datum main_arg)
 {
 	sigjmp_buf	local_sigjmp_buf;
-	TimestampTz next_run = 0;
+
+	/* volatile: assigned in the error handler below and read after it. */
+	volatile TimestampTz next_run = 0;
 
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
 	BackgroundWorkerUnblockSignals();
+
+	/*
+	 * No database.  pg_database and pg_db_role_setting are shared
+	 * catalogs, so this is enough to see every database's setting once a
+	 * worker connects, and it means the launcher never counts as a
+	 * connection to any of them -- DROP DATABASE on an enabled database is
+	 * not blocked by the feature being on.
+	 */
+	BackgroundWorkerInitializeConnection(NULL, NULL, 0);
 
 	ereport(LOG, (errmsg("dbblue repack launcher started")));
 
@@ -300,8 +568,6 @@ RepackLauncherMain(Datum main_arg)
 	/*
 	 * Recover here after any unexpected error: report it, clean up
 	 * whatever transaction state is left, and go back to the main loop.
-	 * The wait at the end of the loop keeps a persistent failure from
-	 * turning into a busy loop.
 	 */
 	if (sigsetjmp(local_sigjmp_buf, 1) != 0)
 	{
@@ -318,10 +584,18 @@ RepackLauncherMain(Datum main_arg)
 		MemoryContextReset(launcher_cxt);
 		MemoryContextSwitchTo(launcher_cxt);
 
-		/* Re-verify the schema before the next cycle. */
-		schema_ready = false;
-
 		pgstat_report_activity(STATE_IDLE, NULL);
+
+		/*
+		 * Defer the next pass.  The error aborted this one part-way
+		 * through, so next_run still holds whatever it did before --
+		 * typically 0, on the very first pass -- and jumping straight
+		 * back into the loop would retry immediately and spin on a
+		 * persistent failure.  A fixed interval, not dbblue_repack_naptime:
+		 * see DBBLUE_REPACK_IDLE_INTERVAL.
+		 */
+		next_run = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+											   DBBLUE_REPACK_IDLE_INTERVAL);
 
 		RESUME_INTERRUPTS();
 	}
@@ -340,55 +614,75 @@ RepackLauncherMain(Datum main_arg)
 		{
 			ConfigReloadPending = false;
 			ProcessConfigFile(PGC_SIGHUP);
+
+			/*
+			 * dbblue_repack_database can only be changed by reload, and a
+			 * reload can also mean an ALTER DATABASE ... SET
+			 * dbblue_repack_enabled has just been followed by
+			 * pg_reload_conf() to pick it up sooner: re-evaluate at once
+			 * rather than at the end of the current interval.
+			 */
+			next_run = 0;
 		}
 
-		if (dbblue_repack_enabled && !RecoveryInProgress())
+		/*
+		 * A standby cannot write, so its copy of the launcher stays idle
+		 * however the feature is set; it will start repacking if this
+		 * server is ever promoted.  Reset next_run so promotion is picked
+		 * up on the very next wakeup rather than waiting out a stale
+		 * interval.
+		 */
+		if (RecoveryInProgress())
 		{
-			if (!launcher_connected)
-			{
-				BackgroundWorkerInitializeConnection(dbblue_repack_database,
-													 NULL, 0);
-
-				/*
-				 * Bound how long the launcher will wait for a lock on a
-				 * configured table.  Without this, a table stuck behind a
-				 * long-running conflicting lock would stall every later
-				 * table in the same cycle indefinitely; on timeout the
-				 * attempt errors, is caught per-table, and is simply
-				 * retried next cycle.
-				 */
-				SetConfigOption("lock_timeout", "5s", PGC_SUSET, PGC_S_SESSION);
-
-				launcher_connected = true;
-			}
-
-			if (!schema_ready)
-				schema_ready = ensure_schema();
-
-			if (schema_ready)
-			{
-				TimestampTz now = GetCurrentTimestamp();
-
-				if (next_run == 0 || now >= next_run)
-				{
-					run_repack_cycle();
-					next_run = GetCurrentTimestamp() +
-						(int64) dbblue_repack_naptime * USECS_PER_SEC;
-				}
-
-				sleep_ms = (long) ((next_run - GetCurrentTimestamp()) / 1000);
-				sleep_ms = Max(sleep_ms, 1000);
-			}
-			else
-				sleep_ms = (long) dbblue_repack_naptime * 1000;
+			next_run = 0;
+			sleep_ms = DBBLUE_REPACK_IDLE_INTERVAL;
 		}
 		else
 		{
-			/* Disabled (or a standby): re-verify everything once re-enabled. */
-			schema_ready = false;
-			next_run = 0;
-			sleep_ms = 5000;
+			/*
+			 * Paced by next_run rather than by having woken up: the
+			 * per-database workers set our latch as they start and stop,
+			 * and without this the last one of a cycle would trigger an
+			 * immediate extra pass.
+			 */
+			if (next_run == 0 || GetCurrentTimestamp() >= next_run)
+			{
+				List	   *databases;
+				ListCell   *lc;
+
+				/*
+				 * Re-read every cycle, so a database created since the
+				 * last pass is picked up and one dropped since simply
+				 * drops out of the list.  An ALTER DATABASE ... SET
+				 * dbblue_repack_enabled needs nothing more than this
+				 * either: the value is read by the worker, at connect
+				 * time, on every pass.
+				 */
+				databases = repack_get_database_list();
+
+				foreach(lc, databases)
+				{
+					if (ShutdownRequestPending)
+						break;
+
+					repack_scan_one_database((RepackDatabase *) lfirst(lc));
+				}
+
+				/* Discard this cycle's database list. */
+				MemoryContextSwitchTo(TopMemoryContext);
+				MemoryContextReset(launcher_cxt);
+				MemoryContextSwitchTo(launcher_cxt);
+
+				next_run = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+													   (int64) dbblue_repack_naptime * 1000);
+			}
+
+			sleep_ms = (long) ((next_run - GetCurrentTimestamp()) / 1000);
+			sleep_ms = Max(sleep_ms, 1000);
 		}
+
+		if (ShutdownRequestPending)
+			break;
 
 		(void) WaitLatch(MyLatch,
 						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
@@ -409,9 +703,110 @@ RepackLauncherMain(Datum main_arg)
 }
 
 /*
+ * DbblueRepackWorkerMain
+ *		Per-database worker: connect to the database whose OID the
+ *		launcher passed, run one cycle if the feature is on there, exit.
+ *
+ * The launcher starts this in every database it could connect to, not
+ * only ones known to be enabled, because it cannot read the per-database
+ * settings itself; the check below is what makes this per-database, and
+ * it costs a disabled database one connect-and-exit per cycle.
+ *
+ * Being short-lived is the point: nothing is held open between cycles, so
+ * DROP DATABASE on an enabled database is never blocked, and there is no
+ * long-lived connection whose GUCs could drift away from the database's
+ * own settings.
+ */
+void
+DbblueRepackWorkerMain(Datum main_arg)
+{
+	Oid			dboid = DatumGetObjectId(main_arg);
+	sigjmp_buf	local_sigjmp_buf;
+
+	pqsignal(SIGHUP, SignalHandlerForConfigReload);
+	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
+	BackgroundWorkerUnblockSignals();
+
+	/*
+	 * By OID, not by name: the launcher resolved the name a moment ago and
+	 * a rename in between must not redirect this worker somewhere else.
+	 * InitPostgres applies the database's own ALTER DATABASE settings, so
+	 * dbblue_repack_enabled/tables/threshold/min_interval below are this
+	 * database's values.
+	 */
+	BackgroundWorkerInitializeConnectionByOid(dboid, InvalidOid, 0);
+
+	launcher_cxt = AllocSetContextCreate(TopMemoryContext,
+										 "dbblue repack worker",
+										 ALLOCSET_DEFAULT_SIZES);
+	MemoryContextSwitchTo(launcher_cxt);
+
+	/*
+	 * One shot, so an unexpected error ends this worker rather than being
+	 * recovered from: the launcher starts a fresh one next cycle.  Report
+	 * it and unwind the transaction and SPI state first, so nothing is
+	 * left half-open at exit.
+	 */
+	if (sigsetjmp(local_sigjmp_buf, 1) != 0)
+	{
+		/* Since not using PG_TRY, must reset error stack by hand. */
+		error_context_stack = NULL;
+
+		HOLD_INTERRUPTS();
+
+		EmitErrorReport();
+		FlushErrorState();
+
+		AbortOutOfAnyTransaction();
+		MemoryContextSwitchTo(TopMemoryContext);
+		MemoryContextReset(launcher_cxt);
+
+		pgstat_report_activity(STATE_IDLE, NULL);
+
+		RESUME_INTERRUPTS();
+
+		proc_exit(1);
+	}
+	PG_exception_stack = &local_sigjmp_buf;
+
+	/*
+	 * Bound how long this worker will wait for a lock on a configured
+	 * table.  Without this, a table stuck behind a long-running
+	 * conflicting lock would stall every later table in this cycle
+	 * indefinitely; on timeout the attempt errors, is caught per-table,
+	 * and is simply retried next cycle.  Unrelated to, and unaffected by,
+	 * the per-database GUCs InitPostgres just merged above.
+	 */
+	SetConfigOption("lock_timeout", "5s", PGC_SUSET, PGC_S_SESSION);
+
+	/*
+	 * This is where the feature is actually switched on or off.
+	 * InitPostgres has applied this database's ALTER DATABASE settings
+	 * over the cluster-wide value, so dbblue_repack_enabled now holds the
+	 * effective value for this database and nothing further needs
+	 * resolving: a database that has been turned off costs this one
+	 * immediate exit.
+	 */
+	if (!dbblue_repack_enabled)
+		proc_exit(0);
+
+	/* A standby cannot write; it will repack if it is promoted. */
+	if (RecoveryInProgress())
+		proc_exit(0);
+
+	if (!ShutdownRequestPending && ensure_schema())
+		run_repack_cycle();
+
+	proc_exit(0);
+}
+
+/*
  * ensure_schema
- *		Create dbblue_repack_history if it doesn't already exist.  Safe
- *		to retry on every wakeup until it succeeds.
+ *		Create dbblue_repack_history if it doesn't already exist in the
+ *		current database.  Run fresh on every worker invocation -- there
+ *		is nothing to cache across processes, since each worker is a
+ *		fresh one-shot process with no state surviving between cycles --
+ *		but cheap, being just a CREATE TABLE IF NOT EXISTS and a GRANT.
  */
 static bool
 ensure_schema(void)
@@ -453,11 +848,6 @@ ensure_schema(void)
 	PopActiveSnapshot();
 	CommitTransactionCommand();
 	pgstat_report_activity(STATE_IDLE, NULL);
-
-	if (table_ok)
-		ereport(LOG,
-				(errmsg("dbblue repack launcher: ready (public.dbblue_repack_history verified in database \"%s\")",
-						dbblue_repack_database)));
 
 	return table_ok;
 }
