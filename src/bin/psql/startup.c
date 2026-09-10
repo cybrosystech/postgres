@@ -276,8 +276,8 @@ main(int argc, char *argv[])
 
 		new_pass = false;
 		pset.db = PQconnectdbParams(keywords, values, true);
-		free(keywords);
-		free(values);
+		pg_free(keywords);
+		pg_free(values);
 
 		if (PQstatus(pset.db) == CONNECTION_BAD &&
 			PQconnectionNeedsPassword(pset.db) &&
@@ -300,7 +300,7 @@ main(int argc, char *argv[])
 			PQfinish(pset.db);
 
 			password = simple_prompt(password_prompt, false);
-			free(password_prompt);
+			pfree(password_prompt);
 			new_pass = true;
 		}
 	} while (new_pass);
@@ -466,7 +466,9 @@ error:
 		pg_logging_config(PG_LOG_FLAG_TERSE);
 		connection_warnings(true);
 		if (!pset.quiet)
-			printf(_("Type \"help\" for help.\n\n"));
+			printf(_("Type \"help\" for help.\n"));
+			printf(_("Welcome to DBblue -  A Odoo Specific Database\n\n"));
+
 		initializeInput(options.no_readline ? 0 : 1);
 		successResult = MainLoop(stdin);
 	}
@@ -620,7 +622,7 @@ parse_psql_options(int argc, char *argv[], struct adhoc_opts *options)
 					if (!result)
 						pg_fatal("could not set printing parameter \"%s\"", value);
 
-					free(value);
+					pg_free(value);
 					break;
 				}
 			case 'q':
@@ -664,7 +666,7 @@ parse_psql_options(int argc, char *argv[], struct adhoc_opts *options)
 							exit(EXIT_FAILURE); /* error already printed */
 					}
 
-					free(value);
+					pg_free(value);
 					break;
 				}
 			case 'V':
@@ -834,8 +836,8 @@ process_psqlrc_file(char *filename)
 	else if (access(filename, R_OK) == 0)
 		(void) process_file(filename, false);
 
-	free(psqlrc_minor);
-	free(psqlrc_major);
+	pfree(psqlrc_minor);
+	pfree(psqlrc_major);
 }
 
 

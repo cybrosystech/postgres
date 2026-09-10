@@ -493,7 +493,7 @@ drop table minmaxtest cascade;
 
 -- DISTINCT can also trigger wrong answers with hash aggregation (bug #18465)
 begin;
-set local enable_sort = off;
+set local enable_groupagg = off;
 explain (costs off)
   select f1, (select distinct min(t1.f1) from int4_tbl t1 where t1.f1 = t0.f1)
   from int4_tbl t0;
@@ -639,60 +639,6 @@ select a, count(*) from t_having group by a having a = row(1.0)::avg_rec;
 
 drop table t_having;
 drop type avg_rec;
-
---
--- Test GROUP BY ALL
---
--- We don't care about the data here, just the proper transformation of the
--- GROUP BY clause, so test some queries and verify the EXPLAIN plans.
---
-
-CREATE TEMP TABLE t1 (
-  a int,
-  b int,
-  c int
-);
-
--- basic example
-EXPLAIN (COSTS OFF) SELECT b, COUNT(*) FROM t1 GROUP BY ALL;
-
--- multiple columns, non-consecutive order
-EXPLAIN (COSTS OFF) SELECT a, SUM(b), b FROM t1 GROUP BY ALL;
-
--- multi columns, no aggregate
-EXPLAIN (COSTS OFF) SELECT a + b FROM t1 GROUP BY ALL;
-
--- check we detect a non-top-level aggregate
-EXPLAIN (COSTS OFF) SELECT a, SUM(b) + 4 FROM t1 GROUP BY ALL;
-
--- including grouped column is okay
-EXPLAIN (COSTS OFF) SELECT a, SUM(b) + a FROM t1 GROUP BY ALL;
-
--- including non-grouped column, not so much
-EXPLAIN (COSTS OFF) SELECT a, SUM(b) + c FROM t1 GROUP BY ALL;
-
--- all aggregates, should reduce to GROUP BY ()
-EXPLAIN (COSTS OFF) SELECT COUNT(a), SUM(b) FROM t1 GROUP BY ALL;
-
--- likewise with empty target list
-EXPLAIN (COSTS OFF) SELECT FROM t1 GROUP BY ALL;
-
--- window functions are not to be included in GROUP BY, either
-EXPLAIN (COSTS OFF) SELECT a, COUNT(a) OVER (PARTITION BY a) FROM t1 GROUP BY ALL;
-
--- all cols
-EXPLAIN (COSTS OFF) SELECT *, count(*) FROM t1 GROUP BY ALL;
-
--- group by all with grouping element(s) (equivalent to GROUP BY's
--- default behavior, explicit antithesis to GROUP BY DISTINCT)
-EXPLAIN (COSTS OFF) SELECT a, count(*) FROM t1 GROUP BY ALL a;
-
--- verify deparsing of GROUP BY ALL
-CREATE TEMP VIEW v1 AS SELECT b, COUNT(*) FROM t1 GROUP BY ALL;
-SELECT pg_get_viewdef('v1'::regclass);
-
-DROP VIEW v1;
-DROP TABLE t1;
 
 --
 -- Test GROUP BY matching of join columns that are type-coerced due to USING
@@ -1702,7 +1648,7 @@ select v||'a', case when v||'a' = 'aa' then 1 else 0 end, count(*)
 -- Hash Aggregation Spill tests
 --
 
-set enable_sort=false;
+set enable_groupagg=false;
 set work_mem='64kB';
 
 select unique1, count(*), sum(twothousand) from tenk1
@@ -1711,7 +1657,7 @@ having sum(fivethous) > 4975
 order by sum(twothousand);
 
 set work_mem to default;
-set enable_sort to default;
+set enable_groupagg to default;
 
 --
 -- Compare results between plans using sorting and plans using hash
@@ -1766,7 +1712,7 @@ select (g/2)::numeric as c1, array_agg(g::numeric) as c2, count(*) as c3
 -- Produce results with hash aggregation
 
 set enable_hashagg = true;
-set enable_sort = false;
+set enable_groupagg = false;
 
 set jit_above_cost = 0;
 
@@ -1799,7 +1745,7 @@ create table agg_hash_4 as
 select (g/2)::numeric as c1, array_agg(g::numeric) as c2, count(*) as c3
   from agg_data_2k group by g/2;
 
-set enable_sort = true;
+set enable_groupagg = true;
 set work_mem to default;
 
 -- Compare group aggregation results to hash aggregation results

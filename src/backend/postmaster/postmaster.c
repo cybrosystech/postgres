@@ -100,11 +100,18 @@
 #include "pgstat.h"
 #include "port/pg_bswap.h"
 #include "port/pg_getopt_ctx.h"
+#include "commands/dbblue_brin_worker.h"
 #include "postmaster/autovacuum.h"
 #include "postmaster/bgworker_internals.h"
+#include "postmaster/dbblue_create_standby.h"
+#include "postmaster/dbblue_index_advisor.h"
+#include "postmaster/dbblue_audit_pruner.h"
+#include "postmaster/dbblue_repack_launcher.h"
+#include "postmaster/dbblue_backup_launcher.h"
 #include "postmaster/pgarch.h"
 #include "postmaster/postmaster.h"
 #include "postmaster/syslogger.h"
+#include "postmaster/waitsampler.h"
 #include "postmaster/walsummarizer.h"
 #include "replication/logicallauncher.h"
 #include "replication/slotsync.h"
@@ -924,6 +931,55 @@ PostmasterMain(int argc, char *argv[])
 	 * before any modules had a chance to take the background worker slots.
 	 */
 	ApplyLauncherRegister();
+
+	/*
+	 * Register the BRIN launcher for automatic BRIN index creation.  It
+	 * always runs and holds no database connection; which databases it
+	 * actually creates indexes in is controlled by the per-database
+	 * dbblue_create_brin, which it re-reads on every cycle.
+	 */
+	DBBlueBrinLauncherRegister();
+
+	/*
+	 * Register the dbblue create standby worker.  Like the apply launcher,
+	 * this is done before any external preloaded library has a chance to
+	 * take a bgworker slot.
+	 */
+	DbblueCreateStandbyRegister();
+	/*
+	 * Register the dbblue index advisor worker.
+	 */
+	DbblueIndexAdvisorRegister();
+	/*
+	 * Register the dbblue repack launcher.  Like the BRIN launcher, it
+	 * always runs and holds no database connection; which databases it
+	 * actually repacks is controlled by the per-database
+	 * dbblue_repack_enabled (optionally restricted to one database by
+	 * dbblue_repack_database), re-read every cycle.
+	 */
+	RepackLauncherRegister();
+
+	/*
+	 * Register the dbblue audit prune launcher, so audit log retention is
+	 * enforced on a timer rather than only when something is writing to an
+	 * audited table.  It always runs and holds no database connection; which
+	 * databases it sweeps is re-read every cycle from
+	 * dbblue_audit_database.
+	 */
+	DbblueAuditPrunerRegister();
+	/*
+	 * Register the dbblue wait sampling collector.  Unlike ApplyLauncher,
+	 * this one always runs; whether it actually samples anything is
+	 * controlled at runtime by dbblue_wait_sampling_enabled.
+	 */
+	WaitSamplerRegister();
+	/*
+	 * Register the dbblue backup launcher.  Like the apply launcher, this
+	 * is done before any external preloaded library has a chance to take a
+	 * bgworker slot.  It always runs; whether it actually backs anything up
+	 * is controlled at runtime by dbblue_backup_enabled.
+	 */
+	BackupLauncherRegister();
 
 	/*
 	 * Register the shared memory needs of all core subsystems.

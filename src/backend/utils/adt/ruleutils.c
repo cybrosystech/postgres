@@ -527,6 +527,7 @@ static void get_rte_alias(RangeTblEntry *rte, int varno, bool use_as,
 static void get_column_alias_list(deparse_columns *colinfo,
 								  deparse_context *context);
 static void get_for_portion_of(ForPortionOfExpr *forPortionOf,
+							   RangeTblEntry *rte,
 							   deparse_context *context);
 static void get_from_clause_coldeflist(RangeTblFunction *rtfunc,
 									   deparse_columns *colinfo,
@@ -6576,9 +6577,7 @@ get_basic_select_query(Query *query, deparse_context *context)
 		save_ingroupby = context->inGroupBy;
 		context->inGroupBy = true;
 
-		if (query->groupByAll)
-			appendStringInfoString(buf, "ALL");
-		else if (query->groupingSets == NIL)
+		if (query->groupingSets == NIL)
 		{
 			sep = "";
 			foreach(l, query->groupClause)
@@ -7579,7 +7578,7 @@ get_update_query_def(Query *query, deparse_context *context)
 					 generate_relation_name(rte->relid, NIL));
 
 	/* Print the FOR PORTION OF, if needed */
-	get_for_portion_of(query->forPortionOf, context);
+	get_for_portion_of(query->forPortionOf, rte, context);
 
 	/* Print the relation alias, if needed */
 	get_rte_alias(rte, query->resultRelation, false, context);
@@ -7786,7 +7785,7 @@ get_delete_query_def(Query *query, deparse_context *context)
 					 generate_relation_name(rte->relid, NIL));
 
 	/* Print the FOR PORTION OF, if needed */
-	get_for_portion_of(query->forPortionOf, context);
+	get_for_portion_of(query->forPortionOf, rte, context);
 
 	/* Print the relation alias, if needed */
 	get_rte_alias(rte, query->resultRelation, false, context);
@@ -12314,6 +12313,7 @@ get_json_constructor(JsonConstructorExpr *ctor, deparse_context *context,
 					  context->prettyFlags, context->wrapColumn,
 					  context->indentLevel);
 
+		get_json_format(ctor->format, buf);
 		get_json_constructor_options(ctor, buf);
 		appendStringInfoChar(buf, ')');
 
@@ -12729,6 +12729,89 @@ get_json_table_nested_columns(TableFunc *tf, JsonTablePlan *plan,
 }
 
 /*
+ * json_table_plan_is_default - does this plan match the implicit default?
+ *
+ * When no PLAN clause is given, JSON_TABLE builds a default plan that joins
+ * every nested path to its parent with OUTER and every set of sibling paths
+ * with UNION (see transformJsonTableColumns()).  Such a plan is fully implied
+ * by the NESTED COLUMNS structure, so we need not (and, to match the input,
+ * should not) print a PLAN clause for it; we only deparse a PLAN clause when
+ * the plan deviates from the default, i.e. uses an INNER or CROSS join
+ * somewhere.  This follows the usual ruleutils convention of omitting a clause
+ * that merely restates the default (cf. get_json_expr_options() for ON
+ * EMPTY/ON ERROR, or the NULLS FIRST/LAST handling in get_rule_orderby()).
+ */
+static bool
+json_table_plan_is_default(JsonTablePlan *plan)
+{
+	if (IsA(plan, JsonTablePathScan))
+	{
+		JsonTablePathScan *scan = castNode(JsonTablePathScan, plan);
+
+		if (scan->child)
+		{
+			if (!scan->outerJoin)
+				return false;	/* INNER is not the default */
+			return json_table_plan_is_default(scan->child);
+		}
+
+		return true;
+	}
+	else
+	{
+		JsonTableSiblingJoin *join = castNode(JsonTableSiblingJoin, plan);
+
+		if (join->cross)
+			return false;		/* CROSS is not the default */
+		return json_table_plan_is_default(join->lplan) &&
+			json_table_plan_is_default(join->rplan);
+	}
+}
+
+/*
+ * get_json_table_plan - Parse back a JSON_TABLE plan
+ */
+static void
+get_json_table_plan(TableFunc *tf, JsonTablePlan *plan, deparse_context *context,
+					bool parenthesize)
+{
+	if (parenthesize)
+		appendStringInfoChar(context->buf, '(');
+
+	if (IsA(plan, JsonTablePathScan))
+	{
+		JsonTablePathScan *s = castNode(JsonTablePathScan, plan);
+
+		appendStringInfoString(context->buf, quote_identifier(s->path->name));
+
+		if (s->child)
+		{
+			appendStringInfoString(context->buf,
+								   s->outerJoin ? " OUTER " : " INNER ");
+			get_json_table_plan(tf, s->child, context,
+								IsA(s->child, JsonTableSiblingJoin));
+		}
+	}
+	else if (IsA(plan, JsonTableSiblingJoin))
+	{
+		JsonTableSiblingJoin *j = (JsonTableSiblingJoin *) plan;
+
+		get_json_table_plan(tf, j->lplan, context,
+							IsA(j->lplan, JsonTableSiblingJoin) ||
+							castNode(JsonTablePathScan, j->lplan)->child);
+
+		appendStringInfoString(context->buf, j->cross ? " CROSS " : " UNION ");
+
+		get_json_table_plan(tf, j->rplan, context,
+							IsA(j->rplan, JsonTableSiblingJoin) ||
+							castNode(JsonTablePathScan, j->rplan)->child);
+	}
+
+	if (parenthesize)
+		appendStringInfoChar(context->buf, ')');
+}
+
+/*
  * get_json_table_columns - Parse back JSON_TABLE columns
  */
 static void
@@ -12737,6 +12820,7 @@ get_json_table_columns(TableFunc *tf, JsonTablePathScan *scan,
 					   bool showimplicit)
 {
 	StringInfo	buf = context->buf;
+	JsonExpr   *jexpr = castNode(JsonExpr, tf->docexpr);
 	ListCell   *lc_colname;
 	ListCell   *lc_coltype;
 	ListCell   *lc_coltypmod;
@@ -12816,6 +12900,9 @@ get_json_table_columns(TableFunc *tf, JsonTablePathScan *scan,
 			default_behavior = JSON_BEHAVIOR_NULL;
 		}
 
+		if (jexpr->on_error->btype == JSON_BEHAVIOR_ERROR)
+			default_behavior = JSON_BEHAVIOR_ERROR;
+
 		appendStringInfoString(buf, " PATH ");
 
 		get_json_path_spec(colexpr->path_spec, context, showimplicit);
@@ -12892,6 +12979,18 @@ get_json_table(TableFunc *tf, deparse_context *context, bool showimplicit)
 
 	get_json_table_columns(tf, castNode(JsonTablePathScan, tf->plan), context,
 						   showimplicit);
+
+	/*
+	 * Deparse a PLAN clause only for a non-default plan; the default plan is
+	 * implied by the NESTED COLUMNS structure (see
+	 * json_table_plan_is_default).
+	 */
+	if (root->child && !json_table_plan_is_default((JsonTablePlan *) root))
+	{
+		appendStringInfoChar(buf, ' ');
+		appendContextKeyword(context, "PLAN ", 0, 0, 0);
+		get_json_table_plan(tf, (JsonTablePlan *) root, context, true);
+	}
 
 	if (jexpr->on_error->btype != JSON_BEHAVIOR_EMPTY_ARRAY)
 		get_json_behavior(jexpr->on_error, context, "ERROR");
@@ -13430,12 +13529,18 @@ get_rte_alias(RangeTblEntry *rte, int varno, bool use_as,
  * alias and SET will be on their own line with a leading space.
  */
 static void
-get_for_portion_of(ForPortionOfExpr *forPortionOf, deparse_context *context)
+get_for_portion_of(ForPortionOfExpr *forPortionOf, RangeTblEntry *rte,
+				   deparse_context *context)
 {
 	if (forPortionOf)
 	{
+		char	   *range_name;
+
+		range_name = get_attname(rte->relid,
+								 forPortionOf->rangeVar->varattno,
+								 false);
 		appendStringInfo(context->buf, " FOR PORTION OF %s",
-						 quote_identifier(forPortionOf->range_name));
+						 quote_identifier(range_name));
 
 		/*
 		 * Try to write it as FROM ... TO ... if we received it that way,

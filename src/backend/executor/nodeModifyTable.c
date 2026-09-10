@@ -73,6 +73,7 @@
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/injection_point.h"
+#include "utils/pg_audit.h"
 #include "utils/rangetypes.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
@@ -1318,6 +1319,14 @@ ExecInsert(ModifyTableContext *context,
 	ExecARInsertTriggers(estate, resultRelInfo, slot, recheckIndexes,
 						 ar_insert_trig_tcs);
 
+	/*
+	 * dbblue dedicated audit log: record this row's post-image.  Runs once
+	 * per inserted row, after the AFTER ROW triggers, so only rows that
+	 * actually survived constraints and triggers are logged.  Whether
+	 * INSERT is captured at all is decided by dbblue_audit_operations.
+	 */
+	dbblue_audit_capture_insert(resultRelInfo, slot);
+
 	list_free(recheckIndexes);
 
 	/*
@@ -1335,8 +1344,18 @@ ExecInsert(ModifyTableContext *context,
 	if (resultRelInfo->ri_WithCheckOptions != NIL)
 		ExecWithCheckOptions(WCO_VIEW_CHECK, resultRelInfo, slot, estate);
 
-	/* Process RETURNING if present */
-	if (resultRelInfo->ri_projectReturning)
+	/*
+	 * Process RETURNING if present.
+	 *
+	 * If this is an UPDATE/DELETE ... FOR PORTION OF, we do not return the
+	 * leftover rows inserted by ExecForPortionOfLeftovers().  Note that we
+	 * must check mtstate->operation here, because we *do* want to process the
+	 * newly inserted row of a cross-partition UPDATE with a FOR PORTION OF
+	 * clause (ExecCrossPartitionUpdate() leaves mtstate->operation set to
+	 * CMD_UPDATE, whereas ExecForPortionOfLeftovers() sets it to CMD_INSERT).
+	 */
+	if (resultRelInfo->ri_projectReturning &&
+		!(node->forPortionOf && mtstate->operation == CMD_INSERT))
 	{
 		TupleTableSlot *oldSlot = NULL;
 
@@ -1819,6 +1838,18 @@ ExecDeleteEpilogue(ModifyTableContext *context, ResultRelInfo *resultRelInfo,
 	/* AFTER ROW DELETE Triggers */
 	ExecARDeleteTriggers(estate, resultRelInfo, tupleid, oldtuple,
 						 ar_delete_trig_tcs, changingPart);
+
+	/*
+	 * dbblue dedicated audit log: record this row's pre-image.  Runs once per
+	 * deleted row.  For a regular delete oldtuple is NULL, so the capture
+	 * routine re-fetches the row by its TID (SnapshotAny).
+	 *
+	 * Skip the delete half of a cross-partition update (changingPart): that
+	 * row is being moved, not deleted, and logging it as a DELETE would be
+	 * misleading.
+	 */
+	if (!changingPart)
+		dbblue_audit_capture_delete(resultRelInfo, tupleid, oldtuple);
 }
 
 /* ----------------------------------------------------------------
@@ -2600,7 +2631,8 @@ lreplace:
 static void
 ExecUpdateEpilogue(ModifyTableContext *context, UpdateContext *updateCxt,
 				   ResultRelInfo *resultRelInfo, ItemPointer tupleid,
-				   HeapTuple oldtuple, TupleTableSlot *slot)
+				   HeapTuple oldtuple, TupleTableSlot *oldSlot,
+				   TupleTableSlot *slot)
 {
 	ModifyTableState *mtstate = context->mtstate;
 	List	   *recheckIndexes = NIL;
@@ -2645,6 +2677,17 @@ ExecUpdateEpilogue(ModifyTableContext *context, UpdateContext *updateCxt,
 	if (resultRelInfo->ri_WithCheckOptions != NIL)
 		ExecWithCheckOptions(WCO_VIEW_CHECK, resultRelInfo,
 							 slot, context->estate);
+
+	/*
+	 * dbblue dedicated audit log: record this row's old/new image.  Runs
+	 * once per updated row, so every affected row is captured.  oldSlot is
+	 * the pre-image our caller worked from: ri_oldTupleSlot for a plain
+	 * UPDATE or MERGE, but ri_onConflict->oc_Existing for the UPDATE arm of
+	 * INSERT ... ON CONFLICT DO UPDATE, which never populates
+	 * ri_oldTupleSlot.  Reading ri_oldTupleSlot directly here would silently
+	 * skip every upsert.
+	 */
+	dbblue_audit_capture_update(resultRelInfo, oldSlot, slot);
 }
 
 /*
@@ -2995,7 +3038,7 @@ redo_act:
 		(estate->es_processed)++;
 
 	ExecUpdateEpilogue(context, &updateCxt, resultRelInfo, tupleid, oldtuple,
-					   slot);
+					   oldSlot, slot);
 
 	/* Process RETURNING if present */
 	if (resultRelInfo->ri_projectReturning)
@@ -3705,7 +3748,9 @@ lmerge_matched:
 				if (result == TM_Ok)
 				{
 					ExecUpdateEpilogue(context, &updateCxt, resultRelInfo,
-									   tupleid, NULL, newslot);
+									   tupleid, NULL,
+									   resultRelInfo->ri_oldTupleSlot,
+									   newslot);
 					mtstate->mt_merge_updated += 1;
 				}
 				break;
@@ -5641,7 +5686,6 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 		/* Create state for FOR PORTION OF operation */
 
 		fpoState = makeNode(ForPortionOfState);
-		fpoState->fp_rangeName = forPortionOf->range_name;
 		fpoState->fp_rangeType = forPortionOf->rangeType;
 		fpoState->fp_rangeAttno = forPortionOf->rangeVar->varattno;
 		fpoState->fp_targetRange = targetRange;
@@ -5928,7 +5972,6 @@ ExecInitForPortionOf(ModifyTableState *mtstate, EState *estate,
 
 	leafState = makeNode(ForPortionOfState);
 
-	leafState->fp_rangeName = fpoState->fp_rangeName;
 	leafState->fp_rangeType = fpoState->fp_rangeType;
 	leafState->fp_targetRange = fpoState->fp_targetRange;
 	map = ExecGetChildToRootMap(resultRelInfo);

@@ -379,6 +379,17 @@ extern void heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 extern void heap_multi_insert(Relation relation, TupleTableSlot **slots,
 							  int ntuples, CommandId cid, uint32 options,
 							  BulkInsertState bistate);
+
+/* opaque state, private to heapam.c */
+typedef struct HeapRawBulkInsertStateData *HeapRawBulkInsertState;
+
+extern bool RelationSupportsRawBulkInsert(Relation rel);
+extern HeapRawBulkInsertState heap_raw_bulk_insert_begin(Relation rel,
+														  CommandId cid,
+														  uint32 options);
+extern void heap_raw_bulk_insert_tuple(HeapRawBulkInsertState state,
+										TupleTableSlot *slot);
+extern void heap_raw_bulk_insert_end(HeapRawBulkInsertState state);
 extern TM_Result heap_delete(Relation relation, const ItemPointerData *tid,
 							 CommandId cid, uint32 options, Snapshot crosscheck,
 							 bool wait, TM_FailureData *tmfd);

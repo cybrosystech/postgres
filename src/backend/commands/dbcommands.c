@@ -65,6 +65,7 @@
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
+#include "utils/injection_point.h"
 #include "utils/lsyscache.h"
 #include "utils/pg_locale.h"
 #include "utils/relmapper.h"
@@ -141,6 +142,16 @@ static void CreateDirAndVersionFile(char *dbpath, Oid dbid, Oid tsid,
 static void CreateDatabaseUsingFileCopy(Oid src_dboid, Oid dst_dboid,
 										Oid src_tsid, Oid dst_tsid);
 static void recovery_create_dbdir(char *path, bool only_tblspc);
+
+
+/*
+ * dbblue: when on, a CREATE DATABASE that does not ask for any particular
+ * encoding or locale is given the builtin C.UTF-8 collation and UTF8
+ * encoding, cloned from template0.  Odoo wants that combination, and the
+ * builtin provider sorts far faster than libc.  Set it off to get stock
+ * PostgreSQL behaviour, where such a CREATE DATABASE inherits template1.
+ */
+bool		dbblue_default_builtin_locale = true;
 
 /*
  * Create a new database using the WAL_LOG strategy.
@@ -559,6 +570,23 @@ CreateDatabaseUsingFileCopy(Oid src_dboid, Oid dst_dboid, Oid src_tsid,
 	HeapTuple	tuple;
 
 	/*
+	 * The strategy check in createdb() runs before our transaction has an XID
+	 * and before the pg_database row exists, so the datachecksumsworker
+	 * launcher can start in that window and miss both the new database and
+	 * our transaction, leaving the raw-copied files without checksums.
+	 */
+	if (DataChecksumsInProgressOn())
+		ereport(ERROR,
+				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				errmsg("create database strategy \"%s\" not allowed when data checksums are being enabled",
+					   "file_copy"));
+
+	/*
+	 * The XID is assigned by now, so a datachecksumsworker launcher starting
+	 * after this point will wait for us and find the new database.
+	 */
+
+	/*
 	 * Force a checkpoint before starting the copy. This will force all dirty
 	 * buffers, including those of unlogged tables, out to disk, to ensure
 	 * source database is up-to-date on disk for the copy.
@@ -743,6 +771,9 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 	int			npreparedxacts;
 	CreateDBStrategy dbstrategy = CREATEDB_WAL_LOG;
 	createdb_failure_params fparms;
+	bool		use_builtin_default = false;
+	bool		replaced_template1 = false;
+	char	   *collate_str;
 
 	/* Report error if name has \n or \r character. */
 	if (strpbrk(dbname, "\n\r"))
@@ -998,6 +1029,96 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 	 * made to the source until we finish copying it, so we can be sure it
 	 * won't change underneath us.
 	 */
+	/*
+	 * If the user supplied no TEMPLATE and no encoding/locale/provider
+	 * options, default the new database to the builtin C.UTF-8 locale with
+	 * UTF8 encoding.  Use template0 as the source so the encoding/locale
+	 * compatibility checks below are bypassed regardless of template1's
+	 * settings.
+	 *
+	 * Also apply the same defaults when the Odoo pattern is detected:
+	 * explicit LC_COLLATE='C' with ENCODING='utf8' and TEMPLATE='template0',
+	 * but no other locale options. This is an upgrade from the legacy libc
+	 * approach to builtin C.UTF-8.
+	 *
+	 * Skip this for template databases being created during initdb.
+	 */
+	if (dbblue_default_builtin_locale &&
+		strcmp(dbname, "template0") != 0 && strcmp(dbname, "template1") != 0 &&
+		strcmp(dbname, "postgres") != 0)
+	{
+		if (templateEl == NULL && encodingEl == NULL &&
+			localeEl == NULL && builtinlocaleEl == NULL && iculocaleEl == NULL &&
+			collateEl == NULL && ctypeEl == NULL && locproviderEl == NULL)
+		{
+			use_builtin_default = true;
+			replaced_template1 = true;
+		}
+		/* Odoo pattern: LC_COLLATE='C' with optional ENCODING='utf8' and TEMPLATE='template0' */
+		else if (localeEl == NULL && builtinlocaleEl == NULL && iculocaleEl == NULL &&
+				 ctypeEl == NULL && locproviderEl == NULL &&
+				 collateEl && collateEl->arg)
+		{
+			collate_str = defGetString(collateEl);
+			if (pg_strcasecmp(collate_str, "C") == 0)
+			{
+				/* Check if template is template0 (or NULL) and encoding is utf8 (or NULL) */
+				bool template_ok = (templateEl == NULL ||
+									 (templateEl->arg &&
+									  pg_strcasecmp(defGetString(templateEl), "template0") == 0));
+				bool encoding_ok = (encodingEl == NULL || encoding == PG_UTF8);
+
+				if (template_ok && encoding_ok)
+					use_builtin_default = true;
+			}
+		}
+	}
+
+	if (use_builtin_default)
+	{
+		dbtemplate = "template0";
+		encoding = PG_UTF8;
+		dblocprovider = COLLPROVIDER_BUILTIN;
+		dblocale = "C.UTF-8";
+		/* Clear the collateEl so it doesn't override our defaults */
+		collateEl = NULL;
+		dbcollate = NULL;
+
+		/*
+		 * Report what was substituted.  The two branches above are different
+		 * events and need different messages.
+		 *
+		 * With no options at all, stock PostgreSQL would have cloned
+		 * template1, so anything the administrator installed there -- a
+		 * customised locale, but equally extensions, schemas and seed data
+		 * -- is silently absent from this database.  That is an undocumented
+		 * divergence usually discovered long afterwards, when a query fails
+		 * on a missing extension, so it warrants a WARNING: NOTICE sits
+		 * below the default log_min_messages of "warning" and would leave
+		 * nothing in the server log for anyone to find.
+		 *
+		 * The LC_COLLATE='C' form is a different matter.  The caller already
+		 * asked for template0, so nothing was taken away and template1 is
+		 * beside the point; what changed is the collation provider, from
+		 * libc to builtin.  That is the form Odoo emits for every database
+		 * it creates, so it is reported at NOTICE -- a WARNING per
+		 * provisioning would be noise, and one repeating a claim about
+		 * template1 that does not apply here would be worse than noise.
+		 */
+		if (replaced_template1)
+			ereport(WARNING,
+					(errmsg("database \"%s\" will use the builtin \"C.UTF-8\" locale with UTF8 encoding",
+							dbname),
+					 errdetail("It is created from template0, so template1 and anything installed in it (extensions, schemas, seed data) are not copied."),
+					 errhint("Set dbblue_default_builtin_locale to off, or name a TEMPLATE, LOCALE or ENCODING explicitly, to get the standard behaviour.")));
+		else
+			ereport(NOTICE,
+					(errmsg("database \"%s\" will use the builtin \"C.UTF-8\" locale instead of the requested libc \"C\" collation",
+							dbname),
+					 errdetail("The builtin locale orders text the same way but applies Unicode case and character rules, where libc \"C\" is limited to ASCII."),
+					 errhint("Set dbblue_default_builtin_locale to off, or name LOCALE_PROVIDER explicitly, to keep the requested collation.")));
+	}
+
 	if (!dbtemplate)
 		dbtemplate = "template1";	/* Default template database name */
 
@@ -1045,6 +1166,14 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 			dbstrategy = CREATEDB_WAL_LOG;
 		else if (pg_strcasecmp(strategy, "file_copy") == 0)
 		{
+			/*
+			 * If data checksums are being enabled we must not use file_copy
+			 * since it might copy source database which hasn't yet had data
+			 * checksums enabled, and the destination database will be skipped
+			 * as it's expected to have data checksums enabled.  Once we have
+			 * an XID assigned this needs to be rechecked, but if can error
+			 * out already we can save a lot of work.
+			 */
 			if (DataChecksumsInProgressOn())
 				ereport(ERROR,
 						errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -1509,6 +1638,8 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 
 	tuple = heap_form_tuple(RelationGetDescr(pg_database_rel),
 							new_record, new_record_nulls);
+
+	INJECTION_POINT("createdb-before-catalog-insert", NULL);
 
 	CatalogTupleInsert(pg_database_rel, tuple);
 

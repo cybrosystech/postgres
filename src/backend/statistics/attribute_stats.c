@@ -505,7 +505,8 @@ attribute_statistics_update_internal(Oid reloid,
 											atttypid, atttypmod,
 											&converted);
 
-		if (converted)
+		if (converted &&
+			statatt_check_bounds_histogram(stavalues))
 		{
 			statatt_set_slot(values, nulls, replaces,
 							 STATISTIC_KIND_BOUNDS_HISTOGRAM,

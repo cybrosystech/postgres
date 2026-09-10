@@ -18,8 +18,11 @@ backend_sources += files(
   'superuser.c',
   'timeout.c',
   'tzparser.c',
-)
 
+  # DBblue additions
+  'pg_audit.c',
+  'dbblue_fillfactor.c',
+)
 guc_scan = custom_target('guc_scan',
   input: 'guc-file.l',
   output: 'guc-file.c',

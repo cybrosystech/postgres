@@ -114,6 +114,12 @@ GetSubscription(Oid subid, bool missing_ok, bool conninfo_needed,
 
 	subform = (Form_pg_subscription) GETSTRUCT(tup);
 
+	/*
+	 * It's only safe to access subscriptions from another database from the
+	 * launcher process, which does not call GetSubscription().
+	 */
+	Assert(subform->subdbid == MyDatabaseId);
+
 	sub = palloc0_object(Subscription);
 	sub->cxt = cxt;
 	sub->oid = subid;
@@ -132,6 +138,7 @@ GetSubscription(Oid subid, bool missing_ok, bool conninfo_needed,
 	sub->retaindeadtuples = subform->subretaindeadtuples;
 	sub->maxretention = subform->submaxretention;
 	sub->retentionactive = subform->subretentionactive;
+	sub->conflictlogrelid = subform->subconflictlogrelid;
 
 	if (conninfo_needed)
 	{
@@ -203,6 +210,12 @@ GetSubscription(Oid subid, bool missing_ok, bool conninfo_needed,
 								   Anum_pg_subscription_suborigin);
 	sub->origin = TextDatumGetCString(datum);
 
+	/* Get conflict log destination */
+	datum = SysCacheGetAttrNotNull(SUBSCRIPTIONOID,
+								   tup,
+								   Anum_pg_subscription_subconflictlogdest);
+	sub->conflictlogdest = TextDatumGetCString(datum);
+
 	/* Is the subscription owner a superuser? */
 	sub->ownersuperuser = superuser_arg(sub->owner);
 
@@ -264,6 +277,9 @@ DisableSubscription(Oid subid)
 
 	if (!HeapTupleIsValid(tup))
 		elog(ERROR, "cache lookup failed for subscription %u", subid);
+
+	/* Must only modify subscriptions belonging to the current database. */
+	Assert(((Form_pg_subscription) GETSTRUCT(tup))->subdbid == MyDatabaseId);
 
 	LockSharedObject(SubscriptionRelationId, subid, 0, AccessShareLock);
 
@@ -706,6 +722,9 @@ UpdateDeadTupleRetentionStatus(Oid subid, bool active)
 
 	if (!HeapTupleIsValid(tup))
 		elog(ERROR, "cache lookup failed for subscription %u", subid);
+
+	/* Must only modify subscriptions belonging to the current database. */
+	Assert(((Form_pg_subscription) GETSTRUCT(tup))->subdbid == MyDatabaseId);
 
 	LockSharedObject(SubscriptionRelationId, subid, 0, AccessShareLock);
 

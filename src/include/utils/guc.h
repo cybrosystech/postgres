@@ -290,6 +290,9 @@ extern PGDLLIMPORT char *event_source;
 extern PGDLLIMPORT bool check_function_bodies;
 extern PGDLLIMPORT bool current_role_is_superuser;
 
+extern PGDLLIMPORT char *dbblue_brin_database;
+extern PGDLLIMPORT bool dbblue_create_brin;
+
 extern PGDLLIMPORT bool AllowAlterSystem;
 extern PGDLLIMPORT bool log_duration;
 extern PGDLLIMPORT int log_parameter_max_length;
@@ -300,6 +303,7 @@ extern PGDLLIMPORT int client_min_messages;
 extern PGDLLIMPORT int log_min_duration_sample;
 extern PGDLLIMPORT int log_min_duration_statement;
 extern PGDLLIMPORT int log_temp_files;
+extern PGDLLIMPORT int log_statement_max_length;
 extern PGDLLIMPORT double log_statement_sample_rate;
 extern PGDLLIMPORT double log_xact_sample_rate;
 extern PGDLLIMPORT char *backtrace_functions;

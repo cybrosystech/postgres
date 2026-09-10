@@ -85,6 +85,7 @@
 #include "parser/parse_expr.h"
 #include "parser/parse_relation.h"
 #include "parser/parse_type.h"
+#include "parser/analyze.h"
 #include "parser/parse_utilcmd.h"
 #include "parser/parser.h"
 #include "partitioning/partbounds.h"
@@ -113,6 +114,7 @@
 #include "utils/timestamp.h"
 #include "utils/typcache.h"
 #include "utils/usercontext.h"
+#include "utils/dbblue_fillfactor.h"
 
 /*
  * ON COMMIT action list
@@ -984,7 +986,46 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 
 	/*
 	 * Parse and validate reloptions, if any.
-	 */
+	 */	
+   if (relkind == RELKIND_RELATION)
+   {
+       ereport(DEBUG2,errmsg("DefineRelation: looking up fillfactor for table \"%s\"", stmt->relation->relname));
+       int ff = dbblue_fillfactor_lookup(stmt->relation->relname);
+        ereport(DEBUG2,
+                       (errmsg("dbblue_fillfactor: injecting fillfactor=%d "
+                               "for table \"%s\"",
+                               ff, stmt->relation->relname)));
+       if (ff > 0)
+       {
+           bool found_existing = false;
+           ListCell *lc;
+
+
+           foreach(lc, stmt->options)
+           {
+               DefElem *opt = (DefElem *) lfirst(lc);
+               if (pg_strcasecmp(opt->defname, "fillfactor") == 0)
+               {
+                   found_existing = true;
+                   break;
+               }
+           }
+
+
+           if (!found_existing)
+           {
+               DefElem *ff_elem = makeDefElem("fillfactor",
+                                              (Node *) makeInteger(ff),
+                                              -1);
+               stmt->options = lappend(stmt->options, ff_elem);
+               ereport(DEBUG2,
+                       (errmsg("dbblue_fillfactor: injecting fillfactor=%d "
+                               "for table \"%s\"",
+                               ff, stmt->relation->relname)));
+           }
+       }
+   }
+
 	reloptions = transformRelOptions((Datum) 0, stmt->options, NULL, validnsps,
 									 true, false);
 
@@ -1930,6 +1971,17 @@ ExecuteTruncate(TruncateStmt *stmt)
 	ListCell   *cell;
 
 	/*
+	 * dbblue: TRUNCATE has no restricting clause to inspect -- it always
+	 * removes every row -- so safe mode refuses it outright.
+	 */
+	if (dbblue_safe_mode)
+		ereport(ERROR,
+				errcode(ERRCODE_RESTRICT_VIOLATION),
+				errmsg("TRUNCATE is not allowed because dbblue_safe_mode is enabled"),
+				errdetail("TRUNCATE always removes every row of a table."),
+				errhint("Use DELETE with a WHERE clause selecting the rows to remove, or ask a superuser to turn dbblue_safe_mode off."));
+
+	/*
 	 * Open, exclusive-lock, and check all the explicitly-specified relations
 	 */
 	foreach(cell, stmt->relations)
@@ -2466,9 +2518,11 @@ truncate_check_rel(Oid relid, Form_pg_class reltuple)
 	 * pg_largeobject and pg_largeobject_metadata to be truncated as part of
 	 * pg_upgrade, because we need to change its relfilenode to match the old
 	 * cluster, and allowing a TRUNCATE command to be executed is the easiest
-	 * way of doing that.
+	 * way of doing that. We also allow TRUNCATE on the conflict log tables,
+	 * to permit users to manually prune conflict data to manage disk space.
 	 */
-	if (!allowSystemTableMods && IsSystemClass(relid, reltuple)
+	if (!allowSystemTableMods && IsSystemClass(relid, reltuple) &&
+		!IsConflictLogTableClass(reltuple)
 		&& (!IsBinaryUpgrade ||
 			(relid != LargeObjectRelationId &&
 			 relid != LargeObjectMetadataRelationId)))
@@ -2756,6 +2810,18 @@ MergeAttributes(List *columns, const List *supers, char relpersistence,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 					 errmsg("cannot inherit from partition \"%s\"",
 							RelationGetRelationName(relation))));
+
+		/*
+		 * Conflict log tables are managed by the system for logical
+		 * replication and should not be used as parent tables, as inheritance
+		 * could interfere with the logging behavior.
+		 */
+		if (IsConflictLogTableNamespace(relation->rd_rel->relnamespace))
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("cannot inherit from conflict log table \"%s\"",
+							RelationGetRelationName(relation)),
+					 errdetail("Conflict log tables are system-managed tables for logical replication conflicts.")));
 
 		if (relation->rd_rel->relkind != RELKIND_RELATION &&
 			relation->rd_rel->relkind != RELKIND_FOREIGN_TABLE &&
@@ -3894,6 +3960,19 @@ renameatt_check(Oid myrelid, Form_pg_class classform, bool recursing)
 	if (!object_ownercheck(RelationRelationId, myrelid, GetUserId()))
 		aclcheck_error(ACLCHECK_NOT_OWNER, get_relkind_objtype(get_rel_relkind(myrelid)),
 					   NameStr(classform->relname));
+
+	/*
+	 * Conflict log tables are used internally for logical replication
+	 * conflict logging and should not be modified directly, as it could
+	 * disrupt conflict logging.
+	 */
+	if (IsConflictLogTableClass(classform))
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("cannot rename columns of conflict log table \"%s\"",
+						NameStr(classform->relname)),
+				 errdetail("Conflict log tables are system-managed tables for logical replication conflicts.")));
+
 	if (!allowSystemTableMods && IsSystemClass(myrelid, classform))
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
@@ -6904,6 +6983,22 @@ ATSimplePermissions(AlterTableType cmdtype, Relation rel, int allowed_targets)
 		aclcheck_error(ACLCHECK_NOT_OWNER, get_relkind_objtype(rel->rd_rel->relkind),
 					   RelationGetRelationName(rel));
 
+	/*
+	 * Conflict log tables are used internally for logical replication
+	 * conflict logging and should not be altered directly, as it could
+	 * disrupt conflict logging. Direct ALTER commands are already rejected
+	 * during relation lookup in RangeVarCallbackForAlterRelation(), and
+	 * AlterTableMoveAll() skips these tables, so a conflict log table does
+	 * not normally reach here; this check guards any internal caller that
+	 * arrives via AlterTableInternal().
+	 */
+	if (IsConflictLogTableClass(rel->rd_rel))
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("cannot alter conflict log table \"%s\"",
+						RelationGetRelationName(rel)),
+				 errdetail("Conflict log tables are system-managed tables for logical replication conflicts.")));
+
 	if (!allowSystemTableMods && IsSystemRelation(rel))
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
@@ -7840,6 +7935,64 @@ add_column_collation_dependency(Oid relid, int32 attnum, Oid collid)
 }
 
 /*
+ * dbblue_ignore_drop_notnull
+ *
+ * Report whether a DROP NOT NULL on attnum should be silently ignored rather
+ * than raising an error.  That is the case only when all of the following
+ * hold, which is exactly the situation partitioning an Odoo table creates:
+ *
+ *	- rel is a partitioned table,
+ *	- attnum is one of its partition key columns, and
+ *	- attnum is part of its primary key, so the drop is going to fail anyway.
+ *
+ * Requiring the primary key membership keeps this narrow: we only suppress an
+ * error that would certainly have been raised further down in
+ * dropconstraint_internal().  A nullable partition key that is not part of a
+ * primary key can still have its not-null constraint dropped normally.
+ *
+ * Expression partition keys are recorded with an attnum of 0, which never
+ * matches a real column number, so they are excluded implicitly.
+ *
+ * See ATExecDropNotNull() for why DBblue needs this.
+ */
+static bool
+dbblue_ignore_drop_notnull(Relation rel, AttrNumber attnum)
+{
+	PartitionKey key;
+	Bitmapset  *pkattrs;
+	bool		is_partkey = false;
+	bool		in_pkey;
+	int			i;
+
+	if (rel->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
+		return false;
+
+	key = RelationGetPartitionKey(rel);
+	if (key == NULL)
+		return false;
+
+	for (i = 0; i < get_partition_natts(key); i++)
+	{
+		if (get_partition_col_attnum(key, i) == attnum)
+		{
+			is_partkey = true;
+			break;
+		}
+	}
+
+	if (!is_partkey)
+		return false;
+
+	pkattrs = RelationGetIndexAttrBitmap(rel, INDEX_ATTR_BITMAP_PRIMARY_KEY);
+	in_pkey = (pkattrs != NULL &&
+			   bms_is_member(attnum - FirstLowInvalidHeapAttributeNumber,
+							 pkattrs));
+	bms_free(pkattrs);
+
+	return in_pkey;
+}
+
+/*
  * ALTER TABLE ALTER COLUMN DROP NOT NULL
  *
  * Return the address of the modified column.  If the column was already
@@ -7875,6 +8028,34 @@ ATExecDropNotNull(Relation rel, const char *colName, bool recurse,
 	/* If the column is already nullable there's nothing to do. */
 	if (!attTup->attnotnull)
 	{
+		table_close(attr_rel, RowExclusiveLock);
+		return InvalidObjectAddress;
+	}
+
+	/*
+	 * DBblue: tolerate DROP NOT NULL on a partition key column.
+	 *
+	 * PostgreSQL requires every UNIQUE or PRIMARY KEY on a partitioned table
+	 * to include all partition key columns, so partitioning an Odoo table by
+	 * create_date widens its primary key from (id) to (id, create_date) and
+	 * makes create_date NOT NULL.  Odoo's ORM, however, issues ALTER COLUMN
+	 * ... DROP NOT NULL for every field whose Python definition is not
+	 * required, and create_date is not required.  Erroring out there aborts
+	 * module installation and upgrades on any partitioned table.
+	 *
+	 * Ignore the request instead of failing it.  The column deliberately
+	 * stays NOT NULL: we are declining a statement, not recording anything
+	 * untrue in the catalog, so the primary key and pg_dump output remain
+	 * correct.  A WARNING keeps the divergence from standard behaviour
+	 * visible.
+	 */
+	if (dbblue_ignore_drop_notnull(rel, attnum))
+	{
+		ereport(WARNING,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("ignoring DROP NOT NULL on partition key column \"%s\" of relation \"%s\"",
+						colName, RelationGetRelationName(rel)),
+				 errdetail("A partition key column must remain NOT NULL because it is part of the partitioned table's primary key.")));
 		table_close(attr_rel, RowExclusiveLock);
 		return InvalidObjectAddress;
 	}
@@ -10219,6 +10400,18 @@ ATAddForeignKeyConstraint(List **wqueue, AlteredTableInfo *tab, Relation rel,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("referenced relation \"%s\" is not a table",
 						RelationGetRelationName(pkrel))));
+
+	/*
+	 * Conflict log tables are used internally for logical replication
+	 * conflict logging and should not be referenced by foreign keys, as it
+	 * could disrupt conflict logging.
+	 */
+	if (IsConflictLogTableClass(pkrel->rd_rel))
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("cannot reference conflict log table \"%s\"",
+						RelationGetRelationName(pkrel)),
+				 errdetail("Conflict log tables are system-managed tables for logical replication conflicts.")));
 
 	if (!allowSystemTableMods && IsSystemRelation(pkrel))
 		ereport(ERROR,
@@ -13960,6 +14153,84 @@ transformFkeyGetPrimaryKey(Relation pkrel, Oid *indexOid,
 }
 
 /*
+ * dbblue_index_extras_are_partkey
+ *
+ * Helper for transformFkeyCheckAttrs().  Given a unique index on a partitioned
+ * table that has more key columns than the foreign key references, report
+ * whether every surplus column is a partition key column.
+ *
+ * This keeps DBblue's relaxation of the FK column-count rule to the exact case
+ * it exists for: PostgreSQL forces partition key columns into every unique
+ * index on a partitioned table, so an Odoo table partitioned by create_date
+ * ends up with a primary key of (id, create_date) even though only (id) is the
+ * logical key.  Surplus columns that are *not* part of the partition key were
+ * chosen by the user and must still be matched exactly, as upstream requires.
+ */
+static bool
+dbblue_index_extras_are_partkey(PartitionKey partkey,
+								Form_pg_index indexStruct,
+								int numattrs, const int16 *attnums)
+{
+	int			j;
+
+	if (partkey == NULL)
+		return false;
+
+
+	for (j = 0; j < indexStruct->indnkeyatts; j++)
+	{
+		AttrNumber	indattno = indexStruct->indkey.values[j];
+		bool		referenced = false;
+		bool		is_partkey = false;
+		int			k;
+
+		/* Columns the foreign key actually references are fine. */
+		for (k = 0; k < numattrs; k++)
+		{
+			if (attnums[k] == indattno)
+			{
+				referenced = true;
+				break;
+			}
+		}
+		if (referenced)
+			continue;
+
+		/* Anything else must be a partition key column. */
+		for (k = 0; k < get_partition_natts(partkey); k++)
+		{
+			if (get_partition_col_attnum(partkey, k) == indattno)
+			{
+				is_partkey = true;
+				break;
+			}
+		}
+		if (!is_partkey)
+			return false;
+	}
+
+	/*
+	 * The relaxation rests on the referenced columns being unique in practice
+	 * even though the widened index cannot enforce it.  That holds for a
+	 * primary key, whose remaining column is the table's identity drawn from
+	 * a sequence -- the Odoo case this exists for.  A plain UNIQUE carries no
+	 * such promise: REFERENCES t(name) backed by UNIQUE (name, create_date)
+	 * is accepted here, but two rows in different partitions may then share
+	 * "name", and referential actions applied per leaf partition would
+	 * cascade or restrict against a parent that still exists.  Accept it --
+	 * refusing would break legitimate composite keys whose leading column is
+	 * itself unique -- but say so.
+	 */
+	if (!indexStruct->indisprimary)
+		ereport(WARNING,
+				(errmsg("foreign key relies on a non-primary unique constraint widened by the partition key"),
+				 errdetail("Uniqueness of the referenced columns is not enforced across partitions, so referential actions may misbehave if duplicates appear."),
+				 errhint("Reference the primary key instead, or include the partition key columns in the foreign key.")));
+
+	return true;
+}
+
+/*
  * transformFkeyCheckAttrs -
  *
  *	Validate that the 'attnums' columns in the 'pkrel' relation are valid to
@@ -13985,6 +14256,42 @@ transformFkeyCheckAttrs(Relation pkrel,
 	ListCell   *indexoidscan;
 	int			i,
 				j;
+	PartitionKey partkey = NULL;
+
+	/*
+	 * DBblue: when the referenced table is a partitioned table, PostgreSQL
+	 * requires that any UNIQUE or PRIMARY KEY index include all partition key
+	 * columns (see indexcmds.c).  This means a table partitioned by
+	 * create_date will have a composite PK of (id, create_date) even when
+	 * only (id) is the logical primary key.  To allow foreign keys that
+	 * reference only the logical key columns (e.g., REFERENCES
+	 * sale_order(id), which is what Odoo's ORM generates), we relax the
+	 * exact-column-count requirement for partitioned referenced tables: the
+	 * index must contain all FK-referenced columns, but may also contain
+	 * additional partition key columns.
+	 *
+	 * The relaxation is deliberately narrow: it applies only to the primary
+	 * key, and the *only* extra columns tolerated are the partition key
+	 * columns that PostgreSQL forced into it (see
+	 * dbblue_index_extras_are_partkey).  A unique index on (name, company_id)
+	 * still does not satisfy REFERENCES t(name), and neither does a
+	 * non-primary UNIQUE (name, create_date), exactly as upstream requires.
+	 *
+	 * Temporal FKs (WITH PERIOD) keep the strict exact-match requirement
+	 * because their semantics depend on precise column positioning.
+	 *
+	 * NOTE: because a subset of a composite unique key is not itself unique,
+	 * the resulting foreign key relies on the referenced column being
+	 * globally unique by convention rather than by enforcement.  Odoo
+	 * satisfies this by drawing id from a sequence.  If duplicate ids ever
+	 * appear across partitions, referential actions are applied per leaf
+	 * partition and will misbehave.  This trade-off is accepted; see the
+	 * DBblue documentation.
+	 */
+	bool		pk_is_partitioned = (pkrel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE);
+
+	if (pk_is_partitioned)
+		partkey = RelationGetPartitionKey(pkrel);
 
 	/*
 	 * Reject duplicate appearances of columns in the referenced-columns list.
@@ -14023,11 +14330,18 @@ transformFkeyCheckAttrs(Relation pkrel,
 		indexStruct = (Form_pg_index) GETSTRUCT(indexTuple);
 
 		/*
-		 * Must have the right number of columns; must be unique (or if
-		 * temporal then exclusion instead) and not a partial index; forget it
-		 * if there are any expressions, too. Invalid indexes are out as well.
+		 * Must have the right number of columns (or, for non-temporal FKs on
+		 * partitioned tables, at least as many columns as the FK references,
+		 * with every surplus column being a partition key column); must be
+		 * unique (or if temporal then exclusion instead) and not a partial
+		 * index; forget it if there are any expressions, too. Invalid indexes
+		 * are out as well.
 		 */
-		if (indexStruct->indnkeyatts == numattrs &&
+		if ((indexStruct->indnkeyatts == numattrs ||
+			 (pk_is_partitioned && !with_period &&
+			  indexStruct->indnkeyatts > numattrs &&
+			  dbblue_index_extras_are_partkey(partkey, indexStruct,
+											  numattrs, attnums))) &&
 			(with_period ? indexStruct->indisexclusion : indexStruct->indisunique) &&
 			indexStruct->indisvalid &&
 			heap_attisnull(indexTuple, Anum_pg_index_indpred, NULL) &&
@@ -14046,15 +14360,17 @@ transformFkeyCheckAttrs(Relation pkrel,
 			 * Check for a match, and extract the appropriate opclasses while
 			 * we're at it.
 			 *
-			 * We know that attnums[] is duplicate-free per the test at the
-			 * start of this function, and we checked above that the number of
-			 * index columns agrees, so if we find a match for each attnums[]
-			 * entry then we must have a one-to-one match in some order.
+			 * For non-partitioned tables the number of index columns equals
+			 * numattrs (verified above), so as attnums[] is duplicate-free
+			 * per the test at the start of this function, this is a
+			 * one-to-one match check.  For partitioned tables the index may
+			 * have extra partition key columns; we search all indnkeyatts
+			 * positions to locate each FK column anywhere within the index.
 			 */
 			for (i = 0; i < numattrs; i++)
 			{
 				found = false;
-				for (j = 0; j < numattrs; j++)
+				for (j = 0; j < indexStruct->indnkeyatts; j++)
 				{
 					if (attnums[i] == indexStruct->indkey.values[j])
 					{
@@ -15618,7 +15934,7 @@ RememberAllDependentForRebuilding(AlteredTableInfo *tab, AlterTableType subtype,
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							 errmsg("cannot alter type of a column used by a function or procedure"),
-							 errdetail("%s depends on column \"%s\"",
+							 errdetail("%s depends on column \"%s\".",
 									   getObjectDescription(&foundObject, false),
 									   colName)));
 				break;
@@ -15633,7 +15949,7 @@ RememberAllDependentForRebuilding(AlteredTableInfo *tab, AlterTableType subtype,
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							 errmsg("cannot alter type of a column used by a view or rule"),
-							 errdetail("%s depends on column \"%s\"",
+							 errdetail("%s depends on column \"%s\".",
 									   getObjectDescription(&foundObject, false),
 									   colName)));
 				break;
@@ -15653,7 +15969,7 @@ RememberAllDependentForRebuilding(AlteredTableInfo *tab, AlterTableType subtype,
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							 errmsg("cannot alter type of a column used in a trigger definition"),
-							 errdetail("%s depends on column \"%s\"",
+							 errdetail("%s depends on column \"%s\".",
 									   getObjectDescription(&foundObject, false),
 									   colName)));
 				break;
@@ -15672,7 +15988,7 @@ RememberAllDependentForRebuilding(AlteredTableInfo *tab, AlterTableType subtype,
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							 errmsg("cannot alter type of a column used in a policy definition"),
-							 errdetail("%s depends on column \"%s\"",
+							 errdetail("%s depends on column \"%s\".",
 									   getObjectDescription(&foundObject, false),
 									   colName)));
 				break;
@@ -15731,7 +16047,7 @@ RememberAllDependentForRebuilding(AlteredTableInfo *tab, AlterTableType subtype,
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							 errmsg("cannot alter type of a column used by a publication WHERE clause"),
-							 errdetail("%s depends on column \"%s\"",
+							 errdetail("%s depends on column \"%s\".",
 									   getObjectDescription(&foundObject, false),
 									   colName)));
 				break;
@@ -17724,13 +18040,19 @@ AlterTableMoveAll(AlterTableMoveAllStmt *stmt)
 		 * really wishes to do so, they can issue the individual ALTER
 		 * commands directly.
 		 *
-		 * Also, explicitly avoid any shared tables, temp tables, or TOAST
-		 * (TOAST will be moved with the main table).
+		 * Also, explicitly avoid any shared tables, temp tables, TOAST (TOAST
+		 * will be moved with the main table).
+		 *
+		 * Conflict log tables are system-managed for logical replication and
+		 * cannot be altered directly, so skip them as well; otherwise a
+		 * single such table in the source tablespace would abort the whole
+		 * bulk move.
 		 */
 		if (IsCatalogNamespace(relForm->relnamespace) ||
 			relForm->relisshared ||
 			isAnyTempNamespace(relForm->relnamespace) ||
-			IsToastNamespace(relForm->relnamespace))
+			IsToastNamespace(relForm->relnamespace) ||
+			IsConflictLogTableNamespace(relForm->relnamespace))
 			continue;
 
 		/* Only move the object type requested */
@@ -20219,6 +20541,18 @@ RangeVarCallbackOwnsRelation(const RangeVar *relation,
 		aclcheck_error(ACLCHECK_NOT_OWNER, get_relkind_objtype(get_rel_relkind(relId)),
 					   relation->relname);
 
+	/*
+	 * Conflict log tables are used internally for logical replication
+	 * conflict logging and should not be modified directly, as it could
+	 * disrupt conflict logging.
+	 */
+	if (IsConflictLogTableClass((Form_pg_class) GETSTRUCT(tuple)))
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("cannot change conflict log table \"%s\"",
+						relation->relname),
+				 errdetail("Conflict log tables are system-managed tables for logical replication conflicts.")));
+
 	if (!allowSystemTableMods &&
 		IsSystemClass(relId, (Form_pg_class) GETSTRUCT(tuple)))
 		ereport(ERROR,
@@ -20253,6 +20587,18 @@ RangeVarCallbackForAlterRelation(const RangeVar *rv, Oid relid, Oid oldrelid,
 	/* Must own relation. */
 	if (!object_ownercheck(RelationRelationId, relid, GetUserId()))
 		aclcheck_error(ACLCHECK_NOT_OWNER, get_relkind_objtype(get_rel_relkind(relid)), rv->relname);
+
+	/*
+	 * Conflict log tables are used internally for logical replication
+	 * conflict logging and should not be altered directly, as it could
+	 * disrupt conflict logging.
+	 */
+	if (IsConflictLogTableClass(classform))
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("cannot alter conflict log table \"%s\"",
+						rv->relname),
+				 errdetail("Conflict log tables are system-managed tables for logical replication conflicts.")));
 
 	/* No system table modifications unless explicitly allowed. */
 	if (!allowSystemTableMods && IsSystemClass(relid, classform))

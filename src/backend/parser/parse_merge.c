@@ -292,6 +292,7 @@ transformMergeStmt(ParseState *pstate, MergeStmt *stmt)
 		action->qual = transformWhereClause(pstate, mergeWhenClause->condition,
 											EXPR_KIND_MERGE_WHEN, "WHEN");
 
+
 		/*
 		 * Transform target lists for each INSERT and UPDATE action stmt
 		 */
@@ -402,6 +403,48 @@ transformMergeStmt(ParseState *pstate, MergeStmt *stmt)
 	qry->hasSubLinks = pstate->p_hasSubLinks;
 
 	assign_query_collations(pstate, qry);
+
+	/*
+	 * dbblue: refuse a MERGE action that would change every target row.
+	 *
+	 * Only actions touching rows already in the target matter; NOT MATCHED
+	 * BY TARGET merely inserts.  The rows such an action reaches are those
+	 * satisfying the ON condition (for MATCHED) or failing it (for NOT
+	 * MATCHED BY SOURCE), narrowed further by the action's own WHEN
+	 * condition -- so hand the guard exactly that expression and let it
+	 * fold.  Negating the join condition for NOT MATCHED BY SOURCE matters:
+	 * there it is "ON false", not "ON true", that sweeps the whole table.
+	 *
+	 * Done here rather than as each action is transformed because the guard
+	 * constant-folds, which is only safe once collations are resolved.
+	 */
+	if (dbblue_safe_mode)
+	{
+		foreach(l, qry->mergeActionList)
+		{
+			MergeAction *action = lfirst_node(MergeAction, l);
+			Node	   *reach;
+
+			if (action->commandType != CMD_UPDATE &&
+				action->commandType != CMD_DELETE)
+				continue;
+			if (action->matchKind == MERGE_WHEN_NOT_MATCHED_BY_TARGET)
+				continue;
+
+			reach = qry->mergeJoinCondition;
+			if (action->matchKind == MERGE_WHEN_NOT_MATCHED_BY_SOURCE)
+				reach = (Node *) makeBoolExpr(NOT_EXPR, list_make1(reach), -1);
+			if (action->qual != NULL)
+				reach = (Node *) makeBoolExpr(AND_EXPR,
+											  list_make2(reach, action->qual),
+											  -1);
+
+			dbblue_safe_mode_check(action->commandType == CMD_DELETE ?
+								   "MERGE ... THEN DELETE" :
+								   "MERGE ... THEN UPDATE",
+								   "condition", reach);
+		}
+	}
 
 	return qry;
 }

@@ -72,6 +72,7 @@
 #include "storage/shmem_internal.h"
 #include "storage/sinval.h"
 #include "storage/standby.h"
+#include "tcop/autoprepare.h"
 #include "tcop/backend_startup.h"
 #include "tcop/fastpath.h"
 #include "tcop/pquery.h"
@@ -183,6 +184,7 @@ static int	SocketBackend(StringInfo inBuf);
 static int	ReadCommand(StringInfo inBuf);
 static void forbidden_in_wal_sender(char firstchar);
 static bool check_log_statement(List *stmt_list);
+static char *truncate_query_log(const char *query);
 static int	errdetail_execute(List *raw_parsetree_list);
 static int	errdetail_params(ParamListInfo params);
 static void bind_param_error_callback(void *arg);
@@ -837,6 +839,19 @@ pg_rewrite_query(Query *query)
 	if (log_parser_stats)
 		ShowUsage("REWRITER STATISTICS");
 
+	/*
+	 * dbblue: re-check safe mode against what the rewriter produced.  Rules
+	 * can replace the statement the user wrote with one that touches every
+	 * row, so the parse-time check alone is not enough.
+	 */
+	if (dbblue_safe_mode)
+	{
+		ListCell   *lc;
+
+		foreach(lc, querytree_list)
+			dbblue_safe_mode_check_rewritten(lfirst_node(Query, lc));
+	}
+
 #ifdef DEBUG_NODE_TESTS_ENABLED
 
 	/* Optional debugging check: pass querytree through copyObject() */
@@ -1084,11 +1099,17 @@ exec_simple_query(const char *query_string)
 	/* Log immediately if dictated by log_statement */
 	if (check_log_statement(parsetree_list))
 	{
+		char	   *truncated_stmt = truncate_query_log(query_string);
+
 		ereport(LOG,
-				(errmsg("statement: %s", query_string),
+				(errmsg("statement: %s",
+						(truncated_stmt != NULL) ? truncated_stmt : query_string),
 				 errhidestmt(true),
 				 errdetail_execute(parsetree_list)));
 		was_logged = true;
+
+		if (truncated_stmt != NULL)
+			pfree(truncated_stmt);
 	}
 
 	/*
@@ -1118,6 +1139,9 @@ exec_simple_query(const char *query_string)
 		MemoryContext per_parsetree_context = NULL;
 		List	   *querytree_list,
 				   *plantree_list;
+		CachedPlan *aprep_cplan = NULL;
+		ResourceOwner aprep_owner = NULL;
+		ParamListInfo aprep_params = NULL;
 		Portal		portal;
 		DestReceiver *receiver;
 		int16		format;
@@ -1203,11 +1227,39 @@ exec_simple_query(const char *query_string)
 		else
 			oldcontext = MemoryContextSwitchTo(MessageContext);
 
-		querytree_list = pg_analyze_and_rewrite_fixedparams(parsetree, query_string,
-															NULL, 0, NULL);
+		/*
+		 * dbblue autoprepare: consult with the analyzed-but-NOT-yet-rewritten
+		 * query.  The plancache must own the rewrite so it can re-do it
+		 * correctly on invalidation; rewriting an already-rewritten query trips
+		 * Assert(querySource == QSRC_ORIGINAL) in the rewriter.  So we split
+		 * pg_analyze_and_rewrite_fixedparams() here: analyze, consult, then on a
+		 * miss rewrite + plan as usual (on a hit, reuse the cached plan and skip
+		 * both).  The plan refcount is tracked by CurrentResourceOwner, so it is
+		 * released automatically if any step before PortalDefineQuery throws; on
+		 * the normal path we release it explicitly after PortalDrop.
+		 */
+		{
+			Query	   *analyzed_query;
+			CachedPlanSource *aprep_src = NULL;
 
-		plantree_list = pg_plan_queries(querytree_list, query_string,
-										CURSOR_OPT_PARALLEL_OK, NULL);
+			analyzed_query = parse_analyze_fixedparams(parsetree, query_string,
+													   NULL, 0, NULL);
+
+			if (AutoprepareConsult(analyzed_query, query_string,
+								   &aprep_src, &aprep_params) == APREP_HIT)
+			{
+				aprep_owner = CurrentResourceOwner;
+				aprep_cplan = GetCachedPlan(aprep_src, aprep_params,
+											aprep_owner, NULL);
+				plantree_list = aprep_cplan->stmt_list;
+			}
+			else
+			{
+				querytree_list = pg_rewrite_query(analyzed_query);
+				plantree_list = pg_plan_queries(querytree_list, query_string,
+												CURSOR_OPT_PARALLEL_OK, NULL);
+			}
+		}
 
 		/*
 		 * Done with the snapshot used for parsing/planning.
@@ -1248,7 +1300,7 @@ exec_simple_query(const char *query_string)
 		/*
 		 * Start the portal.  No parameters here.
 		 */
-		PortalStart(portal, NULL, 0, InvalidSnapshot);
+		PortalStart(portal, aprep_params, 0, InvalidSnapshot);
 
 		/*
 		 * Select the appropriate output format: text unless we are doing a
@@ -1298,6 +1350,13 @@ exec_simple_query(const char *query_string)
 
 		PortalDrop(portal, false);
 
+		/* dbblue: release the autoprepare cached plan, if we used one. */
+		if (aprep_cplan != NULL)
+		{
+			ReleaseCachedPlan(aprep_cplan, aprep_owner);
+			aprep_cplan = NULL;
+		}
+		/*dbblue code end*/
 		if (lnext(parsetree_list, parsetree_item) == NULL)
 		{
 			/*
@@ -1381,12 +1440,20 @@ exec_simple_query(const char *query_string)
 					 errhidestmt(true)));
 			break;
 		case 2:
-			ereport(LOG,
-					(errmsg("duration: %s ms  statement: %s",
-							msec_str, query_string),
-					 errhidestmt(true),
-					 errdetail_execute(parsetree_list)));
-			break;
+			{
+				char	   *truncated_stmt = truncate_query_log(query_string);
+
+				ereport(LOG,
+						(errmsg("duration: %s ms  statement: %s",
+								msec_str,
+								(truncated_stmt != NULL) ? truncated_stmt : query_string),
+						 errhidestmt(true),
+						 errdetail_execute(parsetree_list)));
+
+				if (truncated_stmt != NULL)
+					pfree(truncated_stmt);
+				break;
+			}
 	}
 
 	if (save_log_statement_stats)
@@ -1616,13 +1683,20 @@ exec_parse_message(const char *query_string,	/* string to execute */
 					 errhidestmt(true)));
 			break;
 		case 2:
-			ereport(LOG,
-					(errmsg("duration: %s ms  parse %s: %s",
-							msec_str,
-							*stmt_name ? stmt_name : "<unnamed>",
-							query_string),
-					 errhidestmt(true)));
-			break;
+			{
+				char	   *truncated_stmt = truncate_query_log(query_string);
+
+				ereport(LOG,
+						(errmsg("duration: %s ms  parse %s: %s",
+								msec_str,
+								*stmt_name ? stmt_name : "<unnamed>",
+								(truncated_stmt != NULL) ? truncated_stmt : query_string),
+						 errhidestmt(true)));
+
+				if (truncated_stmt != NULL)
+					pfree(truncated_stmt);
+				break;
+			}
 	}
 
 	if (save_log_statement_stats)
@@ -2093,16 +2167,23 @@ exec_bind_message(StringInfo input_message)
 					 errhidestmt(true)));
 			break;
 		case 2:
-			ereport(LOG,
-					(errmsg("duration: %s ms  bind %s%s%s: %s",
-							msec_str,
-							*stmt_name ? stmt_name : "<unnamed>",
-							*portal_name ? "/" : "",
-							*portal_name ? portal_name : "",
-							psrc->query_string),
-					 errhidestmt(true),
-					 errdetail_params(params)));
-			break;
+			{
+				char	   *truncated_stmt = truncate_query_log(psrc->query_string);
+
+				ereport(LOG,
+						(errmsg("duration: %s ms  bind %s%s%s: %s",
+								msec_str,
+								*stmt_name ? stmt_name : "<unnamed>",
+								*portal_name ? "/" : "",
+								*portal_name ? portal_name : "",
+								(truncated_stmt != NULL) ? truncated_stmt : psrc->query_string),
+						 errhidestmt(true),
+						 errdetail_params(params)));
+
+				if (truncated_stmt != NULL)
+					pfree(truncated_stmt);
+				break;
+			}
 	}
 
 	if (save_log_statement_stats)
@@ -2241,6 +2322,8 @@ exec_execute_message(const char *portal_name, long max_rows)
 	/* Log immediately if dictated by log_statement */
 	if (check_log_statement(portal->stmts))
 	{
+		char	   *truncated_source = truncate_query_log(sourceText);
+
 		ereport(LOG,
 				(errmsg("%s %s%s%s: %s",
 						execute_is_fetch ?
@@ -2249,10 +2332,13 @@ exec_execute_message(const char *portal_name, long max_rows)
 						prepStmtName,
 						*portal_name ? "/" : "",
 						*portal_name ? portal_name : "",
-						sourceText),
+						(truncated_source != NULL) ? truncated_source : sourceText),
 				 errhidestmt(true),
 				 errdetail_params(portalParams)));
 		was_logged = true;
+
+		if (truncated_source != NULL)
+			pfree(truncated_source);
 	}
 
 	/*
@@ -2364,19 +2450,26 @@ exec_execute_message(const char *portal_name, long max_rows)
 					 errhidestmt(true)));
 			break;
 		case 2:
-			ereport(LOG,
-					(errmsg("duration: %s ms  %s %s%s%s: %s",
-							msec_str,
-							execute_is_fetch ?
-							_("execute fetch from") :
-							_("execute"),
-							prepStmtName,
-							*portal_name ? "/" : "",
-							*portal_name ? portal_name : "",
-							sourceText),
-					 errhidestmt(true),
-					 errdetail_params(portalParams)));
-			break;
+			{
+				char	   *truncated_source = truncate_query_log(sourceText);
+
+				ereport(LOG,
+						(errmsg("duration: %s ms  %s %s%s%s: %s",
+								msec_str,
+								execute_is_fetch ?
+								_("execute fetch from") :
+								_("execute"),
+								prepStmtName,
+								*portal_name ? "/" : "",
+								*portal_name ? portal_name : "",
+								(truncated_source != NULL) ? truncated_source : sourceText),
+						 errhidestmt(true),
+						 errdetail_params(portalParams)));
+
+				if (truncated_source != NULL)
+					pfree(truncated_source);
+				break;
+			}
 	}
 
 	if (save_log_statement_stats)
@@ -2491,6 +2584,46 @@ check_log_duration(char *msec_str, bool was_logged)
 }
 
 /*
+ * truncate_query_log
+ *		Truncate query string if needed for logging
+ *
+ * Returns a palloc'd copy of the query truncated for logging, with an
+ * ellipsis appended if truncation occurs, or NULL if no truncation is
+ * required.
+ */
+static char *
+truncate_query_log(const char *query)
+{
+	size_t		query_len;
+	size_t		truncated_len;
+	char	   *truncated_query;
+
+	/* Truncation is disabled when the limit is negative */
+	if (!query || log_statement_max_length < 0)
+		return NULL;
+
+	query_len = strnlen(query,
+						(size_t) log_statement_max_length +
+						MAX_MULTIBYTE_CHAR_LEN);
+
+	/*
+	 * No need to allocate a truncated copy if the query is shorter than
+	 * log_statement_max_length.
+	 */
+	if (query_len <= (size_t) log_statement_max_length)
+		return NULL;
+
+	/* Truncate at a multibyte character boundary */
+	truncated_len = pg_mbcliplen(query, query_len, log_statement_max_length);
+	truncated_query = (char *) palloc(truncated_len + 4);
+	memcpy(truncated_query, query, truncated_len);
+	memcpy(truncated_query + truncated_len, "...", 3);
+	truncated_query[truncated_len + 3] = '\0';
+
+	return truncated_query;
+}
+
+/*
  * errdetail_execute
  *
  * Add an errdetail() line showing the query referenced by an EXECUTE, if any.
@@ -2513,7 +2646,16 @@ errdetail_execute(List *raw_parsetree_list)
 			pstmt = FetchPreparedStatement(stmt->name, false);
 			if (pstmt)
 			{
-				errdetail("prepare: %s", pstmt->plansource->query_string);
+				char	   *truncated_stmt =
+					truncate_query_log(pstmt->plansource->query_string);
+
+				errdetail("prepare: %s",
+						  truncated_stmt ?
+						  truncated_stmt : pstmt->plansource->query_string);
+
+				if (truncated_stmt != NULL)
+					pfree(truncated_stmt);
+
 				return 0;
 			}
 		}
@@ -4392,6 +4534,13 @@ PostgresMain(const char *dbname, const char *username)
 	}
 
 	SetProcessingMode(NormalProcessing);
+
+	/*
+	 * dbblue: register the autoprepare plan-cache GUCs for this backend, and
+	 * force query-id computation on (under compute_query_id = auto) since the
+	 * autoprepare fingerprint is the query jumble.
+	 */
+	AutoprepareRegisterGUCs();
 
 	/*
 	 * Now all GUC states are fully set up.  Report them to client if

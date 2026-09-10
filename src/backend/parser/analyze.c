@@ -73,6 +73,71 @@ typedef struct SelectStmtPassthrough
 /* Hook for plugins to get control at end of parse analysis */
 post_parse_analyze_hook_type post_parse_analyze_hook = NULL;
 
+/* GUC: reject UPDATE/DELETE statements that have no WHERE clause */
+bool		dbblue_safe_mode = false;
+
+/*
+ * dbblue_safe_mode_check
+ *		Refuse a statement that would change every row of a table.
+ *
+ * "qual" is the *transformed* restriction limiting which rows the command
+ * touches -- the WHERE clause of an UPDATE or DELETE, or for MERGE the ON
+ * condition combined with the action's own WHEN condition -- or NULL when
+ * the statement carries no restriction at all.  "cmd" and "restriction"
+ * name the command and its restricting clause in the error message.
+ *
+ * Testing the transformed expression rather than the raw parse tree lets the
+ * guard constant-fold it first, so a predicate written purely to satisfy the
+ * guard ("WHERE true", "WHERE 1=1") is refused as well as an omitted one.
+ *
+ * That fold is necessarily incomplete: whether an arbitrary predicate matches
+ * every row cannot be decided without running it, so anything that does not
+ * reduce to a constant is allowed through -- "WHERE (SELECT 1) = 1" still
+ * gets past.  This is a guard against changing every row by accident, not a
+ * sandbox against someone determined to do it deliberately; for that, do not
+ * grant the privilege in the first place.
+ */
+void
+dbblue_safe_mode_check(const char *cmd, const char *restriction, Node *qual)
+{
+	if (!dbblue_safe_mode)
+		return;
+
+	if (qual == NULL)
+		ereport(ERROR,
+				errcode(ERRCODE_RESTRICT_VIOLATION),
+				errmsg("%s requires a %s because dbblue_safe_mode is enabled",
+					   cmd, restriction),
+				errdetail("Safe mode refuses statements that would change every row of a table."),
+				errhint("Add a %s selecting the rows to change, or ask a superuser to turn dbblue_safe_mode off.",
+						restriction));
+
+	/*
+	 * eval_const_expressions() accepts a NULL PlannerInfo, and this is the
+	 * same folding the planner is about to do to this expression anyway.
+	 */
+	qual = eval_const_expressions(NULL, qual);
+
+	if (IsA(qual, Const))
+	{
+		Const	   *con = (Const *) qual;
+
+		/*
+		 * A restriction of NULL matches no rows at all, so it is not a
+		 * whole-table change; only a constant true is.
+		 */
+		if (!con->constisnull && DatumGetBool(con->constvalue))
+			ereport(ERROR,
+					errcode(ERRCODE_RESTRICT_VIOLATION),
+					errmsg("%s with an always-true %s is not allowed because dbblue_safe_mode is enabled",
+						   cmd, restriction),
+					errdetail("The %s reduces to true, so the statement would change every row of a table.",
+							  restriction),
+					errhint("Use a %s selecting the rows to change, or ask a superuser to turn dbblue_safe_mode off.",
+							restriction));
+	}
+}
+
 static Query *transformOptionalSelectInto(ParseState *pstate, Node *parseTree);
 static Query *transformDeleteStmt(ParseState *pstate, DeleteStmt *stmt);
 static Query *transformInsertStmt(ParseState *pstate, InsertStmt *stmt);
@@ -325,6 +390,149 @@ transformOptionalSelectInto(ParseState *pstate, Node *parseTree)
 	}
 
 	return transformStmt(pstate, parseTree);
+}
+
+/*
+ * dbblue_safe_mode_check_rewritten
+ *		Re-apply the safe mode guard to a query the rewriter has produced.
+ *
+ * The checks in transformUpdateStmt/transformDeleteStmt/transformMergeStmt see
+ * only what the user wrote.  Rule rewriting happens afterwards and can replace
+ * that statement wholesale: a DO INSTEAD rule on a view turns a restricted
+ * DELETE on the view into whatever the rule body says, which may touch every
+ * row of the underlying table.  Checking the rewriter's output as well closes
+ * that route.
+ *
+ * Both checks are kept rather than moving to this one.  Post-rewrite, a view's
+ * own WHERE clause has been merged into the query, so "DELETE FROM some_view"
+ * with no WHERE would look restricted and be allowed -- which would quietly
+ * weaken the guard for the ordinary case it exists to catch.  The parse-time
+ * check still refuses that, and this one only adds refusals.
+ */
+/*
+ * qual_reaches_result_rel
+ *		Does this restriction actually narrow which rows of the query's
+ *		target relation are touched?
+ *
+ * A qual that mentions no column of the target cannot: whatever it
+ * evaluates to, it evaluates the same for every target row, so either all
+ * of them are affected or none are.  That is precisely how a rule slips
+ * past the parse-time check -- rewriting keeps the user's WHERE clause but
+ * re-points it at the view's own scan, leaving the delete target unfiltered.
+ *
+ * Queries containing sublinks are exempted.  pull_varnos() does not look
+ * inside an unflattened SubLink, so a correlated "WHERE EXISTS (SELECT ...
+ * WHERE s.id = t.id)" would look like it never mentions t and be refused
+ * although it restricts perfectly well.  Rule rewriting produces a plain
+ * join rather than a sublink, so the case this exists for is still caught.
+ */
+static bool
+qual_reaches_result_rel(Query *query, Node *qual)
+{
+	Bitmapset  *varnos;
+
+	if (qual == NULL)
+		return false;
+	if (query->hasSubLinks)
+		return true;			/* cannot tell; assume it does */
+	if (query->resultRelation <= 0)
+		return true;
+
+	varnos = pull_varnos(NULL, qual);
+	return bms_is_member(query->resultRelation, varnos);
+}
+
+/*
+ * dbblue_safe_mode_reject_unreached
+ *		Complain that `qual` leaves every row of the target reachable.
+ */
+static void
+dbblue_safe_mode_reject_unreached(Query *query, const char *cmd,
+								  const char *restriction)
+{
+	RangeTblEntry *rte = rt_fetch(query->resultRelation, query->rtable);
+	const char *relname = get_rel_name(rte->relid);
+
+	ereport(ERROR,
+			errcode(ERRCODE_RESTRICT_VIOLATION),
+			errmsg("%s would change every row of \"%s\" because dbblue_safe_mode is enabled",
+				   cmd, relname ? relname : "?"),
+			errdetail("The %s does not refer to \"%s\", so it cannot select which of its rows are changed.",
+					  restriction, relname ? relname : "?"),
+			errhint("This can happen when a rule rewrites the statement onto a different table. Restrict the statement on \"%s\" itself, or ask a superuser to turn dbblue_safe_mode off.",
+					relname ? relname : "?"));
+}
+
+void
+dbblue_safe_mode_check_rewritten(Query *query)
+{
+	if (!dbblue_safe_mode)
+		return;
+
+	/* Utility statements carry no row restriction to inspect. */
+	if (query->commandType == CMD_UTILITY || query->utilityStmt != NULL)
+		return;
+
+	switch (query->commandType)
+	{
+		case CMD_DELETE:
+		case CMD_UPDATE:
+			{
+				const char *cmd = (query->commandType == CMD_DELETE) ?
+					"DELETE" : "UPDATE";
+				Node	   *qual = query->jointree ? query->jointree->quals : NULL;
+
+				dbblue_safe_mode_check(cmd, "WHERE clause", qual);
+
+				if (!qual_reaches_result_rel(query, qual))
+					dbblue_safe_mode_reject_unreached(query, cmd, "WHERE clause");
+			}
+			break;
+
+		case CMD_MERGE:
+			{
+				ListCell   *lc;
+
+				foreach(lc, query->mergeActionList)
+				{
+					MergeAction *action = lfirst_node(MergeAction, lc);
+					Node	   *reach;
+
+					if (action->commandType != CMD_UPDATE &&
+						action->commandType != CMD_DELETE)
+						continue;
+					if (action->matchKind == MERGE_WHEN_NOT_MATCHED_BY_TARGET)
+						continue;
+
+					reach = query->mergeJoinCondition;
+					if (reach == NULL)
+						continue;
+					if (action->matchKind == MERGE_WHEN_NOT_MATCHED_BY_SOURCE)
+						reach = (Node *) makeBoolExpr(NOT_EXPR,
+													  list_make1(reach), -1);
+					if (action->qual != NULL)
+						reach = (Node *) makeBoolExpr(AND_EXPR,
+													  list_make2(reach, action->qual),
+													  -1);
+
+					dbblue_safe_mode_check(action->commandType == CMD_DELETE ?
+										   "MERGE ... THEN DELETE" :
+										   "MERGE ... THEN UPDATE",
+										   "condition", reach);
+
+					if (!qual_reaches_result_rel(query, reach))
+						dbblue_safe_mode_reject_unreached(query,
+														  action->commandType == CMD_DELETE ?
+														  "MERGE ... THEN DELETE" :
+														  "MERGE ... THEN UPDATE",
+														  "condition");
+				}
+			}
+			break;
+
+		default:
+			break;
+	}
 }
 
 /*
@@ -647,6 +855,14 @@ transformDeleteStmt(ParseState *pstate, DeleteStmt *stmt)
 	qry->hasAggs = pstate->p_hasAggs;
 
 	assign_query_collations(pstate, qry);
+
+	/*
+	 * dbblue: refuse a DELETE that would remove every row.  This must follow
+	 * assign_query_collations(), because the check constant-folds the qual
+	 * and folding a collatable comparison before its collation is resolved
+	 * fails ("could not determine which collation to use").
+	 */
+	dbblue_safe_mode_check("DELETE", "WHERE clause", qual);
 
 	/* this must be done after collations, for reliable comparison of exprs */
 	if (pstate->p_hasAggs)
@@ -1606,7 +1822,6 @@ transformForPortionOfClause(ParseState *pstate,
 	else
 		result->rangeTargetList = NIL;
 
-	result->range_name = forPortionOf->range_name;
 	result->location = forPortionOf->location;
 	result->targetLocation = forPortionOf->target_location;
 
@@ -1811,14 +2026,12 @@ transformSelectStmt(ParseState *pstate, SelectStmt *stmt,
 
 	qry->groupClause = transformGroupClause(pstate,
 											stmt->groupClause,
-											stmt->groupByAll,
 											&qry->groupingSets,
 											&qry->targetList,
 											qry->sortClause,
 											EXPR_KIND_GROUP_BY,
 											false /* allow SQL92 rules */ );
 	qry->groupDistinct = stmt->groupDistinct;
-	qry->groupByAll = stmt->groupByAll;
 
 	if (stmt->distinctClause == NIL)
 	{
@@ -2924,6 +3137,9 @@ transformUpdateStmt(ParseState *pstate, UpdateStmt *stmt)
 	qry->hasSubLinks = pstate->p_hasSubLinks;
 
 	assign_query_collations(pstate, qry);
+
+	/* see the matching comment in transformDeleteStmt */
+	dbblue_safe_mode_check("UPDATE", "WHERE clause", qual);
 
 	return qry;
 }

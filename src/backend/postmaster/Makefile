@@ -19,6 +19,11 @@ OBJS = \
 	bgwriter.o \
 	checkpointer.o \
 	datachecksum_state.o \
+	dbblue_create_standby.o \
+	dbblue_index_advisor.o \
+	dbblue_repack_launcher.o \
+	dbblue_audit_pruner.o \
+	dbblue_backup_launcher.o \
 	fork_process.o \
 	interrupt.o \
 	launch_backend.o \
@@ -27,6 +32,7 @@ OBJS = \
 	postmaster.o \
 	startup.o \
 	syslogger.o \
+	waitsampler.o \
 	walsummarizer.o \
 	walwriter.o
 

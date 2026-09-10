@@ -49,23 +49,23 @@ typedef struct rfile
 static void debug_reconstruction(int n_source,
 								 rfile **sources,
 								 bool dry_run);
-static unsigned find_reconstructed_block_length(rfile *s);
-static rfile *make_incremental_rfile(char *filename);
-static rfile *make_rfile(char *filename, bool missing_ok);
-static void write_reconstructed_file(char *input_filename,
-									 char *output_filename,
+static unsigned find_reconstructed_block_length(const rfile *s);
+static rfile *make_incremental_rfile(const char *filename);
+static rfile *make_rfile(const char *filename, bool missing_ok);
+static void write_reconstructed_file(const char *input_filename,
+									 const char *output_filename,
 									 unsigned block_length,
 									 rfile **sourcemap,
-									 off_t *offsetmap,
+									 const off_t *offsetmap,
 									 pg_checksum_context *checksum_ctx,
 									 CopyMethod copy_method,
 									 bool debug,
 									 bool dry_run);
-static void read_bytes(rfile *rf, void *buffer, unsigned length);
-static void write_block(int fd, char *output_filename,
-						uint8 *buffer,
+static void read_bytes(const rfile *rf, void *buffer, unsigned length);
+static void write_block(int fd, const char *output_filename,
+						const uint8 *buffer,
 						pg_checksum_context *checksum_ctx);
-static void read_block(rfile *s, off_t off, uint8 *buffer);
+static void read_block(const rfile *s, off_t off, uint8 *buffer);
 
 /*
  * Reconstruct a full file from an incremental file and a chain of prior
@@ -105,7 +105,6 @@ reconstruct_from_incremental_file(char *input_filename,
 	rfile	  **sourcemap;
 	off_t	   *offsetmap;
 	unsigned	block_length;
-	unsigned	i;
 	unsigned	sidx = n_prior_backups;
 	bool		full_copy_possible = true;
 	int			copy_source_index = -1;
@@ -147,7 +146,7 @@ reconstruct_from_incremental_file(char *input_filename,
 	 * output but would not have needed to be found in an older backup if it
 	 * had not been present.
 	 */
-	for (i = 0; i < latest_source->num_blocks; ++i)
+	for (unsigned i = 0; i < latest_source->num_blocks; ++i)
 	{
 		BlockNumber b = latest_source->relative_block_numbers[i];
 
@@ -261,7 +260,7 @@ reconstruct_from_incremental_file(char *input_filename,
 		 * Since we found another incremental file, source all blocks from it
 		 * that we need but don't yet have.
 		 */
-		for (i = 0; i < s->num_blocks; ++i)
+		for (unsigned i = 0; i < s->num_blocks; ++i)
 		{
 			BlockNumber b = s->relative_block_numbers[i];
 
@@ -359,7 +358,7 @@ reconstruct_from_incremental_file(char *input_filename,
 	/*
 	 * Close files and release memory.
 	 */
-	for (i = 0; i <= n_prior_backups; ++i)
+	for (int i = 0; i <= n_prior_backups; ++i)
 	{
 		rfile	   *s = source[i];
 
@@ -372,9 +371,9 @@ reconstruct_from_incremental_file(char *input_filename,
 		pg_free(s->filename);
 		pg_free(s);
 	}
-	pfree(sourcemap);
-	pfree(offsetmap);
-	pfree(source);
+	pg_free(sourcemap);
+	pg_free(offsetmap);
+	pg_free(source);
 }
 
 /*
@@ -383,9 +382,7 @@ reconstruct_from_incremental_file(char *input_filename,
 static void
 debug_reconstruction(int n_source, rfile **sources, bool dry_run)
 {
-	unsigned	i;
-
-	for (i = 0; i < n_source; ++i)
+	for (int i = 0; i < n_source; ++i)
 	{
 		rfile	   *s = sources[i];
 
@@ -421,10 +418,10 @@ debug_reconstruction(int n_source, rfile **sources, bool dry_run)
 			if (fstat(s->fd, &sb) < 0)
 				pg_fatal("could not stat file \"%s\": %m", s->filename);
 			if (sb.st_size < s->highest_offset_read)
-				pg_fatal("file \"%s\" is too short: expected %llu, found %llu",
+				pg_fatal("file \"%s\" is too short: expected %lld, found %lld",
 						 s->filename,
-						 (unsigned long long) s->highest_offset_read,
-						 (unsigned long long) sb.st_size);
+						 (long long) s->highest_offset_read,
+						 (long long) sb.st_size);
 		}
 	}
 }
@@ -436,7 +433,7 @@ debug_reconstruction(int n_source, rfile **sources, bool dry_run)
  * necessary to include those blocks.
  */
 static unsigned
-find_reconstructed_block_length(rfile *s)
+find_reconstructed_block_length(const rfile *s)
 {
 	unsigned	block_length = s->truncation_block_length;
 	unsigned	i;
@@ -453,7 +450,7 @@ find_reconstructed_block_length(rfile *s)
  * blocks it contains.
  */
 static rfile *
-make_incremental_rfile(char *filename)
+make_incremental_rfile(const char *filename)
 {
 	rfile	   *rf;
 	unsigned	magic;
@@ -508,7 +505,7 @@ make_incremental_rfile(char *filename)
  * Allocate and perform basic initialization of an rfile.
  */
 static rfile *
-make_rfile(char *filename, bool missing_ok)
+make_rfile(const char *filename, bool missing_ok)
 {
 	rfile	   *rf;
 
@@ -518,7 +515,7 @@ make_rfile(char *filename, bool missing_ok)
 	{
 		if (missing_ok && errno == ENOENT)
 		{
-			pg_free(rf->filename);
+			pfree(rf->filename);
 			pg_free(rf);
 			return NULL;
 		}
@@ -532,7 +529,7 @@ make_rfile(char *filename, bool missing_ok)
  * Read the indicated number of bytes from an rfile into the buffer.
  */
 static void
-read_bytes(rfile *rf, void *buffer, unsigned length)
+read_bytes(const rfile *rf, void *buffer, unsigned length)
 {
 	int			rb = read(rf->fd, buffer, length);
 
@@ -550,11 +547,11 @@ read_bytes(rfile *rf, void *buffer, unsigned length)
  * Write out a reconstructed file.
  */
 static void
-write_reconstructed_file(char *input_filename,
-						 char *output_filename,
+write_reconstructed_file(const char *input_filename,
+						 const char *output_filename,
 						 unsigned block_length,
 						 rfile **sourcemap,
-						 off_t *offsetmap,
+						 const off_t *offsetmap,
 						 pg_checksum_context *checksum_ctx,
 						 CopyMethod copy_method,
 						 bool debug,
@@ -698,7 +695,7 @@ write_reconstructed_file(char *input_filename,
 			 */
 			do
 			{
-				int			wb;
+				ssize_t		wb;
 
 				wb = copy_file_range(s->fd, &off, wfd, NULL, BLCKSZ - nwritten, 0);
 
@@ -753,8 +750,8 @@ write_reconstructed_file(char *input_filename,
  * provided only for the error message.
  */
 static void
-write_block(int fd, char *output_filename,
-			uint8 *buffer, pg_checksum_context *checksum_ctx)
+write_block(int fd, const char *output_filename,
+			const uint8 *buffer, pg_checksum_context *checksum_ctx)
 {
 	int			wb;
 
@@ -777,7 +774,7 @@ write_block(int fd, char *output_filename,
  * Read a block of data (BLCKSZ bytes) into the buffer.
  */
 static void
-read_block(rfile *s, off_t off, uint8 *buffer)
+read_block(const rfile *s, off_t off, uint8 *buffer)
 {
 	int			rb;
 
@@ -788,7 +785,7 @@ read_block(rfile *s, off_t off, uint8 *buffer)
 		if (rb < 0)
 			pg_fatal("could not read from file \"%s\": %m", s->filename);
 		else
-			pg_fatal("could not read from file \"%s\", offset %llu: read %d of %d",
-					 s->filename, (unsigned long long) off, rb, BLCKSZ);
+			pg_fatal("could not read from file \"%s\", offset %lld: read %d of %d",
+					 s->filename, (long long) off, rb, BLCKSZ);
 	}
 }

@@ -2396,7 +2396,11 @@ REVOKE ALL ON accounts FROM PUBLIC;
      <listitem>
       <para>
        Allows creation of a foreign key constraint referencing a
-       table, or specific column(s) of a table.
+       table, or specific column(s) of a table. Great care should be taken when
+       granting this privilege, since a user who creates a foreign key can arrange
+       for enforcement of that foreign key to call an arbitrary function, such as
+       a cast function, and such functions will be called with the privileges of
+       the table owner.
       </para>
      </listitem>
     </varlistentry>
@@ -2405,7 +2409,9 @@ REVOKE ALL ON accounts FROM PUBLIC;
      <term><literal>TRIGGER</literal></term>
      <listitem>
       <para>
-       Allows creation of a trigger on a table, view, etc.
+       Allows creation of a trigger on a table, view, etc. Great care should be
+       taken when granting this privilege, since any triggers added to a table
+       or view will be executed with the privileges of users who modify it.
       </para>
      </listitem>
     </varlistentry>
@@ -2538,7 +2544,8 @@ REVOKE ALL ON accounts FROM PUBLIC;
     <listitem>
      <para>
       Allows <command>VACUUM</command>, <command>ANALYZE</command>,
-      <command>CLUSTER</command>, <command>REFRESH MATERIALIZED VIEW</command>,
+      <command>CLUSTER</command>, <command>REPACK</command>,
+      <command>REFRESH MATERIALIZED VIEW</command>,
       <command>REINDEX</command>, <command>LOCK TABLE</command>,
       and database object statistics manipulation functions
       (see <xref linkend="functions-admin-statsmod"/>) on a relation.
@@ -3758,6 +3765,26 @@ REVOKE CREATE ON SCHEMA public FROM PUBLIC;
     names beginning with <literal>pg_</literal>, so that they will not
     conflict with unqualified user-table names so long as users avoid
     the <literal>pg_</literal> prefix.
+   </para>
+  </sect2>
+
+  <sect2 id="ddl-schemas-conflict">
+   <title>The Conflict Schema</title>
+
+   <indexterm zone="ddl-schemas-conflict">
+    <primary>conflict</primary>
+    <secondary>schema</secondary>
+   </indexterm>
+
+   <para>
+    The <literal>pg_conflict</literal> schema (sometimes referred to as the
+    <emphasis>conflict schema</emphasis>) contains system-managed conflict
+    log tables used for logical replication conflict tracking.
+    These tables are created and maintained by the system and are not intended for
+    direct user manipulation. Unlike <literal>pg_catalog</literal>, the
+    <literal>pg_conflict</literal> schema is not implicitly included in the
+    search path, so objects within it must be referenced explicitly or by
+    adjusting the search path.
    </para>
   </sect2>
 
@@ -5901,7 +5928,7 @@ CREATE PROPERTY GRAPH myshop
     VERTEX TABLES (
         products LABEL product,
         customers LABEL customer LABEL person PROPERTIES (name),
-        orders LABEL order,
+        orders LABEL "order",
         employees LABEL employee LABEL person PROPERTIES (employee_name AS name)
     )
     EDGE TABLES (

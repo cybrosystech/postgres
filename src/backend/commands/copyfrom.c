@@ -49,6 +49,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/portal.h"
+#include "utils/pg_audit.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/typcache.h"
@@ -517,6 +518,9 @@ CopyMultiInsertBufferFlush(CopyMultiInsertInfo *miinfo,
 					ExecARInsertTriggers(estate, resultRelInfo,
 										 slot, NIL,
 										 cstate->transition_capture);
+
+					/* dbblue dedicated audit log: see CopyMultiInsertBufferFlush */
+					dbblue_audit_capture_insert(resultRelInfo, slot);
 				}
 			}
 
@@ -595,6 +599,17 @@ CopyMultiInsertBufferFlush(CopyMultiInsertInfo *miinfo,
 									 slots[i], NIL,
 									 cstate->transition_capture);
 			}
+
+			/*
+			 * dbblue dedicated audit log: record this row.
+			 *
+			 * COPY does not go through ExecInsert(), so the capture in
+			 * nodeModifyTable.c never sees these rows.  This call sits
+			 * outside the index/trigger branches above deliberately: a table
+			 * with neither indexes nor AFTER ROW triggers runs neither of
+			 * them, and a bulk load into such a table must still be audited.
+			 */
+			dbblue_audit_capture_insert(resultRelInfo, slots[i]);
 
 			ExecClearTuple(slots[i]);
 		}
@@ -1439,6 +1454,9 @@ CopyFrom(CopyFromState cstate)
 					/* AFTER ROW INSERT Triggers */
 					ExecARInsertTriggers(estate, resultRelInfo, myslot,
 										 recheckIndexes, cstate->transition_capture);
+
+					/* dbblue dedicated audit log: see CopyMultiInsertBufferFlush */
+					dbblue_audit_capture_insert(resultRelInfo, myslot);
 
 					list_free(recheckIndexes);
 				}

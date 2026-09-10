@@ -31,7 +31,10 @@
 
 #include "access/commit_ts.h"
 #include "access/gin.h"
+#include "access/hio.h"
+#include "access/nbtree.h"
 #include "access/slru.h"
+#include "access/tableam.h"
 #include "access/toast_compression.h"
 #include "access/twophase.h"
 #include "access/xlog_internal.h"
@@ -43,6 +46,7 @@
 #include "catalog/storage.h"
 #include "commands/async.h"
 #include "commands/extension.h"
+#include "commands/dbcommands.h"
 #include "commands/event_trigger.h"
 #include "commands/matview_dirty.h"
 #include "commands/matview_incr.h"
@@ -63,6 +67,7 @@
 #include "optimizer/optimizer.h"
 #include "optimizer/paths.h"
 #include "optimizer/planmain.h"
+#include "parser/analyze.h"
 #include "parser/parse_expr.h"
 #include "utils/dbblue_countcache.h"
 #include "utils/dbblue_relmod.h"
@@ -70,10 +75,17 @@
 #include "pgstat.h"
 #include "postmaster/autovacuum.h"
 #include "postmaster/bgworker_internals.h"
+#include "commands/dbblue_brin_worker.h"
+#include "postmaster/dbblue_audit_pruner.h"
 #include "postmaster/bgwriter.h"
+#include "postmaster/dbblue_create_standby.h"
+#include "postmaster/dbblue_index_advisor.h"
+#include "postmaster/dbblue_repack_launcher.h"
+#include "postmaster/dbblue_backup_launcher.h"
 #include "postmaster/postmaster.h"
 #include "postmaster/startup.h"
 #include "postmaster/syslogger.h"
+#include "postmaster/waitsampler.h"
 #include "postmaster/walsummarizer.h"
 #include "postmaster/walwriter.h"
 #include "replication/logicallauncher.h"
@@ -83,6 +95,7 @@
 #include "storage/aio.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
+#include "storage/bulk_write.h"
 #include "storage/copydir.h"
 #include "storage/fd.h"
 #include "storage/io_worker.h"
@@ -92,6 +105,7 @@
 #include "storage/proc.h"
 #include "storage/procnumber.h"
 #include "storage/standby.h"
+#include "tcop/autoprepare.h"
 #include "tcop/backend_startup.h"
 #include "tcop/tcopprot.h"
 #include "portability/instr_time.h"
@@ -108,6 +122,8 @@
 #include "utils/ps_status.h"
 #include "utils/rls.h"
 #include "utils/xml.h"
+#include "utils/pg_audit.h"
+#include "utils/dbblue_fillfactor.h"
 
 #ifdef TRACE_SYNCSCAN
 #include "access/syncscan.h"
@@ -261,6 +277,20 @@ static const struct config_enum_entry track_function_options[] = {
 
 StaticAssertDecl(lengthof(track_function_options) == (TRACK_FUNC_ALL + 2),
 				 "array length mismatch");
+
+static const struct config_enum_entry dbblue_wait_sampling_profile_queries_options[] = {
+	{"none", DBBLUE_WS_PROFILE_QUERIES_NONE, false},
+	{"off", DBBLUE_WS_PROFILE_QUERIES_NONE, false},
+	{"no", DBBLUE_WS_PROFILE_QUERIES_NONE, false},
+	{"false", DBBLUE_WS_PROFILE_QUERIES_NONE, false},
+	{"0", DBBLUE_WS_PROFILE_QUERIES_NONE, false},
+	{"top", DBBLUE_WS_PROFILE_QUERIES_TOP, false},
+	{"on", DBBLUE_WS_PROFILE_QUERIES_TOP, false},
+	{"yes", DBBLUE_WS_PROFILE_QUERIES_TOP, false},
+	{"true", DBBLUE_WS_PROFILE_QUERIES_TOP, false},
+	{"1", DBBLUE_WS_PROFILE_QUERIES_TOP, false},
+	{NULL, 0, false}
+};
 
 static const struct config_enum_entry stats_fetch_consistency[] = {
 	{"none", PGSTAT_FETCH_CONSISTENCY_NONE, false},
@@ -560,6 +590,9 @@ char	   *event_source;
 bool		row_security;
 bool		check_function_bodies = true;
 
+char	   *dbblue_brin_database = NULL;
+bool		dbblue_create_brin = false;
+
 /*
  * These GUCs exist solely for backward compatibility.
  */
@@ -575,6 +608,7 @@ int			log_min_duration_statement = -1;
 int			log_parameter_max_length = -1;
 int			log_parameter_max_length_on_error = 0;
 int			log_temp_files = -1;
+int			log_statement_max_length = -1;
 double		log_statement_sample_rate = 1.0;
 double		log_xact_sample_rate = 0;
 char	   *backtrace_functions;

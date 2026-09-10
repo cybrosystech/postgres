@@ -16,6 +16,7 @@ SUBDIRS = \
 		citext		\
 		cube		\
 		dbblue_columnar	\
+		dbblue_partition \
 		dblink		\
 		dict_int	\
 		dict_xsyn	\
@@ -23,6 +24,7 @@ SUBDIRS = \
 		file_fdw	\
 		fuzzystrmatch	\
 		hstore		\
+		hypopg		\
 		intagg		\
 		intarray	\
 		isn		\
@@ -35,6 +37,7 @@ SUBDIRS = \
 		pg_freespacemap \
 		pg_logicalinspect \
 		pg_overexplain \
+		pg_partman\
 		pg_plan_advice \
 		pg_prewarm	\
 		pg_stash_advice	\
@@ -43,6 +46,7 @@ SUBDIRS = \
 		pg_trgm		\
 		pgrowlocks	\
 		pgstattuple	\
+		pgvector \
 		pg_visibility	\
 		pg_walinspect	\
 		postgres_fdw	\

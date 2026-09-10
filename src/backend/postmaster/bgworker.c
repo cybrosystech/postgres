@@ -13,6 +13,7 @@
 #include "postgres.h"
 
 #include "access/parallel.h"
+#include "commands/dbblue_brin_worker.h"
 #include "commands/repack.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
@@ -20,7 +21,13 @@
 #include "port/atomics.h"
 #include "postmaster/bgworker_internals.h"
 #include "postmaster/datachecksum_state.h"
+#include "postmaster/dbblue_create_standby.h"
+#include "postmaster/dbblue_audit_pruner.h"
+#include "postmaster/dbblue_index_advisor.h"
+#include "postmaster/dbblue_repack_launcher.h"
+#include "postmaster/dbblue_backup_launcher.h"
 #include "postmaster/postmaster.h"
+#include "postmaster/waitsampler.h"
 #include "replication/logicallauncher.h"
 #include "replication/logicalworker.h"
 #include "storage/ipc.h"
@@ -136,8 +143,28 @@ static const struct
 		.fn_addr = ApplyLauncherMain
 	},
 	{
+		.fn_name = "DbblueIndexAdvisorLauncherMain",
+		.fn_addr = DbblueIndexAdvisorLauncherMain
+	},
+	{
+		.fn_name = "DbblueIndexAdvisorMain",
+		.fn_addr = DbblueIndexAdvisorMain
+	},
+	{
+		.fn_name = "DbblueAuditPruneLauncherMain",
+		.fn_addr = DbblueAuditPruneLauncherMain
+	},
+	{
+		.fn_name = "AuditPrunerMain",
+		.fn_addr = AuditPrunerMain
+	},
+	{
 		.fn_name = "ApplyWorkerMain",
 		.fn_addr = ApplyWorkerMain
+	},
+	{
+		.fn_name = "DbblueCreateStandbyMain",
+		.fn_addr = DbblueCreateStandbyMain
 	},
 	{
 		.fn_name = "ParallelApplyWorkerMain",
@@ -166,6 +193,30 @@ static const struct
 	{
 		.fn_name = "DataChecksumsWorkerMain",
 		.fn_addr = DataChecksumsWorkerMain
+	},
+	{
+		.fn_name = "DBBlueBrinLauncherMain",
+		.fn_addr = DBBlueBrinLauncherMain
+	},
+	{
+		.fn_name = "DBBlueBrinWorkerMain",
+		.fn_addr = DBBlueBrinWorkerMain
+	},
+	{
+		.fn_name = "WaitSamplerMain",
+		.fn_addr = WaitSamplerMain
+	},
+	{
+		.fn_name = "RepackLauncherMain",
+		.fn_addr = RepackLauncherMain
+	},
+	{
+		.fn_name = "DbblueRepackWorkerMain",
+		.fn_addr = DbblueRepackWorkerMain
+	},
+	{
+		.fn_name = "BackupLauncherMain",
+		.fn_addr = BackupLauncherMain
 	}
 };
 
@@ -1365,9 +1416,7 @@ LookupBackgroundWorkerFunction(const char *libraryname, const char *funcname)
 	 */
 	if (strcmp(libraryname, "postgres") == 0)
 	{
-		int			i;
-
-		for (i = 0; i < lengthof(InternalBGWorkers); i++)
+		for (size_t i = 0; i < lengthof(InternalBGWorkers); i++)
 		{
 			if (strcmp(InternalBGWorkers[i].fn_name, funcname) == 0)
 				return InternalBGWorkers[i].fn_addr;

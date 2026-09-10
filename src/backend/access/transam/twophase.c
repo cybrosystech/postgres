@@ -241,7 +241,7 @@ static void MarkAsPreparingGuts(GlobalTransaction gxact, FullTransactionId fxid,
 								const char *gid, TimestampTz prepared_at, Oid owner,
 								Oid databaseid);
 static void RemoveTwoPhaseFile(FullTransactionId fxid, bool giveWarning);
-static void RecreateTwoPhaseFile(FullTransactionId fxid, void *content, int len);
+static void RecreateTwoPhaseFile(FullTransactionId fxid, const void *content, int len);
 
 /*
  * Register shared memory for two-phase state.
@@ -1757,7 +1757,7 @@ RemoveTwoPhaseFile(FullTransactionId fxid, bool giveWarning)
  * Note: content and len don't include CRC.
  */
 static void
-RecreateTwoPhaseFile(FullTransactionId fxid, void *content, int len)
+RecreateTwoPhaseFile(FullTransactionId fxid, const void *content, int len)
 {
 	char		path[MAXPGPATH];
 	pg_crc32c	statefile_crc;

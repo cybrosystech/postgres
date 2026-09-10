@@ -220,7 +220,6 @@ typedef struct Query
 
 	List	   *groupClause;	/* a list of SortGroupClause's */
 	bool		groupDistinct;	/* was GROUP BY DISTINCT used? */
-	bool		groupByAll;		/* was GROUP BY ALL used? */
 
 	List	   *groupingSets;	/* a list of GroupingSet's if present */
 
@@ -821,7 +820,8 @@ typedef enum TableLikeOption
  *
  * For a plain index attribute, 'name' is the name of the table column to
  * index, and 'expr' is NULL.  For an index expression, 'name' is NULL and
- * 'expr' is the expression tree.
+ * 'expr' is the expression tree.  indexcolname is currently used only to
+ * force column name choices when cloning an index.
  */
 typedef struct IndexElem
 {
@@ -1982,6 +1982,48 @@ typedef struct JsonTablePathSpec
 } JsonTablePathSpec;
 
 /*
+ * JsonTablePlanType -
+ *		flags for JSON_TABLE plan node types representation
+ */
+typedef enum JsonTablePlanType
+{
+	JSTP_DEFAULT,
+	JSTP_SIMPLE,
+	JSTP_JOINED,
+} JsonTablePlanType;
+
+/*
+ * JsonTablePlanJoinType -
+ *		JSON_TABLE join types for JSTP_JOINED plans
+ */
+typedef enum JsonTablePlanJoinType
+{
+	JSTP_JOIN_INNER = 0x01,
+	JSTP_JOIN_OUTER = 0x02,
+	JSTP_JOIN_CROSS = 0x04,
+	JSTP_JOIN_UNION = 0x08,
+} JsonTablePlanJoinType;
+
+/*
+ * JsonTablePlanSpec -
+ *		untransformed representation of JSON_TABLE's PLAN clause
+ */
+typedef struct JsonTablePlanSpec
+{
+	NodeTag		type;
+
+	JsonTablePlanType plan_type;	/* plan type */
+	JsonTablePlanJoinType join_type;	/* join type (for joined plan only) */
+	char	   *pathname;		/* path name (for simple plan only) */
+
+	/* For joined plans */
+	struct JsonTablePlanSpec *plan1;	/* first joined plan */
+	struct JsonTablePlanSpec *plan2;	/* second joined plan */
+
+	ParseLoc	location;		/* token location, or -1 if unknown */
+} JsonTablePlanSpec;
+
+/*
  * JsonTable -
  *		untransformed representation of JSON_TABLE
  */
@@ -1992,6 +2034,7 @@ typedef struct JsonTable
 	JsonTablePathSpec *pathspec;	/* JSON path specification */
 	List	   *passing;		/* list of PASSING clause arguments, if any */
 	List	   *columns;		/* list of JsonTableColumn */
+	JsonTablePlanSpec *planspec;	/* join plan, if specified */
 	JsonBehavior *on_error;		/* ON ERROR behavior */
 	Alias	   *alias;			/* table alias in FROM clause */
 	bool		lateral;		/* does it have LATERAL prefix? */
@@ -2297,7 +2340,6 @@ typedef struct SelectStmt
 	Node	   *whereClause;	/* WHERE qualification */
 	List	   *groupClause;	/* GROUP BY clauses */
 	bool		groupDistinct;	/* Is this GROUP BY DISTINCT? */
-	bool		groupByAll;		/* Is this GROUP BY ALL? */
 	Node	   *havingClause;	/* HAVING conditional-expression */
 	List	   *windowClause;	/* WINDOW window_name AS (...), ... */
 
