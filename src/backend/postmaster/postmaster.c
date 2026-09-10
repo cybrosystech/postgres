@@ -951,9 +951,11 @@ PostmasterMain(int argc, char *argv[])
 	 */
 	DbblueIndexAdvisorRegister();
 	/*
-	 * Register the dbblue repack launcher.  Like the index advisor, this
-	 * one always runs; whether it actually repacks anything is controlled
-	 * at runtime by dbblue_repack_enabled.
+	 * Register the dbblue repack launcher.  Like the BRIN launcher, it
+	 * always runs and holds no database connection; which databases it
+	 * actually repacks is controlled by the per-database
+	 * dbblue_repack_enabled (optionally restricted to one database by
+	 * dbblue_repack_database), re-read every cycle.
 	 */
 	RepackLauncherRegister();
 

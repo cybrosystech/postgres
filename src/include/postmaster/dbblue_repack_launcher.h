@@ -24,10 +24,11 @@ extern PGDLLIMPORT char *dbblue_repack_database;
 
 extern void RepackLauncherRegister(void);
 extern void RepackLauncherMain(Datum main_arg);
+extern void DbblueRepackWorkerMain(Datum main_arg);
 
-/* GUC check hook for dbblue_repack_enabled */
-extern bool dbblue_check_repack_enabled(bool *newval, void **extra,
-										 GucSource source);
+/* GUC check hook for dbblue_repack_database */
+extern bool dbblue_check_repack_database(char **newval, void **extra,
+										  GucSource source);
 
 /* GUC check hook for dbblue_repack_tables */
 extern bool dbblue_check_repack_tables(char **newval, void **extra,

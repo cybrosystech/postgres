@@ -61,6 +61,7 @@ DBBLUE_CREATE_STANDBY_MAIN	"Waiting in main loop of dbblue create standby proces
 DBBLUE_INDEX_ADVISOR_LAUNCHER_MAIN	"Waiting in main loop of dbblue index advisor launcher process."
 DBBLUE_INDEX_ADVISOR_MAIN	"Waiting in main loop of dbblue index advisor process."
 DBBLUE_REPACK_LAUNCHER_MAIN	"Waiting in main loop of dbblue repack launcher process."
+DBBLUE_REPACK_WORKER_MAIN	"Waiting in main loop of dbblue repack worker process."
 DBBLUE_BACKUP_LAUNCHER_MAIN	"Waiting in main loop of dbblue backup launcher process."
 DBBLUE_AUDIT_PRUNE_LAUNCHER_MAIN	"Waiting in main loop of dbblue audit log prune launcher process."
 DBBLUE_AUDIT_PRUNER_MAIN	"Waiting in main loop of dbblue audit log pruner process."

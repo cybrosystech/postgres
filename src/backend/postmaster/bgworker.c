@@ -211,6 +211,10 @@ static const struct
 		.fn_addr = RepackLauncherMain
 	},
 	{
+		.fn_name = "DbblueRepackWorkerMain",
+		.fn_addr = DbblueRepackWorkerMain
+	},
+	{
 		.fn_name = "BackupLauncherMain",
 		.fn_addr = BackupLauncherMain
 	}
