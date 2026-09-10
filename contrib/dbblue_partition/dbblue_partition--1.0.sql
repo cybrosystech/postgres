@@ -30,7 +30,7 @@
  *		dbblue_partition_undo             1.4
  *		dbblue_partition_model            1.4
  *
- * Odoo's own Python code now understands relkind = 'p' natively, so this
+ * Cyllo's own Python code now understands relkind = 'p' natively, so this
  * script carries no Odoo compatibility layer: every table dbblue_partition
  * converts is simply a partitioned table, reported as such by the real
  * pg_catalog.
@@ -68,20 +68,20 @@ SELECT pg_catalog.pg_extension_config_dump('dbblue_partition_catalog', '');
  * dbblue_partition.enabled = on.  The GUC name deliberately avoids
  * reserved SQL keywords so SET/SHOW always work.
  * ------------------------------------------------------------------------
- */
-CREATE FUNCTION @extschema@.dbblue_partition_enabled_check()
-RETURNS void
-LANGUAGE plpgsql
-SET search_path = pg_catalog, pg_temp
-AS $$
-BEGIN
-	IF NOT coalesce(nullif(current_setting('dbblue_partition.enabled', true), ''), 'off')::boolean THEN
-		RAISE EXCEPTION 'dbblue_partition is disabled'
-			USING HINT = 'Run SET dbblue_partition.enabled = on; to enable it for this session.',
-				  ERRCODE = 'object_not_in_prerequisite_state';
-	END IF;
-END
-$$;
+--  */
+-- CREATE FUNCTION @extschema@.dbblue_partition_enabled_check()
+-- RETURNS void
+-- LANGUAGE plpgsql
+-- SET search_path = pg_catalog, pg_temp
+-- AS $$
+-- BEGIN
+-- 	IF NOT coalesce(nullif(current_setting('dbblue_partition.enabled', true), ''), 'off')::boolean THEN
+-- 		RAISE EXCEPTION 'dbblue_partition is disabled'
+-- 			USING HINT = 'Run SET dbblue_partition.enabled = on; to enable it for this session.',
+-- 				  ERRCODE = 'object_not_in_prerequisite_state';
+-- 	END IF;
+-- END
+-- $$;
 
 /* ------------------------------------------------------------------------
  * dbblue_partition_partman_schema
@@ -1223,7 +1223,7 @@ DECLARE
 	v_cat		@extschema@.dbblue_partition_catalog%ROWTYPE;
 	v_rows		bigint;
 BEGIN
-	PERFORM @extschema@.dbblue_partition_enabled_check();
+	-- PERFORM @extschema@.dbblue_partition_enabled_check();
 
 	v_table := @extschema@.dbblue_partition_resolve_table(p_model);
 
@@ -1294,7 +1294,7 @@ DECLARE
 	r				record;
 	r2				record;
 BEGIN
-	PERFORM @extschema@.dbblue_partition_enabled_check();
+	-- PERFORM @extschema@.dbblue_partition_enabled_check();
 
 	v_table := @extschema@.dbblue_partition_resolve_table(p_model);
 	v_partman := @extschema@.dbblue_partition_partman_schema();
@@ -1711,7 +1711,7 @@ DECLARE
 	v_moved_total	bigint;
 	r				record;
 BEGIN
-	PERFORM @extschema@.dbblue_partition_enabled_check();
+	-- PERFORM @extschema@.dbblue_partition_enabled_check();
 
 	/*
 	 * The batched migration commits between batches, which a procedure can
