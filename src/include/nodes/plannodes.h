@@ -1102,6 +1102,22 @@ typedef struct HashGroupJoin
 	List	   *hashcollations;
 	List	   *hashkeys;
 
+	/*
+	 * dbblue: build-side counterpart of each hashkeys entry, parallel to it.
+	 * hashkeys[i] and buildEchoKeys[i] are provably equal for every row this
+	 * node ever folds together (that is what makes fusion legal at all --
+	 * see groupjoin_keys_match(), planner.c) but there is no single probe
+	 * tuple at emit time to read hashkeys[i] from, so the executor evaluates
+	 * buildEchoKeys[i] against the build side instead and writes the result
+	 * into a small stand-in slot attribute-numbered to match hashkeys.  This
+	 * node's own targetlist/havingQual are deliberately left referencing the
+	 * probe side exactly as the query wrote them, rather than rewritten to
+	 * buildEchoKeys directly, so that pathkey matching for a Sort/ORDER BY
+	 * above this node keeps working by expression identity.  See
+	 * nodeHashgroupjoin.c's ExecHashGroupJoinPopulateEchoSlot().
+	 */
+	List	   *buildEchoKeys;
+
 	/* grouping fields, as Agg */
 
 	/* number of grouping columns */

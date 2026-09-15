@@ -1148,13 +1148,13 @@ ExecHashIncreaseNumBatches(HashJoinTable hashtable)
 			HashJoinTuple hashTuple = (HashJoinTuple) (HASH_CHUNK_DATA(oldchunks) + idx);
 			MinimalTuple tuple = HJTUPLE_MINTUPLE(hashTuple);
 			int			hashTupleSize = (HJTUPLE_OVERHEAD + tuple->t_len);
+			int			bucketno;
+			int			batchno;
 
 			/* dbblue: keep the per-tuple aggregate state area when relocating */
 			if (hashtable->extraTupleSpace > 0)
 				hashTupleSize = HJTUPLE_OVERHEAD + MAXALIGN(tuple->t_len) +
 					hashtable->extraTupleSpace;
-			int			bucketno;
-			int			batchno;
 
 			ninmemory++;
 			ExecHashGetBucketAndBatch(hashtable, hashTuple->hashvalue,

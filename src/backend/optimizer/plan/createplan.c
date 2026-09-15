@@ -247,6 +247,7 @@ static HashGroupJoin *make_hashgroupjoin(List *tlist,
 										 List *hashoperators,
 										 List *hashcollations,
 										 List *hashkeys,
+										 List *buildEchoKeys,
 										 int numGroupCols,
 										 AttrNumber *grpColIdx,
 										 Oid *grpOperators, Oid *grpCollations,
@@ -4866,6 +4867,116 @@ create_hashjoin_plan(PlannerInfo *root,
 }
 
 /*
+ * dbblue: context for replace_probe_echo_mutator.
+ */
+typedef struct
+{
+	List	   *probe_vars;
+	List	   *build_vars;
+} probe_echo_context;
+
+static Node *
+replace_probe_echo_mutator(Node *node, probe_echo_context *ctx)
+{
+	if (node == NULL)
+		return NULL;
+
+	/*
+	 * An Aggref's arguments are evaluated at fold time, once per input row,
+	 * against the real probe/build tuple pair that is actually being folded
+	 * in right then (see nodeHashgroupjoin.c's ExecAggAdvance calls) -- not
+	 * against whatever this operator happens to have on hand at emit time.
+	 * Treat it as opaque: copy it whole, without substituting inside it, so
+	 * an aggregate that legitimately takes the probe's own key value as an
+	 * argument (e.g. a CASE expression keyed off it) keeps seeing the real
+	 * per-row value.
+	 */
+	if (IsA(node, Aggref))
+		return (Node *) copyObject(node);
+
+	if (IsA(node, Var))
+	{
+		ListCell   *lc1,
+				   *lc2;
+
+		forboth(lc1, ctx->probe_vars, lc2, ctx->build_vars)
+		{
+			if (equal(node, lfirst(lc1)))
+				return (Node *) copyObject(lfirst(lc2));
+		}
+		return (Node *) copyObject(node);
+	}
+
+	return expression_tree_mutator(node, replace_probe_echo_mutator, ctx);
+}
+
+/*
+ * replace_probe_echo_vars
+ *		Rewrite every reference to the probe side's own copy of a hash key
+ *		into a reference to the corresponding build-side key column.
+ *		(dbblue-specific.)
+ *
+ * groupjoin_keys_match() (planner.c) allows GROUP BY / the output to
+ * reference the probe side's own copy of a hash key, on the strength of the
+ * join condition guaranteeing it equals the build key for every row folded
+ * into a given entry.  But at *emit* time there is no single probe tuple to
+ * read that column from: an entry may have been folded from many different
+ * probe rows, from none at all, or -- for a proven-safe LEFT join -- belongs
+ * to the reserved NULL-key group with no probe tuple whatsoever.  Rewriting
+ * the reference to the build key it is provably equal to sidesteps the
+ * problem entirely: the value is right there in the build tuple (or
+ * correctly NULL, for the reserved group's all-NULLs stand-in).
+ *
+ * Safe to call with probe_vars == NIL (a no-op then); safe to apply
+ * unconditionally to any jointype, since it only ever touches Vars that
+ * exactly match something in probe_vars, which is empty unless the query
+ * actually echoed a hash key.
+ */
+static Node *
+replace_probe_echo_vars(Node *node, List *probe_vars, List *build_vars)
+{
+	probe_echo_context ctx;
+
+	if (probe_vars == NIL)
+		return node;
+
+	ctx.probe_vars = probe_vars;
+	ctx.build_vars = build_vars;
+	return replace_probe_echo_mutator(node, &ctx);
+}
+
+/*
+ * tlist_member_ignoring_nullingrels
+ *		Like tlist_member(), but for a bare Var, ignoring varnullingrels.
+ *		(dbblue-specific; mirrors the private tlist_member_match_var() in
+ *		optimizer/util/tlist.c, which is static there and not reachable from
+ *		here.)
+ *
+ * See extract_hashgroupjoin_grouping_cols()'s call site for why this is
+ * needed and why it is safe to match this loosely here specifically.
+ */
+static TargetEntry *
+tlist_member_ignoring_nullingrels(Var *var, List *targetlist)
+{
+	ListCell   *lc;
+
+	foreach(lc, targetlist)
+	{
+		TargetEntry *tle = (TargetEntry *) lfirst(lc);
+		Var		   *tlvar = (Var *) tle->expr;
+
+		if (!tlvar || !IsA(tlvar, Var))
+			continue;
+		if (var->varno == tlvar->varno &&
+			var->varattno == tlvar->varattno &&
+			var->varlevelsup == tlvar->varlevelsup &&
+			var->vartype == tlvar->vartype)
+			return tle;
+	}
+	return NULL;
+}
+
+/*
  * extract_hashgroupjoin_grouping_cols
  *	  Locate each grouping column in the build side's targetlist, and collect
  *	  the matching collations.  (dbblue-specific.)
@@ -4879,14 +4990,17 @@ create_hashjoin_plan(PlannerInfo *root,
  * build side does not help, for the same reason: there is nothing to label.)
  *
  * Instead we take each grouping clause's expression from processed_tlist and
- * find that expression in the build side's targetlist.  This is sound because
- * try_add_hashgroupjoin_path() has already proven the grouping keys to be
- * exactly the join's hash keys, and the hash keys are by construction
- * evaluable from the build side's output.
+ * find that expression in the build side's targetlist.  This is sound
+ * because try_add_hashgroupjoin_path() has already proven every GROUP BY
+ * entry to be either a join hash key or something else that is evaluable
+ * from the build side's output -- the probe's own echo of a hash key being
+ * the one exception, handled by rewriting it first (see
+ * replace_probe_echo_vars(), above).
  */
 static AttrNumber *
 extract_hashgroupjoin_grouping_cols(PlannerInfo *root, List *groupClause,
-									List *inner_tlist, Oid **grpCollations)
+									List *inner_tlist, Oid **grpCollations,
+									List *probe_vars, List *build_vars)
 {
 	int			numCols = list_length(groupClause);
 	int			colno = 0;
@@ -4905,7 +5019,40 @@ extract_hashgroupjoin_grouping_cols(PlannerInfo *root, List *groupClause,
 
 		groupexpr = (Expr *) get_sortgroupclause_expr(groupcl,
 													  root->processed_tlist);
+
+		/*
+		 * dbblue: groupjoin_keys_match() (planner.c) may have allowed this
+		 * GROUP BY entry to be the probe side's own copy of a hash key
+		 * rather than the build key itself -- see that function's comment
+		 * for why that is sound.  It will not be found in inner_tlist under
+		 * its own identity, because it is not a build-side column at all;
+		 * rewrite it to the build key it is provably equal to before
+		 * looking it up.
+		 */
+		groupexpr = (Expr *) replace_probe_echo_vars((Node *) groupexpr,
+													 probe_vars, build_vars);
+
 		tle = tlist_member(groupexpr, inner_tlist);
+		if (tle == NULL && IsA(groupexpr, Var))
+		{
+			/*
+			 * dbblue: for a LEFT join, the build side is the join's
+			 * nullable side, so root->processed_tlist's copy of a build
+			 * column carries an extra varnullingrels bit -- "may be nulled
+			 * by this join" -- that inner_tlist's copy cannot have, since
+			 * inner_plan sits below the join and that nulling has not
+			 * happened from its point of view yet.  equal() (which
+			 * tlist_member uses) compares that field, so it legitimately
+			 * fails here even though this is exactly the right column.
+			 * groupjoin_keys_match() has already guaranteed every surviving
+			 * GROUP BY entry reduces to a bare Var (a build column, or a
+			 * probe echo just rewritten to one above), so falling back to a
+			 * plain varno/varattno match -- the same relaxation
+			 * setrefs.c's NRM_SUPERSET mode makes for the same reason -- is
+			 * safe here, not just convenient.
+			 */
+			tle = tlist_member_ignoring_nullingrels((Var *) groupexpr, inner_tlist);
+		}
 		if (tle == NULL)
 			elog(ERROR, "hashgroupjoin grouping column not found in build-side targetlist");
 
@@ -4945,6 +5092,7 @@ create_hashgroupjoin_plan(PlannerInfo *root,
 	List	   *inner_hashkeys = NIL;
 	List	   *outer_hashkeys = NIL;
 	List	   *havingQual;
+	List	   *buildEchoKeys;
 	AttrNumber *grpColIdx;
 	Oid		   *grpCollations;
 	Oid			skewTable = InvalidOid;
@@ -5059,11 +5207,50 @@ create_hashgroupjoin_plan(PlannerInfo *root,
 	/* HAVING quals, treated as create_agg_plan treats them */
 	havingQual = order_qual_clauses(root, best_path->qual);
 
-	/* Locate the grouping columns within the build side's targetlist */
+	/*
+	 * dbblue: leave tlist/havingQual referencing the probe's own echo of a
+	 * hash key exactly as the query wrote it (e.g. account_move.journal_id,
+	 * rather than account_journal.id) -- do NOT rewrite those Vars in place.
+	 *
+	 * An earlier version of this code rewrote them here, on the reasoning
+	 * that they are provably equal to the build key.  That is true, but the
+	 * rewrite has a real cost: pathkeys (for an ORDER BY or a later Sort
+	 * above this node) were assigned during path costing against the
+	 * *original* expression identity, before this plan is even built, and
+	 * the code that later matches a Sort's required pathkey against this
+	 * node's own output targetlist does so by expression equality.  Odoo's
+	 * generated SQL, in particular, almost always both groups by and orders
+	 * by the same probe-side echo column -- so this is not a rare case to
+	 * shrug off, it is close to the common case.
+	 *
+	 * Instead, buildEchoKeys (parallel to hashkeys) tells the executor,
+	 * for each probe-side hash key, the build-side expression that is
+	 * provably equal to it.  At emit time -- where there is no real probe
+	 * tuple to read the original Var from -- the executor evaluates
+	 * buildEchoKeys against the build tuple it does have (or leaves them
+	 * NULL, for the reserved NULL-key group) and writes the results into a
+	 * small synthetic stand-in for the probe tuple, attribute-numbered to
+	 * match hashkeys.  The compiled targetlist then reads
+	 * account_move.journal_id from that stand-in and gets the right answer,
+	 * without this node's own targetlist ever having been rewritten -- so
+	 * outer pathkey matching keeps working exactly as it does for any other
+	 * node.  See nodeHashgroupjoin.c's ExecHashGroupJoinPopulateEchoSlot().
+	 */
+	buildEchoKeys = inner_hashkeys;
+
+	/*
+	 * Locate the grouping columns within the build side's targetlist.  This
+	 * one still needs the probe-echo rewrite: unlike tlist/havingQual, its
+	 * output (grpColIdx) is consumed only by EXPLAIN's "Group Key" display
+	 * (show_hashgroupjoin_keys(), explain.c), which looks columns up inside
+	 * the build plan directly and was never going to find a probe-side Var
+	 * there regardless of pathkeys.
+	 */
 	grpColIdx = extract_hashgroupjoin_grouping_cols(root,
 													best_path->groupClause,
 													inner_plan->targetlist,
-													&grpCollations);
+													&grpCollations,
+													outer_hashkeys, inner_hashkeys);
 
 	/*
 	 * Build the hash node and the fused join node.
@@ -5095,6 +5282,7 @@ create_hashgroupjoin_plan(PlannerInfo *root,
 								   hashoperators,
 								   hashcollations,
 								   outer_hashkeys,
+								   buildEchoKeys,
 								   list_length(best_path->groupClause),
 								   grpColIdx,
 								   extract_grouping_ops(best_path->groupClause),
@@ -6247,6 +6435,7 @@ make_hashgroupjoin(List *tlist,
 				   List *hashclauses,
 				   List *hashoperators, List *hashcollations,
 				   List *hashkeys,
+				   List *buildEchoKeys,
 				   int numGroupCols,
 				   AttrNumber *grpColIdx,
 				   Oid *grpOperators, Oid *grpCollations,
@@ -6268,6 +6457,7 @@ make_hashgroupjoin(List *tlist,
 	node->hashoperators = hashoperators;
 	node->hashcollations = hashcollations;
 	node->hashkeys = hashkeys;
+	node->buildEchoKeys = buildEchoKeys;
 
 	node->numCols = numGroupCols;
 	node->grpColIdx = grpColIdx;

@@ -2529,6 +2529,20 @@ set_join_references(PlannerInfo *root, Join *join, int rtoffset)
 											    NUM_EXEC_QUAL((Plan *) join));
 
 		/*
+		 * dbblue: buildEchoKeys is hashkeys' build-side counterpart (see the
+		 * field's comment in plannodes.h), so it gets exactly the fixup
+		 * hashkeys gets, just against the *inner* child instead of the
+		 * outer one.
+		 */
+		hgj->buildEchoKeys = (List *) fix_upper_expr(root,
+													 (Node *) hgj->buildEchoKeys,
+													 inner_itlist,
+													 INNER_VAR,
+													 rtoffset,
+													 NRM_EQUAL,
+													 NUM_EXEC_QUAL((Plan *) join));
+
+		/*
 		 * grpColIdx needs no fixing: it holds resnos into the build side's
 		 * targetlist, and neither Hash (which shares its child's tlist) nor
 		 * set_dummy_tlist_references() renumbers those.

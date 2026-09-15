@@ -2273,16 +2273,10 @@ typedef struct HashJoinState
  *
  *		State for a hash join fused with the GROUP BY above it.
  *
- *		SKELETON ONLY.  This is currently just enough to initialize the node
- *		so that EXPLAIN can walk and print the plan tree; there is no
- *		ExecHashGroupJoin(), and attempting to execute the node raises an
- *		error.  Stage 4 adds the hash table whose entries carry aggregate
- *		transition states, along with the build / probe / emit phases.
- *
- *		Deliberately NOT initialized yet, because both require aggregate
- *		machinery this node does not have: the result projection (the
- *		targetlist contains Aggrefs, which ExecInitExprRec insists on
- *		attaching to an AggState) and havingQual.
+ *		Its join half is a hash join whose hash table entries carry each
+ *		group's aggregate transition state; its aggregate half is driven
+ *		through nodeAgg.c's machinery (see ExecInitAggMachinery() and
+ *		friends) rather than reimplementing transition-function handling.
  * ----------------
  */
 typedef struct HashGroupJoinState
@@ -2294,6 +2288,31 @@ typedef struct HashGroupJoinState
 	TupleTableSlot *hgj_OuterTupleSlot;
 	TupleTableSlot *hgj_HashTupleSlot;
 	TupleTableSlot *hgj_NullOuterTupleSlot;
+
+	/*
+	 * All-NULLs stand-in for the BUILD side, used only by the reserved
+	 * NULL-key group (see hgj_NullKeyPergroup below) -- that group has no
+	 * real build tuple at all, since by definition nothing in the hash table
+	 * matches it.  Allocated only when join.jointype == JOIN_LEFT, since
+	 * that reserved group exists only in that case.
+	 */
+	TupleTableSlot *hgj_NullInnerTupleSlot;
+
+	/*
+	 * dbblue: stand-in for the probe side at emit time, for the sole purpose
+	 * of evaluating a bare reference to the probe's own echo of a hash key
+	 * (see HashGroupJoin.buildEchoKeys in plannodes.h for why this exists at
+	 * all, and ExecHashGroupJoinPopulateEchoSlot() for how it is filled).
+	 * hgj_EchoOuterVars are node->hashkeys, cached here for convenience --
+	 * plain Vars, OUTER_VAR-numbered, telling us which attribute of this
+	 * slot each compiled expression's result belongs in.
+	 * hgj_EchoBuildExprs is node->buildEchoKeys, compiled once at init.
+	 * The two lists are parallel.
+	 */
+	TupleTableSlot *hgj_EchoOuterTupleSlot;
+	List	   *hgj_EchoOuterVars;
+	List	   *hgj_EchoBuildExprs;
+
 	int			hgj_Phase;		/* build / probe / emit / done */
 
 	/*
@@ -2304,6 +2323,21 @@ typedef struct HashGroupJoinState
 	 */
 	struct AggState *hgj_AggState;
 	Size		hgj_PergroupSize;	/* bytes of state per hash entry */
+
+	/*
+	 * Reserved accumulator for probe rows whose join key is NULL, used only
+	 * when join.jointype == JOIN_LEFT (the planner has proven, via
+	 * probe_side_provably_total() in planner.c, that a NULL key is the ONLY
+	 * way such a join can leave a probe row unmatched -- see that function).
+	 * Not part of the hash table: there is no build row for it to attach to.
+	 * hgj_NullKeyMatched tracks whether it ever received a row, since it
+	 * should be emitted only when it did (a group nothing folded into does
+	 * not exist, same as for the empty case of any other GROUP BY).
+	 * hgj_NullKeyEmitted guards against emitting it twice.
+	 */
+	struct AggStatePerGroupData *hgj_NullKeyPergroup;
+	bool		hgj_NullKeyMatched;
+	bool		hgj_NullKeyEmitted;
 
 	/* cursor for the emit phase */
 	int			hgj_EmitBucket;

@@ -13,9 +13,20 @@
  * second hash table is built and the join's output is never materialized.
  *
  * This is legal only because the planner has proven that the grouping key is
- * the join's hash key and that the key uniquely determines a build-side row
- * (see try_add_hashgroupjoin_path()).  One build tuple therefore *is* one
- * group.
+ * the join's hash key (or the probe side's own copy of it -- see
+ * groupjoin_keys_match() in planner.c) and that the key uniquely determines a
+ * build-side row (see try_add_hashgroupjoin_path()).  One build tuple
+ * therefore *is* one group.
+ *
+ * A genuine (uncommuted) LEFT join is also supported, but only when the
+ * planner's probe_side_provably_total() has proven that a NULL probe key is
+ * the *only* way such a join can leave a probe row unmatched (an enforced
+ * foreign key rules out any other kind of miss).  Under that proof, exactly
+ * one extra group can exist beyond the hash table's own entries: the rows
+ * whose key came up NULL.  That group is not a hash bucket -- there is no
+ * build row for it to attach to -- so it gets one reserved accumulator,
+ * hgj_NullKeyPergroup, folded into by the probe phase and emitted once, at
+ * the very end, if it ever received a row.
  *
  * The aggregate machinery itself is nodeAgg.c's.  We hold a synthetic Agg
  * plan node and a real AggState built by ExecInitAggMachinery(), and drive it
@@ -72,6 +83,9 @@ static void ExecHashGroupJoinBuild(HashGroupJoinState *node);
 static void ExecHashGroupJoinProbeOne(HashGroupJoinState *node,
 									  TupleTableSlot *outerslot);
 static TupleTableSlot *ExecHashGroupJoinEmit(HashGroupJoinState *node);
+static void ExecHashGroupJoinPopulateEchoSlot(HashGroupJoinState *node,
+											  ExprContext *econtext,
+											  bool has_probe_match);
 
 /*
  * pergroup_for_tuple
@@ -126,18 +140,29 @@ ExecHashGroupJoinBuild(HashGroupJoinState *node)
 	(void) MultiExecProcNode((PlanState *) hashNode);
 
 	/*
-	 * An empty build side means no groups at all -- for both INNER and RIGHT,
-	 * since RIGHT preserves build-side rows and there are none.
-	 */
-	if (hashtable->totalTuples == 0)
-		return;
-
-	/*
 	 * Initialize each group's transition states.  These must be created in
 	 * the aggregate context: pass-by-reference initial values are palloc'd
 	 * there, and they have to outlive the per-tuple context.
+	 *
+	 * Note there is deliberately no "build side is empty, nothing to do"
+	 * early exit here (there was one prior to LEFT-join support).  For a
+	 * proven-safe LEFT join (see the file header), an empty build side does
+	 * not mean zero groups: probe_side_provably_total()'s guarantee runs the
+	 * other way too -- if the build side has no rows at all, the foreign key
+	 * it relies on means *every* probe row's key must be NULL (a non-NULL
+	 * key would require a referenced row to exist), so every probe row
+	 * belongs to the reserved group below.  ExecHashTableCreate() always
+	 * allocates hashtable->buckets regardless of totalTuples, so the loop
+	 * over nbuckets remains safe (and simply does nothing) when it is empty.
 	 */
 	oldcxt = MemoryContextSwitchTo(aggstate->aggcontexts[0]->ecxt_per_tuple_memory);
+
+	if (node->js.jointype == JOIN_LEFT)
+	{
+		ExecAggInitPergroup(aggstate, node->hgj_NullKeyPergroup);
+		node->hgj_NullKeyMatched = false;
+		node->hgj_NullKeyEmitted = false;
+	}
 
 	for (i = 0; i < hashtable->nbuckets; i++)
 	{
@@ -184,7 +209,27 @@ ExecHashGroupJoinProbeOne(HashGroupJoinState *node, TupleTableSlot *outerslot)
 	hashdatum = ExecEvalExprSwitchContext(node->hgj_OuterHash, econtext,
 										  &isnull);
 	if (isnull)
-		return;					/* NULL key cannot match anything */
+	{
+		/*
+		 * A NULL key never matches any bucket.  For a proven-safe LEFT join,
+		 * this is the ONE way such a join can produce an unmatched row (see
+		 * the file header and probe_side_provably_total() in planner.c), and
+		 * it is exactly what the reserved accumulator exists for.  For
+		 * INNER/RIGHT there is no such reservation -- an unmatched-by-NULL
+		 * probe row simply contributes nothing, same as an ordinary hash
+		 * join, and this is not a new case: the plain hash key match below
+		 * would have found nothing for it anyway.
+		 */
+		if (node->js.jointype == JOIN_LEFT)
+		{
+			aggcontext->ecxt_outertuple = outerslot;
+			aggcontext->ecxt_innertuple = node->hgj_NullInnerTupleSlot;
+			ExecAggAdvance(aggstate, node->hgj_NullKeyPergroup);
+			ResetExprContext(aggcontext);
+			node->hgj_NullKeyMatched = true;
+		}
+		return;
+	}
 
 	hashvalue = DatumGetUInt32(hashdatum);
 	ExecHashGetBucketAndBatch(hashtable, hashvalue, &bucketno, &batchno);
@@ -239,6 +284,63 @@ ExecHashGroupJoinProbeOne(HashGroupJoinState *node, TupleTableSlot *outerslot)
 }
 
 /* ----------------------------------------------------------------
+ *		ExecHashGroupJoinPopulateEchoSlot
+ *
+ *		Fill in the stand-in for the probe side used only when the final
+ *		projection bears a bare reference to the probe's own echo of a hash
+ *		key (see HashGroupJoin.buildEchoKeys, plannodes.h).
+ *
+ * If has_probe_match is true, this group was folded from at least one real
+ * probe row, so every hash key's echoed value equals the build side's own
+ * key value (that equality is exactly what makes fusion legal at all -- see
+ * groupjoin_keys_match(), planner.c) -- evaluate buildEchoKeys against
+ * econtext's current innertuple (the real build tuple) and use that.
+ *
+ * If has_probe_match is false, there was no real contributing probe row for
+ * this output row at all: either it is a RIGHT join's build entry that
+ * nothing ever matched, or it is the reserved NULL-key group.  In ordinary
+ * SQL, a row with no real match on the probe side has every probe-side
+ * column genuinely NULL, including the echoed one -- not "whatever the
+ * build key happens to be".  So this leaves the whole slot NULL rather than
+ * evaluating buildEchoKeys at all: evaluating it would read the *build*
+ * side's real key (for a RIGHT join's unmatched build entry, that build
+ * tuple does exist), which is a real value, not NULL, and would be wrong.
+ * ----------------------------------------------------------------
+ */
+static void
+ExecHashGroupJoinPopulateEchoSlot(HashGroupJoinState *node, ExprContext *econtext,
+								  bool has_probe_match)
+{
+	TupleTableSlot *slot = node->hgj_EchoOuterTupleSlot;
+	int			natts = slot->tts_tupleDescriptor->natts;
+	int			i;
+
+	ExecClearTuple(slot);
+	for (i = 0; i < natts; i++)
+		slot->tts_isnull[i] = true;
+
+	if (has_probe_match)
+	{
+		ListCell   *lc1,
+				   *lc2;
+
+		forboth(lc1, node->hgj_EchoOuterVars, lc2, node->hgj_EchoBuildExprs)
+		{
+			Var		   *ovar = lfirst_node(Var, lc1);
+			ExprState  *estate = (ExprState *) lfirst(lc2);
+			bool		isnull;
+			Datum		val;
+
+			val = ExecEvalExpr(estate, econtext, &isnull);
+			slot->tts_values[ovar->varattno - 1] = val;
+			slot->tts_isnull[ovar->varattno - 1] = isnull;
+		}
+	}
+
+	ExecStoreVirtualTuple(slot);
+}
+
+/* ----------------------------------------------------------------
  *		ExecHashGroupJoinEmit
  *
  *		Walk the hash table and return one row per surviving group.
@@ -254,75 +356,131 @@ ExecHashGroupJoinEmit(HashGroupJoinState *node)
 	for (;;)
 	{
 		HashJoinTuple hashTuple = node->hgj_EmitTuple;
+		bool		emit_null_key_group = false;
+		bool		has_probe_match;
 
 		/* advance to the next non-empty bucket if needed */
 		while (hashTuple == NULL)
 		{
 			if (node->hgj_EmitBucket >= hashtable->nbuckets)
+			{
+				/*
+				 * All ordinary hash-table entries are done.  A proven-safe
+				 * LEFT join (see the file header) can have exactly one more
+				 * group beyond them: the reserved accumulator for probe rows
+				 * whose key came up NULL.  Emit it exactly once, and only if
+				 * it actually received a row -- same as any other GROUP BY,
+				 * a group nothing ever folded into does not exist.
+				 */
+				if (node->js.jointype == JOIN_LEFT && !node->hgj_NullKeyEmitted)
+				{
+					node->hgj_NullKeyEmitted = true;
+					if (node->hgj_NullKeyMatched)
+					{
+						emit_null_key_group = true;
+						break;
+					}
+				}
 				return NULL;	/* all groups emitted */
+			}
 			hashTuple = hashtable->buckets.unshared[node->hgj_EmitBucket];
 			node->hgj_EmitBucket++;
 		}
-		node->hgj_EmitTuple = hashTuple->next.unshared;
 
-		CHECK_FOR_INTERRUPTS();
+		has_probe_match = !emit_null_key_group;
 
-		if (!HeapTupleHeaderHasMatch(HJTUPLE_MINTUPLE(hashTuple)))
+		if (!emit_null_key_group)
 		{
-			ExprContext *econtext = node->js.ps.ps_ExprContext;
+			node->hgj_EmitTuple = hashTuple->next.unshared;
 
-			/* For an inner join an unmatched build row yields no group. */
-			if (node->js.jointype == JOIN_INNER)
-				continue;
+			CHECK_FOR_INTERRUPTS();
 
-			/*
-			 * The build side is preserved, so the join still produces exactly
-			 * one row for this group: the build tuple NULL-extended on the
-			 * probe side.  That row has to be folded into the aggregates --
-			 * skipping it is not the same thing.  COUNT(*) must come out as 1
-			 * here (one joined row) while COUNT(aml.id) comes out as 0 (that
-			 * column is NULL), and only running the transition functions over
-			 * the NULL-extended row gets both right.
-			 *
-			 * As in nodeHashjoin's HJ_FILL_INNER_TUPLES, only the otherquals
-			 * apply to this synthesized row -- never the joinqual, which by
-			 * definition failed for every outer tuple.  If the otherquals
-			 * reject it the join emits nothing for this build row, so the
-			 * group disappears entirely.
-			 */
+			if (!HeapTupleHeaderHasMatch(HJTUPLE_MINTUPLE(hashTuple)))
+			{
+				ExprContext *econtext = node->js.ps.ps_ExprContext;
+
+				/*
+				 * dbblue: this build row was never matched by any real probe
+				 * row, so if it is emitted at all (RIGHT preserves it -- see
+				 * below), any probe-echo column in the output must show NULL,
+				 * not the build key -- see
+				 * ExecHashGroupJoinPopulateEchoSlot()'s comment.
+				 */
+				has_probe_match = false;
+
+				/*
+				 * For INNER, an unmatched build row yields no group, same as
+				 * ever.  For a proven-safe LEFT join, likewise: LEFT
+				 * preserves the *probe* side, not the build side, so a build
+				 * row nothing ever referenced simply does not appear in the
+				 * join's output at all -- it is RIGHT alone that preserves
+				 * unmatched build rows.
+				 */
+				if (node->js.jointype == JOIN_INNER ||
+					node->js.jointype == JOIN_LEFT)
+					continue;
+
+				/*
+				 * The build side is preserved, so the join still produces exactly
+				 * one row for this group: the build tuple NULL-extended on the
+				 * probe side.  That row has to be folded into the aggregates --
+				 * skipping it is not the same thing.  COUNT(*) must come out as 1
+				 * here (one joined row) while COUNT(aml.id) comes out as 0 (that
+				 * column is NULL), and only running the transition functions over
+				 * the NULL-extended row gets both right.
+				 *
+				 * As in nodeHashjoin's HJ_FILL_INNER_TUPLES, only the otherquals
+				 * apply to this synthesized row -- never the joinqual, which by
+				 * definition failed for every outer tuple.  If the otherquals
+				 * reject it the join emits nothing for this build row, so the
+				 * group disappears entirely.
+				 */
+				ExecStoreMinimalTuple(HJTUPLE_MINTUPLE(hashTuple),
+									  node->hgj_HashTupleSlot,
+									  false);
+
+				ResetExprContext(econtext);
+				econtext->ecxt_innertuple = node->hgj_HashTupleSlot;
+				econtext->ecxt_outertuple = node->hgj_NullOuterTupleSlot;
+
+				if (node->js.ps.qual != NULL &&
+					!ExecQual(node->js.ps.qual, econtext))
+					continue;
+
+				aggstate->tmpcontext->ecxt_innertuple = node->hgj_HashTupleSlot;
+				aggstate->tmpcontext->ecxt_outertuple = node->hgj_NullOuterTupleSlot;
+				ExecAggAdvance(aggstate, pergroup_for_tuple(hashTuple));
+				ResetExprContext(aggstate->tmpcontext);
+			}
+
 			ExecStoreMinimalTuple(HJTUPLE_MINTUPLE(hashTuple),
 								  node->hgj_HashTupleSlot,
 								  false);
-
-			ResetExprContext(econtext);
-			econtext->ecxt_innertuple = node->hgj_HashTupleSlot;
-			econtext->ecxt_outertuple = node->hgj_NullOuterTupleSlot;
-
-			if (node->js.ps.qual != NULL &&
-				!ExecQual(node->js.ps.qual, econtext))
-				continue;
-
-			aggstate->tmpcontext->ecxt_innertuple = node->hgj_HashTupleSlot;
-			aggstate->tmpcontext->ecxt_outertuple = node->hgj_NullOuterTupleSlot;
-			ExecAggAdvance(aggstate, pergroup_for_tuple(hashTuple));
-			ResetExprContext(aggstate->tmpcontext);
 		}
-
-		ExecStoreMinimalTuple(HJTUPLE_MINTUPLE(hashTuple),
-							  node->hgj_HashTupleSlot,
-							  false);
 
 		ResetExprContext(aggecontext);
 
 		/*
 		 * The grouping columns and the aggregate arguments both come from the
-		 * build tuple's side; there is no current outer tuple at emit time,
-		 * so the outer slot is an all-NULLs slot of the right shape.
+		 * build tuple's side.  The reserved NULL-key group has no build tuple
+		 * at all -- there was never a match -- so hgj_NullInnerTupleSlot
+		 * stands in for it, correctly all-NULLs.
 		 */
-		aggecontext->ecxt_innertuple = node->hgj_HashTupleSlot;
-		aggecontext->ecxt_outertuple = node->hgj_NullOuterTupleSlot;
+		aggecontext->ecxt_innertuple = emit_null_key_group ?
+			node->hgj_NullInnerTupleSlot : node->hgj_HashTupleSlot;
 
-		ExecAggFinalize(aggstate, pergroup_for_tuple(hashTuple));
+		/*
+		 * There is no single probe tuple at emit time -- a group may have
+		 * been folded from many, or from none.  The stand-in supplies the one
+		 * thing the output can legitimately need from the probe side: its own
+		 * echo of a hash key.  It must be built *after* ecxt_innertuple is
+		 * set above, since that is what buildEchoKeys reads.
+		 */
+		ExecHashGroupJoinPopulateEchoSlot(node, aggecontext, has_probe_match);
+		aggecontext->ecxt_outertuple = node->hgj_EchoOuterTupleSlot;
+
+		ExecAggFinalize(aggstate, emit_null_key_group ?
+					   node->hgj_NullKeyPergroup : pergroup_for_tuple(hashTuple));
 
 		/* HAVING, which the AggState owns as its plan qual */
 		if (aggstate->ss.ps.qual != NULL &&
@@ -358,8 +516,17 @@ ExecHashGroupJoin(PlanState *pstate)
 				{
 					TupleTableSlot *outerslot;
 
-					/* Nothing on the build side: no groups are possible. */
-					if (node->hgj_HashTable->totalTuples == 0)
+					/*
+					 * Nothing on the build side: for INNER/RIGHT, no groups
+					 * are possible at all (RIGHT's own preserved-row entries
+					 * live in the hash table, and there are none).  A
+					 * proven-safe LEFT join is different -- see
+					 * ExecHashGroupJoinBuild()'s comment -- so it must still
+					 * probe, to accumulate into the reserved group, and go
+					 * to EMIT rather than DONE.
+					 */
+					if (node->hgj_HashTable->totalTuples == 0 &&
+						node->js.jointype != JOIN_LEFT)
 					{
 						node->hgj_Phase = HGJ_DONE;
 						break;
@@ -458,6 +625,22 @@ ExecInitHashGroupJoin(HashGroupJoin *node, EState *estate, int eflags)
 	hgjstate->hgj_HashTupleSlot = hashstate->ps.ps_ResultTupleSlot;
 
 	/*
+	 * A proven-safe LEFT join (see the file header) needs an all-NULLs
+	 * stand-in for the BUILD side too, for the reserved NULL-key group's
+	 * emit step: that group has no real build tuple, since by construction
+	 * nothing in the hash table ever matches it.
+	 */
+	if (node->join.jointype == JOIN_LEFT)
+	{
+		TupleDesc	innerDesc = ExecGetResultType(innerPlanState(hgjstate));
+		const TupleTableSlotOps *innerOps =
+			ExecGetResultSlotOps(innerPlanState(hgjstate), NULL);
+
+		hgjstate->hgj_NullInnerTupleSlot =
+			ExecInitNullTupleSlot(estate, innerDesc, innerOps);
+	}
+
+	/*
 	 * Join-level expressions.  These reference the two join inputs, so they
 	 * are evaluated against this node's econtext with both slots set.
 	 */
@@ -500,6 +683,19 @@ ExecInitHashGroupJoin(HashGroupJoin *node, EState *estate, int eflags)
 							hash_strict,
 							&hgjstate->js.ps,
 							0);
+
+	/*
+	 * dbblue: the probe-echo stand-in (see the field comments in
+	 * execnodes.h and HashGroupJoin.buildEchoKeys in plannodes.h).  Shaped
+	 * like the outer side, since that is what a bare reference to the
+	 * probe's own echo of a hash key expects to read from; compiled once,
+	 * populated fresh by ExecHashGroupJoinPopulateEchoSlot() on every emit.
+	 */
+	hgjstate->hgj_EchoOuterTupleSlot = ExecInitExtraTupleSlot(estate, outerDesc,
+															  ops);
+	hgjstate->hgj_EchoOuterVars = node->hashkeys;
+	hgjstate->hgj_EchoBuildExprs = ExecInitExprList(node->buildEchoKeys,
+													(PlanState *) hgjstate);
 
 	/*
 	 * The Hash node's own expression, for the build side.  ExecInitHash does
@@ -572,6 +768,19 @@ ExecInitHashGroupJoin(HashGroupJoin *node, EState *estate, int eflags)
 							 innerPlanState(hgjstate));
 	hgjstate->hgj_PergroupSize =
 		MAXALIGN(ExecAggPergroupSize(hgjstate->hgj_AggState));
+
+	/*
+	 * The reserved accumulator for the NULL-key group (proven-safe LEFT
+	 * joins only -- see the file header).  Allocated once, up front, in the
+	 * query's long-lived per-query context (the default context here, since
+	 * this runs during executor init, before any per-tuple context is even
+	 * current); ExecHashGroupJoinBuild() initializes its actual transition
+	 * values in the aggregate context on every (re)build, same as any hash
+	 * entry's.
+	 */
+	if (node->join.jointype == JOIN_LEFT)
+		hgjstate->hgj_NullKeyPergroup =
+			(struct AggStatePerGroupData *) palloc0(hgjstate->hgj_PergroupSize);
 
 	return hgjstate;
 }
