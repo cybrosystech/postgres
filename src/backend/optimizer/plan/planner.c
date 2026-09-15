@@ -7618,7 +7618,7 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
  * plan shape is inspected with EXPLAIN (never EXPLAIN ANALYZE); it must stay
  * undefined until Stage 4 lands.  See dbblue_groupjoin.md 3.2 / T2-3.
  */
-#define DBBLUE_GROUPJOIN_EXECUTOR_READY
+// #define DBBLUE_GROUPJOIN_EXECUTOR_READY
 
 /*
  * find_cheapest_hash_join_path
