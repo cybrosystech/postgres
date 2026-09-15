@@ -323,6 +323,20 @@ typedef struct AggStatePerHashData
 
 
 extern AggState *ExecInitAgg(Agg *node, EState *estate, int eflags);
+
+/*
+ * dbblue: entry points for driving this file's aggregate machinery from a
+ * node that is not an Agg (see nodeHashgroupjoin.c).
+ */
+extern AggState *ExecInitAggMachinery(Agg *node, EState *estate, int eflags,
+									  TupleDesc inputDesc,
+									  const TupleTableSlotOps *inputOps,
+									  const TupleTableSlotOps *innerOps,
+									  PlanState *outerPS, PlanState *innerPS);
+extern Size ExecAggPergroupSize(AggState *aggstate);
+extern void ExecAggInitPergroup(AggState *aggstate, AggStatePerGroup pergroup);
+extern void ExecAggAdvance(AggState *aggstate, AggStatePerGroup pergroup);
+extern void ExecAggFinalize(AggState *aggstate, AggStatePerGroup pergroup);
 extern void ExecEndAgg(AggState *node);
 extern void ExecReScanAgg(AggState *node);
 

@@ -1076,6 +1076,65 @@ typedef struct HashJoin
 } HashJoin;
 
 /* ----------------
+ *		hash groupjoin node
+ *
+ * A HashGroupJoin performs a hash join and the GROUP BY aggregation above it
+ * in a single pass over a single hash table: the aggregate transition states
+ * are stored alongside each build-side tuple in the hash table, and probe
+ * tuples advance them in place rather than being emitted.  (dbblue-specific.)
+ *
+ * The hash* fields have exactly the same meaning as in HashJoin; the grp*
+ * fields have exactly the same meaning as in Agg.  As with Agg, there is no
+ * direct info about the aggregate functions here -- they are found by
+ * scanning the node's tlist and quals at executor startup.
+ *
+ * This is a separate node type rather than extra fields on HashJoin so that
+ * upstream's hash join is untouched and dbblue's rebases stay clean.
+ * ----------------
+ */
+typedef struct HashGroupJoin
+{
+	Join		join;
+
+	/* hash join fields, as HashJoin */
+	List	   *hashclauses;
+	List	   *hashoperators;
+	List	   *hashcollations;
+	List	   *hashkeys;
+
+	/* grouping fields, as Agg */
+
+	/* number of grouping columns */
+	int			numCols;
+
+	/* their indexes in the target list */
+	AttrNumber *grpColIdx pg_node_attr(array_size(numCols));
+
+	/* equality operators to compare with */
+	Oid		   *grpOperators pg_node_attr(array_size(numCols));
+	Oid		   *grpCollations pg_node_attr(array_size(numCols));
+
+	/* estimated number of groups in input */
+	Cardinality numGroups;
+
+	/* for pass-by-ref transition data */
+	uint64		transitionSpace;
+
+	/* IDs of Params used in Aggref inputs */
+	Bitmapset  *aggParams;
+
+	/*
+	 * HAVING quals.  Agg keeps these in plan.qual, but we cannot: for an
+	 * outer join, plan.qual already carries the join's "otherquals" (the
+	 * pushed-down quals that must be applied after the join), exactly as in
+	 * HashJoin.  The two are applied at different times -- otherquals filter
+	 * probe tuples before they reach a transition function, havingQual
+	 * filters whole groups on the way out -- so they must stay separate.
+	 */
+	List	   *havingQual;
+} HashGroupJoin;
+
+/* ----------------
  *		materialization node
  * ----------------
  */

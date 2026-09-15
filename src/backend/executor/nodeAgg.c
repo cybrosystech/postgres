@@ -369,6 +369,11 @@ typedef struct FindColsContext
 static void select_current_set(AggState *aggstate, int setno, bool is_hash);
 static void initialize_phase(AggState *aggstate, int newphase);
 static TupleTableSlot *fetch_input_tuple(AggState *aggstate);
+static AggState *ExecInitAggInternal(Agg *node, EState *estate, int eflags,
+									 TupleDesc inputDesc,
+									 const TupleTableSlotOps *inputOps,
+									 const TupleTableSlotOps *innerOps,
+									 PlanState *outerPS, PlanState *innerPS);
 static void initialize_aggregates(AggState *aggstate,
 								  AggStatePerGroup *pergroups,
 								  int numReset);
@@ -3278,7 +3283,10 @@ hashagg_reset_spill_state(AggState *aggstate)
  * -----------------
  */
 AggState *
-ExecInitAgg(Agg *node, EState *estate, int eflags)
+ExecInitAggInternal(Agg *node, EState *estate, int eflags,
+					TupleDesc inputDesc, const TupleTableSlotOps *inputOps,
+					const TupleTableSlotOps *innerOps,
+					PlanState *outerPS, PlanState *innerPS)
 {
 	AggState   *aggstate;
 	AggStatePerAgg peraggs;
@@ -3408,19 +3416,56 @@ ExecInitAgg(Agg *node, EState *estate, int eflags)
 	 */
 	if (node->aggstrategy == AGG_HASHED)
 		eflags &= ~EXEC_FLAG_REWIND;
-	outerPlan = outerPlan(node);
-	outerPlanState(aggstate) = ExecInitNode(outerPlan, estate, eflags);
 
-	/*
-	 * initialize source tuple type.
-	 */
-	aggstate->ss.ps.outerops =
-		ExecGetResultSlotOps(outerPlanState(&aggstate->ss),
-							 &aggstate->ss.ps.outeropsfixed);
-	aggstate->ss.ps.outeropsset = true;
+	if (inputDesc == NULL)
+	{
+		outerPlan = outerPlan(node);
+		outerPlanState(aggstate) = ExecInitNode(outerPlan, estate, eflags);
 
-	ExecCreateScanSlotFromOuterPlan(estate, &aggstate->ss,
-									aggstate->ss.ps.outerops);
+		/*
+		 * initialize source tuple type.
+		 */
+		aggstate->ss.ps.outerops =
+			ExecGetResultSlotOps(outerPlanState(&aggstate->ss),
+								 &aggstate->ss.ps.outeropsfixed);
+		aggstate->ss.ps.outeropsset = true;
+
+		ExecCreateScanSlotFromOuterPlan(estate, &aggstate->ss,
+										aggstate->ss.ps.outerops);
+	}
+	else
+	{
+		/*
+		 * dbblue: caller drives the aggregation itself and supplies the input
+		 * tuple shape, so there is no child plan to initialize.  See
+		 * ExecInitAggMachinery().  Slot ops are left unfixed so that the
+		 * expression compiler emits generic slot access -- the caller feeds
+		 * tuples from more than one slot type (a join has two inputs).
+		 */
+		/*
+		 * Borrow the caller's already-initialized child plan states.  We
+		 * never run this AggState's own loop, but the expression compiler
+		 * reaches through outerPlanState/innerPlanState to learn the input
+		 * tuple descriptors when a slot type is fixed (ExecComputeSlotInfo).
+		 * The caller owns these and must not let ExecEndAgg run on us.
+		 */
+		outerPlan = NULL;
+		outerPlanState(aggstate) = outerPS;
+		innerPlanState(aggstate) = innerPS;
+		/*
+		 * The outer slot deliberately stays UNFIXED.  A fused join feeds
+		 * probe tuples through it during the probe phase but an all-NULLs
+		 * virtual slot during the emit phase, so its type is not constant and
+		 * specialized deform steps would crash on the second one.
+		 */
+		aggstate->ss.ps.outerops = inputOps;
+		aggstate->ss.ps.outeropsfixed = false;
+		aggstate->ss.ps.outeropsset = true;
+		aggstate->ss.ps.innerops = innerOps;
+		aggstate->ss.ps.inneropsfixed = (innerOps != NULL);
+		aggstate->ss.ps.inneropsset = true;
+		ExecInitScanTupleSlot(estate, &aggstate->ss, inputDesc, inputOps, 0);
+	}
 	scanDesc = aggstate->ss.ss_ScanTupleSlot->tts_tupleDescriptor;
 
 	/*
@@ -4115,6 +4160,114 @@ ExecInitAgg(Agg *node, EState *estate, int eflags)
 	}
 
 	return aggstate;
+}
+
+/*
+ * ExecInitAgg
+ *		Ordinary entry point: the Agg node has its own child plan.
+ */
+AggState *
+ExecInitAgg(Agg *node, EState *estate, int eflags)
+{
+	return ExecInitAggInternal(node, estate, eflags, NULL, NULL, NULL,
+							   NULL, NULL);
+}
+
+/* ---------------------------------------------------------------------------
+ * dbblue: driving aggregation from a node that is not an Agg
+ *
+ * These let another executor node (currently nodeHashgroupjoin.c) reuse all of
+ * this file's aggregate machinery -- pertrans setup, the compiled transition
+ * expressions, strictness and pass-by-reference handling, finalization --
+ * while supplying its own per-group state and its own input tuples.
+ *
+ * The caller builds a synthetic Agg plan node carrying the targetlist and
+ * HAVING quals, calls ExecInitAggMachinery() once, then per group keeps an
+ * array of ExecAggPergroupSize() bytes, and per input tuple sets up the
+ * econtext and calls ExecAggAdvance().
+ *
+ * The synthetic Agg must use AGG_PLAIN with numCols == 0: there is exactly one
+ * implicit group from this file's point of view, and the caller decides which
+ * per-group state that is on each call.  Grouping sets are not supported.
+ * ---------------------------------------------------------------------------
+ */
+
+/*
+ * ExecInitAggMachinery
+ *		Initialize aggregate machinery with no child plan.
+ *
+ * 'inputDesc' and 'inputOps' describe the tuples the caller will feed in.
+ */
+AggState *
+ExecInitAggMachinery(Agg *node, EState *estate, int eflags,
+					 TupleDesc inputDesc, const TupleTableSlotOps *inputOps,
+					 const TupleTableSlotOps *innerOps,
+					 PlanState *outerPS, PlanState *innerPS)
+{
+	Assert(node->aggstrategy == AGG_PLAIN);
+	Assert(node->numCols == 0);
+	Assert(inputDesc != NULL);
+
+	return ExecInitAggInternal(node, estate, eflags, inputDesc, inputOps,
+							   innerOps, outerPS, innerPS);
+}
+
+/*
+ * ExecAggPergroupSize
+ *		Bytes needed for one group's transition state array.
+ */
+Size
+ExecAggPergroupSize(AggState *aggstate)
+{
+	return sizeof(AggStatePerGroupData) * aggstate->numtrans;
+}
+
+/*
+ * ExecAggInitPergroup
+ *		Set a caller-owned per-group state array to its initial values.
+ *
+ * Must be called with CurrentMemoryContext set to a context that lives at
+ * least as long as the group, since pass-by-reference initial values are
+ * copied into the aggregate context.
+ */
+void
+ExecAggInitPergroup(AggState *aggstate, AggStatePerGroup pergroup)
+{
+	AggStatePerGroup pergroups[1];
+
+	pergroups[0] = pergroup;
+	initialize_aggregates(aggstate, pergroups, 1);
+}
+
+/*
+ * ExecAggAdvance
+ *		Run the transition functions for one input tuple against 'pergroup'.
+ *
+ * The caller must already have set aggstate->tmpcontext's input slots (for a
+ * join, both ecxt_outertuple and ecxt_innertuple) to the tuple being folded
+ * in.  The tmpcontext is reset by the caller, not here.
+ */
+void
+ExecAggAdvance(AggState *aggstate, AggStatePerGroup pergroup)
+{
+	aggstate->all_pergroups[0] = pergroup;
+	aggstate->current_set = 0;
+	advance_aggregates(aggstate);
+}
+
+/*
+ * ExecAggFinalize
+ *		Compute the final aggregate values for 'pergroup'.
+ *
+ * Results land in the node's ExprContext as ecxt_aggvalues/ecxt_aggnulls,
+ * which is where the compiled targetlist (EEOP_AGGREF) reads them from.
+ */
+void
+ExecAggFinalize(AggState *aggstate, AggStatePerGroup pergroup)
+{
+	aggstate->all_pergroups[0] = pergroup;
+	aggstate->current_set = 0;
+	finalize_aggregates(aggstate, aggstate->peragg, pergroup);
 }
 
 /*

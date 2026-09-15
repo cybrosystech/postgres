@@ -879,6 +879,7 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 		case T_NestLoop:
 		case T_MergeJoin:
 		case T_HashJoin:
+		case T_HashGroupJoin:
 			set_join_references(root, (Join *) plan, rtoffset);
 			break;
 
@@ -2505,6 +2506,34 @@ set_join_references(PlannerInfo *root, Join *join, int rtoffset)
 											   NRM_EQUAL,
 											   NUM_EXEC_QUAL((Plan *) join));
 	}
+	else if (IsA(join, HashGroupJoin))
+	{
+		/* dbblue: identical to the HashJoin case above */
+		HashGroupJoin *hgj = (HashGroupJoin *) join;
+
+		hgj->hashclauses = fix_join_expr(root,
+										 hgj->hashclauses,
+										 outer_itlist,
+										 inner_itlist,
+										 (Index) 0,
+										 rtoffset,
+										 NRM_EQUAL,
+										 NUM_EXEC_QUAL((Plan *) join));
+
+		hgj->hashkeys = (List *) fix_upper_expr(root,
+											    (Node *) hgj->hashkeys,
+											    outer_itlist,
+											    OUTER_VAR,
+											    rtoffset,
+											    NRM_EQUAL,
+											    NUM_EXEC_QUAL((Plan *) join));
+
+		/*
+		 * grpColIdx needs no fixing: it holds resnos into the build side's
+		 * targetlist, and neither Hash (which shares its child's tlist) nor
+		 * set_dummy_tlist_references() renumbers those.
+		 */
+	}
 
 	/*
 	 * Now we need to fix up the targetlist and qpqual, which are logically
@@ -2532,6 +2561,28 @@ set_join_references(PlannerInfo *root, Join *join, int rtoffset)
 									rtoffset,
 									(join->jointype == JOIN_INNER ? NRM_EQUAL : NRM_SUPERSET),
 									NUM_EXEC_QUAL((Plan *) join));
+
+	/*
+	 * dbblue: a HashGroupJoin carries HAVING quals in a field of its own,
+	 * because plan.qual is already taken by the join's otherquals.  They are
+	 * fixed the same way as the targetlist: they reference aggregates and
+	 * grouping columns, whose inputs come from both join inputs, so they need
+	 * join (outer/inner) treatment rather than the single-child upper
+	 * treatment that Agg's HAVING gets.
+	 */
+	if (IsA(join, HashGroupJoin))
+	{
+		HashGroupJoin *hgj = (HashGroupJoin *) join;
+
+		hgj->havingQual = fix_join_expr(root,
+										hgj->havingQual,
+										outer_itlist,
+										inner_itlist,
+										(Index) 0,
+										rtoffset,
+										(join->jointype == JOIN_INNER ? NRM_EQUAL : NRM_SUPERSET),
+										NUM_EXEC_QUAL((Plan *) join));
+	}
 
 	pfree(outer_itlist);
 	pfree(inner_itlist);

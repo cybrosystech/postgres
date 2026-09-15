@@ -623,6 +623,24 @@
   assign_hook => 'assign_datestyle',
 },
 
+# dbblue: fused hash join + GROUP BY.  These are two flags on purpose and
+# must not be collapsed into one -- see dbblue_groupjoin.md T4-6.
+{ name => 'dbblue_enable_groupjoin', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
+  short_desc => 'Enables the planner\'s use of fused hash join and grouping plans.',
+  long_desc => 'Only takes effect for a join whose build side is provably unique on the join key, and whose GROUP BY key is that same key.',
+  flags => 'GUC_EXPLAIN',
+  variable => 'dbblue_enable_groupjoin',
+  boot_val => 'false',
+},
+
+{ name => 'dbblue_groupjoin_planner_only', type => 'bool', context => 'PGC_USERSET', group => 'DEVELOPER_OPTIONS',
+  short_desc => 'Logs candidate fused groupjoin plans without using them.',
+  long_desc => 'For development only: reports which queries match the groupjoin shape, without ever offering the path to the planner.',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'dbblue_groupjoin_planner_only',
+  boot_val => 'false',
+},
+
 # This is PGC_SUSET to prevent hiding from log_lock_waits.
 { name => 'deadlock_timeout', type => 'int', context => 'PGC_SUSET', group => 'LOCK_MANAGEMENT',
   short_desc => 'Sets the time to wait on a lock before checking for deadlock.',

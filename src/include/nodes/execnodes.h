@@ -2268,6 +2268,48 @@ typedef struct HashJoinState
 	bool		hj_OuterNotEmpty;
 } HashJoinState;
 
+/* ----------------
+ *	 HashGroupJoinState information		(dbblue)
+ *
+ *		State for a hash join fused with the GROUP BY above it.
+ *
+ *		SKELETON ONLY.  This is currently just enough to initialize the node
+ *		so that EXPLAIN can walk and print the plan tree; there is no
+ *		ExecHashGroupJoin(), and attempting to execute the node raises an
+ *		error.  Stage 4 adds the hash table whose entries carry aggregate
+ *		transition states, along with the build / probe / emit phases.
+ *
+ *		Deliberately NOT initialized yet, because both require aggregate
+ *		machinery this node does not have: the result projection (the
+ *		targetlist contains Aggrefs, which ExecInitExprRec insists on
+ *		attaching to an AggState) and havingQual.
+ * ----------------
+ */
+typedef struct HashGroupJoinState
+{
+	JoinState	js;				/* its first field is NodeTag */
+	ExprState  *hashclauses;
+	ExprState  *hgj_OuterHash;	/* hash value of the probe tuple */
+	HashJoinTable hgj_HashTable;
+	TupleTableSlot *hgj_OuterTupleSlot;
+	TupleTableSlot *hgj_HashTupleSlot;
+	TupleTableSlot *hgj_NullOuterTupleSlot;
+	int			hgj_Phase;		/* build / probe / emit / done */
+
+	/*
+	 * Aggregate machinery, owned by nodeAgg.c.  The AggState holds the
+	 * compiled transition expressions, the final projection (this node's
+	 * targetlist, containing the Aggrefs) and the HAVING qual.  Per-group
+	 * transition state lives in each hash entry, not here.
+	 */
+	struct AggState *hgj_AggState;
+	Size		hgj_PergroupSize;	/* bytes of state per hash entry */
+
+	/* cursor for the emit phase */
+	int			hgj_EmitBucket;
+	HashJoinTuple hgj_EmitTuple;
+} HashGroupJoinState;
+
 
 /* ----------------------------------------------------------------
  *				 Materialization State Information

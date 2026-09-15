@@ -252,6 +252,14 @@ static void add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 									  const AggClauseCosts *agg_costs,
 									  grouping_sets_data *gd,
 									  GroupPathExtraData *extra);
+static HashPath *find_cheapest_hash_join_path(RelOptInfo *input_rel);
+static bool groupjoin_keys_match(PlannerInfo *root, HashPath *hpath);
+static void try_add_hashgroupjoin_path(PlannerInfo *root,
+									   RelOptInfo *input_rel,
+									   RelOptInfo *grouped_rel,
+									   const AggClauseCosts *agg_costs,
+									   List *havingQual,
+									   double dNumGroups);
 static RelOptInfo *create_partial_grouping_paths(PlannerInfo *root,
 												 RelOptInfo *grouped_rel,
 												 RelOptInfo *input_rel,
@@ -7554,6 +7562,16 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 									 havingQual,
 									 agg_costs,
 									 dNumGroups));
+
+			/*
+			 * dbblue: also consider fusing that hashed aggregation into the
+			 * hash join below it, if there is one and the fusion is provably
+			 * safe.  This is the one point in planning where both the
+			 * finished join paths and the PK-reduced grouping clause are in
+			 * hand at once.
+			 */
+			try_add_hashgroupjoin_path(root, input_rel, grouped_rel,
+									   agg_costs, havingQual, dNumGroups);
 		}
 
 		/*
@@ -7584,6 +7602,330 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 	 */
 	if (grouped_rel->partial_pathlist != NIL)
 		gather_grouping_paths(root, grouped_rel);
+}
+
+/*
+ * dbblue: compile-time gate for the groupjoin executor.
+ *
+ * Stages 1-3 are implemented: path creation, plan creation, setrefs, and
+ * enough of nodeHashgroupjoin.c and explain.c for EXPLAIN to initialize and
+ * print the node.  What does not exist is execution itself -- there is no
+ * ExecHashGroupJoin(), so running the node raises an error.
+ *
+ * This is deliberately a compile-time symbol and not a GUC, so that *no*
+ * runtime setting -- dbblue_enable_groupjoin included -- can reach the
+ * unimplemented path.  Defining it in a throwaway local build is how the
+ * plan shape is inspected with EXPLAIN (never EXPLAIN ANALYZE); it must stay
+ * undefined until Stage 4 lands.  See dbblue_groupjoin.md 3.2 / T2-3.
+ */
+#define DBBLUE_GROUPJOIN_EXECUTOR_READY
+
+/*
+ * find_cheapest_hash_join_path
+ *		Return the cheapest-total HashPath in input_rel's pathlist, or NULL.
+ *
+ * We look for a HashPath rather than just taking cheapest_total_path because
+ * the cheapest path overall may well be a merge or nestloop join; fusing is
+ * only possible over a hash join, and a slightly-more-expensive hash join
+ * that can absorb the aggregation may still beat the cheapest join plus a
+ * separate HashAgg.  add_path() makes the final call either way.
+ */
+static HashPath *
+find_cheapest_hash_join_path(RelOptInfo *input_rel)
+{
+	HashPath   *best = NULL;
+	ListCell   *lc;
+
+	foreach(lc, input_rel->pathlist)
+	{
+		Path	   *path = (Path *) lfirst(lc);
+
+		if (!IsA(path, HashPath))
+			continue;
+
+		/*
+		 * Parameterized paths depend on values from an outer rel, so they
+		 * cannot be the input of an aggregation here.
+		 */
+		if (path->param_info != NULL)
+			continue;
+
+		if (best == NULL ||
+			compare_path_costs(path, &best->jpath.path, TOTAL_COST) < 0)
+			best = (HashPath *) path;
+	}
+
+	return best;
+}
+
+/*
+ * groupjoin_keys_match
+ *		Precondition 1: the GROUP BY key set is exactly the join key set.
+ *
+ * "Exactly" is required in both directions, and it is worth being precise
+ * about why, because a one-directional check looks sufficient and is not.
+ *
+ * The fused hash table has one entry per *build tuple*, and an entry is what
+ * carries an accumulator.  So the grouping the operator actually performs is
+ * "one group per build tuple in a bucket".  For that to equal the query's
+ * GROUP BY:
+ *
+ * - If the group keys were a strict subset of the hash keys (hash on (a,b),
+ *   GROUP BY a), two build rows differing only in b would occupy separate
+ *   entries and emit two groups where the query wants one.
+ *
+ * - If the hash keys were a strict subset of the group keys, the extra group
+ *   columns are functionally determined by the build row anyway, so that
+ *   direction is in fact harmless -- but we reject it too, to keep this
+ *   function a plain set-equality test rather than one that needs its own
+ *   functional-dependency argument.  It can be relaxed later with evidence.
+ *
+ * Comparison is by equal() on the bare expressions, which is conservative:
+ * an expression that is semantically equal but structurally different (say,
+ * wrapped in a RelabelType on one side) makes us bail rather than fuse.
+ * Bailing is always safe; the ordinary join-then-aggregate plan remains.
+ */
+static bool
+groupjoin_keys_match(PlannerInfo *root, HashPath *hpath)
+{
+	Relids		innerrelids = hpath->jpath.innerjoinpath->parent->relids;
+	List	   *hashkeys = NIL;
+	List	   *groupexprs;
+	ListCell   *lc;
+
+	/* Collect the build-side (inner) expression of every hash clause. */
+	foreach(lc, hpath->path_hashclauses)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+		Expr	   *innerkey;
+
+		if (!is_opclause(rinfo->clause))
+			return false;
+
+		if (bms_is_subset(rinfo->right_relids, innerrelids))
+			innerkey = (Expr *) get_rightop(rinfo->clause);
+		else if (bms_is_subset(rinfo->left_relids, innerrelids))
+			innerkey = (Expr *) get_leftop(rinfo->clause);
+		else
+			return false;		/* clause doesn't split cleanly; bail */
+
+		if (innerkey == NULL)
+			return false;
+
+		hashkeys = lappend(hashkeys, innerkey);
+	}
+
+	if (hashkeys == NIL)
+		return false;
+
+	/*
+	 * Every build-side key must be a NOT NULL column of a base relation.
+	 *
+	 * This is not fussiness about NULL handling -- it closes a real hole.
+	 * The uniqueness proof (INV-1) comes from a unique index, and a unique
+	 * index permits any number of NULLs, because for *join* purposes NULL
+	 * keys never match.  GROUP BY does the opposite: it folds every NULL into
+	 * one group.  So a nullable unique key could put two build rows in the
+	 * table that GROUP BY considers one group, and the fused node would emit
+	 * two rows where the query wants one.
+	 *
+	 * Requiring NOT NULL also keeps the executor simple: with no null keys
+	 * there is no null-tuple store to emit from (see nodeHashgroupjoin.c).
+	 */
+	foreach(lc, hashkeys)
+	{
+		Var		   *var = (Var *) lfirst(lc);
+		RelOptInfo *baserel;
+
+		if (!IsA(var, Var))
+			return false;		/* not a plain column; cannot prove NOT NULL */
+
+		if (var->varno <= 0 || var->varno >= root->simple_rel_array_size)
+			return false;
+
+		baserel = root->simple_rel_array[var->varno];
+		if (baserel == NULL || baserel->reloptkind != RELOPT_BASEREL)
+			return false;
+
+		if (var->varattno <= 0)
+			return false;		/* whole-row or system column */
+
+		if (!bms_is_member(var->varattno, baserel->notnullattnums))
+			return false;
+	}
+
+	/*
+	 * Must be compared against processed_groupClause, which has already been
+	 * through remove_useless_groupby_columns(); the raw parsed GROUP BY list
+	 * would still carry columns functionally dependent on the PK and would
+	 * spuriously fail this test.  (dbblue_groupjoin.md T1-2.)
+	 */
+	groupexprs = get_sortgrouplist_exprs(root->processed_groupClause,
+										 root->processed_tlist);
+
+	if (list_length(groupexprs) != list_length(hashkeys))
+		return false;
+
+	foreach(lc, groupexprs)
+	{
+		if (!list_member(hashkeys, lfirst(lc)))
+			return false;
+	}
+
+	return true;
+}
+
+/*
+ * try_add_hashgroupjoin_path
+ *		Consider fusing a hash join in input_rel with the hashed aggregation
+ *		being added to grouped_rel.  (dbblue-specific.)
+ *
+ * Adds nothing unless the fusion is *proven* sound.  Every bail below returns
+ * silently: the ordinary join-then-aggregate paths have already been added by
+ * the caller and remain available, so failing to fuse costs only the chance
+ * of a speedup, never correctness.
+ */
+static void
+try_add_hashgroupjoin_path(PlannerInfo *root,
+						   RelOptInfo *input_rel,
+						   RelOptInfo *grouped_rel,
+						   const AggClauseCosts *agg_costs,
+						   List *havingQual,
+						   double dNumGroups)
+{
+	Query	   *parse = root->parse;
+	HashPath   *hpath;
+	GroupJoinPath *gjpath;
+
+	/* Feature must be requested; both flags default off. */
+	if (!dbblue_enable_groupjoin && !dbblue_groupjoin_planner_only)
+		return;
+
+	/* B3: grouping sets have semantics this operator does not implement. */
+	if (parse->groupingSets)
+		return;
+
+	/* Nothing to fuse if there is no grouping at all. */
+	if (root->processed_groupClause == NIL)
+		return;
+
+	/*
+	 * B4: DISTINCT / ORDER BY / ordered-set aggregates need per-group sorted
+	 * input, which a hash table does not provide.  Aggregates with no
+	 * combine or serial function are likewise out of scope for v1.
+	 */
+	if (root->numOrderedAggs > 0)
+		return;
+	if (root->hasNonPartialAggs || root->hasNonSerialAggs)
+		return;
+
+	/* Find a hash join to fuse into. */
+	hpath = find_cheapest_hash_join_path(input_rel);
+	if (hpath == NULL)
+		return;
+
+	/*
+	 * B5: v1 handles only INNER and RIGHT.  RIGHT is the important case:
+	 * Odoo writes "journal LEFT JOIN move_line", and the planner commutes it
+	 * so the small unique side can be hashed, which is what makes the build
+	 * side the one carrying accumulators.  LEFT/FULL would put the
+	 * accumulators on the probe side -- a different operator.
+	 */
+	if (hpath->jpath.jointype != JOIN_INNER &&
+		hpath->jpath.jointype != JOIN_RIGHT)
+		return;
+
+	/*
+	 * v1 executes a single batch only (see nodeHashgroupjoin.c).  Bail if the
+	 * join is expected to spill, rather than let the executor discover it and
+	 * error out at run time.
+	 */
+	if (hpath->num_batches > 1)
+	{
+		if (dbblue_groupjoin_planner_only)
+			elog(LOG,
+				 "dbblue groupjoin: candidate shape found but join needs %d "
+				 "batches (work_mem too small for the build side); v1 is "
+				 "single-batch only (not added)",
+				 hpath->num_batches);
+		return;
+	}
+
+	/* B2 / precondition 1: join key set == group key set. */
+	if (!groupjoin_keys_match(root, hpath))
+		return;
+
+	/*
+	 * B1 / INV-1 / precondition 2: the build side must be uniquely keyed by
+	 * the join key, or two build rows would share a bucket under one key and
+	 * the aggregate would be silently wrong -- a bad report total, with no
+	 * error raised.
+	 *
+	 * The proof must be made against path_hashclauses specifically, not the
+	 * full joinrestrictinfo: it is the *hash* key that decides which build
+	 * tuples collide, so uniqueness established via some non-hashable join
+	 * qual does not license the fusion.
+	 *
+	 * That is also why this calls innerrel_is_unique_for_clauses() rather
+	 * than innerrel_is_unique().  The latter would consult a cache that the
+	 * join search has already populated from the full clause list, and would
+	 * return that cached "unique" without ever looking at our narrower list.
+	 */
+	if (!innerrel_is_unique_for_clauses(root,
+										hpath->jpath.path.parent->relids,
+										hpath->jpath.outerjoinpath->parent->relids,
+										hpath->jpath.innerjoinpath->parent,
+										hpath->jpath.jointype,
+										hpath->path_hashclauses))
+		return;
+
+	/* All preconditions hold; build the path. */
+	gjpath = create_hashgroupjoin_path(root,
+									   grouped_rel,
+									   hpath,
+									   grouped_rel->reltarget,
+									   root->processed_groupClause,
+									   havingQual,
+									   agg_costs,
+									   dNumGroups);
+
+	if (dbblue_groupjoin_planner_only)
+	{
+		/*
+		 * Development mode (Stage 1 deliverable): report that the shape was
+		 * recognised and what it would have cost, and add nothing.  This is
+		 * how we find out whether real Odoo reporting queries hit this shape,
+		 * without any executor code existing.
+		 */
+		elog(LOG,
+			 "dbblue groupjoin: candidate found; jointype=%d groupcols=%d "
+			 "numGroups=%.0f joinrows=%.0f "
+			 "cost fused=%.2f..%.2f vs hashjoin=%.2f..%.2f (not added)",
+			 (int) hpath->jpath.jointype,
+			 list_length(root->processed_groupClause),
+			 dNumGroups,
+			 hpath->jpath.path.rows,
+			 gjpath->jpath.path.startup_cost,
+			 gjpath->jpath.path.total_cost,
+			 hpath->jpath.path.startup_cost,
+			 hpath->jpath.path.total_cost);
+		return;
+	}
+
+#ifdef DBBLUE_GROUPJOIN_EXECUTOR_READY
+	add_path(grouped_rel, (Path *) gjpath);
+#else
+
+	/*
+	 * dbblue_enable_groupjoin is on, but this build has no executor for the
+	 * node.  Do not add the path -- see the gate comment above.  Warn once so
+	 * that a user who set the flag expecting a speedup is not left wondering
+	 * why nothing changed.
+	 */
+	elog(DEBUG1,
+		 "dbblue groupjoin: candidate found but executor not built in; "
+		 "using the ordinary join-then-aggregate plan");
+#endif
 }
 
 /*

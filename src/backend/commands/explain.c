@@ -98,6 +98,8 @@ static void show_incremental_sort_keys(IncrementalSortState *incrsortstate,
 									   List *ancestors, ExplainState *es);
 static void show_merge_append_keys(MergeAppendState *mstate, List *ancestors,
 								   ExplainState *es);
+static void show_hashgroupjoin_keys(HashGroupJoinState *hgjstate,
+									List *ancestors, ExplainState *es);
 static void show_agg_keys(AggState *astate, List *ancestors,
 						  ExplainState *es);
 static void show_grouping_sets(PlanState *planstate, Agg *agg,
@@ -1441,6 +1443,11 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			pname = "Hash";		/* "Join" gets added by jointype switch */
 			sname = "Hash Join";
 			break;
+		case T_HashGroupJoin:
+			/* dbblue: "Join" gets added by the jointype switch */
+			pname = "Hash Group";
+			sname = "Hash Group Join";
+			break;
 		case T_SeqScan:
 			pname = sname = "Seq Scan";
 			break;
@@ -1724,6 +1731,7 @@ ExplainNode(PlanState *planstate, List *ancestors,
 		case T_NestLoop:
 		case T_MergeJoin:
 		case T_HashJoin:
+		case T_HashGroupJoin:
 			{
 				const char *jointype;
 
@@ -1952,6 +1960,7 @@ ExplainNode(PlanState *planstate, List *ancestors,
 		case T_NestLoop:
 		case T_MergeJoin:
 		case T_HashJoin:
+		case T_HashGroupJoin:
 			/* try not to be too chatty about this in text mode */
 			if (es->format != EXPLAIN_FORMAT_TEXT ||
 				(es->verbose && ((Join *) plan)->inner_unique))
@@ -2207,6 +2216,28 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			if (plan->qual)
 				show_instrumentation_count("Rows Removed by Filter", 2,
 										   planstate, es);
+			break;
+		case T_HashGroupJoin:
+			{
+				/* dbblue */
+				HashGroupJoin *hgj = (HashGroupJoin *) plan;
+
+				show_upper_qual(hgj->hashclauses,
+								"Hash Cond", planstate, ancestors, es);
+				show_upper_qual(hgj->join.joinqual,
+								"Join Filter", planstate, ancestors, es);
+				if (hgj->join.joinqual)
+					show_instrumentation_count("Rows Removed by Join Filter", 1,
+											   planstate, es);
+				show_hashgroupjoin_keys((HashGroupJoinState *) planstate,
+										ancestors, es);
+				show_upper_qual(hgj->havingQual,
+								"Group Filter", planstate, ancestors, es);
+				show_upper_qual(plan->qual, "Filter", planstate, ancestors, es);
+				if (plan->qual)
+					show_instrumentation_count("Rows Removed by Filter", 2,
+											   planstate, es);
+			}
 			break;
 		case T_Agg:
 			show_agg_keys(castNode(AggState, planstate), ancestors, es);
@@ -2629,6 +2660,32 @@ show_merge_append_keys(MergeAppendState *mstate, List *ancestors,
 /*
  * Show the grouping keys for an Agg node.
  */
+static void
+show_hashgroupjoin_keys(HashGroupJoinState *hgjstate, List *ancestors,
+						ExplainState *es)
+{
+	HashGroupJoin *plan = (HashGroupJoin *) hgjstate->js.ps.plan;
+
+	if (plan->numCols > 0)
+	{
+		/*
+		 * dbblue: grpColIdx holds resnos into the BUILD side's targetlist,
+		 * so the keys must be deparsed against that plan -- not against this
+		 * node's own tlist (which holds the aggregates), and not against the
+		 * Hash node in between (whose tlist setrefs has replaced with dummy
+		 * Vars).  Hence the child of the inner child.
+		 */
+		PlanState  *buildstate = outerPlanState(innerPlanState(hgjstate));
+
+		ancestors = lcons(plan, ancestors);
+		show_sort_group_keys(buildstate, "Group Key",
+							 plan->numCols, 0, plan->grpColIdx,
+							 NULL, NULL, NULL,
+							 ancestors, es);
+		ancestors = list_delete_first(ancestors);
+	}
+}
+
 static void
 show_agg_keys(AggState *astate, List *ancestors,
 			  ExplainState *es)

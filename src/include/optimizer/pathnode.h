@@ -225,6 +225,15 @@ extern HashPath *create_hashjoin_path(PlannerInfo *root,
 									  Relids required_outer,
 									  List *hashclauses);
 
+extern GroupJoinPath *create_hashgroupjoin_path(PlannerInfo *root,
+												RelOptInfo *grouped_rel,
+												HashPath *hpath,
+												PathTarget *target,
+												List *groupClause,
+												List *qual,
+												const AggClauseCosts *aggcosts,
+												double numGroups);
+
 extern ProjectionPath *create_projection_path(PlannerInfo *root,
 											  RelOptInfo *rel,
 											  Path *subpath,

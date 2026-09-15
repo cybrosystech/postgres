@@ -72,6 +72,10 @@ extern PGDLLIMPORT bool enable_presorted_aggregate;
 extern PGDLLIMPORT bool enable_async_append;
 extern PGDLLIMPORT int constraint_exclusion;
 
+/* dbblue: fused hash join + GROUP BY ("groupjoin"); see dbblue_groupjoin.md */
+extern PGDLLIMPORT bool dbblue_enable_groupjoin;
+extern PGDLLIMPORT bool dbblue_groupjoin_planner_only;
+
 extern double index_pages_fetched(double tuples_fetched, BlockNumber pages,
 								  double index_pages, PlannerInfo *root);
 extern void cost_seqscan(Path *path, PlannerInfo *root, RelOptInfo *baserel,
@@ -135,6 +139,12 @@ extern void cost_agg(Path *path, PlannerInfo *root,
 					 int disabled_nodes,
 					 Cost input_startup_cost, Cost input_total_cost,
 					 double input_tuples, double input_width);
+extern void cost_hashgroupjoin(Path *path, PlannerInfo *root,
+							   const AggClauseCosts *aggcosts,
+							   double numGroups,
+							   List *quals,
+							   int disabled_nodes,
+							   Cost input_total_cost);
 extern void cost_windowagg(Path *path, PlannerInfo *root,
 						   List *windowFuncs, WindowClause *winclause,
 						   int input_disabled_nodes,

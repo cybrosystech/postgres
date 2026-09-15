@@ -2493,6 +2493,51 @@ typedef struct HashPath
 } HashPath;
 
 /*
+ * A groupjoin path fuses a hash join with the GROUP BY aggregation that sits
+ * immediately above it, so that the aggregate transition states live inside
+ * the join's own hash table entries.  No second hash table is built, and the
+ * join's output is never materialized.  (dbblue-specific; see the "memoizing"
+ * strategy of Fent & Neumann, "A Practical Approach to Groupjoin and Nested
+ * Aggregates", VLDB 2021.)
+ *
+ * This fusion is only sound when the join key equals the grouping key and
+ * that key provably determines at most one build-side row; otherwise two
+ * build rows would share one accumulator and silently double-count.  The
+ * proof is made in try_add_hashgroupjoin_path() in planner.c -- do not
+ * construct this path node without it.
+ *
+ * The first three fields mirror HashPath, the rest mirror AggPath.  They are
+ * flattened rather than embedded because gen_node_support.pl expects flat
+ * struct definitions.
+ */
+
+typedef struct GroupJoinPath
+{
+	JoinPath	jpath;
+	List	   *path_hashclauses;	/* join clauses used for hashing */
+	int			num_batches;	/* number of batches expected */
+	Cardinality inner_rows_total;	/* total inner rows expected */
+
+	/*
+	 * Relids of the join relation this was built from.
+	 *
+	 * Unlike a HashPath, jpath.path.parent is the *grouped* upper relation
+	 * here (as it is for an AggPath), so it cannot be used to identify the
+	 * join.  createplan.c needs the real join relids for
+	 * RINFO_IS_PUSHED_DOWN(), which decides whether an outer join's clauses
+	 * are joinquals or otherquals -- get that wrong and the join condition is
+	 * applied after null-extension instead of during the join.
+	 */
+	Relids		joinrelids;
+
+	/* grouping, mirroring AggPath */
+	List	   *groupClause;	/* a list of SortGroupClause's */
+	List	   *qual;			/* quals (HAVING quals), if any */
+	Cardinality numGroups;		/* estimated number of groups in input */
+	uint64		transitionSpace;	/* for pass-by-ref transition data */
+} GroupJoinPath;
+
+/*
  * ProjectionPath represents a projection (that is, targetlist computation)
  *
  * Nominally, this path node represents using a Result plan node to do a

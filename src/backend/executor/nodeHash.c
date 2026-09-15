@@ -532,6 +532,7 @@ ExecHashTableCreate(HashState *state)
 	hashtable->nbatch_original = nbatch;
 	hashtable->nbatch_outstart = nbatch;
 	hashtable->growEnabled = true;
+	hashtable->extraTupleSpace = 0;	/* dbblue */
 	hashtable->totalTuples = 0;
 	hashtable->reportTuples = 0;
 	hashtable->skewTuples = 0;
@@ -1147,6 +1148,11 @@ ExecHashIncreaseNumBatches(HashJoinTable hashtable)
 			HashJoinTuple hashTuple = (HashJoinTuple) (HASH_CHUNK_DATA(oldchunks) + idx);
 			MinimalTuple tuple = HJTUPLE_MINTUPLE(hashTuple);
 			int			hashTupleSize = (HJTUPLE_OVERHEAD + tuple->t_len);
+
+			/* dbblue: keep the per-tuple aggregate state area when relocating */
+			if (hashtable->extraTupleSpace > 0)
+				hashTupleSize = HJTUPLE_OVERHEAD + MAXALIGN(tuple->t_len) +
+					hashtable->extraTupleSpace;
 			int			bucketno;
 			int			batchno;
 
@@ -1796,6 +1802,10 @@ ExecHashTableInsert(HashJoinTable hashtable,
 
 		/* Create the HashJoinTuple */
 		hashTupleSize = HJTUPLE_OVERHEAD + tuple->t_len;
+		/* dbblue: room for per-tuple aggregate state, if requested */
+		if (hashtable->extraTupleSpace > 0)
+			hashTupleSize = HJTUPLE_OVERHEAD + MAXALIGN(tuple->t_len) +
+				hashtable->extraTupleSpace;
 		hashTuple = (HashJoinTuple) dense_alloc(hashtable, hashTupleSize);
 
 		hashTuple->hashvalue = hashvalue;

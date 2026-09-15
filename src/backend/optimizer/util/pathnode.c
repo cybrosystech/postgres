@@ -2576,6 +2576,91 @@ create_hashjoin_path(PlannerInfo *root,
 }
 
 /*
+ * create_hashgroupjoin_path
+ *	  Creates a pathnode for a hash join fused with the GROUP BY above it.
+ *	  (dbblue-specific; see dbblue_groupjoin.md.)
+ *
+ * 'grouped_rel' is the upper relation the grouping output belongs to
+ * 'hpath' is the already-costed hash join path being fused into
+ * 'target' is the PathTarget for the grouped output
+ * 'groupClause' is the (already PK-reduced) grouping clause
+ * 'qual' is the HAVING quals, if any
+ * 'aggcosts' are the aggregate costs, as for create_agg_path
+ * 'numGroups' is the estimated number of groups
+ *
+ * CALLER MUST HAVE PROVEN the fusion legal -- join key == group key, and that
+ * key unique on the build side.  This function does not re-check; see
+ * try_add_hashgroupjoin_path() in planner.c.
+ */
+GroupJoinPath *
+create_hashgroupjoin_path(PlannerInfo *root,
+						  RelOptInfo *grouped_rel,
+						  HashPath *hpath,
+						  PathTarget *target,
+						  List *groupClause,
+						  List *qual,
+						  const AggClauseCosts *aggcosts,
+						  double numGroups)
+{
+	GroupJoinPath *pathnode = makeNode(GroupJoinPath);
+	Path	   *jpath = &hpath->jpath.path;
+
+	pathnode->jpath.path.pathtype = T_HashGroupJoin;
+	pathnode->jpath.path.parent = grouped_rel;
+	pathnode->jpath.path.pathtarget = target;
+	pathnode->jpath.path.param_info = jpath->param_info;
+
+	/*
+	 * Never parallel.  Odoo's monetary columns all use sum(numeric), whose
+	 * transition state is 'internal' and holds process-local pointers, so the
+	 * accumulators cannot live in a DSA-backed shared hash table.  See
+	 * dbblue_groupjoin.md section 7 before changing this.
+	 */
+	pathnode->jpath.path.parallel_aware = false;
+	pathnode->jpath.path.parallel_safe = false;
+	pathnode->jpath.path.parallel_workers = 0;
+
+	/* Output is unordered, as for both HashPath and hashed AggPath */
+	pathnode->jpath.path.pathkeys = NIL;
+
+	pathnode->jpath.jointype = hpath->jpath.jointype;
+	pathnode->jpath.inner_unique = hpath->jpath.inner_unique;
+	pathnode->jpath.outerjoinpath = hpath->jpath.outerjoinpath;
+	pathnode->jpath.innerjoinpath = hpath->jpath.innerjoinpath;
+	pathnode->jpath.joinrestrictinfo = hpath->jpath.joinrestrictinfo;
+
+	pathnode->joinrelids = hpath->jpath.path.parent->relids;
+	pathnode->path_hashclauses = hpath->path_hashclauses;
+	pathnode->num_batches = hpath->num_batches;
+	pathnode->inner_rows_total = hpath->inner_rows_total;
+
+	pathnode->groupClause = groupClause;
+	pathnode->qual = qual;
+	pathnode->numGroups = numGroups;
+	pathnode->transitionSpace = aggcosts ? aggcosts->transitionSpace : 0;
+
+	/*
+	 * cost_hashgroupjoin() reads path->rows as the number of transition
+	 * function calls (i.e. the join's output cardinality) and overwrites it
+	 * with the group count.
+	 */
+	pathnode->jpath.path.rows = jpath->rows;
+
+	cost_hashgroupjoin(&pathnode->jpath.path, root,
+					   aggcosts, numGroups,
+					   qual,
+					   jpath->disabled_nodes,
+					   jpath->total_cost);
+
+	/* add tlist eval cost for each output row, as create_agg_path does */
+	pathnode->jpath.path.startup_cost += target->cost.startup;
+	pathnode->jpath.path.total_cost += target->cost.startup +
+		target->cost.per_tuple * pathnode->jpath.path.rows;
+
+	return pathnode;
+}
+
+/*
  * create_projection_path
  *	  Creates a pathnode that represents performing a projection.
  *

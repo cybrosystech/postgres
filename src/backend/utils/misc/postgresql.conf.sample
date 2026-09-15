@@ -423,6 +423,8 @@
 
 # - Planner Method Configuration -
 
+#dbblue_enable_groupjoin = off		# dbblue: fuse a hash join with the
+					# GROUP BY above it (opt-in per session)
 #enable_async_append = on
 #enable_bitmapscan = on
 #enable_gathermerge = on

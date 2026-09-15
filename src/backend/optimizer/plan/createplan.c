@@ -160,6 +160,8 @@ static CustomScan *create_customscan_plan(PlannerInfo *root,
 static NestLoop *create_nestloop_plan(PlannerInfo *root, NestPath *best_path);
 static MergeJoin *create_mergejoin_plan(PlannerInfo *root, MergePath *best_path);
 static HashJoin *create_hashjoin_plan(PlannerInfo *root, HashPath *best_path);
+static HashGroupJoin *create_hashgroupjoin_plan(PlannerInfo *root,
+												GroupJoinPath *best_path);
 static Node *replace_nestloop_params(PlannerInfo *root, Node *expr);
 static Node *replace_nestloop_params_mutator(Node *node, PlannerInfo *root);
 static void fix_indexqual_references(PlannerInfo *root, IndexPath *index_path,
@@ -239,6 +241,20 @@ static HashJoin *make_hashjoin(List *tlist,
 							   List *hashkeys,
 							   Plan *lefttree, Plan *righttree,
 							   JoinType jointype, bool inner_unique);
+static HashGroupJoin *make_hashgroupjoin(List *tlist,
+										 List *joinclauses, List *otherclauses,
+										 List *hashclauses,
+										 List *hashoperators,
+										 List *hashcollations,
+										 List *hashkeys,
+										 int numGroupCols,
+										 AttrNumber *grpColIdx,
+										 Oid *grpOperators, Oid *grpCollations,
+										 Cardinality numGroups,
+										 uint64 transitionSpace,
+										 List *havingQual,
+										 Plan *lefttree, Plan *righttree,
+										 JoinType jointype, bool inner_unique);
 static Hash *make_hash(Plan *lefttree,
 					   List *hashkeys,
 					   Oid skewTable,
@@ -415,6 +431,7 @@ create_plan_recurse(PlannerInfo *root, Path *best_path, int flags)
 			plan = create_scan_plan(root, best_path, flags);
 			break;
 		case T_HashJoin:
+		case T_HashGroupJoin:
 		case T_MergeJoin:
 		case T_NestLoop:
 			plan = create_join_plan(root,
@@ -1084,6 +1101,10 @@ create_join_plan(PlannerInfo *root, JoinPath *best_path)
 		case T_HashJoin:
 			plan = (Plan *) create_hashjoin_plan(root,
 												 (HashPath *) best_path);
+			break;
+		case T_HashGroupJoin:
+			plan = (Plan *) create_hashgroupjoin_plan(root,
+													  (GroupJoinPath *) best_path);
 			break;
 		case T_NestLoop:
 			plan = (Plan *) create_nestloop_plan(root,
@@ -4776,29 +4797,11 @@ create_hashjoin_plan(PlannerInfo *root,
 	 * most common combinations of outer values, which we don't currently have
 	 * enough stats for.)
 	 */
-	if (list_length(hashclauses) == 1)
-	{
-		OpExpr	   *clause = (OpExpr *) linitial(hashclauses);
-		Node	   *node;
-
-		Assert(is_opclause(clause));
-		node = (Node *) linitial(clause->args);
-		if (IsA(node, RelabelType))
-			node = (Node *) ((RelabelType *) node)->arg;
-		if (IsA(node, Var))
-		{
-			Var		   *var = (Var *) node;
-			RangeTblEntry *rte;
-
-			rte = root->simple_rte_array[var->varno];
-			if (rte->rtekind == RTE_RELATION)
-			{
-				skewTable = rte->relid;
-				skewColumn = var->varattno;
-				skewInherit = rte->inh;
-			}
-		}
-	}
+	/*
+	 * dbblue: no skew optimization.  Skew buckets are a third place where hash
+	 * tuples get allocated, and they would each need the per-group aggregate
+	 * state area too; not worth the extra path in v1.  skewTable stays invalid.
+	 */
 
 	/*
 	 * Collect hash related information. The hashed expressions are
@@ -4856,6 +4859,253 @@ create_hashjoin_plan(PlannerInfo *root,
 							  (Plan *) hash_plan,
 							  best_path->jpath.jointype,
 							  best_path->jpath.inner_unique);
+
+	copy_generic_path_info(&join_plan->join.plan, &best_path->jpath.path);
+
+	return join_plan;
+}
+
+/*
+ * extract_hashgroupjoin_grouping_cols
+ *	  Locate each grouping column in the build side's targetlist, and collect
+ *	  the matching collations.  (dbblue-specific.)
+ *
+ * We cannot use extract_grouping_cols()/extract_grouping_collations() here.
+ * Those find a column via get_sortgroupclause_tle(), i.e. by matching
+ * ressortgroupref, and only the query's processed_tlist carries those labels.
+ * The build side of the join is an ordinary join input whose PathTarget has
+ * no sortgrouprefs at all, so the lookup would fail with "ORDER/GROUP BY
+ * expression not found in targetlist".  (Requesting CP_LABEL_TLIST from the
+ * build side does not help, for the same reason: there is nothing to label.)
+ *
+ * Instead we take each grouping clause's expression from processed_tlist and
+ * find that expression in the build side's targetlist.  This is sound because
+ * try_add_hashgroupjoin_path() has already proven the grouping keys to be
+ * exactly the join's hash keys, and the hash keys are by construction
+ * evaluable from the build side's output.
+ */
+static AttrNumber *
+extract_hashgroupjoin_grouping_cols(PlannerInfo *root, List *groupClause,
+									List *inner_tlist, Oid **grpCollations)
+{
+	int			numCols = list_length(groupClause);
+	int			colno = 0;
+	AttrNumber *grpColIdx;
+	Oid		   *collations;
+	ListCell   *lc;
+
+	grpColIdx = palloc_array(AttrNumber, numCols);
+	collations = palloc_array(Oid, numCols);
+
+	foreach(lc, groupClause)
+	{
+		SortGroupClause *groupcl = (SortGroupClause *) lfirst(lc);
+		Expr	   *groupexpr;
+		TargetEntry *tle;
+
+		groupexpr = (Expr *) get_sortgroupclause_expr(groupcl,
+													  root->processed_tlist);
+		tle = tlist_member(groupexpr, inner_tlist);
+		if (tle == NULL)
+			elog(ERROR, "hashgroupjoin grouping column not found in build-side targetlist");
+
+		grpColIdx[colno] = tle->resno;
+		collations[colno] = exprCollation((Node *) groupexpr);
+		colno++;
+	}
+
+	*grpCollations = collations;
+	return grpColIdx;
+}
+
+/*
+ * create_hashgroupjoin_plan
+ *	  Create a HashGroupJoin plan for 'best_path' and (recursively) plans for
+ *	  its subpaths.  (dbblue-specific.)
+ *
+ * This is create_hashjoin_plan() with the grouping-column extraction of
+ * create_agg_plan() folded in.  The join half is deliberately kept
+ * line-for-line equivalent to create_hashjoin_plan(), so that the two can be
+ * diffed when rebasing onto a new upstream release.
+ */
+static HashGroupJoin *
+create_hashgroupjoin_plan(PlannerInfo *root,
+						  GroupJoinPath *best_path)
+{
+	HashGroupJoin *join_plan;
+	Hash	   *hash_plan;
+	Plan	   *outer_plan;
+	Plan	   *inner_plan;
+	List	   *tlist = build_path_tlist(root, &best_path->jpath.path);
+	List	   *joinclauses;
+	List	   *otherclauses;
+	List	   *hashclauses;
+	List	   *hashoperators = NIL;
+	List	   *hashcollations = NIL;
+	List	   *inner_hashkeys = NIL;
+	List	   *outer_hashkeys = NIL;
+	List	   *havingQual;
+	AttrNumber *grpColIdx;
+	Oid		   *grpCollations;
+	Oid			skewTable = InvalidOid;
+	AttrNumber	skewColumn = InvalidAttrNumber;
+	bool		skewInherit = false;
+	ListCell   *lc;
+
+	outer_plan = create_plan_recurse(root, best_path->jpath.outerjoinpath,
+									 (best_path->num_batches > 1) ? CP_SMALL_TLIST : 0);
+
+	/*
+	 * Small inner tlist, exactly as create_hashjoin_plan does.  The grouping
+	 * columns are located in it by expression rather than by sortgroupref --
+	 * see extract_hashgroupjoin_grouping_cols() for why.
+	 */
+	inner_plan = create_plan_recurse(root, best_path->jpath.innerjoinpath,
+									 CP_SMALL_TLIST);
+
+	/* Sort join qual clauses into best execution order */
+	joinclauses = order_qual_clauses(root, best_path->jpath.joinrestrictinfo);
+	/* There's no point in sorting the hash clauses ... */
+
+	/* Get the join qual clauses (in plain expression form) */
+	/* Any pseudoconstant clauses are ignored here */
+	if (IS_OUTER_JOIN(best_path->jpath.jointype))
+	{
+		/*
+		 * Note best_path->joinrelids, NOT path.parent->relids: this path's
+		 * parent is the grouped upper rel, so parent->relids would misjudge
+		 * every clause as pushed-down and demote the join condition to an
+		 * otherqual.
+		 */
+		extract_actual_join_clauses(joinclauses,
+									best_path->joinrelids,
+									&joinclauses, &otherclauses);
+	}
+	else
+	{
+		/* We can treat all clauses alike for an inner join */
+		joinclauses = extract_actual_clauses(joinclauses, false);
+		otherclauses = NIL;
+	}
+
+	/*
+	 * Remove the hashclauses from the list of join qual clauses, leaving the
+	 * list of quals that must be checked as qpquals.
+	 */
+	hashclauses = get_actual_clauses(best_path->path_hashclauses);
+	joinclauses = list_difference(joinclauses, hashclauses);
+
+	/*
+	 * Replace any outer-relation variables with nestloop params.  There
+	 * should not be any in the hashclauses.
+	 */
+	if (best_path->jpath.path.param_info)
+	{
+		joinclauses = (List *)
+			replace_nestloop_params(root, (Node *) joinclauses);
+		otherclauses = (List *)
+			replace_nestloop_params(root, (Node *) otherclauses);
+	}
+
+	/*
+	 * Rearrange hashclauses, if needed, so that the outer variable is always
+	 * on the left.
+	 */
+	hashclauses = get_switched_clauses(best_path->path_hashclauses,
+									   best_path->jpath.outerjoinpath->parent->relids);
+
+	/*
+	 * If there is a single join clause and we can identify the outer variable
+	 * as a simple column reference, supply its identity for possible use in
+	 * skew optimization.
+	 */
+	if (list_length(hashclauses) == 1)
+	{
+		OpExpr	   *clause = (OpExpr *) linitial(hashclauses);
+		Node	   *node;
+
+		Assert(is_opclause(clause));
+		node = (Node *) linitial(clause->args);
+		if (IsA(node, RelabelType))
+			node = (Node *) ((RelabelType *) node)->arg;
+		if (IsA(node, Var))
+		{
+			Var		   *var = (Var *) node;
+			RangeTblEntry *rte;
+
+			rte = root->simple_rte_array[var->varno];
+			if (rte->rtekind == RTE_RELATION)
+			{
+				skewTable = rte->relid;
+				skewColumn = var->varattno;
+				skewInherit = rte->inh;
+			}
+		}
+	}
+
+	/*
+	 * Collect hash related information, exactly as create_hashjoin_plan does.
+	 */
+	foreach(lc, hashclauses)
+	{
+		OpExpr	   *hclause = lfirst_node(OpExpr, lc);
+
+		hashoperators = lappend_oid(hashoperators, hclause->opno);
+		hashcollations = lappend_oid(hashcollations, hclause->inputcollid);
+		outer_hashkeys = lappend(outer_hashkeys, linitial(hclause->args));
+		inner_hashkeys = lappend(inner_hashkeys, lsecond(hclause->args));
+	}
+
+	/* HAVING quals, treated as create_agg_plan treats them */
+	havingQual = order_qual_clauses(root, best_path->qual);
+
+	/* Locate the grouping columns within the build side's targetlist */
+	grpColIdx = extract_hashgroupjoin_grouping_cols(root,
+													best_path->groupClause,
+													inner_plan->targetlist,
+													&grpCollations);
+
+	/*
+	 * Build the hash node and the fused join node.
+	 */
+	hash_plan = make_hash(inner_plan,
+						  inner_hashkeys,
+						  skewTable,
+						  skewColumn,
+						  skewInherit);
+
+	/*
+	 * Set Hash node's startup & total costs equal to total cost of input
+	 * plan; this only affects EXPLAIN display not decisions.
+	 */
+	copy_plan_costsize(&hash_plan->plan, inner_plan);
+	hash_plan->plan.startup_cost = hash_plan->plan.total_cost;
+
+	/*
+	 * No parallel_aware handling here: a groupjoin path is never built
+	 * parallel-aware (see create_hashgroupjoin_path), because 'internal'
+	 * aggregate transition states cannot live in a shared hash table.
+	 */
+	Assert(!best_path->jpath.path.parallel_aware);
+
+	join_plan = make_hashgroupjoin(tlist,
+								   joinclauses,
+								   otherclauses,
+								   hashclauses,
+								   hashoperators,
+								   hashcollations,
+								   outer_hashkeys,
+								   list_length(best_path->groupClause),
+								   grpColIdx,
+								   extract_grouping_ops(best_path->groupClause),
+								   grpCollations,
+								   best_path->numGroups,
+								   best_path->transitionSpace,
+								   havingQual,
+								   outer_plan,
+								   (Plan *) hash_plan,
+								   best_path->jpath.jointype,
+								   best_path->jpath.inner_unique);
 
 	copy_generic_path_info(&join_plan->join.plan, &best_path->jpath.path);
 
@@ -5974,6 +6224,60 @@ make_hashjoin(List *tlist,
 	node->hashoperators = hashoperators;
 	node->hashcollations = hashcollations;
 	node->hashkeys = hashkeys;
+	node->join.jointype = jointype;
+	node->join.inner_unique = inner_unique;
+	node->join.joinqual = joinclauses;
+
+	return node;
+}
+
+/*
+ * make_hashgroupjoin
+ *	  Build a HashGroupJoin plan node.  (dbblue-specific.)
+ *
+ * Note the two qual lists are distinct and are NOT interchangeable:
+ * 'otherclauses' become plan.qual, applied to each joined row before it
+ * reaches a transition function, while 'havingQual' is applied to whole
+ * groups as they are emitted.  Agg can keep HAVING in plan.qual because it
+ * has no join quals to compete for the slot; this node cannot.
+ */
+static HashGroupJoin *
+make_hashgroupjoin(List *tlist,
+				   List *joinclauses, List *otherclauses,
+				   List *hashclauses,
+				   List *hashoperators, List *hashcollations,
+				   List *hashkeys,
+				   int numGroupCols,
+				   AttrNumber *grpColIdx,
+				   Oid *grpOperators, Oid *grpCollations,
+				   Cardinality numGroups,
+				   uint64 transitionSpace,
+				   List *havingQual,
+				   Plan *lefttree, Plan *righttree,
+				   JoinType jointype, bool inner_unique)
+{
+	HashGroupJoin *node = makeNode(HashGroupJoin);
+	Plan	   *plan = &node->join.plan;
+
+	plan->targetlist = tlist;
+	plan->qual = otherclauses;
+	plan->lefttree = lefttree;
+	plan->righttree = righttree;
+
+	node->hashclauses = hashclauses;
+	node->hashoperators = hashoperators;
+	node->hashcollations = hashcollations;
+	node->hashkeys = hashkeys;
+
+	node->numCols = numGroupCols;
+	node->grpColIdx = grpColIdx;
+	node->grpOperators = grpOperators;
+	node->grpCollations = grpCollations;
+	node->numGroups = numGroups;
+	node->transitionSpace = transitionSpace;
+	node->aggParams = NULL;		/* SS_finalize_plan() will fill this */
+	node->havingQual = havingQual;
+
 	node->join.jointype = jointype;
 	node->join.inner_unique = inner_unique;
 	node->join.joinqual = joinclauses;

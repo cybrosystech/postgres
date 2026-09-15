@@ -46,6 +46,7 @@ OBJS = \
 	nodeGatherMerge.o \
 	nodeGroup.o \
 	nodeHash.o \
+	nodeHashgroupjoin.o \
 	nodeHashjoin.o \
 	nodeIncrementalSort.o \
 	nodeIndexonlyscan.o \
