@@ -1667,9 +1667,25 @@ ExecHashIncreaseNumBuckets(HashJoinTable hashtable)
 			hashTuple->next.unshared = hashtable->buckets.unshared[bucketno];
 			hashtable->buckets.unshared[bucketno] = hashTuple;
 
-			/* advance index past the tuple */
-			idx += MAXALIGN(HJTUPLE_OVERHEAD +
-							HJTUPLE_MINTUPLE(hashTuple)->t_len);
+			/*
+			 * Advance index past the tuple.
+			 *
+			 * dbblue: when entries carry an extra per-tuple state area, the
+			 * allocation stride is wider than the tuple itself, so it has to
+			 * be recomputed exactly as ExecHashTableInsert() laid it out.
+			 * Using the plain tuple length would desynchronize this walk from
+			 * the chunk after the first entry and reinterpret arbitrary bytes
+			 * as a HashJoinTuple.  Note this path is reachable whenever the
+			 * bucket count is revised upward, which does not depend on
+			 * growEnabled or on the join being multi-batch.
+			 */
+			if (hashtable->extraTupleSpace > 0)
+				idx += MAXALIGN(HJTUPLE_OVERHEAD +
+								MAXALIGN(HJTUPLE_MINTUPLE(hashTuple)->t_len) +
+								hashtable->extraTupleSpace);
+			else
+				idx += MAXALIGN(HJTUPLE_OVERHEAD +
+								HJTUPLE_MINTUPLE(hashTuple)->t_len);
 		}
 
 		/* allow this loop to be cancellable */

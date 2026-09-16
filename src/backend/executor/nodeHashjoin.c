@@ -199,10 +199,6 @@ static TupleTableSlot *ExecHashJoinOuterGetTuple(PlanState *outerNode,
 static TupleTableSlot *ExecParallelHashJoinOuterGetTuple(PlanState *outerNode,
 														 HashJoinState *hjstate,
 														 uint32 *hashvalue);
-static TupleTableSlot *ExecHashJoinGetSavedTuple(HashJoinState *hjstate,
-												 BufFile *file,
-												 uint32 *hashvalue,
-												 TupleTableSlot *tupleSlot);
 static bool ExecHashJoinNewBatch(HashJoinState *hjstate);
 static bool ExecParallelHashJoinNewBatch(HashJoinState *hjstate);
 static void ExecParallelHashJoinPartitionOuter(HashJoinState *hjstate);
@@ -1178,7 +1174,7 @@ ExecHashJoinOuterGetTuple(PlanState *outerNode,
 		if (file == NULL)
 			return NULL;
 
-		slot = ExecHashJoinGetSavedTuple(hjstate,
+		slot = ExecHashJoinGetSavedTuple(
 										 file,
 										 hashvalue,
 										 hjstate->hj_OuterTupleSlot);
@@ -1378,8 +1374,7 @@ ExecHashJoinNewBatch(HashJoinState *hjstate)
 					(errcode_for_file_access(),
 					 errmsg("could not rewind hash-join temporary file")));
 
-		while ((slot = ExecHashJoinGetSavedTuple(hjstate,
-												 innerFile,
+		while ((slot = ExecHashJoinGetSavedTuple(innerFile,
 												 &hashvalue,
 												 hjstate->hj_HashTupleSlot)))
 		{
@@ -1608,9 +1603,8 @@ ExecHashJoinSaveTuple(MinimalTuple tuple, uint32 hashvalue,
  * On success, *hashvalue is set to the tuple's hash value, and the tuple
  * itself is stored in the given slot.
  */
-static TupleTableSlot *
-ExecHashJoinGetSavedTuple(HashJoinState *hjstate,
-						  BufFile *file,
+TupleTableSlot *
+ExecHashJoinGetSavedTuple(BufFile *file,
 						  uint32 *hashvalue,
 						  TupleTableSlot *tupleSlot)
 {

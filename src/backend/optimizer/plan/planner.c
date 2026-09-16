@@ -8139,22 +8139,6 @@ try_add_hashgroupjoin_path(PlannerInfo *root,
 		return;
 
 	/*
-	 * v1 executes a single batch only (see nodeHashgroupjoin.c).  Bail if the
-	 * join is expected to spill, rather than let the executor discover it and
-	 * error out at run time.
-	 */
-	if (hpath->num_batches > 1)
-	{
-		if (dbblue_groupjoin_planner_only)
-			elog(LOG,
-				 "dbblue groupjoin: candidate shape found but join needs %d "
-				 "batches (work_mem too small for the build side); v1 is "
-				 "single-batch only (not added)",
-				 hpath->num_batches);
-		return;
-	}
-
-	/*
 	 * B2 / precondition 1: GROUP BY matches the join key.  Done before the
 	 * jointype check below because the LEFT case needs the (build, probe)
 	 * key pairs this produces.

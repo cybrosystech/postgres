@@ -20,5 +20,6 @@
 extern HashGroupJoinState *ExecInitHashGroupJoin(HashGroupJoin *node,
 												 EState *estate, int eflags);
 extern void ExecEndHashGroupJoin(HashGroupJoinState *node);
+extern void ExecReScanHashGroupJoin(HashGroupJoinState *node);
 
 #endif							/* NODEHASHGROUPJOIN_H */

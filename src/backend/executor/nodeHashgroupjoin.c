@@ -35,23 +35,33 @@
  * qual.  Reimplementing transition-function semantics here would be a good way
  * to get pass-by-reference states and strictness subtly wrong.
  *
- * Phases:
+ * Phases, cycling probe -> emit once per batch:
  *	  build	 -- MultiExecHash fills the hash table, then we walk it once to
  *				initialize each entry's transition states
  *	  probe	 -- for each outer tuple, advance the transition states of every
- *				matching bucket entry; emit nothing
+ *				matching bucket entry; emit nothing.  Rows whose key belongs
+ *				to a batch not yet loaded are written to that batch's spill
+ *				file instead.
  *	  emit	 -- walk every bucket entry (not just unmatched ones, as a plain
  *				hash join does), finalize, apply HAVING, project.  This is
  *				what makes an unmatched build row still produce its group with
- *				COUNT returning 0.
+ *				COUNT returning 0.  At the end, load the next batch and return
+ *				to probe, or finish.
  *
- * LIMITATION (v1): single batch only.  The planner refuses to build this path
- * when it estimates more than one batch, and we re-check at runtime.  Groups
- * never span batches (batch number is a pure function of the hash value, and
- * the hash key is the group key), so multi-batch is a natural extension --
- * process each batch independently and emit its groups at batch end -- but it
- * needs the outer-side batch spooling that nodeHashjoin.c does, which is not
- * written yet.
+ * Multiple batches are supported.  Fusing across them is sound because a
+ * tuple's batch number is a pure function of its hash value, and that hash is
+ * taken over the join key -- which the planner has proven is the grouping key.
+ * Two rows of one group therefore always land in the same batch, so a batch's
+ * groups are complete as soon as its probe rows are exhausted, and can be
+ * finalized and emitted before the next batch is loaded.  Only one batch's
+ * accumulators are resident at a time; ExecHashGroupJoinNextBatch() releases
+ * the previous batch's before loading the next.
+ *
+ * The one piece of state that does not belong to any batch is the reserved
+ * NULL-key group, since NULL keys hash nowhere.  It is complete after the
+ * single pass over the outer plan (batch 0's probe sees every outer row), so
+ * it is emitted at the end of batch 0 and its accumulator need not survive
+ * into later batches.
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -69,6 +79,7 @@
 #include "executor/nodeAgg.h"
 #include "executor/nodeHash.h"
 #include "executor/nodeHashgroupjoin.h"
+#include "executor/nodeHashjoin.h"
 #include "miscadmin.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -80,8 +91,15 @@
 #define HGJ_DONE		4
 
 static void ExecHashGroupJoinBuild(HashGroupJoinState *node);
+static void ExecHashGroupJoinInitPergroups(HashGroupJoinState *node);
+static bool ExecHashGroupJoinNextBatch(HashGroupJoinState *node);
+static TupleTableSlot *ExecHashGroupJoinNextOuter(HashGroupJoinState *node,
+												  bool *have_hashvalue,
+												  uint32 *hashvalue);
 static void ExecHashGroupJoinProbeOne(HashGroupJoinState *node,
-									  TupleTableSlot *outerslot);
+									  TupleTableSlot *outerslot,
+									  bool have_hashvalue,
+									  uint32 given_hashvalue);
 static TupleTableSlot *ExecHashGroupJoinEmit(HashGroupJoinState *node);
 static void ExecHashGroupJoinPopulateEchoSlot(HashGroupJoinState *node,
 											  ExprContext *econtext,
@@ -111,58 +129,72 @@ ExecHashGroupJoinBuild(HashGroupJoinState *node)
 	HashJoinTable hashtable;
 	AggState   *aggstate = node->hgj_AggState;
 	MemoryContext oldcxt;
-	int			i;
 
 	hashtable = ExecHashTableCreate(hashNode);
 
 	/*
 	 * Every hash entry must carry its group's transition states.  This has to
 	 * be set before a single tuple is inserted.
+	 *
+	 * ExecChooseHashTableSize() has already picked nbatch by this point, and
+	 * it sized the entries without knowing about this extra area, so its
+	 * choice is an under-estimate.  That self-corrects: spaceUsed is tracked
+	 * with the extra area included, so once the real footprint exceeds
+	 * spaceAllowed, ExecHashIncreaseNumBatches() splits again -- the same way
+	 * stock recovers from any other misestimate.
 	 */
 	hashtable->extraTupleSpace = node->hgj_PergroupSize;
-
-	/*
-	 * v1 is single-batch (see the file header).  Growing the number of
-	 * batches mid-build would silently split the input across batch files
-	 * that the probe loop below does not know how to read back, so switch
-	 * growth off and verify.
-	 */
-	hashtable->growEnabled = false;
-	if (hashtable->nbatch > 1)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("HashGroupJoin does not support multiple batches yet"),
-				 errhint("Increase work_mem, or set dbblue_enable_groupjoin to off.")));
 
 	node->hgj_HashTable = hashtable;
 	hashNode->hashtable = hashtable;
 
 	(void) MultiExecProcNode((PlanState *) hashNode);
 
-	/*
-	 * Initialize each group's transition states.  These must be created in
-	 * the aggregate context: pass-by-reference initial values are palloc'd
-	 * there, and they have to outlive the per-tuple context.
-	 *
-	 * Note there is deliberately no "build side is empty, nothing to do"
-	 * early exit here (there was one prior to LEFT-join support).  For a
-	 * proven-safe LEFT join (see the file header), an empty build side does
-	 * not mean zero groups: probe_side_provably_total()'s guarantee runs the
-	 * other way too -- if the build side has no rows at all, the foreign key
-	 * it relies on means *every* probe row's key must be NULL (a non-NULL
-	 * key would require a referenced row to exist), so every probe row
-	 * belongs to the reserved group below.  ExecHashTableCreate() always
-	 * allocates hashtable->buckets regardless of totalTuples, so the loop
-	 * over nbuckets remains safe (and simply does nothing) when it is empty.
-	 */
-	oldcxt = MemoryContextSwitchTo(aggstate->aggcontexts[0]->ecxt_per_tuple_memory);
-
 	if (node->js.jointype == JOIN_LEFT)
 	{
+		oldcxt = MemoryContextSwitchTo(aggstate->aggcontexts[0]->ecxt_per_tuple_memory);
 		ExecAggInitPergroup(aggstate, node->hgj_NullKeyPergroup);
+		MemoryContextSwitchTo(oldcxt);
 		node->hgj_NullKeyMatched = false;
 		node->hgj_NullKeyEmitted = false;
 	}
+
+	ExecHashGroupJoinInitPergroups(node);
+}
+
+/* ----------------------------------------------------------------
+ *		ExecHashGroupJoinInitPergroups
+ *
+ *		Give every build tuple now resident in the hash table a freshly
+ *		initialized transition-state area.  Called once per batch, after all
+ *		of that batch's build tuples are in place -- never before, since
+ *		loading can relocate tuples to later batches.
+ *
+ * The states must be created in the aggregate context: pass-by-reference
+ * initial values are palloc'd there, and they have to outlive the per-tuple
+ * context.
+ *
+ * Note there is deliberately no "build side is empty, nothing to do" early
+ * exit here (there was one prior to LEFT-join support).  For a proven-safe
+ * LEFT join (see the file header), an empty build side does not mean zero
+ * groups: probe_side_provably_total()'s guarantee runs the other way too --
+ * if the build side has no rows at all, the foreign key it relies on means
+ * *every* probe row's key must be NULL (a non-NULL key would require a
+ * referenced row to exist), so every probe row belongs to the reserved
+ * group.  ExecHashTableCreate() always allocates hashtable->buckets
+ * regardless of totalTuples, so the loop below remains safe (and simply does
+ * nothing) when it is empty.
+ * ----------------------------------------------------------------
+ */
+static void
+ExecHashGroupJoinInitPergroups(HashGroupJoinState *node)
+{
+	HashJoinTable hashtable = node->hgj_HashTable;
+	AggState   *aggstate = node->hgj_AggState;
+	MemoryContext oldcxt;
+	int			i;
+
+	oldcxt = MemoryContextSwitchTo(aggstate->aggcontexts[0]->ecxt_per_tuple_memory);
 
 	for (i = 0; i < hashtable->nbuckets; i++)
 	{
@@ -180,13 +212,169 @@ ExecHashGroupJoinBuild(HashGroupJoinState *node)
 }
 
 /* ----------------------------------------------------------------
+ *		ExecHashGroupJoinNextBatch
+ *
+ *		Retire the batch just emitted and load the next one.  Returns false
+ *		when every batch has been processed.
+ *
+ * Fusing across batches is sound because a tuple's batch is a pure function
+ * of its hash value, and the hash value is computed from the join key -- the
+ * very columns the grouping is keyed on.  Two rows of the same group
+ * therefore always land in the same batch, so a batch's groups are complete
+ * the moment its probe rows run out, and can be finalized and emitted before
+ * the next batch is loaded.  That is what keeps only one batch's worth of
+ * accumulators in memory at a time.
+ * ----------------------------------------------------------------
+ */
+static bool
+ExecHashGroupJoinNextBatch(HashGroupJoinState *node)
+{
+	HashJoinTable hashtable = node->hgj_HashTable;
+	AggState   *aggstate = node->hgj_AggState;
+	int			nbatch = hashtable->nbatch;
+	int			curbatch = hashtable->curbatch;
+	TupleTableSlot *slot;
+	uint32		hashvalue;
+	BufFile    *innerFile;
+
+	if (nbatch == 1)
+		return false;
+
+	curbatch++;
+
+	/*
+	 * Skip batches that cannot produce a group, mirroring
+	 * ExecHashJoinNewBatch().  A batch with no build tuples has no groups at
+	 * all for INNER and for a proven-safe LEFT (whose unmatched build rows
+	 * are dropped anyway); RIGHT is the exception, since it preserves build
+	 * rows nothing matched.  The nbatch_original / nbatch_outstart tests
+	 * cover batches written before a split, which may hold tuples that now
+	 * belong even later.
+	 *
+	 * There is no converse "outer file non-empty, inner missing" case to
+	 * worry about: probe_side_provably_total() is what licensed a LEFT join
+	 * here in the first place, so a probe row with a non-NULL key always has
+	 * a build row somewhere, and NULL-keyed rows never reach a batch file.
+	 */
+	while (curbatch < nbatch &&
+		   (hashtable->outerBatchFile[curbatch] == NULL ||
+			hashtable->innerBatchFile[curbatch] == NULL))
+	{
+		if (hashtable->innerBatchFile[curbatch] &&
+			node->js.jointype == JOIN_RIGHT)
+			break;
+		if (hashtable->innerBatchFile[curbatch] &&
+			nbatch != hashtable->nbatch_original)
+			break;
+		if (hashtable->outerBatchFile[curbatch] &&
+			nbatch != hashtable->nbatch_outstart)
+			break;
+
+		if (hashtable->innerBatchFile[curbatch])
+			BufFileClose(hashtable->innerBatchFile[curbatch]);
+		hashtable->innerBatchFile[curbatch] = NULL;
+		if (hashtable->outerBatchFile[curbatch])
+			BufFileClose(hashtable->outerBatchFile[curbatch]);
+		hashtable->outerBatchFile[curbatch] = NULL;
+		curbatch++;
+	}
+
+	if (curbatch >= nbatch)
+		return false;
+
+	hashtable->curbatch = curbatch;
+
+	/*
+	 * Discard the finished batch.  Its hash entries -- and the state areas
+	 * embedded in them -- live in the table's batch context, which
+	 * ExecHashTableReset() clears.  The transition *values* those states
+	 * point at were palloc'd in the aggregate context instead, so they have
+	 * to be released separately or every batch would strand another full set,
+	 * which is precisely the memory this operator exists to avoid.  Rescan
+	 * rather than plain reset, so a transfn's registered callback still runs.
+	 */
+	ExecHashTableReset(hashtable);
+	ReScanExprContext(aggstate->aggcontexts[0]);
+
+	/* Reload the hash table with the new inner batch (which could be empty) */
+	innerFile = hashtable->innerBatchFile[curbatch];
+
+	if (innerFile != NULL)
+	{
+		if (BufFileSeek(innerFile, 0, 0, SEEK_SET))
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not rewind hash-join temporary file")));
+
+		while ((slot = ExecHashJoinGetSavedTuple(innerFile,
+												 &hashvalue,
+												 node->hgj_HashTupleSlot)))
+		{
+			/*
+			 * NOTE: some tuples may be sent to future batches.  Also, it is
+			 * possible for hashtable->nbatch to be increased here!
+			 */
+			ExecHashTableInsert(hashtable, slot, hashvalue);
+		}
+
+		BufFileClose(innerFile);
+		hashtable->innerBatchFile[curbatch] = NULL;
+	}
+
+	/* Only now is the batch's membership final, so states can be created. */
+	ExecHashGroupJoinInitPergroups(node);
+
+	/* Rewind the matching probe rows, if we spilled any. */
+	if (hashtable->outerBatchFile[curbatch] != NULL &&
+		BufFileSeek(hashtable->outerBatchFile[curbatch], 0, 0, SEEK_SET))
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not rewind hash-join temporary file")));
+
+	node->hgj_EmitBucket = 0;
+	node->hgj_EmitTuple = NULL;
+
+	return true;
+}
+
+/* ----------------------------------------------------------------
+ *		ExecHashGroupJoinNextOuter
+ *
+ *		Next probe row for the current batch: straight from the outer plan
+ *		while batch 0 is current, and from that batch's spill file after
+ *		that.  *hashvalue is set only in the latter case, where the value was
+ *		recorded when the row was written and need not be recomputed.
+ * ----------------------------------------------------------------
+ */
+static TupleTableSlot *
+ExecHashGroupJoinNextOuter(HashGroupJoinState *node, bool *have_hashvalue,
+						   uint32 *hashvalue)
+{
+	HashJoinTable hashtable = node->hgj_HashTable;
+
+	*have_hashvalue = false;
+
+	if (hashtable->curbatch == 0)
+		return ExecProcNode(outerPlanState(node));
+
+	if (hashtable->outerBatchFile[hashtable->curbatch] == NULL)
+		return NULL;
+
+	*have_hashvalue = true;
+	return ExecHashJoinGetSavedTuple(hashtable->outerBatchFile[hashtable->curbatch],
+									 hashvalue,
+									 node->hgj_OuterTupleSlot);
+}
+
+/* ----------------------------------------------------------------
  *		ExecHashGroupJoinProbeOne
  *
  *		Fold one outer tuple into every matching group.  Emits nothing.
  * ----------------------------------------------------------------
  */
 static void
-ExecHashGroupJoinProbeOne(HashGroupJoinState *node, TupleTableSlot *outerslot)
+ExecHashGroupJoinProbeOne(HashGroupJoinState *node, TupleTableSlot *outerslot,
+						  bool have_hashvalue, uint32 given_hashvalue)
 {
 	HashJoinTable hashtable = node->hgj_HashTable;
 	AggState   *aggstate = node->hgj_AggState;
@@ -202,12 +390,23 @@ ExecHashGroupJoinProbeOne(HashGroupJoinState *node, TupleTableSlot *outerslot)
 	/*
 	 * Compute the outer tuple's hash value.  The hash expression reads the
 	 * outer tuple from the node's own econtext.
+	 *
+	 * A row replayed from a spill file already carries the value computed
+	 * when it was written, and cannot have a NULL key -- those are folded in
+	 * below during the single pass over the outer plan and are never spilled.
 	 */
 	econtext->ecxt_outertuple = outerslot;
 	ResetExprContext(econtext);
 
-	hashdatum = ExecEvalExprSwitchContext(node->hgj_OuterHash, econtext,
-										  &isnull);
+	if (have_hashvalue)
+	{
+		hashdatum = UInt32GetDatum(given_hashvalue);
+		isnull = false;
+	}
+	else
+		hashdatum = ExecEvalExprSwitchContext(node->hgj_OuterHash, econtext,
+											  &isnull);
+
 	if (isnull)
 	{
 		/*
@@ -233,7 +432,28 @@ ExecHashGroupJoinProbeOne(HashGroupJoinState *node, TupleTableSlot *outerslot)
 
 	hashvalue = DatumGetUInt32(hashdatum);
 	ExecHashGetBucketAndBatch(hashtable, hashvalue, &bucketno, &batchno);
-	Assert(batchno == 0);		/* single batch, enforced at build time */
+
+	if (batchno != hashtable->curbatch)
+	{
+		bool		shouldFree;
+		MinimalTuple mintuple = ExecFetchSlotMinimalTuple(outerslot,
+														  &shouldFree);
+
+		/*
+		 * This row's group lives in a batch we have not loaded yet.  Park it
+		 * in that batch's spill file; it will be folded in when we get there.
+		 * Note batchno can be *later* than the file this row was read from,
+		 * if the table split again while the current batch was loading.
+		 */
+		Assert(batchno > hashtable->curbatch);
+		ExecHashJoinSaveTuple(mintuple, hashvalue,
+							  &hashtable->outerBatchFile[batchno],
+							  hashtable);
+
+		if (shouldFree)
+			heap_free_minimal_tuple(mintuple);
+		return;
+	}
 
 	for (hashTuple = hashtable->buckets.unshared[bucketno];
 		 hashTuple != NULL;
@@ -499,7 +719,6 @@ static TupleTableSlot *
 ExecHashGroupJoin(PlanState *pstate)
 {
 	HashGroupJoinState *node = castNode(HashGroupJoinState, pstate);
-	PlanState  *outerNode = outerPlanState(node);
 
 	CHECK_FOR_INTERRUPTS();
 
@@ -509,12 +728,22 @@ ExecHashGroupJoin(PlanState *pstate)
 		{
 			case HGJ_BUILD:
 				ExecHashGroupJoinBuild(node);
+
+				/*
+				 * Remember whether nbatch grows once the outer scan is under
+				 * way; ExecHashGroupJoinNextBatch() needs it to decide which
+				 * spill files it may skip.
+				 */
+				node->hgj_HashTable->nbatch_outstart =
+					node->hgj_HashTable->nbatch;
 				node->hgj_Phase = HGJ_PROBE;
 				break;
 
 			case HGJ_PROBE:
 				{
 					TupleTableSlot *outerslot;
+					bool		have_hashvalue;
+					uint32		hashvalue = 0;
 
 					/*
 					 * Nothing on the build side: for INNER/RIGHT, no groups
@@ -524,6 +753,10 @@ ExecHashGroupJoin(PlanState *pstate)
 					 * ExecHashGroupJoinBuild()'s comment -- so it must still
 					 * probe, to accumulate into the reserved group, and go
 					 * to EMIT rather than DONE.
+					 *
+					 * totalTuples counts the whole build relation, not just
+					 * the resident batch, so this stays correct once the join
+					 * is split across batches.
 					 */
 					if (node->hgj_HashTable->totalTuples == 0 &&
 						node->js.jointype != JOIN_LEFT)
@@ -532,7 +765,9 @@ ExecHashGroupJoin(PlanState *pstate)
 						break;
 					}
 
-					outerslot = ExecProcNode(outerNode);
+					outerslot = ExecHashGroupJoinNextOuter(node,
+														   &have_hashvalue,
+														   &hashvalue);
 					if (TupIsNull(outerslot))
 					{
 						node->hgj_Phase = HGJ_EMIT;
@@ -541,7 +776,8 @@ ExecHashGroupJoin(PlanState *pstate)
 						break;
 					}
 
-					ExecHashGroupJoinProbeOne(node, outerslot);
+					ExecHashGroupJoinProbeOne(node, outerslot,
+											  have_hashvalue, hashvalue);
 					break;
 				}
 
@@ -551,6 +787,19 @@ ExecHashGroupJoin(PlanState *pstate)
 
 					if (!TupIsNull(result))
 						return result;
+
+					/*
+					 * This batch's groups are complete and emitted.  Retire
+					 * it and pick up the next one, if any -- the accumulators
+					 * for the batch just finished are released there, which
+					 * is what bounds memory to a single batch.
+					 */
+					if (ExecHashGroupJoinNextBatch(node))
+					{
+						node->hgj_Phase = HGJ_PROBE;
+						break;
+					}
+
 					node->hgj_Phase = HGJ_DONE;
 					break;
 				}
@@ -800,4 +1049,121 @@ ExecEndHashGroupJoin(HashGroupJoinState *node)
 
 	ExecEndNode(outerPlanState(node));
 	ExecEndNode(innerPlanState(node));
+}
+
+/* ----------------------------------------------------------------
+ *		ExecReScanHashGroupJoin
+ * ----------------------------------------------------------------
+ */
+void
+ExecReScanHashGroupJoin(HashGroupJoinState *node)
+{
+	PlanState  *outerPlan = outerPlanState(node);
+	PlanState  *innerPlan = innerPlanState(node);
+	AggState   *aggstate = node->hgj_AggState;
+	HashState  *hashNode;
+
+	/*
+	 * If we never got as far as building the table there is nothing to undo,
+	 * and the next ExecHashGroupJoin() will start from HGJ_BUILD on its own.
+	 */
+	if (node->hgj_HashTable == NULL)
+	{
+		if (outerPlan->chgParam == NULL)
+			ExecReScan(outerPlan);
+		if (innerPlan->chgParam == NULL)
+			ExecReScan(innerPlan);
+		return;
+	}
+
+	/*
+	 * Fast path: unlike a plain hash join, which has already handed its
+	 * joined rows upwards and keeps only the build tuples, our hash table
+	 * still holds the entire result -- one group per entry, with its
+	 * transition values folded in.  So when nothing that feeds either side
+	 * has changed, a rescan is just a replay: rewind the emit cursor and walk
+	 * the buckets again, skipping both the build and the probe.
+	 *
+	 * This re-runs the finalfns over transition values that were already
+	 * finalized once.  That is the same thing ExecReScanAgg() does on its own
+	 * AGG_HASHED fast path, so the aggregates we accept are already required
+	 * to tolerate it.
+	 *
+	 * We insist on our own chgParam being empty too.  A changed parameter can
+	 * reach an aggregate argument or the HAVING qual without appearing in
+	 * either child's chgParam, and unlike nodeAgg we have no aggParams set to
+	 * test it against.
+	 *
+	 * This only works for a single-batch join.  Once the run has been split,
+	 * the table holds just the batch that happened to be loaded last -- every
+	 * earlier batch's groups were emitted and then discarded, and their spill
+	 * files closed -- so there is nothing left to replay.  Multi-batch rescans
+	 * go the hard way, as ExecReScanHashJoin() does for the same reason.
+	 */
+	if (node->hgj_HashTable->nbatch == 1 &&
+		outerPlan->chgParam == NULL &&
+		innerPlan->chgParam == NULL &&
+		node->js.ps.chgParam == NULL)
+	{
+		node->hgj_Phase = HGJ_EMIT;
+		node->hgj_EmitBucket = 0;
+		node->hgj_EmitTuple = NULL;
+
+		/*
+		 * Let the reserved NULL-key group be emitted again, but leave
+		 * hgj_NullKeyMatched alone -- whether that group ever received a row
+		 * is part of the result we are replaying, not scan state.
+		 */
+		node->hgj_NullKeyEmitted = false;
+		return;
+	}
+
+	/*
+	 * Otherwise the groups, the transition values, or both are stale, and
+	 * there is nothing incremental to salvage: throw the table away and
+	 * rebuild from scratch.
+	 */
+	hashNode = castNode(HashState, innerPlan);
+	Assert(hashNode->hashtable == node->hgj_HashTable);
+
+	/* accumulate stats from the old table, if wanted (cf. ExecShutdownHash) */
+	if (hashNode->ps.instrument && !hashNode->hinstrument)
+		hashNode->hinstrument = palloc0_object(HashInstrumentation);
+	if (hashNode->hinstrument)
+		ExecHashAccumInstrumentation(hashNode->hinstrument,
+									 hashNode->hashtable);
+
+	/* for safety, be sure to clear the child plan node's pointer too */
+	hashNode->hashtable = NULL;
+
+	ExecHashTableDestroy(node->hgj_HashTable);
+	node->hgj_HashTable = NULL;
+
+	/*
+	 * Release the groups' transition values.  Those are palloc'd in the
+	 * aggregate context rather than inside the hash entries, so destroying
+	 * the table above did not reclaim them; without this, every rescan would
+	 * leak another full set.  Rescan rather than plain reset, so that any
+	 * callback a transfn registered gets to run (cf. ExecReScanAgg).
+	 *
+	 * v1 plans a single grouping set, so context 0 is the only one in use.
+	 * hgj_NullKeyPergroup itself survives -- it is allocated once at init in
+	 * the per-query context, and ExecHashGroupJoinBuild() re-initializes it.
+	 */
+	ReScanExprContext(aggstate->aggcontexts[0]);
+
+	node->hgj_Phase = HGJ_BUILD;
+	node->hgj_EmitBucket = 0;
+	node->hgj_EmitTuple = NULL;
+	node->hgj_NullKeyMatched = false;
+	node->hgj_NullKeyEmitted = false;
+
+	/*
+	 * if chgParam of subnode is not null then plan will be re-scanned by
+	 * first ExecProcNode.
+	 */
+	if (innerPlan->chgParam == NULL)
+		ExecReScan(innerPlan);
+	if (outerPlan->chgParam == NULL)
+		ExecReScan(outerPlan);
 }
