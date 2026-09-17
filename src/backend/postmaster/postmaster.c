@@ -933,6 +933,11 @@ PostmasterMain(int argc, char *argv[])
 	ApplyLauncherRegister();
 
 	/*
+	 * Register built-in managers that are not part of static arrays
+	 */
+	register_builtin_dynamic_managers();
+
+	/*
 	 * Register the BRIN launcher for automatic BRIN index creation.  It
 	 * always runs and holds no database connection; which databases it
 	 * actually creates indexes in is controlled by the per-database

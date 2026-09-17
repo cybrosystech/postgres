@@ -43,6 +43,7 @@ SUBDIRS = \
 		pg_stash_advice	\
 		pg_stat_statements \
 		pg_surgery	\
+		pg_tde		\
 		pg_trgm		\
 		pgrowlocks	\
 		pgstattuple	\
