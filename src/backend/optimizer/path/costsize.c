@@ -3238,13 +3238,17 @@ get_windowclause_startup_tuples(PlannerInfo *root, WindowClause *wc,
  * calls we will make.
  */
 void
-cost_hashgroupjoin(Path *path, PlannerInfo *root,
+cost_hashgroupjoin(GroupJoinPath *gjpath, PlannerInfo *root,
 				   const AggClauseCosts *aggcosts,
 				   double numGroups,
 				   List *quals,
 				   int disabled_nodes,
-				   Cost input_total_cost)
+				   Cost input_total_cost,
+				   int plain_num_batches)
 {
+	Path	   *path = &gjpath->jpath.path;
+	Path	   *innerp = gjpath->jpath.innerjoinpath;
+	Path	   *outerp = gjpath->jpath.outerjoinpath;
 	double		input_tuples = path->rows;
 	double		output_tuples = numGroups;
 	Cost		startup_cost;
@@ -3295,6 +3299,55 @@ cost_hashgroupjoin(Path *path, PlannerInfo *root,
 															 0,
 															 JOIN_INNER,
 															 NULL));
+	}
+
+	/*
+	 * Re-derive the batch count against the *fused* entry width.
+	 *
+	 * plain_num_batches came from final_cost_hashjoin(), whose entries hold
+	 * only the build tuple.  Ours additionally carry each group's transition
+	 * states, so the same build side may not fit in as few batches, and
+	 * inheriting that figure would understate our spill.  The extra width is
+	 * exact rather than estimated -- sizeof(AggStatePerGroupData) per
+	 * aggregate transition -- so this removes a systematic undercount rather
+	 * than adding a guess.
+	 */
+	{
+		size_t		space_allowed;
+		int			numbuckets;
+		int			numbatches;
+		int			num_skew_mcvs;
+
+		ExecChooseHashTableSize(gjpath->inner_rows_total,
+								innerp->pathtarget->width,
+								ExecAggPergroupSizeForTrans(list_length(root->aggtransinfos)),
+								false,	/* no skew; see create_hashgroupjoin_plan */
+								false,	/* never parallel; see create_hashgroupjoin_path */
+								0,
+								&space_allowed,
+								&numbuckets,
+								&numbatches,
+								&num_skew_mcvs);
+
+		gjpath->num_batches = numbatches;
+
+		/*
+		 * If the transition states are what tip the join into batching,
+		 * charge for the spill the plain hash join was not charged for.  The
+		 * charge mirrors initial_cost_hashjoin()'s and is flat rather than
+		 * per-batch: batching writes and re-reads the tuples once however
+		 * many batches result.
+		 */
+		if (numbatches > 1 && plain_num_batches <= 1)
+		{
+			double		outerpages = page_size(outerp->rows,
+											   outerp->pathtarget->width);
+			double		innerpages = page_size(innerp->rows,
+											   innerp->pathtarget->width);
+
+			startup_cost += seq_page_cost * innerpages;
+			total_cost += seq_page_cost * (2 * innerpages + 2 * outerpages);
+		}
 	}
 
 	path->rows = output_tuples;
@@ -4472,6 +4525,7 @@ initial_cost_hashjoin(PlannerInfo *root, JoinCostWorkspace *workspace,
 	 */
 	ExecChooseHashTableSize(inner_path_rows_total,
 							inner_path->pathtarget->width,
+							0,	/* a plain hash join stores only the tuple */
 							true,	/* useskew */
 							parallel_hash,	/* try_combined_hash_mem */
 							outer_path->parallel_workers,

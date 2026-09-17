@@ -4996,6 +4996,28 @@ tlist_member_ignoring_nullingrels(Var *var, List *targetlist)
  * from the build side's output -- the probe's own echo of a hash key being
  * the one exception, handled by rewriting it first (see
  * replace_probe_echo_vars(), above).
+ *
+ * "Evaluable from the build side's output" does not mean "present there as
+ * its own targetlist entry", though.  groupjoin_keys_match() (planner.c)
+ * accepts any expression built entirely from build-side columns -- e.g. a
+ * jsonb translatable-field lookup, "dim.name ->> 'en_US'" -- but the build
+ * side's plan only ever projects the raw columns it needs (here, just
+ * "dim.name"), never a computed expression over them.  This function's
+ * result feeds only EXPLAIN's "Group Key" text (show_hashgroupjoin_keys(),
+ * explain.c); the query's real output value is computed correctly regardless,
+ * by the AggState's own targetlist, resolved against the build plan through
+ * the ordinary generic per-Var substitution every join uses
+ * (set_join_references(), setrefs.c) -- that does not require the whole
+ * expression to be one targetlist entry, only each Var inside it to be
+ * resolvable, which a raw build column always is.  So when an expression
+ * cannot be found as a literal entry here, its grpColIdx slot is set to
+ * InvalidAttrNumber instead of erroring; show_hashgroupjoin_keys() compacts
+ * those out before display.  The array itself stays the full,
+ * one-per-groupClause-entry length that pg_node_attr(array_size(numCols)) on
+ * the Plan node requires (and that extract_grouping_ops(), building
+ * grpOperators independently over the same groupClause, assumes it can rely
+ * on) -- shrinking it here would desync grpColIdx/grpCollations from
+ * grpOperators, which has no notion of a skipped entry.
  */
 static AttrNumber *
 extract_hashgroupjoin_grouping_cols(PlannerInfo *root, List *groupClause,
@@ -5043,18 +5065,49 @@ extract_hashgroupjoin_grouping_cols(PlannerInfo *root, List *groupClause,
 			 * inner_plan sits below the join and that nulling has not
 			 * happened from its point of view yet.  equal() (which
 			 * tlist_member uses) compares that field, so it legitimately
-			 * fails here even though this is exactly the right column.
-			 * groupjoin_keys_match() has already guaranteed every surviving
-			 * GROUP BY entry reduces to a bare Var (a build column, or a
-			 * probe echo just rewritten to one above), so falling back to a
-			 * plain varno/varattno match -- the same relaxation
-			 * setrefs.c's NRM_SUPERSET mode makes for the same reason -- is
-			 * safe here, not just convenient.
+			 * fails here even though this is exactly the right column.  A
+			 * bare Var surviving groupjoin_keys_match() is always either a
+			 * build column or a probe echo just rewritten to one above, so
+			 * falling back to a plain varno/varattno match -- the same
+			 * relaxation setrefs.c's NRM_SUPERSET mode makes for the same
+			 * reason -- is safe here, not just convenient.
 			 */
 			tle = tlist_member_ignoring_nullingrels((Var *) groupexpr, inner_tlist);
 		}
 		if (tle == NULL)
-			elog(ERROR, "hashgroupjoin grouping column not found in build-side targetlist");
+		{
+			/*
+			 * dbblue: a bare Var not found here would mean groupjoin_keys_match()
+			 * proved something false -- a real bug, so keep this fatal.  A
+			 * non-Var expression, though, is expected to miss sometimes: since
+			 * that function was widened to accept any expression built purely
+			 * from build-side columns (a jsonb translatable-field lookup,
+			 * "dim.name ->> 'en_US'", being the motivating case -- Odoo's
+			 * default shape for a joined dimension's display name from 17.0
+			 * onward), and the build side's plan only ever projects the raw
+			 * columns such an expression reads, never the expression itself.
+			 * This array feeds only EXPLAIN's "Group Key" text
+			 * (show_hashgroupjoin_keys(), explain.c); the query's actual
+			 * output is computed correctly regardless, via the ordinary
+			 * generic per-Var substitution every join's own targetlist
+			 * resolution already does (set_join_references(), setrefs.c),
+			 * which needs each Var inside the expression to resolve, not the
+			 * expression to appear as one targetlist entry.  So: record
+			 * InvalidAttrNumber and move on -- show_hashgroupjoin_keys()
+			 * compacts those slots out before display, rather than the query
+			 * failing over what is, for that one function, only a missing
+			 * label.  colno still advances: this array must stay 1:1 with
+			 * groupClause, matching grpOperators (extract_grouping_ops(),
+			 * built independently over the same list with no notion of a
+			 * skipped entry).
+			 */
+			if (IsA(groupexpr, Var))
+				elog(ERROR, "hashgroupjoin grouping column not found in build-side targetlist");
+			grpColIdx[colno] = InvalidAttrNumber;
+			collations[colno] = InvalidOid;
+			colno++;
+			continue;
+		}
 
 		grpColIdx[colno] = tle->resno;
 		collations[colno] = exprCollation((Node *) groupexpr);

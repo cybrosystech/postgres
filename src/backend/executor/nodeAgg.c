@@ -4219,7 +4219,21 @@ ExecInitAggMachinery(Agg *node, EState *estate, int eflags,
 Size
 ExecAggPergroupSize(AggState *aggstate)
 {
-	return sizeof(AggStatePerGroupData) * aggstate->numtrans;
+	return ExecAggPergroupSizeForTrans(aggstate->numtrans);
+}
+
+/*
+ * ExecAggPergroupSizeForTrans
+ *		As above, from a transition count alone.
+ *
+ * The planner needs this before any AggState exists, to size a fused
+ * HashGroupJoin's hash entries (see cost_hashgroupjoin).  At that point the
+ * transition count is list_length(root->aggtransinfos).
+ */
+Size
+ExecAggPergroupSizeForTrans(int numtrans)
+{
+	return sizeof(AggStatePerGroupData) * numtrans;
 }
 
 /*

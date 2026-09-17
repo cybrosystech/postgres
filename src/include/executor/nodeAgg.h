@@ -334,6 +334,7 @@ extern AggState *ExecInitAggMachinery(Agg *node, EState *estate, int eflags,
 									  const TupleTableSlotOps *innerOps,
 									  PlanState *outerPS, PlanState *innerPS);
 extern Size ExecAggPergroupSize(AggState *aggstate);
+extern Size ExecAggPergroupSizeForTrans(int numtrans);
 extern void ExecAggInitPergroup(AggState *aggstate, AggStatePerGroup pergroup);
 extern void ExecAggAdvance(AggState *aggstate, AggStatePerGroup pergroup);
 extern void ExecAggFinalize(AggState *aggstate, AggStatePerGroup pergroup);

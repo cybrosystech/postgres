@@ -7698,6 +7698,51 @@ find_cheapest_hash_join_path(RelOptInfo *input_rel)
  * fails to reduce to a build-Var-equals-probe-Var comparison.
  */
 static bool
+pull_build_side_varnos_walker(Node *node, Relids *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Var))
+	{
+		Var		   *var = (Var *) node;
+
+		if (var->varlevelsup == 0)
+			*context = bms_add_member(*context, var->varno);
+		return false;
+	}
+	return expression_tree_walker(node, pull_build_side_varnos_walker, context);
+}
+
+/*
+ * pull_build_side_varnos
+ *		Like pull_varnos(), but reports only the relids a Var actually reads
+ *		from (var->varno), never var->varnullingrels.
+ *
+ * pull_varnos() deliberately unions in a Var's varnullingrels -- the set of
+ * outer joins that might null it -- because most of its callers care about
+ * correctness of expression placement relative to outer joins.  Rule 2 in
+ * groupjoin_keys_match() cares about something narrower: which base relation
+ * an expression's *values* physically come from.  The build side of the very
+ * LEFT join being fused is, by definition, the nullable side, so an ordinary
+ * build column already accepted there as a bare Var (see the *build_vars
+ * membership check just above this one) carries a nullingrels bit for that
+ * same join -- using pull_varnos() directly would make it look, wrongly, as
+ * if it also reads from outside the build row, and reject every LEFT-join
+ * query this generalization exists to allow.  Confirmed live: 2026-09-17,
+ * "res_partner LEFT JOIN res_country, GROUP BY ..., res_country.name" failed
+ * Rule 2 this way even though the bare-Var form of the same column already
+ * passes it one check up.
+ */
+static Relids
+pull_build_side_varnos(Node *node)
+{
+	Relids		varnos = NULL;
+
+	(void) pull_build_side_varnos_walker(node, &varnos);
+	return varnos;
+}
+
+static bool
 extract_hashclause_key_pairs(HashPath *hpath, List **build_vars, List **probe_vars)
 {
 	Relids		innerrelids = hpath->jpath.innerjoinpath->parent->relids;
@@ -7796,7 +7841,11 @@ groupjoin_keys_match(PlannerInfo *root, HashPath *hpath,
 	ListCell   *lc2;
 
 	if (!extract_hashclause_key_pairs(hpath, build_vars, probe_vars))
+	{
+		if (dbblue_groupjoin_planner_only)
+			elog(LOG, "dbblue groupjoin: precondition bail at #2a (extract_hashclause_key_pairs)");
 		return false;
+	}
 
 	/*
 	 * Every build-side key must be a NOT NULL column of a base relation.
@@ -7819,17 +7868,34 @@ groupjoin_keys_match(PlannerInfo *root, HashPath *hpath,
 		RelOptInfo *baserel;
 
 		if (var->varno <= 0 || var->varno >= root->simple_rel_array_size)
+		{
+			if (dbblue_groupjoin_planner_only)
+				elog(LOG, "dbblue groupjoin: precondition bail at #2b (build var varno range)");
 			return false;
+		}
 
 		baserel = root->simple_rel_array[var->varno];
 		if (baserel == NULL || baserel->reloptkind != RELOPT_BASEREL)
+		{
+			if (dbblue_groupjoin_planner_only)
+				elog(LOG, "dbblue groupjoin: precondition bail at #2c (build var not a base rel)");
 			return false;
+		}
 
 		if (var->varattno <= 0)
+		{
+			if (dbblue_groupjoin_planner_only)
+				elog(LOG, "dbblue groupjoin: precondition bail at #2d (whole-row/system column)");
 			return false;		/* whole-row or system column */
+		}
 
 		if (!bms_is_member(var->varattno, baserel->notnullattnums))
+		{
+			if (dbblue_groupjoin_planner_only)
+				elog(LOG, "dbblue groupjoin: precondition bail at #2e (build key not proven NOT NULL, attno=%d)",
+					 var->varattno);
 			return false;
+		}
 	}
 
 	/*
@@ -7849,10 +7915,41 @@ groupjoin_keys_match(PlannerInfo *root, HashPath *hpath,
 	{
 		if (!list_member(groupexprs, lfirst(lc)) &&
 			!list_member(groupexprs, lfirst(lc2)))
+		{
+			if (dbblue_groupjoin_planner_only)
+				elog(LOG, "dbblue groupjoin: precondition bail at #2f (hash key not in GROUP BY)");
 			return false;
+		}
 	}
 
-	/* 2. Every other GROUP BY column must be safe, per the comment above. */
+	/*
+	 * 2. Every other GROUP BY column must be safe, per the comment above.
+	 *
+	 * "Safe" means every Var it reads belongs to the build relation, not just
+	 * IsA(ge, Var): an expression computed purely from build-side columns
+	 * (e.g. a jsonb translatable-field lookup, "dim.name ->> 'en_US'" --
+	 * Odoo's default shape for every joined dimension's display name from
+	 * 17.0 onward) cannot vary within one build entry any more than a bare
+	 * build column can, by the same argument the comment above makes.  Once
+	 * this was IsA(ge, Var) only, on the theory that the build side's plan
+	 * only ever projects raw columns; that turned out not to matter, because
+	 * the query's real output projection (aggstate's own tlist) is resolved
+	 * against the build plan by the same generic per-Var substitution any
+	 * ordinary join uses (set_join_references(), setrefs.c) -- it does not
+	 * require the whole expression to appear there as one targetlist entry,
+	 * only each Var inside it to be resolvable, which a raw build column
+	 * always is.  See extract_hashgroupjoin_grouping_cols() (createplan.c)
+	 * for the one place that DOES need the whole expression as a unit --
+	 * purely for EXPLAIN's "Group Key" text -- and how it degrades instead of
+	 * erroring when an expression isn't literally there.
+	 *
+	 * pull_build_side_varnos() (below) ignores the query's other levels by
+	 * design (it only counts a Var with varlevelsup == 0), so a subquery or
+	 * lateral reference nested inside ge cannot slip a relid from outside
+	 * this join in unnoticed.  An expression with no Vars at all (a constant)
+	 * is trivially safe too, and bms_is_subset(empty, anything) is true, so
+	 * it falls out of the same check without a separate case.
+	 */
 	foreach(lc, groupexprs)
 	{
 		Node	   *ge = (Node *) lfirst(lc);
@@ -7863,9 +7960,12 @@ groupjoin_keys_match(PlannerInfo *root, HashPath *hpath,
 		if (list_member(*probe_vars, ge))
 			continue;			/* the probe's own copy of a hash key */
 
-		if (IsA(ge, Var) && bms_is_member(((Var *) ge)->varno, innerrelids))
-			continue;			/* any other column of the same build row */
+		if (bms_is_subset(pull_build_side_varnos(ge), innerrelids))
+			continue;			/* reads only columns of the same build row */
 
+		if (dbblue_groupjoin_planner_only)
+			elog(LOG, "dbblue groupjoin: precondition bail at #2g (extra GROUP BY column reads outside build row): %s",
+				 nodeToString(ge));
 		return false;			/* could vary within one build entry; reject */
 	}
 
@@ -8096,6 +8196,17 @@ probe_side_provably_total(PlannerInfo *root, HashPath *hpath,
  * silently: the ordinary join-then-aggregate paths have already been added by
  * the caller and remain available, so failing to fuse costs only the chance
  * of a speedup, never correctness.
+ *
+ * Every bail point here and in groupjoin_keys_match() also logs, under
+ * dbblue_groupjoin_planner_only, a numbered "precondition bail at #N" line
+ * identifying exactly which check declined the query -- there is no other
+ * way to find that out short of instrumenting the code by hand, which is how
+ * these numbers were discovered to be worth keeping (2026-09-17: a query
+ * that should have fused after a code change didn't, and manual instrumentation
+ * was the only way to find out it was #2g, not the change just made).  Numbers
+ * are not sequential across the two functions and are not a stable API --
+ * they exist to be grepped for during one debugging session, not to be
+ * depended on between releases.
  */
 static void
 try_add_hashgroupjoin_path(PlannerInfo *root,
@@ -8136,7 +8247,11 @@ try_add_hashgroupjoin_path(PlannerInfo *root,
 	/* Find a hash join to fuse into. */
 	hpath = find_cheapest_hash_join_path(input_rel);
 	if (hpath == NULL)
+	{
+		if (dbblue_groupjoin_planner_only)
+			elog(LOG, "dbblue groupjoin: precondition bail at #1 (no HashPath found)");
 		return;
+	}
 
 	/*
 	 * B2 / precondition 1: GROUP BY matches the join key.  Done before the
@@ -8144,7 +8259,11 @@ try_add_hashgroupjoin_path(PlannerInfo *root,
 	 * key pairs this produces.
 	 */
 	if (!groupjoin_keys_match(root, hpath, &build_vars, &probe_vars))
+	{
+		if (dbblue_groupjoin_planner_only)
+			elog(LOG, "dbblue groupjoin: precondition bail at #2 (groupjoin_keys_match)");
 		return;
+	}
 
 	/*
 	 * B5: v1 handles INNER and RIGHT unconditionally.  RIGHT is the common
@@ -8165,9 +8284,18 @@ try_add_hashgroupjoin_path(PlannerInfo *root,
 		hpath->jpath.jointype != JOIN_RIGHT)
 	{
 		if (hpath->jpath.jointype != JOIN_LEFT)
+		{
+			if (dbblue_groupjoin_planner_only)
+				elog(LOG, "dbblue groupjoin: precondition bail at #3 (jointype=%d, not INNER/RIGHT/LEFT)",
+					 (int) hpath->jpath.jointype);
 			return;
+		}
 		if (!probe_side_provably_total(root, hpath, build_vars, probe_vars))
+		{
+			if (dbblue_groupjoin_planner_only)
+				elog(LOG, "dbblue groupjoin: precondition bail at #4 (probe_side_provably_total)");
 			return;
+		}
 	}
 
 	/*
@@ -8192,7 +8320,11 @@ try_add_hashgroupjoin_path(PlannerInfo *root,
 										hpath->jpath.innerjoinpath->parent,
 										hpath->jpath.jointype,
 										hpath->path_hashclauses))
+	{
+		if (dbblue_groupjoin_planner_only)
+			elog(LOG, "dbblue groupjoin: precondition bail at #5 (innerrel_is_unique_for_clauses)");
 		return;
+	}
 
 	/* All preconditions hold; build the path. */
 	gjpath = create_hashgroupjoin_path(root,
@@ -8203,7 +8335,7 @@ try_add_hashgroupjoin_path(PlannerInfo *root,
 									   havingQual,
 									   agg_costs,
 									   dNumGroups);
-
+ 
 	if (dbblue_groupjoin_planner_only)
 	{
 		/*
@@ -8211,11 +8343,23 @@ try_add_hashgroupjoin_path(PlannerInfo *root,
 		 * recognised and what it would have cost, and add nothing.  This is
 		 * how we find out whether real Odoo reporting queries hit this shape,
 		 * without any executor code existing.
+		 *
+		 * The two costs are NOT a like-for-like comparison and the message
+		 * says so: "fused" covers the join *and* the aggregation it absorbs,
+		 * while "bare-hashjoin" is the join alone, without the Agg node that
+		 * would have to sit on top of it.  The latter is therefore always the
+		 * smaller number, for every query, and reading the pair as a verdict
+		 * makes fusion look like a loss even where it wins.  To find out which
+		 * plan actually wins, turn this flag off and compare EXPLAIN with
+		 * dbblue_enable_groupjoin on versus off -- while the flag is on the
+		 * path is never offered to the planner, so the fused plan can never be
+		 * chosen no matter what it costs.
 		 */
 		elog(LOG,
 			 "dbblue groupjoin: candidate found; jointype=%d groupcols=%d "
 			 "numGroups=%.0f joinrows=%.0f "
-			 "cost fused=%.2f..%.2f vs hashjoin=%.2f..%.2f (not added)",
+			 "cost fused(join+agg)=%.2f..%.2f vs bare-hashjoin(no agg)=%.2f..%.2f "
+			 "(not added: dbblue_groupjoin_planner_only is on; not a cost decision)",
 			 (int) hpath->jpath.jointype,
 			 list_length(root->processed_groupClause),
 			 dNumGroups,

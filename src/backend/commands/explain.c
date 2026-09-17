@@ -2677,9 +2677,34 @@ show_hashgroupjoin_keys(HashGroupJoinState *hgjstate, List *ancestors,
 		 */
 		PlanState  *buildstate = outerPlanState(innerPlanState(hgjstate));
 
+		/*
+		 * dbblue: a GROUP BY entry that groupjoin_keys_match() (planner.c)
+		 * accepted as an expression computed purely from build-side columns
+		 * (e.g. a jsonb translatable-field lookup, "dim.name ->> 'en_US'')
+		 * has no entry of its own in the build plan's targetlist -- only the
+		 * raw column(s) it reads do -- so extract_hashgroupjoin_grouping_cols()
+		 * (createplan.c) marks its slot InvalidAttrNumber rather than fail the
+		 * query over a display-only lookup.  Compact those out here: passing
+		 * one through to show_sort_group_keys() would hit its own
+		 * "no tlist entry for key" elog(ERROR), which exists to catch a
+		 * genuine planner bug and does not know about this expected case.
+		 * The result is the "Group Key" line simply omitting that one
+		 * expression -- a cosmetic gap, not a wrong query result, which is
+		 * computed independently by this node's own targetlist.
+		 */
+		AttrNumber *keycols = palloc_array(AttrNumber, plan->numCols);
+		int			nkeys = 0;
+		int			i;
+
+		for (i = 0; i < plan->numCols; i++)
+		{
+			if (plan->grpColIdx[i] != InvalidAttrNumber)
+				keycols[nkeys++] = plan->grpColIdx[i];
+		}
+
 		ancestors = lcons(plan, ancestors);
 		show_sort_group_keys(buildstate, "Group Key",
-							 plan->numCols, 0, plan->grpColIdx,
+							 nkeys, 0, keycols,
 							 NULL, NULL, NULL,
 							 ancestors, es);
 		ancestors = list_delete_first(ancestors);

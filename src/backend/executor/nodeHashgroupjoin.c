@@ -130,20 +130,16 @@ ExecHashGroupJoinBuild(HashGroupJoinState *node)
 	AggState   *aggstate = node->hgj_AggState;
 	MemoryContext oldcxt;
 
-	hashtable = ExecHashTableCreate(hashNode);
-
 	/*
-	 * Every hash entry must carry its group's transition states.  This has to
-	 * be set before a single tuple is inserted.
-	 *
-	 * ExecChooseHashTableSize() has already picked nbatch by this point, and
-	 * it sized the entries without knowing about this extra area, so its
-	 * choice is an under-estimate.  That self-corrects: spaceUsed is tracked
-	 * with the extra area included, so once the real footprint exceeds
-	 * spaceAllowed, ExecHashIncreaseNumBatches() splits again -- the same way
-	 * stock recovers from any other misestimate.
+	 * Every hash entry carries its group's transition states in extra space
+	 * after the tuple.  Passing the size in means ExecChooseHashTableSize()
+	 * picks nbatch against the real entry width, so the table starts out with
+	 * the number of batches it will actually need.  (Getting this wrong was
+	 * never a correctness problem -- spaceUsed counts the extra area, so the
+	 * table would just split again at run time -- but that costs a wasted
+	 * repartition pass over the whole build side.)
 	 */
-	hashtable->extraTupleSpace = node->hgj_PergroupSize;
+	hashtable = ExecHashTableCreate(hashNode, node->hgj_PergroupSize);
 
 	node->hgj_HashTable = hashtable;
 	hashNode->hashtable = hashtable;

@@ -332,7 +332,7 @@ ExecHashJoinImpl(PlanState *pstate, bool parallel)
 				 * whoever gets here first will create the hash table and any
 				 * later arrivals will merely attach to it.
 				 */
-				hashtable = ExecHashTableCreate(hashNode);
+				hashtable = ExecHashTableCreate(hashNode, 0);
 				node->hj_HashTable = hashtable;
 
 				/*

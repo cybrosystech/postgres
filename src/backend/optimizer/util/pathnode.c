@@ -2631,8 +2631,8 @@ create_hashgroupjoin_path(PlannerInfo *root,
 
 	pathnode->joinrelids = hpath->jpath.path.parent->relids;
 	pathnode->path_hashclauses = hpath->path_hashclauses;
-	pathnode->num_batches = hpath->num_batches;
 	pathnode->inner_rows_total = hpath->inner_rows_total;
+	/* cost_hashgroupjoin() re-derives num_batches for the fused entry width */
 
 	pathnode->groupClause = groupClause;
 	pathnode->qual = qual;
@@ -2646,11 +2646,12 @@ create_hashgroupjoin_path(PlannerInfo *root,
 	 */
 	pathnode->jpath.path.rows = jpath->rows;
 
-	cost_hashgroupjoin(&pathnode->jpath.path, root,
+	cost_hashgroupjoin(pathnode, root,
 					   aggcosts, numGroups,
 					   qual,
 					   jpath->disabled_nodes,
-					   jpath->total_cost);
+					   jpath->total_cost,
+					   hpath->num_batches);
 
 	/* add tlist eval cost for each output row, as create_agg_path does */
 	pathnode->jpath.path.startup_cost += target->cost.startup;

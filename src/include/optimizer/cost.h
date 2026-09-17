@@ -139,12 +139,13 @@ extern void cost_agg(Path *path, PlannerInfo *root,
 					 int disabled_nodes,
 					 Cost input_startup_cost, Cost input_total_cost,
 					 double input_tuples, double input_width);
-extern void cost_hashgroupjoin(Path *path, PlannerInfo *root,
+extern void cost_hashgroupjoin(GroupJoinPath *gjpath, PlannerInfo *root,
 							   const AggClauseCosts *aggcosts,
 							   double numGroups,
 							   List *quals,
 							   int disabled_nodes,
-							   Cost input_total_cost);
+							   Cost input_total_cost,
+							   int plain_num_batches);
 extern void cost_windowagg(Path *path, PlannerInfo *root,
 						   List *windowFuncs, WindowClause *winclause,
 						   int input_disabled_nodes,
