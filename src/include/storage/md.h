@@ -20,13 +20,17 @@
 #include "storage/smgr.h"
 #include "storage/sync.h"
 
-extern PGDLLIMPORT const PgAioHandleCallbacks aio_md_readv_cb;
+extern PGDLLIMPORT PgAioHandleCallbacks aio_md_readv_cb;
+
+/* registration function for md storage manager */
+extern void mdsmgr_register(void);
+extern PGDLLIMPORT SMgrId MdSMgrId;
 
 /* md storage manager functionality */
 extern void mdinit(void);
 extern void mdopen(SMgrRelation reln);
 extern void mdclose(SMgrRelation reln, ForkNumber forknum);
-extern void mdcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo);
+extern void mdcreate(RelFileLocator relold, SMgrRelation reln, ForkNumber forknum, bool isRedo);
 extern bool mdexists(SMgrRelation reln, ForkNumber forknum);
 extern void mdunlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo);
 extern void mdextend(SMgrRelation reln, ForkNumber forknum,
@@ -61,5 +65,8 @@ extern void DropRelationFiles(RelFileLocator *delrels, int ndelrels, bool isRedo
 extern int	mdsyncfiletag(const FileTag *ftag, char *path);
 extern int	mdunlinkfiletag(const FileTag *ftag, char *path);
 extern bool mdfiletagmatches(const FileTag *ftag, const FileTag *candidate);
+
+extern PgAioResult
+md_readv_complete(PgAioHandle *ioh, PgAioResult prior_result, uint8 cb_data);
 
 #endif							/* MD_H */
