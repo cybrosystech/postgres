@@ -366,3 +366,11 @@
  * Enable tracing of syncscan operations (see also the trace_syncscan GUC var).
  */
 /* #define TRACE_SYNCSCAN */
+
+/*
+ * Version of the extension-facing API additions carried by this tree (the
+ * pluggable storage manager and extensible XLog storage originally from
+ * Percona Server for PostgreSQL).  pg_tde tests this to decide which smgr
+ * entry points are available.
+ */
+#define PERCONA_API_VERSION 3
