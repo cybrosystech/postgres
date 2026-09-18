@@ -1087,8 +1087,15 @@ ExecReScanHashGroupJoin(HashGroupJoinState *node)
 	 *
 	 * We insist on our own chgParam being empty too.  A changed parameter can
 	 * reach an aggregate argument or the HAVING qual without appearing in
-	 * either child's chgParam, and unlike nodeAgg we have no aggParams set to
-	 * test it against.
+	 * either child's chgParam.  node->aggParams (set by finalize_plan(),
+	 * subselect.c, and copied onto the synthetic Agg node at init) records
+	 * exactly which Params those are, the same as Agg.aggParams -- but unlike
+	 * ExecReScanAgg(), which allows its fast path whenever chgParam doesn't
+	 * overlap aggParams, this checks the whole node chgParam is empty instead.
+	 * Coarser, so it forces a handful of unnecessary rebuilds ExecReScanAgg()
+	 * would avoid, but always safe; narrowing it to bms_overlap(chgParam,
+	 * aggParams), mirroring nodeAgg exactly, is a safe follow-up, not a
+	 * correctness fix.
 	 *
 	 * This only works for a single-batch join.  Once the run has been split,
 	 * the table holds just the batch that happened to be loaded last -- every
