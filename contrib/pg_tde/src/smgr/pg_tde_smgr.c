@@ -1,0 +1,745 @@
+#include "postgres.h"
+
+#include "access/xloginsert.h"
+#include "catalog/catalog.h"
+#include "miscadmin.h"
+#include "storage/md.h"
+#include "storage/smgr.h"
+#include "utils/hsearch.h"
+
+#include "access/pg_tde_tdemap.h"
+#include "access/pg_tde_xlog.h"
+#include "encryption/enc_aes.h"
+#include "encryption/enc_tde.h"
+#include "pg_tde_guc.h"
+#include "pg_tde_event_capture.h"
+#include "smgr/pg_tde_smgr.h"
+#if PG_VERSION_NUM >= 180000
+#include "storage/aio.h"
+#include "storage/aio_subsys.h"
+#include "storage/bufmgr.h"
+#include "storage/proc.h"
+#include "storage/shmem.h"
+#endif
+
+typedef enum TDEMgrRelationEncryptionStatus
+{
+	/* This is a plaintext relation */
+	RELATION_NOT_ENCRYPTED = 0,
+
+	/* This is an encrypted relation, and we have the key available. */
+	RELATION_ENCRYPTED = 1,
+
+	/* Encryption status is unknown */
+	RELATION_ENCRYPTION_UNKNOWN = 2,
+} TDEMgrRelationEncryptionStatus;
+
+/*
+ * TDESMgrRelation is an extended copy of MDSMgrRelationData in md.c
+ *
+ * The first fields of this struct must always exactly match
+ * MDSMgrRelationData since we will pass this structure to the md.c functions.
+ *
+ * Any fields specific to the tde smgr must be placed after these fields.
+ */
+typedef struct TDESMgrRelation
+{
+	/* parent data */
+	SMgrRelationData reln;
+
+	/*
+	 * for md.c; per-fork arrays of the number of open segments
+	 * (md_num_open_segs) and the segments themselves (md_seg_fds).
+	 */
+	int			md_num_open_segs[MAX_FORKNUM + 1];
+	struct _MdfdVec *md_seg_fds[MAX_FORKNUM + 1];
+
+	TDEMgrRelationEncryptionStatus encryption_status;
+	InternalKey relKey;
+} TDESMgrRelation;
+
+typedef struct
+{
+	RelFileLocator rel;
+	InternalKey key;
+} TempRelKeyEntry;
+
+#define INIT_TEMP_RELS 16
+
+/*
+ * Each backend has a hashtable that stores the keys for all temproary tables.
+ */
+static HTAB *TempRelKeys = NULL;
+
+static SMgrId OurSMgrId = UINT8_MAX;
+
+static void tde_smgr_save_temp_key(const RelFileLocator *newrlocator, const InternalKey *key);
+static InternalKey *tde_smgr_get_temp_key(const RelFileLocator *rel);
+static bool tde_smgr_has_temp_key(const RelFileLocator *rel);
+static void tde_smgr_delete_temp_key(const RelFileLocator *rel);
+
+static void
+tde_smgr_log_create_key(const RelFileLocator *rlocator)
+{
+	XLogRelKey	xlrec = {.rlocator = *rlocator};
+
+	XLogBeginInsert();
+	XLogRegisterData((char *) &xlrec, sizeof(xlrec));
+	XLogInsert(RM_TDERMGR_ID, XLOG_TDE_CREATE_RELATION_KEY);
+}
+
+static void
+tde_smgr_log_delete_leftover_key(const RelFileLocator *rlocator)
+{
+	XLogRelKey	xlrec = {.rlocator = *rlocator};
+
+	XLogBeginInsert();
+	XLogRegisterData((char *) &xlrec, sizeof(xlrec));
+	XLogInsert(RM_TDERMGR_ID, XLOG_TDE_DELETE_RELATION_KEY);
+}
+
+static InternalKey *
+tde_smgr_create_key(const RelFileLocatorBackend *smgr_rlocator)
+{
+	InternalKey *key = palloc_object(InternalKey);
+
+	pg_tde_generate_internal_key(key, KeyLength);
+
+	if (RelFileLocatorBackendIsTemp(*smgr_rlocator))
+		tde_smgr_save_temp_key(&smgr_rlocator->locator, key);
+	else
+	{
+		pg_tde_save_smgr_key(smgr_rlocator->locator, key, true);
+		tde_smgr_log_create_key(&smgr_rlocator->locator);
+	}
+
+	return key;
+}
+
+void
+tde_smgr_create_key_redo(const RelFileLocator *rlocator)
+{
+	InternalKey key;
+
+	pg_tde_generate_internal_key(&key, KeyLength);
+	pg_tde_save_smgr_key(*rlocator, &key, false);
+}
+
+static void
+tde_smgr_delete_key(const RelFileLocatorBackend *smgr_rlocator)
+{
+	if (RelFileLocatorBackendIsTemp(*smgr_rlocator))
+		tde_smgr_delete_temp_key(&smgr_rlocator->locator);
+	else
+		pg_tde_free_key_map_entry(smgr_rlocator->locator);
+}
+
+static void
+tde_smgr_delete_leftover_key(const RelFileLocatorBackend *smgr_rlocator)
+{
+	if (!RelFileLocatorBackendIsTemp(*smgr_rlocator))
+	{
+		pg_tde_free_key_map_entry(smgr_rlocator->locator);
+		tde_smgr_log_delete_leftover_key(&smgr_rlocator->locator);
+	}
+}
+
+void
+tde_smgr_delete_leftover_key_redo(const RelFileLocator *rlocator)
+{
+	pg_tde_free_key_map_entry(*rlocator);
+}
+
+static bool
+tde_smgr_is_encrypted(const RelFileLocatorBackend *smgr_rlocator)
+{
+	if (RelFileLocatorBackendIsTemp(*smgr_rlocator))
+		return tde_smgr_has_temp_key(&smgr_rlocator->locator);
+	else
+		return pg_tde_has_smgr_key(smgr_rlocator->locator);
+}
+
+static InternalKey *
+tde_smgr_get_key(const RelFileLocatorBackend *smgr_rlocator)
+{
+	if (RelFileLocatorBackendIsTemp(*smgr_rlocator))
+		return tde_smgr_get_temp_key(&smgr_rlocator->locator);
+	else
+		return pg_tde_get_smgr_key(smgr_rlocator->locator);
+}
+
+static bool
+tde_smgr_should_encrypt(const RelFileLocatorBackend *smgr_rlocator, RelFileLocator *old_locator)
+{
+	/* Do not try to encrypt/decrypt catalog tables */
+	if (IsCatalogRelationOid(smgr_rlocator->locator.relNumber))
+		return false;
+
+	switch (currentTdeEncryptModeValidated())
+	{
+		case TDE_ENCRYPT_MODE_PLAIN:
+			return false;
+		case TDE_ENCRYPT_MODE_ENCRYPT:
+			return true;
+		case TDE_ENCRYPT_MODE_RETAIN:
+			if (old_locator)
+			{
+				RelFileLocatorBackend old_smgr_locator = {
+					.locator = *old_locator,
+					.backend = smgr_rlocator->backend,
+				};
+
+				return tde_smgr_is_encrypted(&old_smgr_locator);
+			}
+	}
+
+	return false;
+}
+
+/*
+ * Ensure the encryption status of the relation is known, and load the key if
+ * it is encrypted.
+ */
+static void
+tde_smgr_resolve_encryption_status(TDESMgrRelation *tdereln)
+{
+	InternalKey *key;
+
+	if (tdereln->encryption_status != RELATION_ENCRYPTION_UNKNOWN)
+		return;
+
+	key = tde_smgr_get_key(&tdereln->reln.smgr_rlocator);
+
+	if (key)
+	{
+		tdereln->relKey = *key;
+		tdereln->encryption_status = RELATION_ENCRYPTED;
+		pfree(key);
+	}
+	else
+	{
+		tdereln->encryption_status = RELATION_NOT_ENCRYPTED;
+	}
+}
+
+bool
+tde_smgr_rel_is_encrypted(SMgrRelation reln)
+{
+	TDESMgrRelation *tdereln = (TDESMgrRelation *) reln;
+
+	if (reln->smgr_which != OurSMgrId)
+		return false;
+
+	/*
+	 * We don't want to actually try to load the key here as we want this
+	 * function to work even if the principal key is not available
+	 */
+	if (tdereln->encryption_status == RELATION_ENCRYPTION_UNKNOWN)
+		return tde_smgr_is_encrypted(&reln->smgr_rlocator);
+
+	return tdereln->encryption_status == RELATION_ENCRYPTED;
+}
+
+#if PG_VERSION_NUM >= 170000
+
+static void
+tde_mdwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+			 const void **buffers, BlockNumber nblocks, bool skipFsync)
+{
+	TDESMgrRelation *tdereln = (TDESMgrRelation *) reln;
+
+	tde_smgr_resolve_encryption_status(tdereln);
+
+	if (tdereln->encryption_status == RELATION_NOT_ENCRYPTED)
+	{
+		mdwritev(reln, forknum, blocknum, buffers, nblocks, skipFsync);
+	}
+	else
+	{
+		unsigned char *local_blocks = palloc_aligned(BLCKSZ * nblocks, PG_IO_ALIGN_SIZE, 0);
+		void	  **local_buffers = palloc_array(void *, nblocks);
+
+		for (int i = 0; i < nblocks; ++i)
+		{
+			BlockNumber bn = blocknum + i;
+
+			local_buffers[i] = &local_blocks[i * BLCKSZ];
+
+			tde_encrypt_smgr_block(&tdereln->relKey, forknum, bn, ((unsigned char **) buffers)[i], local_buffers[i]);
+		}
+
+		mdwritev(reln, forknum, blocknum,
+				 (const void **) local_buffers, nblocks, skipFsync);
+
+		pfree(local_blocks);
+		pfree(local_buffers);
+	}
+}
+
+#else
+
+static void
+tde_mdwrite(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+			const void *buffer, bool skipFsync)
+{
+	TDESMgrRelation *tdereln = (TDESMgrRelation *) reln;
+
+	tde_smgr_resolve_encryption_status(tdereln);
+
+	if (tdereln->encryption_status == RELATION_NOT_ENCRYPTED)
+	{
+		mdwrite(reln, forknum, blocknum, buffer, skipFsync);
+	}
+	else
+	{
+		unsigned char *local_buffer = palloc_aligned(BLCKSZ, PG_IO_ALIGN_SIZE, 0);
+
+		tde_encrypt_smgr_block(&tdereln->relKey, forknum, blocknum, buffer, local_buffer);
+
+		mdwrite(reln, forknum, blocknum, local_buffer, skipFsync);
+
+		pfree(local_buffer);
+	}
+}
+
+#endif
+
+/*
+ * The current transaction might already be commited when this function is
+ * called, so do not call any code that uses ereport(ERROR) or otherwise tries
+ * to abort the transaction.
+ */
+static void
+tde_mdunlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
+{
+	mdunlink(rlocator, forknum, isRedo);
+
+	/*
+	 * As of PostgreSQL 17 we are called once per forks, no matter if they
+	 * exist or not, from smgrdounlinkall() so deleting the relation key on
+	 * attempting to delete the main fork is safe. Additionally since we
+	 * unlink the files after commit/abort we do not need to care about
+	 * concurrent accesses.
+	 *
+	 * We support InvalidForkNumber to be similar to mdunlink() but it can
+	 * actually never happen.
+	 */
+	if (forknum == MAIN_FORKNUM || forknum == InvalidForkNumber)
+	{
+		if (tde_smgr_is_encrypted(&rlocator))
+			tde_smgr_delete_key(&rlocator);
+	}
+}
+
+static void
+tde_mdextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+			 const void *buffer, bool skipFsync)
+{
+	TDESMgrRelation *tdereln = (TDESMgrRelation *) reln;
+
+	tde_smgr_resolve_encryption_status(tdereln);
+
+	if (tdereln->encryption_status == RELATION_NOT_ENCRYPTED)
+	{
+		mdextend(reln, forknum, blocknum, buffer, skipFsync);
+	}
+	else
+	{
+		unsigned char *local_blocks = palloc_aligned(BLCKSZ, PG_IO_ALIGN_SIZE, 0);
+
+		tde_encrypt_smgr_block(&tdereln->relKey, forknum, blocknum, ((unsigned char *) buffer), local_blocks);
+
+		mdextend(reln, forknum, blocknum, local_blocks, skipFsync);
+
+		pfree(local_blocks);
+	}
+}
+
+#if PG_VERSION_NUM >= 170000
+
+static void
+tde_mdreadv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+			void **buffers, BlockNumber nblocks)
+{
+	TDESMgrRelation *tdereln = (TDESMgrRelation *) reln;
+
+	mdreadv(reln, forknum, blocknum, buffers, nblocks);
+
+	tde_smgr_resolve_encryption_status(tdereln);
+
+	if (tdereln->encryption_status == RELATION_NOT_ENCRYPTED)
+		return;
+
+	for (int i = 0; i < nblocks; ++i)
+	{
+		BlockNumber bn = blocknum + i;
+		unsigned char *buf = ((unsigned char **) buffers)[i];
+
+		tde_decrypt_smgr_block(&tdereln->relKey, forknum, bn, buf, buf);
+	}
+}
+
+#else
+
+static void
+tde_mdread(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+		   void *buffer)
+{
+	TDESMgrRelation *tdereln = (TDESMgrRelation *) reln;
+
+	mdread(reln, forknum, blocknum, buffer);
+
+	tde_smgr_resolve_encryption_status(tdereln);
+
+	if (tdereln->encryption_status == RELATION_NOT_ENCRYPTED)
+		return;
+
+	tde_decrypt_smgr_block(&tdereln->relKey, forknum, blocknum, buffer, buffer);
+}
+
+#endif
+
+static void
+tde_mdcreate(RelFileLocator relold, SMgrRelation reln, ForkNumber forknum, bool isRedo)
+{
+	TDESMgrRelation *tdereln = (TDESMgrRelation *) reln;
+	InternalKey *key;
+
+	mdcreate(relold, reln, forknum, isRedo);
+
+	/*
+	 * Creating the key is handled by a separate WAL record on redo and
+	 * fetching the key can be delayed to when we actually need it like we do
+	 * for other forks anyway.
+	 */
+	if (isRedo)
+		return;
+
+	/*
+	 * When running pg_upgrade we do not want to overwrite any old keys. In
+	 * binary upgrade mode no new relfilenos are created so what we want to do
+	 * is to have copied the pg_tde directory with the keys before running
+	 * pg_upgrade and so we can just use exactly the same keys as we did in
+	 * the old cluster.
+	 */
+	if (IsBinaryUpgrade)
+		return;
+
+	/*
+	 * Only create keys when creating the main fork. Other forks are created
+	 * later and use the key which was created when creating the main fork.
+	 */
+	if (forknum != MAIN_FORKNUM)
+		return;
+
+	if (!tde_smgr_should_encrypt(&reln->smgr_rlocator, &relold))
+	{
+		/*
+		 * If we have a key for this relation already, we need to remove it.
+		 * This can happen if OID is re-used after a crash left a key for a
+		 * non-existing relation in the key file.
+		 *
+		 * Old keys for encrypted tables are replace when creating the new
+		 * key.
+		 */
+		tde_smgr_delete_leftover_key(&reln->smgr_rlocator);
+
+		tdereln->encryption_status = RELATION_NOT_ENCRYPTED;
+		return;
+	}
+
+	key = tde_smgr_create_key(&reln->smgr_rlocator);
+
+	tdereln->encryption_status = RELATION_ENCRYPTED;
+	tdereln->relKey = *key;
+	pfree(key);
+}
+
+/*
+ * mdopen() -- Initialize newly-opened relation.
+ *
+ * The current transaction might already be commited when this function is
+ * called, so do not call any code that uses ereport(ERROR) or otherwise tries
+ * to abort the transaction.
+ */
+static void
+tde_mdopen(SMgrRelation reln)
+{
+	TDESMgrRelation *tdereln = (TDESMgrRelation *) reln;
+
+	mdopen(reln);
+
+	tdereln->encryption_status = RELATION_ENCRYPTION_UNKNOWN;
+}
+
+#if PG_VERSION_NUM >= 180000
+
+/* Taken from src/backend/storage/aio/aio_init.c */
+static int
+AioChooseMaxConcurrency(void)
+{
+	uint32		max_backends;
+	int			max_proportional_pins;
+
+	/* Similar logic to LimitAdditionalPins() */
+	max_backends = MaxBackends + NUM_AUXILIARY_PROCS;
+	max_proportional_pins = NBuffers / max_backends;
+
+	max_proportional_pins = Max(max_proportional_pins, 1);
+
+	/* apply upper limit */
+	return Min(max_proportional_pins, 64);
+}
+
+/*
+ * Area in shared memory which has the capacity to store one InternalKey per
+ * IO handle.
+ *
+ * This way we can still have the backend which issues the IO fetch, decrypt
+ * and cache relation keys and then have it put the key in this array to pass
+ * it to the process completing the IO so it can use the key to decrypt the
+ * buffer. The IO handle ID is used to index the array.
+ *
+ * Allocating a slot for each IO handle may seem wasteful but it is no more
+ * wasteful than the allocation of IO handles itself.
+ */
+static InternalKey *tde_io_handle_keys;
+
+static Size
+tde_io_handle_keys_size(void)
+{
+	uint32		aio_procs;
+	uint32		io_handle_count;
+	int			max_concurrency;
+
+	if (io_max_concurrency == -1)
+		max_concurrency = AioChooseMaxConcurrency();
+	else
+		max_concurrency = io_max_concurrency;
+
+	/* pgaio_ctl->io_handle_count is not set yet, so re-implement logic */
+	aio_procs = MaxBackends + NUM_AUXILIARY_PROCS;
+	io_handle_count = aio_procs * max_concurrency;
+
+	return mul_size(io_handle_count, sizeof(InternalKey));
+}
+
+static void
+tde_io_handle_keys_init(void)
+{
+	bool		found;
+
+	tde_io_handle_keys = (InternalKey *)
+		ShmemInitStruct("tde_io_handle_keys", tde_io_handle_keys_size(), &found);
+}
+
+/*
+ * AIO completion callback for tde_mdstartreadv().
+ */
+static PgAioResult
+tde_readv_complete(PgAioHandle *ioh, PgAioResult prior_result, uint8 cb_data)
+{
+	PgAioTargetData *td = pgaio_io_get_target_data(ioh);
+	uint64	   *io_data;
+	uint8		handle_data_len;
+	InternalKey *int_key = &tde_io_handle_keys[pgaio_io_get_id(ioh)];
+
+	if (prior_result.status != PGAIO_RS_OK)
+		return prior_result;
+
+	io_data = pgaio_io_get_handle_data(ioh, &handle_data_len);
+
+	for (uint8 buf_off = 0; buf_off < handle_data_len; buf_off++)
+	{
+		Buffer		buf = io_data[buf_off];
+		char	   *buf_ptr = BufferGetBlock(buf);
+		BlockNumber bn = td->smgr.blockNum + buf_off;
+
+		if (prior_result.result <= buf_off)
+			break;
+
+		tde_decrypt_smgr_block(int_key, td->smgr.forkNum, bn, ((unsigned char *) buf_ptr), ((unsigned char *) buf_ptr));
+	}
+
+	return prior_result;
+}
+
+static PgAioHandleCallbackID PGAIO_HCB_TDE_READV = PGAIO_HCB_INVALID;
+
+/*
+ * Adds a callback which decrypts the pages and is executed after the md.c's
+ * AIO callback but before the callback's in the buffer manager.
+ *
+ * We communicate which key to use to decrypt using the tde_io_handle_keys
+ * array in shared memory.
+ */
+static void
+tde_mdstartreadv(PgAioHandle *ioh,
+				 SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+				 void **buffers, BlockNumber nblocks)
+{
+	TDESMgrRelation *tdereln = (TDESMgrRelation *) reln;
+
+	/* Load key in issuing backend: later we are in a critical section */
+	tde_smgr_resolve_encryption_status(tdereln);
+
+	if (tdereln->encryption_status == RELATION_ENCRYPTED)
+	{
+		/* Register decryption callback and connect key to IO handle */
+		tde_io_handle_keys[pgaio_io_get_id(ioh)] = tdereln->relKey;
+		pgaio_io_register_callbacks(ioh, PGAIO_HCB_TDE_READV, 0);
+	}
+
+	mdstartreadv(ioh, reln, forknum, blocknum, buffers, nblocks);
+}
+
+/*
+ * We use the same callback for both normal and temporary tables despite for
+ * simplicity. For temporary tables we could in theory move the decryption
+ * of the buffer from complete_shared to complete_local but it is unclear
+ * if that would reap any benefits.
+ */
+const static PgAioHandleCallbacks aio_tde_readv_cb = {
+	.complete_shared = tde_readv_complete,
+};
+
+#endif
+
+static void
+tde_mdclose(SMgrRelation reln, ForkNumber forknum)
+{
+	TDESMgrRelation *tdereln = (TDESMgrRelation *) reln;
+
+	mdclose(reln, forknum);
+
+	if (forknum == MAIN_FORKNUM)
+		tdereln->encryption_status = RELATION_ENCRYPTION_UNKNOWN;
+}
+
+static const struct f_smgr tde_smgr = {
+	.name = "tde",
+	.smgr_init = mdinit,
+	.smgr_shutdown = NULL,
+	.smgr_open = tde_mdopen,
+	.smgr_close = tde_mdclose,
+	.smgr_create = tde_mdcreate,
+	.smgr_exists = mdexists,
+	.smgr_unlink = tde_mdunlink,
+	.smgr_extend = tde_mdextend,
+	.smgr_zeroextend = mdzeroextend,
+	.smgr_prefetch = mdprefetch,
+	.smgr_writeback = mdwriteback,
+	.smgr_nblocks = mdnblocks,
+	.smgr_truncate = mdtruncate,
+	.smgr_immedsync = mdimmedsync,
+#if PG_VERSION_NUM >= 170000
+	.smgr_readv = tde_mdreadv,
+	.smgr_writev = tde_mdwritev,
+	.smgr_registersync = mdregistersync,
+#else
+	.smgr_read = tde_mdread,
+	.smgr_write = tde_mdwrite,
+#endif
+#if PG_VERSION_NUM >= 180000
+	.smgr_maxcombine = mdmaxcombine,
+	.smgr_startreadv = tde_mdstartreadv,
+	.smgr_fd = mdfd,
+#endif
+};
+
+void
+RegisterStorageMgr(void)
+{
+	if (storage_manager_id != MdSMgrId)
+		elog(FATAL, "Another storage manager was loaded before pg_tde. Multiple storage managers is unsupported.");
+	OurSMgrId = smgr_register(&tde_smgr, sizeof(TDESMgrRelation));
+	storage_manager_id = OurSMgrId;
+
+#if PERCONA_API_VERSION >= 3
+	percona_allow_upstream_smgr_api = false;
+#endif
+
+#if PG_VERSION_NUM >= 180000
+	PGAIO_HCB_TDE_READV = pgaio_io_register_callback_entry(&aio_tde_readv_cb, "aio_tde_readv_cb");
+#endif
+}
+
+Size
+TDESmgrShmemSize(void)
+{
+	Size		sz = 0;
+
+#if PG_VERSION_NUM >= 180000
+	sz = add_size(sz, tde_io_handle_keys_size());
+#endif
+
+	return sz;
+}
+
+void
+TDESmgrShmemInit(void)
+{
+#if PG_VERSION_NUM >= 180000
+	tde_io_handle_keys_init();
+#endif
+}
+
+static void
+tde_smgr_save_temp_key(const RelFileLocator *newrlocator, const InternalKey *key)
+{
+	TempRelKeyEntry *entry;
+	bool		found;
+
+	if (TempRelKeys == NULL)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = sizeof(RelFileLocator);
+		ctl.entrysize = sizeof(TempRelKeyEntry);
+		TempRelKeys = hash_create("pg_tde temporary relation keys",
+								  INIT_TEMP_RELS,
+								  &ctl,
+								  HASH_ELEM | HASH_BLOBS);
+	}
+
+	entry = (TempRelKeyEntry *) hash_search(TempRelKeys,
+											newrlocator,
+											HASH_ENTER, &found);
+	Assert(!found);
+
+	entry->key = *key;
+}
+
+static InternalKey *
+tde_smgr_get_temp_key(const RelFileLocator *rel)
+{
+	TempRelKeyEntry *entry;
+
+	if (TempRelKeys == NULL)
+		return NULL;
+
+	entry = hash_search(TempRelKeys, rel, HASH_FIND, NULL);
+
+	if (entry)
+	{
+		InternalKey *key = palloc_object(InternalKey);
+
+		*key = entry->key;
+		return key;
+	}
+
+	return NULL;
+}
+
+static bool
+tde_smgr_has_temp_key(const RelFileLocator *rel)
+{
+	return TempRelKeys && hash_search(TempRelKeys, rel, HASH_FIND, NULL);
+}
+
+static void
+tde_smgr_delete_temp_key(const RelFileLocator *rel)
+{
+	Assert(TempRelKeys);
+	hash_search(TempRelKeys, rel, HASH_REMOVE, NULL);
+}
