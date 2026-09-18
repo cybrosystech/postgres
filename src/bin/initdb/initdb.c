@@ -2219,18 +2219,20 @@ setup_pg_tde(FILE *cmdfd)
 	char	   *escaped_path = escape_quotes(tde_keyring_file);
 
 	/*
-	 * Name the schema explicitly.  backend_options pins search_path to
-	 * pg_catalog, so an unqualified CREATE EXTENSION would drop pg_tde's
-	 * functions into the system catalog schema.
+	 * backend_options pins search_path to pg_catalog, which cuts both ways
+	 * here: an unqualified CREATE EXTENSION would drop pg_tde's functions into
+	 * the system catalog schema, so name the schema; and having named it, the
+	 * calls below are then out of the search path, so qualify every one of
+	 * them too.
 	 */
 	PG_CMD_PUTS("CREATE EXTENSION pg_tde SCHEMA public;\n\n");
 
 	/* Record where keys live.  No key material is created by this. */
-	PG_CMD_PRINTF("SELECT pg_tde_add_global_key_provider_file('%s', '%s');\n\n",
+	PG_CMD_PRINTF("SELECT public.pg_tde_add_global_key_provider_file('%s', '%s');\n\n",
 				  TDE_PROVIDER_NAME, escaped_path);
 
 	/* Generate the principal key inside that keystore ... */
-	PG_CMD_PRINTF("SELECT pg_tde_create_key_using_global_key_provider('%s', '%s');\n\n",
+	PG_CMD_PRINTF("SELECT public.pg_tde_create_key_using_global_key_provider('%s', '%s');\n\n",
 				  TDE_KEY_NAME, TDE_PROVIDER_NAME);
 
 	/*
@@ -2242,11 +2244,11 @@ setup_pg_tde(FILE *cmdfd)
 	 * also means that call finds a server key already present and skips its
 	 * own attempt, so the two do not fight.
 	 */
-	PG_CMD_PRINTF("SELECT pg_tde_set_server_key_using_global_key_provider('%s', '%s');\n\n",
+	PG_CMD_PRINTF("SELECT public.pg_tde_set_server_key_using_global_key_provider('%s', '%s');\n\n",
 				  TDE_KEY_NAME, TDE_PROVIDER_NAME);
 
 	/* ... and as the fallback for every database without one of its own. */
-	PG_CMD_PRINTF("SELECT pg_tde_set_default_key_using_global_key_provider('%s', '%s');\n\n",
+	PG_CMD_PRINTF("SELECT public.pg_tde_set_default_key_using_global_key_provider('%s', '%s');\n\n",
 				  TDE_KEY_NAME, TDE_PROVIDER_NAME);
 
 	/*
@@ -3340,6 +3342,58 @@ initialize_data_directory(void)
 	 */
 	umask(pg_mode_mask);
 
+	/*
+	 * Settle where the pg_tde keyring goes and make sure it is usable, before
+	 * anything is created on disk.  The alternative is discovering the problem
+	 * from setup_pg_tde() several minutes later, by which point initdb has to
+	 * tear the whole data directory back down again.
+	 */
+	if (tde_keyring_dir == NULL)
+	{
+		/*
+		 * Anchor the default against the current directory when -D was given
+		 * as a relative path.  canonicalize_path() tidies pg_data but does not
+		 * make it absolute, and the path we derive here is stored in pg_tde's
+		 * key provider and reopened later by backends whose working directory
+		 * is PGDATA itself -- so a relative one is resolved against the wrong
+		 * place and the cluster cannot find its own keyring.
+		 */
+		if (is_absolute_path(pg_data))
+			tde_keyring_dir = psprintf("%s/pg_tde_keys", pg_data);
+		else
+		{
+			char		cwd[MAXPGPATH];
+
+			if (getcwd(cwd, sizeof(cwd)) == NULL)
+				pg_fatal("could not determine current directory: %m");
+
+			tde_keyring_dir = psprintf("%s/%s/pg_tde_keys", cwd, pg_data);
+			canonicalize_path(tde_keyring_dir);
+		}
+	}
+	else
+	{
+		canonicalize_path(tde_keyring_dir);
+		if (!is_absolute_path(tde_keyring_dir))
+			pg_fatal("TDE keyring directory location must be an absolute path");
+	}
+
+	tde_keyring_file = psprintf("%s/keyring.per", tde_keyring_dir);
+
+	/*
+	 * Refuse to build a cluster on top of another one's keyring.  pg_tde
+	 * stores keys by name, so the principal key we are about to create would
+	 * collide with the existing one; adopting that key instead would be worse,
+	 * silently giving two clusters the same principal key.
+	 */
+	if (access(tde_keyring_file, F_OK) == 0)
+	{
+		pg_log_error("TDE keyring file \"%s\" already exists", tde_keyring_file);
+		pg_log_error_detail("It belongs to a cluster that was initialized earlier.");
+		pg_log_error_hint("Give this cluster its own directory with --tde-keyring-dir, or remove the existing keyring if that cluster is gone.");
+		exit(1);
+	}
+
 	create_data_directory();
 
 	create_xlog_or_symlink();
@@ -3366,33 +3420,17 @@ initialize_data_directory(void)
 
 	/*
 	 * Create the directory pg_tde will keep the principal key in, so that
-	 * setup_pg_tde() can point a file key provider at it later.  Inside
-	 * PGDATA it is just one more subdirectory; when --tde-keyring-dir sends
-	 * it elsewhere the parent may not exist yet, so create the whole path.
+	 * setup_pg_tde() can point a file key provider at it later.  The path was
+	 * settled and validated at the top of this function; parents may still be
+	 * missing when --tde-keyring-dir points outside PGDATA, so create the
+	 * whole path, and reassert the mode because pg_mkdir_p leaves an existing
+	 * directory's permissions alone.
 	 */
-	if (tde_keyring_dir == NULL)
-	{
-		tde_keyring_dir = psprintf("%s/pg_tde_keys", pg_data);
+	if (pg_mkdir_p(tde_keyring_dir, pg_dir_create_mode) != 0)
+		pg_fatal("could not create directory \"%s\": %m", tde_keyring_dir);
 
-		if (mkdir(tde_keyring_dir, pg_dir_create_mode) < 0)
-			pg_fatal("could not create directory \"%s\": %m", tde_keyring_dir);
-	}
-	else
-	{
-		canonicalize_path(tde_keyring_dir);
-		if (!is_absolute_path(tde_keyring_dir))
-			pg_fatal("TDE keyring directory location must be an absolute path");
-
-		if (pg_mkdir_p(tde_keyring_dir, pg_dir_create_mode) != 0)
-			pg_fatal("could not create directory \"%s\": %m", tde_keyring_dir);
-
-		/* pg_mkdir_p leaves an existing directory's permissions alone */
-		if (chmod(tde_keyring_dir, pg_dir_create_mode) != 0)
-			pg_fatal("could not change permissions of \"%s\": %m",
-					 tde_keyring_dir);
-	}
-
-	tde_keyring_file = psprintf("%s/keyring.per", tde_keyring_dir);
+	if (chmod(tde_keyring_dir, pg_dir_create_mode) != 0)
+		pg_fatal("could not change permissions of \"%s\": %m", tde_keyring_dir);
 
 	check_ok();
 
