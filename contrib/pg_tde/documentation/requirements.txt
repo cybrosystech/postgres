@@ -1,0 +1,20 @@
+Markdown
+mkdocs
+mkdocs-versioning
+mkdocs-macros-plugin
+mkdocs-exclude
+markdown-include
+mkdocs-material
+mkdocs-with-pdf
+mkdocs-git-revision-date-localized-plugin
+mkdocs-material-extensions
+mkdocs-bootstrap-tables-plugin
+mkdocs-section-index
+mkdocs-htmlproofer-plugin
+mkdocs-meta-descriptions-plugin
+mike
+mkdocs-glightbox
+Pillow > 10.1.0 # Pillow is required for mkdocs-glightbox
+mkdocs-open-in-new-tab # added to fix the open in new tab issue with mkdocs-material
+mkdocs-open-in-new-tab
+mkdocs-print-site-plugin

@@ -1,0 +1,16 @@
+*		whitespace=space-before-tab,trailing-space
+*.[chly]	whitespace=space-before-tab,trailing-space,indent-with-non-tab,tabwidth=4
+*.pl		whitespace=space-before-tab,trailing-space,tabwidth=4
+*.pm		whitespace=space-before-tab,trailing-space,tabwidth=4
+*.po		whitespace=space-before-tab,trailing-space,tab-in-indent,-blank-at-eof
+*.sgml		whitespace=space-before-tab,trailing-space,tab-in-indent
+*.x[ms]l	whitespace=space-before-tab,trailing-space,tab-in-indent
+
+# Avoid confusing ASCII underlines with leftover merge conflict markers
+*.md		conflict-marker-size=32
+
+# Certain data files that contain special whitespace, and other special cases
+*.data						-whitespace
+
+# Test output files that contain extra whitespace
+*.out					-whitespace
