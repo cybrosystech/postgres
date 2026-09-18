@@ -39,7 +39,22 @@
 #include "receivelog.h"
 #include "streamutil.h"
 
+#include "access/pg_tde_xlog_keys.h"
+#include "access/pg_tde_xlog_smgr.h"
+#include "access/xlog_smgr.h"
+#include "catalog/tde_principal_key.h"
+#include "pg_tde.h"
+#include "pg_tde_fe.h"
+
+#define GLOBAL_DATA_TDE_OID 1664
+
+/* pg_tde.h pulls in a conflicting definition; ours must win */
+#undef ERRCODE_DATA_CORRUPTED
+
 #define ERRCODE_DATA_CORRUPTED	"XX001"
+
+/* -E given with no algorithm: take the key length from the server key */
+#define KEY_DATA_SIZE_DEFAULT 1
 
 typedef struct TablespaceListCell
 {
@@ -139,6 +154,7 @@ static bool showprogress = false;
 static bool estimatesize = true;
 static int	verbose = 0;
 static IncludeWal includewal = STREAM_WAL;
+static int	encrypt_wal_key_len = 0;
 static bool fastcheckpoint = false;
 static bool writerecoveryconf = false;
 static bool do_sync = true;
@@ -410,6 +426,9 @@ usage(void)
 	printf(_("      --waldir=WALDIR    location for the write-ahead log directory\n"));
 	printf(_("  -X, --wal-method=none|fetch|stream\n"
 			 "                         include required WAL files with specified method\n"));
+	printf(_("  -E, --encrypt-wal[=aes_128|aes_256]\n"
+			 "                         encrypt streamed WAL (optionally, encryption algorithm);\n"
+			 "                         if not set, uses the algorithm of the server key\n"));
 	printf(_("  -z, --gzip             compress tar output\n"));
 	printf(_("  -Z, --compress=[{client|server}-]METHOD[:DETAIL]\n"
 			 "                         compress on client or server as specified\n"));
@@ -562,6 +581,7 @@ LogStreamerMain(logstreamer_param *param)
 	stream.synchronous = false;
 	/* fsync happens at the end of pg_basebackup for all data */
 	stream.do_sync = false;
+	stream.encrypt = encrypt_wal_key_len;
 	stream.mark_done = true;
 	stream.partial_suffix = NULL;
 	stream.replication_slot = replication_slot;
@@ -655,6 +675,44 @@ StartLogStreamer(char *startpos, uint32 timeline, char *sysidentifier,
 			 PQserverVersion(conn) < MINIMUM_VERSION_FOR_PG_WAL ?
 			 "pg_xlog" : "pg_wal");
 
+	/*
+	 * When asked to encrypt the streamed WAL, set up the TDE storage manager
+	 * before the background streamer starts.  The server principal key is
+	 * copied into the backup so the restored cluster can unwrap the WAL key we
+	 * are about to generate.
+	 */
+	if (encrypt_wal_key_len)
+	{
+		char		tdedir[MAXPGPATH];
+		TDEPrincipalKey *principalKey;
+		int			keyLength = KEY_DATA_SIZE_128;
+
+		snprintf(tdedir, sizeof(tdedir), "%s/%s", basedir, PG_TDE_DATA_DIR);
+		pg_tde_fe_init(tdedir);
+		TDEXLogSmgrInit();
+
+		principalKey = GetPrincipalKey(GLOBAL_DATA_TDE_OID, NULL);
+		if (!principalKey)
+		{
+			pg_log_error("could not find server principal key");
+			pg_log_error_hint("Copy PGDATA/pg_tde from the source to the backup destination dir.");
+			exit(1);
+		}
+		pg_tde_save_server_key(principalKey, false);
+
+		/*
+		 * If no cipher was specified then take the key length from the
+		 * principal key, falling back to 128 bit.
+		 */
+		if (encrypt_wal_key_len != KEY_DATA_SIZE_DEFAULT)
+			keyLength = encrypt_wal_key_len;
+		else if (principalKey->keyLength == KEY_DATA_SIZE_128 ||
+				 principalKey->keyLength == KEY_DATA_SIZE_256)
+			keyLength = principalKey->keyLength;
+
+		TDEXLogSmgrInitWrite(true, keyLength);
+	}
+
 	/* Temporary replication slots are only supported in 10 and newer */
 	if (PQserverVersion(conn) < MINIMUM_VERSION_FOR_TEMP_SLOTS)
 		temp_replication_slot = false;
@@ -741,6 +799,38 @@ StartLogStreamer(char *startpos, uint32 timeline, char *sysidentifier,
 }
 
 /*
+ * Does this directory contain nothing except the named entry?
+ *
+ * Used to accept a backup target that has been pre-seeded with the pg_tde
+ * keyring, without weakening the general "target must be empty" rule.
+ */
+static bool
+dir_contains_only(const char *dirname, const char *only)
+{
+	DIR		   *dir;
+	struct dirent *de;
+	bool		result = true;
+
+	dir = opendir(dirname);
+	if (dir == NULL)
+		return false;
+
+	while ((de = readdir(dir)) != NULL)
+	{
+		if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+			continue;
+		if (strcmp(de->d_name, only) != 0)
+		{
+			result = false;
+			break;
+		}
+	}
+
+	closedir(dir);
+	return result;
+}
+
+/*
  * Verify that the given directory exists and is empty. If it does not
  * exist, it is created. If it exists but is not empty, an error will
  * be given and the process ended.
@@ -771,6 +861,17 @@ verify_dir_is_empty_or_create(char *dirname, bool *created, bool *found)
 		case 2:
 		case 3:
 		case 4:
+
+			/*
+			 * -E needs the keyring seeded into <basedir>/pg_tde before the
+			 * backup starts, so a target whose only content is that directory
+			 * is acceptable.  Anything else is refused exactly as upstream
+			 * does -- in particular this must not become a blanket exemption,
+			 * or pg_basebackup would silently write over an existing backup.
+			 */
+			if (dirname == basedir &&
+				dir_contains_only(dirname, PG_TDE_DATA_DIR))
+				return;
 
 			/*
 			 * Exists, not empty
@@ -1221,6 +1322,9 @@ CreateBackupStreamer(char *archive_name, char *spclocation,
 	 */
 	if (inject_manifest)
 		manifest_inject_streamer = streamer;
+
+	streamer = astreamer_pg_tde_injector_new(streamer, encrypt_wal_key_len,
+											 includewal == STREAM_WAL);
 
 	/*
 	 * If this is the main tablespace and we're supposed to write recovery
@@ -2356,6 +2460,7 @@ main(int argc, char **argv)
 		{"target", required_argument, NULL, 't'},
 		{"tablespace-mapping", required_argument, NULL, 'T'},
 		{"wal-method", required_argument, NULL, 'X'},
+		{"encrypt-wal", optional_argument, NULL, 'E'},
 		{"gzip", no_argument, NULL, 'z'},
 		{"compress", required_argument, NULL, 'Z'},
 		{"label", required_argument, NULL, 'l'},
@@ -2410,7 +2515,7 @@ main(int argc, char **argv)
 
 	atexit(cleanup_directories_atexit);
 
-	while ((c = getopt_long(argc, argv, "c:Cd:D:F:h:i:l:nNp:Pr:Rs:S:t:T:U:vwWX:zZ:",
+	while ((c = getopt_long(argc, argv, "c:Cd:D:EF:h:i:l:nNp:Pr:Rs:S:t:T:U:vwWX:zZ:",
 							long_options, &option_index)) != -1)
 	{
 		switch (c)
@@ -2522,6 +2627,20 @@ main(int argc, char **argv)
 				else
 					pg_fatal("invalid wal-method option \"%s\", must be \"fetch\", \"stream\", or \"none\"",
 							 optarg);
+				break;
+			case 'E':
+				encrypt_wal_key_len = KEY_DATA_SIZE_DEFAULT;
+
+				if (optarg)
+				{
+					if (strcmp(optarg, "aes_128") == 0)
+						encrypt_wal_key_len = KEY_DATA_SIZE_128;
+					else if (strcmp(optarg, "aes_256") == 0)
+						encrypt_wal_key_len = KEY_DATA_SIZE_256;
+					else
+						pg_fatal("invalid encryption option \"%s\", must be \"aes_128\" or \"aes_256\"",
+								 optarg);
+				}
 				break;
 			case 'z':
 				compression_algorithm = "gzip";
@@ -2699,6 +2818,26 @@ main(int argc, char **argv)
 		pg_log_error("replication slots can only be used with WAL streaming");
 		pg_log_error_hint("Try \"%s --help\" for more information.", progname);
 		exit(1);
+	}
+
+	/*
+	 * Sanity checks for WAL encryption.
+	 */
+	if (encrypt_wal_key_len)
+	{
+		if (includewal != STREAM_WAL)
+		{
+			pg_log_error("WAL encryption can only be used with WAL streaming");
+			pg_log_error_hint("Use -X stream with -E.");
+			exit(1);
+		}
+
+		if (format != 'p')
+		{
+			pg_log_error("cannot encrypt WAL in tar mode");
+			pg_log_error_hint("Use -Fp with -E.");
+			exit(1);
+		}
 	}
 
 	/*
