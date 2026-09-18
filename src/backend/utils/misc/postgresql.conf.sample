@@ -873,7 +873,7 @@
 
 #local_preload_libraries = ''
 #session_preload_libraries = ''
-shared_preload_libraries = 'pg_stat_statements,hypopg'	# (change requires restart)
+shared_preload_libraries = 'pg_stat_statements,hypopg,pg_tde'	# (change requires restart)
 #jit_provider = 'llvmjit'               # JIT library to use
 
 # - Other Defaults -
@@ -947,3 +947,16 @@ shared_preload_libraries = 'pg_stat_statements,hypopg'	# (change requires restar
 #------------------------------------------------------------------------------
 
 # Add settings for extensions here
+
+# pg_tde is preloaded above and initdb generates the cluster's principal key,
+# then writes the two settings below to postgresql.auto.conf.  They are not set
+# here because both are read before the key exists, and initdb would fail:
+#
+#   default_table_access_method = 'tde_heap'
+#   pg_tde.wal_encrypt = on
+#
+# To turn encryption off for a cluster, ALTER SYSTEM RESET them (the key and
+# the extension stay, so already-encrypted tables remain readable).
+
+#pg_tde.enforce_encryption = off        # reject creation of unencrypted tables
+#pg_tde.inherit_global_providers = on

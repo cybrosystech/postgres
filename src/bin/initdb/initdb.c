@@ -173,6 +173,25 @@ static int	wal_segment_size_mb = (DEFAULT_XLOG_SEG_SIZE) / (1024 * 1024);
 static DataDirSyncMethod sync_method = DATA_DIR_SYNC_METHOD_FSYNC;
 static bool sync_data_files = true;
 
+/*
+ * pg_tde setup.  In the dbblue distribution every cluster is encrypted out of
+ * the box: initdb creates the keyring directory, then generates the principal
+ * key and installs it as the cluster-wide default while the post-bootstrap
+ * backend is still running.  Without this the DBA has to do it by hand before
+ * any data is loaded, which is easy to forget and impossible to retrofit
+ * cleanly onto tables that were already written unencrypted.
+ *
+ * The keyring lands inside PGDATA unless --tde-keyring-dir says otherwise.
+ * That always works and keeps clusters on the same host from sharing one
+ * keyring, but it does put the principal key next to the data it protects;
+ * production installs should point this at separate storage.
+ */
+static char *tde_keyring_dir = NULL;
+static char *tde_keyring_file = NULL;
+
+#define TDE_PROVIDER_NAME	"global_file_provider"
+#define TDE_KEY_NAME		"odoo_default_key"
+
 
 /* internal vars */
 static const char *progname;
@@ -303,6 +322,7 @@ static void setup_privileges(FILE *cmdfd);
 static void set_info_version(void);
 static void setup_schema(FILE *cmdfd);
 static void load_plpgsql(FILE *cmdfd);
+static void setup_pg_tde(FILE *cmdfd);
 static void vacuum_db(FILE *cmdfd);
 static void make_template0(FILE *cmdfd);
 static void make_postgres(FILE *cmdfd);
@@ -2181,6 +2201,79 @@ load_plpgsql(FILE *cmdfd)
 }
 
 /*
+ * Install pg_tde and generate the cluster's principal key.
+ *
+ * This runs against template1 while the post-bootstrap backend is still up,
+ * and before make_template0() and make_postgres() clone template1, so all
+ * three databases end up carrying the extension.  Doing it here is what lets
+ * us skip the usual dance of flipping template0's datallowconn on, connecting
+ * to it to add the extension, and flipping it back off again.
+ *
+ * The standalone backend was started against the postgresql.conf written by
+ * setup_config(), which preloads pg_tde, so the key-management functions are
+ * available by the time we get here.
+ */
+static void
+setup_pg_tde(FILE *cmdfd)
+{
+	char	   *escaped_path = escape_quotes(tde_keyring_file);
+
+	/*
+	 * Name the schema explicitly.  backend_options pins search_path to
+	 * pg_catalog, so an unqualified CREATE EXTENSION would drop pg_tde's
+	 * functions into the system catalog schema.
+	 */
+	PG_CMD_PUTS("CREATE EXTENSION pg_tde SCHEMA public;\n\n");
+
+	/* Record where keys live.  No key material is created by this. */
+	PG_CMD_PRINTF("SELECT pg_tde_add_global_key_provider_file('%s', '%s');\n\n",
+				  TDE_PROVIDER_NAME, escaped_path);
+
+	/* Generate the principal key inside that keystore ... */
+	PG_CMD_PRINTF("SELECT pg_tde_create_key_using_global_key_provider('%s', '%s');\n\n",
+				  TDE_KEY_NAME, TDE_PROVIDER_NAME);
+
+	/*
+	 * ... install it as the server key, which is what WAL encryption wraps its
+	 * internal key with.  pg_tde_set_default_key_using_global_key_provider()
+	 * below would materialize a server key on its own, but only because of a
+	 * dbblue-local addition to it; ask for it explicitly so this does not
+	 * quietly stop working the next time pg_tde is rebased.  Running first
+	 * also means that call finds a server key already present and skips its
+	 * own attempt, so the two do not fight.
+	 */
+	PG_CMD_PRINTF("SELECT pg_tde_set_server_key_using_global_key_provider('%s', '%s');\n\n",
+				  TDE_KEY_NAME, TDE_PROVIDER_NAME);
+
+	/* ... and as the fallback for every database without one of its own. */
+	PG_CMD_PRINTF("SELECT pg_tde_set_default_key_using_global_key_provider('%s', '%s');\n\n",
+				  TDE_KEY_NAME, TDE_PROVIDER_NAME);
+
+	/*
+	 * The two settings below go through ALTER SYSTEM rather than
+	 * postgresql.conf.sample, because the sample is read before any of the
+	 * above has run and both would then fail closed:
+	 *
+	 * default_table_access_method would make every CREATE TABLE earlier in
+	 * this stream (information_schema, the system views) ask for an access
+	 * method that pg_tde has not registered yet.
+	 *
+	 * pg_tde.wal_encrypt is worse.  It is consumed in tde_shmem_startup(),
+	 * before a single statement executes, and pg_tde_create_wal_range() errors
+	 * out with "principal key not configured" when no server key exists -- so
+	 * with exit_on_error=true this backend would die and take initdb with it.
+	 *
+	 * Writing postgresql.auto.conf here affects only the next server start,
+	 * not this session, so the CREATE DATABASE calls that follow are
+	 * unaffected and the key is in place by the time either takes effect.
+	 */
+	PG_CMD_PUTS("ALTER SYSTEM SET default_table_access_method = 'tde_heap';\n\n");
+	PG_CMD_PUTS("ALTER SYSTEM SET pg_tde.wal_encrypt = on;\n\n");
+
+	free(escaped_path);
+}
+
+/*
  * clean everything up in template1
  */
 static void
@@ -2746,6 +2839,8 @@ usage(const char *progname)
 	printf(_("  -s, --show                show internal settings, then exit\n"));
 	printf(_("      --sync-method=METHOD  set method for syncing files to disk\n"));
 	printf(_("  -S, --sync-only           only sync database files to disk, then exit\n"));
+	printf(_("      --tde-keyring-dir=DIR  where pg_tde keeps the principal key\n"
+			 "                            (default: PGDATA/pg_tde_keys)\n"));
 	printf(_("\nOther options:\n"));
 	printf(_("  -V, --version             output version information, then exit\n"));
 	printf(_("  -?, --help                show this help, then exit\n"));
@@ -3269,6 +3364,36 @@ initialize_data_directory(void)
 		pfree(path);
 	}
 
+	/*
+	 * Create the directory pg_tde will keep the principal key in, so that
+	 * setup_pg_tde() can point a file key provider at it later.  Inside
+	 * PGDATA it is just one more subdirectory; when --tde-keyring-dir sends
+	 * it elsewhere the parent may not exist yet, so create the whole path.
+	 */
+	if (tde_keyring_dir == NULL)
+	{
+		tde_keyring_dir = psprintf("%s/pg_tde_keys", pg_data);
+
+		if (mkdir(tde_keyring_dir, pg_dir_create_mode) < 0)
+			pg_fatal("could not create directory \"%s\": %m", tde_keyring_dir);
+	}
+	else
+	{
+		canonicalize_path(tde_keyring_dir);
+		if (!is_absolute_path(tde_keyring_dir))
+			pg_fatal("TDE keyring directory location must be an absolute path");
+
+		if (pg_mkdir_p(tde_keyring_dir, pg_dir_create_mode) != 0)
+			pg_fatal("could not create directory \"%s\": %m", tde_keyring_dir);
+
+		/* pg_mkdir_p leaves an existing directory's permissions alone */
+		if (chmod(tde_keyring_dir, pg_dir_create_mode) != 0)
+			pg_fatal("could not change permissions of \"%s\": %m",
+					 tde_keyring_dir);
+	}
+
+	tde_keyring_file = psprintf("%s/keyring.per", tde_keyring_dir);
+
 	check_ok();
 
 	/* Top level PG_VERSION is checked by bootstrapper, so make it first */
@@ -3332,6 +3457,8 @@ initialize_data_directory(void)
 
 	load_plpgsql(cmdfd);
 
+	setup_pg_tde(cmdfd);
+
 	vacuum_db(cmdfd);
 
 	make_template0(cmdfd);
@@ -3390,6 +3517,7 @@ main(int argc, char *argv[])
 		{"no-data-checksums", no_argument, NULL, 20},
 		{"no-sync-data-files", no_argument, NULL, 21},
 		{"no-auto-tune", no_argument, NULL, 22},
+		{"tde-keyring-dir", required_argument, NULL, 23},
 		{NULL, 0, NULL, 0}
 	};
 
@@ -3589,6 +3717,9 @@ main(int argc, char *argv[])
 				break;
 			case 22:
 				auto_tune_enabled = false;
+				break;
+			case 23:
+				tde_keyring_dir = pg_strdup(optarg);
 				break;
 			default:
 				/* getopt_long already emitted a complaint */
