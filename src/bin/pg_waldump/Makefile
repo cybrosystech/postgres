@@ -20,8 +20,22 @@ OBJS = \
 	xlogreader.o \
 	xlogstats.o
 
-override CPPFLAGS := -DFRONTEND -I$(libpq_srcdir) $(CPPFLAGS)
+# External libraries libpgtde depends on.  TODO: move to Makefile.global.in
+# once the remaining client utilities are converted, so it is declared once.
+TDE_LIBS = -lssl -lcrypto -lcurl
+
+override CPPFLAGS := -DFRONTEND -I$(libpq_srcdir) \
+	-I$(top_srcdir)/src/include/tde \
+	$(CPPFLAGS)
 LDFLAGS_INTERNAL += -L$(top_builddir)/src/fe_utils -lpgfeutils
+
+# libpgtde resolves its json/base64/list references against libpgcommon and
+# libpgfeutils, so those must be repeated after it on the link line.
+LIBS += -L$(top_builddir)/src/common/tde -lpgtde \
+	-L$(top_builddir)/src/fe_utils -lpgfeutils \
+	-L$(top_builddir)/src/common -lpgcommon \
+	-L$(top_builddir)/src/port -lpgport \
+	$(TDE_LIBS)
 
 RMGRDESCSOURCES = $(sort $(notdir $(wildcard $(top_srcdir)/src/backend/access/rmgrdesc/*desc*.c)))
 RMGRDESCOBJS = $(patsubst %.c,%.o,$(RMGRDESCSOURCES))
