@@ -26,7 +26,17 @@ export TAR
 # name.
 export GZIP_PROGRAM=$(GZIP)
 
-override CPPFLAGS := -I$(libpq_srcdir) $(CPPFLAGS)
+TDE_LIBS = -lssl -lcrypto -lcurl
+
+override CPPFLAGS := -I$(libpq_srcdir) -I$(top_srcdir)/src/include/tde $(CPPFLAGS)
+
+# libpgtde resolves its json/base64/list references against libpgcommon and
+# libpgfeutils, so those must be repeated after it on the link line.
+LIBS += -L$(top_builddir)/src/common/tde -lpgtde \
+	-L$(top_builddir)/src/fe_utils -lpgfeutils \
+	-L$(top_builddir)/src/common -lpgcommon \
+	-L$(top_builddir)/src/port -lpgport \
+	$(TDE_LIBS)
 LDFLAGS_INTERNAL += -L$(top_builddir)/src/fe_utils -lpgfeutils $(libpq_pgport)
 
 OBJS = \
