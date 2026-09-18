@@ -15,6 +15,9 @@
 #include "fe_utils/astreamer.h"
 #include "pqexpbuffer.h"
 
+extern astreamer *astreamer_pg_tde_injector_new(astreamer *next,
+												 bool encrypted_wal,
+												 bool streaming_wal);
 extern astreamer *astreamer_recovery_injector_new(astreamer *next,
 												  bool is_recovery_guc_supported,
 												  PQExpBuffer recoveryconfcontents);
