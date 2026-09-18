@@ -1,6 +1,7 @@
 # Copyright (c) 2022-2026, PostgreSQL Global Development Group
 
 common_sources = files(
+  'xlog_smgr.c',
   'archive.c',
   'base64.c',
   'binaryheap.c',
@@ -213,3 +214,5 @@ common_excluded_shlib = static_library('libpgcommon_excluded_shlib',
 )
 
 subdir('unicode')
+
+subdir('tde')

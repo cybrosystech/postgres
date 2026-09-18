@@ -25,6 +25,7 @@ SUBDIRS = \
 	backend/replication/pgoutput \
 	backend/replication/pgrepack \
 	fe_utils \
+	common/tde \
 	bin \
 	pl \
 	makefiles \
