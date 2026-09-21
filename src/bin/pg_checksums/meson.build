@@ -13,7 +13,7 @@ endif
 pg_checksums = executable('pg_checksums',
   pg_checksums_sources,
   include_directories: [timezone_inc],
-  dependencies: [frontend_code],
+  dependencies: [frontend_code, tde_code],
   kwargs: default_bin_args,
 )
 bin_targets += pg_checksums

@@ -20,6 +20,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "catalog/pg_tablespace_d.h"
 #include "common/controldata_utils.h"
 #include "common/file_utils.h"
 #include "common/logging.h"
@@ -31,6 +32,10 @@
 #include "storage/bufpage.h"
 #include "storage/checksum.h"
 #include "storage/checksum_impl.h"
+
+#include "access/pg_tde_tdemap.h"
+#include "pg_tde.h"
+#include "pg_tde_fe.h"
 
 
 static int64 files_scanned = 0;
@@ -44,6 +49,7 @@ static char *only_filenode = NULL;
 static bool do_sync = true;
 static bool verbose = false;
 static bool showprogress = false;
+static bool no_tde = false;
 static DataDirSyncMethod sync_method = DATA_DIR_SYNC_METHOD_FSYNC;
 
 typedef enum
@@ -77,6 +83,8 @@ usage(void)
 	printf(_("  -e, --enable             enable data checksums\n"));
 	printf(_("  -f, --filenode=FILENODE  check only relation with specified filenode\n"));
 	printf(_("  -N, --no-sync            do not wait for changes to be written safely to disk\n"));
+	printf(_("      --no-tde             cluster has no encrypted relations; do not require\n"
+			 "                           the pg_tde key directory\n"));
 	printf(_("  -P, --progress           show progress information\n"));
 	printf(_("      --sync-method=METHOD set method for syncing files to disk\n"));
 	printf(_("  -v, --verbose            output verbose messages\n"));
@@ -115,6 +123,62 @@ static const struct exclude_list_item skip[] = {
 #endif
 	{NULL, false}
 };
+
+/*
+ * Point the TDE machinery at this cluster's keys.
+ *
+ * A checksum lives in the page header, and pg_tde encrypts the whole page,
+ * header included -- so for an encrypted relation the bytes on disk are
+ * ciphertext all the way through and the checksum can only be verified or
+ * recomputed on the decrypted page.  The backend never has this problem
+ * because smgr decrypts before PageIsVerified() runs; an offline tool has to
+ * do that step itself.
+ *
+ * Note this relies on pg_checksums never chdir()ing into DataDir, so a path
+ * built from it stays valid for the whole run.
+ */
+static void
+pg_tde_init(const char *datadir)
+{
+	char		tdedir[MAXPGPATH];
+	struct stat st;
+
+	snprintf(tdedir, sizeof(tdedir), "%s/%s", datadir, PG_TDE_DATA_DIR);
+
+	/*
+	 * Refuse to rewrite pages when the keys are not where they should be.
+	 *
+	 * Without them every relation looks unencrypted: we would skip the
+	 * decrypt, checksum the ciphertext, and write that checksum back into the
+	 * still-encrypted page -- destroying the page header, silently, while
+	 * reporting success.  That is the exact damage stock pg_checksums does,
+	 * so failing to find the keys must not be a quiet fallback.
+	 *
+	 * initdb always creates this directory, so on a dbblue cluster its
+	 * absence means something is wrong -- most likely separate key storage
+	 * that has not been mounted, or a restore that omitted it.  --check only
+	 * reads, so a warning is enough there; --enable must stop.  A genuinely
+	 * unencrypted cluster (one from stock PostgreSQL, say) can say so with
+	 * --no-tde.
+	 */
+	if (stat(tdedir, &st) != 0 || !S_ISDIR(st.st_mode))
+	{
+		if (no_tde)
+			 /* the user has told us there is nothing to decrypt */ ;
+		else if (mode == PG_MODE_ENABLE)
+		{
+			pg_log_error("TDE key directory \"%s\" is missing or unreadable", tdedir);
+			pg_log_error_detail("Rewriting checksums without the keys would corrupt every encrypted page.");
+			pg_log_error_hint("Restore or mount the key directory, or pass --no-tde if this cluster has no encrypted relations.");
+			exit(1);
+		}
+		else
+			pg_log_warning("TDE key directory \"%s\" is missing or unreadable; encrypted relations will be reported as corrupt",
+						   tdedir);
+	}
+
+	pg_tde_fe_init(tdedir);
+}
 
 /*
  * Report current progress status.  Parts borrowed from
@@ -173,7 +237,8 @@ skipfile(const char *fn)
 }
 
 static void
-scan_file(const char *fn, int segmentno)
+scan_file(const char *fn, Oid spcOid, Oid dbOid, RelFileNumber relNumber,
+		  ForkNumber forknum, int segmentno)
 {
 	PGIOAlignedBlock buf;
 	PageHeader	header = (PageHeader) buf.data;
@@ -181,6 +246,8 @@ scan_file(const char *fn, int segmentno)
 	BlockNumber blockno;
 	int			flags;
 	int64		blocks_written_in_file = 0;
+	RelFileLocator locator = {.spcOid = spcOid, .dbOid = dbOid, .relNumber = relNumber};
+	InternalKey *key = NULL;
 
 	Assert(mode == PG_MODE_ENABLE ||
 		   mode == PG_MODE_CHECK);
@@ -192,6 +259,17 @@ scan_file(const char *fn, int segmentno)
 		pg_fatal("could not open file \"%s\": %m", fn);
 
 	files_scanned++;
+
+	/*
+	 * A file we could not pin down to a relation and fork is not something we
+	 * can look a key up for, so treat it as unencrypted rather than guessing.
+	 * spcOid is invalid for anything sitting directly in pg_tblspc/, which is
+	 * normally only symlinks but can pick up stray files; upstream asserts
+	 * here instead, which turns such a file into an abort on an assert-enabled
+	 * build rather than the harmless scan stock pg_checksums would do.
+	 */
+	if (forknum != InvalidForkNumber && spcOid != InvalidOid)
+		key = pg_tde_get_smgr_key(locator);
 
 	for (blockno = 0;; blockno++)
 	{
@@ -218,6 +296,16 @@ scan_file(const char *fn, int segmentno)
 		 * calculated using those counters may not reach 100%.
 		 */
 		current_size += r;
+
+		/*
+		 * Everything below works on the plaintext page.  The IV is derived
+		 * from the fork and the absolute block number, so the segment offset
+		 * has to be folded in here -- getting that arithmetic wrong decrypts
+		 * with the wrong IV and silently produces garbage.
+		 */
+		if (key)
+			tde_decrypt_smgr_block(key, forknum, blockno + segmentno * RELSEG_SIZE,
+								   (unsigned char *) buf.data, (unsigned char *) buf.data);
 
 		/* New pages have no checksum yet */
 		if (PageIsNew(buf.data))
@@ -250,6 +338,11 @@ scan_file(const char *fn, int segmentno)
 			/* Set checksum in page header */
 			header->pd_checksum = csum;
 
+			/* Re-encrypt before it goes back to disk */
+			if (key)
+				tde_encrypt_smgr_block(key, forknum, blockno + segmentno * RELSEG_SIZE,
+									   (unsigned char *) buf.data, (unsigned char *) buf.data);
+
 			/* Seek back to beginning of block */
 			if (lseek(f, -BLCKSZ, SEEK_CUR) < 0)
 				pg_fatal("seek failed for block %u in file \"%s\": %m", blockno, fn);
@@ -270,6 +363,9 @@ scan_file(const char *fn, int segmentno)
 		if (showprogress)
 			progress_report(false);
 	}
+
+	if (key)
+		pfree(key);
 
 	if (verbose)
 	{
@@ -297,7 +393,8 @@ scan_file(const char *fn, int segmentno)
  * the total size of the data directory for progress reports.
  */
 static int64
-scan_directory(const char *basedir, const char *subdir, bool sizeonly)
+scan_directory(const char *basedir, const char *subdir, Oid tablespace,
+			   bool sizeonly)
 {
 	int64		dirsize = 0;
 	char		path[MAXPGPATH];
@@ -342,6 +439,7 @@ scan_directory(const char *basedir, const char *subdir, bool sizeonly)
 			char	   *forkpath,
 					   *segmentpath;
 			int			segmentno = 0;
+			ForkNumber	forknum = MAIN_FORKNUM;
 
 			if (skipfile(de->d_name))
 				continue;
@@ -371,6 +469,10 @@ scan_directory(const char *basedir, const char *subdir, bool sizeonly)
 				/* filenode not to be included */
 				continue;
 
+			/* The fork selects the IV, so it has to be recovered here */
+			if (forkpath != NULL)
+				forknum = forkname_to_number(forkpath);
+
 			dirsize += st.st_size;
 
 			/*
@@ -378,7 +480,8 @@ scan_directory(const char *basedir, const char *subdir, bool sizeonly)
 			 * the items in the data folder.
 			 */
 			if (!sizeonly)
-				scan_file(fn, segmentno);
+				scan_file(fn, tablespace, atooid(subdir), atooid(fnonly),
+						  forknum, segmentno);
 		}
 		else if (S_ISDIR(st.st_mode) || S_ISLNK(st.st_mode))
 		{
@@ -417,11 +520,12 @@ scan_directory(const char *basedir, const char *subdir, bool sizeonly)
 				/* Looks like a valid tablespace location */
 				dirsize += scan_directory(tblspc_path,
 										  TABLESPACE_VERSION_DIRECTORY,
+										  atooid(de->d_name),
 										  sizeonly);
 			}
 			else
 			{
-				dirsize += scan_directory(path, de->d_name, sizeonly);
+				dirsize += scan_directory(path, de->d_name, tablespace, sizeonly);
 			}
 		}
 	}
@@ -442,6 +546,7 @@ main(int argc, char *argv[])
 		{"progress", no_argument, NULL, 'P'},
 		{"verbose", no_argument, NULL, 'v'},
 		{"sync-method", required_argument, NULL, 1},
+		{"no-tde", no_argument, NULL, 2},
 		{NULL, 0, NULL, 0}
 	};
 
@@ -505,6 +610,9 @@ main(int argc, char *argv[])
 			case 1:
 				if (!parse_sync_method(optarg, &sync_method))
 					exit(1);
+				break;
+			case 2:
+				no_tde = true;
 				break;
 			default:
 				/* getopt_long already emitted a complaint */
@@ -597,6 +705,8 @@ main(int argc, char *argv[])
 		mode == PG_MODE_ENABLE)
 		pg_fatal("data checksums are already enabled in cluster");
 
+	pg_tde_init(DataDir);
+
 	/* Operate on all files if checking or enabling checksums */
 	if (mode == PG_MODE_CHECK || mode == PG_MODE_ENABLE)
 	{
@@ -607,14 +717,14 @@ main(int argc, char *argv[])
 		 */
 		if (showprogress)
 		{
-			total_size = scan_directory(DataDir, "global", true);
-			total_size += scan_directory(DataDir, "base", true);
-			total_size += scan_directory(DataDir, PG_TBLSPC_DIR, true);
+			total_size = scan_directory(DataDir, "global", GLOBALTABLESPACE_OID, true);
+			total_size += scan_directory(DataDir, "base", DEFAULTTABLESPACE_OID, true);
+			total_size += scan_directory(DataDir, PG_TBLSPC_DIR, InvalidOid, true);
 		}
 
-		(void) scan_directory(DataDir, "global", false);
-		(void) scan_directory(DataDir, "base", false);
-		(void) scan_directory(DataDir, PG_TBLSPC_DIR, false);
+		(void) scan_directory(DataDir, "global", GLOBALTABLESPACE_OID, false);
+		(void) scan_directory(DataDir, "base", DEFAULTTABLESPACE_OID, false);
+		(void) scan_directory(DataDir, PG_TBLSPC_DIR, InvalidOid, false);
 
 		if (showprogress)
 			progress_report(true);
