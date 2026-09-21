@@ -60,6 +60,11 @@
 #include "pg_getopt.h"
 #include "storage/large_object.h"
 
+#include "access/xlog_smgr.h"
+#include "access/pg_tde_xlog_smgr.h"
+#include "pg_tde.h"
+#include "pg_tde_fe.h"
+
 static ControlFileData ControlFile; /* pg_control values */
 static XLogSegNo newXlogSegNo;	/* new XLOG segment # */
 static bool guessed = false;	/* T if we had to guess at any values */
@@ -432,6 +437,20 @@ main(int argc, char *argv[])
 	}
 
 	/*
+	 * Give the TDE machinery access to the cluster's keys, and install pg_tde
+	 * as the WAL storage manager so that WriteEmptyXLOG() writes through it.
+	 *
+	 * This has to come after the chdir() above, not before: pg_tde_fe_init()
+	 * only records the path, and the files under it are opened much later, by
+	 * which point the working directory is PGDATA.  Passing DataDir here would
+	 * therefore break for a relative -D, in the same way the rest of this
+	 * program already relies on being inside PGDATA ("postmaster.pid" just
+	 * above, XLOGDIR in KillExistingXLOG(), "." in RewriteControlFile()).
+	 */
+	pg_tde_fe_init(PG_TDE_DATA_DIR);
+	TDEXLogSmgrInit();
+
+	/*
 	 * Attempt to read the existing pg_control file
 	 */
 	if (!read_controlfile())
@@ -545,6 +564,23 @@ main(int argc, char *argv[])
 		pg_log_error_hint("If you want to proceed anyway, use -f to force reset.");
 		exit(1);
 	}
+
+	/*
+	 * The only thing the new WAL will contain is a checkpoint, which holds no
+	 * user data, so we write it unencrypted.  We still have to go through the
+	 * TDE smgr, because the WAL key range has to be told about it: if the last
+	 * range was "encrypted" a new "unencrypted" range is opened here to mark
+	 * the boundary, and if it was already "unencrypted" it is reused.  Without
+	 * this the surviving range still claims everything from its start onwards
+	 * is encrypted -- and since the reset moves the redo pointer forward, past
+	 * that start, startup would try to decrypt a checkpoint that was never
+	 * encrypted and fail to find a valid one.
+	 *
+	 * This is deliberately down here rather than next to TDEXLogSmgrInit(),
+	 * because it mutates the key file.  Everything above can still bail out,
+	 * including the -n dry run, which must leave the cluster untouched.
+	 */
+	TDEXLogSmgrInitUnencryptedWrite();
 
 	/*
 	 * Else, do the dirty deed.
@@ -1186,13 +1222,24 @@ WriteEmptyXLOG(void)
 		pg_fatal("could not open file \"%s\": %m", path);
 
 	errno = 0;
-	if (write(fd, buffer.data, XLOG_BLCKSZ) != XLOG_BLCKSZ)
+	if (xlog_smgr->seg_write(fd, buffer.data, XLOG_BLCKSZ, 0,
+							 ControlFile.checkPointCopy.ThisTimeLineID,
+							 newXlogSegNo, WalSegSz) != XLOG_BLCKSZ)
 	{
 		/* if write didn't set errno, assume problem is no disk space */
 		if (errno == 0)
 			errno = ENOSPC;
 		pg_fatal("could not write file \"%s\": %m", path);
 	}
+
+	/*
+	 * seg_write() takes an explicit offset and leaves the descriptor's file
+	 * position where it was, unlike the write() this replaced.  Advance it by
+	 * hand, or the zero-fill below starts at offset 0 and overwrites the
+	 * checkpoint we just wrote.
+	 */
+	if (lseek(fd, XLOG_BLCKSZ, SEEK_SET) < 0)
+		pg_fatal("could not seek in file \"%s\": %m", path);
 
 	/* Fill the rest of the file with zeroes */
 	memset(buffer.data, 0, XLOG_BLCKSZ);

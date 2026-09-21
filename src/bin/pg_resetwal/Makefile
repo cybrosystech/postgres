@@ -17,6 +17,21 @@ include $(top_builddir)/src/Makefile.global
 
 LDFLAGS_INTERNAL += -L$(top_builddir)/src/fe_utils -lpgfeutils
 
+# External libraries libpgtde depends on.  Kept in step with src/bin/pg_waldump.
+TDE_LIBS = -lssl -lcrypto -lcurl
+
+override CPPFLAGS := -DFRONTEND \
+	-I$(top_srcdir)/src/include/tde \
+	$(CPPFLAGS)
+
+# libpgtde resolves its json/base64/list references against libpgcommon and
+# libpgfeutils, so those must be repeated after it on the link line.
+LIBS += -L$(top_builddir)/src/common/tde -lpgtde \
+	-L$(top_builddir)/src/fe_utils -lpgfeutils \
+	-L$(top_builddir)/src/common -lpgcommon \
+	-L$(top_builddir)/src/port -lpgport \
+	$(TDE_LIBS)
+
 OBJS = \
 	$(WIN32RES) \
 	pg_resetwal.o

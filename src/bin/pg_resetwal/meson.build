@@ -12,7 +12,7 @@ endif
 
 pg_resetwal = executable('pg_resetwal',
   pg_resetwal_sources,
-  dependencies: [frontend_code],
+  dependencies: [frontend_code, tde_code],
   kwargs: default_bin_args,
 )
 bin_targets += pg_resetwal
