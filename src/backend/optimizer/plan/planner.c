@@ -8046,7 +8046,7 @@ probe_side_provably_total(PlannerInfo *root, HashPath *hpath,
 	ListCell   *lc1,
 			   *lc2;
 
-	if (!hashjoin_is_pure_equijoin(hpath))
+	if (!hashjoin_is_pure_equijoin(hpath)) /* no extra ON clauses other than the hashkey*/
 		return false;
 
 	Assert(nkeys > 0 && nkeys == list_length(probe_vars));
