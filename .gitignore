@@ -43,3 +43,10 @@ lib*.pc
 /Release/
 /tmp_install/
 /portlock/
+/bin/
+/lib/
+/include/
+/share/
+/pg_data/
+/logfile
+contrib/pg_tde/build/
