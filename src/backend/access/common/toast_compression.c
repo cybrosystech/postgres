@@ -37,6 +37,9 @@
 /* GUC */
 int			default_toast_compression = DEFAULT_TOAST_COMPRESSION;
 
+/* set by contrib/zstd_toast_reader on a build without USE_ZSTD */
+zstd_decompress_datum_hook_type zstd_decompress_datum_hook = NULL;
+
 #define NO_COMPRESSION_SUPPORT(method) \
 	ereport(ERROR, \
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED), \
@@ -313,6 +316,8 @@ varlena *
 zstd_decompress_datum(const varlena *value)
 {
 #ifndef USE_ZSTD
+	if (zstd_decompress_datum_hook)
+		return zstd_decompress_datum_hook(value);
 	NO_COMPRESSION_SUPPORT("zstd");
 	return NULL;				/* keep compiler quiet */
 #else
@@ -347,14 +352,14 @@ zstd_decompress_datum(const varlena *value)
  * so we decompress the whole value and then copy out the requested prefix.
  * This matches the behaviour Postgres uses for lz4 versions that lack
  * partial-decode support.
+ *
+ * This delegates to zstd_decompress_datum() for the actual decompression,
+ * so it works unmodified whether that came from a compiled-in USE_ZSTD or
+ * from zstd_decompress_datum_hook.
  */
 varlena *
 zstd_decompress_datum_slice(const varlena *value, int32 slicelength)
 {
-#ifndef USE_ZSTD
-	NO_COMPRESSION_SUPPORT("zstd");
-	return NULL;				/* keep compiler quiet */
-#else
 	varlena    *full;
 	varlena    *result;
 	int32		rawsize;
@@ -370,7 +375,6 @@ zstd_decompress_datum_slice(const varlena *value, int32 slicelength)
 
 	pfree(full);
 	return result;
-#endif
 }
 
 /*
@@ -423,9 +427,15 @@ CompressionNameToMethod(const char *compression)
 	}
 	else if (strcmp(compression, "zstd") == 0)
 	{
-#ifndef USE_ZSTD
-		NO_COMPRESSION_SUPPORT("zstd");
-#endif
+		/*
+		 * Unlike lz4 above, don't reject this here even without USE_ZSTD:
+		 * "zstd" is always a selectable compression method (CREATE/ALTER
+		 * TABLE ... COMPRESSION zstd, or default_toast_compression = zstd),
+		 * so that it stays settable regardless of build.  Actual capability
+		 * is checked lazily, when compression is really attempted, by
+		 * zstd_compress_datum() -- which also gives the same "requires the
+		 * server to be built with zstd support" error, at that point.
+		 */
 		return TOAST_ZSTD_COMPRESSION;
 	}
 

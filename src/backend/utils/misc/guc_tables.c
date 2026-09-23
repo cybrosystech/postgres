@@ -474,9 +474,14 @@ static const struct config_enum_entry default_toast_compression_options[] = {
 #ifdef  USE_LZ4
 	{"lz4", TOAST_LZ4_COMPRESSION, false},
 #endif
-#ifdef  USE_ZSTD
+	/*
+	 * zstd is always selectable, even on a build without USE_ZSTD, so that
+	 * SET/ALTER SYSTEM and per-column COMPRESSION zstd behave the same way:
+	 * accepted here, and only rejected once real compression work is
+	 * attempted (see zstd_compress_datum(), which gives a clear "requires
+	 * the server to be built with zstd support" error at that point).
+	 */
 	{"zstd", TOAST_ZSTD_COMPRESSION, false},
-#endif
 	{NULL, 0, false}
 };
 
