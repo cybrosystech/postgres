@@ -8,6 +8,15 @@
 #define PG_TDE_DATA_DIR	"pg_tde"
 #define PG_TDE_WAL_KEY_FILE_NAME "wal_keys"
 
+/*
+ * Directory initdb creates inside PGDATA for the default file key provider.
+ * Upstream pg_tde expects the keyring to live outside the data directory, so
+ * it has no name for this; dbblue needs one because tools that walk PGDATA
+ * (pg_rewind in particular) must leave it alone -- truncating the keyring
+ * while the provider is still reading from it breaks the whole run.
+ */
+#define PG_TDE_KEYRING_DIR "pg_tde_keys"
+
 #define TDE_TRANCHE_NAME "pg_tde_tranche"
 
 /*
