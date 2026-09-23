@@ -8,6 +8,7 @@ pg_rewind_sources = files(
   'local_source.c',
   'parsexlog.c',
   'pg_rewind.c',
+  'tde_ops.c',
   'timeline.c',
 )
 
@@ -21,7 +22,7 @@ endif
 
 pg_rewind = executable('pg_rewind',
   pg_rewind_sources,
-  dependencies: [frontend_code, libpq, lz4, zstd],
+  dependencies: [frontend_code, libpq, lz4, zstd, tde_code],
   c_args: ['-DFRONTEND'], # needed for xlogreader et al
   kwargs: default_bin_args,
 )

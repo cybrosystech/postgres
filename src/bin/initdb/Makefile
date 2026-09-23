@@ -20,7 +20,8 @@ include $(top_builddir)/src/Makefile.global
 # from libpq, else we have risks of version skew if we run with a libpq
 # shared library from a different PG version.  Define
 # USE_PRIVATE_ENCODING_FUNCS to ensure that that happens.
-override CPPFLAGS := -DUSE_PRIVATE_ENCODING_FUNCS -I$(libpq_srcdir) -I$(top_srcdir)/src/timezone $(CPPFLAGS) $(ICU_CFLAGS)
+# pg_tde.h is included for PG_TDE_KEYRING_DIR only; initdb does not link libpgtde.
+override CPPFLAGS := -DUSE_PRIVATE_ENCODING_FUNCS -I$(libpq_srcdir) -I$(top_srcdir)/src/timezone -I$(top_srcdir)/src/include/tde $(CPPFLAGS) $(ICU_CFLAGS)
 
 # We need libpq only because fe_utils does.
 LDFLAGS_INTERNAL += -L$(top_builddir)/src/fe_utils -lpgfeutils $(libpq_pgport) $(ICU_LIBS)

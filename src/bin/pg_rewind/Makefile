@@ -15,8 +15,21 @@ subdir = src/bin/pg_rewind
 top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
 
-override CPPFLAGS := -I$(libpq_srcdir) -DFRONTEND $(CPPFLAGS)
+override CPPFLAGS := -I$(libpq_srcdir) -DFRONTEND \
+	-I$(top_srcdir)/src/include/tde \
+	$(CPPFLAGS)
 LDFLAGS_INTERNAL += -L$(top_builddir)/src/fe_utils -lpgfeutils $(libpq_pgport)
+
+# External libraries libpgtde depends on.  Kept in step with src/bin/pg_waldump.
+TDE_LIBS = -lssl -lcrypto -lcurl
+
+# libpgtde resolves its json/base64/list references against libpgcommon and
+# libpgfeutils, so those must be repeated after it on the link line.
+LIBS += -L$(top_builddir)/src/common/tde -lpgtde \
+	-L$(top_builddir)/src/fe_utils -lpgfeutils \
+	-L$(top_builddir)/src/common -lpgcommon \
+	-L$(top_builddir)/src/port -lpgport \
+	$(TDE_LIBS)
 
 OBJS = \
 	$(WIN32RES) \
@@ -27,6 +40,7 @@ OBJS = \
 	local_source.o \
 	parsexlog.o \
 	pg_rewind.o \
+	tde_ops.o \
 	timeline.o \
 	xlogreader.o
 

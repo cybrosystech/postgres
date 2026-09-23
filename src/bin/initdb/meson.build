@@ -16,7 +16,7 @@ endif
 
 initdb = executable('initdb',
   initdb_sources,
-  include_directories: [timezone_inc],
+  include_directories: [timezone_inc, tde_inc],   # PG_TDE_KEYRING_DIR only
   # Note: it's important that we link to encnames.o from libpgcommon, not
   # from libpq, else we have risks of version skew if we run with a libpq
   # shared library from a different PG version.  Define

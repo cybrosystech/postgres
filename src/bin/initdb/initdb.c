@@ -85,6 +85,9 @@
 
 #include "auto_tune.h"
 
+/* for PG_TDE_KEYRING_DIR only; initdb does not link libpgtde */
+#include "pg_tde.h"
+
 
 /* Ideally this would be in a .h file, but it hardly seems worth the trouble */
 extern const char *select_default_timezone(const char *share_path);
@@ -3359,7 +3362,7 @@ initialize_data_directory(void)
 		 * place and the cluster cannot find its own keyring.
 		 */
 		if (is_absolute_path(pg_data))
-			tde_keyring_dir = psprintf("%s/pg_tde_keys", pg_data);
+			tde_keyring_dir = psprintf("%s/%s", pg_data, PG_TDE_KEYRING_DIR);
 		else
 		{
 			char		cwd[MAXPGPATH];
@@ -3367,7 +3370,7 @@ initialize_data_directory(void)
 			if (getcwd(cwd, sizeof(cwd)) == NULL)
 				pg_fatal("could not determine current directory: %m");
 
-			tde_keyring_dir = psprintf("%s/%s/pg_tde_keys", cwd, pg_data);
+			tde_keyring_dir = psprintf("%s/%s/%s", cwd, pg_data, PG_TDE_KEYRING_DIR);
 			canonicalize_path(tde_keyring_dir);
 		}
 	}
