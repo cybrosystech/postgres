@@ -24,6 +24,8 @@
 #include "access/detoast.h"
 #include "access/toast_compression.h"
 #include "common/pg_lzcompress.h"
+#include "miscadmin.h"
+#include "utils/guc_hooks.h"
 #include "varatt.h"
 
 /*
@@ -46,6 +48,63 @@ zstd_decompress_datum_hook_type zstd_decompress_datum_hook = NULL;
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED), \
 			 errmsg("compression method %s not supported", method), \
 			 errdetail("This functionality requires the server to be built with %s support.", method)))
+
+#define NO_ZSTD_SUPPORT() \
+	ereport(ERROR, \
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED), \
+			 errmsg("compression method zstd is not available"), \
+			 errdetail("This server was not built with --with-zstd, and no module supplying zstd support is loaded."), \
+			 errhint("Load the zstd_toast_compat module (for example via session_preload_libraries), or rebuild the server with --with-zstd.")))
+
+/*
+ * Can this process actually compress with zstd?  Either the server was built
+ * --with-zstd, or a loadable module (contrib/zstd_toast_compat) has supplied
+ * the compression hook.
+ */
+static bool
+zstd_compression_available(void)
+{
+#ifdef USE_ZSTD
+	return true;
+#else
+	return zstd_compress_datum_hook != NULL;
+#endif
+}
+
+/*
+ * GUC check hook for default_toast_compression.
+ *
+ * Reject zstd up front when this process can't actually compress with it,
+ * rather than letting the setting be accepted and then failing on the first
+ * INSERT large enough to be toasted.
+ *
+ * Startup is exempt: libraries named in session_preload_libraries (and
+ * friends) are loaded only once GUC processing is complete, so a value
+ * arriving from postgresql.conf, a per-database/per-user setting, or the
+ * connection request may well become valid moments later.  Rejecting it here
+ * would break that ordering, so those sources are accepted and the check in
+ * zstd_compress_datum() remains the backstop.  What we do catch is the
+ * interactive cases -- SET, and ALTER SYSTEM SET run from a live backend --
+ * where the module, if it were coming at all, would already be loaded.
+ */
+bool
+check_default_toast_compression(int *newval, void **extra, GucSource source)
+{
+	if (*newval != TOAST_ZSTD_COMPRESSION || zstd_compression_available())
+		return true;
+
+	if (source >= PGC_S_INTERACTIVE ||
+		(source == PGC_S_FILE && IsUnderPostmaster && OidIsValid(MyDatabaseId)))
+	{
+		GUC_check_errcode(ERRCODE_FEATURE_NOT_SUPPORTED);
+		GUC_check_errmsg("compression method zstd is not available");
+		GUC_check_errdetail("This server was not built with --with-zstd, and no module supplying zstd support is loaded.");
+		GUC_check_errhint("Load the zstd_toast_compat module (for example via session_preload_libraries), or rebuild the server with --with-zstd.");
+		return false;
+	}
+
+	return true;
+}
 
 /*
  * Compress a varlena using PGLZ.
@@ -273,7 +332,7 @@ zstd_compress_datum(const varlena *value)
 #ifndef USE_ZSTD
 	if (zstd_compress_datum_hook)
 		return zstd_compress_datum_hook(value);
-	NO_COMPRESSION_SUPPORT("zstd");
+	NO_ZSTD_SUPPORT();
 	return NULL;				/* keep compiler quiet */
 #else
 	int32		valsize;
@@ -321,7 +380,7 @@ zstd_decompress_datum(const varlena *value)
 #ifndef USE_ZSTD
 	if (zstd_decompress_datum_hook)
 		return zstd_decompress_datum_hook(value);
-	NO_COMPRESSION_SUPPORT("zstd");
+	NO_ZSTD_SUPPORT();
 	return NULL;				/* keep compiler quiet */
 #else
 	int32		rawsize;
@@ -431,14 +490,13 @@ CompressionNameToMethod(const char *compression)
 	else if (strcmp(compression, "zstd") == 0)
 	{
 		/*
-		 * Unlike lz4 above, don't reject this here even without USE_ZSTD:
-		 * "zstd" is always a selectable compression method (CREATE/ALTER
-		 * TABLE ... COMPRESSION zstd, or default_toast_compression = zstd),
-		 * so that it stays settable regardless of build.  Actual capability
-		 * is checked lazily, when compression is really attempted, by
-		 * zstd_compress_datum() -- which also gives the same "requires the
-		 * server to be built with zstd support" error, at that point.
+		 * Unlike lz4 above, this isn't a purely compile-time decision: a
+		 * loadable module may supply zstd support on a build without
+		 * USE_ZSTD.  Reject only when neither is the case, so the failure
+		 * lands here at DDL time rather than on a later INSERT.
 		 */
+		if (!zstd_compression_available())
+			NO_ZSTD_SUPPORT();
 		return TOAST_ZSTD_COMPRESSION;
 	}
 

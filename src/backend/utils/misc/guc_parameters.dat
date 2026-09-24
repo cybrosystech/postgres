@@ -867,6 +867,7 @@
   variable => 'default_toast_compression',
   boot_val => 'DEFAULT_TOAST_COMPRESSION',
   options => 'default_toast_compression_options',
+  check_hook => 'check_default_toast_compression',
 },
 
 { name => 'default_transaction_deferrable', type => 'bool', context => 'PGC_USERSET', group => 'CLIENT_CONN_STATEMENT',
