@@ -37,7 +37,8 @@
 /* GUC */
 int			default_toast_compression = DEFAULT_TOAST_COMPRESSION;
 
-/* set by contrib/zstd_toast_reader on a build without USE_ZSTD */
+/* set by contrib/zstd_toast_compat on a build without USE_ZSTD */
+zstd_compress_datum_hook_type zstd_compress_datum_hook = NULL;
 zstd_decompress_datum_hook_type zstd_decompress_datum_hook = NULL;
 
 #define NO_COMPRESSION_SUPPORT(method) \
@@ -270,6 +271,8 @@ varlena *
 zstd_compress_datum(const varlena *value)
 {
 #ifndef USE_ZSTD
+	if (zstd_compress_datum_hook)
+		return zstd_compress_datum_hook(value);
 	NO_COMPRESSION_SUPPORT("zstd");
 	return NULL;				/* keep compiler quiet */
 #else
