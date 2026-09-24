@@ -86,12 +86,18 @@ extern varlena *zstd_decompress_datum_slice(const varlena *value,
 											int32 slicelength);
 
 /*
- * Hook allowing a loadable module (see contrib/zstd_toast_reader) to supply
- * zstd decompression on a build that wasn't compiled --with-zstd, e.g. when
- * reading a physical backup or replica that contains zstd-compressed TOAST
- * data written elsewhere.  Only decompression is covered; a server without
- * USE_ZSTD still cannot write new zstd-compressed values.
+ * Hooks allowing a loadable module (see contrib/zstd_toast_compat) to supply
+ * zstd compression and/or decompression on a build that wasn't compiled
+ * --with-zstd -- e.g. reading a physical backup or replica that contains
+ * zstd-compressed TOAST data written elsewhere (decompress hook only), or
+ * opting a non-zstd build into writing new zstd-compressed values without a
+ * full rebuild (both hooks).  Each is independent: a module may register
+ * only the decompress hook for read-only compatibility, or both for full
+ * read/write support.
  */
+typedef varlena *(*zstd_compress_datum_hook_type) (const varlena *value);
+extern PGDLLIMPORT zstd_compress_datum_hook_type zstd_compress_datum_hook;
+
 typedef varlena *(*zstd_decompress_datum_hook_type) (const varlena *value);
 extern PGDLLIMPORT zstd_decompress_datum_hook_type zstd_decompress_datum_hook;
 

@@ -1,0 +1,5 @@
+# zstd_toast_compat extension
+comment = 'read and/or write zstd-compressed TOAST data on a server without --with-zstd'
+default_version = '1.0'
+module_pathname = '$libdir/zstd_toast_compat'
+relocatable = true
