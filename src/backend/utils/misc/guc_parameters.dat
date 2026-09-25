@@ -623,6 +623,14 @@
   assign_hook => 'assign_datestyle',
 },
 
+{ name => 'dbblue_allow_zstd', type => 'bool', context => 'PGC_POSTMASTER', group => 'CLIENT_CONN_STATEMENT',
+  short_desc => 'Allows zstd to be selected as a TOAST compression method.',
+  long_desc => 'When off, zstd cannot be chosen as default_toast_compression or per column, and columns still marked zstd fall back to pglz when written. Use this on a cluster that must stay readable by a server without zstd support, such as one feeding a vanilla PostgreSQL physical standby.',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'dbblue_allow_zstd',
+  boot_val => 'true',
+},
+
 { name => 'dbblue_autoprepare_enabled', type => 'bool', context => 'PGC_SUSET', group => 'QUERY_TUNING_OTHER',
   short_desc => 'Cache and reuse plans for repeated query shapes.',
   flags => 'GUC_NOT_IN_SAMPLE',

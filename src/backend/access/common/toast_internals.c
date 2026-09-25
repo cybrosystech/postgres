@@ -59,6 +59,15 @@ toast_compress_datum(Datum value, char cmethod)
 		cmethod = default_toast_compression;
 
 	/*
+	 * Columns marked 'z' before zstd was disabled cluster-wide would
+	 * otherwise keep producing zstd values.  Fall back to pglz instead of
+	 * erroring, so existing tables stay writable while they wait to be
+	 * normalized; the audit function reports which columns are still marked.
+	 */
+	if (cmethod == TOAST_ZSTD_COMPRESSION && !dbblue_allow_zstd)
+		cmethod = TOAST_PGLZ_COMPRESSION;
+
+	/*
 	 * Call appropriate compression routine for the compression method.
 	 */
 	switch (cmethod)

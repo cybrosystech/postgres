@@ -15,8 +15,10 @@
 #include "postgres.h"
 
 #include "access/detoast.h"
+#include "access/toast_compression.h"
 #include "access/toast_helper.h"
 #include "access/toast_internals.h"
+#include "catalog/catalog.h"
 #include "catalog/pg_type_d.h"
 #include "varatt.h"
 
@@ -54,7 +56,8 @@ toast_tuple_init(ToastTupleContext *ttc)
 
 		ttc->ttc_attr[i].tai_colflags = 0;
 		ttc->ttc_attr[i].tai_oldexternal = NULL;
-		ttc->ttc_attr[i].tai_compression = att->attcompression;
+		ttc->ttc_attr[i].tai_compression =
+			toast_resolve_compression(ttc->ttc_rel, att->attcompression);
 
 		if (ttc->ttc_oldvalues != NULL)
 		{

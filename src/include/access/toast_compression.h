@@ -23,6 +23,15 @@
 extern PGDLLIMPORT int default_toast_compression;
 
 /*
+ * When off, zstd cannot be selected at all: not as default_toast_compression,
+ * not per column, and any column still marked 'z' falls back to pglz on write.
+ * Set this on a cluster that must stay readable by a server without zstd --
+ * notably one feeding a vanilla PostgreSQL physical standby, where a single
+ * zstd value would replicate fine but be unreadable on the standby.
+ */
+extern PGDLLIMPORT bool dbblue_allow_zstd;
+
+/*
  * Built-in compression method ID.  The toast compression header will store
  * this in the first 2 bits of the raw length.  These built-in compression
  * method IDs are directly mapped to the built-in compression methods.
@@ -102,6 +111,8 @@ typedef varlena *(*zstd_decompress_datum_hook_type) (const varlena *value);
 extern PGDLLIMPORT zstd_decompress_datum_hook_type zstd_decompress_datum_hook;
 
 /* other stuff */
+struct RelationData;
+extern char toast_resolve_compression(struct RelationData *rel, char cmethod);
 extern ToastCompressionId toast_get_compression_id(varlena *attr);
 extern char CompressionNameToMethod(const char *compression);
 extern const char *GetCompressionMethodName(char method);

@@ -23,9 +23,11 @@
 
 #include "access/detoast.h"
 #include "access/toast_compression.h"
+#include "catalog/catalog.h"
 #include "common/pg_lzcompress.h"
 #include "miscadmin.h"
 #include "utils/guc_hooks.h"
+#include "utils/rel.h"
 #include "varatt.h"
 
 /*
@@ -38,6 +40,7 @@
 
 /* GUC */
 int			default_toast_compression = DEFAULT_TOAST_COMPRESSION;
+bool		dbblue_allow_zstd = true;
 
 /* set by contrib/zstd_toast_compat on a build without USE_ZSTD */
 zstd_compress_datum_hook_type zstd_compress_datum_hook = NULL;
@@ -56,6 +59,13 @@ zstd_decompress_datum_hook_type zstd_decompress_datum_hook = NULL;
 			 errdetail("This server was not built with --with-zstd, and no module supplying zstd support is loaded."), \
 			 errhint("Load the zstd_toast_compat module (for example via session_preload_libraries), or rebuild the server with --with-zstd.")))
 
+#define ZSTD_DISABLED() \
+	ereport(ERROR, \
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED), \
+			 errmsg("compression method zstd is disabled on this cluster"), \
+			 errdetail("dbblue_allow_zstd is off, so no new data may be compressed with zstd."), \
+			 errhint("Set dbblue_allow_zstd = on in postgresql.conf and restart to re-enable it.")))
+
 /*
  * Can this process actually compress with zstd?  Either the server was built
  * --with-zstd, or a loadable module (contrib/zstd_toast_compat) has supplied
@@ -69,6 +79,29 @@ zstd_compression_available(void)
 #else
 	return zstd_compress_datum_hook != NULL;
 #endif
+}
+
+/*
+ * Decide which compression method a column's values will actually use.
+ *
+ * Resolves the "use the default" case, then applies the one rule that isn't
+ * the user's to choose: system catalogs are never compressed with zstd.
+ * Catalog contents are written by initdb and by ordinary DDL, and a catalog
+ * full of zstd is what makes a data directory unreadable by a server without
+ * zstd -- the cluster won't even answer catalog queries.  Keeping catalogs on
+ * pglz costs nothing (these values are small and rarely read hot) and keeps
+ * the cluster openable by a plain build, so only user data is ever at stake.
+ */
+char
+toast_resolve_compression(Relation rel, char cmethod)
+{
+	if (!CompressionMethodIsValid(cmethod))
+		cmethod = default_toast_compression;
+
+	if (cmethod == TOAST_ZSTD_COMPRESSION && IsCatalogRelation(rel))
+		cmethod = TOAST_PGLZ_COMPRESSION;
+
+	return cmethod;
 }
 
 /*
@@ -90,7 +123,24 @@ zstd_compression_available(void)
 bool
 check_default_toast_compression(int *newval, void **extra, GucSource source)
 {
-	if (*newval != TOAST_ZSTD_COMPRESSION || zstd_compression_available())
+	if (*newval != TOAST_ZSTD_COMPRESSION)
+		return true;
+
+	/*
+	 * A cluster-wide "off" is a deliberate stance, not an ordering artifact,
+	 * so reject it from every source including startup -- unlike the
+	 * availability check below.
+	 */
+	if (!dbblue_allow_zstd)
+	{
+		GUC_check_errcode(ERRCODE_FEATURE_NOT_SUPPORTED);
+		GUC_check_errmsg("compression method zstd is disabled on this cluster");
+		GUC_check_errdetail("dbblue_allow_zstd is off, so no new data may be compressed with zstd.");
+		GUC_check_errhint("Set dbblue_allow_zstd = on in postgresql.conf and restart to re-enable it.");
+		return false;
+	}
+
+	if (zstd_compression_available())
 		return true;
 
 	if (source >= PGC_S_INTERACTIVE ||
@@ -495,6 +545,8 @@ CompressionNameToMethod(const char *compression)
 		 * USE_ZSTD.  Reject only when neither is the case, so the failure
 		 * lands here at DDL time rather than on a later INSERT.
 		 */
+		if (!dbblue_allow_zstd)
+			ZSTD_DISABLED();
 		if (!zstd_compression_available())
 			NO_ZSTD_SUPPORT();
 		return TOAST_ZSTD_COMPRESSION;
