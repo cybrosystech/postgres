@@ -20,7 +20,7 @@
 #include "nodes/parsenodes.h"
 #include "utils/plancache.h"
 
-/* GUCs (registered in autoprepare.c) */
+/* GUCs (defined in src/backend/utils/misc/guc_parameters.dat) */
 extern PGDLLIMPORT bool autoprepare_enabled;
 extern PGDLLIMPORT int	autoprepare_threshold;	/* cache after N sightings */
 extern PGDLLIMPORT int	autoprepare_limit;		/* max cached shapes/backend */
@@ -51,10 +51,28 @@ extern AutoprepareResult AutoprepareConsult(Query *analyzed_query,
 											 CachedPlanSource **plansource_out,
 											 ParamListInfo *boundParams_out);
 
-/* Drop everything (called for DISCARD ALL / DEALLOCATE ALL). */
+/* Drop everything (called for DISCARD PLANS). */
 extern void AutoprepareReset(void);
 
-/* GUC registration; call once from backend startup or _PG_init. */
+/*
+ * Backend-startup hook, called once from PostgresMain.  The GUCs are core
+ * GUCs now; this only forces query-id computation on.
+ */
 extern void AutoprepareRegisterGUCs(void);
+
+/*
+ * dbblue_log_autoprepare_shapes(pid) support: the signal handler only sets
+ * LogAutoprepareShapesPending; ProcessInterrupts() then does the logging.
+ */
+extern void HandleLogAutoprepareShapesInterrupt(void);
+extern void ProcessLogAutoprepareShapesInterrupt(void);
+
+/*
+ * dbblue_autoprepare_shapes() / dbblue_autoprepare_stats() support: another
+ * backend asked for our table; ProcessInterrupts() sends it back over the
+ * requester's shm_mq.
+ */
+extern void HandleAutoprepareReportInterrupt(void);
+extern void ProcessAutoprepareReportInterrupt(void);
 
 #endif							/* AUTOPREPARE_H */

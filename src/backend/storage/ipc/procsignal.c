@@ -36,6 +36,7 @@
 #include "storage/sinval.h"
 #include "storage/smgr.h"
 #include "storage/subsystems.h"
+#include "tcop/autoprepare.h"
 #include "tcop/tcopprot.h"
 #include "utils/memutils.h"
 #include "utils/wait_event.h"
@@ -718,6 +719,12 @@ procsignal_sigusr1_handler(SIGNAL_ARGS)
 
 	if (CheckProcSignal(PROCSIG_REPACK_MESSAGE))
 		HandleRepackMessageInterrupt();
+
+	if (CheckProcSignal(PROCSIG_LOG_AUTOPREPARE_SHAPES))
+		HandleLogAutoprepareShapesInterrupt();
+
+	if (CheckProcSignal(PROCSIG_AUTOPREPARE_REPORT))
+		HandleAutoprepareReportInterrupt();
 
 	if (CheckProcSignal(PROCSIG_SLOTSYNC_MESSAGE))
 		HandleSlotSyncMessageInterrupt();

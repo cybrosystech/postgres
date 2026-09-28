@@ -3648,6 +3648,12 @@ ProcessInterrupts(void)
 	if (LogMemoryContextPending)
 		ProcessLogMemoryContextInterrupt();
 
+	/* dbblue */
+	if (LogAutoprepareShapesPending)
+		ProcessLogAutoprepareShapesInterrupt();
+	if (AutoprepareReportPending)
+		ProcessAutoprepareReportInterrupt();
+
 	if (ParallelApplyMessagePending)
 		ProcessParallelApplyMessages();
 
@@ -4433,9 +4439,9 @@ PostgresMain(const char *dbname, const char *username)
 	SetProcessingMode(NormalProcessing);
 
 	/*
-	 * dbblue: register the autoprepare plan-cache GUCs for this backend, and
-	 * force query-id computation on (under compute_query_id = auto) since the
-	 * autoprepare fingerprint is the query jumble.
+	 * dbblue: force query-id computation on (under compute_query_id = auto)
+	 * since the autoprepare fingerprint is the query jumble.  The autoprepare
+	 * GUCs themselves are core GUCs in guc_parameters.dat.
 	 */
 	AutoprepareRegisterGUCs();
 
