@@ -7617,16 +7617,24 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 /*
  * dbblue: compile-time gate for the groupjoin executor.
  *
- * Stages 1-3 are implemented: path creation, plan creation, setrefs, and
- * enough of nodeHashgroupjoin.c and explain.c for EXPLAIN to initialize and
- * print the node.  What does not exist is execution itself -- there is no
- * ExecHashGroupJoin(), so running the node raises an error.
+ * The executor is complete and has run real production-shaped queries
+ * correctly -- nodeHashgroupjoin.c implements build/probe/emit, multiple
+ * batches, and rescan, all validated against stock output.  This symbol is
+ * no longer standing in for missing functionality; what it now guards
+ * against is an accidental *regression* of that gate itself.
  *
- * This is deliberately a compile-time symbol and not a GUC, so that *no*
- * runtime setting -- dbblue_enable_groupjoin included -- can reach the
- * unimplemented path.  Defining it in a throwaway local build is how the
- * plan shape is inspected with EXPLAIN (never EXPLAIN ANALYZE); it must stay
- * undefined until Stage 4 lands.  See dbblue_groupjoin.md 3.2 / T2-3.
+ * It stays a compile-time symbol rather than a GUC so that no runtime
+ * setting -- dbblue_enable_groupjoin included -- can ever reach path
+ * construction with a build where this is undefined: the #else branch below
+ * (try_add_hashgroupjoin_path()) is the fail-closed fallback for exactly
+ * that case, logging once at DEBUG1 and silently declining to add the path,
+ * rather than adding a path with nothing behind it. Concretely, that
+ * matters during a future rebase onto a newer PostgreSQL release: if this
+ * #define were ever dropped or commented out by mistake in the process,
+ * the feature would quietly stop firing instead of crashing or -- worse --
+ * running an unproven path. Removing this gate entirely (folding its one
+ * remaining branch away) is reasonable once the feature has been stable
+ * through a couple of rebases; until then, leave it defined.
  */
 #define DBBLUE_GROUPJOIN_EXECUTOR_READY
 
