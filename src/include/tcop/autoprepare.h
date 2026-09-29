@@ -51,12 +51,25 @@ extern AutoprepareResult AutoprepareConsult(Query *analyzed_query,
 											 CachedPlanSource **plansource_out,
 											 ParamListInfo *boundParams_out);
 
-/* Drop everything (called for DISCARD PLANS). */
+/*
+ * Planning time of the statement AutoprepareConsult() just returned
+ * APREP_MISS for; the eviction policy values shapes by it.
+ */
+extern void AutoprepareNotePlanTime(double plan_ms);
+
+/* Drop everything (called for DISCARD PLANS; not DISCARD ALL, see discard.c). */
 extern void AutoprepareReset(void);
 
 /*
+ * dbblue_autoprepare_reset() support: the signal handler only sets a flag;
+ * the table is cleared at the start of the next AutoprepareConsult().
+ */
+extern void HandleAutoprepareResetInterrupt(void);
+
+/*
  * Backend-startup hook, called once from PostgresMain.  The GUCs are core
- * GUCs now; this only forces query-id computation on.
+ * GUCs now; this only turns query-id computation on if autoprepare starts
+ * enabled (assign_dbblue_autoprepare_enabled() handles later changes).
  */
 extern void AutoprepareRegisterGUCs(void);
 
