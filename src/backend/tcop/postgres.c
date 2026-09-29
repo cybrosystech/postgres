@@ -72,6 +72,7 @@
 #include "storage/shmem_internal.h"
 #include "storage/sinval.h"
 #include "storage/standby.h"
+#include "portability/instr_time.h"
 #include "tcop/autoprepare.h"
 #include "tcop/backend_startup.h"
 #include "tcop/fastpath.h"
@@ -1221,12 +1222,14 @@ exec_simple_query(const char *query_string)
 		{
 			Query	   *analyzed_query;
 			CachedPlanSource *aprep_src = NULL;
+			AutoprepareResult aprep_res;
 
 			analyzed_query = parse_analyze_fixedparams(parsetree, query_string,
 													   NULL, 0, NULL);
 
-			if (AutoprepareConsult(analyzed_query, query_string,
-								   &aprep_src, &aprep_params) == APREP_HIT)
+			aprep_res = AutoprepareConsult(analyzed_query, query_string,
+										   &aprep_src, &aprep_params);
+			if (aprep_res == APREP_HIT)
 			{
 				aprep_owner = CurrentResourceOwner;
 				aprep_cplan = GetCachedPlan(aprep_src, aprep_params,
@@ -1235,9 +1238,21 @@ exec_simple_query(const char *query_string)
 			}
 			else
 			{
+				instr_time	plan_start;
+				instr_time	plan_time;
+
 				querytree_list = pg_rewrite_query(analyzed_query);
+				INSTR_TIME_SET_CURRENT(plan_start);
 				plantree_list = pg_plan_queries(querytree_list, query_string,
 												CURSOR_OPT_PARALLEL_OK, NULL);
+
+				/* what a reuse would save: feeds autoprepare's eviction */
+				if (aprep_res == APREP_MISS)
+				{
+					INSTR_TIME_SET_CURRENT(plan_time);
+					INSTR_TIME_SUBTRACT(plan_time, plan_start);
+					AutoprepareNotePlanTime(INSTR_TIME_GET_MILLISEC(plan_time));
+				}
 			}
 		}
 
@@ -4439,9 +4454,10 @@ PostgresMain(const char *dbname, const char *username)
 	SetProcessingMode(NormalProcessing);
 
 	/*
-	 * dbblue: force query-id computation on (under compute_query_id = auto)
-	 * since the autoprepare fingerprint is the query jumble.  The autoprepare
-	 * GUCs themselves are core GUCs in guc_parameters.dat.
+	 * dbblue: if autoprepare starts enabled, turn query-id computation on
+	 * (under compute_query_id = auto), since its fingerprint is the query
+	 * jumble.  The autoprepare GUCs themselves are core GUCs in
+	 * guc_parameters.dat.
 	 */
 	AutoprepareRegisterGUCs();
 

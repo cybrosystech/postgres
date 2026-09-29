@@ -76,6 +76,15 @@ DiscardAll(bool isTopLevel)
 	Async_UnlistenAll();
 	LockReleaseAll(USER_LOCKMETHOD, true);
 	ResetPlanCache();
+
+	/*
+	 * dbblue: deliberately NOT AutoprepareReset().  Connection poolers and
+	 * psycopg2's connection.reset() (so every Odoo pool borrow) send DISCARD
+	 * ALL, and clearing here would empty the autoprepare table on every
+	 * request.  Its plans stay correct across sessions' state changes: the
+	 * plancache revalidates search_path, role and invalidations on reuse.
+	 * DISCARD PLANS and dbblue_autoprepare_reset() clear it explicitly.
+	 */
 	ResetTempTableNamespace();
 	ResetSequenceCaches();
 }

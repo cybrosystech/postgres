@@ -633,14 +633,15 @@
 
 { name => 'dbblue_autoprepare_enabled', type => 'bool', context => 'PGC_SUSET', group => 'QUERY_TUNING_OTHER',
   short_desc => 'Cache and reuse plans for repeated query shapes.',
-  flags => 'GUC_NOT_IN_SAMPLE',
+  flags => 'GUC_NOT_IN_SAMPLE | GUC_EXPLAIN',
   variable => 'autoprepare_enabled',
   boot_val => 'false',
+  assign_hook => 'assign_dbblue_autoprepare_enabled',
 },
 
 { name => 'dbblue_autoprepare_limit', type => 'int', context => 'PGC_SUSET', group => 'QUERY_TUNING_OTHER',
   short_desc => 'Maximum number of cached query shapes per backend.',
-  flags => 'GUC_NOT_IN_SAMPLE',
+  flags => 'GUC_NOT_IN_SAMPLE | GUC_EXPLAIN',
   variable => 'autoprepare_limit',
   boot_val => '1024',
   min => '1',
@@ -649,7 +650,7 @@
 
 { name => 'dbblue_autoprepare_threshold', type => 'int', context => 'PGC_SUSET', group => 'QUERY_TUNING_OTHER',
   short_desc => 'Cache a query shape after it is seen this many times.',
-  flags => 'GUC_NOT_IN_SAMPLE',
+  flags => 'GUC_NOT_IN_SAMPLE | GUC_EXPLAIN',
   variable => 'autoprepare_threshold',
   boot_val => '2',
   min => '1',

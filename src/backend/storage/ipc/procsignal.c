@@ -726,6 +726,9 @@ procsignal_sigusr1_handler(SIGNAL_ARGS)
 	if (CheckProcSignal(PROCSIG_AUTOPREPARE_REPORT))
 		HandleAutoprepareReportInterrupt();
 
+	if (CheckProcSignal(PROCSIG_AUTOPREPARE_RESET))
+		HandleAutoprepareResetInterrupt();
+
 	if (CheckProcSignal(PROCSIG_SLOTSYNC_MESSAGE))
 		HandleSlotSyncMessageInterrupt();
 
