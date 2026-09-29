@@ -19,6 +19,21 @@
  *	  GetCachedPlan), so DDL/stat invalidation and the custom-vs-generic plan
  *	  decision come for free.
  *
+ * Space management
+ * ----------------
+ *	dbblue_autoprepare_limit caps all entries.  Promoted and declined entries
+ *	("fixed" entries) may use at most limit minus a 10% reserve
+ *	(aprep_fixed_cap()), so new shapes always have room to be counted.
+ *	- A new shape arriving at a full table takes the slot of the tracking
+ *	  entry seen least recently (aprep_tracking_lru).
+ *	- A shape reaching the threshold while the fixed share is full takes the
+ *	  slot of the fixed entry with the lowest value: its recent reuse rate
+ *	  (from a count that halves every APREP_REUSE_HALF_LIFE statements)
+ *	  times what one reuse saves (planning time for a promoted entry, the build attempt
+ *	  for a declined one).  Reuse is compared as a rate, so new plans are
+ *	  not crowded out by old ones' long histories.  See aprep_entry_score().
+ *	All eviction happens inside AutoprepareConsult(), when no entry is in use.
+ *
  * Correctness stance
  * ------------------
  *	The 64-bit queryId only selects a candidate entry; it is not trusted for
@@ -37,16 +52,20 @@
  */
 #include "postgres.h"
 
+#include <math.h>
+
 #include "tcop/autoprepare.h"
 
 #include "fmgr.h"
 #include "funcapi.h"
+#include "lib/ilist.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/params.h"
 #include "nodes/queryjumble.h"
+#include "portability/instr_time.h"
 #include "rewrite/rewriteHandler.h"
 #include "storage/dsm.h"
 #include "storage/latch.h"
@@ -62,6 +81,7 @@
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
+#include "utils/guc_hooks.h"
 #include "utils/hsearch.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -93,10 +113,32 @@ typedef struct AutoprepareEntry
 	 * for the reuse-time consistency check.  Allocated in AutoprepareContext. */
 	Oid		   *param_types;
 	int			num_params;
+
+	/*
+	 * Position in aprep_tracking_lru; linked only while the entry is neither
+	 * promoted nor declined.  (dynahash never moves an entry, so linking it
+	 * in place is safe.)
+	 */
+	dlist_node	lru_node;
+
+	/* ---- value, for choosing which fixed entry to evict ---- */
+	double		plan_ms;		/* fastest normal planning seen; 0 = unknown */
+	double		build_ms;		/* time of the promotion build attempt */
+	double		reuse;			/* decaying reuse count, as of last_used */
+	uint64		last_used;		/* aprep_clock at the last reuse */
+	uint64		first_seen;		/* aprep_clock when the entry was created */
 }			AutoprepareEntry;
 
 static HTAB *autoprepare_table = NULL;
 static MemoryContext AutoprepareContext = NULL;
+
+/*
+ * Tracking entries, least recently seen at the head.  When the table is full,
+ * a new shape takes the slot of the head entry: a shape that has not
+ * reappeared for the longest time.  Promoted and declined entries are never
+ * evicted this way.
+ */
+static dlist_head aprep_tracking_lru = DLIST_STATIC_INIT(aprep_tracking_lru);
 
 /*
  * Per-backend counters for the lifetime of the backend (not cleared by
@@ -109,9 +151,54 @@ static uint64 aprep_promotions = 0;		/* plan built and cached */
 static uint64 aprep_declines = 0;		/* shape found uncacheable at promotion */
 static uint64 aprep_rejected_full = 0;	/* statements of untracked shapes
 										 * turned away: limit reached */
+static uint64 aprep_tracking_evictions = 0;	/* tracking entries dropped to
+												 * make room for a new shape */
+static uint64 aprep_fixed_evictions = 0;	/* promoted/declined entries
+											 * dropped for a newly
+											 * qualifying shape */
+
+/* Promoted + declined entries currently in the table. */
+static int	aprep_num_fixed = 0;
+
+/*
+ * Statement clock: +1 per statement consulted.  Reuse counts decay by half
+ * every APREP_REUSE_HALF_LIFE ticks, so a plan that was hot long ago loses to
+ * one that is hot now.
+ */
+static uint64 aprep_clock = 0;
+#define APREP_REUSE_HALF_LIFE	10000.0
+
+/*
+ * Entries are compared by reuse *rate* (see aprep_entry_score()), so a new
+ * plan with a short history is not judged against old plans' long ones.
+ * Ages below this many statements are rounded up, so one or two early
+ * sightings do not look like an enormous rate.
+ */
+#define APREP_MIN_AGE			100.0
+
+/* Sighting-count sketch; see aprep_sketch_add(). */
+#define APREP_SKETCH_ROWS		4
+#define APREP_SKETCH_WIDTH		2048	/* power of 2 */
+#define APREP_SKETCH_AGE_EVERY	(APREP_SKETCH_WIDTH * 8)
+
+static uint8 aprep_sketch[APREP_SKETCH_ROWS][APREP_SKETCH_WIDTH];
+static uint32 aprep_sketch_adds = 0;
+
+/*
+ * Shape of the statement being planned normally right now, so that
+ * AutoprepareNotePlanTime() can credit the planning time to it; 0 if none.
+ */
+static uint64 aprep_note_fp = 0;
 
 /* guards against recursion via CHECK_FOR_INTERRUPTS() inside ereport() */
 static bool LogAutoprepareShapesInProgress = false;
+
+/*
+ * Set by dbblue_autoprepare_reset() (via PROCSIG_AUTOPREPARE_RESET, or
+ * directly for our own backend); applied at the start of the next
+ * AutoprepareConsult().
+ */
+static volatile sig_atomic_t AutoprepareResetPending = false;
 
 /* Longest query text written per shape by dbblue_log_autoprepare_shapes(). */
 #define APREP_LOG_QUERY_MAXLEN 1024
@@ -694,6 +781,24 @@ autoprepare_init(void)
 									HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 }
 
+/*
+ * Remove one entry, releasing its cached plan and parameter types.  Only call
+ * where no entry is in use: inside AutoprepareConsult() or DISCARD PLANS.
+ */
+static void
+aprep_remove_entry(AutoprepareEntry *entry)
+{
+	if (entry->promoted || entry->declined)
+		aprep_num_fixed--;
+	else
+		dlist_delete(&entry->lru_node);
+	if (entry->plansource)
+		DropCachedPlan(entry->plansource);
+	if (entry->param_types)
+		pfree(entry->param_types);
+	hash_search(autoprepare_table, &entry->fingerprint, HASH_REMOVE, NULL);
+}
+
 void
 AutoprepareReset(void)
 {
@@ -705,17 +810,281 @@ AutoprepareReset(void)
 
 	hash_seq_init(&seq, autoprepare_table);
 	while ((entry = (AutoprepareEntry *) hash_seq_search(&seq)) != NULL)
+		aprep_remove_entry(entry);
+	Assert(aprep_num_fixed == 0 && dlist_is_empty(&aprep_tracking_lru));
+
+	memset(aprep_sketch, 0, sizeof(aprep_sketch));
+	aprep_sketch_adds = 0;
+}
+
+/*
+ * How many promoted + declined entries the table may hold: the limit minus a
+ * 10% reserve (at least one slot) kept for counting new shapes.  A limit of 1
+ * has no room for a reserve.
+ */
+static int
+aprep_fixed_cap(void)
+{
+	if (autoprepare_limit < 2)
+		return autoprepare_limit;
+	return autoprepare_limit - Max(1, autoprepare_limit / 10);
+}
+
+/* Reuse count as of now: halves every APREP_REUSE_HALF_LIFE statements. */
+static double
+aprep_current_reuse(AutoprepareEntry *entry)
+{
+	return entry->reuse * exp2(-(double) (aprep_clock - entry->last_used) /
+							   APREP_REUSE_HALF_LIFE);
+}
+
+/* Record one reuse of a fixed entry. */
+static void
+aprep_note_reuse(AutoprepareEntry *entry)
+{
+	entry->reuse = aprep_current_reuse(entry) + 1.0;
+	entry->last_used = aprep_clock;
+}
+
+/*
+ * Value of keeping a fixed entry: how often it is reused (per statement)
+ * times what one reuse saves -- i.e. milliseconds saved per statement.
+ *
+ * The rate is the decaying reuse count divided by the count a steady rate of
+ * one reuse per statement would have built up over the entry's age.  So a
+ * plan cached 100 statements ago and reused 5 times rates the same as one
+ * reused 50 times over 1000 statements, a formerly hot plan's rate sinks
+ * once it stops being reused, and newcomers are not crowded out by old
+ * plans' large accumulated counts.
+ *
+ * A promoted entry saves a normal planning run; a declined one only saves
+ * re-attempting the promotion build.  The small constant keeps the rate
+ * deciding when the time is unknown or rounds to zero.
+ */
+static double
+aprep_entry_score(AutoprepareEntry *entry)
+{
+	double		saves_ms = entry->promoted ? entry->plan_ms : entry->build_ms;
+	double		age = Max((double) (aprep_clock - entry->first_seen),
+						  APREP_MIN_AGE);
+	double		window = APREP_REUSE_HALF_LIFE / M_LN2 *
+		(1.0 - exp2(-age / APREP_REUSE_HALF_LIFE));
+
+	return aprep_current_reuse(entry) / window * (saves_ms + 0.001);
+}
+
+/*
+ * Evict the lowest-value promoted or declined entry.  Returns false if there
+ * is none.  O(table size), but runs only when a shape is promoted into a full
+ * fixed share.
+ */
+static bool
+aprep_evict_lowest_fixed(void)
+{
+	HASH_SEQ_STATUS seq;
+	AutoprepareEntry *entry;
+	AutoprepareEntry *victim = NULL;
+	double		victim_score = 0;
+
+	hash_seq_init(&seq, autoprepare_table);
+	while ((entry = (AutoprepareEntry *) hash_seq_search(&seq)) != NULL)
 	{
-		if (entry->plansource)
-			DropCachedPlan(entry->plansource);
-		hash_search(autoprepare_table, &entry->fingerprint, HASH_REMOVE, NULL);
+		double		score;
+
+		if (!entry->promoted && !entry->declined)
+			continue;
+		score = aprep_entry_score(entry);
+		if (victim == NULL || score < victim_score)
+		{
+			victim = entry;
+			victim_score = score;
+		}
 	}
+	if (victim == NULL)
+		return false;
+
+	aprep_remove_entry(victim);
+	aprep_fixed_evictions++;
+	return true;
+}
+
+/*
+ * Sighting counts that outlive tracking entries.
+ *
+ * The tracking share can be small (the 10% reserve), and a shape that
+ * recurs only after more distinct shapes than that would lose its entry
+ * before its next sighting, never reach the threshold, and never be cached.
+ * So every sighting of a not-yet-cached shape is also counted here: a
+ * count-min sketch (4 rows x 2048 one-byte counters, 8kB), which estimates a
+ * shape's count from the minimum of its 4 counters.  Collisions can only
+ * make an estimate too high, so a recurring shape is never missed; now and
+ * then a shape is promoted a sighting early, which is harmless.  All
+ * counters are halved every APREP_SKETCH_AGE_EVERY additions, so old counts
+ * fade.  Conservative update (raise only the counters at the minimum) keeps
+ * the overestimate small.
+ */
+static inline uint32
+aprep_sketch_slot(uint64 fp, int row)
+{
+	/* splitmix64 finalizer over a per-row offset of the fingerprint */
+	uint64		h = fp + (uint64) (row + 1) * UINT64CONST(0x9E3779B97F4A7C15);
+
+	h ^= h >> 30;
+	h *= UINT64CONST(0xBF58476D1CE4E5B9);
+	h ^= h >> 27;
+	h *= UINT64CONST(0x94D049BB133111EB);
+	h ^= h >> 31;
+	return (uint32) (h & (APREP_SKETCH_WIDTH - 1));
+}
+
+/* Count one sighting of fp; returns its estimated sightings, this one included. */
+static uint32
+aprep_sketch_add(uint64 fp)
+{
+	uint32		slot[APREP_SKETCH_ROWS];
+	uint8		min = PG_UINT8_MAX;
+
+	for (int r = 0; r < APREP_SKETCH_ROWS; r++)
+	{
+		slot[r] = aprep_sketch_slot(fp, r);
+		min = Min(min, aprep_sketch[r][slot[r]]);
+	}
+	if (min < PG_UINT8_MAX)
+	{
+		for (int r = 0; r < APREP_SKETCH_ROWS; r++)
+			if (aprep_sketch[r][slot[r]] == min)
+				aprep_sketch[r][slot[r]]++;
+		min++;
+	}
+
+	if (++aprep_sketch_adds >= APREP_SKETCH_AGE_EVERY)
+	{
+		for (int r = 0; r < APREP_SKETCH_ROWS; r++)
+			for (int i = 0; i < APREP_SKETCH_WIDTH; i++)
+				aprep_sketch[r][i] >>= 1;
+		aprep_sketch_adds = 0;
+	}
+	return min;
+}
+
+/*
+ * AutoprepareNotePlanTime
+ *		Called by exec_simple_query() after normally planning a statement that
+ *		AutoprepareConsult() returned APREP_MISS for; credits the planning time
+ *		to that statement's shape.  The minimum is kept, so one slow run (cold
+ *		caches, a busy machine) does not inflate a shape's value.
+ */
+void
+AutoprepareNotePlanTime(double plan_ms)
+{
+	AutoprepareEntry *entry;
+	uint64		fp = aprep_note_fp;
+
+	aprep_note_fp = 0;
+	if (fp == 0 || autoprepare_table == NULL)
+		return;
+
+	entry = (AutoprepareEntry *) hash_search(autoprepare_table, &fp,
+											 HASH_FIND, NULL);
+	if (entry != NULL && (entry->plan_ms == 0 || plan_ms < entry->plan_ms))
+		entry->plan_ms = plan_ms;
 }
 
 
 /* ----------------------------------------------------------------
  *		main entry point
  * ---------------------------------------------------------------- */
+
+/*
+ * Promote a tracking entry that reached the threshold: build its cached plan,
+ * or mark it declined if it cannot have one.  Makes room in the fixed share
+ * first.  Called only from AutoprepareConsult(), when no entry is in use.
+ */
+static void
+aprep_promote(AutoprepareEntry *entry, Query *analyzed_query,
+			  const char *query_string, uint64 fp, bool dbg)
+{
+	/*
+	 * Build in a short-lived context so the scratch produced while
+	 * parameterizing the query (a copyObject of the whole query tree plus
+	 * the QueryRewrite output) is freed immediately.  Only two things must
+	 * outlive this block: the finished CachedPlanSource -- which
+	 * SaveCachedPlan reparents to CacheMemoryContext -- and a copy of the
+	 * parameter types, which we stash in AutoprepareContext.  Without this,
+	 * every promotion (and every promotion attempt) leaked its scratch
+	 * into the long-lived cache context.
+	 */
+	MemoryContext build_cxt = AllocSetContextCreate(CurrentMemoryContext,
+													"Autoprepare build",
+													ALLOCSET_DEFAULT_SIZES);
+	MemoryContext old = MemoryContextSwitchTo(build_cxt);
+	Oid		   *ptypes = NULL;
+	int			nparams = 0;
+	CachedPlanSource *ps;
+	instr_time	build_start;
+	instr_time	build_time;
+
+	/*
+	 * The fixed share is full: this shape has just shown it is in use, so
+	 * it replaces the promoted/declined entry that is worth least.
+	 */
+	while (aprep_num_fixed >= aprep_fixed_cap() &&
+		   aprep_evict_lowest_fixed())
+		;
+
+	INSTR_TIME_SET_CURRENT(build_start);
+	ps = build_parameterized_plansource(analyzed_query, query_string,
+										&ptypes, &nparams);
+	INSTR_TIME_SET_CURRENT(build_time);
+	INSTR_TIME_SUBTRACT(build_time, build_start);
+	entry->build_ms = INSTR_TIME_GET_MILLISEC(build_time);
+
+	/* Its sightings so far count as reuse. */
+	entry->reuse = entry->seen_count;
+	entry->last_used = aprep_clock;
+
+	/*
+	 * The entry leaves the tracking list only together with setting
+	 * promoted/declined, after anything that can fail, so an error on the
+	 * way leaves it a consistent tracking entry.
+	 */
+	if (ps != NULL)
+	{
+		SaveCachedPlan(ps); /* reparents the plan to CacheMemoryContext +
+							 * registers it for invalidation callbacks */
+		entry->plansource = ps;
+		entry->num_params = nparams;
+		/* copy param types into the long-lived cache context */
+		entry->param_types = (Oid *) MemoryContextAlloc(AutoprepareContext,
+														sizeof(Oid) * nparams);
+		memcpy(entry->param_types, ptypes, sizeof(Oid) * nparams);
+		entry->promoted = true;
+		dlist_delete(&entry->lru_node);
+		aprep_num_fixed++;
+		aprep_promotions++;
+		if (dbg)
+			elog(LOG, "[autoprep] PROMOTED (cached now; future runs can HIT) qid=%llu nparams=%d :: %.160s",
+				 (unsigned long long) fp, nparams, query_string);
+	}
+	else
+	{
+		/*
+		 * This shape can't be parameterized/cached (too many params,
+		 * rule-rewritten, etc.).  Mark it so we never pay the build cost
+		 * again -- otherwise every future execution would redo the
+		 * copyObject + QueryRewrite.
+		 */
+		entry->declined = true;
+		dlist_delete(&entry->lru_node);
+		aprep_num_fixed++;
+		aprep_declines++;
+		if (dbg)
+			elog(LOG, "[autoprep] DECLINED(build returned NULL: 0-params, >%d params, or QueryRewrite expanded to !=1 query) qid=%llu -> always REPLAN :: %.160s",
+				 APREP_MAX_PARAMS, (unsigned long long) fp, query_string);
+	}
+	MemoryContextSwitchTo(old);
+	MemoryContextDelete(build_cxt);		/* frees all build scratch */
+}
 
 AutoprepareResult
 AutoprepareConsult(Query *analyzed_query, const char *query_string,
@@ -729,6 +1098,22 @@ AutoprepareConsult(Query *analyzed_query, const char *query_string,
 
 	*plansource_out = NULL;
 	*boundParams_out = NULL;
+	aprep_note_fp = 0;
+
+	/*
+	 * Apply a dbblue_autoprepare_reset() request here, before the table is
+	 * touched, and never from the signal's interrupt: an interrupt can arrive
+	 * while an entry is being built or its cached plan is executing, and
+	 * freeing the table then would leave dangling pointers.  Here no entry is
+	 * in use (the previous statement released its plan), so this is as safe
+	 * as DISCARD PLANS.  Checked ahead of the enabled test so a backend with
+	 * autoprepare off still clears its table.
+	 */
+	if (AutoprepareResetPending)
+	{
+		AutoprepareResetPending = false;
+		AutoprepareReset();
+	}
 
 	/* dbblue diagnostic: focus logging on ir_attachment queries only */
 	dbg = (query_string != NULL && strstr(query_string, "ir_attachment") != NULL);
@@ -753,6 +1138,7 @@ AutoprepareConsult(Query *analyzed_query, const char *query_string,
 
 	if (autoprepare_table == NULL)
 		autoprepare_init();
+	aprep_clock++;
 
 	entry = (AutoprepareEntry *) hash_search(autoprepare_table, &fp,
 											 HASH_FIND, &found);
@@ -760,23 +1146,51 @@ AutoprepareConsult(Query *analyzed_query, const char *query_string,
 	/* ---- first sighting ---- */
 	if (!found)
 	{
-		if (hash_get_num_entries(autoprepare_table) >= autoprepare_limit)
+		/*
+		 * Table full: make room by dropping the tracking entry that has gone
+		 * longest without reappearing.  Fixed entries use at most
+		 * aprep_fixed_cap(), so normally one exists; if not (the limit was
+		 * lowered below what the fixed entries already use), drop the
+		 * lowest-value fixed entry instead.  Looping also shrinks the table
+		 * after the limit is lowered.  Safe here: no entry is in use.
+		 */
+		while (hash_get_num_entries(autoprepare_table) >= autoprepare_limit)
 		{
-			aprep_rejected_full++;
-			return APREP_MISS;	/* cap reached; TODO: LRU-evict instead */
+			if (!dlist_is_empty(&aprep_tracking_lru))
+			{
+				aprep_remove_entry(dlist_head_element(AutoprepareEntry, lru_node,
+													  &aprep_tracking_lru));
+				aprep_tracking_evictions++;
+			}
+			else if (aprep_num_fixed <= aprep_fixed_cap() ||
+					 !aprep_evict_lowest_fixed())
+			{
+				aprep_rejected_full++;
+				return APREP_MISS;
+			}
 		}
 
 		entry = (AutoprepareEntry *) hash_search(autoprepare_table, &fp,
 												 HASH_ENTER, &found);
-		entry->seen_count = 1;
+		/* earlier sightings may survive in the sketch although the entry did not */
+		entry->seen_count = aprep_sketch_add(fp);
 		entry->promoted = false;
 		entry->declined = false;
 		entry->plansource = NULL;
 		entry->param_types = NULL;
 		entry->num_params = 0;
+		entry->plan_ms = 0;
+		entry->build_ms = 0;
+		entry->reuse = 0;
+		entry->last_used = aprep_clock;
+		entry->first_seen = aprep_clock;
+		dlist_push_tail(&aprep_tracking_lru, &entry->lru_node);
+		aprep_note_fp = fp;		/* planned normally: time it */
 		if (dbg)
-			elog(LOG, "[autoprep] MISS(first-sighting) qid=%llu seen=1 :: %.160s",
-				 (unsigned long long) fp, query_string);
+			elog(LOG, "[autoprep] MISS(new entry) qid=%llu seen=%u :: %.160s",
+				 (unsigned long long) fp, entry->seen_count, query_string);
+		if (entry->seen_count >= autoprepare_threshold)
+			aprep_promote(entry, analyzed_query, query_string, fp, dbg);
 		return APREP_MISS;
 	}
 
@@ -814,6 +1228,7 @@ AutoprepareConsult(Query *analyzed_query, const char *query_string,
 			!equal(ipquery, entry->plansource->analyzed_parse_tree))
 		{
 			aprep_fallbacks++;
+			aprep_note_fp = fp;		/* planned normally: time it */
 			if (dbg)
 				elog(LOG, "[autoprep] MISS(reuse-fail: %s) qid=%llu seen=%u -> REPLAN :: %.160s",
 					 (ipquery == NULL) ? "reparameterize-returned-null(0-params/too-many)"
@@ -828,6 +1243,7 @@ AutoprepareConsult(Query *analyzed_query, const char *query_string,
 		if (boundParams == NULL)
 		{
 			aprep_fallbacks++;
+			aprep_note_fp = fp;		/* planned normally: time it */
 			if (dbg)
 				elog(LOG, "[autoprep] MISS(reuse-fail: extract-mismatch, param count/types diverged) qid=%llu -> REPLAN :: %.160s",
 					 (unsigned long long) fp, query_string);
@@ -837,6 +1253,7 @@ AutoprepareConsult(Query *analyzed_query, const char *query_string,
 		*plansource_out = entry->plansource;
 		*boundParams_out = boundParams;
 		aprep_hits++;
+		aprep_note_reuse(entry);
 		if (dbg)
 			elog(LOG, "[autoprep] HIT (reusing cached plan) qid=%llu nparams=%d seen=%u :: %.160s",
 				 (unsigned long long) fp, entry->num_params, entry->seen_count, query_string);
@@ -846,6 +1263,8 @@ AutoprepareConsult(Query *analyzed_query, const char *query_string,
 	/* ---- known-uncacheable shape: never re-attempt the build ---- */
 	if (entry->declined)
 	{
+		aprep_note_reuse(entry);	/* a build attempt saved */
+		aprep_note_fp = fp;		/* planned normally: time it */
 		if (dbg)
 			elog(LOG, "[autoprep] MISS(previously-declined; won't rebuild) qid=%llu -> REPLAN :: %.160s",
 				 (unsigned long long) fp, query_string);
@@ -853,62 +1272,16 @@ AutoprepareConsult(Query *analyzed_query, const char *query_string,
 	}
 
 	/* ---- seen before, not yet promoted: bump and maybe promote ---- */
-	entry->seen_count++;
-	if (entry->seen_count >= autoprepare_threshold)
 	{
-		/*
-		 * Build in a short-lived context so the scratch produced while
-		 * parameterizing the query (a copyObject of the whole query tree plus
-		 * the QueryRewrite output) is freed immediately.  Only two things must
-		 * outlive this block: the finished CachedPlanSource -- which
-		 * SaveCachedPlan reparents to CacheMemoryContext -- and a copy of the
-		 * parameter types, which we stash in AutoprepareContext.  Without this,
-		 * every promotion (and every promotion attempt) leaked its scratch
-		 * into the long-lived cache context.
-		 */
-		MemoryContext build_cxt = AllocSetContextCreate(CurrentMemoryContext,
-														"Autoprepare build",
-														ALLOCSET_DEFAULT_SIZES);
-		MemoryContext old = MemoryContextSwitchTo(build_cxt);
-		Oid		   *ptypes = NULL;
-		int			nparams = 0;
-		CachedPlanSource *ps;
+		/* not inside Max(): that macro would count the sighting twice */
+		uint32		sketched = aprep_sketch_add(fp);
 
-		ps = build_parameterized_plansource(analyzed_query, query_string,
-											&ptypes, &nparams);
-		if (ps != NULL)
-		{
-			SaveCachedPlan(ps); /* reparents the plan to CacheMemoryContext +
-								 * registers it for invalidation callbacks */
-			entry->plansource = ps;
-			entry->num_params = nparams;
-			/* copy param types into the long-lived cache context */
-			entry->param_types = (Oid *) MemoryContextAlloc(AutoprepareContext,
-															sizeof(Oid) * nparams);
-			memcpy(entry->param_types, ptypes, sizeof(Oid) * nparams);
-			entry->promoted = true;
-			aprep_promotions++;
-			if (dbg)
-				elog(LOG, "[autoprep] PROMOTED (cached now; future runs can HIT) qid=%llu nparams=%d :: %.160s",
-					 (unsigned long long) fp, nparams, query_string);
-		}
-		else
-		{
-			/*
-			 * This shape can't be parameterized/cached (too many params,
-			 * rule-rewritten, etc.).  Mark it so we never pay the build cost
-			 * again -- otherwise every future execution would redo the
-			 * copyObject + QueryRewrite.
-			 */
-			entry->declined = true;
-			aprep_declines++;
-			if (dbg)
-				elog(LOG, "[autoprep] DECLINED(build returned NULL: 0-params, >%d params, or QueryRewrite expanded to !=1 query) qid=%llu -> always REPLAN :: %.160s",
-					 APREP_MAX_PARAMS, (unsigned long long) fp, query_string);
-		}
-		MemoryContextSwitchTo(old);
-		MemoryContextDelete(build_cxt);		/* frees all build scratch */
+		entry->seen_count = Max(entry->seen_count + 1, sketched);
 	}
+	dlist_move_tail(&aprep_tracking_lru, &entry->lru_node);	/* just seen */
+	aprep_note_fp = fp;			/* planned normally: time it */
+	if (entry->seen_count >= autoprepare_threshold)
+		aprep_promote(entry, analyzed_query, query_string, fp, dbg);
 
 	return APREP_MISS;			/* plan normally on the promoting call */
 }
@@ -927,13 +1300,28 @@ AutoprepareRegisterGUCs(void)
 	 * GUCs defined in src/backend/utils/misc/guc_parameters.dat, so there is
 	 * nothing to register here at backend start.
 	 *
-	 * We still force query-id computation on:
-	 *
-	 * Our fingerprint is the query jumble (Query->queryId).  Force it on so
-	 * the feature works even under the default compute_query_id = auto when no
-	 * other consumer (e.g. pg_stat_statements) has requested it.
+	 * Our fingerprint is the query jumble (Query->queryId), so query-id
+	 * computation must be on while autoprepare is.  The assign hook below
+	 * turns it on when the setting is changed; this covers the value the
+	 * backend starts with, once compute_query_id is final too.
 	 */
-	EnableQueryId();
+	if (autoprepare_enabled)
+		EnableQueryId();
+}
+
+/*
+ * assign_dbblue_autoprepare_enabled
+ *		Turn query-id computation on (under compute_query_id = auto) when
+ *		autoprepare is enabled, and only then: computing query ids makes
+ *		EXPLAIN VERBOSE print a Query Identifier line, which would otherwise
+ *		appear in every backend even with autoprepare off.  Once on, it stays
+ *		on for the backend, like pg_stat_statements' request.
+ */
+void
+assign_dbblue_autoprepare_enabled(bool newval, void *extra)
+{
+	if (newval)
+		EnableQueryId();
 }
 
 
@@ -990,6 +1378,7 @@ typedef struct AprepMsgSummary
 	char		kind;
 	bool		enabled;
 	int32		limit;
+	int32		fixed_cap;
 	int64		entries;
 	int64		promoted;
 	int64		tracking;
@@ -999,6 +1388,8 @@ typedef struct AprepMsgSummary
 	uint64		promotions;
 	uint64		declines;
 	uint64		rejected_full;
+	uint64		tracking_evictions;
+	uint64		fixed_evictions;
 } AprepMsgSummary;
 
 typedef struct AprepMsgShape
@@ -1008,6 +1399,8 @@ typedef struct AprepMsgShape
 	int32		num_params;
 	uint32		seen_count;
 	int64		queryid;
+	double		plan_ms;		/* < 0: unknown */
+	double		score;			/* < 0: not applicable (tracking) */
 	int32		query_len;		/* -1: no text; else text follows */
 } AprepMsgShape;
 
@@ -1028,6 +1421,7 @@ typedef enum AprepRequestResult
 	APREP_REQ_OK,
 	APREP_REQ_GONE,				/* target exited before it was signalled */
 	APREP_REQ_NO_REPLY,			/* timed out, or reply was cut short */
+	APREP_REQ_SKIPPED,			/* target began waiting on a reply itself */
 } AprepRequestResult;
 
 
@@ -1125,11 +1519,14 @@ aprep_fill_summary(AprepMsgSummary *s)
 	s->kind = APREP_MSG_SUMMARY;
 	s->enabled = autoprepare_enabled;
 	s->limit = autoprepare_limit;
+	s->fixed_cap = aprep_fixed_cap();
 	s->hits = aprep_hits;
 	s->fallbacks = aprep_fallbacks;
 	s->promotions = aprep_promotions;
 	s->declines = aprep_declines;
 	s->rejected_full = aprep_rejected_full;
+	s->tracking_evictions = aprep_tracking_evictions;
+	s->fixed_evictions = aprep_fixed_evictions;
 
 	if (autoprepare_table == NULL)
 		return;
@@ -1190,6 +1587,9 @@ aprep_emit_report(bool want_shapes, AprepEmitFn emit, void *arg)
 			hdr.num_params = entry->num_params;
 			hdr.seen_count = entry->seen_count;
 			hdr.queryid = (int64) entry->fingerprint;
+			hdr.plan_ms = (entry->plan_ms > 0) ? entry->plan_ms : -1;
+			hdr.score = (entry->promoted || entry->declined) ?
+				aprep_entry_score(entry) : -1;
 			hdr.query_len = (qs != NULL) ? (int32) strlen(qs) : -1;
 
 			resetStringInfo(&buf);
@@ -1237,8 +1637,8 @@ aprep_consume(void *arg, const void *data, Size len)
 		case APREP_MSG_SUMMARY:
 			{
 				AprepMsgSummary s;
-				Datum		values[12];
-				bool		nulls[12] = {0};
+				Datum		values[15];
+				bool		nulls[15] = {0};
 
 				if (len != sizeof(s))
 					return false;
@@ -1250,14 +1650,17 @@ aprep_consume(void *arg, const void *data, Size len)
 				values[1] = BoolGetDatum(s.enabled);
 				values[2] = Int64GetDatum(s.entries);
 				values[3] = Int32GetDatum(s.limit);
-				values[4] = Int64GetDatum(s.promoted);
-				values[5] = Int64GetDatum(s.tracking);
-				values[6] = Int64GetDatum(s.declined);
-				values[7] = Int64GetDatum((int64) s.hits);
-				values[8] = Int64GetDatum((int64) s.fallbacks);
-				values[9] = Int64GetDatum((int64) s.promotions);
-				values[10] = Int64GetDatum((int64) s.declines);
-				values[11] = Int64GetDatum((int64) s.rejected_full);
+				values[4] = Int32GetDatum(s.fixed_cap);
+				values[5] = Int64GetDatum(s.promoted);
+				values[6] = Int64GetDatum(s.tracking);
+				values[7] = Int64GetDatum(s.declined);
+				values[8] = Int64GetDatum((int64) s.hits);
+				values[9] = Int64GetDatum((int64) s.fallbacks);
+				values[10] = Int64GetDatum((int64) s.promotions);
+				values[11] = Int64GetDatum((int64) s.declines);
+				values[12] = Int64GetDatum((int64) s.rejected_full);
+				values[13] = Int64GetDatum((int64) s.tracking_evictions);
+				values[14] = Int64GetDatum((int64) s.fixed_evictions);
 				tuplestore_putvalues(c->rsinfo->setResult, c->rsinfo->setDesc,
 									 values, nulls);
 				return true;
@@ -1266,8 +1669,8 @@ aprep_consume(void *arg, const void *data, Size len)
 		case APREP_MSG_SHAPE:
 			{
 				AprepMsgShape h;
-				Datum		values[6];
-				bool		nulls[6] = {0};
+				Datum		values[8];
+				bool		nulls[8] = {0};
 
 				if (len < sizeof(h))
 					return false;
@@ -1283,11 +1686,19 @@ aprep_consume(void *arg, const void *data, Size len)
 				values[2] = CStringGetTextDatum(aprep_state_name(h.state));
 				values[3] = Int64GetDatum((int64) h.seen_count);
 				values[4] = Int32GetDatum(h.num_params);
-				if (h.query_len >= 0)
-					values[5] = PointerGetDatum(cstring_to_text_with_len((const char *) data + sizeof(h),
-																		 h.query_len));
+				if (h.plan_ms >= 0)
+					values[5] = Float8GetDatum(h.plan_ms);
 				else
 					nulls[5] = true;
+				if (h.score >= 0)
+					values[6] = Float8GetDatum(h.score);
+				else
+					nulls[6] = true;
+				if (h.query_len >= 0)
+					values[7] = PointerGetDatum(cstring_to_text_with_len((const char *) data + sizeof(h),
+																		 h.query_len));
+				else
+					nulls[7] = true;
 				tuplestore_putvalues(c->rsinfo->setResult, c->rsinfo->setDesc,
 									 values, nulls);
 				return true;
@@ -1304,10 +1715,12 @@ aprep_consume(void *arg, const void *data, Size len)
 
 /*
  * Ask backend pid (with ProcNumber procno) for its report and feed the reply
- * to the consumer.
+ * to the consumer.  skip_requesters: give up as soon as the target is seen
+ * waiting on a reply itself, since it would only answer after that wait.
  */
 static AprepRequestResult
-aprep_request_report(int pid, ProcNumber procno, AprepConsumer *consumer)
+aprep_request_report(int pid, ProcNumber procno, AprepConsumer *consumer,
+					 bool skip_requesters)
 {
 	AprepReportSlot *slot = &AprepReportSlots[procno];
 	dsm_segment *seg;
@@ -1358,6 +1771,8 @@ aprep_request_report(int pid, ProcNumber procno, AprepConsumer *consumer)
 				if (slot->handle == busy_handle)
 					slot->handle = DSM_HANDLE_INVALID;
 				SpinLockRelease(&slot->mutex);
+				elog(DEBUG1, "autoprepare: discarded stale report request to PID %d left by exited PID %d",
+					 pid, busy_requester);
 				continue;
 			}
 
@@ -1403,6 +1818,21 @@ aprep_request_report(int pid, ProcNumber procno, AprepConsumer *consumer)
 				break;			/* sender went away before the end marker */
 
 			/* SHM_MQ_WOULD_BLOCK */
+			if (skip_requesters && aprep_is_requesting(pid, procno))
+			{
+				result = APREP_REQ_SKIPPED;
+				break;
+			}
+
+			/*
+			 * A target that exits after being signalled never attaches, so
+			 * no detach will tell us; notice it gone instead of timing out.
+			 */
+			if (shm_mq_get_sender(mq) == NULL && BackendPidGetProc(pid) == NULL)
+			{
+				result = APREP_REQ_GONE;
+				break;
+			}
 			if (TimestampDifferenceExceeds(last_progress, GetCurrentTimestamp(),
 										   APREP_REPORT_TIMEOUT_MS))
 				break;
@@ -1469,7 +1899,7 @@ aprep_report_backend(int pid, AprepConsumer *consumer, bool explicit_pid)
 		return;
 	}
 	else
-		res = aprep_request_report(pid, procno, consumer);
+		res = aprep_request_report(pid, procno, consumer, !explicit_pid);
 
 	if (res == APREP_REQ_GONE && explicit_pid)
 		ereport(WARNING,
@@ -1659,6 +2089,90 @@ dbblue_log_autoprepare_shapes(PG_FUNCTION_ARGS)
 }
 
 /*
+ * Ask backend pid to clear its autoprepare table.  Returns true if the
+ * request was delivered.  explicit_pid: the caller named this pid, so warn
+ * when it is not a backend.
+ */
+static bool
+aprep_request_reset(int pid, bool explicit_pid)
+{
+	PGPROC	   *proc;
+
+	/*
+	 * Our own table is not cleared here either: the statement calling us may
+	 * itself be running one of its cached plans.
+	 */
+	if (pid == MyProcPid)
+	{
+		AutoprepareResetPending = true;
+		return true;
+	}
+
+	proc = BackendPidGetProc(pid);
+	if (proc == NULL)
+	{
+		if (explicit_pid)
+			ereport(WARNING,
+					(errmsg("PID %d is not a PostgreSQL backend process", pid)));
+		return false;
+	}
+
+	if (SendProcSignal(pid, PROCSIG_AUTOPREPARE_RESET,
+					   GetNumberFromPGProc(proc)) < 0)
+	{
+		if (explicit_pid)
+			ereport(WARNING,
+					(errmsg("could not send signal to process %d: %m", pid)));
+		return false;
+	}
+	return true;
+}
+
+/*
+ * dbblue_autoprepare_reset([target_pid])
+ *		Clear the autoprepare table of target_pid, or of every client backend
+ *		when target_pid is NULL.  Returns the number of backends asked.
+ *
+ * Each backend clears its table at the start of its next query (see
+ * AutoprepareConsult()), so an idle backend keeps showing its entries until
+ * it runs one.  Lifetime counters are kept, as with DISCARD PLANS.
+ */
+Datum
+dbblue_autoprepare_reset(PG_FUNCTION_ARGS)
+{
+	int			nrequested = 0;
+	int			nbackends;
+
+	if (!PG_ARGISNULL(0))
+		PG_RETURN_INT32(aprep_request_reset(PG_GETARG_INT32(0), true) ? 1 : 0);
+
+	nbackends = pgstat_fetch_stat_numbackends();
+	for (int i = 1; i <= nbackends; i++)
+	{
+		LocalPgBackendStatus *local = pgstat_get_local_beentry_by_index(i);
+
+		if (local == NULL ||
+			local->backendStatus.st_backendType != B_BACKEND ||
+			local->backendStatus.st_procpid <= 0)
+			continue;
+		if (aprep_request_reset(local->backendStatus.st_procpid, false))
+			nrequested++;
+	}
+
+	PG_RETURN_INT32(nrequested);
+}
+
+/*
+ * HandleAutoprepareResetInterrupt
+ *		Signal-handler side of dbblue_autoprepare_reset(): only set the flag.
+ */
+void
+HandleAutoprepareResetInterrupt(void)
+{
+	AutoprepareResetPending = true;
+}
+
+/*
  * HandleLogAutoprepareShapesInterrupt
  *		Signal-handler side: just set the flag; logging happens later.
  */
@@ -1700,11 +2214,14 @@ ProcessLogAutoprepareShapesInterrupt(void)
 						s.enabled ? "on" : "off",
 						(long long) s.promoted, (long long) s.tracking,
 						(long long) s.declined),
-				 errdetail("Since backend start: %llu hits, %llu reuse fallbacks, %llu promotions, %llu declines, %llu statements not tracked because the limit was reached.",
+				 errdetail("At most %d promoted or declined entries.  Since backend start: %llu hits, %llu reuse fallbacks, %llu promotions, %llu declines, %llu tracking entries evicted, %llu cached entries evicted, %llu statements not tracked because the limit was reached.",
+						   s.fixed_cap,
 						   (unsigned long long) s.hits,
 						   (unsigned long long) s.fallbacks,
 						   (unsigned long long) s.promotions,
 						   (unsigned long long) s.declines,
+						   (unsigned long long) s.tracking_evictions,
+						   (unsigned long long) s.fixed_evictions,
 						   (unsigned long long) s.rejected_full)));
 
 		if (autoprepare_table != NULL)
@@ -1727,11 +2244,13 @@ ProcessLogAutoprepareShapesInterrupt(void)
 					ereport(LOG_SERVER_ONLY,
 							(errhidestmt(true),
 							 errhidecontext(true),
-							 errmsg_internal("autoprepare shape: queryid=%lld state=%s seen=%u params=%d query: %.*s%s",
+							 errmsg_internal("autoprepare shape: queryid=%lld state=%s seen=%u params=%d plan_ms=%.3f score=%.3f query: %.*s%s",
 											 (long long) entry->fingerprint,
 											 state,
 											 entry->seen_count,
 											 entry->num_params,
+											 entry->plan_ms,
+											 aprep_entry_score(entry),
 											 cliplen, qs,
 											 cliplen < qlen ? "..." : "")));
 				}

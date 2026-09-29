@@ -42,6 +42,8 @@ typedef enum
 									 * autoprepare shapes */
 	PROCSIG_AUTOPREPARE_REPORT, /* dbblue: ask backend to send its
 								 * autoprepare shapes to a requester */
+	PROCSIG_AUTOPREPARE_RESET,	/* dbblue: ask backend to clear its
+								 * autoprepare table */
 	PROCSIG_RECOVERY_CONFLICT,	/* backend is blocking recovery, check
 								 * PGPROC->pendingRecoveryConflicts for the
 								 * reason */
