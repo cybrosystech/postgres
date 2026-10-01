@@ -299,7 +299,9 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 
 			/*
 			 * We don't have an AM for partitioned indexes, so we'll just
-			 * NULLify the AM related fields for those.
+			 * NULLify the AM related fields for those.  Global partition
+			 * indexes are physical RELKIND_INDEX entries and get real AM
+			 * properties.
 			 */
 			if (indexRelation->rd_rel->relkind != RELKIND_PARTITIONED_INDEX)
 			{
@@ -312,6 +314,7 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 				info->amcanparallel = amroutine->amcanparallel;
 				info->amhasgettuple = (amroutine->amgettuple != NULL);
 				info->amhasgetbitmap = amroutine->amgetbitmap != NULL &&
+					relation->rd_tableam != NULL &&
 					relation->rd_tableam->scan_bitmap_next_tuple != NULL;
 				info->amcanmarkpos = (amroutine->ammarkpos != NULL &&
 									  amroutine->amrestrpos != NULL);
@@ -462,6 +465,32 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 			info->nullsnotdistinct = index->indnullsnotdistinct;
 			info->immediate = index->indimmediate;
 			info->hypothetical = false;
+			info->indglobal = index->indglobal;
+
+			/*
+			 * Global partition indexes only support the *serial* Index Scan
+			 * path, which routes each TID to the owning child partition and
+			 * fetches from that partition's heap (see nodeIndexscan.c).  The
+			 * other scan flavours operate on the partitioned parent, which has
+			 * no table AM / storage of its own, so they crash:
+			 *
+			 *  - Index Only Scan / parallel Index Scan dereference the parent's
+			 *    NULL rd_tableam in table_index_fetch_begin();
+			 *  - mark/restore is not implemented for the per-partition fetch
+			 *    state.
+			 *
+			 * Disable all of those here so the planner never generates them.
+			 * (canreturn=false alone is insufficient: a count(*)-style query
+			 * needs zero columns and would still get an IOS path; that case is
+			 * blocked in check_index_only().)
+			 */
+			if (index->indglobal)
+			{
+				for (int gi = 0; gi < info->ncolumns; gi++)
+					info->canreturn[gi] = false;
+				info->amcanparallel = false;
+				info->amcanmarkpos = false;
+			}
 
 			/*
 			 * Estimate the index size.  If it's not a partial index, we lock
@@ -503,7 +532,7 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 			}
 			else
 			{
-				/* Zero these out for partitioned indexes */
+				/* Zero these out for partitioned/global indexes */
 				info->pages = 0;
 				info->tuples = 0.0;
 				info->tree_height = -1;
@@ -892,6 +921,16 @@ infer_arbiter_indexes(PlannerInfo *root)
 
 		/* obtain the same lock type that the executor will ultimately use */
 		idxRel = index_open(indexoid, rte->rellockmode);
+
+		/*
+		 * A global index cannot be an ON CONFLICT arbiter: arbiters are
+		 * mapped to per-partition indexes, which it does not have.
+		 */
+		if (idxRel->rd_index->indglobal)
+		{
+			index_close(idxRel, NoLock);
+			continue;
+		}
 		indexRelList = lappend(indexRelList, idxRel);
 	}
 
@@ -911,6 +950,23 @@ infer_arbiter_indexes(PlannerInfo *root)
 			ereport(ERROR,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 					 errmsg("constraint in ON CONFLICT clause has no associated index")));
+
+		/* Global indexes were left out of indexRelList above */
+		{
+			HeapTuple	idxtup = SearchSysCache1(INDEXRELID,
+												 ObjectIdGetDatum(indexOidFromConstraint));
+
+			if (HeapTupleIsValid(idxtup))
+			{
+				bool		isglobal = ((Form_pg_index) GETSTRUCT(idxtup))->indglobal;
+
+				ReleaseSysCache(idxtup);
+				if (isglobal)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("ON CONFLICT is not supported for constraints backed by a global index")));
+			}
+		}
 
 		/*
 		 * Find the named constraint index to extract its attributes and

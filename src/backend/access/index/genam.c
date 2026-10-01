@@ -189,6 +189,10 @@ BuildIndexValueDescription(Relation indexRelation,
 
 	indnkeyatts = IndexRelationGetNumberOfKeyAttributes(indexRelation);
 
+	/* A global index's trailing partition key columns are not shown */
+	if (indexRelation->rd_index->indglobal)
+		indnkeyatts = IndexGlobalNumUserKeys(indexRelation->rd_index);
+
 	/*
 	 * Check permissions- if the user does not have access to view all of the
 	 * key columns then return NULL to avoid leaking data.

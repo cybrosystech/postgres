@@ -107,17 +107,31 @@
 #include "postgres.h"
 
 #include "access/genam.h"
+#include "access/htup_details.h"
 #include "access/relscan.h"
+#include "access/table.h"
 #include "access/tableam.h"
+#include "access/tupconvert.h"
 #include "access/xact.h"
 #include "catalog/index.h"
+#include "catalog/indexing.h"
+#include "catalog/partition.h"
+#include "catalog/pg_index.h"
+#include "catalog/pg_index_d.h"
+#include "utils/fmgroids.h"
 #include "executor/executor.h"
+#include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
+#include "partitioning/partbounds.h"
+#include "partitioning/partdesc.h"
+#include "storage/bufmgr.h"
 #include "storage/lmgr.h"
 #include "utils/injection_point.h"
 #include "utils/lsyscache.h"
 #include "utils/multirangetypes.h"
+#include "utils/partcache.h"
 #include "utils/rangetypes.h"
+#include "utils/relcache.h"
 #include "utils/snapmgr.h"
 
 /* waitMode argument to check_exclusion_or_unique_constraint() */
@@ -147,6 +161,517 @@ static bool index_expression_changed_walker(Node *node,
 											Bitmapset *allUpdatedCols);
 static void ExecWithoutOverlapsNotEmpty(Relation rel, NameData attname, Datum attval,
 										char typtype, Oid atttypid);
+static bool global_index_keys_equal(Relation gidx, IndexInfo *indexInfo,
+									int nkeys, const Datum *values1, const bool *isnull1,
+									const Datum *values2, const bool *isnull2);
+
+/* ----------------------------------------------------------------
+ *		ExecGlobalIndexRoutePartition
+ *
+ *		Map an entry of a global partition index to the OID of the leaf
+ *		partition that owns its heap TID, using the partition key value(s)
+ *		stored in the index tuple (a global index always contains the
+ *		partition key columns).  Mirrors get_partition_for_tuple().  Returns
+ *		InvalidOid if no partition accepts the value.  With
+ *		'include_detached', a partition being detached concurrently still
+ *		counts as a partition of the parent (its rows are still indexed).
+ * ----------------------------------------------------------------
+ */
+Oid
+ExecGlobalIndexRoutePartition(Relation parentRel, Relation gidx,
+							  IndexTuple itup, bool include_detached)
+{
+	PartitionDesc partdesc = RelationGetPartitionDesc(parentRel,
+													  !include_detached);
+	int			part_index;
+
+	part_index = ExecGlobalIndexRouteToIndex(RelationGetPartitionKey(parentRel),
+											 partdesc, gidx, itup);
+
+	return part_index >= 0 ? partdesc->oids[part_index] : InvalidOid;
+}
+
+/*
+ * ExecGlobalIndexRouteToIndex
+ *		Like ExecGlobalIndexRoutePartition, but for a given partition
+ *		descriptor, returning the partition's index in it (or -1).
+ */
+int
+ExecGlobalIndexRouteToIndex(PartitionKey key, PartitionDesc partdesc,
+							Relation gidx, IndexTuple itup)
+{
+	PartitionBoundInfo boundinfo = partdesc->boundinfo;
+	TupleDesc	itupdesc = RelationGetDescr(gidx);
+	Datum		values[PARTITION_MAX_KEYS];
+	bool		isnull[PARTITION_MAX_KEYS];
+	int			part_index = -1;
+
+	if (boundinfo == NULL)
+		return -1;
+
+	for (int i = 0; i < key->partnatts; i++)
+	{
+		int			idxatt = 0;
+
+		for (int j = 0; j < gidx->rd_index->indnatts; j++)
+		{
+			if (key->partattrs[i] != 0 &&
+				gidx->rd_index->indkey.values[j] == key->partattrs[i])
+			{
+				idxatt = j + 1;
+				break;
+			}
+		}
+		if (idxatt == 0)
+			elog(ERROR, "global index \"%s\" does not contain the partition key",
+				 RelationGetRelationName(gidx));
+
+		values[i] = index_getattr(itup, idxatt, itupdesc, &isnull[i]);
+	}
+
+	switch (key->strategy)
+	{
+		case PARTITION_STRATEGY_HASH:
+			{
+				uint64		rowHash;
+
+				rowHash = compute_partition_hash_value(key->partnatts,
+													   key->partsupfunc,
+													   key->partcollation,
+													   values, isnull);
+				part_index = boundinfo->indexes[rowHash % boundinfo->nindexes];
+			}
+			break;
+
+		case PARTITION_STRATEGY_LIST:
+			if (isnull[0])
+			{
+				if (partition_bound_accepts_nulls(boundinfo))
+					part_index = boundinfo->null_index;
+			}
+			else
+			{
+				bool		equal = false;
+				int			bound_offset;
+
+				bound_offset = partition_list_bsearch(key->partsupfunc,
+													  key->partcollation,
+													  boundinfo,
+													  values[0], &equal);
+				if (bound_offset >= 0 && equal)
+					part_index = boundinfo->indexes[bound_offset];
+			}
+			break;
+
+		case PARTITION_STRATEGY_RANGE:
+			{
+				bool		equal = false,
+							has_null = false;
+
+				/* No range includes NULL; leave that to the default partition */
+				for (int i = 0; i < key->partnatts; i++)
+				{
+					if (isnull[i])
+					{
+						has_null = true;
+						break;
+					}
+				}
+				if (!has_null)
+				{
+					int			bound_offset;
+
+					bound_offset = partition_range_datum_bsearch(key->partsupfunc,
+																 key->partcollation,
+																 boundinfo,
+																 key->partnatts,
+																 values, &equal);
+					part_index = boundinfo->indexes[bound_offset + 1];
+				}
+			}
+			break;
+	}
+
+	if (part_index < 0)
+		part_index = boundinfo->default_index;
+
+	return part_index;
+}
+
+/*
+ * global_index_keys_equal
+ *		Compare the first nkeys columns of two global index entries,
+ *		treating two NULLs as equal (only reached with NULLS NOT DISTINCT).
+ */
+static bool
+global_index_keys_equal(Relation gidx, IndexInfo *indexInfo, int nkeys,
+						const Datum *values1, const bool *isnull1,
+						const Datum *values2, const bool *isnull2)
+{
+	for (int i = 0; i < nkeys; i++)
+	{
+		if (isnull1[i] || isnull2[i])
+		{
+			if (isnull1[i] && isnull2[i])
+				continue;
+			return false;
+		}
+		if (!DatumGetBool(OidFunctionCall2Coll(indexInfo->ii_UniqueProcs[i],
+											   gidx->rd_indcollation[i],
+											   values1[i], values2[i])))
+			return false;
+	}
+	return true;
+}
+
+/* An entry of a global index found by ExecCheckGlobalIndexUnique() */
+typedef struct GlobalIndexCandidate
+{
+	Oid			partOid;
+	ItemPointerData tid;
+} GlobalIndexCandidate;
+
+/* ----------------------------------------------------------------
+ *		ExecCheckGlobalIndexUnique
+ *
+ *		Enforce uniqueness for an entry just inserted into a UNIQUE global
+ *		partition index.
+ *
+ *		The btree AM cannot do this itself: its uniqueness check fetches the
+ *		conflicting TIDs from the one heap it is given, whereas a global index
+ *		holds TIDs of many partition heaps.  So the entry is inserted without
+ *		a check (UNIQUE_CHECK_NO) and then, as for an exclusion constraint, we
+ *		scan the index for other entries with the same key, route each one to
+ *		its partition through the stored partition key, and look at the heap
+ *		tuple with a dirty snapshot.  A live duplicate raises a unique
+ *		violation; one whose inserting or deleting transaction is still in
+ *		progress is waited for, and the scan restarted.  Two sessions
+ *		inserting the same key concurrently thus wait for each other, and one
+ *		of them fails (possibly with a deadlock error).
+ *
+ *		Entries can be stale (pointing at a dead or recycled heap slot), so
+ *		every heap tuple found is rechecked against the key and predicate.
+ *
+ *		'heapRel' and 'tupleid' identify the new tuple itself, which is
+ *		skipped.  'newIndex' selects the error wording used while building
+ *		the index.  'indexInfo' must come from BuildGlobalIndexInfo(gidx,
+ *		heapRel), i.e. be mapped to heapRel's column layout.
+ * ----------------------------------------------------------------
+ */
+void
+ExecCheckGlobalIndexUnique(Relation gidx, IndexInfo *indexInfo,
+						   Relation heapRel, const ItemPointerData *tupleid,
+						   const Datum *values, const bool *isnull,
+						   EState *estate, bool newIndex)
+{
+	/* uniqueness is on the user's columns, not the routing columns */
+	int			nkeys = IndexGlobalNumUserKeys(gidx->rd_index);
+	Relation	parentRel;
+	ScanKeyData scankeys[INDEX_MAX_KEYS];
+	SnapshotData DirtySnapshot;
+	IndexScanDesc index_scan;
+	ExprContext *econtext;
+	TupleTableSlot *save_scantuple;
+	ExprState  *predicate = NULL;
+	bool		conflict = false;
+	List	   *candidates;
+
+	Assert(gidx->rd_index->indglobal && gidx->rd_index->indisunique);
+	Assert(indexInfo->ii_UniqueProcs != NULL);
+
+	/* With the default NULLS DISTINCT, a NULL key never conflicts */
+	if (!indexInfo->ii_NullsNotDistinct)
+	{
+		for (int i = 0; i < nkeys; i++)
+		{
+			if (isnull[i])
+				return;
+		}
+	}
+
+	for (int i = 0; i < nkeys; i++)
+		ScanKeyEntryInitialize(&scankeys[i],
+							   isnull[i] ? SK_ISNULL | SK_SEARCHNULL : 0,
+							   i + 1,
+							   indexInfo->ii_UniqueStrats[i],
+							   InvalidOid,
+							   gidx->rd_indcollation[i],
+							   indexInfo->ii_UniqueProcs[i],
+							   values[i]);
+
+	if (indexInfo->ii_Predicate != NIL)
+	{
+		predicate = indexInfo->ii_PredicateState;
+		if (predicate == NULL)
+		{
+			predicate = ExecPrepareQual(indexInfo->ii_Predicate, estate);
+			indexInfo->ii_PredicateState = predicate;
+		}
+	}
+
+	parentRel = table_open(gidx->rd_index->indrelid, AccessShareLock);
+
+	econtext = GetPerTupleExprContext(estate);
+	save_scantuple = econtext->ecxt_scantuple;
+
+	InitDirtySnapshot(DirtySnapshot);
+
+retry:
+
+	/*
+	 * First collect the other entries with this key, then look at their
+	 * rows.  Don't open or lock a sibling partition while the index scan
+	 * holds a buffer pin: if the partition is locked by, say, VACUUM FULL,
+	 * that command may itself be waiting to clean up the pinned index page,
+	 * and the deadlock detector can't see buffer pin waits.
+	 *
+	 * index_beginscan() needs a heap relation to set up a fetch descriptor;
+	 * we discard it and fetch from the owning partition of each entry.
+	 */
+	candidates = NIL;
+	index_scan = index_beginscan(heapRel, gidx, &DirtySnapshot, NULL,
+								 nkeys, 0, SO_NONE);
+	if (index_scan->xs_heapfetch != NULL)
+	{
+		table_index_fetch_end(index_scan->xs_heapfetch);
+		index_scan->xs_heapfetch = NULL;
+	}
+	index_scan->xs_want_itup = true;
+	index_rescan(index_scan, scankeys, nkeys, NULL, 0);
+
+	while (index_getnext_tid(index_scan, ForwardScanDirection) != NULL)
+	{
+		GlobalIndexCandidate *cand;
+		Oid			partOid;
+
+		CHECK_FOR_INTERRUPTS();
+
+		partOid = ExecGlobalIndexRoutePartition(parentRel, gidx,
+												index_scan->xs_itup, true);
+		if (!OidIsValid(partOid))
+			continue;
+
+		/* Skip the entry of the tuple being checked */
+		if (partOid == RelationGetRelid(heapRel) &&
+			ItemPointerEquals(&index_scan->xs_heaptid, tupleid))
+			continue;
+
+		cand = palloc_object(GlobalIndexCandidate);
+		cand->partOid = partOid;
+		cand->tid = index_scan->xs_heaptid;
+		candidates = lappend(candidates, cand);
+	}
+
+	index_endscan(index_scan);
+
+	foreach_ptr(GlobalIndexCandidate, cand, candidates)
+	{
+		ItemPointerData tid = cand->tid;
+		Relation	partRel;
+		TupleTableSlot *existing_slot;
+		IndexFetchTableData *fetch;
+		bool		call_again = false;
+		bool		all_dead = false;
+		bool		found;
+		TransactionId xwait;
+
+		CHECK_FOR_INTERRUPTS();
+
+		partRel = (cand->partOid == RelationGetRelid(heapRel)) ? heapRel :
+			table_open(cand->partOid, AccessShareLock);
+
+		/* A stale entry may point past the end of a truncated heap */
+		if (ItemPointerGetBlockNumber(&tid) >=
+			RelationGetNumberOfBlocks(partRel))
+		{
+			if (partRel != heapRel)
+				table_close(partRel, NoLock);
+			continue;
+		}
+
+		existing_slot = table_slot_create(partRel, NULL);
+		fetch = table_index_fetch_begin(partRel, 0);
+		found = table_index_fetch_tuple(fetch, &tid, &DirtySnapshot,
+										existing_slot, &call_again, &all_dead);
+		table_index_fetch_end(fetch);
+
+		if (found)
+		{
+			Datum		existing_values[INDEX_MAX_KEYS];
+			bool		existing_isnull[INDEX_MAX_KEYS];
+			TupleTableSlot *cmp_slot = existing_slot;
+			TupleConversionMap *map = NULL;
+
+			/*
+			 * indexInfo is mapped to heapRel's column layout; a sibling
+			 * partition's may differ, so convert its tuple first.
+			 */
+			if (partRel != heapRel)
+				map = convert_tuples_by_name(RelationGetDescr(partRel),
+											 RelationGetDescr(heapRel));
+			if (map != NULL)
+			{
+				cmp_slot = MakeSingleTupleTableSlot(RelationGetDescr(heapRel),
+													&TTSOpsVirtual);
+				execute_attr_map_slot(map->attrMap, existing_slot, cmp_slot);
+			}
+
+			econtext->ecxt_scantuple = cmp_slot;
+			if (predicate != NULL && !ExecQual(predicate, econtext))
+				found = false;
+			else
+			{
+				FormIndexDatum(indexInfo, cmp_slot, estate,
+							   existing_values, existing_isnull);
+				found = global_index_keys_equal(gidx, indexInfo, nkeys,
+												existing_values, existing_isnull,
+												values, isnull);
+			}
+			econtext->ecxt_scantuple = save_scantuple;
+			if (map != NULL)
+			{
+				ExecDropSingleTupleTableSlot(cmp_slot);
+				free_conversion_map(map);
+			}
+		}
+		ExecDropSingleTupleTableSlot(existing_slot);
+
+		if (!found)
+		{
+			if (partRel != heapRel)
+				table_close(partRel, NoLock);
+			continue;
+		}
+
+		/*
+		 * If the conflicting tuple's inserter or deleter is still in
+		 * progress, wait for it and start over.
+		 */
+		xwait = TransactionIdIsValid(DirtySnapshot.xmin) ?
+			DirtySnapshot.xmin : DirtySnapshot.xmax;
+		if (TransactionIdIsValid(xwait))
+		{
+			if (DirtySnapshot.speculativeToken)
+				SpeculativeInsertionWait(DirtySnapshot.xmin,
+										 DirtySnapshot.speculativeToken);
+			else
+				XactLockTableWait(xwait, partRel, &tid, XLTW_InsertIndex);
+			if (partRel != heapRel)
+				table_close(partRel, NoLock);
+			list_free_deep(candidates);
+			goto retry;
+		}
+
+		if (partRel != heapRel)
+			table_close(partRel, NoLock);
+		conflict = true;
+		break;
+	}
+	list_free_deep(candidates);
+
+	if (conflict)
+	{
+		char	   *key_desc = BuildIndexValueDescription(gidx, values, isnull);
+
+		if (newIndex)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNIQUE_VIOLATION),
+					 errmsg("could not create unique index \"%s\"",
+							RelationGetRelationName(gidx)),
+					 key_desc ?
+					 errdetail("Key %s is duplicated.", key_desc) :
+					 errdetail("Duplicate keys exist."),
+					 errtableconstraint(parentRel,
+										RelationGetRelationName(gidx))));
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_UNIQUE_VIOLATION),
+					 errmsg("duplicate key value violates unique constraint \"%s\"",
+							RelationGetRelationName(gidx)),
+					 key_desc ?
+					 errdetail("Key %s already exists.", key_desc) : 0,
+					 errtableconstraint(parentRel,
+										RelationGetRelationName(gidx))));
+	}
+
+	table_close(parentRel, NoLock);
+}
+
+/* ----------------------------------------------------------------
+ *		ExecOpenGlobalIndexes
+ *
+ *		When the result relation is a partition, resolve and open the parent's
+ *		GLOBAL partition indexes once and cache them on the ResultRelInfo.
+ *		Without this, ExecInsertIndexTuples() would re-scan pg_index and reopen
+ *		the indexes for every inserted row.  Opened with RowExclusiveLock and
+ *		closed in ExecCloseIndices().  Runs in the per-query memory context (it
+ *		is called from ExecOpenIndices at executor setup), so the cache arrays
+ *		and IndexInfos live for the whole statement.
+ * ----------------------------------------------------------------
+ */
+static void
+ExecOpenGlobalIndexes(ResultRelInfo *resultRelInfo)
+{
+	Relation	resultRelation = resultRelInfo->ri_RelationDesc;
+	Oid			parentOid;
+	Relation	pgidxrel;
+	SysScanDesc scan;
+	ScanKeyData key;
+	HeapTuple	htup;
+	List	   *oids = NIL;
+	ListCell   *lc;
+	int			n;
+	List	   *ancestors;
+
+	resultRelInfo->ri_GlobalIndicesResolved = true;
+
+	/* No error if the pg_inherits entry is missing (ATTACH/DETACH) */
+	ancestors = get_partition_ancestors(RelationGetRelid(resultRelation));
+	if (ancestors == NIL)
+		return;
+	parentOid = linitial_oid(ancestors);
+	list_free(ancestors);
+
+	/* Collect the parent's global index OIDs (one pg_index scan, not per row). */
+	ScanKeyInit(&key, Anum_pg_index_indrelid, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(parentOid));
+	pgidxrel = table_open(IndexRelationId, AccessShareLock);
+	scan = systable_beginscan(pgidxrel, IndexIndrelidIndexId, true, NULL, 1, &key);
+	while (HeapTupleIsValid(htup = systable_getnext(scan)))
+	{
+		Form_pg_index idx = (Form_pg_index) GETSTRUCT(htup);
+
+		if (idx->indglobal)
+			oids = lappend_oid(oids, idx->indexrelid);
+	}
+	systable_endscan(scan);
+	table_close(pgidxrel, AccessShareLock);
+
+	n = list_length(oids);
+	if (n > 0)
+	{
+		resultRelInfo->ri_GlobalIndexRelationDescs = palloc_array(Relation, n);
+		resultRelInfo->ri_GlobalIndexRelationInfo = palloc_array(IndexInfo *, n);
+		n = 0;
+		foreach(lc, oids)
+		{
+			Relation	idxrel = index_open(lfirst_oid(lc), RowExclusiveLock);
+
+			/*
+			 * Mapped to this partition's column layout, which may differ
+			 * from the parent's; for a UNIQUE index this also sets up the
+			 * equality operators ExecCheckGlobalIndexUnique() needs.
+			 */
+			IndexInfo  *ii = BuildGlobalIndexInfo(idxrel, resultRelation);
+
+			resultRelInfo->ri_GlobalIndexRelationDescs[n] = idxrel;
+			resultRelInfo->ri_GlobalIndexRelationInfo[n] = ii;
+			n++;
+		}
+		resultRelInfo->ri_NumGlobalIndices = n;
+	}
+	list_free(oids);
+}
 
 /* ----------------------------------------------------------------
  *		ExecOpenIndices
@@ -170,6 +695,16 @@ ExecOpenIndices(ResultRelInfo *resultRelInfo, bool speculative)
 	IndexInfo **indexInfoArray;
 
 	resultRelInfo->ri_NumIndices = 0;
+
+	/*
+	 * If this is a partition, resolve and open the parent's global partition
+	 * indexes once (cached on the ResultRelInfo).  Done before the "no local
+	 * indexes" fast paths below, because a partition can have global indexes
+	 * even when it has no local index of its own.
+	 */
+	if (resultRelation->rd_rel->relispartition &&
+		!resultRelInfo->ri_GlobalIndicesResolved)
+		ExecOpenGlobalIndexes(resultRelInfo);
 
 	/* fast path if no indexes */
 	if (!RelationGetForm(resultRelation)->relhasindex)
@@ -261,6 +796,18 @@ ExecCloseIndices(ResultRelInfo *resultRelInfo)
 
 		/* Mark the index as closed */
 		indexDescs[i] = NULL;
+	}
+
+	/* Close the cached global partition indexes, if any. */
+	for (i = 0; i < resultRelInfo->ri_NumGlobalIndices; i++)
+	{
+		Relation	gidx = resultRelInfo->ri_GlobalIndexRelationDescs[i];
+
+		if (gidx == NULL)
+			continue;
+		index_insert_cleanup(gidx, resultRelInfo->ri_GlobalIndexRelationInfo[i]);
+		index_close(gidx, RowExclusiveLock);
+		resultRelInfo->ri_GlobalIndexRelationDescs[i] = NULL;
 	}
 
 	/*
@@ -512,6 +1059,77 @@ ExecInsertIndexTuples(ResultRelInfo *resultRelInfo,
 			result = lappend_oid(result, RelationGetRelid(indexRelation));
 			if (indexRelation->rd_index->indimmediate && specConflict)
 				*specConflict = true;
+		}
+	}
+
+	/*
+	 * Global Partition Index maintenance
+	 *
+	 * If we just inserted into a partition, check whether the parent
+	 * partitioned table has any global indexes (indglobal = true).  Such
+	 * indexes span all partitions and must be updated for every inserted row.
+	 *
+	 * The TID stored in a global index entry is the tuple's ctid inside the
+	 * partition heap, so it is globally meaningful together with the partition
+	 * OID stored in the INCLUDE columns (if any).  Callers that want to
+	 * resolve the full row must use the PK columns (also stored as INCLUDE
+	 * columns at index-creation time).
+	 */
+	if (heapRelation->rd_rel->relispartition)
+	{
+		/*
+		 * The parent's global indexes were resolved and opened once by
+		 * ExecOpenIndices() and cached on the ResultRelInfo, so here we just
+		 * insert into each -- no per-row pg_index scan or index_open.
+		 */
+		for (int gi = 0; gi < resultRelInfo->ri_NumGlobalIndices; gi++)
+		{
+			Relation	globalIdxRel = resultRelInfo->ri_GlobalIndexRelationDescs[gi];
+			IndexInfo  *globalIdxInfo = resultRelInfo->ri_GlobalIndexRelationInfo[gi];
+			Datum		gvalues[INDEX_MAX_KEYS];
+			bool		gisnull[INDEX_MAX_KEYS];
+
+			if (!globalIdxInfo->ii_ReadyForInserts)
+				continue;
+
+			/* A global btree is never a summarizing index */
+			if (flags & EIIT_ONLY_SUMMARIZING)
+				continue;
+
+			/* Partial global index: skip rows not satisfying the predicate */
+			if (globalIdxInfo->ii_Predicate != NIL)
+			{
+				ExprState  *predicate = globalIdxInfo->ii_PredicateState;
+
+				if (predicate == NULL)
+				{
+					predicate = ExecPrepareQual(globalIdxInfo->ii_Predicate,
+												estate);
+					globalIdxInfo->ii_PredicateState = predicate;
+				}
+				if (!ExecQual(predicate, econtext))
+					continue;
+			}
+
+			FormIndexDatum(globalIdxInfo, slot, estate, gvalues, gisnull);
+
+			/*
+			 * The btree AM can't check uniqueness across partition heaps, so
+			 * insert unchecked and enforce uniqueness ourselves afterwards.
+			 */
+			index_insert(globalIdxRel,
+						 gvalues,
+						 gisnull,
+						 tupleid,
+						 heapRelation,
+						 UNIQUE_CHECK_NO,
+						 false,
+						 globalIdxInfo);
+
+			if (globalIdxRel->rd_index->indisunique)
+				ExecCheckGlobalIndexUnique(globalIdxRel, globalIdxInfo,
+										   heapRelation, tupleid,
+										   gvalues, gisnull, estate, false);
 		}
 	}
 

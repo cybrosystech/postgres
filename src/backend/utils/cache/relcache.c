@@ -2364,6 +2364,7 @@ RelationReloadIndexInfo(Relation relation)
 		relation->rd_index->indisready = index->indisready;
 		relation->rd_index->indislive = index->indislive;
 		relation->rd_index->indisreplident = index->indisreplident;
+		relation->rd_index->indglobal = index->indglobal;
 
 		/* Copy xmin too, as that is needed to make sense of indcheckxmin */
 		HeapTupleHeaderSetXmin(relation->rd_indextuple->t_data,
@@ -5278,6 +5279,118 @@ RelationGetIndexPredicate(Relation relation)
 }
 
 /*
+ * AddParentGlobalIndexHotBlockingAttrs
+ *
+ * A global partition index physically lives on the partitioned parent, not on
+ * this leaf partition, so it never appears in the leaf's own index list (the
+ * loop in RelationGetIndexAttrBitmap therefore misses it).  Its columns must
+ * still be treated as HOT-blocking here: otherwise an UPDATE that changes a
+ * column which is in a global index but in none of the partition's *local*
+ * indexes would take the HOT path and silently skip global-index maintenance,
+ * leaving the global index stale (queries miss the new value until REINDEX).
+ *
+ * We read the parent's global indexes straight from pg_index (taking only
+ * AccessShareLock on the catalog, which is always deadlock-free) and map each
+ * indexed column from the parent's attribute numbers to this partition's by
+ * name, since an attached partition may have a different physical column order.
+ */
+static void
+AddParentGlobalIndexHotBlockingAttrs(Relation relation,
+									 Bitmapset **hotblockingattrs)
+{
+	Oid			parentOid;
+	List	   *ancestors;
+	Relation	pg_index;
+	SysScanDesc scan;
+	ScanKeyData skey;
+	HeapTuple	tup;
+
+	/*
+	 * Don't use get_partition_parent(), which errors out: while a partition
+	 * is being attached or detached it can be marked relispartition without
+	 * having a pg_inherits entry.
+	 */
+	ancestors = get_partition_ancestors(RelationGetRelid(relation));
+	if (ancestors == NIL)
+		return;
+	parentOid = linitial_oid(ancestors);
+	list_free(ancestors);
+
+	ScanKeyInit(&skey,
+				Anum_pg_index_indrelid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(parentOid));
+
+	pg_index = table_open(IndexRelationId, AccessShareLock);
+	scan = systable_beginscan(pg_index, IndexIndrelidIndexId, true,
+							  NULL, 1, &skey);
+
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_pg_index idx = (Form_pg_index) GETSTRUCT(tup);
+		Bitmapset  *parentattrs = NULL;
+		int			i;
+
+		if (!idx->indglobal || !idx->indislive)
+			continue;
+
+		/* Both key and INCLUDE columns matter: any change must maintain it. */
+		for (i = 0; i < idx->indnatts; i++)
+		{
+			if (idx->indkey.values[i] != InvalidAttrNumber)
+				parentattrs = bms_add_member(parentattrs,
+											 idx->indkey.values[i] -
+											 FirstLowInvalidHeapAttributeNumber);
+		}
+
+		/*
+		 * So do columns used in index expressions and in a partial-index
+		 * predicate: e.g. setting "active" on a row of a global UNIQUE index
+		 * "WHERE active" must add the row to the index.
+		 */
+		foreach_int(anum, list_make2_int(Anum_pg_index_indexprs,
+										 Anum_pg_index_indpred))
+		{
+			bool		isnull;
+			Datum		d = heap_getattr(tup, anum,
+										 RelationGetDescr(pg_index), &isnull);
+
+			if (!isnull)
+				pull_varattnos(stringToNode(TextDatumGetCString(d)), 1,
+							   &parentattrs);
+		}
+
+		/* Map the parent's attribute numbers to this partition's, by name */
+		i = -1;
+		while ((i = bms_next_member(parentattrs, i)) >= 0)
+		{
+			AttrNumber	parentAttno = i + FirstLowInvalidHeapAttributeNumber;
+			char	   *attname;
+			AttrNumber	childAttno;
+
+			if (parentAttno <= 0)
+				continue;
+
+			attname = get_attname(parentOid, parentAttno, true);
+			if (attname == NULL)
+				continue;
+			childAttno = get_attnum(RelationGetRelid(relation), attname);
+			pfree(attname);
+			if (childAttno == InvalidAttrNumber)
+				continue;
+
+			*hotblockingattrs =
+				bms_add_member(*hotblockingattrs,
+							   childAttno - FirstLowInvalidHeapAttributeNumber);
+		}
+		bms_free(parentattrs);
+	}
+
+	systable_endscan(scan);
+	table_close(pg_index, AccessShareLock);
+}
+
+/*
  * RelationGetIndexAttrBitmap -- get a bitmap of index attribute numbers
  *
  * The result has a bit set for each attribute used anywhere in the index
@@ -5346,8 +5459,13 @@ RelationGetIndexAttrBitmap(Relation relation, IndexAttrBitmapKind attrKind)
 		}
 	}
 
-	/* Fast path if definitely no indexes */
-	if (!RelationGetForm(relation)->relhasindex)
+	/*
+	 * Fast path if definitely no indexes.  A partition without indexes of its
+	 * own may still be covered by global indexes on its parent, whose columns
+	 * must block HOT (see AddParentGlobalIndexHotBlockingAttrs).
+	 */
+	if (!RelationGetForm(relation)->relhasindex &&
+		!relation->rd_rel->relispartition)
 		return NULL;
 
 	/*
@@ -5357,7 +5475,7 @@ restart:
 	indexoidlist = RelationGetIndexList(relation);
 
 	/* Fall out if no indexes (but relhasindex was set) */
-	if (indexoidlist == NIL)
+	if (indexoidlist == NIL && !relation->rd_rel->relispartition)
 		return NULL;
 
 	/*
@@ -5491,6 +5609,15 @@ restart:
 
 		index_close(indexDesc, AccessShareLock);
 	}
+
+	/*
+	 * If this is a leaf partition, also fold in the columns of any global
+	 * partition index defined on the parent.  Those indexes are not in this
+	 * relation's own index list, but updating one of their columns must still
+	 * block HOT so that global-index maintenance is not skipped.
+	 */
+	if (relation->rd_rel->relispartition)
+		AddParentGlobalIndexHotBlockingAttrs(relation, &hotblockingattrs);
 
 	/*
 	 * During one of the index_opens in the above loop, we might have received

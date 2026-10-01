@@ -29,21 +29,58 @@
  */
 #include "postgres.h"
 
+#include "access/genam.h"
 #include "access/nbtree.h"
 #include "access/relscan.h"
+#include "access/table.h"
 #include "access/tableam.h"
+#include "access/tupconvert.h"
 #include "catalog/pg_am.h"
+#include "catalog/pg_class_d.h"
 #include "executor/executor.h"
 #include "executor/instrument.h"
 #include "executor/nodeIndexscan.h"
 #include "lib/pairingheap.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
+#include "nodes/nodes.h"
+#include "nodes/parsenodes.h"
+#include "partitioning/partdesc.h"
 #include "utils/array.h"
+#include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/lsyscache.h"
+#include "utils/partcache.h"
 #include "utils/rel.h"
 #include "utils/sortsupport.h"
+#include "utils/syscache.h"
+
+/*
+ * GlobalIndexPartState — per-scan state for global partition index scans.
+ * Allocated in ExecInitIndexScan, freed in ExecEndIndexScan.
+ *
+ * Entries are routed over all partitions of the parent, including one being
+ * detached concurrently, so that every entry is fetched from its own heap;
+ * 'visible' then tells whether the query should see that partition's rows
+ * at all (a detach-pending partition is invisible, as in a normal plan).
+ */
+typedef struct GlobalIndexPartState
+{
+	int			nparts;
+	PartitionKey partKey;			/* partition key of the parent (relcache) */
+	PartitionDesc partdesc;			/* parent's partitions, incl. detached */
+	TupleDesc	parentDesc;			/* the scan's (parent's) row layout */
+	Relation   *partRels;			/* open child partition relations */
+	bool	   *visible;			/* partition's rows visible to this query */
+	IndexFetchTableData **fetchStates;	/* per-partition fetch state (lazy) */
+	BlockNumber *nblocks;			/* heap size seen by this scan (lazy) */
+	/* for partitions whose column layout differs from the parent's (lazy) */
+	bool	   *mapChecked;
+	TupleConversionMap **maps;
+	TupleTableSlot **childSlots;
+} GlobalIndexPartState;
+
+static void GlobalIndexPreparePartition(GlobalIndexPartState *gps, int i);
 
 /*
  * When an ordering operator is used, tuples fetched from the index that
@@ -70,6 +107,35 @@ static void reorderqueue_push(IndexScanState *node, TupleTableSlot *slot,
 							  const Datum *orderbyvals, const bool *orderbynulls);
 static HeapTuple reorderqueue_pop(IndexScanState *node);
 
+
+/*
+ * GlobalIndexPreparePartition
+ *
+ * Set up what a global index scan needs to fetch from partition i: a fetch
+ * descriptor, the heap size (entries past it are stale: the heap was
+ * truncated or reset), and for a partition whose physical column layout
+ * differs from the parent's a slot to fetch into plus a map converting its
+ * tuples into the parent's layout.
+ */
+static void
+GlobalIndexPreparePartition(GlobalIndexPartState *gps, int i)
+{
+	Relation	partRel = gps->partRels[i];
+
+	if (gps->fetchStates[i] == NULL)
+	{
+		gps->fetchStates[i] = table_index_fetch_begin(partRel, 0);
+		gps->nblocks[i] = RelationGetNumberOfBlocks(partRel);
+	}
+	if (!gps->mapChecked[i])
+	{
+		gps->maps[i] = convert_tuples_by_name(RelationGetDescr(partRel),
+											  gps->parentDesc);
+		if (gps->maps[i] != NULL)
+			gps->childSlots[i] = table_slot_create(partRel, NULL);
+		gps->mapChecked[i] = true;
+	}
+}
 
 /* ----------------------------------------------------------------
  *		IndexNext
@@ -107,15 +173,50 @@ IndexNext(IndexScanState *node)
 		/*
 		 * We reach here if the index scan is not parallel, or if we're
 		 * serially executing an index scan that was planned to be parallel.
+		 *
+		 * For global partition index scans the "heap relation" passed to
+		 * index_beginscan must be a real heap table (rd_tableam != NULL),
+		 * because index_beginscan unconditionally calls
+		 * table_index_fetch_begin(heapRelation).  A partitioned parent has
+		 * no table AM, so we pass the first child partition instead.  The
+		 * xs_heapfetch that gets created for that child is discarded
+		 * immediately; we do our own per-partition fetches in IndexNext.
 		 */
-		scandesc = index_beginscan(node->ss.ss_currentRelation,
-								   node->iss_RelationDesc,
-								   estate->es_snapshot,
-								   node->iss_Instrument,
-								   node->iss_NumScanKeys,
-								   node->iss_NumOrderByKeys,
-								   ScanRelIsReadOnly(&node->ss) ?
-								   SO_HINT_REL_READ_ONLY : SO_NONE);
+		if (node->iss_GlobalState != NULL)
+		{
+			GlobalIndexPartState *gps = node->iss_GlobalState;
+
+			/* No partitions, no rows (and no heap for index_beginscan) */
+			if (gps->nparts == 0)
+				return ExecClearTuple(slot);
+
+			scandesc = index_beginscan(gps->partRels[0],
+									   node->iss_RelationDesc,
+									   estate->es_snapshot,
+									   node->iss_Instrument,
+									   node->iss_NumScanKeys,
+									   node->iss_NumOrderByKeys,
+									   SO_NONE);
+			/* Discard the xs_heapfetch opened for partRels[0]; we manage
+			 * our own per-partition fetch descriptors. */
+			if (scandesc->xs_heapfetch != NULL)
+			{
+				table_index_fetch_end(scandesc->xs_heapfetch);
+				scandesc->xs_heapfetch = NULL;
+			}
+			scandesc->xs_want_itup = true;
+		}
+		else
+		{
+			scandesc = index_beginscan(node->ss.ss_currentRelation,
+									   node->iss_RelationDesc,
+									   estate->es_snapshot,
+									   node->iss_Instrument,
+									   node->iss_NumScanKeys,
+									   node->iss_NumOrderByKeys,
+									   ScanRelIsReadOnly(&node->ss) ?
+									   SO_HINT_REL_READ_ONLY : SO_NONE);
+		}
 
 		node->iss_ScanDesc = scandesc;
 
@@ -127,6 +228,84 @@ IndexNext(IndexScanState *node)
 			index_rescan(scandesc,
 						 node->iss_ScanKeys, node->iss_NumScanKeys,
 						 node->iss_OrderByKeys, node->iss_NumOrderByKeys);
+	}
+
+	/*
+	 * Global partition index: use TID-only scan then route the TID to the
+	 * correct child partition using the INCLUDE'd partition key column.
+	 */
+	if (node->iss_GlobalState != NULL)
+	{
+		GlobalIndexPartState *gps = node->iss_GlobalState;
+
+		while (index_getnext_tid(scandesc, direction))
+		{
+			int			partIdx;
+			bool		call_again = false;
+			bool		all_dead = false;
+			bool		found;
+			TupleTableSlot *fetchslot;
+
+			CHECK_FOR_INTERRUPTS();
+
+			/* Route the entry to its partition via its partition key value */
+			partIdx = ExecGlobalIndexRouteToIndex(gps->partKey, gps->partdesc,
+												  node->iss_RelationDesc,
+												  scandesc->xs_itup);
+			if (partIdx < 0 || !gps->visible[partIdx])
+				continue;
+
+			GlobalIndexPreparePartition(gps, partIdx);
+
+			/* A stale entry may point past the end of a truncated heap */
+			if (ItemPointerGetBlockNumber(&scandesc->xs_heaptid) >=
+				gps->nblocks[partIdx])
+				continue;
+
+			/* Fetch the heap tuple from the identified partition */
+			fetchslot = gps->maps[partIdx] ? gps->childSlots[partIdx] : slot;
+			found = table_index_fetch_tuple(gps->fetchStates[partIdx],
+											&scandesc->xs_heaptid,
+											estate->es_snapshot,
+											fetchslot,
+											&call_again,
+											&all_dead);
+			if (!found)
+				continue;
+
+			/* Convert a differently laid out partition's row */
+			if (gps->maps[partIdx] != NULL)
+			{
+				execute_attr_map_slot(gps->maps[partIdx]->attrMap,
+									  fetchslot, slot);
+				slot->tts_tableOid = fetchslot->tts_tableOid;
+				slot->tts_tid = fetchslot->tts_tid;
+			}
+
+			/*
+			 * Recheck the scan keys against the fetched tuple.  Unlike an
+			 * ordinary index scan -- which only rechecks when the AM reports a
+			 * lossy match (xs_recheck) -- a global partition index can contain
+			 * stale entries (e.g. of rows deleted but not vacuumed yet, whose
+			 * heap slot may have been pruned and reused).  Without a recheck
+			 * the scan could then return a row that does not match the qual.
+			 * Recheck unconditionally so a stale entry resolving to a
+			 * non-matching live tuple is dropped.
+			 */
+			if (node->indexqualorig != NULL)
+			{
+				econtext->ecxt_scantuple = slot;
+				if (!ExecQualAndReset(node->indexqualorig, econtext))
+				{
+					InstrCountFiltered2(node, 1);
+					continue;
+				}
+			}
+
+			return slot;
+		}
+
+		return ExecClearTuple(slot);
 	}
 
 	/*
@@ -593,6 +772,21 @@ ExecReScanIndexScan(IndexScanState *node)
 					 node->iss_OrderByKeys, node->iss_NumOrderByKeys);
 	node->iss_ReachedEnd = false;
 
+	/* Reset per-partition fetch states for global index rescan */
+	if (node->iss_GlobalState)
+	{
+		GlobalIndexPartState *gps = node->iss_GlobalState;
+
+		for (int i = 0; i < gps->nparts; i++)
+		{
+			if (gps->fetchStates[i])
+			{
+				table_index_fetch_end(gps->fetchStates[i]);
+				gps->fetchStates[i] = NULL;
+			}
+		}
+	}
+
 	ExecScanReScan(&node->ss);
 }
 
@@ -827,6 +1021,25 @@ ExecEndIndexScan(IndexScanState *node)
 		index_endscan(indexScanDesc);
 	if (indexRelationDesc)
 		index_close(indexRelationDesc, NoLock);
+
+	/* Clean up global partition index state */
+	if (node->iss_GlobalState)
+	{
+		GlobalIndexPartState *gps = node->iss_GlobalState;
+
+		for (int i = 0; i < gps->nparts; i++)
+		{
+			if (gps->fetchStates[i])
+				table_index_fetch_end(gps->fetchStates[i]);
+			if (gps->childSlots[i])
+				ExecDropSingleTupleTableSlot(gps->childSlots[i]);
+			if (gps->maps[i])
+				free_conversion_map(gps->maps[i]);
+			if (gps->partRels[i])
+				table_close(gps->partRels[i], NoLock);
+		}
+		node->iss_GlobalState = NULL;
+	}
 }
 
 /* ----------------------------------------------------------------
@@ -941,11 +1154,21 @@ ExecInitIndexScan(IndexScan *node, EState *estate, int eflags)
 
 	/*
 	 * get the scan type from the relation descriptor.
+	 * For a partitioned relation (global partition index scan), use
+	 * TTSOpsBufferHeapTuple directly — table_slot_callbacks returns
+	 * TTSOpsVirtual for partitioned tables, which is incompatible with
+	 * heapam_index_fetch_tuple.
 	 */
-	ExecInitScanTupleSlot(estate, &indexstate->ss,
-						  RelationGetDescr(currentRelation),
-						  table_slot_callbacks(currentRelation),
-						  TTS_FLAG_OBEYS_NOT_NULL_CONSTRAINTS);
+	if (currentRelation->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+		ExecInitScanTupleSlot(estate, &indexstate->ss,
+							  RelationGetDescr(currentRelation),
+							  &TTSOpsBufferHeapTuple,
+							  TTS_FLAG_OBEYS_NOT_NULL_CONSTRAINTS);
+	else
+		ExecInitScanTupleSlot(estate, &indexstate->ss,
+							  RelationGetDescr(currentRelation),
+							  table_slot_callbacks(currentRelation),
+							  TTS_FLAG_OBEYS_NOT_NULL_CONSTRAINTS);
 
 	/*
 	 * Initialize result type and projection.
@@ -986,13 +1209,57 @@ ExecInitIndexScan(IndexScan *node, EState *estate, int eflags)
 	lockmode = exec_rt_fetch(node->scan.scanrelid, estate)->rellockmode;
 	indexstate->iss_RelationDesc = index_open(node->indexid, lockmode);
 
+	/* Initialize global partition index state if needed */
+	indexstate->iss_GlobalState = NULL;
+	if (indexstate->iss_RelationDesc->rd_index->indglobal)
+	{
+		GlobalIndexPartState *gps;
+		Relation	parentRel = currentRelation;
+		PartitionDesc partdesc;
+		PartitionDesc visible_partdesc;
+		int			nparts;
+
+		/* Route over all partitions; see GlobalIndexPartState */
+		partdesc = RelationGetPartitionDesc(parentRel, false);
+		visible_partdesc = RelationGetPartitionDesc(parentRel, true);
+		nparts = partdesc->nparts;
+
+		gps = palloc0(sizeof(GlobalIndexPartState));
+		gps->nparts = nparts;
+		gps->partKey = RelationGetPartitionKey(parentRel);
+		gps->partdesc = partdesc;
+		gps->parentDesc = RelationGetDescr(parentRel);
+		gps->partRels = palloc0_array(Relation, nparts);
+		gps->visible = palloc0_array(bool, nparts);
+		gps->fetchStates = palloc0_array(IndexFetchTableData *, nparts);
+		gps->nblocks = palloc0_array(BlockNumber, nparts);
+		gps->mapChecked = palloc0_array(bool, nparts);
+		gps->maps = palloc0_array(TupleConversionMap *, nparts);
+		gps->childSlots = palloc0_array(TupleTableSlot *, nparts);
+
+		/* Open all child partition relations */
+		for (int i = 0; i < nparts; i++)
+		{
+			gps->partRels[i] = table_open(partdesc->oids[i], AccessShareLock);
+			for (int j = 0; j < visible_partdesc->nparts; j++)
+			{
+				if (visible_partdesc->oids[j] == partdesc->oids[i])
+				{
+					gps->visible[i] = true;
+					break;
+				}
+			}
+		}
+
+		indexstate->iss_GlobalState = gps;
+	}
+
 	/*
 	 * Initialize index-specific scan state
 	 */
 	indexstate->iss_RuntimeKeysReady = false;
 	indexstate->iss_RuntimeKeys = NULL;
 	indexstate->iss_NumRuntimeKeys = 0;
-
 	/*
 	 * build the index scan keys from the index qualification
 	 */
