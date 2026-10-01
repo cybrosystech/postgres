@@ -124,6 +124,12 @@ typedef struct AutoprepareEntry
 	/* ---- value, for choosing which fixed entry to evict ---- */
 	double		plan_ms;		/* fastest normal planning seen; 0 = unknown */
 	double		build_ms;		/* time of the promotion build attempt */
+
+	/* ---- reported only: planning cost without and with the cached plan ---- */
+	double		normal_plan_total_ms;	/* all normal planning runs */
+	uint32		normal_plans;
+	double		reuse_plan_total_ms;	/* GetCachedPlan() on every reuse */
+	uint32		reuse_plans;
 	double		reuse;			/* decaying reuse count, as of last_used */
 	uint64		last_used;		/* aprep_clock at the last reuse */
 	uint64		first_seen;		/* aprep_clock when the entry was created */
@@ -986,8 +992,38 @@ AutoprepareNotePlanTime(double plan_ms)
 
 	entry = (AutoprepareEntry *) hash_search(autoprepare_table, &fp,
 											 HASH_FIND, NULL);
-	if (entry != NULL && (entry->plan_ms == 0 || plan_ms < entry->plan_ms))
+	if (entry == NULL)
+		return;
+	if (entry->plan_ms == 0 || plan_ms < entry->plan_ms)
 		entry->plan_ms = plan_ms;
+	entry->normal_plan_total_ms += plan_ms;
+	entry->normal_plans++;
+}
+
+/*
+ * AutoprepareNoteReuseTime
+ *		Called by exec_simple_query() after GetCachedPlan() for a statement
+ *		that AutoprepareConsult() returned APREP_HIT for: how long getting the
+ *		plan took on reuse.  Near zero when the plancache used its generic
+ *		plan; about a normal planning run when it built a custom plan.
+ *		Reported per shape next to the normal planning time.
+ */
+void
+AutoprepareNoteReuseTime(double plan_ms)
+{
+	AutoprepareEntry *entry;
+	uint64		fp = aprep_note_fp;
+
+	aprep_note_fp = 0;
+	if (fp == 0 || autoprepare_table == NULL)
+		return;
+
+	entry = (AutoprepareEntry *) hash_search(autoprepare_table, &fp,
+											 HASH_FIND, NULL);
+	if (entry == NULL)
+		return;
+	entry->reuse_plan_total_ms += plan_ms;
+	entry->reuse_plans++;
 }
 
 
@@ -1180,6 +1216,10 @@ AutoprepareConsult(Query *analyzed_query, const char *query_string,
 		entry->param_types = NULL;
 		entry->num_params = 0;
 		entry->plan_ms = 0;
+		entry->normal_plan_total_ms = 0;
+		entry->normal_plans = 0;
+		entry->reuse_plan_total_ms = 0;
+		entry->reuse_plans = 0;
 		entry->build_ms = 0;
 		entry->reuse = 0;
 		entry->last_used = aprep_clock;
@@ -1254,6 +1294,7 @@ AutoprepareConsult(Query *analyzed_query, const char *query_string,
 		*boundParams_out = boundParams;
 		aprep_hits++;
 		aprep_note_reuse(entry);
+		aprep_note_fp = fp;		/* reused: time GetCachedPlan() */
 		if (dbg)
 			elog(LOG, "[autoprep] HIT (reusing cached plan) qid=%llu nparams=%d seen=%u :: %.160s",
 				 (unsigned long long) fp, entry->num_params, entry->seen_count, query_string);
@@ -1400,6 +1441,12 @@ typedef struct AprepMsgShape
 	uint32		seen_count;
 	int64		queryid;
 	double		plan_ms;		/* < 0: unknown */
+	double		avg_plan_before_ms;	/* < 0: no normal planning timed */
+	double		avg_plan_after_ms;	/* < 0: no reuse timed */
+	int64		num_custom_plans;	/* -1: not promoted */
+	int64		num_generic_plans;	/* -1: not promoted */
+	double		generic_cost;	/* plancache's own field; < 0: not known/not promoted */
+	double		avg_custom_cost;	/* total_custom_cost / num_custom_plans; < 0: none yet */
 	double		score;			/* < 0: not applicable (tracking) */
 	int32		query_len;		/* -1: no text; else text follows */
 } AprepMsgShape;
@@ -1588,6 +1635,27 @@ aprep_emit_report(bool want_shapes, AprepEmitFn emit, void *arg)
 			hdr.seen_count = entry->seen_count;
 			hdr.queryid = (int64) entry->fingerprint;
 			hdr.plan_ms = (entry->plan_ms > 0) ? entry->plan_ms : -1;
+			hdr.avg_plan_before_ms = (entry->normal_plans > 0) ?
+				entry->normal_plan_total_ms / entry->normal_plans : -1;
+			hdr.avg_plan_after_ms = (entry->reuse_plans > 0) ?
+				entry->reuse_plan_total_ms / entry->reuse_plans : -1;
+			if (entry->plansource != NULL)
+			{
+				CachedPlanSource *ps = entry->plansource;
+
+				hdr.num_custom_plans = ps->num_custom_plans;
+				hdr.num_generic_plans = ps->num_generic_plans;
+				hdr.generic_cost = ps->generic_cost;	/* -1 if not yet built */
+				hdr.avg_custom_cost = (ps->num_custom_plans > 0) ?
+					ps->total_custom_cost / ps->num_custom_plans : -1;
+			}
+			else
+			{
+				hdr.num_custom_plans = -1;
+				hdr.num_generic_plans = -1;
+				hdr.generic_cost = -1;
+				hdr.avg_custom_cost = -1;
+			}
 			hdr.score = (entry->promoted || entry->declined) ?
 				aprep_entry_score(entry) : -1;
 			hdr.query_len = (qs != NULL) ? (int32) strlen(qs) : -1;
@@ -1669,8 +1737,8 @@ aprep_consume(void *arg, const void *data, Size len)
 		case APREP_MSG_SHAPE:
 			{
 				AprepMsgShape h;
-				Datum		values[8];
-				bool		nulls[8] = {0};
+				Datum		values[14];
+				bool		nulls[14] = {0};
 
 				if (len < sizeof(h))
 					return false;
@@ -1690,15 +1758,39 @@ aprep_consume(void *arg, const void *data, Size len)
 					values[5] = Float8GetDatum(h.plan_ms);
 				else
 					nulls[5] = true;
-				if (h.score >= 0)
-					values[6] = Float8GetDatum(h.score);
+				if (h.avg_plan_before_ms >= 0)
+					values[6] = Float8GetDatum(h.avg_plan_before_ms);
 				else
 					nulls[6] = true;
-				if (h.query_len >= 0)
-					values[7] = PointerGetDatum(cstring_to_text_with_len((const char *) data + sizeof(h),
-																		 h.query_len));
+				if (h.avg_plan_after_ms >= 0)
+					values[7] = Float8GetDatum(h.avg_plan_after_ms);
 				else
 					nulls[7] = true;
+				if (h.num_custom_plans >= 0)
+					values[8] = Int64GetDatum(h.num_custom_plans);
+				else
+					nulls[8] = true;
+				if (h.num_generic_plans >= 0)
+					values[9] = Int64GetDatum(h.num_generic_plans);
+				else
+					nulls[9] = true;
+				if (h.generic_cost >= 0)
+					values[10] = Float8GetDatum(h.generic_cost);
+				else
+					nulls[10] = true;
+				if (h.avg_custom_cost >= 0)
+					values[11] = Float8GetDatum(h.avg_custom_cost);
+				else
+					nulls[11] = true;
+				if (h.score >= 0)
+					values[12] = Float8GetDatum(h.score);
+				else
+					nulls[12] = true;
+				if (h.query_len >= 0)
+					values[13] = PointerGetDatum(cstring_to_text_with_len((const char *) data + sizeof(h),
+																		  h.query_len));
+				else
+					nulls[13] = true;
 				tuplestore_putvalues(c->rsinfo->setResult, c->rsinfo->setDesc,
 									 values, nulls);
 				return true;
@@ -2244,12 +2336,21 @@ ProcessLogAutoprepareShapesInterrupt(void)
 					ereport(LOG_SERVER_ONLY,
 							(errhidestmt(true),
 							 errhidecontext(true),
-							 errmsg_internal("autoprepare shape: queryid=%lld state=%s seen=%u params=%d plan_ms=%.3f score=%.3f query: %.*s%s",
+							 errmsg_internal("autoprepare shape: queryid=%lld state=%s seen=%u params=%d plan_ms=%.3f avg_plan_ms_before=%.3f avg_plan_ms_after=%.3f num_custom=%lld num_generic=%lld generic_cost=%.1f avg_custom_cost=%.1f score=%.3f query: %.*s%s",
 											 (long long) entry->fingerprint,
 											 state,
 											 entry->seen_count,
 											 entry->num_params,
 											 entry->plan_ms,
+											 entry->normal_plans > 0 ?
+											 entry->normal_plan_total_ms / entry->normal_plans : 0,
+											 entry->reuse_plans > 0 ?
+											 entry->reuse_plan_total_ms / entry->reuse_plans : 0,
+											 (long long) entry->plansource->num_custom_plans,
+											 (long long) entry->plansource->num_generic_plans,
+											 entry->plansource->generic_cost,
+											 entry->plansource->num_custom_plans > 0 ?
+											 entry->plansource->total_custom_cost / entry->plansource->num_custom_plans : 0,
 											 aprep_entry_score(entry),
 											 cliplen, qs,
 											 cliplen < qlen ? "..." : "")));
