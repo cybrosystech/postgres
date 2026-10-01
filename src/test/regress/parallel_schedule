@@ -158,6 +158,11 @@ test: dbblue_countcache
 # a failure unambiguous.  Self-contained, mvs_* objects.
 test: dbblue_matview_skip
 
+# DBblue: global partition indexes.  Rolled-back DETACH/DROP/TRUNCATE/ATTACH
+# and heap rewrites must leave the global index intact.  Self-contained, gpi*
+# objects; run alone since it takes AccessExclusiveLock on its global index.
+test: global_partition_index
+
 # run tablespace test at the end because it drops the tablespace created during
 # setup that other tests may use.
 test: tablespace

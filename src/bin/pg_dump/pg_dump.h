@@ -426,6 +426,9 @@ typedef struct _indxInfo
 	char	   *indstatvals;	/* statistic values for columns */
 	int			indnkeyattrs;	/* number of index key attributes */
 	int			indnattrs;		/* total number of index attributes */
+	int			indnconkeyattrs;	/* leading key attributes that belong to the
+								 * constraint (fewer than indnkeyattrs for a
+								 * DBblue global partition index) */
 	Oid		   *indkeys;		/* In spite of the name 'indkeys' this field
 								 * contains both key and nonkey attributes */
 	bool		indisclustered;

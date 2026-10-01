@@ -6076,6 +6076,7 @@ ATRewriteTables(AlterTableStmt *parsetree, List **wqueue, LOCKMODE lockmode,
 				AlterTableUtilityContext *context)
 {
 	ListCell   *ltab;
+	List	   *gpi_rewritten = NIL;	/* rewritten partitions */
 
 	/* Go through each table that needs to be checked or rewritten */
 	foreach(ltab, *wqueue)
@@ -6245,14 +6246,11 @@ ATRewriteTables(AlterTableStmt *parsetree, List **wqueue, LOCKMODE lockmode,
 			/*
 			 * finish_heap_swap() rebuilt the partition's own indexes, but the
 			 * entries of a global index on its parent still point at the old
-			 * heap's TIDs; replace them.
+			 * heap's TIDs.  They are replaced once all tables are rewritten,
+			 * below.
 			 */
-			{
-				Relation	rewritten = table_open(tab->relid, NoLock);
-
-				IndexGlobalResyncPartition(rewritten);
-				table_close(rewritten, NoLock);
-			}
+			if (get_rel_relispartition(tab->relid))
+				gpi_rewritten = lappend_oid(gpi_rewritten, tab->relid);
 
 			InvokeObjectPostAlterHook(RelationRelationId, tab->relid, 0);
 		}
@@ -6297,6 +6295,15 @@ ATRewriteTables(AlterTableStmt *parsetree, List **wqueue, LOCKMODE lockmode,
 			}
 		}
 	}
+
+	/*
+	 * Bring the parents' global indexes up to date with the rewritten
+	 * partitions, once per parent.  This has to wait until every partition
+	 * is rewritten: when a column type changed, a global index on it was
+	 * recreated empty and must only be filled from converted rows.
+	 */
+	if (gpi_rewritten != NIL)
+		IndexGlobalResyncPartitions(gpi_rewritten);
 
 	/*
 	 * Foreign key constraints are checked in a final pass, since (a) it's

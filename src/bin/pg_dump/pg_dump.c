@@ -7824,6 +7824,7 @@ getIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
 				i_indexdef,
 				i_indnkeyatts,
 				i_indnatts,
+				i_conkeyatts,
 				i_indkey,
 				i_indisclustered,
 				i_indisreplident,
@@ -7906,6 +7907,9 @@ getIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
 							 "inh.inhparent AS parentidx, "
 							 "i.indnkeyatts AS indnkeyatts, "
 							 "i.indnatts AS indnatts, "
+							 "CASE WHEN c.conkey IS NOT NULL "
+							 "THEN pg_catalog.array_length(c.conkey, 1) "
+							 "ELSE i.indnkeyatts END AS conkeyatts, "
 							 "(SELECT pg_catalog.array_agg(attnum ORDER BY attnum) "
 							 "  FROM pg_catalog.pg_attribute "
 							 "  WHERE attrelid = i.indexrelid AND "
@@ -7919,6 +7923,7 @@ getIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
 							 "0 AS parentidx, "
 							 "i.indnatts AS indnkeyatts, "
 							 "i.indnatts AS indnatts, "
+							 "i.indnatts AS conkeyatts, "
 							 "'' AS indstatcols, "
 							 "'' AS indstatvals, ");
 
@@ -8015,6 +8020,7 @@ getIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
 	i_indexdef = PQfnumber(res, "indexdef");
 	i_indnkeyatts = PQfnumber(res, "indnkeyatts");
 	i_indnatts = PQfnumber(res, "indnatts");
+	i_conkeyatts = PQfnumber(res, "conkeyatts");
 	i_indkey = PQfnumber(res, "indkey");
 	i_indisclustered = PQfnumber(res, "indisclustered");
 	i_indisreplident = PQfnumber(res, "indisreplident");
@@ -8095,6 +8101,7 @@ getIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
 			indxinfo[j].indexdef = pg_strdup(PQgetvalue(res, j, i_indexdef));
 			indxinfo[j].indnkeyattrs = atoi(PQgetvalue(res, j, i_indnkeyatts));
 			indxinfo[j].indnattrs = atoi(PQgetvalue(res, j, i_indnatts));
+			indxinfo[j].indnconkeyattrs = atoi(PQgetvalue(res, j, i_conkeyatts));
 			indxinfo[j].tablespace = pg_strdup(PQgetvalue(res, j, i_tablespace));
 			indxinfo[j].indreloptions = pg_strdup(PQgetvalue(res, j, i_indreloptions));
 			indxinfo[j].indstatcols = pg_strdup(PQgetvalue(res, j, i_indstatcols));
@@ -18888,7 +18895,15 @@ dumpConstraint(Archive *fout, const ConstraintInfo *coninfo)
 			if (indxinfo->indnullsnotdistinct && coninfo->contype != 'p')
 				appendPQExpBufferStr(q, " NULLS NOT DISTINCT");
 			appendPQExpBufferStr(q, " (");
-			for (k = 0; k < indxinfo->indnkeyattrs; k++)
+
+			/*
+			 * List the constraint's own columns (pg_constraint.conkey).  They
+			 * are the index's key columns, except for a DBblue global
+			 * partition index, which also has the partition key as hidden
+			 * trailing key columns.  Writing those would restore a different,
+			 * per-partition constraint.
+			 */
+			for (k = 0; k < indxinfo->indnconkeyattrs; k++)
 			{
 				int			indkey = (int) indxinfo->indkeys[k];
 				const char *attname;

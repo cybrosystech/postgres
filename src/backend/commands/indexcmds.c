@@ -291,9 +291,22 @@ CheckIndexCompatible(Oid oldId,
 		return false;
 	}
 
+	/*
+	 * A global index has the partition key appended as trailing key columns,
+	 * which attributeList (regenerated from the index definition) does not
+	 * list.  Compare only the user's columns: a partition key column cannot
+	 * change type, so the trailing columns stay compatible.  If the counts
+	 * still disagree, rebuild rather than guess.
+	 */
+	old_natts = IndexGlobalNumUserKeys(indexForm);
+	if (old_natts != numberOfAttributes)
+	{
+		Assert(indexForm->indglobal);
+		ReleaseSysCache(tuple);
+		return false;
+	}
+
 	/* Any change in operator class or collation breaks compatibility. */
-	old_natts = indexForm->indnkeyatts;
-	Assert(old_natts == numberOfAttributes);
 
 	d = SysCacheGetAttrNotNull(INDEXRELID, tuple, Anum_pg_index_indcollation);
 	old_indcollation = (oidvector *) DatumGetPointer(d);

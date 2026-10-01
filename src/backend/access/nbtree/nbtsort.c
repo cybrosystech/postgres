@@ -577,6 +577,127 @@ _bt_leafbuild(BTSpool *btspool, BTSpool *btspool2)
 }
 
 /*
+ * _bt_global_collect
+ *
+ * Feed the live entries of global partition index 'index' for which 'keep'
+ * returns true into 'sortstate' (begun with tuplesort_begin_index_btree), so
+ * that the index can be rewritten into new storage by _bt_global_load().
+ * This is how a global index changes when a partition is detached, dropped,
+ * truncated, attached or rewritten: the old storage is left untouched until
+ * commit, so a rollback restores it.
+ *
+ * Leaf pages are walked left to right, so entries come out in index order.
+ * Entries marked LP_DEAD are skipped.  An entry identical to the previous one
+ * (same key and heap TID) can only be a leftover of an earlier bug and is
+ * dropped too: tuplesort must never see two equal index tuples.  The caller
+ * must hold a lock that keeps writers out of the index.
+ */
+void
+_bt_global_collect(Relation index, Tuplesortstate *sortstate,
+				   BTGlobalKeepFn keep, void *arg)
+{
+	TupleDesc	itupdesc = RelationGetDescr(index);
+	Datum		values[INDEX_MAX_KEYS];
+	bool		isnull[INDEX_MAX_KEYS];
+	IndexTuple	prev = NULL;
+	Buffer		buf;
+
+	Assert(index->rd_index->indglobal);
+
+	buf = _bt_get_endpoint(index, 0, false);
+	if (!BufferIsValid(buf))
+		return;					/* empty index, no root yet */
+
+	for (;;)
+	{
+		Page		page = BufferGetPage(buf);
+		BTPageOpaque opaque = BTPageGetOpaque(page);
+		BlockNumber next = opaque->btpo_next;
+
+		if (!P_IGNORE(opaque))
+		{
+			OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+
+			for (OffsetNumber off = P_FIRSTDATAKEY(opaque); off <= maxoff;
+				 off = OffsetNumberNext(off))
+			{
+				ItemId		itemid = PageGetItemId(page, off);
+				IndexTuple	itup;
+
+				if (ItemIdIsDead(itemid))
+					continue;
+				itup = (IndexTuple) PageGetItem(page, itemid);
+
+				if (prev != NULL &&
+					IndexTupleSize(itup) == IndexTupleSize(prev) &&
+					memcmp(itup, prev, IndexTupleSize(itup)) == 0)
+					continue;
+				if (!keep(arg, itup))
+					continue;
+
+				index_deform_tuple(itup, itupdesc, values, isnull);
+				if (BTreeTupleIsPosting(itup))
+				{
+					/* deduplication is off for global indexes, but be safe */
+					for (int i = 0; i < BTreeTupleGetNPosting(itup); i++)
+						tuplesort_putindextuplevalues(sortstate, index,
+													  BTreeTupleGetPostingN(itup, i),
+													  values, isnull);
+				}
+				else
+					tuplesort_putindextuplevalues(sortstate, index,
+												  &itup->t_tid,
+												  values, isnull);
+
+				if (prev != NULL)
+					pfree(prev);
+				prev = CopyIndexTuple(itup);
+			}
+		}
+
+		if (next == P_NONE)
+			break;
+		buf = _bt_relandgetbuf(index, buf, next, BT_READ);
+	}
+	_bt_relbuf(index, buf);
+	if (prev != NULL)
+		pfree(prev);
+}
+
+/*
+ * _bt_global_load
+ *
+ * Write a complete btree for global partition index 'index' from the tuples
+ * in 'sortstate', the way CREATE INDEX writes a sorted build.  The index must
+ * have new, empty storage (RelationSetNewRelfilenumber).  Deduplication stays
+ * off, as for every global index.  'heap' is used for error reports only.
+ */
+void
+_bt_global_load(Relation heap, Relation index, Tuplesortstate *sortstate)
+{
+	BTSpool		spool;
+	BTWriteState wstate;
+
+	Assert(index->rd_index->indglobal);
+
+	tuplesort_performsort(sortstate);
+
+	spool.sortstate = sortstate;
+	spool.heap = heap;
+	spool.index = index;
+	spool.isunique = false;
+	spool.nulls_not_distinct = false;
+
+	wstate.heap = heap;
+	wstate.index = index;
+	wstate.inskey = _bt_mkscankey(index, NULL);
+	wstate.inskey->allequalimage = false;
+	wstate.btws_pages_alloced = BTREE_METAPAGE + 1;
+
+	_bt_load(&wstate, &spool, NULL);
+}
+
+/*
  * Per-tuple callback for table_index_build_scan
  */
 static void
