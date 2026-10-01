@@ -1231,10 +1231,19 @@ exec_simple_query(const char *query_string)
 										   &aprep_src, &aprep_params);
 			if (aprep_res == APREP_HIT)
 			{
+				instr_time	plan_start;
+				instr_time	plan_time;
+
 				aprep_owner = CurrentResourceOwner;
+				INSTR_TIME_SET_CURRENT(plan_start);
 				aprep_cplan = GetCachedPlan(aprep_src, aprep_params,
 											aprep_owner, NULL);
 				plantree_list = aprep_cplan->stmt_list;
+
+				/* planning cost with the cached plan, reported per shape */
+				INSTR_TIME_SET_CURRENT(plan_time);
+				INSTR_TIME_SUBTRACT(plan_time, plan_start);
+				AutoprepareNoteReuseTime(INSTR_TIME_GET_MILLISEC(plan_time));
 			}
 			else
 			{

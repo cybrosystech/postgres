@@ -57,6 +57,9 @@ extern AutoprepareResult AutoprepareConsult(Query *analyzed_query,
  */
 extern void AutoprepareNotePlanTime(double plan_ms);
 
+/* Time GetCachedPlan() took for a statement that got APREP_HIT. */
+extern void AutoprepareNoteReuseTime(double plan_ms);
+
 /* Drop everything (called for DISCARD PLANS; not DISCARD ALL, see discard.c). */
 extern void AutoprepareReset(void);
 
