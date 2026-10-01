@@ -53,6 +53,7 @@
 #include "postgres.h"
 
 #include <math.h>
+#include <unistd.h>
 
 #include "tcop/autoprepare.h"
 
@@ -67,6 +68,7 @@
 #include "nodes/queryjumble.h"
 #include "portability/instr_time.h"
 #include "rewrite/rewriteHandler.h"
+#include "storage/bufmgr.h"
 #include "storage/dsm.h"
 #include "storage/latch.h"
 #include "storage/proc.h"
@@ -1363,6 +1365,115 @@ assign_dbblue_autoprepare_enabled(bool newval, void *extra)
 {
 	if (newval)
 		EnableQueryId();
+}
+
+
+/* ----------------------------------------------------------------
+ *		safe-limit check
+ *
+ * dbblue_autoprepare_limit caps entries per *backend*, and the cache is
+ * private per-process memory: with N concurrent backends, the worst case
+ * (every backend's table full of the biggest shapes we've measured) is
+ * roughly N * limit * (bytes per cached shape).  check_dbblue_autoprepare_limit
+ * rejects a value whose worst case would eat too far into memory beyond
+ * shared_buffers, using two fixed, conservative assumptions documented here
+ * rather than any live memory accounting (so there is no ongoing runtime
+ * cost -- this only runs when the GUC is actually set or reloaded):
+ *
+ *	- APREP_ASSUMED_BYTES_PER_SHAPE: real cached shapes measured on an Odoo
+ *	  workload ranged from about 4kB to 64kB; we assume a conservative 32kB.
+ *	- APREP_MEM_SAFETY_FRACTION: of the RAM left after shared_buffers, the
+ *	  fraction the worst case above may use, leaving the rest for work_mem,
+ *	  OS cache, and everything else running on the box.
+ *
+ * Both are deliberately fixed constants, not GUCs: this is a coarse safety
+ * net against an obviously dangerous value, not a precise budget.
+ * ---------------------------------------------------------------- */
+
+#define APREP_ASSUMED_BYTES_PER_SHAPE	(32 * 1024)		/* 32kB */
+#define APREP_MEM_SAFETY_FRACTION		0.10			/* 10% */
+
+/*
+ * Total physical RAM on this machine, in bytes, or -1 if it cannot be
+ * determined on this platform (the check is then skipped -- fail open,
+ * rather than guess).
+ */
+static int64
+aprep_total_system_memory_bytes(void)
+{
+#ifdef WIN32
+	MEMORYSTATUSEX status;
+
+	status.dwLength = sizeof(status);
+	if (GlobalMemoryStatusEx(&status))
+		return (int64) status.ullTotalPhys;
+	return -1;
+#elif defined(_SC_PHYS_PAGES) && defined(_SC_PAGESIZE)
+	long		pages = sysconf(_SC_PHYS_PAGES);
+	long		page_size = sysconf(_SC_PAGESIZE);
+
+	if (pages > 0 && page_size > 0)
+		return (int64) pages * (int64) page_size;
+	return -1;
+#else
+	return -1;
+#endif
+}
+
+/*
+ * check_dbblue_autoprepare_limit
+ *		Reject a limit whose worst case (every one of max_connections
+ *		backends filling its table with APREP_ASSUMED_BYTES_PER_SHAPE-sized
+ *		plans) would use more than APREP_MEM_SAFETY_FRACTION of the RAM left
+ *		after shared_buffers.
+ *
+ * Only applied to values a user or the config file actually asked for
+ * (never to the compiled-in boot_val: InitializeOneGUCOption() treats a
+ * check-hook failure there as FATAL, since there is no prior good value to
+ * fall back to -- see guc.c).  A config-file value that fails here is
+ * logged and the GUC keeps its previous value, same as any other invalid
+ * setting in postgresql.conf; it does not stop the server from starting.
+ */
+bool
+check_dbblue_autoprepare_limit(int *newval, void **extra, GucSource source)
+{
+	int64		total_ram;
+	double		shared_buffers_bytes;
+	double		usable_bytes;
+	int			safe_limit;
+
+	if (source <= PGC_S_DEFAULT)
+		return true;			/* never reject our own compiled-in default */
+
+	total_ram = aprep_total_system_memory_bytes();
+	if (total_ram <= 0)
+		return true;			/* can't tell on this platform: don't guess */
+
+	shared_buffers_bytes = (double) NBuffers * BLCKSZ;
+	usable_bytes = ((double) total_ram - shared_buffers_bytes) *
+		APREP_MEM_SAFETY_FRACTION;
+	if (usable_bytes < 0)
+		usable_bytes = 0;
+
+	safe_limit = (int) (usable_bytes /
+						((double) Max(MaxConnections, 1) *
+						 APREP_ASSUMED_BYTES_PER_SHAPE));
+	safe_limit = Max(safe_limit, 1);
+
+	if (*newval > safe_limit)
+	{
+		GUC_check_errmsg("\"dbblue_autoprepare_limit\" (%d) exceeds the estimated safe ceiling (%d) for this server",
+						  *newval, safe_limit);
+		GUC_check_errdetail("Worst case, each of the %d possible connections (\"max_connections\") could cache this many query shapes at roughly %dkB each, which would leave too little of the %.1fGB of RAM beyond shared_buffers (%dMB) for everything else running on this machine.",
+							 MaxConnections,
+							 APREP_ASSUMED_BYTES_PER_SHAPE / 1024,
+							 (total_ram - shared_buffers_bytes) / (1024.0 * 1024 * 1024),
+							 (int) (shared_buffers_bytes / (1024 * 1024)));
+		GUC_check_errhint("Lower \"dbblue_autoprepare_limit\" to %d or less, or reduce \"max_connections\".",
+						   safe_limit);
+		return false;
+	}
+	return true;
 }
 
 
