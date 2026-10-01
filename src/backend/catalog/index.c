@@ -956,150 +956,269 @@ gpi_fill_one_partition(Relation indexRelation, Relation partRel,
 }
 
 /*
- * IndexGlobalAttachPartition
- *
- * Backfill a newly-attached partition's existing rows into every global index
- * owned by the parent.  ATTACH PARTITION only flips catalog state; the
- * attached rows never flow through the insert-maintenance path, so without
- * this the global index would silently miss them.  Called from
- * ATExecAttachPartition() once the attach is complete, and to re-add a
- * partition's rows after its heap was rewritten.  The caller must keep
- * writers out of the partition.
+ * gpi_mark_checkxmin
+ *		As index_build() does after seeing broken HOT chains: keep the index
+ *		from being used by transactions whose snapshot could see the broken
+ *		chains' older members.
  */
-void
-IndexGlobalAttachPartition(Relation parentRel, Relation partRel)
+static void
+gpi_mark_checkxmin(Oid indexId)
+{
+	Relation	pg_index;
+	HeapTuple	indexTuple;
+
+	CommandCounterIncrement();
+	pg_index = table_open(IndexRelationId, RowExclusiveLock);
+	indexTuple = SearchSysCacheCopy1(INDEXRELID, ObjectIdGetDatum(indexId));
+	if (!HeapTupleIsValid(indexTuple))
+		elog(ERROR, "cache lookup failed for index %u", indexId);
+	((Form_pg_index) GETSTRUCT(indexTuple))->indcheckxmin = true;
+	CatalogTupleUpdate(pg_index, &indexTuple->t_self, indexTuple);
+	heap_freetuple(indexTuple);
+	table_close(pg_index, RowExclusiveLock);
+}
+
+/* State for gpi_keep_entry() */
+typedef struct GIRewriteKeep
+{
+	PartitionKey partkey;
+	PartitionDesc partdesc;		/* includes detach-pending partitions */
+	Relation	gidx;
+	List	   *removeOids;		/* partitions whose entries are dropped */
+} GIRewriteKeep;
+
+/*
+ * gpi_keep_entry - BTGlobalKeepFn: keep an entry of the old index unless it
+ * belongs to one of the partitions being removed.  An entry that routes to
+ * no partition cannot point at a row of the table (it is a leftover), so it
+ * is dropped as well.
+ */
+static bool
+gpi_keep_entry(void *arg, IndexTuple itup)
+{
+	GIRewriteKeep *st = (GIRewriteKeep *) arg;
+	int			partIdx;
+
+	partIdx = ExecGlobalIndexRouteToIndex(st->partkey, st->partdesc,
+										  st->gidx, itup);
+	return partIdx >= 0 &&
+		!list_member_oid(st->removeOids, st->partdesc->oids[partIdx]);
+}
+
+/* table_index_build_scan() callback: add one row to the rewrite's tuplesort */
+static void
+gpi_spool_callback(Relation index, ItemPointer tid, Datum *values,
+				   bool *isnull, bool tupleIsAlive, void *state)
+{
+	tuplesort_putindextuplevalues((Tuplesortstate *) state, index, tid,
+								  values, isnull);
+}
+
+/*
+ * table_index_build_scan() callback: check one live row of a partition just
+ * added to a UNIQUE global index against all partitions.
+ */
+static void
+gpi_check_callback(Relation index, ItemPointer tid, Datum *values,
+				   bool *isnull, bool tupleIsAlive, void *state)
+{
+	GIBuildState *bs = (GIBuildState *) state;
+	MemoryContext oldcxt;
+
+	if (!tupleIsAlive)
+		return;
+	oldcxt = MemoryContextSwitchTo(bs->tmpcxt);
+	ExecCheckGlobalIndexUnique(index, bs->indexInfo, bs->partRel, tid,
+							   values, isnull, bs->estate, true);
+	MemoryContextSwitchTo(oldcxt);
+	MemoryContextReset(bs->tmpcxt);
+}
+
+/*
+ * gpi_rewrite_global_index
+ *
+ * Rewrite global index 'gidx' of 'parentRel' into new storage: keep the
+ * entries of every partition except those listed in 'removeOids', then add
+ * the rows of the partitions in 'addRels' (each of which should also be in
+ * 'removeOids', so that it is not indexed twice).  With 'check_unique', the
+ * added rows of a UNIQUE index are checked against all partitions.
+ *
+ * The old storage is only unlinked at commit.  If the transaction aborts,
+ * the index is exactly as it was before; this is what makes detaching,
+ * dropping, truncating, attaching and rewriting a partition transactional as
+ * far as its parent's global indexes are concerned.  Modifying the old index
+ * in place (a bulk delete or a backfill) could not be undone by a rollback.
+ *
+ * The caller holds AccessExclusiveLock on 'gidx' and keeps writers out of
+ * the partitions in 'addRels'.
+ */
+static void
+gpi_rewrite_global_index(Relation parentRel, Relation gidx, List *removeOids,
+						 List *addRels, EState *estate, bool check_unique)
+{
+	GIRewriteKeep keep;
+	Tuplesortstate *sortstate;
+	bool		broken_hot_chain = false;
+
+	/* don't replace the storage under an index scan of our own */
+	CheckTableNotInUse(gidx, "rebuild global index");
+
+	/* predicate locks on the old index pages become relation locks */
+	TransferPredicateLocksToHeapRelation(gidx);
+
+	keep.partkey = RelationGetPartitionKey(parentRel);
+	keep.partdesc = RelationGetPartitionDesc(parentRel, false);
+	keep.gidx = gidx;
+	keep.removeOids = removeOids;
+
+	sortstate = tuplesort_begin_index_btree(parentRel, gidx, false, false,
+											maintenance_work_mem, NULL,
+											TUPLESORT_NONE);
+
+	/* the surviving entries of the old index ... */
+	_bt_global_collect(gidx, sortstate, gpi_keep_entry, &keep);
+
+	/* ... plus the current rows of the partitions being (re)added */
+	foreach_ptr(RelationData, partRel, addRels)
+	{
+		IndexInfo  *ii = BuildGlobalIndexInfo(gidx, partRel);
+
+		(void) table_index_build_scan(partRel, gidx, ii, true, false,
+									  gpi_spool_callback, sortstate, NULL);
+		if (ii->ii_BrokenHotChain)
+			broken_hot_chain = true;
+	}
+
+	/* write them as a sorted build into new storage */
+	RelationSetNewRelfilenumber(gidx, gidx->rd_rel->relpersistence);
+	_bt_global_load(parentRel, gidx, sortstate);
+	tuplesort_end(sortstate);
+
+	/*
+	 * Uniqueness of the added rows can only be checked once the index holds
+	 * all entries: the check looks up candidates through the index itself.
+	 */
+	if (check_unique && gidx->rd_index->indisunique)
+	{
+		foreach_ptr(RelationData, partRel, addRels)
+		{
+			GIBuildState bs;
+
+			bs.partRel = partRel;
+			bs.indexInfo = BuildGlobalIndexInfo(gidx, partRel);
+			bs.estate = estate;
+			bs.tmpcxt = AllocSetContextCreate(CurrentMemoryContext,
+											  "global index unique check",
+											  ALLOCSET_DEFAULT_SIZES);
+			(void) table_index_build_scan(partRel, gidx, bs.indexInfo,
+										  true, false, gpi_check_callback,
+										  &bs, NULL);
+			MemoryContextDelete(bs.tmpcxt);
+		}
+	}
+
+	if (broken_hot_chain)
+		gpi_mark_checkxmin(RelationGetRelid(gidx));
+}
+
+/*
+ * gpi_rewrite_parent_indexes
+ *
+ * Apply gpi_rewrite_global_index() to every global index of 'parentRel'.
+ * With 'check_supported', the partitions in 'addRels' are first checked to
+ * be ones a global index can cover.
+ */
+static void
+gpi_rewrite_parent_indexes(Relation parentRel, List *removeOids,
+						   List *addRels, bool check_unique,
+						   bool check_supported)
 {
 	Relation	pgidx;
 	SysScanDesc sysscan;
 	ScanKeyData skey;
 	HeapTuple	htup;
-	EState	   *estate = NULL;
+	List	   *gidxoids = NIL;
+	EState	   *estate;
 
 	ScanKeyInit(&skey, Anum_pg_index_indrelid, BTEqualStrategyNumber,
 				F_OIDEQ, ObjectIdGetDatum(RelationGetRelid(parentRel)));
 	pgidx = table_open(IndexRelationId, AccessShareLock);
 	sysscan = systable_beginscan(pgidx, IndexIndrelidIndexId, true,
 								 NULL, 1, &skey);
-
 	while (HeapTupleIsValid(htup = systable_getnext(sysscan)))
 	{
 		Form_pg_index idxForm = (Form_pg_index) GETSTRUCT(htup);
-		Relation	gidx;
 
-		if (!idxForm->indglobal)
-			continue;
-
-		/* First global index: check the partition, set up executor state. */
-		if (estate == NULL)
-		{
-			gpi_check_partition_supported(parentRel, partRel);
-			estate = CreateExecutorState();
-		}
-
-		gidx = index_open(idxForm->indexrelid, RowExclusiveLock);
-		(void) gpi_fill_one_partition(gidx, partRel, estate);
-		index_close(gidx, RowExclusiveLock);
+		if (idxForm->indglobal)
+			gidxoids = lappend_oid(gidxoids, idxForm->indexrelid);
 	}
-
 	systable_endscan(sysscan);
 	table_close(pgidx, AccessShareLock);
 
-	if (estate != NULL)
-		FreeExecutorState(estate);
+	if (gidxoids == NIL)
+		return;
+
+	if (check_supported)
+	{
+		foreach_ptr(RelationData, partRel, addRels)
+			gpi_check_partition_supported(parentRel, partRel);
+	}
+
+	/* route entries with the caller's catalog changes (e.g. ATTACH) applied */
+	CommandCounterIncrement();
+
+	estate = CreateExecutorState();
+	foreach_oid(gidxoid, gidxoids)
+	{
+		/* like REINDEX: nobody may use the index while its storage changes */
+		Relation	gidx = index_open(gidxoid, AccessExclusiveLock);
+
+		gpi_rewrite_global_index(parentRel, gidx, removeOids, addRels,
+								 estate, check_unique);
+		index_close(gidx, NoLock);
+	}
+	FreeExecutorState(estate);
+	list_free(gidxoids);
 }
 
-
 /*
- * gi_purge_routed - GIVacDeleteFn that flags every global-index entry that
- * routes to the partition being removed.  Used to purge a detached, dropped
- * or truncated partition's entries; there is no liveness check because all
- * of the partition's rows are leaving the index.
+ * IndexGlobalAttachPartition
+ *
+ * Add a newly attached partition's existing rows to every global index owned
+ * by the parent.  ATTACH PARTITION only flips catalog state; the attached
+ * rows never flow through the insert-maintenance path, so without this the
+ * global index would silently miss them.  Any entries that already route to
+ * the partition (left by an earlier, failed attach) are dropped first.  The
+ * caller must keep writers out of the partition.
  */
-typedef struct GIPurgeArg
+void
+IndexGlobalAttachPartition(Relation parentRel, Relation partRel)
 {
-	Relation	parentRel;
-	Relation	gidx;
-	Oid			partOid;
-} GIPurgeArg;
-
-static bool
-gi_purge_routed(void *arg, IndexTuple itup, ItemPointer tid)
-{
-	GIPurgeArg *st = (GIPurgeArg *) arg;
-
-	return ExecGlobalIndexRoutePartition(st->parentRel, st->gidx, itup,
-										 true) == st->partOid;
+	gpi_rewrite_parent_indexes(parentRel,
+							   list_make1_oid(RelationGetRelid(partRel)),
+							   list_make1(partRel), true, true);
 }
 
 /*
  * IndexGlobalDetachPartition
  *
- * Purge a partition's entries from every global index owned by the parent
+ * Remove a partition's entries from every global index owned by the parent
  * when the partition is being detached, dropped or truncated.  An entry
  * belongs to the partition if its partition key value routes to it, which
  * also covers a DEFAULT partition.  Must run while the partition is still
  * part of the parent's partition descriptor (a detach-pending partition
- * counts).  Leftover entries would not just be bloat: once the partition's
- * heap slots are reused they could duplicate a new entry exactly, which
- * btree does not allow.
+ * counts).
  */
 void
 IndexGlobalDetachPartition(Relation parentRel, Relation partRel)
 {
-	GIPurgeArg	arg;
-	Relation	pgidx;
-	SysScanDesc sysscan;
-	ScanKeyData skey;
-	HeapTuple	htup;
-
-	/* Multi-level: a sub-partitioned table has no heap to use as heaprel. */
+	/* A sub-partitioned table is never part of a global index */
 	if (partRel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
 		return;
 
-	arg.parentRel = parentRel;
-	arg.partOid = RelationGetRelid(partRel);
-
-	ScanKeyInit(&skey, Anum_pg_index_indrelid, BTEqualStrategyNumber,
-				F_OIDEQ, ObjectIdGetDatum(RelationGetRelid(parentRel)));
-	pgidx = table_open(IndexRelationId, AccessShareLock);
-	sysscan = systable_beginscan(pgidx, IndexIndrelidIndexId, true,
-								 NULL, 1, &skey);
-
-	while (HeapTupleIsValid(htup = systable_getnext(sysscan)))
-	{
-		Form_pg_index idxForm = (Form_pg_index) GETSTRUCT(htup);
-		Relation	gidx;
-		IndexVacuumInfo ivinfo;
-		GIVacCallback gicb;
-		IndexBulkDeleteResult *istat;
-
-		if (!idxForm->indglobal)
-			continue;
-
-		gidx = index_open(idxForm->indexrelid, ShareUpdateExclusiveLock);
-		arg.gidx = gidx;
-
-		gicb.fn = gi_purge_routed;
-		gicb.arg = &arg;
-
-		ivinfo.index = gidx;
-		ivinfo.heaprel = partRel;
-		ivinfo.analyze_only = false;
-		ivinfo.report_progress = false;
-		ivinfo.estimated_count = true;
-		ivinfo.message_level = DEBUG2;
-		ivinfo.num_heap_tuples = partRel->rd_rel->reltuples;
-		ivinfo.strategy = NULL;
-
-		istat = index_bulk_delete(&ivinfo, NULL, NULL, &gicb);
-		if (istat)
-			pfree(istat);
-
-		index_close(gidx, ShareUpdateExclusiveLock);
-	}
-
-	systable_endscan(sysscan);
-	table_close(pgidx, AccessShareLock);
+	gpi_rewrite_parent_indexes(parentRel,
+							   list_make1_oid(RelationGetRelid(partRel)),
+							   NIL, false, false);
 }
 
 /*
@@ -1153,30 +1272,74 @@ IndexGlobalNumUserKeys(const FormData_pg_index *indexForm)
  * IndexGlobalResyncPartition
  *
  * Resynchronize a partition's entries in the parent's global indexes after the
- * partition's heap has been rewritten (CLUSTER / VACUUM FULL / REPACK).  Such a
- * rewrite assigns new TIDs to every row, so the global index's entries for this
- * partition point at the old, now-wrong TIDs.  We purge those stale entries
- * (matched by the partition's bounds) and backfill fresh entries from the
- * rewritten heap.  No-op when the relation is not a partition or its parent
+ * partition's heap has been replaced (TRUNCATE, CLUSTER / VACUUM FULL /
+ * REPACK).  Such a rewrite assigns new TIDs to every row, so the entries for
+ * this partition point at the old, now-wrong TIDs: they are replaced by
+ * entries for the new heap.  The rows' keys are unchanged, so uniqueness is
+ * not rechecked.  No-op when the relation is not a partition or its parent
  * owns no global index.
  */
 void
 IndexGlobalResyncPartition(Relation partRel)
 {
-	Oid			parentOid;
 	Relation	parentRel;
 
 	if (!partRel->rd_rel->relispartition)
 		return;
 
-	parentOid = get_partition_parent(RelationGetRelid(partRel), false);
-	parentRel = table_open(parentOid, AccessShareLock);
-
-	/* Drop the partition's stale (old-TID) entries, then re-add new ones. */
-	IndexGlobalDetachPartition(parentRel, partRel);
-	IndexGlobalAttachPartition(parentRel, partRel);
-
+	parentRel = table_open(get_partition_parent(RelationGetRelid(partRel),
+												false),
+						   AccessShareLock);
+	gpi_rewrite_parent_indexes(parentRel,
+							   list_make1_oid(RelationGetRelid(partRel)),
+							   list_make1(partRel), false, false);
 	table_close(parentRel, AccessShareLock);
+}
+
+/*
+ * IndexGlobalResyncPartitions
+ *
+ * Like IndexGlobalResyncPartition() for several partitions rewritten by one
+ * ALTER TABLE, doing a single rewrite per parent.  Unlike a plain heap
+ * rewrite, ALTER TABLE may have changed the indexed columns' types (and the
+ * global index may have been recreated empty for that, see
+ * INDEX_CREATE_GLOBAL_NOFILL), so uniqueness is checked.  The caller holds
+ * locks on the partitions.
+ */
+void
+IndexGlobalResyncPartitions(List *partOids)
+{
+	List	   *parents = NIL;
+
+	foreach_oid(partOid, partOids)
+	{
+		if (get_rel_relispartition(partOid))
+			parents = list_append_unique_oid(parents,
+											 get_partition_parent(partOid, false));
+	}
+
+	foreach_oid(parentOid, parents)
+	{
+		Relation	parentRel = table_open(parentOid, AccessShareLock);
+		List	   *removeOids = NIL;
+		List	   *addRels = NIL;
+
+		foreach_oid(partOid, partOids)
+		{
+			if (get_rel_relispartition(partOid) &&
+				get_partition_parent(partOid, false) == parentOid)
+			{
+				removeOids = lappend_oid(removeOids, partOid);
+				addRels = lappend(addRels, table_open(partOid, NoLock));
+			}
+		}
+
+		gpi_rewrite_parent_indexes(parentRel, removeOids, addRels, true, false);
+
+		foreach_ptr(RelationData, partRel, addRels)
+			table_close(partRel, NoLock);
+		table_close(parentRel, AccessShareLock);
+	}
 }
 
 /*
@@ -1833,27 +1996,7 @@ index_create_percona(Relation heapRelation,
 				write_global_index_metapage(indexRelation);
 				if ((flags & INDEX_CREATE_GLOBAL_NOFILL) == 0 &&
 					build_global_index(heapRelation, indexRelation))
-				{
-					/*
-					 * As in index_build(): with broken HOT chains, the index
-					 * must not be used by transactions whose snapshot could
-					 * see the broken chains' older members.
-					 */
-					Relation	pg_index;
-					HeapTuple	indexTuple;
-
-					CommandCounterIncrement();
-					pg_index = table_open(IndexRelationId, RowExclusiveLock);
-					indexTuple = SearchSysCacheCopy1(INDEXRELID,
-													 ObjectIdGetDatum(indexRelationId));
-					if (!HeapTupleIsValid(indexTuple))
-						elog(ERROR, "cache lookup failed for index %u",
-							 indexRelationId);
-					((Form_pg_index) GETSTRUCT(indexTuple))->indcheckxmin = true;
-					CatalogTupleUpdate(pg_index, &indexTuple->t_self, indexTuple);
-					heap_freetuple(indexTuple);
-					table_close(pg_index, RowExclusiveLock);
-				}
+					gpi_mark_checkxmin(indexRelationId);
 			}
 
 			/*
