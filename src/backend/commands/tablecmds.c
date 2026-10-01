@@ -1374,6 +1374,27 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 			IndexStmt  *idxstmt;
 			Oid			constraintOid;
 
+			/*
+			 * A global index covers all partitions itself; it has no
+			 * per-partition counterpart to create.
+			 */
+			if (idxRel->rd_index->indglobal)
+			{
+				/* Its rows could not be kept in the global index */
+				if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ||
+					rel->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("cannot create %s \"%s\" as a partition of \"%s\", which has a global index",
+									rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ?
+									"partitioned table" : "foreign table",
+									RelationGetRelationName(rel),
+									RelationGetRelationName(parent)),
+							 errdetail("Global indexes support only plain partitions.")));
+				index_close(idxRel, AccessShareLock);
+				continue;
+			}
+
 			if (rel->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
 			{
 				if (idxRel->rd_index->indisunique)
@@ -1783,6 +1804,30 @@ RemoveRelations(DropStmt *drop)
 			(void) find_all_inheritors(state.heapOid,
 									   state.heap_lockmode,
 									   NULL);
+
+		/*
+		 * If this is a leaf partition being dropped, purge its entries from any
+		 * global index on its parent first, while the partition is still intact
+		 * (relpartbound set, heap present).  Otherwise the global index would
+		 * keep orphaned entries pointing at a dropped partition.  Note: DROP of
+		 * the parent itself drops the global index too, and only lists the
+		 * parent (which is not a partition), so that case correctly does
+		 * nothing here.
+		 */
+		if (state.actual_relkind == RELKIND_RELATION)
+		{
+			Relation	drel = table_open(relOid, NoLock);
+
+			if (drel->rd_rel->relispartition)
+			{
+				Oid			parentOid = get_partition_parent(relOid, false);
+				Relation	parentRel = table_open(parentOid, AccessShareLock);
+
+				IndexGlobalDetachPartition(parentRel, drel);
+				table_close(parentRel, AccessShareLock);
+			}
+			table_close(drel, NoLock);
+		}
 
 		/* OK, we're ready to delete this one */
 		obj.classId = RelationRelationId;
@@ -2365,6 +2410,18 @@ ExecuteTruncateGuts(List *explicit_rels,
 			reindex_relation(NULL, heap_relid, REINDEX_REL_PROCESS_TOAST,
 							 &reindex_params);
 		}
+
+		/*
+		 * If this is a leaf partition whose parent carries a global partition
+		 * index, the truncation just replaced the partition's heap with a new
+		 * empty one.  Resync the parent's global indexes: this removes the
+		 * now-dangling entries that route to this partition (otherwise a later
+		 * lookup would try to fetch a TID from the truncated heap and error
+		 * with "could not read block").  Backfill from the empty heap is a
+		 * no-op, so the net effect is to purge this partition's entries.
+		 */
+		if (rel->rd_rel->relispartition)
+			IndexGlobalResyncPartition(rel);
 
 		pgstat_count_truncate(rel);
 	}
@@ -6184,6 +6241,18 @@ ATRewriteTables(AlterTableStmt *parsetree, List **wqueue, LOCKMODE lockmode,
 							 RecentXmin,
 							 ReadNextMultiXactId(),
 							 persistence);
+
+			/*
+			 * finish_heap_swap() rebuilt the partition's own indexes, but the
+			 * entries of a global index on its parent still point at the old
+			 * heap's TIDs; replace them.
+			 */
+			{
+				Relation	rewritten = table_open(tab->relid, NoLock);
+
+				IndexGlobalResyncPartition(rewritten);
+				table_close(rewritten, NoLock);
+			}
 
 			InvokeObjectPostAlterHook(RelationRelationId, tab->relid, 0);
 		}
@@ -14335,9 +14404,11 @@ transformFkeyCheckAttrs(Relation pkrel,
 		 * with every surplus column being a partition key column); must be
 		 * unique (or if temporal then exclusion instead) and not a partial
 		 * index; forget it if there are any expressions, too. Invalid indexes
-		 * are out as well.
+		 * are out as well, and so are global indexes, which have no
+		 * per-partition indexes to attach the foreign key to.
 		 */
-		if ((indexStruct->indnkeyatts == numattrs ||
+		if (!indexStruct->indglobal &&
+			(indexStruct->indnkeyatts == numattrs ||
 			 (pk_is_partitioned && !with_period &&
 			  indexStruct->indnkeyatts > numattrs &&
 			  dbblue_index_extras_are_partkey(partkey, indexStruct,
@@ -21611,6 +21682,14 @@ ATExecAttachPartition(List **wqueue, Relation rel, PartitionCmd *cmd,
 		}
 	}
 
+	/*
+	 * If the parent owns any global partition indexes, the rows that already
+	 * existed in the attached partition are not in them yet -- ATTACH only
+	 * flips catalog state and does not route those rows through the insert
+	 * path.  Backfill them now so the global index stays complete.
+	 */
+	IndexGlobalAttachPartition(rel, attachrel);
+
 	/* keep our lock until commit */
 	table_close(attachrel, NoLock);
 
@@ -22016,7 +22095,15 @@ ATExecDetachPartition(List **wqueue, AlteredTableInfo *tab, Relation rel,
 	 * non-concurrent mode) or just set the inhdetachpending flag.
 	 */
 	if (!concurrent)
+	{
+		/*
+		 * Purge the partition's entries from any global index on the parent
+		 * while it is still one of the parent's partitions (entries are
+		 * matched by routing them to their partition).
+		 */
+		IndexGlobalDetachPartition(rel, partRel);
 		RemoveInheritance(partRel, rel, false);
+	}
 	else
 		MarkInheritDetached(partRel, rel);
 
@@ -22153,6 +22240,14 @@ DetachPartitionFinalize(Relation rel, Relation partRel, bool concurrent,
 				newtuple;
 	Relation	trigrel = NULL;
 	List	   *fkoids = NIL;
+
+	/*
+	 * In concurrent mode, the partition's rows stayed in the parent's global
+	 * indexes until now; purge them while the partition is still attached
+	 * (detach-pending).  In non-concurrent mode, the caller already did.
+	 */
+	if (concurrent)
+		IndexGlobalDetachPartition(rel, partRel);
 
 	if (concurrent)
 	{
@@ -23786,6 +23881,9 @@ MergePartitionsMoveRows(List **wqueue, List *mergingPartitions, Relation newPart
 static void
 detachPartitionTable(Relation parent_rel, Relation child_rel, Oid defaultPartOid)
 {
+	/* Purge global index entries while it's still a partition (see above) */
+	IndexGlobalDetachPartition(parent_rel, child_rel);
+
 	/* Remove the pg_inherits row first. */
 	RemoveInheritance(child_rel, parent_rel, false);
 
@@ -24201,6 +24299,10 @@ ATExecMergePartitions(List **wqueue, AlteredTableInfo *tab, Relation rel,
 	 * verification for each cloned constraint is not needed.
 	 */
 	attachPartitionTable(NULL, rel, newPartRel, cmd->bound);
+
+	/* The moved rows are not in the parent's global indexes yet */
+	CommandCounterIncrement();
+	IndexGlobalAttachPartition(rel, newPartRel);
 
 	/*
 	 * Apply extension dependencies to the new partition's indexes. This
@@ -24633,6 +24735,10 @@ ATExecSplitPartition(List **wqueue, AlteredTableInfo *tab, Relation rel,
 		 * needed.
 		 */
 		attachPartitionTable(NULL, rel, newPartRel, sps->bound);
+
+		/* The moved rows are not in the parent's global indexes yet */
+		CommandCounterIncrement();
+		IndexGlobalAttachPartition(rel, newPartRel);
 
 		/*
 		 * Apply extension dependencies to the new partition's indexes. This

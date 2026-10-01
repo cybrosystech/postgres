@@ -47,6 +47,7 @@
 #include "commands/async.h"
 #include "commands/extension.h"
 #include "commands/dbcommands.h"
+#include "commands/defrem.h"
 #include "commands/event_trigger.h"
 #include "commands/matview_dirty.h"
 #include "commands/matview_incr.h"

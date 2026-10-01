@@ -8342,6 +8342,7 @@ apply_scanjoin_target_to_paths(PlannerInfo *root,
 	bool		rel_is_partitioned = IS_PARTITIONED_REL(rel);
 	PathTarget *scanjoin_target;
 	ListCell   *lc;
+	List	   *global_index_paths = NIL;   
 
 	/* This recurses, so be paranoid. */
 	check_stack_depth();
@@ -8372,7 +8373,27 @@ apply_scanjoin_target_to_paths(PlannerInfo *root,
 	 * finally zap the partial pathlist.
 	 */
 	if (rel_is_partitioned && IS_SIMPLE_REL(rel))
+	{
+		/*
+		 * Paths on a global partition index are the only ones on the
+		 * partitioned parent itself; keep them (see below) rather than
+		 * rebuilding them, since the rel's target is about to change.
+		 */
+		foreach(lc, rel->pathlist)
+		{
+			Path	   *path = (Path *) lfirst(lc);
+
+			if (IsA(path, IndexPath) && path->param_info == NULL &&
+				((IndexPath *) path)->indexinfo->indglobal)
+				global_index_paths = lappend(global_index_paths, path);
+		}
+		foreach(lc, global_index_paths)
+		{
+			elog(LOG, "saved global index path: %s", nodeToString(lfirst(lc)));
+		}
+
 		rel->pathlist = NIL;
+	}
 
 	/*
 	 * If the scan/join target is not parallel-safe, partial paths cannot
@@ -8535,6 +8556,40 @@ apply_scanjoin_target_to_paths(PlannerInfo *root,
 
 		/* Build new paths for this relation by appending child paths. */
 		add_paths_to_append_rel(root, rel, live_children);
+
+		/*
+		 * Add back the paths on global partition indexes, which scan the
+		 * parent directly, giving them the final target the same way as the
+		 * paths of a non-partitioned rel above: a projection, and ProjectSet
+		 * steps for set-returning functions.
+		 */
+		if (global_index_paths != NIL)
+		{
+			List	   *append_paths = rel->pathlist;
+			List	   *new_paths;
+
+			rel->pathlist = NIL;
+			foreach(lc, global_index_paths)
+			{
+				Path	   *subpath = (Path *) lfirst(lc);
+
+				if (tlist_same_exprs)
+					subpath->pathtarget->sortgrouprefs =
+						scanjoin_target->sortgrouprefs;
+				else
+					subpath = (Path *) create_projection_path(root, rel, subpath,
+															  scanjoin_target);
+				rel->pathlist = lappend(rel->pathlist, subpath);
+			}
+			if (root->parse->hasTargetSRFs)
+				adjust_paths_for_srfs(root, rel,
+									  scanjoin_targets,
+									  scanjoin_targets_contain_srfs);
+			new_paths = rel->pathlist;
+			rel->pathlist = append_paths;
+			foreach(lc, new_paths)
+				add_path(rel, (Path *) lfirst(lc));
+		}
 	}
 
 	/*

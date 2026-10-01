@@ -520,6 +520,7 @@ static void
 set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 				 Index rti, RangeTblEntry *rte)
 {
+	
 	if (IS_DUMMY_REL(rel))
 	{
 		/* We already proved the relation empty, so nothing more to do */
@@ -528,6 +529,80 @@ set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 	{
 		/* It's an "append relation", process accordingly */
 		set_append_rel_pathlist(root, rel, rti, rte);
+
+		/*
+		 * For partitioned tables that have at least one global partition
+		 * index, also generate IndexPaths on the parent rel directly.
+		 * The executor's nodeIndexscan.c routes each TID to the right
+		 * partition using the INCLUDE'd partition key column.
+		 *
+		 * This is skipped when the partitioned table is the target (result)
+		 * relation of an UPDATE/DELETE: a global-index scan on the storage-less
+		 * parent cannot drive a DML (it would crash during planning/execution),
+		 * so such commands fall back to per-partition scans to locate rows.
+		 */
+		/*
+		 * Nor are they used when EvalPlanQual rechecks are possible (SELECT
+		 * ... FOR UPDATE/SHARE, or other relations of an UPDATE/DELETE/
+		 * MERGE): EPQ finds the row to recheck through the child relations'
+		 * row marks, which a scan of the parent does not provide, so it would
+		 * re-run the whole scan with the old snapshot.
+		 */
+		if (rte->relkind == RELKIND_PARTITIONED_TABLE &&
+			root->parse->resultRelation != rti &&
+			root->parse->commandType == CMD_SELECT &&
+			root->parse->rowMarks == NIL)
+		{
+			ListCell   *lc;
+			bool		has_global = false;
+
+			foreach(lc, rel->indexlist)
+			{
+				IndexOptInfo *idx = lfirst(lc);
+
+				if (idx->indglobal)
+				{
+					has_global = true;
+					break;
+				}
+			}
+			if (has_global)
+			{
+				/*
+				 * check_index_predicates is normally called by
+				 * set_plain_rel_pathlist, which is bypassed for partitioned
+				 * tables.  Call it here so that indrestrictinfo is populated
+				 * before create_index_paths tries to match clauses.
+				 */
+				check_index_predicates(root, rel);
+
+				/*
+				 * The parent's size estimates were not available when
+				 * get_relation_info() filled in the global indexes, and a
+				 * partitioned rel has no pages of its own; without these the
+				 * cost model would take a global index scan to be nearly free.
+				 */
+				if (rel->pages == 0)
+				{
+					int			i = -1;
+
+					while ((i = bms_next_member(rel->live_parts, i)) >= 0)
+					{
+						if (rel->part_rels[i] != NULL)
+							rel->pages += rel->part_rels[i]->pages;
+					}
+				}
+				foreach(lc, rel->indexlist)
+				{
+					IndexOptInfo *idx = lfirst(lc);
+
+					if (idx->indglobal)
+						idx->tuples = rel->tuples;
+				}
+
+				create_index_paths(root, rel);
+			}
+		}
 	}
 	else
 	{
@@ -857,6 +932,7 @@ set_plain_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	if (create_tidscan_paths(root, rel))
 		return;
 
+	
 	/* Consider sequential scan */
 	add_path(rel, create_seqscan_path(root, rel, required_outer, 0));
 

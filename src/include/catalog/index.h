@@ -74,6 +74,8 @@ extern void index_check_primary_key(Relation heapRel,
 #define INDEX_CREATE_INVALID				(1 << 6)
 #define INDEX_CREATE_SUPPRESS_PROGRESS		(1 << 7)
 #define INDEX_CREATE_DEFERRABLE				(1 << 8)
+#define INDEX_CREATE_GLOBAL					(1 << 9)	/* global partition index */
+#define INDEX_CREATE_GLOBAL_NOFILL			(1 << 10)	/* ... filled by a later rewrite */
 
 extern Oid	index_create(Relation heapRelation,
 						 const char *indexRelationName,
@@ -126,6 +128,7 @@ extern Oid	index_create_percona(Relation heapRelation,
 #define	INDEX_CONSTR_CREATE_UPDATE_INDEX	(1 << 3)
 #define	INDEX_CONSTR_CREATE_REMOVE_OLD_DEPS	(1 << 4)
 #define	INDEX_CONSTR_CREATE_WITHOUT_OVERLAPS (1 << 5)
+#define	INDEX_CONSTR_CREATE_GLOBAL			(1 << 6)	/* backed by a global index */
 
 extern Oid	index_create_copy(Relation heapRelation, uint16 flags,
 							  Oid oldIndexId, Oid tablespaceOid,
@@ -176,6 +179,19 @@ extern void index_build(Relation heapRelation,
 						bool isreindex,
 						bool parallel,
 						bool progress);
+
+/* Backfill a newly-attached partition's rows into the parent's global indexes */
+extern void IndexGlobalAttachPartition(Relation parentRel, Relation partRel);
+/* Purge a detached/dropped partition's entries from the parent's global indexes */
+extern void IndexGlobalDetachPartition(Relation parentRel, Relation partRel);
+/* Resync a partition's global-index entries after its heap was rewritten */
+extern void IndexGlobalResyncPartition(Relation partRel);
+struct FormData_pg_index;
+
+/* IndexInfo of a global index, mapped to a partition's column layout */
+extern IndexInfo *BuildGlobalIndexInfo(Relation gidx, Relation partRel);
+/* Number of leading key columns of a global index that the user asked for */
+extern int	IndexGlobalNumUserKeys(const struct FormData_pg_index *indexForm);
 
 extern void validate_index(Oid heapId, Oid indexId, Snapshot snapshot);
 

@@ -25,6 +25,7 @@
 extern void RemoveObjects(DropStmt *stmt);
 
 /* commands/indexcmds.c */
+extern PGDLLIMPORT bool dbblue_auto_global_index;
 extern ObjectAddress DefineIndex(ParseState *pstate,
 								 Oid tableId,
 								 const IndexStmt *stmt,

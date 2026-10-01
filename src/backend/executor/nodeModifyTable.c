@@ -913,7 +913,8 @@ ExecInsert(ModifyTableContext *context,
 	 * Open the table's indexes, if we have not done so already, so that we
 	 * can add new index entries for the inserted tuple.
 	 */
-	if (resultRelationDesc->rd_rel->relhasindex &&
+	if ((resultRelationDesc->rd_rel->relhasindex ||
+		 resultRelationDesc->rd_rel->relispartition) &&
 		resultRelInfo->ri_IndexRelationDescs == NULL)
 		ExecOpenIndices(resultRelInfo, onconflict != ONCONFLICT_NONE);
 
@@ -1279,10 +1280,13 @@ ExecInsert(ModifyTableContext *context,
 							   0, NULL);
 
 			/* insert index entries for tuple */
-			if (resultRelInfo->ri_NumIndices > 0)
+			if (resultRelInfo->ri_NumIndices > 0 ||
+				resultRelInfo->ri_NumGlobalIndices > 0)
+			{
 				recheckIndexes = ExecInsertIndexTuples(resultRelInfo, estate,
 													   0, slot, NIL,
 													   NULL);
+			}
 		}
 	}
 
@@ -2413,7 +2417,8 @@ ExecUpdatePrologue(ModifyTableContext *context, ResultRelInfo *resultRelInfo,
 	 * Open the table's indexes, if we have not done so already, so that we
 	 * can add new index entries for the updated tuple.
 	 */
-	if (resultRelationDesc->rd_rel->relhasindex &&
+	if ((resultRelationDesc->rd_rel->relhasindex ||
+		 resultRelationDesc->rd_rel->relispartition) &&
 		resultRelInfo->ri_IndexRelationDescs == NULL)
 		ExecOpenIndices(resultRelInfo, false);
 
@@ -2638,7 +2643,9 @@ ExecUpdateEpilogue(ModifyTableContext *context, UpdateContext *updateCxt,
 	List	   *recheckIndexes = NIL;
 
 	/* insert index entries for tuple if necessary */
-	if (resultRelInfo->ri_NumIndices > 0 && (updateCxt->updateIndexes != TU_None))
+	if ((resultRelInfo->ri_NumIndices > 0 ||
+		 resultRelInfo->ri_NumGlobalIndices > 0) &&
+		updateCxt->updateIndexes != TU_None)
 	{
 		uint32		flags = EIIT_IS_UPDATE;
 

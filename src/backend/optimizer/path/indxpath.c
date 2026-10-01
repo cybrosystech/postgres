@@ -263,6 +263,21 @@ create_index_paths(PlannerInfo *root, RelOptInfo *rel)
 		Assert(index->nkeycolumns <= INDEX_MAX_KEYS);
 
 		/*
+		 * Skip indexes that have no physical access method on this relation --
+		 * i.e. partitioned indexes (RELKIND_PARTITIONED_INDEX), whose AM fields
+		 * (including amcostestimate) were NULLified in get_relation_info().
+		 * Such indexes have no storage of their own and cannot produce a scan
+		 * path; trying to cost one dereferences a NULL amcostestimate and
+		 * crashes.  This normally never arises because create_index_paths() is
+		 * not called on a partitioned parent, but the global partition index
+		 * feature does call it on the parent, whose indexlist also contains the
+		 * parent's own (non-global) partitioned indexes -- e.g. its primary
+		 * key.  Only real physical indexes (the global index, here) qualify.
+		 */
+		if (index->amcostestimate == NULL)
+			continue;
+
+		/*
 		 * Ignore partial indexes that do not match the query.
 		 * (generate_bitmap_or_paths() might be able to do something with
 		 * them, but that's of no concern here.)
@@ -2233,6 +2248,17 @@ check_index_only(RelOptInfo *rel, IndexOptInfo *index)
 
 	/* If we're not allowed to consider index-only scans, give up now */
 	if ((rel->pgs_mask & PGS_CONSIDER_INDEXONLY) == 0)
+		return false;
+
+	/*
+	 * A global partition index can never be used for an index-only scan: its
+	 * entries point at TIDs in child partition heaps that must be fetched to
+	 * produce a row, and the index lives on the storage-less partitioned
+	 * parent (an IOS over it would crash).  This must be checked explicitly
+	 * because a count(*)-style query needs no columns and would otherwise
+	 * qualify for IOS regardless of canreturn.
+	 */
+	if (index->indglobal)
 		return false;
 
 	/*

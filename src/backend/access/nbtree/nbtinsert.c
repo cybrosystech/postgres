@@ -2753,30 +2753,44 @@ _bt_delete_or_dedup_one_page(Relation rel, Relation heapRel,
 	 * end up getting deleted are items that would have had their LP_DEAD bit
 	 * set before long anyway (if we opted not to include them as extras).
 	 */
-	minoff = P_FIRSTDATAKEY(opaque);
-	maxoff = PageGetMaxOffsetNumber(page);
-	for (offnum = minoff;
-		 offnum <= maxoff;
-		 offnum = OffsetNumberNext(offnum))
+	/*
+	 * Global partition indexes store TIDs from many different heap
+	 * relations (one per partition).  The deletion passes below use
+	 * heapRel to check whether individual TIDs are still live, but
+	 * heapRel is only the *current* inserting partition.  Fetching a TID
+	 * that belongs to a different partition via heapRel would either
+	 * return wrong data (silently corrupting the index) or crash with an
+	 * out-of-range block error.  Skip both deletion passes entirely for
+	 * global indexes; deduplication (below) is safe because it never
+	 * accesses the heap.
+	 */
+	if (!rel->rd_index->indglobal)
 	{
-		ItemId		itemId = PageGetItemId(page, offnum);
+		minoff = P_FIRSTDATAKEY(opaque);
+		maxoff = PageGetMaxOffsetNumber(page);
+		for (offnum = minoff;
+			 offnum <= maxoff;
+			 offnum = OffsetNumberNext(offnum))
+		{
+			ItemId		itemId = PageGetItemId(page, offnum);
 
-		if (ItemIdIsDead(itemId))
-			deletable[ndeletable++] = offnum;
-	}
+			if (ItemIdIsDead(itemId))
+				deletable[ndeletable++] = offnum;
+		}
 
-	if (ndeletable > 0)
-	{
-		_bt_simpledel_pass(rel, buffer, heapRel, deletable, ndeletable,
-						   insertstate->itup, minoff, maxoff);
-		insertstate->bounds_valid = false;
+		if (ndeletable > 0)
+		{
+			_bt_simpledel_pass(rel, buffer, heapRel, deletable, ndeletable,
+							   insertstate->itup, minoff, maxoff);
+			insertstate->bounds_valid = false;
 
-		/* Return when a page split has already been avoided */
-		if (PageGetFreeSpace(page) >= insertstate->itemsz)
-			return;
+			/* Return when a page split has already been avoided */
+			if (PageGetFreeSpace(page) >= insertstate->itemsz)
+				return;
 
-		/* Might as well assume duplicates (if checkingunique) */
-		uniquedup = true;
+			/* Might as well assume duplicates (if checkingunique) */
+			uniquedup = true;
+		}
 	}
 
 	/*
@@ -2818,7 +2832,8 @@ _bt_delete_or_dedup_one_page(Relation rel, Relation heapRel,
 	 * together index tuples, so the same correctness considerations do not
 	 * apply.  We deliberately omit an index-is-allequalimage test here.
 	 */
-	if ((indexUnchanged || uniquedup) &&
+	if (!rel->rd_index->indglobal &&
+		(indexUnchanged || uniquedup) &&
 		_bt_bottomupdel_pass(rel, buffer, heapRel, insertstate->itemsz))
 		return;
 

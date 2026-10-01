@@ -3982,6 +3982,7 @@ create pg_index 2610
  indisready = bool ,
  indislive = bool ,
  indisreplident = bool ,
+ indglobal = bool ,
  indkey = int2vector FORCE NOT NULL ,
  indcollation = oidvector FORCE NOT NULL ,
  indclass = oidvector FORCE NOT NULL ,

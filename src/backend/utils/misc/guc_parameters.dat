@@ -698,6 +698,14 @@
   boot_val => '""',
 },
 
+{ name => 'dbblue_auto_global_index', type => 'bool', context => 'PGC_USERSET', group => 'CLIENT_CONN_STATEMENT',
+  short_desc => 'Creates UNIQUE indexes and constraints on partitioned tables that lack the partition key as GLOBAL indexes.',
+  long_desc => 'When enabled, a UNIQUE index or non-deferrable UNIQUE constraint on a range-partitioned table whose key columns do not include the partition key is backed by a global index enforcing uniqueness across all partitions, instead of raising an error.',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'dbblue_auto_global_index',
+  boot_val => 'true',
+},
+
 { name => 'dbblue_auto_index_suggestion_database', type => 'string', context => 'PGC_SIGHUP', group => 'STATS_MONITORING',
   short_desc => 'Obsolete; the index advisor is enabled per database.',
   long_desc => 'No longer has any effect. The index advisor is now enabled per database with ALTER DATABASE dbname SET dbblue_auto_index_suggestion_enabled = on, so a single cluster-wide target database is no longer meaningful. Retained only so that a configuration file written for the earlier single-database implementation still loads; setting it emits a warning and it should be removed.',

@@ -849,7 +849,8 @@ ExecSimpleRelationInsert(ResultRelInfo *resultRelInfo,
 
 		conflictindexes = resultRelInfo->ri_onConflictArbiterIndexes;
 
-		if (resultRelInfo->ri_NumIndices > 0)
+		if (resultRelInfo->ri_NumIndices > 0 ||
+			resultRelInfo->ri_NumGlobalIndices > 0)
 		{
 			uint32		flags;
 
@@ -953,7 +954,9 @@ ExecSimpleRelationUpdate(ResultRelInfo *resultRelInfo,
 
 		conflictindexes = resultRelInfo->ri_onConflictArbiterIndexes;
 
-		if (resultRelInfo->ri_NumIndices > 0 && (update_indexes != TU_None))
+		if ((resultRelInfo->ri_NumIndices > 0 ||
+			 resultRelInfo->ri_NumGlobalIndices > 0) &&
+			update_indexes != TU_None)
 		{
 			uint32		flags = EIIT_IS_UPDATE;
 

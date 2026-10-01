@@ -26,6 +26,7 @@
 #include "access/amapi.h"
 #include "access/attmap.h"
 #include "access/heapam.h"
+#include "access/nbtree.h"
 #include "access/multixact.h"
 #include "access/relscan.h"
 #include "access/tableam.h"
@@ -47,6 +48,7 @@
 #include "catalog/pg_description.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/pg_opclass.h"
+#include "catalog/pg_partitioned_table.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_trigger.h"
@@ -62,11 +64,14 @@
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/optimizer.h"
+#include "catalog/partition.h"
 #include "parser/parser.h"
+#include "partitioning/partdesc.h"
 #include "pgstat.h"
 #include "postmaster/autovacuum.h"
 #include "rewrite/rewriteManip.h"
 #include "storage/bufmgr.h"
+#include "storage/bulk_write.h"
 #include "storage/lmgr.h"
 #include "storage/predicate.h"
 #include "storage/smgr.h"
@@ -76,6 +81,7 @@
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/partcache.h"
 #include "utils/pg_rusage.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
@@ -120,7 +126,15 @@ static void UpdateIndexRelation(Oid indexoid, Oid heapoid,
 								bool isexclusion,
 								bool immediate,
 								bool isvalid,
-								bool isready);
+								bool isready,
+								bool isglobal);
+static void write_global_index_metapage(Relation indexRelation);
+static bool build_global_index(Relation heapRelation,
+							   Relation indexRelation);
+static bool gpi_fill_one_partition(Relation indexRelation, Relation partRel,
+								   EState *estate);
+static void gpi_check_partition_supported(Relation parentRel,
+										  Relation partRel);
 static void index_update_stats(Relation rel,
 							   bool hasindex,
 							   double reltuples);
@@ -572,7 +586,8 @@ UpdateIndexRelation(Oid indexoid,
 					bool isexclusion,
 					bool immediate,
 					bool isvalid,
-					bool isready)
+					bool isready,
+					bool isglobal)
 {
 	int2vector *indkey;
 	oidvector  *indcollation;
@@ -650,6 +665,7 @@ UpdateIndexRelation(Oid indexoid,
 	values[Anum_pg_index_indisready - 1] = BoolGetDatum(isready);
 	values[Anum_pg_index_indislive - 1] = BoolGetDatum(true);
 	values[Anum_pg_index_indisreplident - 1] = BoolGetDatum(false);
+	values[Anum_pg_index_indglobal - 1] = BoolGetDatum(isglobal);
 	values[Anum_pg_index_indkey - 1] = PointerGetDatum(indkey);
 	values[Anum_pg_index_indcollation - 1] = PointerGetDatum(indcollation);
 	values[Anum_pg_index_indclass - 1] = PointerGetDatum(indclass);
@@ -707,6 +723,460 @@ index_create(Relation heapRelation,
 								collationIds, opclassIds, opclassOptions, coloptions,
 								stattargets, reloptions, flags, constr_flags,
 								allow_system_table_mods, is_internal, constraintId, NULL);
+}
+
+/*
+ * write_global_index_metapage
+ *
+ * Initialize the empty btree structure of a global partition index on its
+ * MAIN_FORKNUM.  A global index is a real physical RELKIND_INDEX, but it is
+ * never populated by the normal index_build() path (which would scan the
+ * storage-less partitioned parent), so we write the btree metapage directly.
+ * ambuildempty() writes INIT_FORKNUM (used only for unlogged-table crash
+ * recovery) and would leave the main fork empty.  btree-only, like the rest of
+ * the feature.  Used by both CREATE INDEX and REINDEX of a global index.
+ */
+static void
+write_global_index_metapage(Relation indexRelation)
+{
+	bool			allequalimage;
+	BulkWriteState *bulkstate;
+	BulkWriteBuffer metabuf;
+
+	if (indexRelation->rd_rel->relam != BTREE_AM_OID)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("global partition indexes are only supported for btree")));
+
+	/*
+	 * Disable deduplication for global indexes.  Deduplication would merge
+	 * equal-key entries into a posting-list tuple holding one key but many
+	 * TIDs; for a global index those TIDs could come from different partition
+	 * heaps, and vacuum's routing-aware cleanup (and scan routing) must be
+	 * able to treat every entry individually.  Passing allequalimage = false
+	 * to _bt_initmetapage turns deduplication off for this index.
+	 */
+	allequalimage = false;
+	bulkstate = smgr_bulk_start_rel(indexRelation, MAIN_FORKNUM);
+	metabuf = smgr_bulk_get_buf(bulkstate);
+	_bt_initmetapage((Page) metabuf, P_NONE, 0, allequalimage);
+	smgr_bulk_write(bulkstate, BTREE_METAPAGE, metabuf, true);
+	smgr_bulk_finish(bulkstate);
+}
+
+
+/*
+ * BuildGlobalIndexInfo
+ *
+ * Build an IndexInfo for global index 'gidx' whose attribute numbers,
+ * expressions and predicate refer to partition 'partRel' rather than to the
+ * partitioned parent.  A partition's physical column layout can differ from
+ * the parent's (the parent has dropped columns, or the partition was attached
+ * with another column order), so the parent's IndexInfo must not be applied
+ * to a partition's tuples.  For a UNIQUE index, the equality operators used
+ * by ExecCheckGlobalIndexUnique() are filled in too.  The result is
+ * allocated in CurrentMemoryContext.
+ */
+IndexInfo *
+BuildGlobalIndexInfo(Relation gidx, Relation partRel)
+{
+	IndexInfo  *ii = BuildIndexInfo(gidx);
+	Relation	parentRel;
+	AttrMap    *attmap;
+
+	Assert(gidx->rd_index->indglobal);
+
+	parentRel = table_open(gidx->rd_index->indrelid, AccessShareLock);
+	attmap = build_attrmap_by_name_if_req(RelationGetDescr(partRel),
+										  RelationGetDescr(parentRel),
+										  false);
+	if (attmap != NULL)
+	{
+		bool		found_whole_row;
+
+		for (int i = 0; i < ii->ii_NumIndexAttrs; i++)
+		{
+			AttrNumber	attno = ii->ii_IndexAttrNumbers[i];
+
+			if (attno != InvalidAttrNumber)
+				ii->ii_IndexAttrNumbers[i] = attmap->attnums[attno - 1];
+		}
+		if (ii->ii_Expressions != NIL)
+			ii->ii_Expressions = (List *)
+				map_variable_attnos((Node *) ii->ii_Expressions, 1, 0,
+									attmap, InvalidOid, &found_whole_row);
+		if (ii->ii_Predicate != NIL)
+			ii->ii_Predicate = (List *)
+				map_variable_attnos((Node *) ii->ii_Predicate, 1, 0,
+									attmap, InvalidOid, &found_whole_row);
+		free_attrmap(attmap);
+	}
+	table_close(parentRel, NoLock);
+
+	if (gidx->rd_index->indisunique)
+		BuildSpeculativeIndexInfo(gidx, ii);
+
+	return ii;
+}
+
+/*
+ * gpi_check_partition_supported
+ *
+ * Every row of a table with a global index must be in the global index, but
+ * only rows of plain leaf partitions can be: a sub-partitioned table's rows
+ * are in partitions of its own (which don't maintain the parent's global
+ * indexes), and a foreign table's rows are not stored here at all.  Refuse
+ * such partitions rather than silently leaving their rows unindexed.
+ */
+static void
+gpi_check_partition_supported(Relation parentRel, Relation partRel)
+{
+	char		relkind = partRel->rd_rel->relkind;
+
+	if (relkind == RELKIND_PARTITIONED_TABLE ||
+		relkind == RELKIND_FOREIGN_TABLE)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot use %s \"%s\" as a partition of \"%s\", which has a global index",
+						relkind == RELKIND_PARTITIONED_TABLE ?
+						"partitioned table" : "foreign table",
+						RelationGetRelationName(partRel),
+						RelationGetRelationName(parentRel)),
+				 errdetail("Global indexes support only plain partitions.")));
+}
+
+/*
+ * build_global_index
+ *
+ * Populate a freshly-created (or REINDEXed) global partition index with
+ * entries for the rows that already exist in the parent's partitions.
+ *
+ * A global index is a single physical btree attached to the partitioned
+ * parent, which has no storage of its own, so the normal index_build() (which
+ * scans the index's *own* relation) cannot be used and would build an empty
+ * index.  Instead every leaf partition is scanned like in a normal index
+ * build (see gpi_fill_one_partition).
+ *
+ * Each partition is locked in ShareLock, as a normal CREATE INDEX on a
+ * partitioned table would: locking the parent only doesn't keep out
+ * transactions writing to a partition directly, whose rows the build could
+ * otherwise miss for good.
+ *
+ * Returns true if a potentially broken HOT chain was seen.
+ */
+static bool
+build_global_index(Relation heapRelation, Relation indexRelation)
+{
+	PartitionDesc partdesc;
+	EState	   *estate;
+	bool		broken_hot_chain = false;
+
+	partdesc = RelationGetPartitionDesc(heapRelation, true);
+	estate = CreateExecutorState();
+
+	for (int i = 0; i < partdesc->nparts; i++)
+	{
+		Relation	partRel = table_open(partdesc->oids[i], ShareLock);
+
+		gpi_check_partition_supported(heapRelation, partRel);
+		if (gpi_fill_one_partition(indexRelation, partRel, estate))
+			broken_hot_chain = true;
+		table_close(partRel, NoLock);
+	}
+
+	FreeExecutorState(estate);
+
+	return broken_hot_chain;
+}
+
+/* State for gpi_build_callback() */
+typedef struct GIBuildState
+{
+	Relation	partRel;
+	IndexInfo  *indexInfo;
+	EState	   *estate;
+	MemoryContext tmpcxt;
+} GIBuildState;
+
+/*
+ * gpi_build_callback - table_index_build_scan() callback: insert one entry
+ * into the global index, and for a UNIQUE index check it against all
+ * partitions.  Recently dead tuples are indexed (older snapshots may need
+ * them) but, as in a normal unique index build, not checked.
+ */
+static void
+gpi_build_callback(Relation index, ItemPointer tid, Datum *values,
+				   bool *isnull, bool tupleIsAlive, void *state)
+{
+	GIBuildState *bs = (GIBuildState *) state;
+	MemoryContext oldcxt = MemoryContextSwitchTo(bs->tmpcxt);
+
+	index_insert(index, values, isnull, tid, bs->partRel,
+				 UNIQUE_CHECK_NO, false, bs->indexInfo);
+
+	if (index->rd_index->indisunique && tupleIsAlive)
+		ExecCheckGlobalIndexUnique(index, bs->indexInfo, bs->partRel, tid,
+								   values, isnull, bs->estate, true);
+
+	MemoryContextSwitchTo(oldcxt);
+	MemoryContextReset(bs->tmpcxt);
+}
+
+/*
+ * gpi_fill_one_partition
+ *
+ * Add entries for all rows of one leaf partition to a global index, using the
+ * table AM's regular index build scan.  That takes care of what a normal
+ * index build does: entries point at HOT chain roots (not at a chain's
+ * visible heap-only member, which an index fetch would not find), the
+ * partial-index predicate is applied, and recently dead rows are indexed
+ * too.  The caller must keep writers out of the partition.  Shared by the
+ * initial build, REINDEX, ATTACH PARTITION backfill and resync after a
+ * rewrite.  Returns true if a potentially broken HOT chain was seen.
+ */
+static bool
+gpi_fill_one_partition(Relation indexRelation, Relation partRel,
+					   EState *estate)
+{
+	GIBuildState bs;
+
+	bs.partRel = partRel;
+	bs.indexInfo = BuildGlobalIndexInfo(indexRelation, partRel);
+	bs.estate = estate;
+	bs.tmpcxt = AllocSetContextCreate(CurrentMemoryContext,
+									  "global index build",
+									  ALLOCSET_DEFAULT_SIZES);
+
+	(void) table_index_build_scan(partRel, indexRelation, bs.indexInfo,
+								  true, false, gpi_build_callback, &bs, NULL);
+
+	MemoryContextDelete(bs.tmpcxt);
+
+	return bs.indexInfo->ii_BrokenHotChain;
+}
+
+/*
+ * IndexGlobalAttachPartition
+ *
+ * Backfill a newly-attached partition's existing rows into every global index
+ * owned by the parent.  ATTACH PARTITION only flips catalog state; the
+ * attached rows never flow through the insert-maintenance path, so without
+ * this the global index would silently miss them.  Called from
+ * ATExecAttachPartition() once the attach is complete, and to re-add a
+ * partition's rows after its heap was rewritten.  The caller must keep
+ * writers out of the partition.
+ */
+void
+IndexGlobalAttachPartition(Relation parentRel, Relation partRel)
+{
+	Relation	pgidx;
+	SysScanDesc sysscan;
+	ScanKeyData skey;
+	HeapTuple	htup;
+	EState	   *estate = NULL;
+
+	ScanKeyInit(&skey, Anum_pg_index_indrelid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(RelationGetRelid(parentRel)));
+	pgidx = table_open(IndexRelationId, AccessShareLock);
+	sysscan = systable_beginscan(pgidx, IndexIndrelidIndexId, true,
+								 NULL, 1, &skey);
+
+	while (HeapTupleIsValid(htup = systable_getnext(sysscan)))
+	{
+		Form_pg_index idxForm = (Form_pg_index) GETSTRUCT(htup);
+		Relation	gidx;
+
+		if (!idxForm->indglobal)
+			continue;
+
+		/* First global index: check the partition, set up executor state. */
+		if (estate == NULL)
+		{
+			gpi_check_partition_supported(parentRel, partRel);
+			estate = CreateExecutorState();
+		}
+
+		gidx = index_open(idxForm->indexrelid, RowExclusiveLock);
+		(void) gpi_fill_one_partition(gidx, partRel, estate);
+		index_close(gidx, RowExclusiveLock);
+	}
+
+	systable_endscan(sysscan);
+	table_close(pgidx, AccessShareLock);
+
+	if (estate != NULL)
+		FreeExecutorState(estate);
+}
+
+
+/*
+ * gi_purge_routed - GIVacDeleteFn that flags every global-index entry that
+ * routes to the partition being removed.  Used to purge a detached, dropped
+ * or truncated partition's entries; there is no liveness check because all
+ * of the partition's rows are leaving the index.
+ */
+typedef struct GIPurgeArg
+{
+	Relation	parentRel;
+	Relation	gidx;
+	Oid			partOid;
+} GIPurgeArg;
+
+static bool
+gi_purge_routed(void *arg, IndexTuple itup, ItemPointer tid)
+{
+	GIPurgeArg *st = (GIPurgeArg *) arg;
+
+	return ExecGlobalIndexRoutePartition(st->parentRel, st->gidx, itup,
+										 true) == st->partOid;
+}
+
+/*
+ * IndexGlobalDetachPartition
+ *
+ * Purge a partition's entries from every global index owned by the parent
+ * when the partition is being detached, dropped or truncated.  An entry
+ * belongs to the partition if its partition key value routes to it, which
+ * also covers a DEFAULT partition.  Must run while the partition is still
+ * part of the parent's partition descriptor (a detach-pending partition
+ * counts).  Leftover entries would not just be bloat: once the partition's
+ * heap slots are reused they could duplicate a new entry exactly, which
+ * btree does not allow.
+ */
+void
+IndexGlobalDetachPartition(Relation parentRel, Relation partRel)
+{
+	GIPurgeArg	arg;
+	Relation	pgidx;
+	SysScanDesc sysscan;
+	ScanKeyData skey;
+	HeapTuple	htup;
+
+	/* Multi-level: a sub-partitioned table has no heap to use as heaprel. */
+	if (partRel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+		return;
+
+	arg.parentRel = parentRel;
+	arg.partOid = RelationGetRelid(partRel);
+
+	ScanKeyInit(&skey, Anum_pg_index_indrelid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(RelationGetRelid(parentRel)));
+	pgidx = table_open(IndexRelationId, AccessShareLock);
+	sysscan = systable_beginscan(pgidx, IndexIndrelidIndexId, true,
+								 NULL, 1, &skey);
+
+	while (HeapTupleIsValid(htup = systable_getnext(sysscan)))
+	{
+		Form_pg_index idxForm = (Form_pg_index) GETSTRUCT(htup);
+		Relation	gidx;
+		IndexVacuumInfo ivinfo;
+		GIVacCallback gicb;
+		IndexBulkDeleteResult *istat;
+
+		if (!idxForm->indglobal)
+			continue;
+
+		gidx = index_open(idxForm->indexrelid, ShareUpdateExclusiveLock);
+		arg.gidx = gidx;
+
+		gicb.fn = gi_purge_routed;
+		gicb.arg = &arg;
+
+		ivinfo.index = gidx;
+		ivinfo.heaprel = partRel;
+		ivinfo.analyze_only = false;
+		ivinfo.report_progress = false;
+		ivinfo.estimated_count = true;
+		ivinfo.message_level = DEBUG2;
+		ivinfo.num_heap_tuples = partRel->rd_rel->reltuples;
+		ivinfo.strategy = NULL;
+
+		istat = index_bulk_delete(&ivinfo, NULL, NULL, &gicb);
+		if (istat)
+			pfree(istat);
+
+		index_close(gidx, ShareUpdateExclusiveLock);
+	}
+
+	systable_endscan(sysscan);
+	table_close(pgidx, AccessShareLock);
+}
+
+/*
+ * IndexGlobalNumUserKeys
+ *
+ * A global index stores the parent's partition key column(s) as its
+ * trailing key column(s), after the columns the user asked for.  Btree
+ * requires every entry to be unique by (key columns, heap TID), and heap
+ * TIDs repeat across partitions; since partitions don't overlap, the
+ * partition key value tells partitions apart and restores that invariant.
+ *
+ * Return the number of leading key columns that make up the user's index
+ * definition: those are what uniqueness is checked on and what is shown in
+ * the index or constraint definition.  Indexes created before this layout
+ * (partition key as an INCLUDE column only) have no trailing routing
+ * columns, so all their key columns are user columns.
+ */
+int
+IndexGlobalNumUserKeys(const FormData_pg_index *indexForm)
+{
+	HeapTuple	tuple;
+	Form_pg_partitioned_table partform;
+	int			nkeys = indexForm->indnkeyatts;
+	int			partnatts;
+	bool		trailing = true;
+
+	if (!indexForm->indglobal)
+		return nkeys;
+
+	tuple = SearchSysCache1(PARTRELID, ObjectIdGetDatum(indexForm->indrelid));
+	if (!HeapTupleIsValid(tuple))
+		return nkeys;
+	partform = (Form_pg_partitioned_table) GETSTRUCT(tuple);
+	partnatts = partform->partnatts;
+
+	if (nkeys <= partnatts)
+		trailing = false;
+	for (int i = 0; trailing && i < partnatts; i++)
+	{
+		if (partform->partattrs.values[i] == 0 ||
+			indexForm->indkey.values[nkeys - partnatts + i] !=
+			partform->partattrs.values[i])
+			trailing = false;
+	}
+	ReleaseSysCache(tuple);
+
+	return trailing ? nkeys - partnatts : nkeys;
+}
+
+/*
+ * IndexGlobalResyncPartition
+ *
+ * Resynchronize a partition's entries in the parent's global indexes after the
+ * partition's heap has been rewritten (CLUSTER / VACUUM FULL / REPACK).  Such a
+ * rewrite assigns new TIDs to every row, so the global index's entries for this
+ * partition point at the old, now-wrong TIDs.  We purge those stale entries
+ * (matched by the partition's bounds) and backfill fresh entries from the
+ * rewritten heap.  No-op when the relation is not a partition or its parent
+ * owns no global index.
+ */
+void
+IndexGlobalResyncPartition(Relation partRel)
+{
+	Oid			parentOid;
+	Relation	parentRel;
+
+	if (!partRel->rd_rel->relispartition)
+		return;
+
+	parentOid = get_partition_parent(RelationGetRelid(partRel), false);
+	parentRel = table_open(parentOid, AccessShareLock);
+
+	/* Drop the partition's stale (old-TID) entries, then re-add new ones. */
+	IndexGlobalDetachPartition(parentRel, partRel);
+	IndexGlobalAttachPartition(parentRel, partRel);
+
+	table_close(parentRel, AccessShareLock);
 }
 
 /*
@@ -800,6 +1270,7 @@ index_create_percona(Relation heapRelation,
 	bool		invalid = (flags & INDEX_CREATE_INVALID) != 0;
 	bool		concurrent = (flags & INDEX_CREATE_CONCURRENT) != 0;
 	bool		partitioned = (flags & INDEX_CREATE_PARTITIONED) != 0;
+	bool		isglobal = (flags & INDEX_CREATE_GLOBAL) != 0;
 	bool		progress = (flags & INDEX_CREATE_SUPPRESS_PROGRESS) == 0;
 	char		relkind;
 	TransactionId relfrozenxid;
@@ -811,7 +1282,14 @@ index_create_percona(Relation heapRelation,
 		   ((flags & INDEX_CREATE_ADD_CONSTRAINT) != 0));
 	/* partitioned indexes must never be "built" by themselves */
 	Assert(!partitioned || (flags & INDEX_CREATE_SKIP_BUILD));
+	/* global indexes are always built lazily (no heap scan on parent) */
+	Assert(!isglobal || (flags & INDEX_CREATE_SKIP_BUILD));
 
+	/*
+	 * A global partition index is a real physical RELKIND_INDEX even though
+	 * the parent relation is a partitioned table.  It is populated
+	 * incrementally as rows are inserted into the individual partitions.
+	 */
 	relkind = partitioned ? RELKIND_PARTITIONED_INDEX : RELKIND_INDEX;
 	is_exclusion = (indexInfo->ii_ExclusionOps != NULL);
 
@@ -1092,7 +1570,8 @@ index_create_percona(Relation heapRelation,
 						(constr_flags & INDEX_CONSTR_CREATE_DEFERRABLE) == 0 &&
 						(flags & INDEX_CREATE_DEFERRABLE) == 0,
 						!concurrent && !invalid,
-						!concurrent);
+						!concurrent,
+						(flags & INDEX_CREATE_GLOBAL) != 0);
 
 	/*
 	 * Register relcache invalidation on the indexes' heap relation, to
@@ -1153,7 +1632,8 @@ index_create_percona(Relation heapRelation,
 												indexInfo,
 												indexRelationName,
 												constraintType,
-												constr_flags,
+												constr_flags |
+												(isglobal ? INDEX_CONSTR_CREATE_GLOBAL : 0),
 												allow_system_table_mods,
 												is_internal);
 			if (constraintId)
@@ -1316,6 +1796,90 @@ index_create_percona(Relation heapRelation,
 						   -1.0);
 		/* Make the above update visible */
 		CommandCounterIncrement();
+
+		/*
+		 * A global partition index is a real physical index (RELKIND_INDEX)
+		 * but we skip the heap scan because the partitioned parent has no
+		 * storage.  We still need to initialize the index AM's empty
+		 * structure on the MAIN_FORKNUM.
+		 *
+		 * ambuildempty() always writes to INIT_FORKNUM (used only for
+		 * unlogged-table crash recovery) — calling it here would leave the
+		 * main fork empty, causing every subsequent index_insert to fail.
+		 * Instead, write the btree meta page directly to MAIN_FORKNUM.
+		 *
+		 * This is intentionally btree-specific; only btree global indexes
+		 * are supported in this prototype.
+		 */
+		if (isglobal)
+		{
+			/*
+			 * Initialize the global index's empty btree structure, then
+			 * backfill it from the rows that already exist in the partitions
+			 * (the parent itself has no storage to scan).  This indexes rows
+			 * present BEFORE "CREATE INDEX ... GLOBAL", not only those inserted
+			 * afterwards.
+			 */
+			/*
+			 * With a caller-supplied relfilenumber the index reuses existing,
+			 * already complete storage (ALTER TABLE ... TYPE that needs no
+			 * rewrite); leave it alone.  INDEX_CREATE_GLOBAL_NOFILL means the
+			 * partitions are about to be rewritten, which re-adds their rows
+			 * (see IndexGlobalResyncPartition); their current tuples may not
+			 * even match the new column types yet.
+			 */
+			if (create_storage)
+			{
+				write_global_index_metapage(indexRelation);
+				if ((flags & INDEX_CREATE_GLOBAL_NOFILL) == 0 &&
+					build_global_index(heapRelation, indexRelation))
+				{
+					/*
+					 * As in index_build(): with broken HOT chains, the index
+					 * must not be used by transactions whose snapshot could
+					 * see the broken chains' older members.
+					 */
+					Relation	pg_index;
+					HeapTuple	indexTuple;
+
+					CommandCounterIncrement();
+					pg_index = table_open(IndexRelationId, RowExclusiveLock);
+					indexTuple = SearchSysCacheCopy1(INDEXRELID,
+													 ObjectIdGetDatum(indexRelationId));
+					if (!HeapTupleIsValid(indexTuple))
+						elog(ERROR, "cache lookup failed for index %u",
+							 indexRelationId);
+					((Form_pg_index) GETSTRUCT(indexTuple))->indcheckxmin = true;
+					CatalogTupleUpdate(pg_index, &indexTuple->t_self, indexTuple);
+					heap_freetuple(indexTuple);
+					table_close(pg_index, RowExclusiveLock);
+				}
+			}
+
+			/*
+			 * A new global index contributes HOT-blocking columns to every
+			 * leaf partition (see AddParentGlobalIndexHotBlockingAttrs in
+			 * relcache.c).  Invalidate the partitions' relcache entries so that
+			 * already-connected backends rebuild those bitmaps; otherwise they
+			 * would keep treating an UPDATE of the indexed column as HOT and
+			 * silently skip global-index maintenance.
+			 */
+			{
+				List	   *children;
+				ListCell   *lc;
+
+				children = find_all_inheritors(RelationGetRelid(heapRelation),
+											   NoLock, NULL);
+				foreach(lc, children)
+				{
+					Oid			childoid = lfirst_oid(lc);
+
+					if (childoid != RelationGetRelid(heapRelation))
+						CacheInvalidateRelcacheByRelid(childoid);
+				}
+				list_free(children);
+			}
+		}
 	}
 	else
 	{
@@ -1970,6 +2534,7 @@ index_constraint_create(Relation heapRelation,
 	bool		noinherit;
 	bool		is_without_overlaps;
 	int16		inhcount;
+	int			conkeyatts;
 
 	deferrable = (constr_flags & INDEX_CONSTR_CREATE_DEFERRABLE) != 0;
 	initdeferred = (constr_flags & INDEX_CONSTR_CREATE_INIT_DEFERRED) != 0;
@@ -2019,6 +2584,15 @@ index_constraint_create(Relation heapRelation,
 	}
 
 	/*
+	 * A global index's trailing partition key columns are part of the index
+	 * but not of the constraint (see IndexGlobalNumUserKeys).  Our caller
+	 * just created the index, so its pg_index row is not visible yet.
+	 */
+	conkeyatts = indexInfo->ii_NumIndexKeyAttrs;
+	if (constr_flags & INDEX_CONSTR_CREATE_GLOBAL)
+		conkeyatts -= RelationGetPartitionKey(heapRelation)->partnatts;
+
+	/*
 	 * Construct a pg_constraint entry.
 	 */
 	conOid = CreateConstraintEntry(constraintName,
@@ -2031,7 +2605,7 @@ index_constraint_create(Relation heapRelation,
 								   parentConstraintId,
 								   RelationGetRelid(heapRelation),
 								   indexInfo->ii_IndexAttrNumbers,
-								   indexInfo->ii_NumIndexKeyAttrs,
+								   conkeyatts,
 								   indexInfo->ii_NumIndexAttrs,
 								   InvalidOid,	/* no domain */
 								   indexRelationId, /* index OID */
@@ -3893,10 +4467,32 @@ reindex_index(const ReindexStmt *stmt, Oid indexId,
 
 	/* Initialize the index and rebuild */
 	/* Note: we do not need to re-establish pkey setting */
-	index_build(heapRelation, iRel, indexInfo, true, true, progress);
+	if (iRel->rd_index->indglobal)
+	{
+		/*
+		 * A global partition index cannot be rebuilt by the normal
+		 * index_build() path: that scans the index's own relation (the
+		 * partitioned parent), which has no storage, and would leave the index
+		 * empty.  Recreate its empty btree structure and then backfill it from
+		 * the partition heaps (see build_global_index()).
+		 *
+		 * The backfill populates the index with index_insert(), which the
+		 * reindex-in-progress guard would reject, so re-allow use of the index
+		 * before backfilling.  REINDEX holds an exclusive lock on the index, so
+		 * no other backend can use the half-built index meanwhile.
+		 */
+		write_global_index_metapage(iRel);
+		ResetReindexProcessing();
+		/* the indcheckxmin logic below looks at ii_BrokenHotChain */
+		indexInfo->ii_BrokenHotChain = build_global_index(heapRelation, iRel);
+	}
+	else
+	{
+		index_build(heapRelation, iRel, indexInfo, true, true, progress);
 
-	/* Re-allow use of target index */
-	ResetReindexProcessing();
+		/* Re-allow use of target index */
+		ResetReindexProcessing();
+	}
 
 	/*
 	 * If the index is marked invalid/not-ready/dead (ie, it's from a failed

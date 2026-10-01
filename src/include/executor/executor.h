@@ -769,6 +769,19 @@ extern void check_exclusion_constraint(Relation heap, Relation index,
 									   const ItemPointerData *tupleid,
 									   const Datum *values, const bool *isnull,
 									   EState *estate, bool newIndex);
+struct IndexTupleData;
+extern Oid	ExecGlobalIndexRoutePartition(Relation parentRel, Relation gidx,
+										  struct IndexTupleData *itup,
+										  bool include_detached);
+extern int	ExecGlobalIndexRouteToIndex(struct PartitionKeyData *key,
+										struct PartitionDescData *partdesc,
+										Relation gidx,
+										struct IndexTupleData *itup);
+extern void ExecCheckGlobalIndexUnique(Relation gidx, IndexInfo *indexInfo,
+									   Relation heapRel,
+									   const ItemPointerData *tupleid,
+									   const Datum *values, const bool *isnull,
+									   EState *estate, bool newIndex);
 
 /*
  * prototypes from functions in execReplication.c

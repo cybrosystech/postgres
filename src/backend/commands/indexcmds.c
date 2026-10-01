@@ -127,6 +127,11 @@ static bool ReindexRelationConcurrently(const ReindexStmt *stmt,
 										const ReindexParams *params);
 static void update_relispartition(Oid relationId, bool newval);
 static inline void set_indexsafe_procflags(void);
+static bool UniqueIndexNeedsGlobal(Relation rel, const IndexStmt *stmt,
+								   bool exclusion);
+
+/* GUC: create UNIQUE indexes lacking the partition key as GLOBAL indexes */
+bool		dbblue_auto_global_index = true;
 
 /*
  * callback argument type for RangeVarCallbackForReindexIndex()
@@ -587,6 +592,7 @@ DefineIndex(ParseState *pstate,
 	amoptions_function amoptions;
 	bool		exclusion;
 	bool		partitioned;
+	bool		global = stmt->global;
 	bool		safe_index;
 	Datum		reloptions;
 	int16	   *coloptions;
@@ -733,24 +739,144 @@ DefineIndex(ParseState *pstate,
 	 * Establish behavior for partitioned tables, and verify sanity of
 	 * parameters.
 	 *
-	 * We do not build an actual index in this case; we only create a few
-	 * catalog entries.  The actual indexes are built by recursing for each
-	 * partition.
+	 * For a regular (non-global) partitioned index we do not build an actual
+	 * index; we only create catalog entries and recurse into each partition.
+	 *
+	 * For a GLOBAL index the partitioned table itself gets a single real
+	 * physical index (RELKIND_INDEX).  It is populated incrementally as rows
+	 * are inserted into partitions, so we never recurse into partitions and
+	 * we skip the initial index build.
 	 */
 	partitioned = rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE;
+
+	/*
+	 * A plain UNIQUE index on a partitioned table must normally include the
+	 * partition key, otherwise uniqueness could only be enforced per
+	 * partition.  Applications such as Odoo issue "CREATE UNIQUE INDEX" or
+	 * "ALTER TABLE ... ADD CONSTRAINT ... UNIQUE" on tables that were
+	 * partitioned behind their back, so instead of failing we transparently
+	 * create such an index as a GLOBAL index, which enforces uniqueness
+	 * across all partitions.
+	 */
+	if (partitioned && dbblue_auto_global_index && !global &&
+		!OidIsValid(parentIndexId) &&
+		UniqueIndexNeedsGlobal(rel, stmt, exclusion))
+	{
+		global = true;
+		ereport(NOTICE,
+				(errmsg("creating unique %s%s%s%s on partitioned table \"%s\" as a GLOBAL index",
+						stmt->isconstraint ? "constraint" : "index",
+						stmt->idxname ? " \"" : "",
+						stmt->idxname ? stmt->idxname : "",
+						stmt->idxname ? "\"" : "",
+						RelationGetRelationName(rel)),
+				 errdetail("The index does not include the partition key, so uniqueness is enforced across all partitions by a global index."),
+				 errhint("Set \"dbblue_auto_global_index\" to off to get the standard error instead.")));
+	}
+
 	if (partitioned)
 	{
-		/*
-		 * Note: we check 'stmt->concurrent' rather than 'concurrent', so that
-		 * the error is thrown also for temporary tables.  Seems better to be
-		 * consistent, even though we could do it on temporary table because
-		 * we're not actually doing it concurrently.
-		 */
-		if (stmt->concurrent)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("cannot create index on partitioned table \"%s\" concurrently",
-							RelationGetRelationName(rel))));
+		if (global)
+		{
+			/* GLOBAL indexes are not compatible with concurrent build */
+			if (stmt->concurrent)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("cannot create global index on partitioned table \"%s\" concurrently",
+								RelationGetRelationName(rel))));
+
+			/*
+			 * A global index can back a UNIQUE constraint, which then lives
+			 * on the parent only (there are no per-partition counterparts).
+			 * Its uniqueness is checked immediately after each insert, so it
+			 * cannot be deferrable, and it is not supported for PRIMARY KEY
+			 * or EXCLUDE constraints.
+			 */
+			if (stmt->primary || exclusion)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("global indexes cannot be used for PRIMARY KEY or EXCLUDE constraints")));
+			if (stmt->deferrable)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("global indexes cannot be used for deferrable constraints")));
+
+			/*
+			 * Append the partition key column(s) as trailing KEY columns (see
+			 * IndexGlobalNumUserKeys).  Besides letting the executor route an
+			 * entry's TID to its partition, this keeps btree entries unique
+			 * by (key, heap TID): heap TIDs repeat across partitions, but the
+			 * partition key value differs.  They are appended even if the
+			 * user's columns already contain them, so the trailing columns
+			 * are always the routing columns.
+			 */
+			{
+				PartitionKey partkey = RelationGetPartitionKey(rel);
+				TupleDesc	reldesc = RelationGetDescr(rel);
+
+				/* Routing (scans, detach) only handles this shape */
+				if (partkey->strategy != PARTITION_STRATEGY_RANGE ||
+					partkey->partnatts != 1)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("global indexes are only supported on tables partitioned by RANGE on a single column")));
+
+				for (int pk_i = 0; pk_i < partkey->partnatts; pk_i++)
+				{
+					AttrNumber	attno = partkey->partattrs[pk_i];
+					Form_pg_attribute attr;
+					IndexElem  *ielem;
+
+					if (attno == 0)
+						ereport(ERROR,
+								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								 errmsg("global indexes on expression partition keys are not supported")));
+
+					attr = TupleDescAttr(reldesc, attno - 1);
+
+					ielem = makeNode(IndexElem);
+					ielem->name = pstrdup(NameStr(attr->attname));
+					ielem->expr = NULL;
+					ielem->indexcolname = NULL;
+					ielem->collation = NIL;
+					ielem->opclass = NIL;
+					ielem->opclassopts = NIL;
+					ielem->ordering = SORTBY_DEFAULT;
+					ielem->nulls_ordering = SORTBY_NULLS_DEFAULT;
+
+					/* after the key columns, before any INCLUDE columns */
+					allIndexParams = list_insert_nth(allIndexParams,
+													 numberOfKeyAttributes,
+													 ielem);
+					numberOfKeyAttributes++;
+					numberOfAttributes++;
+				}
+
+				if (numberOfAttributes > INDEX_MAX_KEYS)
+					ereport(ERROR,
+							(errcode(ERRCODE_TOO_MANY_COLUMNS),
+							 errmsg("cannot use more than %d columns in an index",
+									INDEX_MAX_KEYS)));
+			}
+		}
+		else
+		{
+			/*
+			 * Note: we check 'stmt->concurrent' rather than 'concurrent', so
+			 * that the error is thrown also for temporary tables.
+			 */
+			if (stmt->concurrent)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("cannot create index on partitioned table \"%s\" concurrently",
+								RelationGetRelationName(rel))));
+		}
+	}
+	else if (global)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("GLOBAL is only valid for indexes on partitioned tables")));
 	}
 
 	/*
@@ -794,15 +920,20 @@ DefineIndex(ParseState *pstate,
 	if (stmt->tableSpace)
 	{
 		tablespaceId = get_tablespace_oid(stmt->tableSpace, false);
-		if (partitioned && tablespaceId == MyDatabaseTableSpace)
+		/* Global indexes are real physical indexes; no tablespace restriction */
+		if (partitioned && !global && tablespaceId == MyDatabaseTableSpace)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("cannot specify default tablespace for partitioned relations")));
 	}
 	else
 	{
+		/*
+		 * For a global index we pass partitioned=false so GetDefaultTablespace
+		 * treats it like an ordinary index.
+		 */
 		tablespaceId = GetDefaultTablespace(rel->rd_rel->relpersistence,
-											partitioned);
+											partitioned && !global);
 		/* note InvalidOid is OK in this case */
 	}
 
@@ -837,12 +968,18 @@ DefineIndex(ParseState *pstate,
 	indexColNames = ChooseIndexColumnNames(rel, allIndexParams);
 
 	/*
-	 * Select name for index if caller didn't specify
+	 * Select name for index if caller didn't specify.  For a global index,
+	 * leave out the appended partition key columns, so the name is the one
+	 * the user would get without partitioning.
 	 */
 	indexRelationName = stmt->idxname;
 	if (indexRelationName == NULL)
 		indexRelationName = ChooseIndexName(RelationGetRelationName(rel),
 											namespaceId,
+											global ?
+											ChooseIndexColumnNames(rel,
+																   list_concat_copy(stmt->indexParams,
+																					stmt->indexIncludingParams)) :
 											indexColNames,
 											stmt->excludeOpNames,
 											stmt->primary,
@@ -971,10 +1108,10 @@ DefineIndex(ParseState *pstate,
 	 * violate uniqueness by putting values that ought to be unique in
 	 * different partitions.
 	 *
-	 * We could lift this limitation if we had global indexes, but those have
-	 * their own problems, so this is a useful feature combination.
+	 * A GLOBAL index is a single btree spanning all partitions, so it
+	 * enforces uniqueness by itself and is exempt from this rule.
 	 */
-	if (partitioned && (stmt->unique || exclusion))
+	if (partitioned && !global && (stmt->unique || exclusion))
 	{
 		PartitionKey key = RelationGetPartitionKey(rel);
 		const char *constraint_type;
@@ -1231,22 +1368,37 @@ DefineIndex(ParseState *pstate,
 	flags = constr_flags = 0;
 	if (stmt->isconstraint)
 		flags |= INDEX_CREATE_ADD_CONSTRAINT;
-	if (skip_build || concurrent || partitioned)
+	/*
+	 * A global index always skips the initial build: it starts empty and is
+	 * populated incrementally during partition DML.
+	 */
+	if (skip_build || concurrent || (partitioned && !global))
 		flags |= INDEX_CREATE_SKIP_BUILD;
+	if (global)
+	{
+		flags |= INDEX_CREATE_SKIP_BUILD | INDEX_CREATE_GLOBAL;
+
+		/*
+		 * skip_build without reused storage means ALTER TABLE is going to
+		 * rewrite the partitions; that fills the global index.
+		 */
+		if (skip_build && !RelFileNumberIsValid(stmt->oldNumber))
+			flags |= INDEX_CREATE_GLOBAL_NOFILL;
+	}
 	if (stmt->if_not_exists)
 		flags |= INDEX_CREATE_IF_NOT_EXISTS;
 	if (concurrent)
 		flags |= INDEX_CREATE_CONCURRENT;
-	if (partitioned)
+	if (partitioned && !global)
 		flags |= INDEX_CREATE_PARTITIONED;
 	if (stmt->primary)
 		flags |= INDEX_CREATE_IS_PRIMARY;
 
 	/*
-	 * If the table is partitioned, and recursion was declined but partitions
-	 * exist, mark the index as invalid.
+	 * If the table is partitioned (non-global), and recursion was declined
+	 * but partitions exist, mark the index as invalid.
 	 */
-	if (partitioned && stmt->relation && !stmt->relation->inh)
+	if (partitioned && !global && stmt->relation && !stmt->relation->inh)
 	{
 		PartitionDesc pd = RelationGetPartitionDesc(rel, true);
 
@@ -1308,7 +1460,7 @@ DefineIndex(ParseState *pstate,
 		CreateComments(indexRelationId, RelationRelationId, 0,
 					   stmt->idxcomment);
 
-	if (partitioned)
+	if (partitioned && !global)
 	{
 		PartitionDesc partdesc;
 
@@ -1846,6 +1998,48 @@ DefineIndex(ParseState *pstate,
 	pgstat_progress_end_command();
 
 	return address;
+}
+
+
+/*
+ * UniqueIndexNeedsGlobal
+ *		Decide whether a UNIQUE index about to be created on partitioned table
+ *		'rel' should automatically be created as a GLOBAL index.
+ *
+ * That is the case for a btree UNIQUE index or non-deferrable UNIQUE
+ * constraint whose key columns do not contain the partition key column,
+ * which would otherwise be rejected.  Only single-column RANGE partition keys
+ * on a plain column are handled, as that is what global index routing
+ * supports.
+ */
+static bool
+UniqueIndexNeedsGlobal(Relation rel, const IndexStmt *stmt, bool exclusion)
+{
+	PartitionKey key;
+	const char *partattname;
+
+	if (!stmt->unique || stmt->primary || stmt->deferrable || exclusion)
+		return false;
+	if (stmt->accessMethod == NULL ||
+		strcmp(stmt->accessMethod, DEFAULT_INDEX_TYPE) != 0)
+		return false;
+
+	key = RelationGetPartitionKey(rel);
+	if (key->strategy != PARTITION_STRATEGY_RANGE ||
+		key->partnatts != 1 || key->partattrs[0] == 0)
+		return false;
+
+	partattname = NameStr(TupleDescAttr(RelationGetDescr(rel),
+										key->partattrs[0] - 1)->attname);
+
+	/* Key already covers the partition key: a regular index works */
+	foreach_node(IndexElem, elem, stmt->indexParams)
+	{
+		if (elem->name && strcmp(elem->name, partattname) == 0)
+			return false;
+	}
+
+	return true;
 }
 
 
@@ -3931,6 +4125,18 @@ ReindexRelationConcurrently(const ReindexStmt *stmt, Oid relationOid, const Rein
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							 errmsg("cannot reindex system catalogs concurrently")));
+
+				/*
+				 * A plain index on a partitioned table is a global index; a
+				 * concurrent build would scan the parent, which has no
+				 * storage.
+				 */
+				if (get_rel_relkind(heapId) == RELKIND_PARTITIONED_TABLE)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("cannot reindex global index \"%s\" concurrently",
+									get_rel_name(relationOid)),
+							 errhint("Use REINDEX INDEX without CONCURRENTLY.")));
 
 				/*
 				 * Don't allow reindex for an invalid index on TOAST table, as
