@@ -158,6 +158,22 @@
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
+/* Additional headers for global partition index vacuum maintenance */
+#include "access/itup.h"
+#include "executor/executor.h"
+#include "access/stratnum.h"
+#include "access/table.h"
+#include "catalog/indexing.h"
+#include "catalog/partition.h"
+#include "catalog/pg_class.h"
+#include "catalog/pg_index.h"
+#include "nodes/parsenodes.h"
+#include "utils/builtins.h"
+#include "utils/fmgroids.h"
+#include "utils/partcache.h"
+#include "utils/rel.h"
+#include "utils/syscache.h"
+
 
 /*
  * Space/time tradeoff parameters: do these need to be user-tunable?
@@ -255,6 +271,8 @@ typedef struct LVRelState
 	Relation	rel;
 	Relation   *indrels;
 	int			nindexes;
+	bool		has_global_indexes; /* partition covered by a parent's global
+									 * index (see gpi_vacuum_parent_global_indexes) */
 
 	/* Buffer access strategy and parallel vacuum state */
 	BufferAccessStrategy bstrategy;
@@ -442,6 +460,17 @@ static bool lazy_scan_noprune(LVRelState *vacrel, Buffer buf,
 							  bool *has_lpdead_items);
 static void lazy_vacuum(LVRelState *vacrel);
 static bool lazy_vacuum_all_indexes(LVRelState *vacrel);
+static void gpi_vacuum_parent_global_indexes(LVRelState *vacrel);
+static bool gpi_partition_has_global_indexes(Relation rel);
+
+/*
+ * A partition without indexes of its own may be covered by global indexes on
+ * its parent.  Those need the two-pass strategy just like local indexes: dead
+ * line pointers may only be recycled after their index entries are gone.
+ */
+#define VacrelHasIndexes(vacrel) \
+	((vacrel)->nindexes > 0 || (vacrel)->has_global_indexes)
+static bool gi_should_delete(void *arg, IndexTuple itup, ItemPointer tid);
 static void lazy_vacuum_heap_rel(LVRelState *vacrel);
 static void lazy_vacuum_heap_page(LVRelState *vacrel, BlockNumber blkno,
 								  Buffer buffer, OffsetNumber *deadoffsets,
@@ -699,6 +728,7 @@ heap_vacuum_rel(Relation rel, const VacuumParams *params,
 	vacrel->rel = rel;
 	vac_open_indexes(vacrel->rel, RowExclusiveLock, &vacrel->nindexes,
 					 &vacrel->indrels);
+	vacrel->has_global_indexes = gpi_partition_has_global_indexes(vacrel->rel);
 	vacrel->bstrategy = bstrategy;
 	if (instrument && vacrel->nindexes > 0)
 	{
@@ -1115,7 +1145,7 @@ heap_vacuum_rel(Relation rel, const VacuumParams *params,
 							 vacrel->new_all_frozen_pages);
 			if (vacrel->do_index_vacuuming)
 			{
-				if (vacrel->nindexes == 0 || vacrel->num_index_scans == 0)
+				if (!VacrelHasIndexes(vacrel) || vacrel->num_index_scans == 0)
 					appendStringInfoString(&buf, _("index scan not needed: "));
 				else
 					appendStringInfoString(&buf, _("index scan needed: "));
@@ -1543,7 +1573,7 @@ lazy_scan_heap(LVRelState *vacrel)
 		 * revisit this page. Since updating the FSM is desirable but not
 		 * absolutely required, that's OK.
 		 */
-		if (vacrel->nindexes == 0
+		if (!VacrelHasIndexes(vacrel)
 			|| !vacrel->do_index_vacuuming
 			|| !has_lpdead_items)
 		{
@@ -1558,7 +1588,7 @@ lazy_scan_heap(LVRelState *vacrel)
 			 * table has indexes. There will only be newly-freed space if we
 			 * held the cleanup lock and lazy_scan_prune() was called.
 			 */
-			if (got_cleanup_lock && vacrel->nindexes == 0 && ndeleted > 0 &&
+			if (got_cleanup_lock && !VacrelHasIndexes(vacrel) && ndeleted > 0 &&
 				blkno - next_fsm_block_to_vacuum >= VACUUM_FSM_EVERY_PAGES)
 			{
 				FreeSpaceMapVacuumRange(vacrel->rel, next_fsm_block_to_vacuum,
@@ -2055,7 +2085,7 @@ lazy_scan_prune(LVRelState *vacrel,
 	 * tuples. Pruning will have determined whether or not the page is
 	 * all-visible.
 	 */
-	if (vacrel->nindexes == 0)
+	if (!VacrelHasIndexes(vacrel))
 		params.options |= HEAP_PAGE_PRUNE_MARK_UNUSED_NOW;
 
 	/*
@@ -2301,7 +2331,7 @@ lazy_scan_noprune(LVRelState *vacrel,
 	vacrel->NewRelminMxid = NoFreezePageRelminMxid;
 
 	/* Save any LP_DEAD items found on the page in dead_items */
-	if (vacrel->nindexes == 0)
+	if (!VacrelHasIndexes(vacrel))
 	{
 		/* Using one-pass strategy (since table has no indexes) */
 		if (lpdead_items > 0)
@@ -2371,7 +2401,7 @@ lazy_vacuum(LVRelState *vacrel)
 	bool		bypass;
 
 	/* Should not end up here with no indexes */
-	Assert(vacrel->nindexes > 0);
+	Assert(VacrelHasIndexes(vacrel));
 	Assert(vacrel->lpdead_item_pages > 0);
 
 	if (!vacrel->do_index_vacuuming)
@@ -2483,6 +2513,173 @@ lazy_vacuum(LVRelState *vacrel)
 }
 
 /*
+ * gpi_partition_has_global_indexes() -- is this leaf partition covered by a
+ * global partition index on its parent?
+ */
+static bool
+gpi_partition_has_global_indexes(Relation rel)
+{
+	List	   *ancestors;
+	Oid			parentOid;
+	Relation	pgidx;
+	SysScanDesc scan;
+	ScanKeyData skey;
+	HeapTuple	htup;
+	bool		found = false;
+
+	if (!rel->rd_rel->relispartition)
+		return false;
+	ancestors = get_partition_ancestors(RelationGetRelid(rel));
+	if (ancestors == NIL)
+		return false;
+	parentOid = linitial_oid(ancestors);
+	list_free(ancestors);
+
+	ScanKeyInit(&skey, Anum_pg_index_indrelid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(parentOid));
+	pgidx = table_open(IndexRelationId, AccessShareLock);
+	scan = systable_beginscan(pgidx, IndexIndrelidIndexId, true, NULL, 1, &skey);
+	while (!found && HeapTupleIsValid(htup = systable_getnext(scan)))
+		found = ((Form_pg_index) GETSTRUCT(htup))->indglobal;
+	systable_endscan(scan);
+	table_close(pgidx, AccessShareLock);
+
+	return found;
+}
+
+/*
+ * State for the routing-aware bulk delete of a parent's global partition
+ * index while vacuuming one leaf partition.  See
+ * gpi_vacuum_parent_global_indexes().
+ */
+typedef struct GIVacArg
+{
+	TidStore   *dead;			/* this leaf's dead TIDs */
+	Relation	parentRel;		/* the partitioned parent */
+	Relation	gidx;			/* the global index being vacuumed */
+	Oid			leafOid;		/* the leaf being vacuumed */
+} GIVacArg;
+
+/*
+ * gi_should_delete() -- GIVacDeleteFn for one global-index entry.
+ *
+ * Returns true iff the entry's heap TID is dead in the leaf being vacuumed
+ * AND the entry actually belongs to that leaf (its partition key value routes
+ * to it).  The partition check is essential: a sibling partition's entry can
+ * carry the same (block,offset) TID and must not be removed.
+ */
+static bool
+gi_should_delete(void *arg, IndexTuple itup, ItemPointer tid)
+{
+	GIVacArg   *st = (GIVacArg *) arg;
+
+	return TidStoreIsMember(st->dead, tid) &&
+		ExecGlobalIndexRoutePartition(st->parentRel, st->gidx, itup,
+									  true) == st->leafOid;
+}
+
+/*
+ * gpi_vacuum_parent_global_indexes() -- clean this leaf's dead entries out of
+ * the parent's global partition indexes.
+ *
+ * Global indexes are physical indexes on the partitioned parent and are not
+ * in any leaf's index list, so lazy_vacuum_all_indexes()'s loop never touches
+ * them.  We remove this leaf's dead entries here, using its dead-TID set and a
+ * routing-aware bulk delete (gi_should_delete) so that only entries belonging
+ * to this leaf are deleted.  This must happen for every leaf, including a
+ * DEFAULT partition: lazy_vacuum_heap_rel() recycles the line pointers next,
+ * and a leftover entry would then resolve to an unrelated row.  The global
+ * index is opened with ShareUpdateExclusiveLock so concurrent vacuums of
+ * sibling leaves do not bulk-delete the same shared index at once (the lock
+ * does not block scans or inserts, which take weaker locks).
+ */
+static void
+gpi_vacuum_parent_global_indexes(LVRelState *vacrel)
+{
+	Relation	leaf = vacrel->rel;
+	List	   *ancestors;
+	Oid			parentOid;
+	Relation	parentRel;
+	Relation	pgidx;
+	SysScanDesc scan;
+	ScanKeyData skey;
+	HeapTuple	htup;
+	GIVacArg	arg;
+
+	if (!vacrel->has_global_indexes || !vacrel->do_index_vacuuming)
+		return;
+
+	ancestors = get_partition_ancestors(RelationGetRelid(leaf));
+	if (ancestors == NIL)
+		return;
+	parentOid = linitial_oid(ancestors);
+	list_free(ancestors);
+	parentRel = table_open(parentOid, AccessShareLock);
+
+	arg.dead = vacrel->dead_items;
+	arg.parentRel = parentRel;
+	arg.leafOid = RelationGetRelid(leaf);
+
+	/* Find and clean each global index on the parent. */
+	ScanKeyInit(&skey, Anum_pg_index_indrelid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(parentOid));
+	pgidx = table_open(IndexRelationId, AccessShareLock);
+	scan = systable_beginscan(pgidx, IndexIndrelidIndexId, true, NULL, 1, &skey);
+	while (HeapTupleIsValid(htup = systable_getnext(scan)))
+	{
+		Form_pg_index idxForm = (Form_pg_index) GETSTRUCT(htup);
+		Relation	gidx;
+		IndexVacuumInfo ivinfo;
+		GIVacCallback gicb;
+		IndexBulkDeleteResult *istat;
+
+		if (!idxForm->indglobal)
+			continue;
+
+		gidx = index_open(idxForm->indexrelid, ShareUpdateExclusiveLock);
+		arg.gidx = gidx;
+
+		gicb.fn = gi_should_delete;
+		gicb.arg = &arg;
+
+		ivinfo.index = gidx;
+		ivinfo.heaprel = leaf;
+		ivinfo.analyze_only = false;
+		ivinfo.report_progress = false;
+		ivinfo.estimated_count = true;
+		ivinfo.message_level = DEBUG2;
+		ivinfo.num_heap_tuples = leaf->rd_rel->reltuples;
+		ivinfo.strategy = vacrel->bstrategy;
+
+		/*
+		 * Routing-aware bulk delete: a NULL callback plus a GIVacCallback as
+		 * callback_state signals the btree AM to use the itup-aware path.
+		 */
+		istat = index_bulk_delete(&ivinfo, NULL, NULL, &gicb);
+
+		/*
+		 * Report what the global-index cleanup did.  This index is not part of
+		 * the leaf's own index list, so it would otherwise be invisible to
+		 * VACUUM VERBOSE; surface it here at INFO when verbose (DEBUG2
+		 * otherwise) so operators can confirm the global index was scanned.
+		 */
+		ereport(vacrel->verbose ? INFO : DEBUG2,
+				(errmsg("global partition index \"%s\" scanned while vacuuming partition \"%s\": %.0f dead entries removed",
+						RelationGetRelationName(gidx),
+						RelationGetRelationName(leaf),
+						istat ? istat->tuples_removed : 0.0)));
+
+		if (istat)
+			pfree(istat);
+
+		index_close(gidx, ShareUpdateExclusiveLock);
+	}
+	systable_endscan(scan);
+	table_close(pgidx, AccessShareLock);
+	table_close(parentRel, AccessShareLock);
+}
+
+/*
  *	lazy_vacuum_all_indexes() -- Main entry for index vacuuming
  *
  * Returns true in the common case when all indexes were successfully
@@ -2507,7 +2704,7 @@ lazy_vacuum_all_indexes(LVRelState *vacrel)
 	int64		progress_start_val[2];
 	int64		progress_end_val[3];
 
-	Assert(vacrel->nindexes > 0);
+	Assert(VacrelHasIndexes(vacrel));
 	Assert(vacrel->do_index_vacuuming);
 	Assert(vacrel->do_index_cleanup);
 
@@ -2563,6 +2760,15 @@ lazy_vacuum_all_indexes(LVRelState *vacrel)
 		if (lazy_check_wraparound_failsafe(vacrel))
 			allindexes = false;
 	}
+
+	/*
+	 * Global partition indexes hang off the partitioned parent, not this leaf,
+	 * so the loop above never vacuums them.  Remove this leaf's dead entries
+	 * from the parent's global indexes now -- before lazy_vacuum_heap_rel()
+	 * recycles the heap line pointers, which would otherwise let a stale
+	 * global-index entry resolve to an unrelated recycled tuple.
+	 */
+	gpi_vacuum_parent_global_indexes(vacrel);
 
 	/*
 	 * We delete all LP_DEAD items from the first heap pass in all indexes on

@@ -522,6 +522,18 @@ typedef struct ResultRelInfo
 	IndexInfo **ri_IndexRelationInfo;
 
 	/*
+	 * Cache of the parent's GLOBAL partition indexes, used when this result
+	 * rel is a partition.  Resolved once (lazily, on the first inserted row)
+	 * so that per-row inserts don't re-scan pg_index / re-open the indexes.
+	 * ri_GlobalIndicesResolved guards the one-time setup; the arrays are freed
+	 * in ExecCloseIndices().
+	 */
+	bool		ri_GlobalIndicesResolved;
+	int			ri_NumGlobalIndices;
+	RelationPtr ri_GlobalIndexRelationDescs;
+	IndexInfo **ri_GlobalIndexRelationInfo;
+
+	/*
 	 * For UPDATE/DELETE/MERGE result relations, the attribute number of the
 	 * row identity junk attribute in the source plan's output tuples
 	 */
@@ -1746,6 +1758,9 @@ typedef struct
  *		PscanLen		   size of parallel index scan descriptor
  * ----------------
  */
+/* Opaque state for global partition index scans — defined in nodeIndexscan.c */
+struct GlobalIndexPartState;
+
 typedef struct IndexScanState
 {
 	ScanState	ss;				/* its first field is NodeTag */
@@ -1773,6 +1788,9 @@ typedef struct IndexScanState
 	bool	   *iss_OrderByTypByVals;
 	int16	   *iss_OrderByTypLens;
 	Size		iss_PscanLen;
+
+	/* Non-NULL when scanning a global partition index */
+	struct GlobalIndexPartState *iss_GlobalState;
 } IndexScanState;
 
 /* ----------------

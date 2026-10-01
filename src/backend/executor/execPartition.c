@@ -602,7 +602,7 @@ ExecInitPartitionInfo(ModifyTableState *mtstate, EState *estate,
 	 * error.  Be prepared in that case by initializing the index information
 	 * needed by ExecInsert() to perform speculative insertions.
 	 */
-	if (partrel->rd_rel->relhasindex &&
+	if ((partrel->rd_rel->relhasindex || partrel->rd_rel->relispartition) &&
 		leaf_part_rri->ri_IndexRelationDescs == NULL)
 		ExecOpenIndices(leaf_part_rri,
 						(node != NULL &&

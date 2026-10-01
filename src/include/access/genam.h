@@ -27,6 +27,7 @@
  * forward references in this file
  */
 typedef struct IndexInfo IndexInfo;
+struct IndexTupleData;			/* in access/itup.h; used by GIVacDeleteFn */
 typedef struct RelationData *Relation;
 typedef struct TIDBitmap TIDBitmap;
 typedef struct TupleTableSlot TupleTableSlot;
@@ -93,6 +94,27 @@ typedef struct IndexBulkDeleteResult
 
 /* Typedef for callback function to determine if a tuple is bulk-deletable */
 typedef bool (*IndexBulkDeleteCallback) (ItemPointer itemptr, void *state);
+
+/*
+ * Global partition index bulk-delete callback.
+ *
+ * A global partition index stores heap TIDs that reference *different*
+ * partition heaps, so the ordinary bare-TID IndexBulkDeleteCallback cannot
+ * tell which partition an entry belongs to (the same block/offset exists in
+ * every partition's heap).  When vacuuming a leaf partition we instead pass a
+ * GIVacCallback as the bulk-delete callback_state; the index AM (btree)
+ * detects rd_index->indglobal and invokes ->fn with the full *index tuple* so
+ * the routing-aware caller can decide -- from the tuple's partition-key
+ * column -- whether the entry belongs to the leaf being vacuumed (and is dead
+ * there).  itup is "struct IndexTupleData *" to avoid pulling access/itup.h.
+ */
+typedef bool (*GIVacDeleteFn) (void *arg, struct IndexTupleData *itup,
+							   ItemPointer tid);
+typedef struct GIVacCallback
+{
+	GIVacDeleteFn fn;
+	void	   *arg;
+} GIVacCallback;
 
 /* struct definitions appear in relscan.h */
 typedef struct IndexScanDescData *IndexScanDesc;

@@ -571,7 +571,8 @@ CopyMultiInsertBufferFlush(CopyMultiInsertInfo *miinfo,
 			 * If there are any indexes, update them for all the inserted
 			 * tuples, and run AFTER ROW INSERT triggers.
 			 */
-			if (resultRelInfo->ri_NumIndices > 0)
+			if (resultRelInfo->ri_NumIndices > 0 ||
+				resultRelInfo->ri_NumGlobalIndices > 0)
 			{
 				List	   *recheckIndexes;
 
@@ -1444,7 +1445,8 @@ CopyFrom(CopyFromState cstate)
 						table_tuple_insert(resultRelInfo->ri_RelationDesc,
 										   myslot, mycid, ti_options, bistate);
 
-						if (resultRelInfo->ri_NumIndices > 0)
+						if (resultRelInfo->ri_NumIndices > 0 ||
+							resultRelInfo->ri_NumGlobalIndices > 0)
 							recheckIndexes = ExecInsertIndexTuples(resultRelInfo,
 																   estate, 0,
 																   myslot, NIL,

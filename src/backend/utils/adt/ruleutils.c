@@ -23,6 +23,7 @@
 #include "access/htup_details.h"
 #include "access/relation.h"
 #include "access/table.h"
+#include "catalog/index.h"
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_authid.h"
@@ -1284,7 +1285,7 @@ static char *
 pg_get_indexdef_worker(Oid indexrelid, int colno,
 					   const Oid *excludeOps,
 					   bool attrsOnly, bool keysOnly,
-					   bool showTblSpc, bool inherits,
+				   bool showTblSpc, bool inherits,
 					   int prettyFlags, bool missing_ok)
 {
 	/* might want a separate isConstraint parameter later */
@@ -1301,6 +1302,7 @@ pg_get_indexdef_worker(Oid indexrelid, int colno,
 	List	   *context;
 	Oid			indrelid;
 	int			keyno;
+	int			nuserkeys;
 	Datum		indcollDatum;
 	Datum		indclassDatum;
 	Datum		indoptionDatum;
@@ -1391,8 +1393,9 @@ pg_get_indexdef_worker(Oid indexrelid, int colno,
 	if (!attrsOnly)
 	{
 		if (!isConstraint)
-			appendStringInfo(&buf, "CREATE %sINDEX %s ON %s%s USING %s (",
+			appendStringInfo(&buf, "CREATE %sINDEX %s%s ON %s%s USING %s (",
 							 idxrec->indisunique ? "UNIQUE " : "",
+							 idxrec->indglobal ? "GLOBAL " : "",
 							 quote_identifier(NameStr(idxrelrec->relname)),
 							 idxrelrec->relkind == RELKIND_PARTITIONED_INDEX
 							 && !inherits ? "ONLY " : "",
@@ -1404,6 +1407,14 @@ pg_get_indexdef_worker(Oid indexrelid, int colno,
 			appendStringInfo(&buf, "EXCLUDE USING %s (",
 							 quote_identifier(NameStr(amrec->amname)));
 	}
+
+	/*
+	 * A global index has the partition key appended as trailing key columns;
+	 * they are implied by GLOBAL, so leave them out of the definition (and
+	 * of column lists such as the one in unique violation messages).
+	 */
+	nuserkeys = idxrec->indglobal ? IndexGlobalNumUserKeys(idxrec) :
+		idxrec->indnkeyatts;
 
 	/*
 	 * Report the indexed attributes
@@ -1420,6 +1431,14 @@ pg_get_indexdef_worker(Oid indexrelid, int colno,
 		 */
 		if (keysOnly && keyno >= idxrec->indnkeyatts)
 			break;
+
+		/* Skip a global index's routing columns, but keep expressions in step */
+		if (!colno && keyno >= nuserkeys && keyno < idxrec->indnkeyatts)
+		{
+			if (attnum == 0)
+				indexpr_item = lnext(indexprs, indexpr_item);
+			continue;
+		}
 
 		/* Otherwise, print INCLUDE to divide key and non-key attrs. */
 		if (!colno && keyno == idxrec->indnkeyatts)
@@ -2776,7 +2795,12 @@ pg_get_constraintdef_worker(Oid constraintId, bool fullCommand,
 
 				appendStringInfoChar(&buf, ')');
 
-				/* Build including column list (from pg_index.indkeys) */
+				/*
+				 * Build including column list (from pg_index.indkeys).  They
+				 * start after the index's key columns, which for a global
+				 * index include partition key columns not in conkey.
+				 */
+				keyatts = ((Form_pg_index) GETSTRUCT(indtup))->indnkeyatts;
 				val = SysCacheGetAttrNotNull(INDEXRELID, indtup,
 											 Anum_pg_index_indnatts);
 				if (DatumGetInt32(val) > keyatts)

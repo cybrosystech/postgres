@@ -1869,7 +1869,12 @@ generateClonedIndexStmt(RangeVar *heapRel, Relation source_idx,
 	index->indexIncludingParams = NIL;
 
 	indexpr_item = list_head(indexprs);
-	for (keyno = 0; keyno < idxrec->indnkeyatts; keyno++)
+
+	/*
+	 * A global index's trailing partition key columns (always plain columns)
+	 * are not part of its definition; the copy is an ordinary index.
+	 */
+	for (keyno = 0; keyno < IndexGlobalNumUserKeys(idxrec); keyno++)
 	{
 		IndexElem  *iparam;
 		AttrNumber	attnum = idxrec->indkey.values[keyno];
