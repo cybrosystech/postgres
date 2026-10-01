@@ -267,15 +267,36 @@ Executor (`nodeIndexscan.c`):
 |---|---|---|
 | `VACUUM` of a leaf | dead TIDs of that leaf are removed. The btree bulk-delete callback gets the whole index tuple (`GIVacCallback`), so it deletes only entries that are dead **and** route to that leaf | `vacuumlazy.c` (`gi_should_delete`), `nbtree.c`, `genam.h` |
 | `CREATE TABLE … PARTITION OF` | nothing to do (empty). Rejected if the new partition is partitioned or foreign | `tablecmds.c` (`DefineRelation`) |
-| `ATTACH PARTITION` | backfill the partition's rows (`IndexGlobalAttachPartition`) | `tablecmds.c`, `index.c` |
-| `DETACH PARTITION` | purge entries routing to it before `RemoveInheritance` (`IndexGlobalDetachPartition` → `gi_purge_routed`) | `tablecmds.c`, `index.c` |
-| `DETACH … CONCURRENTLY` | purge in `DetachPartitionFinalize`. Until then the partition is detach-pending, still routed to, but invisible to queries | `tablecmds.c` |
-| `DROP` / `TRUNCATE` a partition or the parent | purge (TRUNCATE: purge, then nothing to add) | `tablecmds.c` |
-| Heap rewrite: `VACUUM FULL`, `CLUSTER`, `REPACK`, `ALTER TABLE` rewrite | `IndexGlobalResyncPartition` = purge old TIDs, then backfill new ones | `repack.c`, `tablecmds.c` |
+| `ATTACH PARTITION` (also MERGE/SPLIT PARTITIONS) | rewrite: keep all entries except ones routing to the partition (leftovers), add its rows, check uniqueness (`IndexGlobalAttachPartition`) | `tablecmds.c`, `index.c` |
+| `DETACH PARTITION` | rewrite without the entries routing to it, before `RemoveInheritance` (`IndexGlobalDetachPartition`) | `tablecmds.c`, `index.c` |
+| `DETACH … CONCURRENTLY` | the same rewrite in `DetachPartitionFinalize`. Until then the partition is detach-pending, still routed to, but invisible to queries | `tablecmds.c` |
+| `DROP` / `TRUNCATE` a partition or the parent | rewrite without the partition's entries; TRUNCATE re-adds its (now empty) heap | `tablecmds.c` |
+| Heap rewrite: `VACUUM FULL`, `CLUSTER`, `REPACK` | rewrite, replacing the partition's entries with ones for the new heap (`IndexGlobalResyncPartition`) | `repack.c`, `tablecmds.c` |
+| `ALTER TABLE` that rewrites partitions | one rewrite per parent after all partitions are rewritten, with a uniqueness check, since column types may have changed (`IndexGlobalResyncPartitions`) | `tablecmds.c` |
 | `REINDEX` of the global index | new relfilenode, metapage, `build_global_index()` | `index.c` (`reindex_index`) |
 
-The purge is a full bulk-delete pass over the whole global index, whatever the
-partition's size.
+**All of these are transactional.** None of them edits the global index in
+place. `gpi_rewrite_global_index()` (`catalog/index.c`):
+
+1. Walks the old btree's leaf pages (`_bt_global_collect`, `nbtsort.c`) and
+   feeds every entry that should survive into a tuplesort. Entries that route
+   to no partition (leftovers) are dropped on the way.
+2. Adds the current rows of the partitions being (re)added, via
+   `table_index_build_scan`.
+3. Gives the index new storage (`RelationSetNewRelfilenumber`, as REINDEX does)
+   and writes it as a sorted build (`_bt_global_load` → `_bt_load`).
+4. For ATTACH and ALTER TABLE, checks the added rows' uniqueness.
+
+The old file is unlinked only at commit. On ROLLBACK, an error, or ROLLBACK
+TO SAVEPOINT, the new file is discarded and the index is exactly as before.
+(An earlier version bulk-deleted or backfilled in place, which a rollback
+could not undo; see §8, bugs 1 and 2.)
+
+Costs: each rewrite reads and rewrites the whole global index (~0.5–0.9 s per
+operation on a 1.3M-row table) and holds `AccessExclusiveLock` on it, like
+REINDEX. While it runs, queries through the global index and writes to *any*
+partition wait. A sorted rewrite also leaves the index compact (40 MB → 26 MB
+in the test).
 
 ---
 
@@ -292,7 +313,7 @@ partition's size.
 | Concurrency of DDL | No `CREATE INDEX CONCURRENTLY` and no `REINDEX CONCURRENTLY` |
 | Scans | Serial Index Scan only: no Index Only, bitmap or parallel scans. **UPDATE/DELETE and `SELECT … FOR UPDATE` never use a global index** and fall back to per-partition scans (a seq scan when no local index exists) |
 | Display | `\d` doesn't mark the index GLOBAL. `pg_class.reltuples` of the index stays `-1` after ANALYZE |
-| Cost | Build is ~10× slower than a local index (row-by-row inserts); ATTACH/DETACH scale with the whole index (see §9) |
+| Cost | Build is ~10× slower than a local index (row-by-row inserts); ATTACH/DETACH/DROP/TRUNCATE/VACUUM FULL of a partition rewrite the whole global index and block writes to all partitions meanwhile (see §5.6, §9) |
 | `dbblue_partition` | The extension itself never creates global indexes. Existing unique indexes become per-partition (template) indexes; global ones come from later Odoo DDL |
 
 ---
@@ -311,6 +332,8 @@ partition's size.
 | `src/backend/executor/nodeModifyTable.c`, `execPartition.c`, `execReplication.c`, `commands/copyfrom.c` | open and maintain global indexes for partitions |
 | `src/backend/optimizer/path/allpaths.c`, `indxpath.c`, `plan/planner.c`, `util/plancat.c` | planning global index paths on the parent |
 | `src/backend/access/nbtree/nbtree.c`, `nbtinsert.c`, `access/index/genam.c`, `include/access/genam.h` | routing-aware bulk delete, no deletion passes, error key text |
+| `src/backend/access/nbtree/nbtsort.c`, `include/access/nbtree.h` | `_bt_global_collect` / `_bt_global_load`: copy surviving entries and write them as a sorted build into new storage |
+| `src/test/regress/sql/global_partition_index.sql` | regression test: rollbacks of DETACH/DROP/TRUNCATE/ATTACH/rewrites, ATTACH retry, ALTER TYPE |
 | `src/backend/access/heap/vacuumlazy.c` | VACUUM of a leaf cleans the parent's global indexes |
 | `src/backend/commands/tablecmds.c`, `repack.c` | partition lifecycle and rewrites |
 | `src/backend/utils/cache/relcache.c` | HOT-blocking columns from the parent's global indexes |
@@ -326,9 +349,9 @@ Severity is from an Odoo production point of view.
 
 | # | Severity | Bug | Repro | Cause, and fix direction |
 |---|---|---|---|---|
-| 1 | **Critical** | Rolling back DETACH, DROP partition or TRUNCATE (of a partition or the parent) **deletes index entries permanently** | `BEGIN; TRUNCATE part; ROLLBACK;` → entries 3000 → 1906, lookups miss rows, uniqueness lost. `TRUNCATE parent` + rollback → 0 entries | `IndexGlobalDetachPartition` bulk-deletes immediately, which is not transactional. Defer the purge to pre-commit (pending list, like ON COMMIT actions). Readers already skip rows of gone partitions |
-| 2 | **Critical** | A failed or rolled-back ATTACH leaves its backfilled entries behind. Re-attaching duplicates them; if it's never re-attached they become permanent orphans | attach fails or rolls back, then attach again → the row is returned twice, `bt_index_check`: "item order invariant violated" | `IndexGlobalAttachPartition` inserts without first purging. Purge, then fill (like `IndexGlobalResyncPartition`); also handle aborted attaches |
-| 3 | **Critical** | `ALTER TABLE … ALTER COLUMN … TYPE` on a column of a global index **when no rewrite is needed** (e.g. `varchar(50)` → `varchar(80)`) crashes the backend on cassert builds (all sessions reset). On release builds it reads out of bounds | `ALTER TABLE d ALTER COLUMN code TYPE varchar(80);` → `TRAP: Assert("old_natts == numberOfAttributes")`, `indexcmds.c:296` | `CheckIndexCompatible()` compares the user columns with `indnkeyatts`, which includes the trailing key. Compare only `IndexGlobalNumUserKeys()` columns, or return false for global indexes. Odoo changes varchar sizes during upgrades |
+| 1 | **Fixed** | Rolling back DETACH, DROP partition or TRUNCATE (of a partition or the parent) **deletes index entries permanently** | `BEGIN; TRUNCATE part; ROLLBACK;` → entries 3000 → 1906, lookups miss rows, uniqueness lost. `TRUNCATE parent` + rollback → 0 entries | `IndexGlobalDetachPartition` bulk-deletes immediately, which is not transactional. **Fixed 2026-10-01**: the index is rewritten into new storage, which a rollback discards (§5.6). Regression test `global_partition_index` |
+| 2 | **Fixed** | A failed or rolled-back ATTACH leaves its backfilled entries behind. Re-attaching duplicates them; if it's never re-attached they become permanent orphans | attach fails or rolls back, then attach again → the row is returned twice, `bt_index_check`: "item order invariant violated" | `IndexGlobalAttachPartition` inserts without first purging. **Fixed 2026-10-01**: same rewrite; a failed or rolled-back ATTACH leaves nothing, and a re-attach drops leftovers first |
+| 3 | **Fixed** | `ALTER TABLE … ALTER COLUMN … TYPE` on a column of a global index **when no rewrite is needed** (e.g. `varchar(50)` → `varchar(80)`) crashes the backend on cassert builds (all sessions reset). On release builds it reads out of bounds | `ALTER TABLE d ALTER COLUMN code TYPE varchar(80);` → `TRAP: Assert("old_natts == numberOfAttributes")`, `indexcmds.c:296` | **Fixed 2026-10-01**: `CheckIndexCompatible` compares only `IndexGlobalNumUserKeys()` columns (and rebuilds instead of asserting if the counts differ). A compatible change reuses the index storage. Covered by the regression test |
 | 4 | **High** | **pg_dump loses global UNIQUE constraints.** It writes `ADD CONSTRAINT … UNIQUE (name, company_id, create_date)`, so the restore creates a per-partition constraint and cross-partition uniqueness is silently gone | dump + restore → `sale_order_name_uniq` is `UNIQUE (name, company_id, create_date)`, `indglobal = f` | `pg_dump.c` (`dumpConstraint`, ~line 18891) lists all `indnkeyattrs` columns. Make pg_dump global-aware (user keys only), or use `pg_get_constraintdef()`. `CREATE UNIQUE INDEX GLOBAL` statements are dumped correctly |
 | 5 | Medium | `INSERT … ON CONFLICT DO NOTHING` (no target) raises `unique_violation` on a global-index conflict | see §6 | global indexes aren't considered as arbiters |
 | 6 | Medium | Concurrent inserts of the same key can fail with `deadlock_detected` instead of `unique_violation`, and each one costs `deadlock_timeout` | 8 sessions × 400 inserts on 300 keys: 6 deadlocks, 6.2 s vs 0.2 s for a plain table. No duplicates | insert-then-check design (§5.3). Apps that retry only on unique_violation won't retry |
@@ -337,10 +360,7 @@ Severity is from an Odoo production point of view.
 | 9 | Low | Confusing messages: CONCURRENTLY prints the auto-convert NOTICE and then fails; a hash GLOBAL index says "does not support multicolumn indexes"; a failed ATTACH says "could not create unique index" | — | cosmetic |
 | 10 | Low | `\d` doesn't show GLOBAL; `reltuples` stays -1; stale comments (`INCLUDE'd partition key` in `nodeIndexscan.c`/`allpaths.c`, "starts empty" in `indexcmds.c:1371`) | — | cosmetic |
 
-Workaround for 1 and 2 until they are fixed: avoid DETACH, DROP, TRUNCATE and
-ATTACH of partitions inside transactions that might roll back. Run
-`REINDEX INDEX <global index>` if one did. REINDEX was verified to repair the
-index.
+Bugs 1, 2 and 3 are fixed. On a database that ran an older build, `REINDEX INDEX <global index>` removes damage they may have left (REINDEX rebuilds from the partitions' heaps).
 
 ---
 
@@ -356,7 +376,7 @@ failure is listed in §8. The groups:
 | G2 Odoo flow | 37 / 38 | `dbblue_partition` conversion, Odoo's `ADD CONSTRAINT` + `COMMENT ON CONSTRAINT`, `constraint_definition()` round trip, `IF NOT EXISTS` idempotence, expression/partial/NULLS NOT DISTINCT/INCLUDE, drop and re-add, pg_partman `run_maintenance`, undo |
 | G3 DML | 30 / 34 | HOT safety, cross-partition UPDATE, DEFAULT partition, NULLs, ON CONFLICT, MERGE, ordered and backward scans, joins |
 | G4 maintenance | 14 / 16 | VACUUM, VACUUM FULL, CLUSTER, rewrites, type changes, REINDEX variants, LIKE |
-| G5 lifecycle | 8 / 17 | create/attach/detach/detach concurrently/drop/truncate and their rollbacks |
+| G5 lifecycle | 8 / 17 → **27 / 27** after the fix | create/attach/detach/detach concurrently/drop/truncate, their rollbacks, savepoints, ATTACH retry, ALTER/CLUSTER rollbacks |
 | G6 concurrency | 5 / 6 | waits, commit/rollback interleavings, 8-session stress |
 | G7 durability | 3 / 4 | pg_dump/restore, crash (immediate stop) under load + recovery |
 | G8 performance | 5 / 5 | measurements below (informational) |
@@ -373,8 +393,8 @@ Performance (1M rows, 24 monthly partitions, global `UNIQUE (id)` vs local
 | Index size | 33 MB | 22 MB | |
 | 100k single-row inserts | 6.17 s | 3.99 s | 1.5× slower |
 | 200k-row INSERT … SELECT | 1.65 s | 0.77 s | 2.1× slower |
-| DETACH a 41k-row partition | 188 ms | 1 ms | full index purge |
-| ATTACH it back | 463 ms | 10 ms | row-by-row backfill |
+| DETACH a 41k-row partition | 561 ms (was 188 ms before the rollback fix) | 1 ms | rewrites the whole index |
+| ATTACH it back | 907 ms (was 463 ms) | 10 ms | rewrite + uniqueness check |
 
 ### How to verify an index yourself
 
@@ -385,6 +405,9 @@ SELECT allequalimage FROM bt_metap('sale_order_name_uniq'); -- false = dedup off
 -- entries vs rows: count leaf items with bt_page_items (skip the high key);
 -- run VACUUM (INDEX_CLEANUP ON) first, because plain VACUUM may bypass index cleanup.
 ```
+
+Regression test: `src/test/regress/sql/global_partition_index.sql` (in `parallel_schedule`). To run it alone against a running cluster:
+`./pg_regress --bindir=<bin> --host=… --port=… --inputdir=. global_partition_index` from `src/test/regress`.
 
 Build and test notes for this tree: it has no header dependency tracking, so
 do a clean backend rebuild after editing any `.h`. `make check` fails because

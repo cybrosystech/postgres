@@ -186,6 +186,8 @@ extern void IndexGlobalAttachPartition(Relation parentRel, Relation partRel);
 extern void IndexGlobalDetachPartition(Relation parentRel, Relation partRel);
 /* Resync a partition's global-index entries after its heap was rewritten */
 extern void IndexGlobalResyncPartition(Relation partRel);
+/* Same for the partitions one ALTER TABLE rewrote, rechecking uniqueness */
+extern void IndexGlobalResyncPartitions(List *partOids);
 struct FormData_pg_index;
 
 /* IndexInfo of a global index, mapped to a partition's column layout */
