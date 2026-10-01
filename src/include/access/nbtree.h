@@ -1335,4 +1335,12 @@ extern IndexBuildResult *btbuild(Relation heap, Relation index,
 								 struct IndexInfo *indexInfo);
 extern void _bt_parallel_build_main(dsm_segment *seg, shm_toc *toc);
 
+/* rewriting a global partition index into new storage (nbtsort.c) */
+typedef bool (*BTGlobalKeepFn) (void *arg, IndexTuple itup);
+struct Tuplesortstate;
+extern void _bt_global_collect(Relation index, struct Tuplesortstate *sortstate,
+							   BTGlobalKeepFn keep, void *arg);
+extern void _bt_global_load(Relation heap, Relation index,
+							struct Tuplesortstate *sortstate);
+
 #endif							/* NBTREE_H */
