@@ -641,8 +641,10 @@
 
 { name => 'dbblue_autoprepare_limit', type => 'int', context => 'PGC_SUSET', group => 'QUERY_TUNING_OTHER',
   short_desc => 'Maximum number of cached query shapes per backend.',
+  long_desc => 'Rejected if the worst case across all backends (max_connections times this value times an assumed 32kB per cached shape) would use more than 10% of the RAM left after shared_buffers.',
   flags => 'GUC_NOT_IN_SAMPLE | GUC_EXPLAIN',
   variable => 'autoprepare_limit',
+  check_hook => 'check_dbblue_autoprepare_limit',
   boot_val => '1024',
   min => '1',
   max => 'INT_MAX',
