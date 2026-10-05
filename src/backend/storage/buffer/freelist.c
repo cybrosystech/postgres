@@ -49,6 +49,14 @@ typedef struct
 	pg_atomic_uint32 numBufferAllocs;	/* Buffers allocated since last reset */
 
 	/*
+	 * dbblue soft-pin: number of buffers whose soft_pin_tier is not NONE.
+	 * Kept current by SoftPinSetTier(); lets pool pressure be judged without
+	 * walking the buffer pool.  The pinner re-counts it each cycle to correct
+	 * any drift.
+	 */
+	pg_atomic_uint32 nSoftPinned;
+
+	/*
 	 * Bgworker process to be notified upon activity or -1 if none. See
 	 * StrategyNotifyBgWriter.
 	 */
@@ -307,9 +315,9 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint64 *buf_state, bool *from_r
 			 * is a non-atomic uint8; benign races with the pinner are
 			 * tolerated (a missed clear gets re-stamped next pinner cycle).
 			 */
-			if (buf->soft_pin_tier != SOFT_PIN_TIER_NONE)
+			if (pg_atomic_read_u32(&buf->soft_pin_tier) != SOFT_PIN_TIER_NONE)
 			{
-				uint8		tier = buf->soft_pin_tier;
+				uint32		tier = pg_atomic_read_u32(&buf->soft_pin_tier);
 
 				/*
 				 * Resolve pool pressure once per StrategyGetBuffer call.
@@ -327,7 +335,7 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint64 *buf_state, bool *from_r
 				{
 					if (!critical_pressure)
 						break;
-					buf->soft_pin_tier = SOFT_PIN_TIER_NONE;
+					SoftPinSetTier(buf, SOFT_PIN_TIER_NONE);
 					elog(LOG,
 						 "StrategyGetBuffer: releasing tier 1 pin on buf %d under critical pressure",
 						 buf->buf_id);
@@ -336,12 +344,12 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint64 *buf_state, bool *from_r
 				{
 					if (!under_pressure)
 						break;
-					buf->soft_pin_tier = SOFT_PIN_TIER_NONE;
+					SoftPinSetTier(buf, SOFT_PIN_TIER_NONE);
 				}
 				else
 				{
 					/* stale/invalid tier — clear it */
-					buf->soft_pin_tier = SOFT_PIN_TIER_NONE;
+					SoftPinSetTier(buf, SOFT_PIN_TIER_NONE);
 				}
 			}
 
@@ -376,6 +384,33 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint64 *buf_state, bool *from_r
 			}
 		}
 	}
+}
+
+/*
+ * Count of soft-pinned buffers (see SoftPinSetTier()).
+ */
+void
+StrategySoftPinAdjust(int delta)
+{
+	if (delta > 0)
+		pg_atomic_fetch_add_u32(&StrategyControl->nSoftPinned, (uint32) delta);
+	else if (delta < 0)
+		pg_atomic_fetch_sub_u32(&StrategyControl->nSoftPinned, (uint32) -delta);
+}
+
+/* Clamped, since a drifted count must never claim more than the pool holds. */
+uint32
+StrategySoftPinCount(void)
+{
+	uint32		n = pg_atomic_read_u32(&StrategyControl->nSoftPinned);
+
+	return Min(n, (uint32) NBuffers);
+}
+
+void
+StrategySoftPinSetCount(uint32 count)
+{
+	pg_atomic_write_u32(&StrategyControl->nSoftPinned, count);
 }
 
 /*
@@ -467,6 +502,7 @@ StrategyCtlShmemInit(void *arg)
 	/* Clear statistics */
 	StrategyControl->completePasses = 0;
 	pg_atomic_init_u32(&StrategyControl->numBufferAllocs, 0);
+	pg_atomic_init_u32(&StrategyControl->nSoftPinned, 0);
 
 	/* No pending notification */
 	StrategyControl->bgwprocno = -1;
