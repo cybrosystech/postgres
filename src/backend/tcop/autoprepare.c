@@ -1040,7 +1040,7 @@ AutoprepareNoteReuseTime(double plan_ms)
  */
 static void
 aprep_promote(AutoprepareEntry *entry, Query *analyzed_query,
-			  const char *query_string, uint64 fp, bool dbg)
+			  const char *query_string, uint64 fp)
 {
 	/*
 	 * Build in a short-lived context so the scratch produced while
@@ -1100,9 +1100,6 @@ aprep_promote(AutoprepareEntry *entry, Query *analyzed_query,
 		dlist_delete(&entry->lru_node);
 		aprep_num_fixed++;
 		aprep_promotions++;
-		if (dbg)
-			elog(LOG, "[autoprep] PROMOTED (cached now; future runs can HIT) qid=%llu nparams=%d :: %.160s",
-				 (unsigned long long) fp, nparams, query_string);
 	}
 	else
 	{
@@ -1116,9 +1113,6 @@ aprep_promote(AutoprepareEntry *entry, Query *analyzed_query,
 		dlist_delete(&entry->lru_node);
 		aprep_num_fixed++;
 		aprep_declines++;
-		if (dbg)
-			elog(LOG, "[autoprep] DECLINED(build returned NULL: 0-params, >%d params, or QueryRewrite expanded to !=1 query) qid=%llu -> always REPLAN :: %.160s",
-				 APREP_MAX_PARAMS, (unsigned long long) fp, query_string);
 	}
 	MemoryContextSwitchTo(old);
 	MemoryContextDelete(build_cxt);		/* frees all build scratch */
@@ -1132,7 +1126,6 @@ AutoprepareConsult(Query *analyzed_query, const char *query_string,
 	AutoprepareEntry *entry;
 	uint64		fp;
 	bool		found;
-	bool		dbg;
 
 	*plansource_out = NULL;
 	*boundParams_out = NULL;
@@ -1153,26 +1146,15 @@ AutoprepareConsult(Query *analyzed_query, const char *query_string,
 		AutoprepareReset();
 	}
 
-	/* dbblue diagnostic: focus logging on ir_attachment queries only */
-	dbg = (query_string != NULL && strstr(query_string, "ir_attachment") != NULL);
-
 	if (!autoprepare_enabled)
 		return APREP_UNCACHEABLE;
 	if (!query_is_cacheable(analyzed_query))
-	{
-		if (dbg)
-			elog(LOG, "[autoprep] UNCACHEABLE(not-cacheable: utility/cmdtype/graph) :: %.160s", query_string);
 		return APREP_UNCACHEABLE;
-	}
 
 	/* The fingerprint is the queryId the core jumbler already computed. */
 	fp = (uint64) analyzed_query->queryId;
 	if (fp == UINT64CONST(0))
-	{
-		if (dbg)
-			elog(LOG, "[autoprep] UNCACHEABLE(queryId=0; compute_query_id off?) :: %.160s", query_string);
 		return APREP_UNCACHEABLE;	/* query-id computation disabled */
-	}
 
 	if (autoprepare_table == NULL)
 		autoprepare_init();
@@ -1228,11 +1210,8 @@ AutoprepareConsult(Query *analyzed_query, const char *query_string,
 		entry->first_seen = aprep_clock;
 		dlist_push_tail(&aprep_tracking_lru, &entry->lru_node);
 		aprep_note_fp = fp;		/* planned normally: time it */
-		if (dbg)
-			elog(LOG, "[autoprep] MISS(new entry) qid=%llu seen=%u :: %.160s",
-				 (unsigned long long) fp, entry->seen_count, query_string);
 		if (entry->seen_count >= autoprepare_threshold)
-			aprep_promote(entry, analyzed_query, query_string, fp, dbg);
+			aprep_promote(entry, analyzed_query, query_string, fp);
 		return APREP_MISS;
 	}
 
@@ -1271,11 +1250,6 @@ AutoprepareConsult(Query *analyzed_query, const char *query_string,
 		{
 			aprep_fallbacks++;
 			aprep_note_fp = fp;		/* planned normally: time it */
-			if (dbg)
-				elog(LOG, "[autoprep] MISS(reuse-fail: %s) qid=%llu seen=%u -> REPLAN :: %.160s",
-					 (ipquery == NULL) ? "reparameterize-returned-null(0-params/too-many)"
-									   : "equal()-shape-mismatch(query text/aliases/kept-literals differ)",
-					 (unsigned long long) fp, entry->seen_count, query_string);
 			return APREP_MISS;	/* queryId collision -> plan normally */
 		}
 
@@ -1286,9 +1260,6 @@ AutoprepareConsult(Query *analyzed_query, const char *query_string,
 		{
 			aprep_fallbacks++;
 			aprep_note_fp = fp;		/* planned normally: time it */
-			if (dbg)
-				elog(LOG, "[autoprep] MISS(reuse-fail: extract-mismatch, param count/types diverged) qid=%llu -> REPLAN :: %.160s",
-					 (unsigned long long) fp, query_string);
 			return APREP_MISS;	/* divergence -> plan normally */
 		}
 
@@ -1297,9 +1268,6 @@ AutoprepareConsult(Query *analyzed_query, const char *query_string,
 		aprep_hits++;
 		aprep_note_reuse(entry);
 		aprep_note_fp = fp;		/* reused: time GetCachedPlan() */
-		if (dbg)
-			elog(LOG, "[autoprep] HIT (reusing cached plan) qid=%llu nparams=%d seen=%u :: %.160s",
-				 (unsigned long long) fp, entry->num_params, entry->seen_count, query_string);
 		return APREP_HIT;
 	}
 
@@ -1308,9 +1276,6 @@ AutoprepareConsult(Query *analyzed_query, const char *query_string,
 	{
 		aprep_note_reuse(entry);	/* a build attempt saved */
 		aprep_note_fp = fp;		/* planned normally: time it */
-		if (dbg)
-			elog(LOG, "[autoprep] MISS(previously-declined; won't rebuild) qid=%llu -> REPLAN :: %.160s",
-				 (unsigned long long) fp, query_string);
 		return APREP_MISS;
 	}
 
@@ -1324,7 +1289,7 @@ AutoprepareConsult(Query *analyzed_query, const char *query_string,
 	dlist_move_tail(&aprep_tracking_lru, &entry->lru_node);	/* just seen */
 	aprep_note_fp = fp;			/* planned normally: time it */
 	if (entry->seen_count >= autoprepare_threshold)
-		aprep_promote(entry, analyzed_query, query_string, fp, dbg);
+		aprep_promote(entry, analyzed_query, query_string, fp);
 
 	return APREP_MISS;			/* plan normally on the promoting call */
 }
