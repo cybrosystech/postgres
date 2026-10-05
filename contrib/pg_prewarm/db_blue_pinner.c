@@ -1,10 +1,8 @@
 /*-------------------------------------------------------------------------
  * db_blue_pinner.c
  *
- * Background worker: reads db_blue.pinned_tables and
- * db_blue.ring_buffer_tables from GUCs, preloads those relations
- * into shared_buffers, applies soft-pin flags, and enforces ring-buffer
- * strategy for tables that must never pollute the cache.
+ * Background worker: reads dbblue_pinned_tables from the GUC, preloads
+ * those relations into shared_buffers and applies soft-pin flags.
  *
  * DROP THIS FILE into: contrib/pg_prewarm/db_blue_pinner.c
  * Add it to contrib/pg_prewarm/Makefile OBJS list.
@@ -56,7 +54,7 @@
  */
 
 /*
- * db_blue.pinned_tables
+ * dbblue_pinned_tables
  *
  * Comma-separated list of table names to keep warm in shared_buffers.
  * Supports two-tier syntax:
@@ -65,30 +63,14 @@
  *   "table_name:tier1"      → Tier 1 (never yield, metadata only)
  *
  * Example:
- *   db_blue.pinned_tables = '
+ *   dbblue_pinned_tables = '
  *       res_users:tier1, res_company:tier1,
  *       res_partner, account_move, product_product
  *   '
  */
 
 /*
- * db_blue.ring_buffer_tables
- *
- * Comma-separated list of tables whose sequential scans must NEVER
- * pollute shared_buffers. All I/O for these tables is routed through
- * a private 256KB ring buffer.
- *
- * Best candidates: large append-mostly tables used in reports.
- *
- * Example:
- *   db_blue.ring_buffer_tables = '
- *       account_move_line, stock_move, mail_message, mail_mail,
- *       account_analytic_line, mrp_production
- *   '
- */
-
-/*
- * db_blue.pin_check_interval
+ * dbblue_pin_check_interval
  *
  * How often (seconds) the pinner re-checks which tables need re-loading.
  * Set to 0 to disable periodic checks (prewarm on startup only).
@@ -98,7 +80,7 @@
  */
 
 /*
- * db_blue.max_pin_size_percent
+ * dbblue_max_pin_size_percent
  *
  * Maximum percentage of shared_buffers the pinner may occupy with
  * pinned data. The pinner sorts pinned_tables by access frequency
@@ -109,7 +91,7 @@
  */
 
 /*
- * db_blue.pinner_database
+ * dbblue_pinner_database
  *
  * The database the pinner worker connects to. For single-database
  * Odoo setups, set this to your Odoo database name. For multi-DB
@@ -117,7 +99,7 @@
  */
 
 /*
- * db_blue.min_access_count
+ * dbblue_min_access_count
  *
  * Minimum total access count (seq_scan + idx_scan from
  * pg_stat_user_tables) a table must have before the pinner considers
@@ -152,30 +134,6 @@ typedef struct PinEntry
 /* Max tables we will process in one cycle */
 #define MAX_PIN_ENTRIES     256
 
-/*
- * Max ring-buffer-routed tables we will track between cycles. Matches the
- * shmem registry size in bufmgr.c (MAX_RING_BUFFER_RELATIONS).
- */
-#define MAX_RING_BUFFER_TRACKED  64
-
-/*
- * Previous cycle's registered ring-buffer relfilenodes. Used to compute
- * the set we need to unregister at the start of the next cycle.
- *
- * Without this tracking, RegisterRingBufferRelation accumulates entries
- * across DDL events (TRUNCATE, VACUUM FULL, CLUSTER, DROP+recreate)
- * because the relfilenode changes but the old entry is never removed.
- * Over time the 64-entry shmem registry fills with dead entries and new
- * tables fail to register.
- *
- * Lives in the bgworker's process memory; lost on worker restart, in
- * which case we just over-write the shmem registry with the fresh set
- * on the next cycle (any pre-restart dead entries are functionally
- * harmless until they get unregistered or the postmaster restarts).
- */
-static Oid  prev_ring_buffer_oids[MAX_RING_BUFFER_TRACKED];
-static int  prev_ring_buffer_count = 0;
-
 /* =========================================================================
  * FORWARD DECLARATIONS
  * =========================================================================
@@ -188,7 +146,6 @@ DBBluePinnerMain(Datum main_arg);
 static void  PinnerRunCycle(void);
 static void  PinnerRunCycleSafe(void);
 static void  DBBluePinnerEnsureExtensions(void);
-static void  PinnerSetupRingBuffers(void);
 static int   ResolvePinEntries(PinEntry *entries, int max_entries);
 static void  SortEntriesByAccessCount(PinEntry *entries, int nentries);
 static float4 GetRelCacheRatio(Oid relid);
@@ -198,8 +155,31 @@ static void  PrewarmRelationIntoBuffers(PinEntry *entry);
 static void  SoftPinRelationIndexes(PinEntry *entry);
 static uint8 ParseTierSuffix(char *table_name);
 static void  PinnerHandleSignals(void);
+static void  PinAndRemember(Oid spcOid, Oid relfileOid, uint8 tier);
+static void  PinnerReleaseDropped(void);
 
 static bool pinner_shutdown_requested = false;
+
+/*
+ * Relations whose buffers this worker has soft-pinned.  "pinned_last" is what
+ * the previous successful cycle left pinned; "pinned_building" is collected
+ * during the running cycle.  At the end of a cycle anything in pinned_last
+ * but not in pinned_building -- a table removed from dbblue_pinned_tables, or
+ * one that no longer fits the budget -- is unpinned, then the two are swapped.
+ * Both live in TopMemoryContext so they survive across cycles.
+ */
+typedef struct PinnedRel
+{
+    Oid     spcOid;
+    Oid     relfileOid;
+} PinnedRel;
+
+static PinnedRel *pinned_last = NULL;
+static int  pinned_last_n = 0;
+static int  pinned_last_cap = 0;
+static PinnedRel *pinned_building = NULL;
+static int  pinned_building_n = 0;
+static int  pinned_building_cap = 0;
 
 /* =========================================================================
  * INTERNAL HELPERS
@@ -331,6 +311,12 @@ DBBluePinnerMain(Datum main_arg)
          DBBluePinner_check_interval,
          DBBluePinner_max_pin_percent);
 
+    /*
+     * Drop any pins left by an earlier incarnation of this worker; it keeps
+     * no record of them, so they would otherwise never be released.
+     */
+    ClearAllSoftPins();
+
     /* Ensure the extensions we depend on exist in this database. */
     DBBluePinnerEnsureExtensions();
 
@@ -368,6 +354,14 @@ DBBluePinnerMain(Datum main_arg)
                          PG_WAIT_EXTENSION);
         ResetLatch(MyLatch);
 
+        /*
+         * SIGTERM (die) only flags a pending shutdown; it is acted on here.
+         * Cycles that run no SPI queries (e.g. an empty dbblue_pinned_tables)
+         * never reach a CHECK_FOR_INTERRUPTS() of their own, and without
+         * this the worker would ignore a server shutdown forever.
+         */
+        CHECK_FOR_INTERRUPTS();
+
         PinnerHandleSignals();
 
         if (pinner_shutdown_requested)
@@ -377,6 +371,76 @@ DBBluePinnerMain(Datum main_arg)
     }
 
     proc_exit(0);
+}
+
+/*
+ * PinAndRemember — soft-pin one relation's resident buffers and record it, so
+ * a later cycle can unpin it if it leaves the pinned set.
+ */
+static void
+PinAndRemember(Oid spcOid, Oid relfileOid, uint8 tier)
+{
+    SoftPinRelationBuffers(spcOid, MyDatabaseId, relfileOid, tier);
+
+    if (pinned_building_n >= pinned_building_cap)
+    {
+        int     newcap = Max(64, pinned_building_cap * 2);
+
+        if (pinned_building == NULL)
+            pinned_building = MemoryContextAlloc(TopMemoryContext,
+                                                 newcap * sizeof(PinnedRel));
+        else
+            pinned_building = repalloc(pinned_building,
+                                       newcap * sizeof(PinnedRel));
+        pinned_building_cap = newcap;
+    }
+    pinned_building[pinned_building_n].spcOid = spcOid;
+    pinned_building[pinned_building_n].relfileOid = relfileOid;
+    pinned_building_n++;
+}
+
+/*
+ * PinnerReleaseDropped — unpin every relation pinned last cycle that was not
+ * pinned this cycle, then make this cycle's set the "last" set.
+ */
+static void
+PinnerReleaseDropped(void)
+{
+    PinnedRel  *tmp;
+    int         tmp_cap;
+
+    for (int i = 0; i < pinned_last_n; i++)
+    {
+        PinnedRel  *old = &pinned_last[i];
+        bool        still = false;
+
+        for (int j = 0; j < pinned_building_n; j++)
+        {
+            if (pinned_building[j].relfileOid == old->relfileOid &&
+                pinned_building[j].spcOid == old->spcOid)
+            {
+                still = true;
+                break;
+            }
+        }
+        if (!still)
+        {
+            elog(LOG,
+                 "db_blue pinner: unpinning relfilenode %u (no longer in "
+                 "dbblue_pinned_tables or over budget)", old->relfileOid);
+            ClearSoftPinForRelation(old->spcOid, MyDatabaseId, old->relfileOid);
+        }
+    }
+
+    /* this cycle's set becomes the previous set; reuse the old array */
+    tmp = pinned_last;
+    tmp_cap = pinned_last_cap;
+    pinned_last = pinned_building;
+    pinned_last_n = pinned_building_n;
+    pinned_last_cap = pinned_building_cap;
+    pinned_building = tmp;
+    pinned_building_n = 0;
+    pinned_building_cap = tmp_cap;
 }
 
 /* =========================================================================
@@ -394,7 +458,6 @@ DBBluePinnerMain(Datum main_arg)
  *   4. Sort by access count descending
  *   5. For each table (in order): check cache ratio,
  *      prewarm if needed, apply soft pin
- *   6. Update ring_buffer_tables registration
  */
 static void
 PinnerRunCycle(void)
@@ -404,8 +467,10 @@ PinnerRunCycle(void)
     int64       budget_bytes;
     int64       used_bytes   = 0;
     int         i;
+    bool        keep_pins = false;
 
     elog(DEBUG1, "db_blue pinner: starting cycle");
+    pinned_building_n = 0;
 
     /* ---- Calculate byte budget ---- */
     budget_bytes = (int64) NBuffers * BLCKSZ *
@@ -425,10 +490,20 @@ PinnerRunCycle(void)
 
     nentries = ResolvePinEntries(entries, MAX_PIN_ENTRIES);
 
+    if (nentries < 0)
+    {
+        /*
+         * The list could not be parsed.  Do not treat that as "pin nothing":
+         * leave the current pins in place until the setting is fixed.
+         */
+        keep_pins = true;
+        goto cycle_end;
+    }
+
     if (nentries == 0)
     {
         elog(DEBUG1, "db_blue pinner: no valid tables found in "
-             "db_blue.pinned_tables");
+             "dbblue_pinned_tables");
         goto cycle_end;
     }
 
@@ -486,10 +561,7 @@ PinnerRunCycle(void)
         }
 
         /* Apply soft-pin flag to all cached heap buffers */
-        SoftPinRelationBuffers(e->relspcOid,
-                               MyDatabaseId,
-                               e->relfileOid,
-                               e->tier);
+        PinAndRemember(e->relspcOid, e->relfileOid, e->tier);
 
         /*
          * Also pin each index's buffers. SoftPinRelationBuffers stamps
@@ -504,10 +576,14 @@ PinnerRunCycle(void)
         used_bytes += e->table_size;
     }
 
-    /* ---- Update ring buffer registration ---- */
-    PinnerSetupRingBuffers();
-
 cycle_end:
+    /* unpin whatever was pinned last cycle but is not pinned now */
+    if (!keep_pins)
+        PinnerReleaseDropped();
+
+    /* correct any drift in the shared count of soft-pinned buffers */
+    RecountSoftPinnedBuffers();
+
     SPI_finish();
     PopActiveSnapshot();
     CommitTransactionCommand();
@@ -515,126 +591,6 @@ cycle_end:
     elog(DEBUG1,
          "db_blue pinner: cycle complete, %ldMB pinned",
          (long) (used_bytes / (1024 * 1024)));
-}
-
-/* =========================================================================
- * RING BUFFER SETUP
- * =========================================================================
- */
-
-/*
- * PinnerSetupRingBuffers — parse ring_buffer_tables GUC and register
- * each table's relfilenode in the shared RingBufferRelations array.
- *
- * Also soft-pins each table's *indexes* at Tier 2. Ring-buffer routing
- * keeps the heap out of shared_buffers (route reads through a 256 KB
- * private ring), but index pages are small and benefit from staying
- * resident — without protection, concurrent pool pressure (e.g. archive
- * scans) can evict report PK indexes and turn index-only scans into
- * disk-bound queries. Pinning the indexes here gives ring_buffer_tables
- * the contract users want: "don't pollute cache with this table's heap,
- * but keep its indexes warm."
- *
- * Index pin sizes are not charged against max_pin_size_percent — they
- * are typically small (a few MB per table) and disabling protection
- * because the budget is consumed by heaps would defeat the purpose.
- *
- * This runs inside a transaction so we can resolve table names to OIDs.
- */
-static void
-PinnerSetupRingBuffers(void)
-{
-    List       *namelist;
-    ListCell   *lc;
-    char       *rawstring;
-    Oid         new_oids[MAX_RING_BUFFER_TRACKED];
-    int         new_count = 0;
-    int         i;
-
-    /*
-     * Step 1: unregister everything we registered last cycle. This is the
-     * fix for the leak — DDL operations (TRUNCATE, VACUUM FULL, CLUSTER,
-     * DROP+recreate) change a table's relfilenode, leaving the old one as
-     * a dead entry in the shmem registry. Without this cleanup, the
-     * 64-slot registry fills with stale entries over time and new tables
-     * fail to register.
-     *
-     * Tables that survived will get re-registered in step 2 (with their
-     * current relfilenode, which may have changed since last cycle).
-     */
-    for (i = 0; i < prev_ring_buffer_count; i++)
-        UnregisterRingBufferRelation(prev_ring_buffer_oids[i]);
-    prev_ring_buffer_count = 0;
-
-    if (DBBluePinner_ring_buffer_tables == NULL ||
-        strlen(DBBluePinner_ring_buffer_tables) == 0)
-        return;
-
-    rawstring = pstrdup(DBBluePinner_ring_buffer_tables);
-
-    if (!SplitIdentifierString(rawstring, ',', &namelist))
-    {
-        elog(WARNING,
-             "db_blue pinner: invalid db_blue.ring_buffer_tables syntax");
-        return;
-    }
-
-    /*
-     * Step 2: walk the desired set, register each, remember relfileOids
-     * for next cycle's cleanup pass.
-     */
-    foreach(lc, namelist)
-    {
-        char       *table_name = (char *) lfirst(lc);
-        Oid         relid;
-        Oid         relfileOid;
-        PinEntry    ring_entry;
-
-        /* Trim whitespace */
-        while (*table_name == ' ') table_name++;
-
-        relid = RelnameGetRelid(table_name);
-        if (!OidIsValid(relid))
-        {
-            elog(WARNING,
-                 "db_blue pinner: ring_buffer_table \"%s\" not found",
-                 table_name);
-            continue;
-        }
-
-        relfileOid = GetRelFileNumber(relid);
-        if (!OidIsValid(relfileOid))
-            continue;
-
-        RegisterRingBufferRelation(relfileOid);
-
-        /* Remember for next cycle's cleanup pass */
-        if (new_count < MAX_RING_BUFFER_TRACKED)
-            new_oids[new_count++] = relfileOid;
-
-        elog(DEBUG1,
-             "db_blue pinner: ring buffer forced for \"%s\" "
-             "(relfileOid=%u)",
-             table_name, relfileOid);
-
-        /*
-         * Soft-pin the indexes of this ring-buffered table. Builds a
-         * minimal PinEntry with just the fields SoftPinRelationIndexes
-         * needs: relid (for the SPI lookup), table_name (for log
-         * messages), and tier.
-         */
-        memset(&ring_entry, 0, sizeof(ring_entry));
-        ring_entry.relid = relid;
-        ring_entry.tier  = SOFT_PIN_TIER_2;
-        strlcpy(ring_entry.table_name, table_name, NAMEDATALEN);
-        SoftPinRelationIndexes(&ring_entry);
-    }
-
-    /* Remember the new set for next cycle's cleanup pass */
-    memcpy(prev_ring_buffer_oids, new_oids, new_count * sizeof(Oid));
-    prev_ring_buffer_count = new_count;
-
-    list_free(namelist);
 }
 
 /* =========================================================================
@@ -676,7 +632,8 @@ ParseTierSuffix(char *table_name)
  * ResolvePinEntries — turn the pinned_tables GUC string into a
  * populated PinEntry array with OIDs, sizes, and access counts.
  *
- * Returns the number of valid entries filled.
+ * Returns the number of valid entries filled, or -1 if the setting cannot
+ * be parsed.
  * Must be called inside a transaction with an active snapshot.
  */
 static int
@@ -696,8 +653,9 @@ ResolvePinEntries(PinEntry *entries, int max_entries)
     if (!SplitIdentifierString(rawstring, ',', &namelist))
     {
         elog(WARNING,
-             "db_blue pinner: invalid db_blue.pinned_tables syntax");
-        return 0;
+             "db_blue pinner: invalid dbblue_pinned_tables syntax; "
+             "keeping current pins");
+        return -1;
     }
 
     foreach(lc, namelist)
@@ -1020,10 +978,7 @@ SoftPinRelationIndexes(PinEntry *entry)
         if (isnull || !OidIsValid(idx_relspcOid))
             idx_relspcOid = MyDatabaseTableSpace;
 
-        SoftPinRelationBuffers(idx_relspcOid,
-                               MyDatabaseId,
-                               idx_relfileOid,
-                               entry->tier);
+        PinAndRemember(idx_relspcOid, idx_relfileOid, entry->tier);
         pinned_indexes++;
     }
 
