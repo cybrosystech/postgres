@@ -118,6 +118,7 @@
 #include "replication/walsender.h"
 #include "storage/aio_subsys.h"
 #include "storage/fd.h"
+#include "storage/bufmgr.h"
 #include "storage/io_worker.h"
 #include "storage/ipc.h"
 #include "storage/pmsignal.h"
@@ -985,6 +986,14 @@ PostmasterMain(int argc, char *argv[])
 	 * is controlled at runtime by dbblue_backup_enabled.
 	 */
 	BackupLauncherRegister();
+
+	/*
+	 * dbblue: register the soft-pin ("db_blue pinner") background worker when
+	 * dbblue_pinner_enabled is on. Doing it here means the feature does not
+	 * require pg_prewarm in shared_preload_libraries — the worker's code is
+	 * loaded lazily from the pg_prewarm library when it starts.
+	 */
+	DBBlueRegisterPinnerWorker();
 
 	/*
 	 * Register the shared memory needs of all core subsystems.

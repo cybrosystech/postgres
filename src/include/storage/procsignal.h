@@ -38,6 +38,12 @@ typedef enum
 	PROCSIG_PARALLEL_APPLY_MESSAGE, /* Message from parallel apply workers */
 	PROCSIG_SLOTSYNC_MESSAGE,	/* ask slot synchronization to stop */
 	PROCSIG_REPACK_MESSAGE,		/* Message from repack worker */
+	PROCSIG_LOG_AUTOPREPARE_SHAPES, /* dbblue: ask backend to log its
+									 * autoprepare shapes */
+	PROCSIG_AUTOPREPARE_REPORT, /* dbblue: ask backend to send its
+								 * autoprepare shapes to a requester */
+	PROCSIG_AUTOPREPARE_RESET,	/* dbblue: ask backend to clear its
+								 * autoprepare table */
 	PROCSIG_RECOVERY_CONFLICT,	/* backend is blocking recovery, check
 								 * PGPROC->pendingRecoveryConflicts for the
 								 * reason */

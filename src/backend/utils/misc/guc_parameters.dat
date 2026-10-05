@@ -622,6 +622,15 @@
   check_hook => 'check_datestyle',
   assign_hook => 'assign_datestyle',
 },
+
+{ name => 'dbblue_allow_zstd', type => 'bool', context => 'PGC_POSTMASTER', group => 'CLIENT_CONN_STATEMENT',
+  short_desc => 'Allows zstd to be selected as a TOAST compression method.',
+  long_desc => 'When off, zstd cannot be chosen as default_toast_compression or per column, and columns still marked zstd fall back to pglz when written. Use this on a cluster that must stay readable by a server without zstd support, such as one feeding a vanilla PostgreSQL physical standby.',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'dbblue_allow_zstd',
+  boot_val => 'true',
+},
+
 { name => 'dbblue_audit_changed_columns_only', type => 'bool', context => 'PGC_SUSET', group => 'CUSTOM_OPTIONS',
   short_desc => 'Records only the columns an UPDATE actually changed.',
   long_desc => 'By default an UPDATE writes every column of the row into both old_data and new_data, so changing one field on a wide table can write hundreds of times more than it altered. When this is on, columns whose value is identical in both images are omitted, and only the primary key is always kept so the audit row still identifies its row. INSERT and DELETE are unaffected, and a table without a primary key is not filtered at all. The trade-off is that an audit row alone no longer shows the full record state; reconstructing it means walking the history.',
@@ -786,15 +795,18 @@
 
 { name => 'dbblue_autoprepare_enabled', type => 'bool', context => 'PGC_SUSET', group => 'QUERY_TUNING_OTHER',
   short_desc => 'Cache and reuse plans for repeated query shapes.',
-  flags => 'GUC_NOT_IN_SAMPLE',
+  flags => 'GUC_NOT_IN_SAMPLE | GUC_EXPLAIN',
   variable => 'autoprepare_enabled',
   boot_val => 'false',
+  assign_hook => 'assign_dbblue_autoprepare_enabled',
 },
 
 { name => 'dbblue_autoprepare_limit', type => 'int', context => 'PGC_SUSET', group => 'QUERY_TUNING_OTHER',
   short_desc => 'Maximum number of cached query shapes per backend.',
-  flags => 'GUC_NOT_IN_SAMPLE',
+  long_desc => 'Rejected if the worst case across all backends (max_connections times this value times an assumed 32kB per cached shape) would use more than 10% of the RAM left after shared_buffers.',
+  flags => 'GUC_NOT_IN_SAMPLE | GUC_EXPLAIN',
   variable => 'autoprepare_limit',
+  check_hook => 'check_dbblue_autoprepare_limit',
   boot_val => '1024',
   min => '1',
   max => 'INT_MAX',
@@ -802,7 +814,7 @@
 
 { name => 'dbblue_autoprepare_threshold', type => 'int', context => 'PGC_SUSET', group => 'QUERY_TUNING_OTHER',
   short_desc => 'Cache a query shape after it is seen this many times.',
-  flags => 'GUC_NOT_IN_SAMPLE',
+  flags => 'GUC_NOT_IN_SAMPLE | GUC_EXPLAIN',
   variable => 'autoprepare_threshold',
   boot_val => '2',
   min => '1',
@@ -1381,6 +1393,7 @@
   variable => 'default_toast_compression',
   boot_val => 'DEFAULT_TOAST_COMPRESSION',
   options => 'default_toast_compression_options',
+  check_hook => 'check_default_toast_compression',
 },
 
 { name => 'default_transaction_deferrable', type => 'bool', context => 'PGC_USERSET', group => 'CLIENT_CONN_STATEMENT',

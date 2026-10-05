@@ -23,6 +23,15 @@
 extern PGDLLIMPORT int default_toast_compression;
 
 /*
+ * When off, zstd cannot be selected at all: not as default_toast_compression,
+ * not per column, and any column still marked 'z' falls back to pglz on write.
+ * Set this on a cluster that must stay readable by a server without zstd --
+ * notably one feeding a vanilla PostgreSQL physical standby, where a single
+ * zstd value would replicate fine but be unreadable on the standby.
+ */
+extern PGDLLIMPORT bool dbblue_allow_zstd;
+
+/*
  * Built-in compression method ID.  The toast compression header will store
  * this in the first 2 bits of the raw length.  These built-in compression
  * method IDs are directly mapped to the built-in compression methods.
@@ -38,7 +47,8 @@ typedef enum ToastCompressionId
 {
 	TOAST_PGLZ_COMPRESSION_ID = 0,
 	TOAST_LZ4_COMPRESSION_ID = 1,
-	TOAST_INVALID_COMPRESSION_ID = 2,
+	TOAST_ZSTD_COMPRESSION_ID = 2,
+	TOAST_INVALID_COMPRESSION_ID = 3,
 } ToastCompressionId;
 
 /*
@@ -48,15 +58,19 @@ typedef enum ToastCompressionId
  */
 #define TOAST_PGLZ_COMPRESSION			'p'
 #define TOAST_LZ4_COMPRESSION			'l'
+#define TOAST_ZSTD_COMPRESSION			'z'
 #define InvalidCompressionMethod		'\0'
 
 #define CompressionMethodIsValid(cm)  ((cm) != InvalidCompressionMethod)
 
 /*
- * Choose an appropriate default toast compression method.  If lz4 is
- * compiled-in, use it, otherwise use pglz.
+ * Choose an appropriate default toast compression method.  Prefer zstd if
+ * compiled-in (best ratio for Odoo's HTML/XML/JSON workloads); fall back to
+ * lz4, then pglz.
  */
-#ifdef USE_LZ4
+#if defined(USE_ZSTD)
+#define DEFAULT_TOAST_COMPRESSION	TOAST_ZSTD_COMPRESSION
+#elif defined(USE_LZ4)
 #define DEFAULT_TOAST_COMPRESSION	TOAST_LZ4_COMPRESSION
 #else
 #define DEFAULT_TOAST_COMPRESSION	TOAST_PGLZ_COMPRESSION
@@ -74,7 +88,31 @@ extern varlena *lz4_decompress_datum(const varlena *value);
 extern varlena *lz4_decompress_datum_slice(const varlena *value,
 										   int32 slicelength);
 
+/* zstd compression/decompression routines */
+extern varlena *zstd_compress_datum(const varlena *value);
+extern varlena *zstd_decompress_datum(const varlena *value);
+extern varlena *zstd_decompress_datum_slice(const varlena *value,
+											int32 slicelength);
+
+/*
+ * Hooks allowing a loadable module (see contrib/zstd_toast_compat) to supply
+ * zstd compression and/or decompression on a build that wasn't compiled
+ * --with-zstd -- e.g. reading a physical backup or replica that contains
+ * zstd-compressed TOAST data written elsewhere (decompress hook only), or
+ * opting a non-zstd build into writing new zstd-compressed values without a
+ * full rebuild (both hooks).  Each is independent: a module may register
+ * only the decompress hook for read-only compatibility, or both for full
+ * read/write support.
+ */
+typedef varlena *(*zstd_compress_datum_hook_type) (const varlena *value);
+extern PGDLLIMPORT zstd_compress_datum_hook_type zstd_compress_datum_hook;
+
+typedef varlena *(*zstd_decompress_datum_hook_type) (const varlena *value);
+extern PGDLLIMPORT zstd_decompress_datum_hook_type zstd_decompress_datum_hook;
+
 /* other stuff */
+struct RelationData;
+extern char toast_resolve_compression(struct RelationData *rel, char cmethod);
 extern ToastCompressionId toast_get_compression_id(varlena *attr);
 extern char CompressionNameToMethod(const char *compression);
 extern const char *GetCompressionMethodName(char method);

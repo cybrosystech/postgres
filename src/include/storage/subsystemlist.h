@@ -86,6 +86,7 @@ PG_SHMEM_SUBSYSTEM(InjectionPointShmemCallbacks)
 PG_SHMEM_SUBSYSTEM(WaitLSNShmemCallbacks)
 PG_SHMEM_SUBSYSTEM(LogicalDecodingCtlShmemCallbacks)
 PG_SHMEM_SUBSYSTEM(DataChecksumsShmemCallbacks)
+PG_SHMEM_SUBSYSTEM(AutoprepareShmemCallbacks)	/* dbblue */
 
 /* AIO subsystem. This delegates to the method-specific callbacks */
 PG_SHMEM_SUBSYSTEM(AioShmemCallbacks)

@@ -39,6 +39,8 @@ extern void assign_backtrace_functions(const char *newval, void *extra);
 extern bool check_bonjour(bool *newval, void **extra, GucSource source);
 extern bool check_canonical_path(char **newval, void **extra, GucSource source);
 extern void assign_checkpoint_completion_target(double newval, void *extra);
+extern void assign_dbblue_autoprepare_enabled(bool newval, void *extra);
+extern bool check_dbblue_autoprepare_limit(int *newval, void **extra, GucSource source);
 extern bool check_client_connection_check_interval(int *newval, void **extra,
 												   GucSource source);
 extern bool check_client_encoding(char **newval, void **extra, GucSource source);
@@ -55,6 +57,8 @@ extern bool check_log_connections(char **newval, void **extra, GucSource source)
 extern void assign_log_connections(const char *newval, void *extra);
 extern bool check_default_table_access_method(char **newval, void **extra,
 											  GucSource source);
+extern bool check_default_toast_compression(int *newval, void **extra,
+											GucSource source);
 extern bool check_default_tablespace(char **newval, void **extra,
 									 GucSource source);
 extern bool check_default_text_search_config(char **newval, void **extra, GucSource source);

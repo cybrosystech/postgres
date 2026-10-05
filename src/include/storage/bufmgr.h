@@ -395,9 +395,13 @@ extern void FreeAccessStrategy(BufferAccessStrategy strategy);
 
 /* Odoo pinner: ring-buffer forced-relations table (shared memory) */
 extern Size RingBufferShmemSize(void);
+extern void RingBufferShmemRequest(void);
 extern void InitRingBufferTable(void);
 extern void RegisterRingBufferRelation(Oid relfileOid);
 extern void UnregisterRingBufferRelation(Oid relfileOid);
+
+/* Odoo pinner: register the soft-pin background worker from the postmaster */
+extern void DBBlueRegisterPinnerWorker(void);
 
 /* Odoo pinner: soft-pin a relation's resident buffers */
 extern void SoftPinRelationBuffers(Oid relspcOid, Oid reldbOid,

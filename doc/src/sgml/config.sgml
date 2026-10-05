@@ -10629,11 +10629,78 @@ COPY postgres_log FROM '/full/path/to/logfile.csv' WITH csv;
         the <literal>COMPRESSION</literal> column option in
         <command>CREATE TABLE</command> or
         <command>ALTER TABLE</command>.)
-        The supported compression methods are <literal>pglz</literal> and
+        The supported compression methods are <literal>pglz</literal>,
         (if <productname>PostgreSQL</productname> was compiled with
-        <option>--with-lz4</option>) <literal>lz4</literal>.
-        The default is <literal>lz4</literal> (if available); otherwise,
-        <literal>pglz</literal>.
+        <option>--with-lz4</option>) <literal>lz4</literal>, and
+        <literal>zstd</literal>.
+        The default is <literal>zstd</literal> if the server was compiled
+        with <option>--with-zstd</option>, otherwise <literal>lz4</literal>
+        (if available); otherwise <literal>pglz</literal>.
+       </para>
+
+       <para>
+        <literal>zstd</literal> requires either a server compiled with
+        <option>--with-zstd</option> or a loaded module that supplies zstd
+        support, such as
+        <filename>contrib/zstd_toast_compat</filename>; otherwise setting
+        this parameter to <literal>zstd</literal> is rejected.  It is also
+        rejected outright when <xref linkend="guc-dbblue-allow-zstd"/> is
+        off.  Note that data compressed with <literal>zstd</literal> cannot
+        be read by a server that lacks zstd support, which matters when a
+        data directory may later be opened by a different build; see
+        <xref linkend="guc-dbblue-allow-zstd"/>.
+       </para>
+
+       <para>
+        System catalogs are never compressed with <literal>zstd</literal>,
+        whatever this parameter is set to.  Catalog contents stay readable
+        by a server without zstd support, so only user data is affected by
+        the choice.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry id="guc-dbblue-allow-zstd" xreflabel="dbblue_allow_zstd">
+      <term><varname>dbblue_allow_zstd</varname> (<type>boolean</type>)
+      <indexterm>
+       <primary><varname>dbblue_allow_zstd</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Controls whether <literal>zstd</literal> may be selected as a
+        <link linkend="storage-toast">TOAST</link> compression method at
+        all.  The default is <literal>on</literal>.  This parameter can
+        only be set at server start.
+       </para>
+
+       <para>
+        When set to <literal>off</literal>, <literal>zstd</literal> is
+        refused everywhere: as a value for
+        <xref linkend="guc-default-toast-compression"/>, as a
+        <literal>COMPRESSION</literal> column option in
+        <command>CREATE TABLE</command> or <command>ALTER TABLE</command>,
+        and in the write path.  Columns already marked
+        <literal>zstd</literal> remain writable; their values are
+        compressed with <literal>pglz</literal> instead of raising an
+        error, so existing tables keep working until they are converted.
+       </para>
+
+       <para>
+        Setting <xref linkend="guc-default-toast-compression"/> to something
+        other than <literal>zstd</literal> only changes the
+        <emphasis>default</emphasis>; a session can still request zstd
+        explicitly.  Turning this parameter off is therefore the only way to
+        guarantee that a cluster produces no new zstd-compressed data.
+        That is required when the data directory must remain readable by a
+        server built without zstd support, such as a standby running
+        unmodified <productname>PostgreSQL</productname>.
+       </para>
+
+       <para>
+        Turning it off does not convert data that is already compressed with
+        zstd.  Use the <filename>contrib/dbblue_toast_tools</filename>
+        extension to find and rewrite such values.
        </para>
       </listitem>
      </varlistentry>

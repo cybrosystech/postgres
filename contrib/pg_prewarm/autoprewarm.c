@@ -34,6 +34,7 @@
 #include "postmaster/bgworker.h"
 #include "postmaster/interrupt.h"
 #include "storage/buf_internals.h"
+#include "storage/bufmgr.h"
 #include "storage/dsm.h"
 #include "storage/dsm_registry.h"
 #include "storage/fd.h"
@@ -161,9 +162,14 @@ _PG_init(void)
 	/* Register autoprewarm worker, if enabled. */
 	if (autoprewarm)
 		apw_start_leader_worker();
-		/* NEW  */
-    DBBluePinnerRegisterGUCs();
-    DBBluePinnerRegister();
+
+	/*
+	 * The dbblue soft-pin ("db_blue pinner") worker is now registered from the
+	 * postmaster in core (DBBlueRegisterPinnerWorker), gated by
+	 * dbblue_pinner_enabled — so it no longer requires pg_prewarm to be in
+	 * shared_preload_libraries, and we must NOT register it again here (that
+	 * would start two workers). Nothing to do from pg_prewarm's _PG_init.
+	 */
 }
 
 /*
