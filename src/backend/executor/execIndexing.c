@@ -1200,11 +1200,11 @@ ExecInsertIndexTuples(ResultRelInfo *resultRelInfo,
 	 * partitioned table has any global indexes (indglobal = true).  Such
 	 * indexes span all partitions and must be updated for every inserted row.
 	 *
-	 * The TID stored in a global index entry is the tuple's ctid inside the
-	 * partition heap, so it is globally meaningful together with the partition
-	 * OID stored in the INCLUDE columns (if any).  Callers that want to
-	 * resolve the full row must use the PK columns (also stored as INCLUDE
-	 * columns at index-creation time).
+	 * The TID stored in a global index entry is the tuple's ctid inside its
+	 * partition's heap.  It is only meaningful together with the partition,
+	 * which is found by routing the entry's partition key value (stored as
+	 * the index's trailing key columns) through the partition bounds; see
+	 * ExecGlobalIndexRouteToIndex().
 	 */
 	if (heapRelation->rd_rel->relispartition)
 	{

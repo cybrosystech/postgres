@@ -756,9 +756,9 @@ DefineIndex(ParseState *pstate,
 	 * index; we only create catalog entries and recurse into each partition.
 	 *
 	 * For a GLOBAL index the partitioned table itself gets a single real
-	 * physical index (RELKIND_INDEX).  It is populated incrementally as rows
-	 * are inserted into partitions, so we never recurse into partitions and
-	 * we skip the initial index build.
+	 * physical index (RELKIND_INDEX).  We never recurse into partitions:
+	 * index_create() fills it from the rows the partitions already hold (see
+	 * build_global_index()), and later rows are added as they are inserted.
 	 */
 	partitioned = rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE;
 
@@ -1392,8 +1392,10 @@ DefineIndex(ParseState *pstate,
 	if (stmt->isconstraint)
 		flags |= INDEX_CREATE_ADD_CONSTRAINT;
 	/*
-	 * A global index always skips the initial build: it starts empty and is
-	 * populated incrementally during partition DML.
+	 * A global index always skips the generic index_build(), which would scan
+	 * the partitioned table itself (no storage).  index_create() builds it
+	 * from the partitions instead (build_global_index()), except with
+	 * INDEX_CREATE_GLOBAL_NOFILL, when an ALTER TABLE rewrite fills it.
 	 */
 	if (skip_build || concurrent || (partitioned && !global))
 		flags |= INDEX_CREATE_SKIP_BUILD;
