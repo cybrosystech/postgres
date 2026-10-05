@@ -2669,6 +2669,31 @@ gpi_vacuum_parent_global_indexes(LVRelState *vacrel)
 						RelationGetRelationName(leaf),
 						istat ? istat->tuples_removed : 0.0)));
 
+		/*
+		 * The bulk delete scanned the whole global index, so its result is
+		 * an exact entry count; record it as the index's statistics, which
+		 * plain VACUUM otherwise never updates (the index is not part of any
+		 * table's own index list).
+		 *
+		 * Updating an index's pg_class row in place requires
+		 * ShareUpdateExclusiveLock on its table, here the partitioned parent
+		 * (README.tuplock).  Don't wait for it, and don't keep it: siblings'
+		 * VACUUMs, ANALYZE and DDL of the parent would queue behind us for
+		 * the rest of this VACUUM.  The update is non-transactional, so the
+		 * lock can go right away; if it is busy, the statistics just stay as
+		 * they were until the next time.
+		 */
+		if (istat && !istat->estimated_count &&
+			ConditionalLockRelationOid(parentOid, ShareUpdateExclusiveLock))
+		{
+			vac_update_relstats(gidx, istat->num_pages,
+								istat->num_index_tuples,
+								0, 0, false,
+								InvalidTransactionId, InvalidMultiXactId,
+								NULL, NULL, false);
+			UnlockRelationOid(parentOid, ShareUpdateExclusiveLock);
+		}
+
 		if (istat)
 			pfree(istat);
 

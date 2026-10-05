@@ -54,7 +54,7 @@ Only a few PostgreSQL forks have global indexes; upstream does not.
 | Automatic (the Odoo path) | `CREATE UNIQUE INDEX … ON parent (cols)` or `ALTER TABLE parent ADD CONSTRAINT … UNIQUE (cols)` where `cols` does not contain the partition column |
 | Explicit | `CREATE [UNIQUE] INDEX GLOBAL name ON parent (cols)` (`GLOBAL` comes right after `INDEX`) |
 | Turn auto-conversion off | `SET dbblue_auto_global_index = off` gives the upstream error back |
-| Is an index global? | `SELECT indexrelid::regclass FROM pg_index WHERE indglobal;` or `pg_get_indexdef()` prints `CREATE UNIQUE INDEX GLOBAL …` (`\d` does **not** mark it) |
+| Is an index global? | `\d table` shows `GLOBAL` at the end of its line; also `SELECT indexrelid::regclass FROM pg_index WHERE indglobal;` or `pg_get_indexdef()` (`CREATE UNIQUE INDEX GLOBAL …`) |
 
 Supported index shapes include plain columns, expressions (`lower(name)`),
 partial indexes (`WHERE active`), `INCLUDE (…)`, and `NULLS NOT DISTINCT`. A
@@ -340,7 +340,7 @@ in the test).
 | Foreign keys | A global unique index cannot be the referenced key of an FK |
 | Concurrency of DDL | No `CREATE INDEX CONCURRENTLY` and no `REINDEX CONCURRENTLY` |
 | Scans | Serial Index Scan only: no Index Only, bitmap or parallel scans. **UPDATE/DELETE and `SELECT … FOR UPDATE` never use a global index** and fall back to per-partition scans (a seq scan when no local index exists) |
-| Display | `\d` doesn't mark the index GLOBAL. `pg_class.reltuples` of the index stays `-1` after ANALYZE |
+| Display | `\d` marks global indexes `GLOBAL`; statistics are kept by ANALYZE of the parent and by VACUUM of its partitions (fixed 2026-10-05) |
 | Cost | Build is ~10× slower than a local index (row-by-row inserts); ATTACH/DETACH/DROP/TRUNCATE/VACUUM FULL of a partition rewrite the whole global index and block writes to all partitions meanwhile (see §5.6, §9) |
 | `dbblue_partition` | Since 1.1, `dbblue_partition_undo` recreates indexes and unique constraints added after the conversion as ordinary ones on the restored table. The extension itself never creates global indexes. Existing unique indexes become per-partition (template) indexes; global ones come from later Odoo DDL |
 
@@ -366,6 +366,8 @@ in the test).
 | `src/backend/commands/tablecmds.c`, `repack.c` | partition lifecycle and rewrites |
 | `src/backend/utils/cache/relcache.c` | HOT-blocking columns from the parent's global indexes |
 | `src/bin/pg_dump/pg_dump.c`, `pg_dump.h` | constraints on a global index are dumped with their own columns only (`indnconkeyattrs`) |
+| `src/bin/psql/describe.c` | `\d` shows `GLOBAL` |
+| `src/backend/commands/analyze.c` | ANALYZE of a partitioned table updates its global indexes' statistics |
 | `src/backend/utils/adt/ruleutils.c`, `parser/parse_utilcmd.c` | `pg_get_indexdef`/`constraintdef`, `LIKE … INCLUDING INDEXES` |
 | `src/backend/catalog/system_views.sql` | `pg_stat_*_indexes` include global indexes |
 | `src/backend/utils/misc/guc_parameters.dat`, `guc_tables.c` | `dbblue_auto_global_index` |
@@ -387,7 +389,7 @@ Severity is from an Odoo production point of view.
 | 7 | **Fixed** | `dbblue_partition_undo` drops unique indexes that Odoo added after partitioning | undo after the Odoo-upgrade flow → only the conversion-time indexes come back | **Fixed 2026-10-05** in `dbblue_partition` 1.1 (`dbblue_partition--1.0--1.1.sql`): undo records the indexes and unique/PK/exclusion constraints that exist on the partitioned table but not on the backup, and recreates them on the restored table as ordinary objects (constraints as constraints, `GLOBAL` / `ON ONLY` dropped), with their comments. The conversion's own `_fkuq` indexes are skipped. Existing databases: `ALTER EXTENSION dbblue_partition UPDATE` |
 | 8 | Limitation | UPDATE/DELETE/FOR UPDATE by a globally indexed column seq-scan every partition | `EXPLAIN UPDATE d … WHERE code = 'x'` | **Not a bug** (planner restriction by design, see §5.5 and §6): results are correct; Odoo writes and locks by `id`. For custom SQL: add a normal index on the column, or `UPDATE … WHERE id IN (SELECT id … WHERE col = …)` |
 | 9 | **Fixed** | Confusing messages: CONCURRENTLY prints the auto-convert NOTICE and then fails; a hash GLOBAL index says "does not support multicolumn indexes"; a failed ATTACH says "could not create unique index" | — | **Fixed 2026-10-05**: `CONCURRENTLY` is no longer auto-converted, so it gets upstream's "cannot create index on partitioned table … concurrently"; non-btree GLOBAL is rejected before the partition key is appended ("only supported for btree"); a duplicate during ATTACH says "cannot attach partition …: duplicate key value violates unique constraint …" and names the partition holding it (`GlobalUniqueCheckContext` in `ExecCheckGlobalIndexUnique`) |
-| 10 | Low | `\d` doesn't show GLOBAL; `reltuples` stays -1; stale comments (`INCLUDE'd partition key` in `nodeIndexscan.c`/`allpaths.c`, "starts empty" in `indexcmds.c:1371`) | — | cosmetic |
+| 10 | **Fixed** | `\d` doesn't show GLOBAL; `reltuples` stays -1; stale comments (`INCLUDE'd partition key` in `nodeIndexscan.c`/`allpaths.c`, "starts empty" in `indexcmds.c:1371`) | — | **Fixed 2026-10-05**: `\d` tags global indexes with `GLOBAL` (psql reads `indglobal` through `to_jsonb()`, so it still works against upstream servers); ANALYZE of the partitioned table sets the global indexes' `relpages`/`reltuples` (scaled by the predicate for partial ones); VACUUM of a partition records the exact entry count from the global cleanup scan, taking the parent's lock only if it is free; stale comments rewritten |
 
 Bugs 1–4 are fixed. On a database that ran an older build, `REINDEX INDEX <global index>` removes damage they may have left (REINDEX rebuilds from the partitions' heaps).
 

@@ -2442,6 +2442,17 @@ describeOneTableDetails(const char *schemaname,
 				appendPQExpBufferStr(&buf, ", con.conperiod");
 			else
 				appendPQExpBufferStr(&buf, ", false AS conperiod");
+
+			/*
+			 * DBblue global partition index.  Upstream servers of the same
+			 * version have no pg_index.indglobal, so read it through
+			 * to_jsonb(), which yields NULL where the column is missing.
+			 */
+			if (pset.sversion >= 190000)
+				appendPQExpBufferStr(&buf,
+									 ", COALESCE(pg_catalog.jsonb_extract_path_text(pg_catalog.to_jsonb(i), 'indglobal')::pg_catalog.bool, false) AS indglobal");
+			else
+				appendPQExpBufferStr(&buf, ", false AS indglobal");
 			appendPQExpBuffer(&buf,
 							  "\nFROM pg_catalog.pg_class c, pg_catalog.pg_class c2, pg_catalog.pg_index i\n"
 							  "  LEFT JOIN pg_catalog.pg_constraint con ON (conrelid = i.indrelid AND conindid = i.indexrelid AND contype IN ("
@@ -2516,6 +2527,9 @@ describeOneTableDetails(const char *schemaname,
 
 					if (strcmp(PQgetvalue(result, i, 10), "t") == 0)
 						appendPQExpBufferStr(&buf, " REPLICA IDENTITY");
+
+					if (strcmp(PQgetvalue(result, i, 13), "t") == 0)
+						appendPQExpBufferStr(&buf, " GLOBAL");
 
 					printTableAddFooter(&cont, buf.data);
 
