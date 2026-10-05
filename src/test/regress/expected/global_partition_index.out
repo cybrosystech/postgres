@@ -180,8 +180,8 @@ SELECT gpi_check('gpi');
 INSERT INTO gpi VALUES (5, '2024-02-02');	-- reuse id 5, now only in the detached table
 ALTER TABLE gpi ATTACH PARTITION gpi_y2023
 	FOR VALUES FROM ('2023-01-01') TO ('2024-01-01');	-- fails: duplicate id 5
-ERROR:  could not create unique index "gpi_id_key"
-DETAIL:  Key (id)=(5) is duplicated.
+ERROR:  cannot attach partition "gpi_y2023": duplicate key value violates unique constraint "gpi_id_key"
+DETAIL:  Key (id)=(5) already exists in partition "gpi_y2024".
 SELECT gpi_check('gpi');	-- the failed ATTACH left nothing behind
  gpi_check 
 -----------

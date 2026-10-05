@@ -87,6 +87,7 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/tuplesort.h"
+#include "executor.h"
 
 /* Potentially set by pg_upgrade_support functions */
 Oid			binary_upgrade_next_index_pg_class_oid = InvalidOid;
@@ -896,6 +897,7 @@ typedef struct GIBuildState
 	IndexInfo  *indexInfo;
 	EState	   *estate;
 	MemoryContext tmpcxt;
+	GlobalUniqueCheckContext checkcontext;	/* for gpi_check_callback() */
 } GIBuildState;
 
 /*
@@ -916,7 +918,7 @@ gpi_build_callback(Relation index, ItemPointer tid, Datum *values,
 
 	if (index->rd_index->indisunique && tupleIsAlive)
 		ExecCheckGlobalIndexUnique(index, bs->indexInfo, bs->partRel, tid,
-								   values, isnull, bs->estate, true);
+								   values, isnull, bs->estate, GUCC_BUILD);
 
 	MemoryContextSwitchTo(oldcxt);
 	MemoryContextReset(bs->tmpcxt);
@@ -943,6 +945,7 @@ gpi_fill_one_partition(Relation indexRelation, Relation partRel,
 	bs.partRel = partRel;
 	bs.indexInfo = BuildGlobalIndexInfo(indexRelation, partRel);
 	bs.estate = estate;
+	bs.checkcontext = GUCC_BUILD;
 	bs.tmpcxt = AllocSetContextCreate(CurrentMemoryContext,
 									  "global index build",
 									  ALLOCSET_DEFAULT_SIZES);
@@ -1029,7 +1032,7 @@ gpi_check_callback(Relation index, ItemPointer tid, Datum *values,
 		return;
 	oldcxt = MemoryContextSwitchTo(bs->tmpcxt);
 	ExecCheckGlobalIndexUnique(index, bs->indexInfo, bs->partRel, tid,
-							   values, isnull, bs->estate, true);
+							   values, isnull, bs->estate, bs->checkcontext);
 	MemoryContextSwitchTo(oldcxt);
 	MemoryContextReset(bs->tmpcxt);
 }
@@ -1054,7 +1057,8 @@ gpi_check_callback(Relation index, ItemPointer tid, Datum *values,
  */
 static void
 gpi_rewrite_global_index(Relation parentRel, Relation gidx, List *removeOids,
-						 List *addRels, EState *estate, bool check_unique)
+						 List *addRels, EState *estate, bool check_unique,
+						 GlobalUniqueCheckContext checkcontext)
 {
 	GIRewriteKeep keep;
 	Tuplesortstate *sortstate;
@@ -1107,6 +1111,7 @@ gpi_rewrite_global_index(Relation parentRel, Relation gidx, List *removeOids,
 			bs.partRel = partRel;
 			bs.indexInfo = BuildGlobalIndexInfo(gidx, partRel);
 			bs.estate = estate;
+			bs.checkcontext = checkcontext;
 			bs.tmpcxt = AllocSetContextCreate(CurrentMemoryContext,
 											  "global index unique check",
 											  ALLOCSET_DEFAULT_SIZES);
@@ -1173,8 +1178,10 @@ gpi_rewrite_parent_indexes(Relation parentRel, List *removeOids,
 		/* like REINDEX: nobody may use the index while its storage changes */
 		Relation	gidx = index_open(gidxoid, AccessExclusiveLock);
 
+		/* ATTACH (the caller checking the partition) gets its own wording */
 		gpi_rewrite_global_index(parentRel, gidx, removeOids, addRels,
-								 estate, check_unique);
+								 estate, check_unique,
+								 check_supported ? GUCC_ATTACH : GUCC_BUILD);
 		index_close(gidx, NoLock);
 	}
 	FreeExecutorState(estate);

@@ -791,6 +791,16 @@ DefineIndex(ParseState *pstate,
 	{
 		if (global)
 		{
+			/*
+			 * Only btree is supported.  Check before the partition key is
+			 * appended below, or e.g. hash would complain about getting a
+			 * multicolumn index although the user named one column.
+			 */
+			if (strcmp(stmt->accessMethod, DEFAULT_INDEX_TYPE) != 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("global partition indexes are only supported for btree")));
+
 			/* GLOBAL indexes are not compatible with concurrent build */
 			if (stmt->concurrent)
 				ereport(ERROR,
@@ -2032,6 +2042,14 @@ UniqueIndexNeedsGlobal(Relation rel, const IndexStmt *stmt, bool exclusion)
 	const char *partattname;
 
 	if (!stmt->unique || stmt->primary || stmt->deferrable || exclusion)
+		return false;
+
+	/*
+	 * Neither a global nor a partitioned index can be built concurrently;
+	 * leave CONCURRENTLY to the standard error rather than announcing a
+	 * conversion to GLOBAL that then fails.
+	 */
+	if (stmt->concurrent)
 		return false;
 	if (stmt->accessMethod == NULL ||
 		strcmp(stmt->accessMethod, DEFAULT_INDEX_TYPE) != 0)
