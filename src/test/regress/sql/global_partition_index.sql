@@ -172,6 +172,41 @@ INSERT INTO gpi VALUES (99001, '2025-06-06', 'C10');	-- duplicate code
 ALTER TABLE gpi ALTER COLUMN code TYPE text;
 SELECT gpi_check('gpi');
 
+-- INSERT ... ON CONFLICT with a global index as arbiter: the conflicting row
+-- can be in another partition than the one the new row is routed to
+SELECT gpi_reset();
+CREATE TABLE gpi_wv (token text NOT NULL, visits int DEFAULT 1, seen date,
+	d date NOT NULL) PARTITION BY RANGE (d);
+CREATE TABLE gpi_wv_y2023 PARTITION OF gpi_wv FOR VALUES FROM ('2023-01-01') TO ('2024-01-01');
+CREATE TABLE gpi_wv_y2024 PARTITION OF gpi_wv FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+SET client_min_messages = warning;
+ALTER TABLE gpi_wv ADD CONSTRAINT gpi_wv_token_key UNIQUE (token);
+RESET client_min_messages;
+INSERT INTO gpi_wv VALUES ('a', 1, '2023-02-01', '2023-02-01');
+-- DO UPDATE: the existing 2023 row is updated in place, nothing is inserted
+INSERT INTO gpi_wv (token, seen, d) VALUES ('a', '2024-06-01', '2024-06-01')
+	ON CONFLICT (token) DO UPDATE SET visits = gpi_wv.visits + 1, seen = excluded.seen
+	RETURNING token, visits, seen, tableoid::regclass;
+INSERT INTO gpi_wv (token, d) VALUES ('a', '2024-07-01')
+	ON CONFLICT ON CONSTRAINT gpi_wv_token_key DO UPDATE SET visits = gpi_wv.visits + 1
+	RETURNING visits, tableoid::regclass;
+INSERT INTO gpi_wv (token, d) VALUES ('a', '2024-07-01')
+	ON CONFLICT (token) DO UPDATE SET visits = 0 WHERE gpi_wv.visits > 10
+	RETURNING visits;
+-- moving the row to another partition is refused, as with local arbiters
+INSERT INTO gpi_wv (token, d) VALUES ('a', '2024-07-01')
+	ON CONFLICT (token) DO UPDATE SET d = '2024-08-01';
+INSERT INTO gpi_wv (token, d) VALUES ('b', '2023-03-01'), ('b', '2024-03-01')
+	ON CONFLICT (token) DO UPDATE SET visits = gpi_wv.visits + 1;
+-- DO NOTHING, with and without a target, and DO SELECT
+INSERT INTO gpi_wv (token, d) VALUES ('a', '2024-09-01'), ('c', '2024-09-01')
+	ON CONFLICT (token) DO NOTHING RETURNING token;
+INSERT INTO gpi_wv (token, d) VALUES ('a', '2024-09-01') ON CONFLICT DO NOTHING;
+INSERT INTO gpi_wv (token, d) VALUES ('a', '2024-10-01')
+	ON CONFLICT (token) DO SELECT RETURNING token, visits, tableoid::regclass;
+SELECT token, visits, seen, d, tableoid::regclass FROM gpi_wv ORDER BY token;
+DROP TABLE gpi_wv;
+
 DROP TABLE gpi;
 DROP FUNCTION gpi_check(regclass);
 DROP FUNCTION gpi_reset();

@@ -350,6 +350,79 @@ SELECT gpi_check('gpi');
  ok 3000
 (1 row)
 
+-- INSERT ... ON CONFLICT with a global index as arbiter: the conflicting row
+-- can be in another partition than the one the new row is routed to
+SELECT gpi_reset();
+ gpi_reset 
+-----------
+ 
+(1 row)
+
+CREATE TABLE gpi_wv (token text NOT NULL, visits int DEFAULT 1, seen date,
+	d date NOT NULL) PARTITION BY RANGE (d);
+CREATE TABLE gpi_wv_y2023 PARTITION OF gpi_wv FOR VALUES FROM ('2023-01-01') TO ('2024-01-01');
+CREATE TABLE gpi_wv_y2024 PARTITION OF gpi_wv FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+SET client_min_messages = warning;
+ALTER TABLE gpi_wv ADD CONSTRAINT gpi_wv_token_key UNIQUE (token);
+RESET client_min_messages;
+INSERT INTO gpi_wv VALUES ('a', 1, '2023-02-01', '2023-02-01');
+-- DO UPDATE: the existing 2023 row is updated in place, nothing is inserted
+INSERT INTO gpi_wv (token, seen, d) VALUES ('a', '2024-06-01', '2024-06-01')
+	ON CONFLICT (token) DO UPDATE SET visits = gpi_wv.visits + 1, seen = excluded.seen
+	RETURNING token, visits, seen, tableoid::regclass;
+ token | visits |    seen    |   tableoid   
+-------+--------+------------+--------------
+ a     |      2 | 06-01-2024 | gpi_wv_y2023
+(1 row)
+
+INSERT INTO gpi_wv (token, d) VALUES ('a', '2024-07-01')
+	ON CONFLICT ON CONSTRAINT gpi_wv_token_key DO UPDATE SET visits = gpi_wv.visits + 1
+	RETURNING visits, tableoid::regclass;
+ visits |   tableoid   
+--------+--------------
+      3 | gpi_wv_y2023
+(1 row)
+
+INSERT INTO gpi_wv (token, d) VALUES ('a', '2024-07-01')
+	ON CONFLICT (token) DO UPDATE SET visits = 0 WHERE gpi_wv.visits > 10
+	RETURNING visits;
+ visits 
+--------
+(0 rows)
+
+-- moving the row to another partition is refused, as with local arbiters
+INSERT INTO gpi_wv (token, d) VALUES ('a', '2024-07-01')
+	ON CONFLICT (token) DO UPDATE SET d = '2024-08-01';
+ERROR:  invalid ON UPDATE specification
+DETAIL:  The result tuple would appear in a different partition than the original tuple.
+INSERT INTO gpi_wv (token, d) VALUES ('b', '2023-03-01'), ('b', '2024-03-01')
+	ON CONFLICT (token) DO UPDATE SET visits = gpi_wv.visits + 1;
+ERROR:  ON CONFLICT DO UPDATE command cannot affect row a second time
+HINT:  Ensure that no rows proposed for insertion within the same command have duplicate constrained values.
+-- DO NOTHING, with and without a target, and DO SELECT
+INSERT INTO gpi_wv (token, d) VALUES ('a', '2024-09-01'), ('c', '2024-09-01')
+	ON CONFLICT (token) DO NOTHING RETURNING token;
+ token 
+-------
+ c
+(1 row)
+
+INSERT INTO gpi_wv (token, d) VALUES ('a', '2024-09-01') ON CONFLICT DO NOTHING;
+INSERT INTO gpi_wv (token, d) VALUES ('a', '2024-10-01')
+	ON CONFLICT (token) DO SELECT RETURNING token, visits, tableoid::regclass;
+ token | visits |   tableoid   
+-------+--------+--------------
+ a     |      3 | gpi_wv_y2023
+(1 row)
+
+SELECT token, visits, seen, d, tableoid::regclass FROM gpi_wv ORDER BY token;
+ token | visits |    seen    |     d      |   tableoid   
+-------+--------+------------+------------+--------------
+ a     |      3 | 06-01-2024 | 02-01-2023 | gpi_wv_y2023
+ c     |      1 |            | 09-01-2024 | gpi_wv_y2024
+(2 rows)
+
+DROP TABLE gpi_wv;
 DROP TABLE gpi;
 DROP FUNCTION gpi_check(regclass);
 DROP FUNCTION gpi_reset();
