@@ -90,6 +90,9 @@ static int	acquire_sample_rows(Relation onerel, int elevel,
 								HeapTuple *rows, int targrows,
 								double *totalrows, double *totaldeadrows);
 static int	compare_rows(const void *a, const void *b, void *arg);
+static void update_global_index_stats(Relation onerel, HeapTuple *rows,
+									  int numrows, double totalrows,
+									  bool in_outer_xact);
 static int	acquire_inherited_sample_rows(Relation onerel, int elevel,
 										  HeapTuple *rows, int targrows,
 										  double *totalrows, double *totaldeadrows);
@@ -693,6 +696,10 @@ do_analyze_rel(Relation onerel, const VacuumParams *params,
 							InvalidMultiXactId,
 							NULL, NULL,
 							in_outer_xact);
+
+		/* its global partition indexes do have storage */
+		update_global_index_stats(onerel, rows, numrows, totalrows,
+								  in_outer_xact);
 	}
 
 	/*
@@ -1223,6 +1230,70 @@ block_sampling_read_stream_next(ReadStream *stream,
 	BlockSamplerData *bs = callback_private_data;
 
 	return BlockSampler_HasMore(bs) ? BlockSampler_Next(bs) : InvalidBlockNumber;
+}
+
+/*
+ * update_global_index_stats -- relpages/reltuples of a partitioned table's
+ * global partition indexes
+ *
+ * A global index is a physical index on the partitioned table, so unlike
+ * its partitioned indexes it has a size and a row count, but the generic
+ * code only updates the indexes of tables with storage.  Its row count is
+ * the table's, scaled for a partial index by the fraction of sampled rows
+ * (already in the partitioned table's row type) that satisfy the predicate.
+ */
+static void
+update_global_index_stats(Relation onerel, HeapTuple *rows, int numrows,
+						  double totalrows, bool in_outer_xact)
+{
+	List	   *indexoids = RelationGetIndexList(onerel);
+
+	foreach_oid(indexoid, indexoids)
+	{
+		Relation	idx = index_open(indexoid, AccessShareLock);
+		double		ntuples = totalrows;
+
+		if (!idx->rd_index->indglobal)
+		{
+			index_close(idx, AccessShareLock);
+			continue;
+		}
+
+		if (RelationGetIndexPredicate(idx) != NIL)
+		{
+			EState	   *estate = CreateExecutorState();
+			ExprContext *econtext = GetPerTupleExprContext(estate);
+			IndexInfo  *ii = BuildIndexInfo(idx);
+			ExprState  *predicate = ExecPrepareQual(ii->ii_Predicate, estate);
+			TupleTableSlot *slot = MakeSingleTupleTableSlot(RelationGetDescr(onerel),
+															&TTSOpsHeapTuple);
+			int			nmatch = 0;
+
+			econtext->ecxt_scantuple = slot;
+			for (int i = 0; i < numrows; i++)
+			{
+				ExecStoreHeapTuple(rows[i], slot, false);
+				if (ExecQual(predicate, econtext))
+					nmatch++;
+				ResetExprContext(econtext);
+			}
+			ntuples = numrows > 0 ? ceil(totalrows * nmatch / numrows) : 0;
+			ExecDropSingleTupleTableSlot(slot);
+			FreeExecutorState(estate);
+		}
+
+		vac_update_relstats(idx,
+							RelationGetNumberOfBlocks(idx),
+							ntuples,
+							0, 0,
+							false,
+							InvalidTransactionId,
+							InvalidMultiXactId,
+							NULL, NULL,
+							in_outer_xact);
+		index_close(idx, AccessShareLock);
+	}
+	list_free(indexoids);
 }
 
 /*

@@ -232,7 +232,8 @@ IndexNext(IndexScanState *node)
 
 	/*
 	 * Global partition index: use TID-only scan then route the TID to the
-	 * correct child partition using the INCLUDE'd partition key column.
+	 * correct child partition using its partition key value, which a global
+	 * index stores as trailing key column(s).
 	 */
 	if (node->iss_GlobalState != NULL)
 	{

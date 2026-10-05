@@ -534,7 +534,7 @@ set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 		 * For partitioned tables that have at least one global partition
 		 * index, also generate IndexPaths on the parent rel directly.
 		 * The executor's nodeIndexscan.c routes each TID to the right
-		 * partition using the INCLUDE'd partition key column.
+		 * partition using its partition key value (trailing key columns).
 		 *
 		 * This is skipped when the partitioned table is the target (result)
 		 * relation of an UPDATE/DELETE: a global-index scan on the storage-less
