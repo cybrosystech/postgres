@@ -361,10 +361,8 @@ typedef struct GlobalIndexCandidate
  *		Entries can be stale (pointing at a dead or recycled heap slot), so
  *		every heap tuple found is rechecked against the key and predicate.
  *
- *		'heapRel' and 'tupleid' identify the new tuple itself, which is
- *		skipped.  'newIndex' selects the error wording used while building
- *		the index.  'indexInfo' must come from BuildGlobalIndexInfo(gidx,
- *		heapRel), i.e. be mapped to heapRel's column layout.
+ *		'indexInfo' must come from BuildGlobalIndexInfo(gidx, heapRel), i.e.
+ *		be mapped to heapRel's column layout.
  * ----------------------------------------------------------------
  */
 static bool
@@ -597,16 +595,19 @@ retry:
  *		(possibly with a deadlock error).
  *
  *		'heapRel' and 'tupleid' identify the new tuple itself, which is
- *		skipped.  'newIndex' selects the error wording used while building
- *		the index.  'indexInfo' must come from BuildGlobalIndexInfo(gidx,
- *		heapRel), i.e. be mapped to heapRel's column layout.
+ *		skipped.  'context' selects the error wording: a plain duplicate key
+ *		for an inserted or updated row, the index build wording while
+ *		building the index, and an attach-specific one while attaching
+ *		partition 'heapRel'.  'indexInfo' must come from
+ *		BuildGlobalIndexInfo(gidx, heapRel), i.e. be mapped to heapRel's
+ *		column layout.
  * ----------------------------------------------------------------
  */
 void
 ExecCheckGlobalIndexUnique(Relation gidx, IndexInfo *indexInfo,
 						   Relation heapRel, const ItemPointerData *tupleid,
 						   const Datum *values, const bool *isnull,
-						   EState *estate, bool newIndex)
+						   EState *estate, GlobalUniqueCheckContext context)
 {
 	Oid			conflictPart;
 	ItemPointerData conflictTid;
@@ -619,7 +620,33 @@ ExecCheckGlobalIndexUnique(Relation gidx, IndexInfo *indexInfo,
 										   AccessShareLock);
 		char	   *key_desc = BuildIndexValueDescription(gidx, values, isnull);
 
-		if (newIndex)
+		if (context == GUCC_ATTACH)
+		{
+			/* the duplicate is either inside the attached table or elsewhere */
+			if (conflictPart == RelationGetRelid(heapRel))
+				ereport(ERROR,
+						(errcode(ERRCODE_UNIQUE_VIOLATION),
+						 errmsg("cannot attach partition \"%s\": duplicate key value violates unique constraint \"%s\"",
+								RelationGetRelationName(heapRel),
+								RelationGetRelationName(gidx)),
+						 key_desc ?
+						 errdetail("Key %s is duplicated within \"%s\".",
+								   key_desc, RelationGetRelationName(heapRel)) : 0,
+						 errtableconstraint(parentRel,
+											RelationGetRelationName(gidx))));
+			else
+				ereport(ERROR,
+						(errcode(ERRCODE_UNIQUE_VIOLATION),
+						 errmsg("cannot attach partition \"%s\": duplicate key value violates unique constraint \"%s\"",
+								RelationGetRelationName(heapRel),
+								RelationGetRelationName(gidx)),
+						 key_desc ?
+						 errdetail("Key %s already exists in partition \"%s\".",
+								   key_desc, get_rel_name(conflictPart)) : 0,
+						 errtableconstraint(parentRel,
+											RelationGetRelationName(gidx))));
+		}
+		else if (context == GUCC_BUILD)
 			ereport(ERROR,
 					(errcode(ERRCODE_UNIQUE_VIOLATION),
 					 errmsg("could not create unique index \"%s\"",
@@ -1260,7 +1287,8 @@ ExecInsertIndexTuples(ResultRelInfo *resultRelInfo,
 				else
 					ExecCheckGlobalIndexUnique(globalIdxRel, globalIdxInfo,
 											   heapRelation, tupleid,
-											   gvalues, gisnull, estate, false);
+											   gvalues, gisnull, estate,
+											   GUCC_INSERT);
 			}
 		}
 	}
