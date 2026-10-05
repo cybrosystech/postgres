@@ -777,11 +777,19 @@ extern int	ExecGlobalIndexRouteToIndex(struct PartitionKeyData *key,
 										struct PartitionDescData *partdesc,
 										Relation gidx,
 										struct IndexTupleData *itup);
+/* why the uniqueness of a global index is checked; selects the error message */
+typedef enum GlobalUniqueCheckContext
+{
+	GUCC_INSERT,				/* a row inserted or updated */
+	GUCC_BUILD,					/* building it: CREATE INDEX, REINDEX, ALTER TABLE */
+	GUCC_ATTACH,				/* attaching a partition */
+} GlobalUniqueCheckContext;
+
 extern void ExecCheckGlobalIndexUnique(Relation gidx, IndexInfo *indexInfo,
 									   Relation heapRel,
 									   const ItemPointerData *tupleid,
 									   const Datum *values, const bool *isnull,
-									   EState *estate, bool newIndex);
+									   EState *estate, GlobalUniqueCheckContext context);
 extern bool ExecCheckGlobalIndexConstraints(ResultRelInfo *resultRelInfo,
 											TupleTableSlot *slot, EState *estate,
 											ItemPointer conflictTid,
