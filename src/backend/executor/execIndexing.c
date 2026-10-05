@@ -332,10 +332,19 @@ typedef struct GlobalIndexCandidate
 } GlobalIndexCandidate;
 
 /* ----------------------------------------------------------------
- *		ExecCheckGlobalIndexUnique
+ *		global_index_find_conflict
  *
- *		Enforce uniqueness for an entry just inserted into a UNIQUE global
- *		partition index.
+ *		Look for a row, other than the one identified by 'heapRel' and
+ *		'tupleid' (may be NULL), whose key in UNIQUE global partition index
+ *		'gidx' equals 'values'/'isnull'.  If one is found, return true and
+ *		its partition and TID in *conflictPart and *conflictTid.
+ *
+ *		With 'wait', a matching row whose inserting or deleting transaction
+ *		is still in progress is waited for, and the search restarted, so the
+ *		answer is conclusive.  Without it, such a row counts as a conflict
+ *		right away: that is how a speculative insertion (INSERT ... ON
+ *		CONFLICT) detects a possible conflict without waiting while it holds
+ *		its own speculative insertion lock.
  *
  *		The btree AM cannot do this itself: its uniqueness check fetches the
  *		conflicting TIDs from the one heap it is given, whereas a global index
@@ -358,11 +367,12 @@ typedef struct GlobalIndexCandidate
  *		heapRel), i.e. be mapped to heapRel's column layout.
  * ----------------------------------------------------------------
  */
-void
-ExecCheckGlobalIndexUnique(Relation gidx, IndexInfo *indexInfo,
+static bool
+global_index_find_conflict(Relation gidx, IndexInfo *indexInfo,
 						   Relation heapRel, const ItemPointerData *tupleid,
 						   const Datum *values, const bool *isnull,
-						   EState *estate, bool newIndex)
+						   EState *estate, bool wait,
+						   Oid *conflictPart, ItemPointer conflictTid)
 {
 	/* uniqueness is on the user's columns, not the routing columns */
 	int			nkeys = IndexGlobalNumUserKeys(gidx->rd_index);
@@ -385,7 +395,7 @@ ExecCheckGlobalIndexUnique(Relation gidx, IndexInfo *indexInfo,
 		for (int i = 0; i < nkeys; i++)
 		{
 			if (isnull[i])
-				return;
+				return false;
 		}
 	}
 
@@ -452,7 +462,8 @@ retry:
 			continue;
 
 		/* Skip the entry of the tuple being checked */
-		if (partOid == RelationGetRelid(heapRel) &&
+		if (tupleid != NULL &&
+			partOid == RelationGetRelid(heapRel) &&
 			ItemPointerEquals(&index_scan->xs_heaptid, tupleid))
 			continue;
 
@@ -545,11 +556,12 @@ retry:
 
 		/*
 		 * If the conflicting tuple's inserter or deleter is still in
-		 * progress, wait for it and start over.
+		 * progress, wait for it and start over (unless told not to wait, in
+		 * which case it counts as a conflict).
 		 */
 		xwait = TransactionIdIsValid(DirtySnapshot.xmin) ?
 			DirtySnapshot.xmin : DirtySnapshot.xmax;
-		if (TransactionIdIsValid(xwait))
+		if (TransactionIdIsValid(xwait) && wait)
 		{
 			if (DirtySnapshot.speculativeToken)
 				SpeculativeInsertionWait(DirtySnapshot.xmin,
@@ -565,12 +577,46 @@ retry:
 		if (partRel != heapRel)
 			table_close(partRel, NoLock);
 		conflict = true;
+		*conflictPart = cand->partOid;
+		*conflictTid = tid;
 		break;
 	}
 	list_free_deep(candidates);
 
-	if (conflict)
+	table_close(parentRel, NoLock);
+	return conflict;
+}
+
+/* ----------------------------------------------------------------
+ *		ExecCheckGlobalIndexUnique
+ *
+ *		Enforce uniqueness for an entry just inserted into a UNIQUE global
+ *		partition index: raise a unique violation if another row has the same
+ *		key (see global_index_find_conflict()).  Two sessions inserting the
+ *		same key concurrently wait for each other, and one of them fails
+ *		(possibly with a deadlock error).
+ *
+ *		'heapRel' and 'tupleid' identify the new tuple itself, which is
+ *		skipped.  'newIndex' selects the error wording used while building
+ *		the index.  'indexInfo' must come from BuildGlobalIndexInfo(gidx,
+ *		heapRel), i.e. be mapped to heapRel's column layout.
+ * ----------------------------------------------------------------
+ */
+void
+ExecCheckGlobalIndexUnique(Relation gidx, IndexInfo *indexInfo,
+						   Relation heapRel, const ItemPointerData *tupleid,
+						   const Datum *values, const bool *isnull,
+						   EState *estate, bool newIndex)
+{
+	Oid			conflictPart;
+	ItemPointerData conflictTid;
+
+	if (global_index_find_conflict(gidx, indexInfo, heapRel, tupleid,
+								   values, isnull, estate, true,
+								   &conflictPart, &conflictTid))
 	{
+		Relation	parentRel = table_open(gidx->rd_index->indrelid,
+										   AccessShareLock);
 		char	   *key_desc = BuildIndexValueDescription(gidx, values, isnull);
 
 		if (newIndex)
@@ -593,8 +639,66 @@ retry:
 					 errtableconstraint(parentRel,
 										RelationGetRelationName(gidx))));
 	}
+}
 
-	table_close(parentRel, NoLock);
+/* ----------------------------------------------------------------
+ *		ExecCheckGlobalIndexConstraints
+ *
+ *		The ON CONFLICT pre-check for the parent's global indexes, the
+ *		counterpart of ExecCheckIndexConstraints() for a partition's own
+ *		indexes: check whether the row in 'slot', about to be inserted into
+ *		the partition of 'resultRelInfo', conflicts with an existing row in
+ *		any partition through a UNIQUE global index that is an arbiter
+ *		('arbiterIndexes' NIL means all of them).
+ *
+ *		Returns true if there is no conflict.  Otherwise returns false and
+ *		sets *conflictTid and *conflictPart to the conflicting row, which may
+ *		be in a different partition than the one being inserted into.  Rows
+ *		of transactions still in progress are waited for, as in
+ *		ExecCheckIndexConstraints().
+ * ----------------------------------------------------------------
+ */
+bool
+ExecCheckGlobalIndexConstraints(ResultRelInfo *resultRelInfo,
+								TupleTableSlot *slot, EState *estate,
+								ItemPointer conflictTid, Oid *conflictPart,
+								List *arbiterIndexes)
+{
+	Relation	heapRelation = resultRelInfo->ri_RelationDesc;
+	ExprContext *econtext = GetPerTupleExprContext(estate);
+
+	econtext->ecxt_scantuple = slot;
+
+	for (int gi = 0; gi < resultRelInfo->ri_NumGlobalIndices; gi++)
+	{
+		Relation	gidx = resultRelInfo->ri_GlobalIndexRelationDescs[gi];
+		IndexInfo  *ii = resultRelInfo->ri_GlobalIndexRelationInfo[gi];
+		Datum		values[INDEX_MAX_KEYS];
+		bool		isnull[INDEX_MAX_KEYS];
+
+		if (!gidx->rd_index->indisunique || !ii->ii_ReadyForInserts)
+			continue;
+		if (arbiterIndexes != NIL &&
+			!list_member_oid(arbiterIndexes, RelationGetRelid(gidx)))
+			continue;
+
+		/* A row outside a partial index's predicate cannot conflict on it */
+		if (ii->ii_Predicate != NIL)
+		{
+			if (ii->ii_PredicateState == NULL)
+				ii->ii_PredicateState = ExecPrepareQual(ii->ii_Predicate, estate);
+			if (!ExecQual(ii->ii_PredicateState, econtext))
+				continue;
+		}
+
+		FormIndexDatum(ii, slot, estate, values, isnull);
+		if (global_index_find_conflict(gidx, ii, heapRelation, NULL,
+									   values, isnull, estate, true,
+									   conflictPart, conflictTid))
+			return false;
+	}
+
+	return true;
 }
 
 /* ----------------------------------------------------------------
@@ -1127,9 +1231,37 @@ ExecInsertIndexTuples(ResultRelInfo *resultRelInfo,
 						 globalIdxInfo);
 
 			if (globalIdxRel->rd_index->indisunique)
-				ExecCheckGlobalIndexUnique(globalIdxRel, globalIdxInfo,
-										   heapRelation, tupleid,
-										   gvalues, gisnull, estate, false);
+			{
+				/*
+				 * During a speculative insertion (INSERT ... ON CONFLICT), a
+				 * conflict on an arbiter only flags *specConflict, without
+				 * waiting, so that ExecInsert() backs the tuple out and redoes
+				 * its pre-check, which then finds (and waits for) the other
+				 * row.  Upstream does the same for btree arbiters.
+				 */
+				if ((flags & EIIT_NO_DUPE_ERROR) &&
+					(arbiterIndexes == NIL ||
+					 list_member_oid(arbiterIndexes,
+									 RelationGetRelid(globalIdxRel))))
+				{
+					Oid			conflictPart;
+					ItemPointerData conflictTid;
+
+					if (global_index_find_conflict(globalIdxRel, globalIdxInfo,
+												   heapRelation, tupleid,
+												   gvalues, gisnull, estate,
+												   false, &conflictPart,
+												   &conflictTid))
+					{
+						Assert(specConflict != NULL);
+						*specConflict = true;
+					}
+				}
+				else
+					ExecCheckGlobalIndexUnique(globalIdxRel, globalIdxInfo,
+											   heapRelation, tupleid,
+											   gvalues, gisnull, estate, false);
+			}
 		}
 	}
 
@@ -1272,7 +1404,20 @@ ExecCheckIndexConstraints(ResultRelInfo *resultRelInfo, TupleTableSlot *slot,
 	}
 
 	if (arbiterIndexes != NIL && !checkedIndex)
-		elog(ERROR, "unexpected failure to find arbiter index");
+	{
+		/*
+		 * The arbiters may all be the parent's global indexes, which
+		 * ExecCheckGlobalIndexConstraints() checks instead.
+		 */
+		for (i = 0; i < resultRelInfo->ri_NumGlobalIndices; i++)
+		{
+			if (list_member_oid(arbiterIndexes,
+								RelationGetRelid(resultRelInfo->ri_GlobalIndexRelationDescs[i])))
+				checkedIndex = true;
+		}
+		if (!checkedIndex)
+			elog(ERROR, "unexpected failure to find arbiter index");
+	}
 
 	return true;
 }

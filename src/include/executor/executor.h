@@ -782,6 +782,11 @@ extern void ExecCheckGlobalIndexUnique(Relation gidx, IndexInfo *indexInfo,
 									   const ItemPointerData *tupleid,
 									   const Datum *values, const bool *isnull,
 									   EState *estate, bool newIndex);
+extern bool ExecCheckGlobalIndexConstraints(ResultRelInfo *resultRelInfo,
+											TupleTableSlot *slot, EState *estate,
+											ItemPointer conflictTid,
+											Oid *conflictPart,
+											List *arbiterIndexes);
 
 /*
  * prototypes from functions in execReplication.c

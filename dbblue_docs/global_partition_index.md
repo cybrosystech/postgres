@@ -223,6 +223,34 @@ same key into different partitions at the same moment can see each other and
 wait on each other. One of them gets `deadlock_detected` instead of
 `unique_violation`.
 
+### 5.3a INSERT … ON CONFLICT
+
+A global unique index can be an ON CONFLICT arbiter (`ON CONFLICT (cols)`,
+`ON CONSTRAINT name`, or none for `DO NOTHING`).
+
+* **Planner** (`infer_arbiter_indexes`, `plancat.c`): global indexes are
+  candidates; their columns are matched without the trailing partition key.
+* **Partition setup** (`ExecInitPartitionInfo`, `execPartition.c`): a global
+  arbiter has no copy in the partition, so it stays in the partition's arbiter
+  list as is.
+* **Pre-check** (`ExecInsert`, `nodeModifyTable.c`): after the partition's own
+  arbiters (`ExecCheckIndexConstraints`), `ExecCheckGlobalIndexConstraints()`
+  looks for the key across all partitions, waiting for in-progress inserters,
+  and returns the conflicting row's partition and TID.
+* **Conflict in another partition**: `ExecGetGlobalConflictPartition()` routes
+  the conflicting row to get that partition's `ResultRelInfo`, with its ON
+  CONFLICT projections, RETURNING and RLS, and converts the proposed row
+  (`EXCLUDED`) to its layout. The unchanged `ExecOnConflictUpdate` /
+  `ExecOnConflictSelect` / DO NOTHING code then locks, checks `WHERE`, updates
+  or returns that row. A DO UPDATE that changes the partition key is refused
+  ("invalid ON UPDATE specification"), as upstream.
+* **Speculative insertion**: if no conflict was found, the row is inserted
+  speculatively. In `ExecInsertIndexTuples` a global arbiter then only flags
+  `specConflict`, without waiting (`global_index_find_conflict(…, wait = false)`).
+  `ExecInsert` backs the row out and redoes the pre-check, which waits for the
+  other row. This is the same protocol upstream uses for btree arbiters, which
+  is why concurrent upserts neither fail nor deadlock.
+
 ### 5.4 HOT updates
 
 An UPDATE runs on the leaf partition, whose own index list doesn't include the
@@ -308,13 +336,13 @@ in the test).
 | Hierarchy | One level only. No sub-partitioned or foreign-table partitions, neither before nor after the global index exists |
 | Index type | btree only. Deduplication disabled |
 | Constraints | No PRIMARY KEY, EXCLUDE or DEFERRABLE global constraints |
-| `INSERT … ON CONFLICT` | A global index is never an arbiter. `ON CONFLICT (col)` fails with "no unique or exclusion constraint matching", and **`ON CONFLICT DO NOTHING` without a target raises `unique_violation`** instead of skipping |
+| `INSERT … ON CONFLICT` | Supported since 2026-10-01 for `DO NOTHING`, `DO UPDATE` and `DO SELECT`, with `ON CONFLICT (cols)`, `ON CONSTRAINT` or no target. The conflicting row may be in another partition; it is updated where it is. As upstream, a `DO UPDATE` that would move the row to another partition is refused. Only when inserting through the partitioned parent; a global index is not an arbiter for an `INSERT` straight into a partition |
 | Foreign keys | A global unique index cannot be the referenced key of an FK |
 | Concurrency of DDL | No `CREATE INDEX CONCURRENTLY` and no `REINDEX CONCURRENTLY` |
 | Scans | Serial Index Scan only: no Index Only, bitmap or parallel scans. **UPDATE/DELETE and `SELECT … FOR UPDATE` never use a global index** and fall back to per-partition scans (a seq scan when no local index exists) |
 | Display | `\d` doesn't mark the index GLOBAL. `pg_class.reltuples` of the index stays `-1` after ANALYZE |
 | Cost | Build is ~10× slower than a local index (row-by-row inserts); ATTACH/DETACH/DROP/TRUNCATE/VACUUM FULL of a partition rewrite the whole global index and block writes to all partitions meanwhile (see §5.6, §9) |
-| `dbblue_partition` | The extension itself never creates global indexes. Existing unique indexes become per-partition (template) indexes; global ones come from later Odoo DDL |
+| `dbblue_partition` | Since 1.1, `dbblue_partition_undo` recreates indexes and unique constraints added after the conversion as ordinary ones on the restored table. The extension itself never creates global indexes. Existing unique indexes become per-partition (template) indexes; global ones come from later Odoo DDL |
 
 ---
 
@@ -327,9 +355,9 @@ in the test).
 | `src/include/nodes/parsenodes.h`, `pathnodes.h`, `execnodes.h` | `IndexStmt.global`, `IndexOptInfo.indglobal`, `ResultRelInfo.ri_*GlobalIndex*` |
 | `src/backend/commands/indexcmds.c` | auto-conversion, guards, trailing key, flags |
 | `src/backend/catalog/index.c` | metapage, build/backfill, attach/detach/resync, REINDEX, `IndexGlobalNumUserKeys`, `BuildGlobalIndexInfo` |
-| `src/backend/executor/execIndexing.c` | routing, insert maintenance, `ExecCheckGlobalIndexUnique` |
+| `src/backend/executor/execIndexing.c` | routing, insert maintenance, `ExecCheckGlobalIndexUnique`, ON CONFLICT pre-check `ExecCheckGlobalIndexConstraints` |
 | `src/backend/executor/nodeIndexscan.c` | routed index scan |
-| `src/backend/executor/nodeModifyTable.c`, `execPartition.c`, `execReplication.c`, `commands/copyfrom.c` | open and maintain global indexes for partitions |
+| `src/backend/executor/nodeModifyTable.c`, `execPartition.c`, `execReplication.c`, `commands/copyfrom.c` | open and maintain global indexes for partitions; ON CONFLICT through a global arbiter (`ExecGetGlobalConflictPartition`) |
 | `src/backend/optimizer/path/allpaths.c`, `indxpath.c`, `plan/planner.c`, `util/plancat.c` | planning global index paths on the parent |
 | `src/backend/access/nbtree/nbtree.c`, `nbtinsert.c`, `access/index/genam.c`, `include/access/genam.h` | routing-aware bulk delete, no deletion passes, error key text |
 | `src/backend/access/nbtree/nbtsort.c`, `include/access/nbtree.h` | `_bt_global_collect` / `_bt_global_load`: copy surviving entries and write them as a sorted build into new storage |
@@ -337,6 +365,7 @@ in the test).
 | `src/backend/access/heap/vacuumlazy.c` | VACUUM of a leaf cleans the parent's global indexes |
 | `src/backend/commands/tablecmds.c`, `repack.c` | partition lifecycle and rewrites |
 | `src/backend/utils/cache/relcache.c` | HOT-blocking columns from the parent's global indexes |
+| `src/bin/pg_dump/pg_dump.c`, `pg_dump.h` | constraints on a global index are dumped with their own columns only (`indnconkeyattrs`) |
 | `src/backend/utils/adt/ruleutils.c`, `parser/parse_utilcmd.c` | `pg_get_indexdef`/`constraintdef`, `LIKE … INCLUDING INDEXES` |
 | `src/backend/catalog/system_views.sql` | `pg_stat_*_indexes` include global indexes |
 | `src/backend/utils/misc/guc_parameters.dat`, `guc_tables.c` | `dbblue_auto_global_index` |
@@ -352,15 +381,15 @@ Severity is from an Odoo production point of view.
 | 1 | **Fixed** | Rolling back DETACH, DROP partition or TRUNCATE (of a partition or the parent) **deletes index entries permanently** | `BEGIN; TRUNCATE part; ROLLBACK;` → entries 3000 → 1906, lookups miss rows, uniqueness lost. `TRUNCATE parent` + rollback → 0 entries | `IndexGlobalDetachPartition` bulk-deletes immediately, which is not transactional. **Fixed 2026-10-01**: the index is rewritten into new storage, which a rollback discards (§5.6). Regression test `global_partition_index` |
 | 2 | **Fixed** | A failed or rolled-back ATTACH leaves its backfilled entries behind. Re-attaching duplicates them; if it's never re-attached they become permanent orphans | attach fails or rolls back, then attach again → the row is returned twice, `bt_index_check`: "item order invariant violated" | `IndexGlobalAttachPartition` inserts without first purging. **Fixed 2026-10-01**: same rewrite; a failed or rolled-back ATTACH leaves nothing, and a re-attach drops leftovers first |
 | 3 | **Fixed** | `ALTER TABLE … ALTER COLUMN … TYPE` on a column of a global index **when no rewrite is needed** (e.g. `varchar(50)` → `varchar(80)`) crashes the backend on cassert builds (all sessions reset). On release builds it reads out of bounds | `ALTER TABLE d ALTER COLUMN code TYPE varchar(80);` → `TRAP: Assert("old_natts == numberOfAttributes")`, `indexcmds.c:296` | **Fixed 2026-10-01**: `CheckIndexCompatible` compares only `IndexGlobalNumUserKeys()` columns (and rebuilds instead of asserting if the counts differ). A compatible change reuses the index storage. Covered by the regression test |
-| 4 | **High** | **pg_dump loses global UNIQUE constraints.** It writes `ADD CONSTRAINT … UNIQUE (name, company_id, create_date)`, so the restore creates a per-partition constraint and cross-partition uniqueness is silently gone | dump + restore → `sale_order_name_uniq` is `UNIQUE (name, company_id, create_date)`, `indglobal = f` | `pg_dump.c` (`dumpConstraint`, ~line 18891) lists all `indnkeyattrs` columns. Make pg_dump global-aware (user keys only), or use `pg_get_constraintdef()`. `CREATE UNIQUE INDEX GLOBAL` statements are dumped correctly |
-| 5 | Medium | `INSERT … ON CONFLICT DO NOTHING` (no target) raises `unique_violation` on a global-index conflict | see §6 | global indexes aren't considered as arbiters |
-| 6 | Medium | Concurrent inserts of the same key can fail with `deadlock_detected` instead of `unique_violation`, and each one costs `deadlock_timeout` | 8 sessions × 400 inserts on 300 keys: 6 deadlocks, 6.2 s vs 0.2 s for a plain table. No duplicates | insert-then-check design (§5.3). Apps that retry only on unique_violation won't retry |
-| 7 | Medium | `dbblue_partition_undo` drops unique indexes that Odoo added after partitioning | undo after the Odoo-upgrade flow → only the conversion-time indexes come back | the undo procedure restores the captured index set only |
+| 4 | **Fixed** | **pg_dump loses global UNIQUE constraints.** It writes `ADD CONSTRAINT … UNIQUE (name, company_id, create_date)`, so the restore creates a per-partition constraint and cross-partition uniqueness is silently gone | dump + restore → `sale_order_name_uniq` is `UNIQUE (name, company_id, create_date)`, `indglobal = f` | **Fixed 2026-10-01**: `getIndexes` reads the constraint's own column count (`array_length(pg_constraint.conkey, 1)`) and `dumpConstraint` lists only those columns, so the dump says `UNIQUE (name, company_id)`; on restore DBblue auto-converts it to a valid global index again. Output for ordinary constraints is byte-identical. A database restored from an older dump keeps an invalid, empty constraint: find it with `SELECT conrelid::regclass, conname FROM pg_constraint c JOIN pg_index i ON i.indexrelid = c.conindid WHERE NOT i.indisvalid`, then drop and re-add it |
+| 5 | **Fixed** | `INSERT … ON CONFLICT DO NOTHING` (no target) raises `unique_violation` on a global-index conflict | see §6 | **Fixed 2026-10-01**: global indexes are ON CONFLICT arbiters (see §5.3a). Concurrency verified: 8 sessions × 500 upserts on 50 keys, 0 errors, 0 deadlocks, no lost updates |
+| 6 | Medium | Concurrent inserts of the same key can fail with `deadlock_detected` instead of `unique_violation`, and each one costs `deadlock_timeout` | 8 sessions × 400 inserts on 300 keys: 6 deadlocks, 6.2 s vs 0.2 s for a plain table. No duplicates | insert-then-check design (§5.3). Apps that retry only on unique_violation won't retry. Does not apply to `INSERT … ON CONFLICT`, whose speculative insertion reports a conflict without waiting |
+| 7 | **Fixed** | `dbblue_partition_undo` drops unique indexes that Odoo added after partitioning | undo after the Odoo-upgrade flow → only the conversion-time indexes come back | **Fixed 2026-10-05** in `dbblue_partition` 1.1 (`dbblue_partition--1.0--1.1.sql`): undo records the indexes and unique/PK/exclusion constraints that exist on the partitioned table but not on the backup, and recreates them on the restored table as ordinary objects (constraints as constraints, `GLOBAL` / `ON ONLY` dropped), with their comments. The conversion's own `_fkuq` indexes are skipped. Existing databases: `ALTER EXTENSION dbblue_partition UPDATE` |
 | 8 | Low | UPDATE/DELETE/FOR UPDATE by a globally indexed column seq-scan every partition | `EXPLAIN UPDATE d … WHERE code = 'x'` | planner restriction (§5.5) |
 | 9 | Low | Confusing messages: CONCURRENTLY prints the auto-convert NOTICE and then fails; a hash GLOBAL index says "does not support multicolumn indexes"; a failed ATTACH says "could not create unique index" | — | cosmetic |
 | 10 | Low | `\d` doesn't show GLOBAL; `reltuples` stays -1; stale comments (`INCLUDE'd partition key` in `nodeIndexscan.c`/`allpaths.c`, "starts empty" in `indexcmds.c:1371`) | — | cosmetic |
 
-Bugs 1, 2 and 3 are fixed. On a database that ran an older build, `REINDEX INDEX <global index>` removes damage they may have left (REINDEX rebuilds from the partitions' heaps).
+Bugs 1–4 are fixed. On a database that ran an older build, `REINDEX INDEX <global index>` removes damage they may have left (REINDEX rebuilds from the partitions' heaps).
 
 ---
 

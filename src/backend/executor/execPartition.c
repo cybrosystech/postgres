@@ -871,12 +871,28 @@ ExecInitPartitionInfo(ModifyTableState *mtstate, EState *estate,
 			list_free(unparented_idxs);
 			list_free(arbiters_listidxs);
 			list_free(ancestors_seen);
+
+			/*
+			 * A global index arbiter has no counterpart in the partition; it
+			 * stays an arbiter as is, checked by ExecCheckGlobalIndexConstraints()
+			 * and ExecInsertIndexTuples() through the parent's global indexes,
+			 * which ExecOpenIndices() opened for the partition.
+			 */
+			for (int gi = 0; gi < leaf_part_rri->ri_NumGlobalIndices; gi++)
+			{
+				Oid			gidxoid =
+					RelationGetRelid(leaf_part_rri->ri_GlobalIndexRelationDescs[gi]);
+
+				if (list_member_oid(rootResultRelInfo->ri_onConflictArbiterIndexes,
+									gidxoid))
+					arbiterIndexes = lappend_oid(arbiterIndexes, gidxoid);
+			}
 		}
 
 		/*
 		 * We expect to find as many arbiter indexes on this partition as the
-		 * root has, plus however many "additional arbiters" (to wit: those
-		 * being concurrently rebuilt) we found.
+		 * root has (global arbiters included), plus however many "additional
+		 * arbiters" (to wit: those being concurrently rebuilt) we found.
 		 */
 		if (list_length(rootResultRelInfo->ri_onConflictArbiterIndexes) !=
 			list_length(arbiterIndexes) - additional_arbiters)

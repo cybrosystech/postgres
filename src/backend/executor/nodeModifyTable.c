@@ -54,6 +54,7 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
+#include "access/table.h"
 #include "access/tableam.h"
 #include "access/tupconvert.h"
 #include "access/xact.h"
@@ -73,6 +74,7 @@
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/injection_point.h"
+#include "utils/lsyscache.h"
 #include "utils/pg_audit.h"
 #include "utils/rangetypes.h"
 #include "utils/rel.h"
@@ -853,6 +855,116 @@ ExecGetUpdateNewTuple(ResultRelInfo *relinfo,
 }
 
 /* ----------------------------------------------------------------
+ *		ExecGetGlobalConflictPartition
+ *
+ *		INSERT ... ON CONFLICT with a global partition index as arbiter: the
+ *		conflicting row found by ExecCheckGlobalIndexConstraints() can be in
+ *		partition 'partOid', other than the one the new row is routed to
+ *		('resultRelInfo').  DO UPDATE / DO SELECT / DO NOTHING act on that
+ *		row, so they need that partition's ResultRelInfo, with its ON
+ *		CONFLICT, RETURNING and RLS state: route the conflicting row itself to
+ *		get it, the same way any inserted row gets its partition's.
+ *
+ *		*excluded is set to the proposed row ('slot', the EXCLUDED
+ *		pseudo-relation) in that partition's column layout, which the
+ *		partition's ON CONFLICT expressions expect; *tofree to a slot the
+ *		caller must drop once done with *excluded, or NULL.
+ *
+ *		Returns NULL if the conflicting row has gone in the meantime; the
+ *		caller then retries from its pre-check.
+ * ----------------------------------------------------------------
+ */
+static ResultRelInfo *
+ExecGetGlobalConflictPartition(ModifyTableContext *context,
+							   ResultRelInfo *resultRelInfo,
+							   Oid partOid, ItemPointer conflictTid,
+							   TupleTableSlot *slot,
+							   TupleTableSlot **excluded,
+							   TupleTableSlot **tofree)
+{
+	ModifyTableState *mtstate = context->mtstate;
+	EState	   *estate = context->estate;
+	ResultRelInfo *rootRelInfo = resultRelInfo->ri_RootResultRelInfo;
+	TupleDesc	rootDesc;
+	Relation	partRel;
+	TupleTableSlot *existing;
+	TupleTableSlot *rootslot;
+	TupleConversionMap *map;
+	TupleConversionMap *toRoot;
+	TupleConversionMap *toPart;
+	ResultRelInfo *partInfo;
+
+	*excluded = slot;
+	*tofree = NULL;
+
+	if (rootRelInfo == NULL || mtstate->mt_partition_tuple_routing == NULL)
+		elog(ERROR, "ON CONFLICT through a global index requires tuple routing");
+	rootDesc = RelationGetDescr(rootRelInfo->ri_RelationDesc);
+
+	/* Fetch the conflicting row, and route it to find its partition */
+	partRel = table_open(partOid, RowExclusiveLock);
+	existing = table_slot_create(partRel, NULL);
+	if (!table_tuple_fetch_row_version(partRel, conflictTid, SnapshotAny,
+									   existing))
+	{
+		ExecDropSingleTupleTableSlot(existing);
+		table_close(partRel, NoLock);
+		return NULL;
+	}
+
+	map = convert_tuples_by_name(RelationGetDescr(partRel), rootDesc);
+	rootslot = existing;
+	if (map != NULL)
+	{
+		rootslot = MakeSingleTupleTableSlot(rootDesc, &TTSOpsVirtual);
+		execute_attr_map_slot(map->attrMap, existing, rootslot);
+	}
+	partInfo = ExecFindPartition(mtstate, rootRelInfo,
+								 mtstate->mt_partition_tuple_routing,
+								 rootslot, estate);
+	if (map != NULL)
+	{
+		ExecDropSingleTupleTableSlot(rootslot);
+		free_conversion_map(map);
+	}
+	ExecDropSingleTupleTableSlot(existing);
+	table_close(partRel, NoLock);
+
+	/* Only a partition being detached concurrently is routed elsewhere */
+	if (RelationGetRelid(partInfo->ri_RelationDesc) != partOid)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("conflicting row is in partition \"%s\", which is being detached",
+						get_rel_name(partOid))));
+
+	/* EXCLUDED in the conflicting partition's layout, by way of the root's */
+	toRoot = ExecGetChildToRootMap(resultRelInfo);
+	toPart = ExecGetRootToChildMap(partInfo, estate);
+	if (toRoot != NULL || toPart != NULL)
+	{
+		TupleTableSlot *r = slot;
+
+		if (toRoot != NULL)
+		{
+			r = MakeSingleTupleTableSlot(rootDesc, &TTSOpsVirtual);
+			execute_attr_map_slot(toRoot->attrMap, slot, r);
+			*tofree = r;
+		}
+		if (toPart != NULL)
+		{
+			*excluded = partInfo->ri_PartitionTupleSlot;
+			execute_attr_map_slot(toPart->attrMap, r, *excluded);
+			/* the values are copied into the partition's slot */
+			ExecMaterializeSlot(*excluded);
+		}
+		else
+			*excluded = r;
+	}
+
+	return partInfo;
+}
+
+/* ----------------------------------------------------------------
  *		ExecInsert
  *
  *		For INSERT, we have to insert the tuple into the target relation
@@ -1130,7 +1242,9 @@ ExecInsert(ModifyTableContext *context,
 			  resultRelInfo->ri_TrigDesc->trig_insert_before_row)))
 			ExecPartitionCheck(resultRelInfo, slot, estate, true);
 
-		if (onconflict != ONCONFLICT_NONE && resultRelInfo->ri_NumIndices > 0)
+		if (onconflict != ONCONFLICT_NONE &&
+			(resultRelInfo->ri_NumIndices > 0 ||
+			 resultRelInfo->ri_NumGlobalIndices > 0))
 		{
 			/* Perform a speculative insertion. */
 			uint32		specToken;
@@ -1138,6 +1252,7 @@ ExecInsert(ModifyTableContext *context,
 			ItemPointerData invalidItemPtr;
 			bool		specConflict;
 			List	   *arbiterIndexes;
+			Oid			conflictPart;
 
 			ItemPointerSetInvalid(&invalidItemPtr);
 			arbiterIndexes = resultRelInfo->ri_onConflictArbiterIndexes;
@@ -1158,10 +1273,40 @@ ExecInsert(ModifyTableContext *context,
 	vlock:
 			CHECK_FOR_INTERRUPTS();
 			specConflict = false;
+
+			/*
+			 * Check the partition's own arbiter indexes, then the parent's
+			 * global ones.  A conflict through a global index can be with a
+			 * row in another partition.
+			 */
+			conflictPart = RelationGetRelid(resultRelationDesc);
 			if (!ExecCheckIndexConstraints(resultRelInfo, slot, estate,
 										   &conflictTid, &invalidItemPtr,
-										   arbiterIndexes))
+										   arbiterIndexes) ||
+				(resultRelInfo->ri_NumGlobalIndices > 0 &&
+				 !ExecCheckGlobalIndexConstraints(resultRelInfo, slot, estate,
+												  &conflictTid, &conflictPart,
+												  arbiterIndexes)))
 			{
+				ResultRelInfo *conflictRelInfo = resultRelInfo;
+				TupleTableSlot *excludedSlot = slot;
+				TupleTableSlot *tofree = NULL;
+
+				/*
+				 * The conflicting row is in another partition: act on it
+				 * through that partition's ResultRelInfo.
+				 */
+				if (conflictPart != RelationGetRelid(resultRelationDesc))
+				{
+					conflictRelInfo =
+						ExecGetGlobalConflictPartition(context, resultRelInfo,
+													   conflictPart,
+													   &conflictTid, slot,
+													   &excludedSlot, &tofree);
+					if (conflictRelInfo == NULL)
+						goto vlock; /* the row went away, check again */
+				}
+
 				/* committed conflict tuple found */
 				if (onconflict == ONCONFLICT_UPDATE)
 				{
@@ -1172,10 +1317,14 @@ ExecInsert(ModifyTableContext *context,
 					 * tuple.
 					 */
 					TupleTableSlot *returning = NULL;
+					bool		done;
 
-					if (ExecOnConflictUpdate(context, resultRelInfo,
-											 &conflictTid, slot, canSetTag,
-											 &returning))
+					done = ExecOnConflictUpdate(context, conflictRelInfo,
+												&conflictTid, excludedSlot,
+												canSetTag, &returning);
+					if (tofree)
+						ExecDropSingleTupleTableSlot(tofree);
+					if (done)
 					{
 						InstrCountTuples2(&mtstate->ps, 1);
 						return returning;
@@ -1192,10 +1341,14 @@ ExecInsert(ModifyTableContext *context,
 					 * concurrent UPDATE/DELETE to the conflict tuple.
 					 */
 					TupleTableSlot *returning = NULL;
+					bool		done;
 
-					if (ExecOnConflictSelect(context, resultRelInfo,
-											 &conflictTid, slot, canSetTag,
-											 &returning))
+					done = ExecOnConflictSelect(context, conflictRelInfo,
+												&conflictTid, excludedSlot,
+												canSetTag, &returning);
+					if (tofree)
+						ExecDropSingleTupleTableSlot(tofree);
+					if (done)
 					{
 						InstrCountTuples2(&mtstate->ps, 1);
 						return returning;
@@ -1217,8 +1370,10 @@ ExecInsert(ModifyTableContext *context,
 					 * ExecGetReturningSlot() in the DO NOTHING case...
 					 */
 					Assert(onconflict == ONCONFLICT_NOTHING);
-					ExecCheckTIDVisible(estate, resultRelInfo, &conflictTid,
-										ExecGetReturningSlot(estate, resultRelInfo));
+					ExecCheckTIDVisible(estate, conflictRelInfo, &conflictTid,
+										ExecGetReturningSlot(estate, conflictRelInfo));
+					if (tofree)
+						ExecDropSingleTupleTableSlot(tofree);
 					InstrCountTuples2(&mtstate->ps, 1);
 					return NULL;
 				}
