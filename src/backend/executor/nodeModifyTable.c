@@ -863,7 +863,9 @@ ExecGetUpdateNewTuple(ResultRelInfo *relinfo,
  *		('resultRelInfo').  DO UPDATE / DO SELECT / DO NOTHING act on that
  *		row, so they need that partition's ResultRelInfo, with its ON
  *		CONFLICT, RETURNING and RLS state: route the conflicting row itself to
- *		get it, the same way any inserted row gets its partition's.
+ *		get it, the same way any inserted row gets its partition's.  An
+ *		INSERT directly into a partition (no routing) gets a plain
+ *		ResultRelInfo instead, which DO NOTHING is all it can need.
  *
  *		*excluded is set to the proposed row ('slot', the EXCLUDED
  *		pseudo-relation) in that partition's column layout, which the
@@ -897,10 +899,6 @@ ExecGetGlobalConflictPartition(ModifyTableContext *context,
 	*excluded = slot;
 	*tofree = NULL;
 
-	if (rootRelInfo == NULL || mtstate->mt_partition_tuple_routing == NULL)
-		elog(ERROR, "ON CONFLICT through a global index requires tuple routing");
-	rootDesc = RelationGetDescr(rootRelInfo->ri_RelationDesc);
-
 	/* Fetch the conflicting row, and route it to find its partition */
 	partRel = table_open(partOid, RowExclusiveLock);
 	existing = table_slot_create(partRel, NULL);
@@ -911,6 +909,23 @@ ExecGetGlobalConflictPartition(ModifyTableContext *context,
 		table_close(partRel, NoLock);
 		return NULL;
 	}
+
+	/*
+	 * An INSERT directly into a partition has no tuple routing.  Only ON
+	 * CONFLICT DO NOTHING without a conflict target gets here then (a target
+	 * is never inferred to a parent's global index), and it uses the
+	 * conflicting partition only to check the row's visibility: any
+	 * ResultRelInfo for it will do.  The partition stays locked.
+	 */
+	if (rootRelInfo == NULL || mtstate->mt_partition_tuple_routing == NULL)
+	{
+		Assert(((ModifyTable *) mtstate->ps.plan)->onConflictAction ==
+			   ONCONFLICT_NOTHING);
+		ExecDropSingleTupleTableSlot(existing);
+		table_close(partRel, NoLock);
+		return ExecGetTriggerResultRel(estate, partOid, NULL);
+	}
+	rootDesc = RelationGetDescr(rootRelInfo->ri_RelationDesc);
 
 	map = convert_tuples_by_name(RelationGetDescr(partRel), rootDesc);
 	rootslot = existing;
