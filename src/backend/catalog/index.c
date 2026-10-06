@@ -826,7 +826,10 @@ BuildGlobalIndexInfo(Relation gidx, Relation partRel)
  * only rows of plain leaf partitions can be: a sub-partitioned table's rows
  * are in partitions of its own (which don't maintain the parent's global
  * indexes), and a foreign table's rows are not stored here at all.  Refuse
- * such partitions rather than silently leaving their rows unindexed.
+ * such partitions rather than silently leaving their rows unindexed.  An
+ * unlogged partition is refused too: crash recovery empties it, but its
+ * entries in the (logged) global index would remain and could later be
+ * matched against new rows at the same TIDs.
  */
 static void
 gpi_check_partition_supported(Relation parentRel, Relation partRel)
@@ -843,6 +846,15 @@ gpi_check_partition_supported(Relation parentRel, Relation partRel)
 						RelationGetRelationName(partRel),
 						RelationGetRelationName(parentRel)),
 				 errdetail("Global indexes support only plain partitions.")));
+
+	/* crash recovery empties an unlogged table, but not the global index */
+	if (partRel->rd_rel->relpersistence == RELPERSISTENCE_UNLOGGED)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot use unlogged table \"%s\" as a partition of \"%s\", which has a global index",
+						RelationGetRelationName(partRel),
+						RelationGetRelationName(parentRel)),
+				 errdetail("After a crash an unlogged table is emptied, but its entries in the global index would remain.")));
 }
 
 /*
@@ -2000,9 +2012,25 @@ index_create_percona(Relation heapRelation,
 			if (create_storage)
 			{
 				write_global_index_metapage(indexRelation);
-				if ((flags & INDEX_CREATE_GLOBAL_NOFILL) == 0 &&
-					build_global_index(heapRelation, indexRelation))
-					gpi_mark_checkxmin(indexRelationId);
+				if ((flags & INDEX_CREATE_GLOBAL_NOFILL) == 0)
+				{
+					if (build_global_index(heapRelation, indexRelation))
+						gpi_mark_checkxmin(indexRelationId);
+				}
+				else
+				{
+					/* not built here, but the partitions must still qualify */
+					PartitionDesc partdesc = RelationGetPartitionDesc(heapRelation, true);
+
+					for (int k = 0; k < partdesc->nparts; k++)
+					{
+						Relation	partRel = table_open(partdesc->oids[k],
+														 AccessShareLock);
+
+						gpi_check_partition_supported(heapRelation, partRel);
+						table_close(partRel, NoLock);
+					}
+				}
 			}
 
 			/*

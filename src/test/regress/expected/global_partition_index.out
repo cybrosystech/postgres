@@ -375,6 +375,63 @@ SELECT k, tableoid::regclass FROM gpi_s WHERE k >= 'X';
 RESET enable_seqscan;
 RESET enable_bitmapscan;
 DROP TABLE gpi_s;
+-- SET ACCESS METHOD on a partitioned table rewrites no partition, so it must
+-- not make an index added in the same command skip its build (the global
+-- index was left empty, a partitioned index's children without storage)
+CREATE TABLE gpi_am (id int NOT NULL, k int NOT NULL, d date NOT NULL) PARTITION BY RANGE (d);
+CREATE TABLE gpi_am_y2023 PARTITION OF gpi_am FOR VALUES FROM ('2023-01-01') TO ('2024-01-01');
+CREATE TABLE gpi_am_y2024 PARTITION OF gpi_am FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+INSERT INTO gpi_am SELECT g, g, '2023-01-01'::date + g * 2 FROM generate_series(1, 300) g;
+INSERT INTO gpi_am VALUES (301, 5, '2024-12-01');	-- k = 5 is in both partitions
+SET client_min_messages = warning;
+ALTER TABLE gpi_am SET ACCESS METHOD heap, ADD CONSTRAINT gpi_am_k_key UNIQUE (k);	-- fails
+ERROR:  could not create unique index "gpi_am_k_key"
+DETAIL:  Key (k)=(5) is duplicated.
+DELETE FROM gpi_am WHERE id = 301;
+ALTER TABLE gpi_am SET ACCESS METHOD heap, ADD CONSTRAINT gpi_am_k_key UNIQUE (k),
+  ADD CONSTRAINT gpi_am_kd_key UNIQUE (k, d);
+RESET client_min_messages;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT id, d FROM gpi_am WHERE k = 250;
+ id  |     d      
+-----+------------
+ 250 | 05-15-2024
+(1 row)
+
+SELECT id FROM gpi_am WHERE k = 250 AND d = '2024-05-15';
+ id  
+-----
+ 250
+(1 row)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+INSERT INTO gpi_am VALUES (302, 7, '2024-12-01');	-- fails
+ERROR:  duplicate key value violates unique constraint "gpi_am_k_key"
+DETAIL:  Key (k)=(7) already exists.
+DROP TABLE gpi_am;
+-- Unlogged partitions are refused: crash recovery empties them, but not the
+-- global index
+CREATE TABLE gpi_ul (id int NOT NULL, d date NOT NULL) PARTITION BY RANGE (d);
+CREATE TABLE gpi_ul_y2023 PARTITION OF gpi_ul FOR VALUES FROM ('2023-01-01') TO ('2024-01-01');
+CREATE UNLOGGED TABLE gpi_ul_y2024 (id int NOT NULL, d date NOT NULL);
+ALTER TABLE gpi_ul ATTACH PARTITION gpi_ul_y2024 FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+CREATE UNIQUE INDEX GLOBAL gpi_ul_id_key ON gpi_ul (id);		-- fails
+ERROR:  cannot use unlogged table "gpi_ul_y2024" as a partition of "gpi_ul", which has a global index
+DETAIL:  After a crash an unlogged table is emptied, but its entries in the global index would remain.
+ALTER TABLE gpi_ul DETACH PARTITION gpi_ul_y2024;
+CREATE UNIQUE INDEX GLOBAL gpi_ul_id_key ON gpi_ul (id);
+CREATE UNLOGGED TABLE gpi_ul_y2025 PARTITION OF gpi_ul FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');	-- fails
+ERROR:  cannot create unlogged table "gpi_ul_y2025" as a partition of "gpi_ul", which has a global index
+DETAIL:  After a crash an unlogged table is emptied, but its entries in the global index would remain.
+ALTER TABLE gpi_ul ATTACH PARTITION gpi_ul_y2024 FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');	-- fails
+ERROR:  cannot use unlogged table "gpi_ul_y2024" as a partition of "gpi_ul", which has a global index
+DETAIL:  After a crash an unlogged table is emptied, but its entries in the global index would remain.
+ALTER TABLE gpi_ul_y2023 SET UNLOGGED;	-- fails
+ERROR:  cannot change partition "gpi_ul_y2023" to unlogged because "gpi_ul" has a global index
+DETAIL:  After a crash an unlogged table is emptied, but its entries in the global index would remain.
+DROP TABLE gpi_ul, gpi_ul_y2024;
 -- INSERT ... ON CONFLICT with a global index as arbiter: the conflicting row
 -- can be in another partition than the one the new row is routed to
 SELECT gpi_reset();

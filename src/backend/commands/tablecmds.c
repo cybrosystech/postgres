@@ -1392,6 +1392,14 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 									RelationGetRelationName(rel),
 									RelationGetRelationName(parent)),
 							 errdetail("Global indexes support only plain partitions.")));
+				/* crash recovery would empty it, but not the global index */
+				if (rel->rd_rel->relpersistence == RELPERSISTENCE_UNLOGGED)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("cannot create unlogged table \"%s\" as a partition of \"%s\", which has a global index",
+									RelationGetRelationName(rel),
+									RelationGetRelationName(parent)),
+							 errdetail("After a crash an unlogged table is emptied, but its entries in the global index would remain.")));
 				has_global_index = true;
 				index_close(idxRel, AccessShareLock);
 				continue;
@@ -9997,6 +10005,7 @@ ATExecAddIndex(AlteredTableInfo *tab, Relation rel,
 	bool		check_rights;
 	bool		skip_build;
 	bool		quiet;
+	int			rewrite;
 	ObjectAddress address;
 
 	Assert(IsA(stmt, IndexStmt));
@@ -10007,8 +10016,18 @@ ATExecAddIndex(AlteredTableInfo *tab, Relation rel,
 
 	/* suppress schema rights check when rebuilding existing index */
 	check_rights = !is_rebuild;
-	/* skip index build if phase 3 will do it or we're reusing an old one */
-	skip_build = tab->rewrite > 0 || RelFileNumberIsValid(stmt->oldNumber);
+	/*
+	 * skip index build if phase 3 will do it or we're reusing an old one.
+	 *
+	 * SET ACCESS METHOD on a partitioned table only changes its catalog
+	 * entry: no partition is rewritten, so nothing would build the index (a
+	 * partitioned index's children would be left without even a metapage,
+	 * and a global index empty).
+	 */
+	rewrite = tab->rewrite;
+	if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+		rewrite &= ~AT_REWRITE_ACCESS_METHOD;
+	skip_build = rewrite > 0 || RelFileNumberIsValid(stmt->oldNumber);
 	/* suppress notices when rebuilding existing index */
 	quiet = is_rebuild;
 
@@ -19916,6 +19935,39 @@ ATPrepChangePersistence(AlteredTableInfo *tab, Relation rel, bool toLogged)
 				/* nothing to do */
 				return;
 			break;
+	}
+
+	/*
+	 * An unlogged partition is emptied by crash recovery, but its entries in
+	 * the parent's global indexes (which are logged) would remain.
+	 */
+	if (!toLogged && rel->rd_rel->relispartition)
+	{
+		Oid			parentOid = get_partition_parent(RelationGetRelid(rel), false);
+		Relation	parent = table_open(parentOid, AccessShareLock);
+		List	   *idxlist = RelationGetIndexList(parent);
+
+		foreach_oid(idxoid, idxlist)
+		{
+			HeapTuple	idxtup = SearchSysCache1(INDEXRELID,
+												 ObjectIdGetDatum(idxoid));
+			bool		global;
+
+			if (!HeapTupleIsValid(idxtup))
+				elog(ERROR, "cache lookup failed for index %u", idxoid);
+			global = ((Form_pg_index) GETSTRUCT(idxtup))->indglobal;
+			ReleaseSysCache(idxtup);
+
+			if (global)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("cannot change partition \"%s\" to unlogged because \"%s\" has a global index",
+								RelationGetRelationName(rel),
+								RelationGetRelationName(parent)),
+						 errdetail("After a crash an unlogged table is emptied, but its entries in the global index would remain.")));
+		}
+		list_free(idxlist);
+		table_close(parent, AccessShareLock);
 	}
 
 	/*
