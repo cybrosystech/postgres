@@ -9005,10 +9005,6 @@ apply_scanjoin_target_to_paths(PlannerInfo *root,
 				((IndexPath *) path)->indexinfo->indglobal)
 				global_index_paths = lappend(global_index_paths, path);
 		}
-		foreach(lc, global_index_paths)
-		{
-			elog(LOG, "saved global index path: %s", nodeToString(lfirst(lc)));
-		}
 
 		rel->pathlist = NIL;
 	}

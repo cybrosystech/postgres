@@ -263,6 +263,17 @@ INSERT INTO gpi_wv (token, d) VALUES ('a', '2024-09-01') ON CONFLICT DO NOTHING;
 INSERT INTO gpi_wv (token, d) VALUES ('a', '2024-10-01')
 	ON CONFLICT (token) DO SELECT RETURNING token, visits, tableoid::regclass;
 SELECT token, visits, seen, d, tableoid::regclass FROM gpi_wv ORDER BY token;
+-- an INSERT directly into a partition has no tuple routing: DO NOTHING still
+-- skips a row whose duplicate is in a sibling partition
+INSERT INTO gpi_wv_y2024 (token, d) VALUES ('a', '2024-11-01') ON CONFLICT DO NOTHING;
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+INSERT INTO gpi_wv_y2024 (token, d) VALUES ('a', '2024-11-01'), ('d', '2024-11-01'),
+	('c', '2024-11-01') ON CONFLICT DO NOTHING RETURNING token;
+COMMIT;
+INSERT INTO gpi_wv_y2024 (token, d) VALUES ('a', '2024-11-01');	-- fails
+INSERT INTO gpi_wv_y2024 (token, d) VALUES ('a', '2024-11-01')
+	ON CONFLICT (token) DO NOTHING;	-- fails, no arbiter on the partition
+SELECT token, tableoid::regclass FROM gpi_wv ORDER BY token;
 DROP TABLE gpi_wv;
 
 DROP TABLE gpi;
