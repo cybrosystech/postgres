@@ -1359,6 +1359,7 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 		Relation	parent;
 		List	   *idxlist;
 		ListCell   *cell;
+		bool		has_global_index = false;
 
 		/* Already have strong enough lock on the parent */
 		parent = table_open(parentId, NoLock);
@@ -1391,6 +1392,7 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 									RelationGetRelationName(rel),
 									RelationGetRelationName(parent)),
 							 errdetail("Global indexes support only plain partitions.")));
+				has_global_index = true;
 				index_close(idxRel, AccessShareLock);
 				continue;
 			}
@@ -1430,6 +1432,20 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 		}
 
 		list_free(idxlist);
+
+		/*
+		 * A global index may still hold entries that route to this new
+		 * partition's key range: a row of the DEFAULT partition that was
+		 * deleted but not vacuumed yet, or an orphan of a partition dropped
+		 * through a dependency.  Now that the range belongs to this
+		 * partition, such an entry would be matched against whatever row of
+		 * the new partition sits at the same TID, and a range scan would
+		 * return that row twice.  The partition is still empty, so every
+		 * entry that routes to it is stale: drop them, as ATTACH PARTITION
+		 * does (the index is rewritten, so this is undone on rollback).
+		 */
+		if (has_global_index)
+			IndexGlobalAttachPartition(parent, rel);
 
 		/*
 		 * If there are any row-level triggers, clone them to the new

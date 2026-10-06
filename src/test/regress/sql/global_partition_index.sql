@@ -172,6 +172,27 @@ INSERT INTO gpi VALUES (99001, '2025-06-06', 'C10');	-- duplicate code
 ALTER TABLE gpi ALTER COLUMN code TYPE text;
 SELECT gpi_check('gpi');
 
+-- CREATE TABLE ... PARTITION OF must not adopt stale entries: a deleted, not
+-- yet vacuumed row of the DEFAULT partition leaves an entry that would route
+-- to a partition created later for its range and match the new partition's
+-- row at the same TID (a range scan returned it twice)
+CREATE TABLE gpi_s (id int NOT NULL, k text NOT NULL, d date NOT NULL) PARTITION BY RANGE (d);
+CREATE TABLE gpi_s_y2023 PARTITION OF gpi_s FOR VALUES FROM ('2023-01-01') TO ('2024-01-01');
+CREATE TABLE gpi_s_def PARTITION OF gpi_s DEFAULT WITH (autovacuum_enabled = off);
+SET client_min_messages = warning;
+CREATE UNIQUE INDEX gpi_s_k_key ON gpi_s (k);
+RESET client_min_messages;
+INSERT INTO gpi_s VALUES (1, 'X', '2024-06-01');	-- goes to DEFAULT
+DELETE FROM gpi_s WHERE k = 'X';
+CREATE TABLE gpi_s_y2024 PARTITION OF gpi_s FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+INSERT INTO gpi_s VALUES (2, 'Y', '2024-03-03');	-- first row of the new partition
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT k, tableoid::regclass FROM gpi_s WHERE k >= 'X';
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+DROP TABLE gpi_s;
+
 -- INSERT ... ON CONFLICT with a global index as arbiter: the conflicting row
 -- can be in another partition than the one the new row is routed to
 SELECT gpi_reset();
