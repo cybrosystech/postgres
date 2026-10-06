@@ -34,6 +34,7 @@
  */
 #include "postgres.h"
 
+#include <math.h>
 #include <sys/file.h>
 #include <unistd.h>
 
@@ -9274,7 +9275,8 @@ ClearAllSoftPins(void)
  * database, relid is the regclass of the relation, so the pin status of a
  * table can be read directly; it is NULL for other databases or when the
  * filenode cannot be mapped (e.g. a relation dropped since).  Indexes show
- * up as their own rows, as the pinner pins each index separately.
+ * up as their own rows, as the pinner pins each index separately.  size_mb
+ * is buffers * BLCKSZ in megabytes, rounded to two decimals.
  *
  * Reads the buffer pool without a consistent snapshot, so counts are
  * approximate while pinning or eviction is going on.
@@ -9342,8 +9344,8 @@ dbblue_pinned_buffers(PG_FUNCTION_ARGS)
 	hash_seq_init(&seq, counts);
 	while ((ent = (PinnedBufEntry *) hash_seq_search(&seq)) != NULL)
 	{
-		Datum		values[5];
-		bool		nulls[5] = {false};
+		Datum		values[6];
+		bool		nulls[6] = {false};
 		Oid			relid = InvalidOid;
 
 		if (ent->key.dbOid == MyDatabaseId)
@@ -9357,6 +9359,9 @@ dbblue_pinned_buffers(PG_FUNCTION_ARGS)
 			nulls[2] = true;
 		values[3] = Int32GetDatum((int32) ent->key.tier);
 		values[4] = Int64GetDatum(ent->buffers);
+		/* buffers are BLCKSZ pages; report the memory they use, in MB */
+		values[5] = Float8GetDatum(floor((double) ent->buffers * BLCKSZ /
+										 (1024.0 * 1024.0) * 100.0 + 0.5) / 100.0);
 
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}
