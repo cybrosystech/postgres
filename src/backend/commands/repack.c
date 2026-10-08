@@ -761,6 +761,16 @@ check_index_is_clusterable(Relation OldHeap, Oid indexOid, LOCKMODE lockmode)
 						RelationGetRelationName(OldIndex),
 						RelationGetRelationName(OldHeap))));
 
+	/*
+	 * A global index orders the rows of all partitions together; there is no
+	 * order of one partition's heap to follow.
+	 */
+	if (OldIndex->rd_index->indglobal)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot cluster on global index \"%s\"",
+						RelationGetRelationName(OldIndex))));
+
 	/* Index AM must allow clustering */
 	if (!OldIndex->rd_indam->amclusterable)
 		ereport(ERROR,

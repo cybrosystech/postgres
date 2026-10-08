@@ -118,6 +118,8 @@ static Oid	ReindexTable(const ReindexStmt *stmt, const ReindexParams *params,
 static void ReindexMultipleTables(const ReindexStmt *stmt,
 								  const ReindexParams *params);
 static void reindex_error_callback(void *arg);
+static List *ReindexAddGlobalIndexes(List *list, Oid relid,
+									 const ReindexParams *params);
 static void ReindexPartitions(const ReindexStmt *stmt, Oid relid,
 							  const ReindexParams *params, bool isTopLevel);
 static void ReindexMultipleInternal(const ReindexStmt *stmt, const List *relids,
@@ -3587,11 +3589,26 @@ ReindexMultipleTables(const ReindexStmt *stmt, const ReindexParams *params)
 		Oid			relid = classtuple->oid;
 
 		/*
+		 * A partitioned table's own indexes are its global indexes, which no
+		 * leaf partition covers: process those (they are never catalogs).
+		 */
+		if (classtuple->relkind == RELKIND_PARTITIONED_TABLE &&
+			objectKind != REINDEX_OBJECT_SYSTEM &&
+			(classtuple->relpersistence != RELPERSISTENCE_TEMP ||
+			 isTempNamespace(classtuple->relnamespace)))
+		{
+			old = MemoryContextSwitchTo(private_context);
+			relids = ReindexAddGlobalIndexes(relids, relid, params);
+			MemoryContextSwitchTo(old);
+			continue;
+		}
+
+		/*
 		 * Only regular tables and matviews can have indexes, so ignore any
 		 * other kind of relation.
 		 *
 		 * Partitioned tables/indexes are skipped but matching leaf partitions
-		 * are processed.
+		 * are processed (and the global indexes of partitioned tables, above).
 		 */
 		if (classtuple->relkind != RELKIND_RELATION &&
 			classtuple->relkind != RELKIND_MATVIEW)
@@ -3719,10 +3736,60 @@ reindex_error_callback(void *arg)
 }
 
 /*
+ * ReindexAddGlobalIndexes
+ *
+ * Append to 'list' the global indexes of partitioned table 'relid'.  They are
+ * btrees on the partitioned table itself, so reindexing its partitions does
+ * not cover them.  They cannot be rebuilt concurrently: with CONCURRENTLY,
+ * warn and skip them instead.
+ */
+static List *
+ReindexAddGlobalIndexes(List *list, Oid relid, const ReindexParams *params)
+{
+	Relation	pg_index;
+	SysScanDesc scan;
+	ScanKeyData key;
+	HeapTuple	tuple;
+	bool		concurrent;
+
+	/* a temporary table is reindexed non-concurrently anyway */
+	concurrent = (params->options & REINDEXOPT_CONCURRENTLY) != 0 &&
+		get_rel_persistence(relid) != RELPERSISTENCE_TEMP;
+
+	ScanKeyInit(&key, Anum_pg_index_indrelid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(relid));
+	pg_index = table_open(IndexRelationId, AccessShareLock);
+	scan = systable_beginscan(pg_index, IndexIndrelidIndexId, true,
+							  NULL, 1, &key);
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		Form_pg_index index = (Form_pg_index) GETSTRUCT(tuple);
+
+		if (!index->indglobal)
+			continue;
+
+		if (concurrent)
+			ereport(WARNING,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cannot reindex global index \"%s.%s\" concurrently, skipping",
+							get_namespace_name(get_rel_namespace(index->indexrelid)),
+							get_rel_name(index->indexrelid)),
+					 errhint("Use REINDEX INDEX without CONCURRENTLY.")));
+		else
+			list = lappend_oid(list, index->indexrelid);
+	}
+	systable_endscan(scan);
+	table_close(pg_index, AccessShareLock);
+
+	return list;
+}
+
+/*
  * ReindexPartitions
  *
  * Reindex a set of partitions, per the partitioned index or table given
- * by the caller.
+ * by the caller.  For a partitioned table, its global indexes are reindexed
+ * too.
  */
 static void
 ReindexPartitions(const ReindexStmt *stmt, Oid relid, const ReindexParams *params, bool isTopLevel)
@@ -3780,6 +3847,14 @@ ReindexPartitions(const ReindexStmt *stmt, Oid relid, const ReindexParams *param
 		Oid			partoid = lfirst_oid(lc);
 		char		partkind = get_rel_relkind(partoid);
 		MemoryContext old_context;
+
+		/* A partitioned table's global indexes are no partition's indexes */
+		if (partkind == RELKIND_PARTITIONED_TABLE)
+		{
+			old_context = MemoryContextSwitchTo(reindex_context);
+			partitions = ReindexAddGlobalIndexes(partitions, partoid, params);
+			MemoryContextSwitchTo(old_context);
+		}
 
 		/*
 		 * This discards partitioned tables, partitioned indexes and foreign

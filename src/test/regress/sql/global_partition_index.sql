@@ -276,6 +276,31 @@ INSERT INTO gpi_wv_y2024 (token, d) VALUES ('a', '2024-11-01')
 SELECT token, tableoid::regclass FROM gpi_wv ORDER BY token;
 DROP TABLE gpi_wv;
 
+-- REINDEX of a partitioned table (or of its schema) rebuilds its global
+-- indexes too, which no partition covers; CONCURRENTLY cannot rebuild them
+-- and says so.  CLUSTER cannot follow a global index's order.
+CREATE SCHEMA gpi_rx;
+CREATE TABLE gpi_rx.t (id int NOT NULL, d date NOT NULL) PARTITION BY RANGE (d);
+CREATE TABLE gpi_rx.t_y2023 PARTITION OF gpi_rx.t FOR VALUES FROM ('2023-01-01') TO ('2024-01-01');
+CREATE TABLE gpi_rx.t_y2024 PARTITION OF gpi_rx.t FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+INSERT INTO gpi_rx.t SELECT g, '2023-01-01'::date + g FROM generate_series(1, 500) g;
+CREATE UNIQUE INDEX GLOBAL gpi_rx_id_key ON gpi_rx.t (id);
+CREATE INDEX gpi_rx_d_idx ON gpi_rx.t (d);
+SELECT relfilenode AS gpi_rx_file FROM pg_class WHERE relname = 'gpi_rx_id_key' \gset
+REINDEX TABLE gpi_rx.t;
+SELECT relfilenode <> :gpi_rx_file AS rebuilt FROM pg_class WHERE relname = 'gpi_rx_id_key';
+SELECT relfilenode AS gpi_rx_file FROM pg_class WHERE relname = 'gpi_rx_id_key' \gset
+REINDEX SCHEMA gpi_rx;
+SELECT relfilenode <> :gpi_rx_file AS rebuilt FROM pg_class WHERE relname = 'gpi_rx_id_key';
+SELECT relfilenode AS gpi_rx_file FROM pg_class WHERE relname = 'gpi_rx_id_key' \gset
+REINDEX TABLE CONCURRENTLY gpi_rx.t;
+REINDEX SCHEMA CONCURRENTLY gpi_rx;
+SELECT relfilenode = :gpi_rx_file AS untouched FROM pg_class WHERE relname = 'gpi_rx_id_key';
+CLUSTER gpi_rx.t USING gpi_rx_id_key;	-- fails
+CLUSTER gpi_rx.t USING gpi_rx_d_idx;
+INSERT INTO gpi_rx.t VALUES (7, '2024-06-06');	-- fails
+DROP SCHEMA gpi_rx CASCADE;
+
 DROP TABLE gpi;
 DROP FUNCTION gpi_check(regclass);
 DROP FUNCTION gpi_reset();
