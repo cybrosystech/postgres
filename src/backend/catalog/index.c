@@ -1305,8 +1305,9 @@ IndexGlobalResyncPartition(Relation partRel)
 	if (!partRel->rd_rel->relispartition)
 		return;
 
+	/* a detach-pending partition still has entries in the global indexes */
 	parentRel = table_open(get_partition_parent(RelationGetRelid(partRel),
-												false),
+												true),
 						   AccessShareLock);
 	gpi_rewrite_parent_indexes(parentRel,
 							   list_make1_oid(RelationGetRelid(partRel)),
@@ -1333,7 +1334,7 @@ IndexGlobalResyncPartitions(List *partOids)
 	{
 		if (get_rel_relispartition(partOid))
 			parents = list_append_unique_oid(parents,
-											 get_partition_parent(partOid, false));
+											 get_partition_parent(partOid, true));
 	}
 
 	foreach_oid(parentOid, parents)
@@ -1345,7 +1346,7 @@ IndexGlobalResyncPartitions(List *partOids)
 		foreach_oid(partOid, partOids)
 		{
 			if (get_rel_relispartition(partOid) &&
-				get_partition_parent(partOid, false) == parentOid)
+				get_partition_parent(partOid, true) == parentOid)
 			{
 				removeOids = lappend_oid(removeOids, partOid);
 				addRels = lappend(addRels, table_open(partOid, NoLock));
