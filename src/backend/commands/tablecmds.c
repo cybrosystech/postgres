@@ -1843,7 +1843,8 @@ RemoveRelations(DropStmt *drop)
 
 			if (drel->rd_rel->relispartition)
 			{
-				Oid			parentOid = get_partition_parent(relOid, false);
+				/* a detach-pending partition's entries are still there too */
+				Oid			parentOid = get_partition_parent(relOid, true);
 				Relation	parentRel = table_open(parentOid, AccessShareLock);
 
 				IndexGlobalDetachPartition(parentRel, drel);
@@ -19934,7 +19935,7 @@ ATPrepChangePersistence(AlteredTableInfo *tab, Relation rel, bool toLogged)
 	 */
 	if (!toLogged && rel->rd_rel->relispartition)
 	{
-		Oid			parentOid = get_partition_parent(RelationGetRelid(rel), false);
+		Oid			parentOid = get_partition_parent(RelationGetRelid(rel), true);
 		Relation	parent = table_open(parentOid, AccessShareLock);
 		List	   *idxlist = RelationGetIndexList(parent);
 

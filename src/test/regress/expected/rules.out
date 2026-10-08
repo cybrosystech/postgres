@@ -1815,7 +1815,7 @@ pg_stat_all_indexes| SELECT c.oid AS relid,
      JOIN pg_index x ON ((c.oid = x.indrelid)))
      JOIN pg_class i ON ((i.oid = x.indexrelid)))
      LEFT JOIN pg_namespace n ON ((n.oid = c.relnamespace)))
-  WHERE (c.relkind = ANY (ARRAY['r'::"char", 't'::"char", 'm'::"char"]));
+  WHERE ((c.relkind = ANY (ARRAY['r'::"char", 't'::"char", 'm'::"char"])) OR ((c.relkind = 'p'::"char") AND x.indglobal));
 pg_stat_all_tables| SELECT c.oid AS relid,
     n.nspname AS schemaname,
     c.relname,
@@ -2516,7 +2516,7 @@ pg_statio_all_indexes| SELECT c.oid AS relid,
      JOIN pg_index x ON ((c.oid = x.indrelid)))
      JOIN pg_class i ON ((i.oid = x.indexrelid)))
      LEFT JOIN pg_namespace n ON ((n.oid = c.relnamespace)))
-  WHERE (c.relkind = ANY (ARRAY['r'::"char", 't'::"char", 'm'::"char"]));
+  WHERE ((c.relkind = ANY (ARRAY['r'::"char", 't'::"char", 'm'::"char"])) OR ((c.relkind = 'p'::"char") AND x.indglobal));
 pg_statio_all_sequences| SELECT c.oid AS relid,
     n.nspname AS schemaname,
     c.relname,
