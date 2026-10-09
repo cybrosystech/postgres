@@ -1466,6 +1466,47 @@ innerrel_is_unique(PlannerInfo *root,
 }
 
 /*
+ * innerrel_is_unique_for_clauses
+ *	  Like innerrel_is_unique(), but proves uniqueness *only* from the given
+ *	  restrictlist, consulting and updating no cache.  (dbblue-specific.)
+ *
+ * innerrel_is_unique() cannot answer this question.  Its positive cache is
+ * keyed only by (innerrel, outerrelids) and is matched with bms_is_subset(),
+ * so a "unique" result that the join search proved earlier from the *full*
+ * joinrestrictinfo (joinpath.c, computing extra->inner_unique) is returned
+ * immediately for any later inquiry about the same rels -- including one that
+ * passes a narrower clause list.  A caller asking "is the inner rel unique
+ * with respect to *these particular* clauses?" would therefore get a false
+ * positive whenever uniqueness actually depended on a clause outside its list.
+ *
+ * dbblue's groupjoin fusion needs exactly that narrower question: the inner
+ * rel must be unique with respect to the *hash* clauses alone, because those
+ * are what determine which build tuples land in a bucket together.  A build
+ * side made unique by some non-hashable join qual would still put two rows in
+ * one bucket under the same key, and the fused aggregate would be silently
+ * wrong.  So we go straight to the prover and skip the cache entirely -- we
+ * also must not write to it, since a negative proved from a subset of the
+ * clauses says nothing about the full list.
+ */
+bool
+innerrel_is_unique_for_clauses(PlannerInfo *root,
+							   Relids joinrelids,
+							   Relids outerrelids,
+							   RelOptInfo *innerrel,
+							   JoinType jointype,
+							   List *restrictlist)
+{
+	if (restrictlist == NIL)
+		return false;
+
+	if (!rel_supports_distinctness(root, innerrel))
+		return false;
+
+	return is_innerrel_unique_for(root, joinrelids, outerrelids, innerrel,
+								  jointype, restrictlist, NULL);
+}
+
+/*
  * innerrel_is_unique_ext
  *	  Do the same as innerrel_is_unique(), but also set to (*extra_clauses)
  *	  additional clauses from a baserestrictinfo list used to prove the

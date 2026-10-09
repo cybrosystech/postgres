@@ -23,6 +23,7 @@
 #include "access/sysattr.h"
 #include "access/table.h"
 #include "catalog/pg_aggregate.h"
+#include "catalog/pg_constraint.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
@@ -60,6 +61,9 @@
 #include "rewrite/rewriteManip.h"
 #include "utils/acl.h"
 #include "utils/backend_status.h"
+#include "access/htup_details.h"
+#include "utils/array.h"
+#include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/selfuncs.h"
@@ -252,6 +256,20 @@ static void add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 									  const AggClauseCosts *agg_costs,
 									  grouping_sets_data *gd,
 									  GroupPathExtraData *extra);
+static HashPath *find_cheapest_hash_join_path(RelOptInfo *input_rel);
+static bool extract_hashclause_key_pairs(HashPath *hpath,
+										 List **build_vars, List **probe_vars);
+static bool groupjoin_keys_match(PlannerInfo *root, HashPath *hpath,
+								 List **build_vars, List **probe_vars);
+static bool hashjoin_is_pure_equijoin(HashPath *hpath);
+static bool probe_side_provably_total(PlannerInfo *root, HashPath *hpath,
+									  List *build_vars, List *probe_vars);
+static void try_add_hashgroupjoin_path(PlannerInfo *root,
+									   RelOptInfo *input_rel,
+									   RelOptInfo *grouped_rel,
+									   const AggClauseCosts *agg_costs,
+									   List *havingQual,
+									   double dNumGroups);
 static RelOptInfo *create_partial_grouping_paths(PlannerInfo *root,
 												 RelOptInfo *grouped_rel,
 												 RelOptInfo *input_rel,
@@ -7554,6 +7572,16 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 									 havingQual,
 									 agg_costs,
 									 dNumGroups));
+
+			/*
+			 * dbblue: also consider fusing that hashed aggregation into the
+			 * hash join below it, if there is one and the fusion is provably
+			 * safe.  This is the one point in planning where both the
+			 * finished join paths and the PK-reduced grouping clause are in
+			 * hand at once.
+			 */
+			try_add_hashgroupjoin_path(root, input_rel, grouped_rel,
+									   agg_costs, havingQual, dNumGroups);
 		}
 
 		/*
@@ -7584,6 +7612,787 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 	 */
 	if (grouped_rel->partial_pathlist != NIL)
 		gather_grouping_paths(root, grouped_rel);
+}
+
+/*
+ * dbblue: compile-time gate for the groupjoin executor.
+ *
+ * The executor is complete and has run real production-shaped queries
+ * correctly -- nodeHashgroupjoin.c implements build/probe/emit, multiple
+ * batches, and rescan, all validated against stock output.  This symbol is
+ * no longer standing in for missing functionality; what it now guards
+ * against is an accidental *regression* of that gate itself.
+ *
+ * It stays a compile-time symbol rather than a GUC so that no runtime
+ * setting -- dbblue_enable_groupjoin included -- can ever reach path
+ * construction with a build where this is undefined: the #else branch below
+ * (try_add_hashgroupjoin_path()) is the fail-closed fallback for exactly
+ * that case, logging once at DEBUG1 and silently declining to add the path,
+ * rather than adding a path with nothing behind it. Concretely, that
+ * matters during a future rebase onto a newer PostgreSQL release: if this
+ * #define were ever dropped or commented out by mistake in the process,
+ * the feature would quietly stop firing instead of crashing or -- worse --
+ * running an unproven path. Removing this gate entirely (folding its one
+ * remaining branch away) is reasonable once the feature has been stable
+ * through a couple of rebases; until then, leave it defined.
+ */
+#define DBBLUE_GROUPJOIN_EXECUTOR_READY
+
+/*
+ * find_cheapest_hash_join_path
+ *		Return the cheapest-total HashPath in input_rel's pathlist, or NULL.
+ *
+ * We look for a HashPath rather than just taking cheapest_total_path because
+ * the cheapest path overall may well be a merge or nestloop join; fusing is
+ * only possible over a hash join, and a slightly-more-expensive hash join
+ * that can absorb the aggregation may still beat the cheapest join plus a
+ * separate HashAgg.  add_path() makes the final call either way.
+ */
+static HashPath *
+find_cheapest_hash_join_path(RelOptInfo *input_rel)
+{
+	HashPath   *best = NULL;
+	ListCell   *lc;
+
+	foreach(lc, input_rel->pathlist)
+	{
+		Path	   *path = (Path *) lfirst(lc);
+
+		/*
+		 * The planner may have wrapped the join in a ProjectionPath to
+		 * compute grouped_rel's eventual output tlist (e.g. when that tlist
+		 * needs a column combination the join's own reltarget doesn't
+		 * already provide).  That projection is irrelevant to us: we build
+		 * our own output tlist directly from grouped_rel->reltarget (see
+		 * create_hashgroupjoin_path()), never from the wrapped path's own
+		 * pathtarget, so unwrapping and looking at the join underneath is
+		 * exactly as good as if the projection were never there.
+		 */
+		while (IsA(path, ProjectionPath))
+			path = ((ProjectionPath *) path)->subpath;
+
+		if (!IsA(path, HashPath))
+			continue;
+
+		/*
+		 * Parameterized paths depend on values from an outer rel, so they
+		 * cannot be the input of an aggregation here.
+		 */
+		if (path->param_info != NULL)
+			continue;
+
+		if (best == NULL ||
+			compare_path_costs(path, &best->jpath.path, TOTAL_COST) < 0)
+			best = (HashPath *) path;
+	}
+
+	return best;
+}
+
+/*
+ * extract_hashclause_key_pairs
+ *		For every hash clause, extract the plain-Var expression on the build
+ *		(inner) side and its counterpart on the probe (outer) side.
+ *
+ * Both sides are required to be bare Vars, not just the build side: the
+ * probe side needs to be a plain column too, both so it can be compared by
+ * equal() against GROUP BY expressions (groupjoin_keys_match) and so its
+ * relation/attribute can be looked up in pg_constraint
+ * (probe_side_provably_total).  This is slightly stricter than the join
+ * itself requires, but a hash clause between anything other than two plain
+ * columns is rare, and bailing on it is always safe.
+ *
+ * Returns false (with both lists left in an unspecified state) if any clause
+ * fails to reduce to a build-Var-equals-probe-Var comparison.
+ */
+static bool
+pull_build_side_varnos_walker(Node *node, Relids *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Var))
+	{
+		Var		   *var = (Var *) node;
+
+		if (var->varlevelsup == 0)
+			*context = bms_add_member(*context, var->varno);
+		return false;
+	}
+	return expression_tree_walker(node, pull_build_side_varnos_walker, context);
+}
+
+/*
+ * pull_build_side_varnos
+ *		Like pull_varnos(), but reports only the relids a Var actually reads
+ *		from (var->varno), never var->varnullingrels.
+ *
+ * pull_varnos() deliberately unions in a Var's varnullingrels -- the set of
+ * outer joins that might null it -- because most of its callers care about
+ * correctness of expression placement relative to outer joins.  Rule 2 in
+ * groupjoin_keys_match() cares about something narrower: which base relation
+ * an expression's *values* physically come from.  The build side of the very
+ * LEFT join being fused is, by definition, the nullable side, so an ordinary
+ * build column already accepted there as a bare Var (see the *build_vars
+ * membership check just above this one) carries a nullingrels bit for that
+ * same join -- using pull_varnos() directly would make it look, wrongly, as
+ * if it also reads from outside the build row, and reject every LEFT-join
+ * query this generalization exists to allow.  Confirmed live: 2026-09-17,
+ * "res_partner LEFT JOIN res_country, GROUP BY ..., res_country.name" failed
+ * Rule 2 this way even though the bare-Var form of the same column already
+ * passes it one check up.
+ */
+static Relids
+pull_build_side_varnos(Node *node)
+{
+	Relids		varnos = NULL;
+
+	(void) pull_build_side_varnos_walker(node, &varnos);
+	return varnos;
+}
+
+static bool
+extract_hashclause_key_pairs(HashPath *hpath, List **build_vars, List **probe_vars)
+{
+	Relids		innerrelids = hpath->jpath.innerjoinpath->parent->relids;
+	Relids		outerrelids = hpath->jpath.outerjoinpath->parent->relids;
+	ListCell   *lc;
+
+	*build_vars = NIL;
+	*probe_vars = NIL;
+
+	foreach(lc, hpath->path_hashclauses)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+		Expr	   *leftop,
+				   *rightop;
+		Expr	   *build_expr,
+				   *probe_expr;
+
+		if (!is_opclause(rinfo->clause))
+			return false;
+
+		leftop = (Expr *) get_leftop(rinfo->clause);
+		rightop = (Expr *) get_rightop(rinfo->clause);
+		if (leftop == NULL || rightop == NULL)
+			return false;
+
+		if (bms_is_subset(rinfo->right_relids, innerrelids) &&
+			bms_is_subset(rinfo->left_relids, outerrelids))
+		{
+			build_expr = rightop;
+			probe_expr = leftop;
+		}
+		else if (bms_is_subset(rinfo->left_relids, innerrelids) &&
+				bms_is_subset(rinfo->right_relids, outerrelids))
+		{
+			build_expr = leftop;
+			probe_expr = rightop;
+		}
+		else
+			return false;		/* clause doesn't split cleanly; bail */
+
+		if (!IsA(build_expr, Var) || !IsA(probe_expr, Var))
+			return false;		/* need plain columns on both sides */
+
+		*build_vars = lappend(*build_vars, build_expr);
+		*probe_vars = lappend(*probe_vars, probe_expr);
+	}
+
+	return (*build_vars != NIL);
+}
+
+/*
+ * groupjoin_keys_match
+ *		Precondition 1: the GROUP BY key set matches the join key.
+ *
+ * The fused hash table has one entry per *build tuple*, and an entry is what
+ * carries an accumulator.  So the grouping the operator actually performs is
+ * "one group per build tuple in a bucket".  For the query's GROUP BY to
+ * agree with that:
+ *
+ *	1. For every hash key, GROUP BY must contain it OR its probe-side echo
+ *	   (the two are provably interchangeable here -- see point 2).  If
+ *	   neither appeared (hash on (a,b), GROUP BY a alone), two build rows
+ *	   differing only in b would occupy separate entries and emit two groups
+ *	   where the query wants one.  A query is free to write either column;
+ *	   Odoo's own generated SQL, in fact, always writes the probe side's
+ *	   copy (its own FK column) rather than the dimension's key.
+ *
+ *	2. Any *other* GROUP BY column is safe to allow, but only if it cannot
+ *	   distinguish two rows that share a build entry -- i.e. it is either
+ *	   another column of the build row itself (functionally constant per
+ *	   entry, and already sitting right there in the stored tuple), or it is
+ *	   the probe side's own copy of a hash key (which the join condition
+ *	   forces to equal the build key for every row folded into that entry,
+ *	   so it carries no extra information).  Anything else -- an unrelated
+ *	   probe-side column -- really could vary within one build entry and is
+ *	   rejected, since honoring it would require splitting one entry into
+ *	   several, which this operator does not do.
+ *
+ * *build_vars and *probe_vars are set to the matched build/probe Var pairs
+ * (parallel lists) on success, for the caller to use in the probe-echo
+ * rewrite (createplan.c) and the LEFT-join safety proof below.  On failure
+ * their contents are unspecified.
+ *
+ * Comparison is by equal() on the bare expressions, which is conservative:
+ * an expression that is semantically equal but structurally different (say,
+ * wrapped in a RelabelType on one side) makes us bail rather than fuse.
+ * Bailing is always safe; the ordinary join-then-aggregate plan remains.
+ */
+static bool
+groupjoin_keys_match(PlannerInfo *root, HashPath *hpath,
+					 List **build_vars, List **probe_vars)
+{
+	Relids		innerrelids = hpath->jpath.innerjoinpath->parent->relids;
+	List	   *groupexprs;
+	ListCell   *lc;
+	ListCell   *lc2;
+
+	if (!extract_hashclause_key_pairs(hpath, build_vars, probe_vars))
+	{
+		if (dbblue_groupjoin_planner_only)
+			elog(LOG, "dbblue groupjoin: precondition bail at #2a (extract_hashclause_key_pairs)");
+		return false;
+	}
+
+	/*
+	 * Every build-side key must be a NOT NULL column of a base relation.
+	 *
+	 * This is not fussiness about NULL handling -- it closes a real hole.
+	 * The uniqueness proof (INV-1) comes from a unique index, and a unique
+	 * index permits any number of NULLs, because for *join* purposes NULL
+	 * keys never match.  GROUP BY does the opposite: it folds every NULL into
+	 * one group.  So a nullable unique key could put two build rows in the
+	 * table that GROUP BY considers one group, and the fused node would emit
+	 * two rows where the query wants one.
+	 *
+	 * There is no equivalent requirement on the probe side: a NULL probe key
+	 * is exactly what the reserved "unmatched" group (see
+	 * probe_side_provably_total() and nodeHashgroupjoin.c) exists to handle.
+	 */
+	foreach(lc, *build_vars)
+	{
+		Var		   *var = (Var *) lfirst(lc);
+		RelOptInfo *baserel;
+
+		if (var->varno <= 0 || var->varno >= root->simple_rel_array_size)
+		{
+			if (dbblue_groupjoin_planner_only)
+				elog(LOG, "dbblue groupjoin: precondition bail at #2b (build var varno range)");
+			return false;
+		}
+
+		baserel = root->simple_rel_array[var->varno];
+		if (baserel == NULL || baserel->reloptkind != RELOPT_BASEREL)
+		{
+			if (dbblue_groupjoin_planner_only)
+				elog(LOG, "dbblue groupjoin: precondition bail at #2c (build var not a base rel)");
+			return false;
+		}
+
+		if (var->varattno <= 0)
+		{
+			if (dbblue_groupjoin_planner_only)
+				elog(LOG, "dbblue groupjoin: precondition bail at #2d (whole-row/system column)");
+			return false;		/* whole-row or system column */
+		}
+
+		if (!bms_is_member(var->varattno, baserel->notnullattnums))
+		{
+			if (dbblue_groupjoin_planner_only)
+				elog(LOG, "dbblue groupjoin: precondition bail at #2e (build key not proven NOT NULL, attno=%d)",
+					 var->varattno);
+			return false;
+		}
+	}
+
+	/*
+	 * Must be compared against processed_groupClause, which has already been
+	 * through remove_useless_groupby_columns(); the raw parsed GROUP BY list
+	 * would still carry columns functionally dependent on the PK and would
+	 * spuriously fail this test.  (dbblue_groupjoin.md T1-2.)
+	 */
+	groupexprs = get_sortgrouplist_exprs(root->processed_groupClause,
+										 root->processed_tlist);
+
+	/*
+	 * 1. For every hash key, GROUP BY must contain the build column or its
+	 * probe-side echo -- see point 2's comment for why either is fine.
+	 */
+	forboth(lc, *build_vars, lc2, *probe_vars)
+	{
+		if (!list_member(groupexprs, lfirst(lc)) &&
+			!list_member(groupexprs, lfirst(lc2)))
+		{
+			if (dbblue_groupjoin_planner_only)
+				elog(LOG, "dbblue groupjoin: precondition bail at #2f (hash key not in GROUP BY)");
+			return false;
+		}
+	}
+
+	/*
+	 * 2. Every other GROUP BY column must be safe, per the comment above.
+	 *
+	 * "Safe" means every Var it reads belongs to the build relation, not just
+	 * IsA(ge, Var): an expression computed purely from build-side columns
+	 * (e.g. a jsonb translatable-field lookup, "dim.name ->> 'en_US'" --
+	 * Odoo's default shape for every joined dimension's display name from
+	 * 17.0 onward) cannot vary within one build entry any more than a bare
+	 * build column can, by the same argument the comment above makes.  Once
+	 * this was IsA(ge, Var) only, on the theory that the build side's plan
+	 * only ever projects raw columns; that turned out not to matter, because
+	 * the query's real output projection (aggstate's own tlist) is resolved
+	 * against the build plan by the same generic per-Var substitution any
+	 * ordinary join uses (set_join_references(), setrefs.c) -- it does not
+	 * require the whole expression to appear there as one targetlist entry,
+	 * only each Var inside it to be resolvable, which a raw build column
+	 * always is.  See extract_hashgroupjoin_grouping_cols() (createplan.c)
+	 * for the one place that DOES need the whole expression as a unit --
+	 * purely for EXPLAIN's "Group Key" text -- and how it degrades instead of
+	 * erroring when an expression isn't literally there.
+	 *
+	 * pull_build_side_varnos() (below) ignores the query's other levels by
+	 * design (it only counts a Var with varlevelsup == 0), so a subquery or
+	 * lateral reference nested inside ge cannot slip a relid from outside
+	 * this join in unnoticed.  An expression with no Vars at all (a constant)
+	 * is trivially safe too, and bms_is_subset(empty, anything) is true, so
+	 * it falls out of the same check without a separate case.
+	 */
+	foreach(lc, groupexprs)
+	{
+		Node	   *ge = (Node *) lfirst(lc);
+
+		if (list_member(*build_vars, ge))
+			continue;			/* a hash key itself */
+
+		if (list_member(*probe_vars, ge))
+			continue;			/* the probe's own copy of a hash key */
+
+		if (bms_is_subset(pull_build_side_varnos(ge), innerrelids))
+			continue;			/* reads only columns of the same build row */
+
+		if (dbblue_groupjoin_planner_only)
+			elog(LOG, "dbblue groupjoin: precondition bail at #2g (extra GROUP BY column reads outside build row): %s",
+				 nodeToString(ge));
+		return false;			/* could vary within one build entry; reject */
+	}
+
+	return true;
+}
+
+/*
+ * hashjoin_is_pure_equijoin
+ *		True if the join's ON condition is *exactly* the hash clauses -- no
+ *		extra quals of any kind.
+ *
+ * This matters for the LEFT-join safety proof below.  If there were an
+ * extra ON-clause qual, a probe row could have a perfectly valid, FK-backed
+ * key value and still end up unmatched because that extra qual rejected it
+ * -- a case this operator cannot handle (it has nowhere to put a probe row
+ * that hash-matched a real build entry but was then rejected; the reserved
+ * "unmatched" group is only for a NULL key, not this).  Requiring the hash
+ * clauses to be the *entire* condition rules that out: a NOT-NULL,
+ * FK-valid key is then unconditionally a match.
+ *
+ * As a side effect this also guarantees the plan carries no join-level
+ * otherquals: create_hashgroupjoin_plan() derives plan.qual entirely from
+ * joinrestrictinfo (see extract_actual_join_clauses() there), so if
+ * joinrestrictinfo is nothing but the hash clauses, plan.qual comes out
+ * empty too.  The executor's null-key fold (nodeHashgroupjoin.c) relies on
+ * that: it does not re-check plan.qual before folding a NULL-keyed probe row
+ * in, on the grounds that this precondition has already made it vacuous.
+ */
+static bool
+hashjoin_is_pure_equijoin(HashPath *hpath)
+{
+	return list_length(hpath->jpath.joinrestrictinfo) ==
+		list_length(hpath->path_hashclauses);
+}
+
+/*
+ * probe_side_provably_total
+ *		True if every hash-key pair (probe_var, build_var) is backed by a
+ *		currently-valid, enforced foreign key from probe_var's column into
+ *		build_var's column, AND the join has no extra quals beyond the hash
+ *		clauses (hashjoin_is_pure_equijoin()).
+ *
+ * Under both conditions, a JOIN_LEFT here can only ever be "unmatched" in
+ * one way: the probe key is NULL.  A non-NULL probe key is *guaranteed* by
+ * the foreign key to reference an existing build row, and with no extra
+ * quals to reject it, that reference is guaranteed to become a match.  So
+ * the only unmatched case the executor has to handle is the NULL-key one,
+ * which nodeHashgroupjoin.c handles with a single reserved accumulator
+ * (see ExecHashGroupJoinProbeOne) -- not the general "probe row matched
+ * nothing at all" problem this feature does not otherwise attempt.
+ *
+ * Deliberately not using root->fkey_list: it is built from
+ * RelationGetFKeyList(), which filters out constraints that are not
+ * *enforced* but does not check convalidated -- a constraint added with NOT
+ * VALID and never validated could have existing violating rows, which would
+ * break this proof.  We scan pg_constraint directly and require both flags.
+ *
+ * This is deliberately conservative about the match: if a constraint's
+ * columns are a superset or subset of our key columns, or the same columns
+ * under a different constraint arrangement, we reject rather than try to be
+ * clever about partial coverage.
+ */
+static bool
+probe_side_provably_total(PlannerInfo *root, HashPath *hpath,
+						  List *build_vars, List *probe_vars)
+{
+	int			nkeys = list_length(build_vars);
+	AttrNumber *build_attnums;
+	AttrNumber *probe_attnums;
+	Oid			build_relid,
+				probe_relid;
+	Relation	conrel;
+	SysScanDesc conscan;
+	ScanKeyData skey;
+	HeapTuple	htup;
+	bool		found = false;
+	int			i;
+	ListCell   *lc1,
+			   *lc2;
+
+	if (!hashjoin_is_pure_equijoin(hpath)) /* no extra ON clauses other than the hashkey*/
+		return false;
+
+	Assert(nkeys > 0 && nkeys == list_length(probe_vars));
+
+	/*
+	 * All build vars must share one relid and all probe vars another -- true
+	 * by construction (extract_hashclause_key_pairs draws them from a single
+	 * two-relation join), but let's not trust that silently.
+	 */
+	build_attnums = palloc_array(AttrNumber, nkeys);
+	probe_attnums = palloc_array(AttrNumber, nkeys);
+	build_relid = InvalidOid;
+	probe_relid = InvalidOid;
+
+	i = 0;
+	forboth(lc1, build_vars, lc2, probe_vars)
+	{
+		Var		   *bvar = lfirst_node(Var, lc1);
+		Var		   *pvar = lfirst_node(Var, lc2);
+		RangeTblEntry *brte,
+				   *prte;
+
+		if (bvar->varno <= 0 || bvar->varno >= root->simple_rel_array_size ||
+			pvar->varno <= 0 || pvar->varno >= root->simple_rel_array_size)
+			return false;
+
+		brte = planner_rt_fetch(bvar->varno, root);
+		prte = planner_rt_fetch(pvar->varno, root);
+		if (brte->rtekind != RTE_RELATION || prte->rtekind != RTE_RELATION)
+			return false;
+
+		if (build_relid == InvalidOid)
+			build_relid = brte->relid;
+		else if (build_relid != brte->relid)
+			return false;		/* build side spans >1 relation; not v1 */
+
+		if (probe_relid == InvalidOid)
+			probe_relid = prte->relid;
+		else if (probe_relid != prte->relid)
+			return false;		/* probe side spans >1 relation; not v1 */
+
+		build_attnums[i] = bvar->varattno;
+		probe_attnums[i] = pvar->varattno;
+		i++;
+	}
+
+	if (build_attnums[0] <= 0 || probe_attnums[0] <= 0)
+		return false;			/* whole-row or system column, for nkeys==1 */
+	for (i = 0; i < nkeys; i++)
+	{
+		if (build_attnums[i] <= 0 || probe_attnums[i] <= 0)
+			return false;
+	}
+
+	/* Scan pg_constraint for a matching, validated, enforced FK. */
+	ScanKeyInit(&skey,
+			   Anum_pg_constraint_conrelid,
+			   BTEqualStrategyNumber, F_OIDEQ,
+			   ObjectIdGetDatum(probe_relid));
+
+	conrel = table_open(ConstraintRelationId, AccessShareLock);
+	conscan = systable_beginscan(conrel, ConstraintRelidTypidNameIndexId, true,
+								 NULL, 1, &skey);
+
+	while (!found && HeapTupleIsValid(htup = systable_getnext(conscan)))
+	{
+		Form_pg_constraint con = (Form_pg_constraint) GETSTRUCT(htup);
+		Datum		conkey_datum,
+					confkey_datum;
+		bool		isnull;
+		ArrayType  *conkey_arr,
+				   *confkey_arr;
+		int16	   *conkey_vals,
+				   *confkey_vals;
+		int			n;
+		bool		all_pairs_found;
+
+		if (con->contype != CONSTRAINT_FOREIGN)
+			continue;
+		if (con->confrelid != build_relid)
+			continue;
+		if (!con->convalidated || !con->conenforced)
+			continue;
+
+		conkey_datum = heap_getattr(htup, Anum_pg_constraint_conkey,
+									RelationGetDescr(conrel), &isnull);
+		if (isnull)
+			continue;
+		confkey_datum = heap_getattr(htup, Anum_pg_constraint_confkey,
+									 RelationGetDescr(conrel), &isnull);
+		if (isnull)
+			continue;
+
+		conkey_arr = DatumGetArrayTypeP(conkey_datum);
+		confkey_arr = DatumGetArrayTypeP(confkey_datum);
+		if (ARR_NDIM(conkey_arr) != 1 || ARR_NDIM(confkey_arr) != 1)
+			continue;
+
+		n = ARR_DIMS(conkey_arr)[0];
+		if (n != nkeys || ARR_DIMS(confkey_arr)[0] != nkeys)
+			continue;			/* not the same number of columns; reject */
+
+		conkey_vals = (int16 *) ARR_DATA_PTR(conkey_arr);
+		confkey_vals = (int16 *) ARR_DATA_PTR(confkey_arr);
+
+		/*
+		 * Every one of our (probe_attnum, build_attnum) pairs must appear
+		 * among the constraint's (conkey[j], confkey[j]) pairs, order
+		 * independent -- a multi-column FK's column order need not match
+		 * the order our hash clauses happened to be written in.
+		 */
+		all_pairs_found = true;
+		for (i = 0; i < nkeys && all_pairs_found; i++)
+		{
+			bool		pair_found = false;
+			int			j;
+
+			for (j = 0; j < n; j++)
+			{
+				if (conkey_vals[j] == probe_attnums[i] &&
+					confkey_vals[j] == build_attnums[i])
+				{
+					pair_found = true;
+					break;
+				}
+			}
+			if (!pair_found)
+				all_pairs_found = false;
+		}
+
+		if (all_pairs_found)
+			found = true;
+	}
+
+	systable_endscan(conscan);
+	table_close(conrel, AccessShareLock);
+
+	return found;
+}
+
+/*
+ * try_add_hashgroupjoin_path
+ *		Consider fusing a hash join in input_rel with the hashed aggregation
+ *		being added to grouped_rel.  (dbblue-specific.)
+ *
+ * Adds nothing unless the fusion is *proven* sound.  Every bail below returns
+ * silently: the ordinary join-then-aggregate paths have already been added by
+ * the caller and remain available, so failing to fuse costs only the chance
+ * of a speedup, never correctness.
+ *
+ * Every bail point here and in groupjoin_keys_match() also logs, under
+ * dbblue_groupjoin_planner_only, a numbered "precondition bail at #N" line
+ * identifying exactly which check declined the query -- there is no other
+ * way to find that out short of instrumenting the code by hand, which is how
+ * these numbers were discovered to be worth keeping (2026-09-17: a query
+ * that should have fused after a code change didn't, and manual instrumentation
+ * was the only way to find out it was #2g, not the change just made).  Numbers
+ * are not sequential across the two functions and are not a stable API --
+ * they exist to be grepped for during one debugging session, not to be
+ * depended on between releases.
+ */
+static void
+try_add_hashgroupjoin_path(PlannerInfo *root,
+						   RelOptInfo *input_rel,
+						   RelOptInfo *grouped_rel,
+						   const AggClauseCosts *agg_costs,
+						   List *havingQual,
+						   double dNumGroups)
+{
+	Query	   *parse = root->parse;
+	HashPath   *hpath;
+	GroupJoinPath *gjpath;
+	List	   *build_vars;
+	List	   *probe_vars;
+
+	/* Feature must be requested; both flags default off. */
+	if (!dbblue_enable_groupjoin && !dbblue_groupjoin_planner_only)
+		return;
+
+	/* B3: grouping sets have semantics this operator does not implement. */
+	if (parse->groupingSets)
+		return;
+
+	/* Nothing to fuse if there is no grouping at all. */
+	if (root->processed_groupClause == NIL)
+		return;
+
+	/*
+	 * B4: DISTINCT / ORDER BY / ordered-set aggregates need per-group sorted
+	 * input, which a hash table does not provide.  Aggregates with no
+	 * combine or serial function are likewise out of scope for v1.
+	 */
+	if (root->numOrderedAggs > 0)
+		return;
+	if (root->hasNonPartialAggs || root->hasNonSerialAggs)
+		return;
+
+	/* Find a hash join to fuse into. */
+	hpath = find_cheapest_hash_join_path(input_rel);
+	if (hpath == NULL)
+	{
+		if (dbblue_groupjoin_planner_only)
+			elog(LOG, "dbblue groupjoin: precondition bail at #1 (no HashPath found)");
+		return;
+	}
+
+	/*
+	 * B2 / precondition 1: GROUP BY matches the join key.  Done before the
+	 * jointype check below because the LEFT case needs the (build, probe)
+	 * key pairs this produces.
+	 */
+	if (!groupjoin_keys_match(root, hpath, &build_vars, &probe_vars))
+	{
+		if (dbblue_groupjoin_planner_only)
+			elog(LOG, "dbblue groupjoin: precondition bail at #2 (groupjoin_keys_match)");
+		return;
+	}
+
+	/*
+	 * B5: v1 handles INNER and RIGHT unconditionally.  RIGHT is the common
+	 * case: Odoo writes "journal LEFT JOIN move_line", and the planner
+	 * commutes it so the small unique side can be hashed, which is what
+	 * makes the build side the one carrying accumulators.
+	 *
+	 * A genuine (uncommuted) LEFT is also allowed, but only when
+	 * probe_side_provably_total() proves it safe: our accumulators live on
+	 * the build side, so a LEFT join's preserved (probe) side needs
+	 * somewhere to put an unmatched row, and ordinarily there is nowhere.
+	 * When it holds, the only possible "unmatched" case is a NULL probe key,
+	 * which the executor handles with one reserved accumulator -- see
+	 * nodeHashgroupjoin.c.  FULL/SEMI/ANTI are never safe under this design
+	 * and stay excluded.
+	 */
+	if (hpath->jpath.jointype != JOIN_INNER &&
+		hpath->jpath.jointype != JOIN_RIGHT)
+	{
+		if (hpath->jpath.jointype != JOIN_LEFT)
+		{
+			if (dbblue_groupjoin_planner_only)
+				elog(LOG, "dbblue groupjoin: precondition bail at #3 (jointype=%d, not INNER/RIGHT/LEFT)",
+					 (int) hpath->jpath.jointype);
+			return;
+		}
+		if (!probe_side_provably_total(root, hpath, build_vars, probe_vars))
+		{
+			if (dbblue_groupjoin_planner_only)
+				elog(LOG, "dbblue groupjoin: precondition bail at #4 (probe_side_provably_total)");
+			return;
+		}
+	}
+
+	/*
+	 * B1 / INV-1 / precondition 2: the build side must be uniquely keyed by
+	 * the join key, or two build rows would share a bucket under one key and
+	 * the aggregate would be silently wrong -- a bad report total, with no
+	 * error raised.
+	 *
+	 * The proof must be made against path_hashclauses specifically, not the
+	 * full joinrestrictinfo: it is the *hash* key that decides which build
+	 * tuples collide, so uniqueness established via some non-hashable join
+	 * qual does not license the fusion.
+	 *
+	 * That is also why this calls innerrel_is_unique_for_clauses() rather
+	 * than innerrel_is_unique().  The latter would consult a cache that the
+	 * join search has already populated from the full clause list, and would
+	 * return that cached "unique" without ever looking at our narrower list.
+	 */
+	if (!innerrel_is_unique_for_clauses(root,
+										hpath->jpath.path.parent->relids,
+										hpath->jpath.outerjoinpath->parent->relids,
+										hpath->jpath.innerjoinpath->parent,
+										hpath->jpath.jointype,
+										hpath->path_hashclauses))
+	{
+		if (dbblue_groupjoin_planner_only)
+			elog(LOG, "dbblue groupjoin: precondition bail at #5 (innerrel_is_unique_for_clauses)");
+		return;
+	}
+
+	/* All preconditions hold; build the path. */
+	gjpath = create_hashgroupjoin_path(root,
+									   grouped_rel,
+									   hpath,
+									   grouped_rel->reltarget,
+									   root->processed_groupClause,
+									   havingQual,
+									   agg_costs,
+									   dNumGroups);
+ 
+	if (dbblue_groupjoin_planner_only)
+	{
+		/*
+		 * Development mode (Stage 1 deliverable): report that the shape was
+		 * recognised and what it would have cost, and add nothing.  This is
+		 * how we find out whether real Odoo reporting queries hit this shape,
+		 * without any executor code existing.
+		 *
+		 * The two costs are NOT a like-for-like comparison and the message
+		 * says so: "fused" covers the join *and* the aggregation it absorbs,
+		 * while "bare-hashjoin" is the join alone, without the Agg node that
+		 * would have to sit on top of it.  The latter is therefore always the
+		 * smaller number, for every query, and reading the pair as a verdict
+		 * makes fusion look like a loss even where it wins.  To find out which
+		 * plan actually wins, turn this flag off and compare EXPLAIN with
+		 * dbblue_enable_groupjoin on versus off -- while the flag is on the
+		 * path is never offered to the planner, so the fused plan can never be
+		 * chosen no matter what it costs.
+		 */
+		elog(LOG,
+			 "dbblue groupjoin: candidate found; jointype=%d groupcols=%d "
+			 "numGroups=%.0f joinrows=%.0f "
+			 "cost fused(join+agg)=%.2f..%.2f vs bare-hashjoin(no agg)=%.2f..%.2f "
+			 "(not added: dbblue_groupjoin_planner_only is on; not a cost decision)",
+			 (int) hpath->jpath.jointype,
+			 list_length(root->processed_groupClause),
+			 dNumGroups,
+			 hpath->jpath.path.rows,
+			 gjpath->jpath.path.startup_cost,
+			 gjpath->jpath.path.total_cost,
+			 hpath->jpath.path.startup_cost,
+			 hpath->jpath.path.total_cost);
+		return;
+	}
+
+#ifdef DBBLUE_GROUPJOIN_EXECUTOR_READY
+	add_path(grouped_rel, (Path *) gjpath);
+#else
+
+	/*
+	 * dbblue_enable_groupjoin is on, but this build has no executor for the
+	 * node.  Do not add the path -- see the gate comment above.  Warn once so
+	 * that a user who set the flag expecting a speedup is not left wondering
+	 * why nothing changed.
+	 */
+	elog(DEBUG1,
+		 "dbblue groupjoin: candidate found but executor not built in; "
+		 "using the ordinary join-then-aggregate plan");
+#endif
 }
 
 /*

@@ -2268,6 +2268,82 @@ typedef struct HashJoinState
 	bool		hj_OuterNotEmpty;
 } HashJoinState;
 
+/* ----------------
+ *	 HashGroupJoinState information		(dbblue)
+ *
+ *		State for a hash join fused with the GROUP BY above it.
+ *
+ *		Its join half is a hash join whose hash table entries carry each
+ *		group's aggregate transition state; its aggregate half is driven
+ *		through nodeAgg.c's machinery (see ExecInitAggMachinery() and
+ *		friends) rather than reimplementing transition-function handling.
+ * ----------------
+ */
+typedef struct HashGroupJoinState
+{
+	JoinState	js;				/* its first field is NodeTag */
+	ExprState  *hashclauses;
+	ExprState  *hgj_OuterHash;	/* hash value of the probe tuple */
+	HashJoinTable hgj_HashTable;
+	TupleTableSlot *hgj_OuterTupleSlot;
+	TupleTableSlot *hgj_HashTupleSlot;
+	TupleTableSlot *hgj_NullOuterTupleSlot;
+
+	/*
+	 * All-NULLs stand-in for the BUILD side, used only by the reserved
+	 * NULL-key group (see hgj_NullKeyPergroup below) -- that group has no
+	 * real build tuple at all, since by definition nothing in the hash table
+	 * matches it.  Allocated only when join.jointype == JOIN_LEFT, since
+	 * that reserved group exists only in that case.
+	 */
+	TupleTableSlot *hgj_NullInnerTupleSlot;
+
+	/*
+	 * dbblue: stand-in for the probe side at emit time, for the sole purpose
+	 * of evaluating a bare reference to the probe's own echo of a hash key
+	 * (see HashGroupJoin.buildEchoKeys in plannodes.h for why this exists at
+	 * all, and ExecHashGroupJoinPopulateEchoSlot() for how it is filled).
+	 * hgj_EchoOuterVars are node->hashkeys, cached here for convenience --
+	 * plain Vars, OUTER_VAR-numbered, telling us which attribute of this
+	 * slot each compiled expression's result belongs in.
+	 * hgj_EchoBuildExprs is node->buildEchoKeys, compiled once at init.
+	 * The two lists are parallel.
+	 */
+	TupleTableSlot *hgj_EchoOuterTupleSlot;
+	List	   *hgj_EchoOuterVars;
+	List	   *hgj_EchoBuildExprs;
+
+	int			hgj_Phase;		/* build / probe / emit / done */
+
+	/*
+	 * Aggregate machinery, owned by nodeAgg.c.  The AggState holds the
+	 * compiled transition expressions, the final projection (this node's
+	 * targetlist, containing the Aggrefs) and the HAVING qual.  Per-group
+	 * transition state lives in each hash entry, not here.
+	 */
+	struct AggState *hgj_AggState;
+	Size		hgj_PergroupSize;	/* bytes of state per hash entry */
+
+	/*
+	 * Reserved accumulator for probe rows whose join key is NULL, used only
+	 * when join.jointype == JOIN_LEFT (the planner has proven, via
+	 * probe_side_provably_total() in planner.c, that a NULL key is the ONLY
+	 * way such a join can leave a probe row unmatched -- see that function).
+	 * Not part of the hash table: there is no build row for it to attach to.
+	 * hgj_NullKeyMatched tracks whether it ever received a row, since it
+	 * should be emitted only when it did (a group nothing folded into does
+	 * not exist, same as for the empty case of any other GROUP BY).
+	 * hgj_NullKeyEmitted guards against emitting it twice.
+	 */
+	struct AggStatePerGroupData *hgj_NullKeyPergroup;
+	bool		hgj_NullKeyMatched;
+	bool		hgj_NullKeyEmitted;
+
+	/* cursor for the emit phase */
+	int			hgj_EmitBucket;
+	HashJoinTuple hgj_EmitTuple;
+} HashGroupJoinState;
+
 
 /* ----------------------------------------------------------------
  *				 Materialization State Information
