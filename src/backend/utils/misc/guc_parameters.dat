@@ -695,13 +695,15 @@
 
 { name => 'dbblue_pinner_database', type => 'string', context => 'PGC_POSTMASTER', group => 'RESOURCES_MEM',
   short_desc => 'Database the pinner background worker connects to.',
+  long_desc => 'A single database name; a list of databases is not supported.',
   flags => 'GUC_NOT_IN_SAMPLE',
   variable => 'DBBluePinner_database',
   boot_val => '"postgres"',
+  check_hook => 'check_dbblue_pinner_database',
 },
 
 { name => 'dbblue_pinner_enabled', type => 'bool', context => 'PGC_POSTMASTER', group => 'RESOURCES_MEM',
-  short_desc => 'Enables the dbblue soft-pin / ring-buffer background worker.',
+  short_desc => 'Enables the dbblue soft-pin background worker.',
   long_desc => 'When off, the pinner worker is not registered even if pg_prewarm is preloaded, keeping advanced caching fully disabled.',
   flags => 'GUC_NOT_IN_SAMPLE',
   variable => 'DBBluePinner_enabled',
