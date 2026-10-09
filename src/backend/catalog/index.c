@@ -2265,7 +2265,7 @@ index_create_copy(Relation heapRelation, uint16 flags,
 									  indcoloptions->values,
 									  stattargets,
 									  reloptionsDatum,
-									  INDEX_CREATE_SKIP_BUILD | INDEX_CREATE_CONCURRENT,
+									  flags,
 									  0,	/* constr_flags */
 									  true, /* allow table to be a system
 											 * catalog? */
