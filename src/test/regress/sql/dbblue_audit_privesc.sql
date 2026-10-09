@@ -12,7 +12,7 @@
 -- This test proves three things at once:
 --   1. legitimate actor-name resolution still works,
 --   2. a non-superuser cannot escalate by shadowing res_users/res_partner,
---   3. the log stays readable only by its owner.
+--   3. that user cannot forge or alter audit rows.
 --
 -- It must create tables literally named res_users / res_partner because the
 -- lookup matches those names; it runs alone (see parallel_schedule) and drops
@@ -57,9 +57,13 @@ RESET ROLE;
 -- The role must NOT have gained the superuser attribute.
 SELECT rolname, rolsuper FROM pg_roles WHERE rolname = 'regress_dap_user';
 
--- (3) The log is readable only by its owner; the role cannot read it.
+-- (3) The log is readable (so non-superuser backups work -- see
+-- dbblue_audit_grants) but not writable, so the role cannot forge or alter
+-- entries even though it can read them.
 SET ROLE regress_dap_user;
-SELECT count(*) FROM dbblue.dbblue_audit_log;
+INSERT INTO dbblue.dbblue_audit_log(rel_name, dml_op, changed_by, session_usr)
+  VALUES ('forged', 'INSERT', 'regress_dap_user', 'regress_dap_user');
+UPDATE dbblue.dbblue_audit_log SET rel_name = 'tampered';
 RESET ROLE;
 
 -- cleanup
