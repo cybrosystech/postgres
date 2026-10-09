@@ -77,5 +77,15 @@ extern void  dbblue_audit_capture_delete(ResultRelInfo   *rri,
 extern void  dbblue_audit_capture_insert(ResultRelInfo   *rri,
                                          TupleTableSlot  *newslot);
 
+/*
+ * Cross-partition UPDATE (row movement) is delete+insert under the hood; these
+ * let the executor record it as one proper UPDATE instead of a bare INSERT.
+ */
+extern bool  dbblue_audit_crosspart_update_wanted(Relation rootrel,
+                                                  Relation srcrel);
+extern void  dbblue_audit_capture_crosspart_update(ResultRelInfo *rootRelInfo,
+                                                   HeapTuple oldtup,
+                                                   HeapTuple newtup);
+
 
 #endif /* PG_AUDIT_H */

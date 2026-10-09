@@ -174,6 +174,11 @@ test: dbblue_audit_privesc
 # objects plus a dropped dbblue schema; run alone.
 test: dbblue_audit_grants
 
+# DBblue: a cross-partition UPDATE (row movement) is recorded as a single
+# UPDATE with both images, not as a bare INSERT.  Self-contained, dac_ objects
+# plus a dropped dbblue schema; run alone.
+test: dbblue_audit_crosspart
+
 # run tablespace test at the end because it drops the tablespace created during
 # setup that other tests may use.
 test: tablespace

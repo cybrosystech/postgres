@@ -123,6 +123,14 @@ typedef struct ModifyTableContext
 	 * cross-partition UPDATE
 	 */
 	TupleTableSlot *cpUpdateReturningSlot;
+
+	/*
+	 * True while ExecCrossPartitionUpdate is running the INSERT half of a row
+	 * movement.  ExecInsert checks it so the dbblue audit log does not record
+	 * that insert as a standalone INSERT: the move is logged once as an UPDATE
+	 * by ExecCrossPartitionUpdate instead.
+	 */
+	bool		cpMoveInProgress;
 } ModifyTableContext;
 
 /*
@@ -1498,8 +1506,13 @@ ExecInsert(ModifyTableContext *context,
 	 * per inserted row, after the AFTER ROW triggers, so only rows that
 	 * actually survived constraints and triggers are logged.  Whether
 	 * INSERT is captured at all is decided by dbblue_audit_operations.
+	 *
+	 * Skip it when this insert is the second half of a cross-partition UPDATE
+	 * (cpMoveInProgress): that move is logged once as an UPDATE by
+	 * ExecCrossPartitionUpdate, not as an INSERT here.
 	 */
-	dbblue_audit_capture_insert(resultRelInfo, slot);
+	if (!context->cpMoveInProgress)
+		dbblue_audit_capture_insert(resultRelInfo, slot);
 
 	list_free(recheckIndexes);
 
@@ -2423,6 +2436,8 @@ ExecCrossPartitionUpdate(ModifyTableContext *context,
 	TupleConversionMap *tupconv_map;
 	bool		tuple_deleted;
 	TupleTableSlot *epqslot = NULL;
+	HeapTuple	cpAuditOld = NULL;
+	HeapTuple	cpAuditNew = NULL;
 
 	context->cpDeletedSlot = NULL;
 	context->cpUpdateReturningSlot = NULL;
@@ -2473,6 +2488,47 @@ ExecCrossPartitionUpdate(ModifyTableContext *context,
 	}
 
 	/*
+	 * dbblue audit: a cross-partition UPDATE is run as delete+insert, so
+	 * capture the pre-image now -- before the delete -- in the root (queried)
+	 * table's format, so the move can be logged as one UPDATE further down.
+	 * Only done when this table's UPDATEs are audited; the cost (one fetch) is
+	 * paid only on an actual row movement.
+	 */
+	if (dbblue_audit_crosspart_update_wanted(mtstate->rootResultRelInfo->ri_RelationDesc,
+											 resultRelInfo->ri_RelationDesc))
+	{
+		Relation	srcRel = resultRelInfo->ri_RelationDesc;
+		TupleTableSlot *srcSlot = table_slot_create(srcRel, NULL);
+		bool		got;
+
+		if (oldtuple != NULL)
+		{
+			ExecForceStoreHeapTuple(oldtuple, srcSlot, false);
+			got = true;
+		}
+		else
+			got = table_tuple_fetch_row_version(srcRel, tupleid,
+												SnapshotAny, srcSlot);
+
+		if (got)
+		{
+			TupleConversionMap *map = ExecGetChildToRootMap(resultRelInfo);
+			TupleTableSlot *rootSlot = srcSlot;
+
+			if (map != NULL)
+			{
+				rootSlot = table_slot_create(
+					mtstate->rootResultRelInfo->ri_RelationDesc, NULL);
+				execute_attr_map_slot(map->attrMap, srcSlot, rootSlot);
+			}
+			cpAuditOld = ExecCopySlotHeapTuple(rootSlot);
+			if (rootSlot != srcSlot)
+				ExecDropSingleTupleTableSlot(rootSlot);
+		}
+		ExecDropSingleTupleTableSlot(srcSlot);
+	}
+
+	/*
 	 * Row movement, part 1.  Delete the tuple, but skip RETURNING processing.
 	 * We want to return rows from INSERT.
 	 */
@@ -2503,6 +2559,13 @@ ExecCrossPartitionUpdate(ModifyTableContext *context,
 	 */
 	if (!tuple_deleted)
 	{
+		/* The move will not proceed; drop the captured pre-image. */
+		if (cpAuditOld != NULL)
+		{
+			heap_freetuple(cpAuditOld);
+			cpAuditOld = NULL;
+		}
+
 		/*
 		 * epqslot will be typically NULL.  But when ExecDelete() finds that
 		 * another transaction has concurrently updated the same row, it
@@ -2548,10 +2611,28 @@ ExecCrossPartitionUpdate(ModifyTableContext *context,
 									 slot,
 									 mtstate->mt_root_tuple_slot);
 
+	/*
+	 * dbblue audit: capture the post-image now, while slot is in the root
+	 * table's format (ExecInsert may re-route and transform it), then suppress
+	 * the INSERT half's own audit row and log the move as one UPDATE below.
+	 */
+	if (cpAuditOld != NULL)
+		cpAuditNew = ExecCopySlotHeapTuple(slot);
+
 	/* Tuple routing starts from the root table. */
+	context->cpMoveInProgress = true;
 	context->cpUpdateReturningSlot =
 		ExecInsert(context, mtstate->rootResultRelInfo, slot, canSetTag,
 				   inserted_tuple, insert_destrel);
+	context->cpMoveInProgress = false;
+
+	if (cpAuditOld != NULL && cpAuditNew != NULL)
+		dbblue_audit_capture_crosspart_update(mtstate->rootResultRelInfo,
+											  cpAuditOld, cpAuditNew);
+	if (cpAuditOld != NULL)
+		heap_freetuple(cpAuditOld);
+	if (cpAuditNew != NULL)
+		heap_freetuple(cpAuditNew);
 
 	/*
 	 * Reset the transition state that may possibly have been written by
@@ -4900,6 +4981,7 @@ ExecModifyTable(PlanState *pstate)
 	context.mtstate = node;
 	context.epqstate = &node->mt_epqstate;
 	context.estate = estate;
+	context.cpMoveInProgress = false;
 
 	/*
 	 * Fetch rows from subplan, and execute the required table modification
