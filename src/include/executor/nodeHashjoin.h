@@ -30,5 +30,8 @@ extern void ExecHashJoinInitializeWorker(HashJoinState *state,
 
 extern void ExecHashJoinSaveTuple(MinimalTuple tuple, uint32 hashvalue,
 								  BufFile **fileptr, HashJoinTable hashtable);
+extern TupleTableSlot *ExecHashJoinGetSavedTuple(BufFile *file,
+												 uint32 *hashvalue,
+												 TupleTableSlot *tupleSlot);
 
 #endif							/* NODEHASHJOIN_H */

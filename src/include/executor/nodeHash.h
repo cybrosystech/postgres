@@ -24,7 +24,8 @@ extern Node *MultiExecHash(HashState *node);
 extern void ExecEndHash(HashState *node);
 extern void ExecReScanHash(HashState *node);
 
-extern HashJoinTable ExecHashTableCreate(HashState *state);
+extern HashJoinTable ExecHashTableCreate(HashState *state,
+										 Size extraTupleSpace);
 extern void ExecParallelHashTableAlloc(HashJoinTable hashtable,
 									   int batchno);
 extern void ExecHashTableDestroy(HashJoinTable hashtable);
@@ -56,7 +57,8 @@ extern bool ExecParallelScanHashTableForUnmatched(HashJoinState *hjstate,
 												  ExprContext *econtext);
 extern void ExecHashTableReset(HashJoinTable hashtable);
 extern void ExecHashTableResetMatchFlags(HashJoinTable hashtable);
-extern void ExecChooseHashTableSize(double ntuples, int tupwidth, bool useskew,
+extern void ExecChooseHashTableSize(double ntuples, int tupwidth,
+									Size extraTupleSpace, bool useskew,
 									bool try_combined_hash_mem,
 									int parallel_workers,
 									size_t *space_allowed,

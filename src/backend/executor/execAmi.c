@@ -31,6 +31,7 @@
 #include "executor/nodeGatherMerge.h"
 #include "executor/nodeGroup.h"
 #include "executor/nodeHash.h"
+#include "executor/nodeHashgroupjoin.h"
 #include "executor/nodeHashjoin.h"
 #include "executor/nodeIncrementalSort.h"
 #include "executor/nodeIndexonlyscan.h"
@@ -249,6 +250,10 @@ ExecReScan(PlanState *node)
 
 		case T_HashJoinState:
 			ExecReScanHashJoin((HashJoinState *) node);
+			break;
+
+		case T_HashGroupJoinState:
+			ExecReScanHashGroupJoin((HashGroupJoinState *) node);
 			break;
 
 		case T_MaterialState:

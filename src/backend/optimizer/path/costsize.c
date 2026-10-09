@@ -165,6 +165,18 @@ bool		enable_partition_pruning = true;
 bool		enable_presorted_aggregate = true;
 bool		enable_async_append = true;
 
+/*
+ * dbblue: fused hash join + GROUP BY.  Both default off.
+ *
+ * dbblue_enable_groupjoin is the real feature switch; it is deliberately
+ * inert until the executor node exists (see DBBLUE_GROUPJOIN_EXECUTOR_READY
+ * in planner.c).  dbblue_groupjoin_planner_only is the development switch: it
+ * builds and logs the candidate path without ever offering it to add_path().
+ * These must stay two separate flags -- see dbblue_groupjoin.md T4-6.
+ */
+bool		dbblue_enable_groupjoin = false;
+bool		dbblue_groupjoin_planner_only = false;
+
 typedef struct
 {
 	PlannerInfo *root;
@@ -3194,6 +3206,157 @@ get_windowclause_startup_tuples(PlannerInfo *root, WindowClause *wc,
 }
 
 /*
+ * cost_hashgroupjoin
+ *		Determines and returns the cost of a HashGroupJoin plan node -- a hash
+ *		join fused with the GROUP BY above it -- including the cost of its
+ *		input.  (dbblue-specific.)
+ *
+ * 'input_total_cost' is the total cost of the underlying hash join, which has
+ * already been costed by final_cost_hashjoin(); this function charges only
+ * for the aggregation that the fused node absorbs.  There is no input startup
+ * cost parameter because the node is blocking: nothing can be emitted until
+ * the last probe tuple has updated its accumulator.
+ *
+ * The model is cost_agg()'s AGG_HASHED branch, less the two terms that the
+ * fusion is specifically designed to avoid:
+ *
+ * 1. The hash-computation charge.  cost_agg() adds
+ *    (cpu_operator_cost * numGroupCols) * input_tuples to hash each input
+ *    row's grouping columns.  We do not, because the join has already hashed
+ *    exactly those columns to locate the bucket -- that is precondition 1
+ *    (join key == group key) turned into a cost saving.
+ *
+ * 2. The spill charge.  A standalone HashAgg builds a second hash table over
+ *    the join's output and may spill it.  Here the accumulators live in the
+ *    join's existing hash table, whose size and batching final_cost_hashjoin()
+ *    has already accounted for, and which holds one entry per build-side row
+ *    (== one per group, by precondition 2).  There is no second table.
+ *
+ * Note we do not charge transCost.per_tuple against the join's *output*
+ * cardinality by a separate estimate: path->rows on the input hash join is
+ * exactly the joined-row count, which is the number of transition function
+ * calls we will make.
+ */
+void
+cost_hashgroupjoin(GroupJoinPath *gjpath, PlannerInfo *root,
+				   const AggClauseCosts *aggcosts,
+				   double numGroups,
+				   List *quals,
+				   int disabled_nodes,
+				   Cost input_total_cost,
+				   int plain_num_batches)
+{
+	Path	   *path = &gjpath->jpath.path;
+	Path	   *innerp = gjpath->jpath.innerjoinpath;
+	Path	   *outerp = gjpath->jpath.outerjoinpath;
+	double		input_tuples = path->rows;
+	double		output_tuples = numGroups;
+	Cost		startup_cost;
+	Cost		total_cost;
+	const AggClauseCosts dummy_aggcosts = {0};
+
+	/* Use all-zero per-aggregate costs if NULL is passed */
+	if (aggcosts == NULL)
+		aggcosts = &dummy_aggcosts;
+
+	/*
+	 * Respect enable_hashagg: this node aggregates via a hash table, so a
+	 * user who has switched hashed aggregation off should not get one by
+	 * another name.
+	 */
+	if (!enable_hashagg)
+		++disabled_nodes;
+
+	/*
+	 * Like AGG_HASHED, we cannot emit anything until the whole probe side has
+	 * been consumed, so the input's total cost is our startup cost.
+	 */
+	startup_cost = input_total_cost;
+	startup_cost += aggcosts->transCost.startup;
+	startup_cost += aggcosts->transCost.per_tuple * input_tuples;
+	startup_cost += aggcosts->finalCost.startup;
+
+	total_cost = startup_cost;
+	total_cost += aggcosts->finalCost.per_tuple * numGroups;
+	/* cost of walking the hash table to emit each group */
+	total_cost += cpu_tuple_cost * numGroups;
+
+	/*
+	 * If there are quals (HAVING quals), account for their cost and
+	 * selectivity.  Same treatment as cost_agg().
+	 */
+	if (quals)
+	{
+		QualCost	qual_cost;
+
+		cost_qual_eval(&qual_cost, quals, root);
+		startup_cost += qual_cost.startup;
+		total_cost += qual_cost.startup + output_tuples * qual_cost.per_tuple;
+
+		output_tuples = clamp_row_est(output_tuples *
+									  clauselist_selectivity(root,
+															 quals,
+															 0,
+															 JOIN_INNER,
+															 NULL));
+	}
+
+	/*
+	 * Re-derive the batch count against the *fused* entry width.
+	 *
+	 * plain_num_batches came from final_cost_hashjoin(), whose entries hold
+	 * only the build tuple.  Ours additionally carry each group's transition
+	 * states, so the same build side may not fit in as few batches, and
+	 * inheriting that figure would understate our spill.  The extra width is
+	 * exact rather than estimated -- sizeof(AggStatePerGroupData) per
+	 * aggregate transition -- so this removes a systematic undercount rather
+	 * than adding a guess.
+	 */
+	{
+		size_t		space_allowed;
+		int			numbuckets;
+		int			numbatches;
+		int			num_skew_mcvs;
+
+		ExecChooseHashTableSize(gjpath->inner_rows_total,
+								innerp->pathtarget->width,
+								ExecAggPergroupSizeForTrans(list_length(root->aggtransinfos)),
+								false,	/* no skew; see create_hashgroupjoin_plan */
+								false,	/* never parallel; see create_hashgroupjoin_path */
+								0,
+								&space_allowed,
+								&numbuckets,
+								&numbatches,
+								&num_skew_mcvs);
+
+		gjpath->num_batches = numbatches;
+
+		/*
+		 * If the transition states are what tip the join into batching,
+		 * charge for the spill the plain hash join was not charged for.  The
+		 * charge mirrors initial_cost_hashjoin()'s and is flat rather than
+		 * per-batch: batching writes and re-reads the tuples once however
+		 * many batches result.
+		 */
+		if (numbatches > 1 && plain_num_batches <= 1)
+		{
+			double		outerpages = page_size(outerp->rows,
+											   outerp->pathtarget->width);
+			double		innerpages = page_size(innerp->rows,
+											   innerp->pathtarget->width);
+
+			startup_cost += seq_page_cost * innerpages;
+			total_cost += seq_page_cost * (2 * innerpages + 2 * outerpages);
+		}
+	}
+
+	path->rows = output_tuples;
+	path->disabled_nodes = disabled_nodes;
+	path->startup_cost = startup_cost;
+	path->total_cost = total_cost;
+}
+
+/*
  * cost_windowagg
  *		Determines and returns the cost of performing a WindowAgg plan node,
  *		including the cost of its input.
@@ -4362,6 +4525,7 @@ initial_cost_hashjoin(PlannerInfo *root, JoinCostWorkspace *workspace,
 	 */
 	ExecChooseHashTableSize(inner_path_rows_total,
 							inner_path->pathtarget->width,
+							0,	/* a plain hash join stores only the tuple */
 							true,	/* useskew */
 							parallel_hash,	/* try_combined_hash_mem */
 							outer_path->parallel_workers,

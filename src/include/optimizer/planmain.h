@@ -119,6 +119,12 @@ extern bool innerrel_is_unique_ext(PlannerInfo *root, Relids joinrelids,
 								   Relids outerrelids, RelOptInfo *innerrel,
 								   JoinType jointype, List *restrictlist,
 								   bool force_cache, List **extra_clauses);
+/* dbblue: uncached uniqueness proof from a specific clause list only */
+extern bool innerrel_is_unique_for_clauses(PlannerInfo *root, Relids joinrelids,
+										   Relids outerrelids,
+										   RelOptInfo *innerrel,
+										   JoinType jointype,
+										   List *restrictlist);
 extern List *remove_useless_self_joins(PlannerInfo *root, List *joinlist);
 
 /*

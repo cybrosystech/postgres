@@ -88,6 +88,7 @@
 #include "executor/nodeGatherMerge.h"
 #include "executor/nodeGroup.h"
 #include "executor/nodeHash.h"
+#include "executor/nodeHashgroupjoin.h"
 #include "executor/nodeHashjoin.h"
 #include "executor/nodeIncrementalSort.h"
 #include "executor/nodeIndexonlyscan.h"
@@ -307,6 +308,11 @@ ExecInitNode(Plan *node, EState *estate, int eflags)
 		case T_HashJoin:
 			result = (PlanState *) ExecInitHashJoin((HashJoin *) node,
 													estate, eflags);
+			break;
+
+		case T_HashGroupJoin:
+			result = (PlanState *) ExecInitHashGroupJoin((HashGroupJoin *) node,
+														 estate, eflags);
 			break;
 
 			/*
@@ -678,6 +684,10 @@ ExecEndNode(PlanState *node)
 
 		case T_HashJoinState:
 			ExecEndHashJoin((HashJoinState *) node);
+			break;
+
+		case T_HashGroupJoinState:
+			ExecEndHashGroupJoin((HashGroupJoinState *) node);
 			break;
 
 			/*
