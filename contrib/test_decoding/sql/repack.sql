@@ -33,6 +33,23 @@ REPACK (CONCURRENTLY) rpk_missing;
 SELECT * FROM rpk_missing;
 DROP TABLE rpk_missing;
 
+-- Verify that REPACK (CONCURRENTLY) builds the new indexes instead of
+-- leaving them empty
+CREATE TABLE rpk_index (id int PRIMARY KEY, v text);
+CREATE INDEX rpk_index_v_idx ON rpk_index (v);
+INSERT INTO rpk_index SELECT g, 'val' || g FROM generate_series(1, 1000) g;
+REPACK (CONCURRENTLY) rpk_index;
+SELECT c.relname, pg_relation_size(c.oid) > 0 AS has_data, i.indisvalid, i.indisready
+  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+  WHERE i.indrelid = 'rpk_index'::regclass ORDER BY c.relname COLLATE "C";
+SET enable_seqscan = off;
+SELECT * FROM rpk_index WHERE id = 42;
+SELECT * FROM rpk_index WHERE v = 'val500';
+RESET enable_seqscan;
+INSERT INTO rpk_index VALUES (1001, 'new');
+SELECT count(*) FROM rpk_index;
+DROP TABLE rpk_index;
+
 -- Error cases for concurrent mode
 
 -- Doesn't like partitioned tables
