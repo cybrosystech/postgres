@@ -163,6 +163,12 @@ test: dbblue_matview_skip
 # objects; run alone since it takes AccessExclusiveLock on its global index.
 test: global_partition_index
 
+# DBblue: dedicated audit log privilege-escalation hardening.  The actor-name
+# lookup must run as the invoking user, not the elevated superuser.  Creates
+# tables named res_users/res_partner that the lookup matches, so run it alone;
+# self-contained, dap_/regress_dap_ objects plus a dropped dbblue schema.
+test: dbblue_audit_privesc
+
 # run tablespace test at the end because it drops the tablespace created during
 # setup that other tests may use.
 test: tablespace

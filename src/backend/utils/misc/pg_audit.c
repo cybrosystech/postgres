@@ -18,6 +18,7 @@
 #include "nodes/plannodes.h"
 #include "tcop/utility.h"
 #include "utils/builtins.h"
+#include "utils/guc.h"
 #include "utils/hsearch.h"
 #include "utils/varlena.h"
 #include "utils/json.h"
@@ -170,10 +171,6 @@ static bool audit_retention_is_set(void);
 static SPIPlanPtr audit_insert_plan(void);
 static const char *odoo_actor_name(int32 uid);
 
-/* Scratch for the resolved Odoo actor names, set inside the write path. */
-static const char *audit_created_by = NULL;
-static const char *audit_changed_by = NULL;
-
 /*
  * The audit INSERT, prepared once per backend and kept.
  *
@@ -210,7 +207,8 @@ audit_do_insert(const char *table_name, const char *operation,
                 const char *username, const char *sess_user,
                 const char *client_addr,
                 bool have_create_uid, int32 create_uid,
-                bool have_write_uid, int32 write_uid)
+                bool have_write_uid, int32 write_uid,
+                const char *created_by, const char *changed_by)
 {
    Datum       values[11];
    char        nulls[11];
@@ -225,14 +223,14 @@ audit_do_insert(const char *table_name, const char *operation,
    if (SPI_connect() != SPI_OK_CONNECT)
        elog(ERROR, "dbblue_audit: SPI_connect failed");
 
-   audit_created_by = have_create_uid ? odoo_actor_name(create_uid) : NULL;
-   if (have_write_uid)
-       audit_changed_by = (have_create_uid && write_uid == create_uid)
-           ? audit_created_by
-           : odoo_actor_name(write_uid);
-   else
-       audit_changed_by = NULL;
-
+   /*
+    * The Odoo actor names were resolved by the caller, before elevation and
+    * as the invoking user -- see dbblue_audit_write().  They are not looked
+    * up here on purpose: this runs as the bootstrap superuser, and resolving
+    * user-facing table names (res_users/res_partner) in that state is a
+    * privilege-escalation vector.  Everything below touches only the
+    * fully-qualified log table with bound parameters.
+    */
    memset(nulls, ' ', sizeof(nulls));
 
    values[0] = CStringGetTextDatum(table_name);
@@ -256,12 +254,12 @@ audit_do_insert(const char *table_name, const char *operation,
        values[8] = Int32GetDatum(write_uid);
    else
        nulls[8] = 'n';
-   if (audit_created_by)
-       values[9] = CStringGetTextDatum(audit_created_by);
+   if (created_by)
+       values[9] = CStringGetTextDatum(created_by);
    else
        nulls[9] = 'n';
-   if (audit_changed_by)
-       values[10] = CStringGetTextDatum(audit_changed_by);
+   if (changed_by)
+       values[10] = CStringGetTextDatum(changed_by);
    else
        nulls[10] = 'n';
 
@@ -341,19 +339,37 @@ typedef struct AuditPriv
 {
    Oid         save_userid;
    int         save_sec_context;
+   int         save_nestlevel;
 } AuditPriv;
 
 static void
 audit_priv_enter(AuditPriv *priv)
 {
    GetUserIdAndSecContext(&priv->save_userid, &priv->save_sec_context);
+
+   /*
+    * Elevate to the bootstrap superuser, but lock the environment down the
+    * same way the rest of the backend does for any elevated operation
+    * (compare index_concurrently_build).  SECURITY_RESTRICTED_OPERATION
+    * distrusts pg_temp and forbids creating temp objects, and
+    * RestrictSearchPath() pins search_path to "pg_catalog, pg_temp" for the
+    * duration.  Without this, any unqualified name the elevated SQL resolves
+    * -- the CREATE SCHEMA/TABLE DDL below, or a stray lookup -- could be
+    * pointed at an object an unprivileged user planted in their own schema
+    * or in pg_temp, and would then run that object's code as the superuser.
+    */
    SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID,
-                          priv->save_sec_context | SECURITY_LOCAL_USERID_CHANGE);
+                          priv->save_sec_context | SECURITY_LOCAL_USERID_CHANGE |
+                          SECURITY_RESTRICTED_OPERATION);
+   priv->save_nestlevel = NewGUCNestLevel();
+   RestrictSearchPath();
 }
 
 static void
 audit_priv_leave(AuditPriv *priv)
 {
+   /* Undo the scoped search_path override, then drop the elevation. */
+   AtEOXact_GUC(false, priv->save_nestlevel);
    SetUserIdAndSecContext(priv->save_userid, priv->save_sec_context);
 }
 
@@ -1868,6 +1884,8 @@ dbblue_audit_write(Relation rel,
    int32       write_uid = 0;
    bool        have_create_uid;
    bool        have_write_uid;
+   const char *created_by = NULL;
+   const char *changed_by = NULL;
    AuditPriv   priv;
    MemoryContext oldcxt;
    ResourceOwner oldowner;
@@ -1937,6 +1955,32 @@ dbblue_audit_write(Relation rel,
                                        &write_uid);
 
    /*
+    * Resolve the Odoo actor names here, BEFORE elevating -- so the lookup
+    * runs as the user who issued the statement, not as the bootstrap
+    * superuser.  That lookup reads res_users/res_partner, which are
+    * user-facing tables resolved through the caller's search_path; running it
+    * elevated would let an unprivileged user shadow those names (e.g. via
+    * pg_temp) and have their object's code executed as the superuser.  As
+    * the invoking user it is harmless: it only sees what that user may
+    * already read (odoo_schema_is_present() checks has_table_privilege), and
+    * the worst a planted object can do is mislabel that user's own audit row.
+    * The resolved strings live in the backend's actor-name cache, so they
+    * remain valid after the SPI session closes and across the elevation.
+    */
+   if (have_create_uid || have_write_uid)
+   {
+       if (SPI_connect() == SPI_OK_CONNECT)
+       {
+           created_by = have_create_uid ? odoo_actor_name(create_uid) : NULL;
+           if (have_write_uid)
+               changed_by = (have_create_uid && write_uid == create_uid)
+                   ? created_by
+                   : odoo_actor_name(write_uid);
+           SPI_finish();
+       }
+   }
+
+   /*
     * The write runs in its own subtransaction so that a failure inside it --
     * the log table dropped by another session, its tablespace full, a
     * constraint violation -- is contained here instead of propagating out
@@ -1976,7 +2020,8 @@ dbblue_audit_write(Relation rel,
            audit_do_insert(table_name, operation, old_json, new_json,
                            username, sess_user, client_addr,
                            have_create_uid, create_uid,
-                           have_write_uid, write_uid);
+                           have_write_uid, write_uid,
+                           created_by, changed_by);
        }
        PG_FINALLY();
        {
@@ -1994,7 +2039,8 @@ dbblue_audit_write(Relation rel,
        audit_do_insert(table_name, operation, old_json, new_json,
                        username, sess_user, client_addr,
                        have_create_uid, create_uid,
-                       have_write_uid, write_uid);
+                       have_write_uid, write_uid,
+                       created_by, changed_by);
 
        audit_priv_leave(&priv);
        ReleaseCurrentSubTransaction();

@@ -1,0 +1,73 @@
+--
+-- DBblue dedicated audit log: privilege-escalation hardening.
+--
+-- The audit writer elevates to the bootstrap superuser to insert the audit
+-- row.  The Odoo actor-name lookup (res_users / res_partner) must NOT run in
+-- that elevated state: those are user-facing names resolved through the
+-- caller's search_path, so an unprivileged user could shadow them (e.g. via
+-- pg_temp) and have their own code executed as the superuser.  The fix runs
+-- the lookup as the invoking user, before elevation, and locks the elevated
+-- window down (SECURITY_RESTRICTED_OPERATION + RestrictSearchPath).
+--
+-- This test proves three things at once:
+--   1. legitimate actor-name resolution still works,
+--   2. a non-superuser cannot escalate by shadowing res_users/res_partner,
+--   3. the log stays readable only by its owner.
+--
+-- It must create tables literally named res_users / res_partner because the
+-- lookup matches those names; it runs alone (see parallel_schedule) and drops
+-- them again, so it stays self-contained.  Other objects are prefixed dap_ /
+-- regress_dap_.
+SET client_min_messages = warning;      -- hide the one-time audit DDL notices
+\set VERBOSITY terse
+SET dbblue_audit_operations = 'all';
+CREATE ROLE regress_dap_user;
+-- Real Odoo-shaped identity tables, so a benign lookup resolves a name.
+CREATE TABLE res_partner (id int PRIMARY KEY, name text);
+CREATE TABLE res_users (id int PRIMARY KEY, partner_id int);
+INSERT INTO res_partner VALUES (7, 'Audit Tester');
+INSERT INTO res_users VALUES (7, 7);
+CREATE TABLE dap_t (id int PRIMARY KEY, v int, create_uid int, write_uid int);
+GRANT ALL ON dap_t TO regress_dap_user;
+INSERT INTO dap_t VALUES (1, 10, 7, 7);
+SET dbblue_audit_tables = 'public.dap_t';
+-- (1) Benign: the audited UPDATE records the resolved actor name.
+UPDATE dap_t SET v = 20 WHERE id = 1;
+SELECT dml_op, odoo_changed_by
+  FROM dbblue.dbblue_audit_log WHERE rel_name = 'dap_t' ORDER BY id;
+ dml_op | odoo_changed_by 
+--------+-----------------
+ UPDATE | Audit Tester
+(1 row)
+
+-- (2) Escalation attempt: a non-superuser shadows res_users / res_partner with
+-- pg_temp objects whose definition tries to make the role a superuser.  Since
+-- the lookup now runs as that role (not the bootstrap superuser), the ALTER
+-- ROLE is denied and the statement fails -- harmlessly, with no escalation.
+SET ROLE regress_dap_user;
+CREATE FUNCTION pg_temp.dap_pwn() RETURNS text LANGUAGE plpgsql AS
+  $$ BEGIN EXECUTE 'ALTER ROLE regress_dap_user SUPERUSER'; RETURN 'pwned'; END $$;
+CREATE TEMP VIEW res_users   AS SELECT 99 AS id, 99 AS partner_id;
+CREATE TEMP VIEW res_partner AS SELECT 99 AS id, pg_temp.dap_pwn() AS name;
+INSERT INTO dap_t VALUES (2, 10, 99, 99);       -- fires the audit lookup
+ERROR:  permission denied to alter role
+RESET ROLE;
+-- The role must NOT have gained the superuser attribute.
+SELECT rolname, rolsuper FROM pg_roles WHERE rolname = 'regress_dap_user';
+     rolname      | rolsuper 
+------------------+----------
+ regress_dap_user | f
+(1 row)
+
+-- (3) The log is readable only by its owner; the role cannot read it.
+SET ROLE regress_dap_user;
+SELECT count(*) FROM dbblue.dbblue_audit_log;
+ERROR:  permission denied for schema dbblue at character 22
+RESET ROLE;
+-- cleanup
+RESET dbblue_audit_tables;
+RESET dbblue_audit_operations;
+DROP SCHEMA dbblue CASCADE;
+DROP TABLE public.dap_t, public.res_users, public.res_partner;
+DROP OWNED BY regress_dap_user;
+DROP ROLE regress_dap_user;
