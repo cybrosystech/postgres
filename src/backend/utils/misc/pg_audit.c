@@ -2301,3 +2301,87 @@ dbblue_audit_capture_insert(ResultRelInfo *rri, TupleTableSlot *newslot)
    }
    PG_END_TRY();
 }
+
+
+/* ----------------------------------------------------------------
+ * dbblue_audit_crosspart_update_wanted
+ *
+ * True when a cross-partition UPDATE on this (root) table should be audited.
+ * The executor uses this to decide whether it is worth capturing the
+ * pre-image before the row-moving delete; see dbblue_audit_capture_crosspart_update.
+ * ---------------------------------------------------------------- */
+bool
+dbblue_audit_crosspart_update_wanted(Relation rootrel, Relation srcrel)
+{
+   const char *nspname;
+   const char *relname;
+
+   if (!dbblue_audit_active(DBBLUE_AUDIT_UPDATE))
+       return false;
+
+   /*
+    * Audit the move when either the root (queried) table or the source
+    * partition is tracked.  Checking the root covers the normal case of
+    * listing the partitioned table; checking the source partition -- whose
+    * is_tracked() also matches any listed ancestor -- covers a configuration
+    * that lists the leaf partitions instead.  Either way the move is recorded
+    * against the root table below.
+    */
+   if (dbblue_audit_table_is_tracked(rootrel, &nspname, &relname))
+       return true;
+   if (srcrel != NULL &&
+       dbblue_audit_table_is_tracked(srcrel, &nspname, &relname))
+       return true;
+   return false;
+}
+
+/* ----------------------------------------------------------------
+ * dbblue_audit_capture_crosspart_update
+ *
+ * Record a cross-partition UPDATE as a single UPDATE row.
+ *
+ * A cross-partition UPDATE is executed as a DELETE from the old partition
+ * followed by an INSERT into the new one, so neither half knows it is really
+ * an UPDATE: left alone, the delete half is (correctly) suppressed and the
+ * insert half logs a bare INSERT with no pre-image, which misrepresents the
+ * change and loses the old values.  Instead the executor suppresses the insert
+ * half's own audit row and calls this once, with both images already converted
+ * to the root (queried) table's format, so the trail carries a proper UPDATE
+ * with old_data and new_data.
+ * ---------------------------------------------------------------- */
+void
+dbblue_audit_capture_crosspart_update(ResultRelInfo *rootRelInfo,
+                                      HeapTuple oldtup, HeapTuple newtup)
+{
+   Relation    rel;
+   const char *relname;
+   const char *nspname;
+
+   if (!dbblue_audit_active(DBBLUE_AUDIT_UPDATE))
+       return;
+   if (oldtup == NULL || newtup == NULL)
+       return;
+
+   /*
+    * The caller already decided this move should be audited (see
+    * dbblue_audit_crosspart_update_wanted), which may have matched the source
+    * partition rather than the root.  The move is always recorded against the
+    * root (queried) table, whose descriptor both images were converted to, so
+    * resolve its name directly rather than re-checking is_tracked here.
+    */
+   rel = rootRelInfo->ri_RelationDesc;
+   nspname = get_namespace_name(RelationGetNamespace(rel));
+   relname = RelationGetRelationName(rel);
+
+   audit_in_progress = true;
+   PG_TRY();
+   {
+       dbblue_audit_write(rel, nspname, relname, "UPDATE", oldtup, newtup,
+                          RelationGetDescr(rel));
+   }
+   PG_FINALLY();
+   {
+       audit_in_progress = false;
+   }
+   PG_END_TRY();
+}
