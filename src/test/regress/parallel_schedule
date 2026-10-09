@@ -169,6 +169,11 @@ test: global_partition_index
 # self-contained, dap_/regress_dap_ objects plus a dropped dbblue schema.
 test: dbblue_audit_privesc
 
+# DBblue: dedicated audit log is SELECT-to-PUBLIC (so non-superuser pg_dump can
+# back it up) but writable by no one.  Self-contained, dag_/regress_dag_
+# objects plus a dropped dbblue schema; run alone.
+test: dbblue_audit_grants
+
 # run tablespace test at the end because it drops the tablespace created during
 # setup that other tests may use.
 test: tablespace

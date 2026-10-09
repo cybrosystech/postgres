@@ -814,7 +814,17 @@ dbblue_audit_ensure_log_table_guts(void)
        "   AND has_table_privilege('dbblue.dbblue_audit_log', 'INSERT')"
        "   AND coalesce(has_sequence_privilege("
        "         pg_get_serial_sequence('dbblue.dbblue_audit_log','id'),"
-       "         'USAGE'), true)", true, 1);
+       "         'USAGE'), true)"
+       /*
+        * Also require that PUBLIC already has SELECT (grantee 0 in the ACL).
+        * A log table created by an older dbblue was REVOKEd from PUBLIC with
+        * no grant; falling through here re-runs the grant block (once) so
+        * such a database gains the read access non-superuser backups need.
+        */
+       "   AND EXISTS (SELECT 1 FROM pg_class c, aclexplode(c.relacl) a"
+       "                WHERE c.oid = to_regclass('dbblue.dbblue_audit_log')"
+       "                  AND a.grantee = 0 AND a.privilege_type = 'SELECT')",
+       true, 1);
 
    if (spi_ret == SPI_OK_SELECT && SPI_processed == 1)
    {
@@ -908,16 +918,29 @@ dbblue_audit_ensure_log_table_guts(void)
    /*
     * Nobody but the owner gets any privilege on the audit trail.
     *
-    * Audit rows are not written by the invoking user -- dbblue_audit_write()
-    * switches to the bootstrap superuser for the insert -- so no grant to
-    * PUBLIC is needed to make auditing work.  Granting one would be actively
-    * harmful: INSERT to PUBLIC lets any role fabricate entries naming
-    * somebody else, and SELECT to PUBLIC exposes old_data/new_data for every
-    * audited table to roles that cannot query those tables at all.
+    * Readable by everyone, writable by no one.
     *
-    * A DBA who wants someone to read the trail grants it explicitly:
-    *     GRANT USAGE ON SCHEMA dbblue TO auditor;
-    *     GRANT SELECT ON dbblue.dbblue_audit_log TO auditor;
+    * First strip every default privilege from PUBLIC, then grant back exactly
+    * the read-only ones.  No INSERT, UPDATE, DELETE or TRUNCATE is granted, so
+    * -- since audit rows are written by the bootstrap superuser, never by the
+    * invoking user (see dbblue_audit_write()) -- no role can forge, alter or
+    * erase an entry: the trail cannot be tampered with.
+    *
+    * SELECT, though, IS granted to PUBLIC, and deliberately so.  A
+    * non-superuser pg_dump (the path Odoo's own backup takes) acquires an
+    * ACCESS SHARE lock on every table it dumps, which requires SELECT; without
+    * it the whole dump aborts with "permission denied for schema dbblue" the
+    * moment this schema exists, so the audited database can no longer be
+    * backed up by anyone but a superuser.  Granting read access lets every
+    * role's backup include the trail.  The trade-off is accepted: any role
+    * that can connect can also read the trail, including old_data/new_data for
+    * tables it cannot otherwise query -- redact sensitive columns with
+    * dbblue_audit_exclude_columns where that matters.
+    *
+    * USAGE (not CREATE) on the schema and SELECT (not USAGE/UPDATE) on the
+    * sequence are the read-only halves pg_dump needs to reference the schema
+    * and read the sequence value; neither lets a role create objects here or
+    * advance the sequence.
     */
    spi_ret = SPI_execute(
        "REVOKE ALL ON dbblue.dbblue_audit_log FROM public",
@@ -930,6 +953,20 @@ dbblue_audit_ensure_log_table_guts(void)
    if (spi_ret >= 0)
        spi_ret = SPI_execute(
            "REVOKE ALL ON ALL SEQUENCES IN SCHEMA dbblue FROM public",
+           false, 0);
+
+   if (spi_ret >= 0)
+       spi_ret = SPI_execute("GRANT USAGE ON SCHEMA dbblue TO public",
+                             false, 0);
+
+   if (spi_ret >= 0)
+       spi_ret = SPI_execute(
+           "GRANT SELECT ON dbblue.dbblue_audit_log TO public",
+           false, 0);
+
+   if (spi_ret >= 0)
+       spi_ret = SPI_execute(
+           "GRANT SELECT ON ALL SEQUENCES IN SCHEMA dbblue TO public",
            false, 0);
 
    if (spi_ret < 0)
