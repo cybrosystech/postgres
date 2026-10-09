@@ -8774,6 +8774,17 @@
   prorettype => 'bool', proargtypes => 'int4',
   prosrc => 'dbblue_log_autoprepare_shapes', proacl => '{POSTGRES=X}' },
 
+# dbblue soft-pin introspection
+{ oid => '9774',
+  descr => 'number of soft-pinned shared buffers per relation and tier',
+  proname => 'dbblue_pinned_buffers', prorows => '100', proretset => 't',
+  provolatile => 'v', proparallel => 'r', prorettype => 'record',
+  proargtypes => '', proallargtypes => '{oid,oid,regclass,int4,int8,float8}',
+  proargmodes => '{o,o,o,o,o,o}',
+  proargnames => '{reldatabase,relfilenode,relid,tier,buffers,size_mb}',
+  prosrc => 'dbblue_pinned_buffers',
+  proacl => '{POSTGRES=X,pg_read_all_stats=X}' },
+
 # non-persistent series generator
 { oid => '1066', descr => 'non-persistent series generator',
   proname => 'generate_series', prorows => '1000',

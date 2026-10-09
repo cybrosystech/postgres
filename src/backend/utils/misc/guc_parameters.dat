@@ -1125,13 +1125,6 @@
   max => '100.0',
 },
 
-{ name => 'dbblue_ring_buffer_tables', type => 'string', context => 'PGC_SIGHUP', group => 'RESOURCES_MEM',
-  short_desc => 'Tables whose scans must never pollute shared_buffers.',
-  flags => 'GUC_NOT_IN_SAMPLE',
-  variable => 'DBBluePinner_ring_buffer_tables',
-  boot_val => '""',
-},
-
 { name => 'dbblue_safe_mode', type => 'bool', context => 'PGC_SUSET', group => 'CLIENT_CONN_STATEMENT',
   short_desc => 'Rejects UPDATE, DELETE, MERGE and TRUNCATE statements that would change every row.',
   long_desc => 'Guards against accidentally modifying or removing every row in a table. UPDATE and DELETE must carry a WHERE clause, and a MERGE action that updates or deletes must be restricted by its ON or WHEN condition; a restriction that reduces to a constant true does not count. TRUNCATE is refused outright. This is PGC_SUSET so an unprivileged session cannot simply turn it off, and it is a guard against mistakes rather than a privilege boundary: a restriction that is true for every row but does not fold to a constant, such as a subquery, is not detected.',

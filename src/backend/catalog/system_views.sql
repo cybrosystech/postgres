@@ -1570,3 +1570,102 @@ CREATE VIEW pg_aios AS
     SELECT * FROM pg_get_aios();
 REVOKE ALL ON pg_aios FROM PUBLIC;
 GRANT SELECT ON pg_aios TO pg_read_all_stats;
+
+-- dbblue advanced caching: suggest tables for dbblue_pinned_tables.
+--
+-- Ranks the tables of the current database by how many blocks had to be read
+-- from outside shared_buffers per MB of table size (the misses that pinning
+-- could avoid for the memory it costs), then walks that ranking taking every
+-- table that still fits in the pin budget -- the same all-or-nothing rule the
+-- pinner applies.  The budget is budget_percent (default
+-- dbblue_max_pin_size_percent) of shared_buffers, and a table counts with its
+-- total size: heap, indexes and TOAST.  Tables with fewer than min_access
+-- scans (default dbblue_min_access_count) are left out.  Only tables visible
+-- on the search_path are listed, because that is how the pinner finds them.
+CREATE FUNCTION dbblue_pin_candidates(
+    budget_percent int DEFAULT NULL,
+    min_access bigint DEFAULT NULL,
+    max_rows int DEFAULT 50)
+RETURNS TABLE (
+    schemaname name,
+    relname name,
+    total_mb numeric,
+    heap_mb numeric,
+    index_mb numeric,
+    toast_mb numeric,
+    access_count bigint,
+    blocks_read bigint,
+    hit_pct numeric,
+    already_pinned boolean,
+    recommended boolean,
+    cumulative_mb numeric,
+    reason text)
+LANGUAGE SQL STABLE PARALLEL RESTRICTED
+AS $$
+WITH RECURSIVE cfg AS (
+    SELECT pg_size_bytes(current_setting('shared_buffers'))::numeric *
+           coalesce(budget_percent,
+                    current_setting('dbblue_max_pin_size_percent')::int) / 100
+             AS budget,
+           coalesce(min_access,
+                    current_setting('dbblue_min_access_count')::bigint)
+             AS min_acc
+), pinned AS (
+    SELECT btrim(regexp_replace(x, ':tier[12]\s*$', '')) AS name
+    FROM unnest(string_to_array(current_setting('dbblue_pinned_tables'), ',')) AS x
+), cand AS (
+    SELECT n.nspname AS nsp, c.relname AS rel,
+           pg_total_relation_size(c.oid) AS total_b,
+           pg_relation_size(c.oid) AS heap_b,
+           pg_indexes_size(c.oid) AS idx_b,
+           coalesce(s.seq_scan, 0) + coalesce(s.idx_scan, 0) AS acc,
+           coalesce(io.heap_blks_read, 0) + coalesce(io.idx_blks_read, 0) +
+           coalesce(io.toast_blks_read, 0) + coalesce(io.tidx_blks_read, 0) AS rd,
+           coalesce(io.heap_blks_hit, 0) + coalesce(io.idx_blks_hit, 0) +
+           coalesce(io.toast_blks_hit, 0) + coalesce(io.tidx_blks_hit, 0) AS ht
+    FROM pg_class c
+         JOIN pg_namespace n ON n.oid = c.relnamespace
+         LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
+         LEFT JOIN pg_statio_user_tables io ON io.relid = c.oid
+    WHERE c.relkind = 'r' AND c.relpersistence = 'p'
+      AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+      AND n.nspname !~ '^pg_toast'
+      AND pg_table_is_visible(c.oid)
+      AND pg_total_relation_size(c.oid) > 0
+), ranked AS (
+    SELECT cand.*,
+           row_number() OVER (ORDER BY rd::numeric / total_b DESC, acc DESC,
+                                       total_b ASC, rel) AS rn
+    FROM cand, cfg
+    WHERE acc >= cfg.min_acc
+), greedy AS (
+    SELECT r.rn, (r.total_b <= cfg.budget) AS fits,
+           CASE WHEN r.total_b <= cfg.budget THEN r.total_b ELSE 0 END::numeric AS used
+    FROM ranked r, cfg WHERE r.rn = 1
+    UNION ALL
+    SELECT r.rn, (g.used + r.total_b <= cfg.budget),
+           g.used + CASE WHEN g.used + r.total_b <= cfg.budget
+                         THEN r.total_b ELSE 0 END
+    FROM greedy g
+         JOIN ranked r ON r.rn = g.rn + 1
+         CROSS JOIN cfg
+)
+SELECT r.nsp::name, r.rel::name,
+       round(r.total_b / 1048576.0, 2),
+       round(r.heap_b / 1048576.0, 2),
+       round(r.idx_b / 1048576.0, 2),
+       round((r.total_b - r.heap_b - r.idx_b) / 1048576.0, 2),
+       r.acc, r.rd,
+       round(100.0 * r.ht / nullif(r.ht + r.rd, 0), 1),
+       r.rel IN (SELECT name FROM pinned),
+       g.fits,
+       round(g.used / 1048576.0, 2),
+       CASE WHEN g.fits THEN 'fits the budget'
+            WHEN r.total_b > cfg.budget THEN 'larger than the whole budget'
+            ELSE 'budget already used by higher-ranked tables' END
+FROM ranked r
+     JOIN greedy g USING (rn)
+     CROSS JOIN cfg
+ORDER BY r.rn
+LIMIT max_rows
+$$;
