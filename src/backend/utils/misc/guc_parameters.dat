@@ -945,6 +945,7 @@
   flags => '0',
   variable => 'dbblue_fillfactor_map',
   boot_val => '""',
+  check_hook => 'dbblue_fillfactor_check_hook',
   assign_hook => 'dbblue_fillfactor_assign_hook',
 },
 
