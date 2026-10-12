@@ -1,0 +1,79 @@
+--
+-- DBblue safe mode (dbblue_safe_mode): refuses UPDATE/DELETE that would change
+-- every row.  Two fixes are exercised here:
+--
+--   Bug 1: an UPDATE on an INSTEAD OF trigger view WITH a real WHERE is allowed
+--          (it used to be wrongly refused), while a no-WHERE one is still
+--          refused.
+--   Bug 2: a DO INSTEAD rule that rewrites a restricted statement into a
+--          whole-table change is refused even after AutoPrepare caches the
+--          plan (the post-rewrite guard used to be skipped once cached).
+--
+-- Self-contained: dsu_ objects.
+SET client_min_messages = warning;
+\set VERBOSITY terse
+-- ---------- Bug 1: INSTEAD OF trigger view ----------
+CREATE TABLE dsu_acct (id int PRIMARY KEY, bal int);
+INSERT INTO dsu_acct VALUES (1, 100), (2, 200), (3, 300);
+CREATE VIEW dsu_vacct AS SELECT id, bal FROM dsu_acct;
+CREATE FUNCTION dsu_vacct_upd() RETURNS trigger LANGUAGE plpgsql AS
+  $$ BEGIN UPDATE dsu_acct SET bal = NEW.bal WHERE id = OLD.id; RETURN NEW; END $$;
+CREATE TRIGGER dsu_vacct_io INSTEAD OF UPDATE ON dsu_vacct
+  FOR EACH ROW EXECUTE FUNCTION dsu_vacct_upd();
+SET dbblue_safe_mode = on;
+-- restricted view update: ALLOWED (Bug 1 fix), changes only id = 2
+UPDATE dsu_vacct SET bal = 999 WHERE id = 2;
+SELECT id, bal FROM dsu_acct ORDER BY id;
+ id | bal 
+----+-----
+  1 | 100
+  2 | 999
+  3 | 300
+(3 rows)
+
+-- no-WHERE view update: still REFUSED
+UPDATE dsu_vacct SET bal = 0;
+ERROR:  UPDATE requires a WHERE clause because dbblue_safe_mode is enabled
+-- plain table: WHERE allowed, no-WHERE refused, always-true refused
+UPDATE dsu_acct SET bal = 111 WHERE id = 1;
+UPDATE dsu_acct SET bal = 0;
+ERROR:  UPDATE requires a WHERE clause because dbblue_safe_mode is enabled
+UPDATE dsu_acct SET bal = 0 WHERE true;
+ERROR:  UPDATE with an always-true WHERE clause is not allowed because dbblue_safe_mode is enabled
+RESET dbblue_safe_mode;
+-- ---------- Bug 2: DO INSTEAD rule + AutoPrepare ----------
+CREATE TABLE dsu_t (id int, flag bool);
+INSERT INTO dsu_t SELECT g, false FROM generate_series(1, 5) g;
+CREATE VIEW dsu_vt AS SELECT id, flag FROM dsu_t;
+-- a rule that turns any update on the view into a whole-table update
+CREATE RULE dsu_vt_upd AS ON UPDATE TO dsu_vt DO INSTEAD UPDATE dsu_t SET flag = true;
+SET dbblue_safe_mode = on;
+SET compute_query_id = on;
+SET dbblue_autoprepare_enabled = on;
+SET dbblue_autoprepare_threshold = 2;
+-- Same statement repeated: must be refused every time, whether or not
+-- AutoPrepare has cached a plan by now.
+UPDATE dsu_vt SET flag = true WHERE id = 3;
+ERROR:  UPDATE would change every row of "dsu_t" because dbblue_safe_mode is enabled
+UPDATE dsu_vt SET flag = true WHERE id = 3;
+ERROR:  UPDATE would change every row of "dsu_t" because dbblue_safe_mode is enabled
+UPDATE dsu_vt SET flag = true WHERE id = 3;
+ERROR:  UPDATE would change every row of "dsu_t" because dbblue_safe_mode is enabled
+UPDATE dsu_vt SET flag = true WHERE id = 3;
+ERROR:  UPDATE would change every row of "dsu_t" because dbblue_safe_mode is enabled
+-- No row of dsu_t may have changed.
+SELECT count(*) FILTER (WHERE flag) AS changed, count(*) AS total FROM dsu_t;
+ changed | total 
+---------+-------
+       0 |     5
+(1 row)
+
+RESET dbblue_autoprepare_enabled;
+RESET compute_query_id;
+RESET dbblue_safe_mode;
+-- cleanup
+DROP VIEW dsu_vt;
+DROP TABLE dsu_t;
+DROP VIEW dsu_vacct;
+DROP TABLE dsu_acct;
+DROP FUNCTION dsu_vacct_upd();

@@ -183,6 +183,11 @@ test: dbblue_audit_crosspart
 # at SET), and applied to a matching CREATE TABLE.  Self-contained, dff_ objects.
 test: dbblue_fillfactor
 
+# DBblue: safe mode allows a restricted INSTEAD OF view update but still refuses
+# a no-WHERE one, and refuses a rule-rewritten whole-table change even once
+# AutoPrepare caches it.  Self-contained, dsu_ objects; run alone.
+test: dbblue_safe_update
+
 # run tablespace test at the end because it drops the tablespace created during
 # setup that other tests may use.
 test: tablespace

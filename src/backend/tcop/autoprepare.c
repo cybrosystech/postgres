@@ -66,6 +66,7 @@
 #include "nodes/nodeFuncs.h"
 #include "nodes/params.h"
 #include "nodes/queryjumble.h"
+#include "parser/analyze.h"
 #include "portability/instr_time.h"
 #include "rewrite/rewriteHandler.h"
 #include "storage/bufmgr.h"
@@ -748,6 +749,17 @@ build_parameterized_plansource(Query *analyzed, const char *query_string,
 	rewritten = QueryRewrite(copyObject(pquery));
 	if (list_length(rewritten) != 1)
 		return NULL;			/* rule-rewritten / multi -> skip (see caveat) */
+
+	/*
+	 * Re-apply the safe-mode guard to the rewriter's output, exactly as
+	 * pg_rewrite_query() does on the normal path.  Autoprepare rewrites here
+	 * itself, so without this a rule that turns a restricted statement into a
+	 * whole-table change would be caught the first few times (normal path) but
+	 * slip through once the plan is cached.  Errors out when unsafe, which is
+	 * the intended behaviour -- the statement must not be cached or run.
+	 */
+	if (dbblue_safe_mode)
+		dbblue_safe_mode_check_rewritten(linitial_node(Query, rewritten));
 
 	plansource = CreateCachedPlanForQuery(pquery, query_string,
 										  aprep_cmdtag(analyzed->commandType));
