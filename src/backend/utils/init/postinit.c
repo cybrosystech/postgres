@@ -1289,10 +1289,13 @@ InitPostgres(const char *in_dbname, Oid dboid,
 
 	/* send any WARNINGs we've accumulated during initialization */
 	EmitConnectionWarnings();
-	if(dbblue_fillfactor_map)
-	{
-		dbblue_fillfactor_init();
-	}
+
+	/*
+	 * The dbblue fillfactor map is built lazily on first use
+	 * (dbblue_fillfactor_lookup) and by the GUC assign hook, so there is no
+	 * need to parse it again here -- doing so re-parsed the map on every
+	 * connection.
+	 */
 }
 
 /*

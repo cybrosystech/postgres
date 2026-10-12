@@ -1,0 +1,76 @@
+--
+-- DBblue fillfactor map.
+--
+-- A malformed map must be rejected at SET / reload time (the check hook),
+-- instead of being accepted and then warned about -- twice -- on every
+-- connection.  A valid map lowers the fillfactor of a matching CREATE TABLE.
+-- Self-contained: dff_ objects.
+-- (1) Malformed maps are refused at SET, each with a clear reason.
+SET dbblue_fillfactor_map = 'dff.hot';              -- missing ":fillfactor"
+ERROR:  invalid value for parameter "dbblue_fillfactor_map": "dff.hot"
+DETAIL:  malformed entry "dff.hot"; expected "tablename:fillfactor".
+SET dbblue_fillfactor_map = 'dff.hot:abc';          -- non-numeric fillfactor
+ERROR:  invalid value for parameter "dbblue_fillfactor_map": "dff.hot:abc"
+DETAIL:  invalid fillfactor value for table "dff.hot".
+SET dbblue_fillfactor_map = 'dff.hot:5';            -- below the [10,100] range
+ERROR:  invalid value for parameter "dbblue_fillfactor_map": "dff.hot:5"
+DETAIL:  fillfactor 5 for "dff.hot" is out of range [10,100].
+SET dbblue_fillfactor_map = 'dff.hot:150';          -- above the range
+ERROR:  invalid value for parameter "dbblue_fillfactor_map": "dff.hot:150"
+DETAIL:  fillfactor 150 for "dff.hot" is out of range [10,100].
+SET dbblue_fillfactor_map = ':70';                  -- empty table name
+ERROR:  invalid value for parameter "dbblue_fillfactor_map": ":70"
+DETAIL:  entry has an empty or too-long table name (maximum 127 characters).
+SET dbblue_fillfactor_map = 'dff.hot:70, broken';   -- a later entry is malformed
+ERROR:  invalid value for parameter "dbblue_fillfactor_map": "dff.hot:70, broken"
+DETAIL:  malformed entry "broken"; expected "tablename:fillfactor".
+-- A failed SET leaves the previous value in place.
+SHOW dbblue_fillfactor_map;
+ dbblue_fillfactor_map 
+-----------------------
+ 
+(1 row)
+
+-- (2) A valid map is accepted with no error and no warning.
+SET dbblue_fillfactor_map = 'dff.hot:70, dff.warm:75';
+SHOW dbblue_fillfactor_map;
+  dbblue_fillfactor_map  
+-------------------------
+ dff.hot:70, dff.warm:75
+(1 row)
+
+-- (3) A matching table gets the mapped fillfactor...
+CREATE TABLE dff_hot (id int, v text);
+SELECT reloptions FROM pg_class WHERE relname = 'dff_hot';
+   reloptions    
+-----------------
+ {fillfactor=70}
+(1 row)
+
+-- ...a non-matching table is left alone...
+CREATE TABLE dff_cold (id int);
+SELECT reloptions FROM pg_class WHERE relname = 'dff_cold';
+ reloptions 
+------------
+ 
+(1 row)
+
+-- ...and an explicit fillfactor on the statement wins over the map.
+CREATE TABLE dff_warm (id int) WITH (fillfactor = 90);
+SELECT reloptions FROM pg_class WHERE relname = 'dff_warm';
+   reloptions    
+-----------------
+ {fillfactor=90}
+(1 row)
+
+-- (4) An empty map is valid (feature off).
+SET dbblue_fillfactor_map = '';
+SHOW dbblue_fillfactor_map;
+ dbblue_fillfactor_map 
+-----------------------
+ 
+(1 row)
+
+-- cleanup
+RESET dbblue_fillfactor_map;
+DROP TABLE dff_hot, dff_cold, dff_warm;
