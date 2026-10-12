@@ -103,6 +103,18 @@ typedef struct HashJoinTupleData
 	((MinimalTuple) ((char *) (hjtup) + HJTUPLE_OVERHEAD))
 
 /*
+ * dbblue: when HashJoinTableData.extraTupleSpace is nonzero, each hash tuple
+ * is allocated that many extra bytes after its MinimalTuple, and this macro
+ * finds them.  nodeHashgroupjoin.c stores one group's aggregate transition
+ * states there, so that the join's own hash table doubles as the aggregation's
+ * hash table.  The tuple length is MAXALIGNed in this case (see
+ * ExecHashTableInsert) so that the extra area is properly aligned.
+ */
+#define HJTUPLE_EXTRA(hjtup)  \
+	((void *) ((char *) HJTUPLE_MINTUPLE(hjtup) + \
+			   MAXALIGN(HJTUPLE_MINTUPLE(hjtup)->t_len)))
+
+/*
  * If the outer relation's distribution is sufficiently nonuniform, we attempt
  * to optimize the join by treating the hash values corresponding to the outer
  * relation's MCVs specially.  Inner relation tuples matching these hash
@@ -358,6 +370,13 @@ typedef struct HashJoinTableData
 	 */
 	BufFile   **innerBatchFile; /* buffered virtual temp file per batch */
 	BufFile   **outerBatchFile; /* buffered virtual temp file per batch */
+
+	/*
+	 * dbblue: extra bytes to allocate after each hash tuple, reachable with
+	 * HJTUPLE_EXTRA().  Zero for an ordinary hash join.  Must be set before
+	 * any tuple is inserted.
+	 */
+	Size		extraTupleSpace;
 
 	Size		spaceUsed;		/* memory space currently used by tuples */
 	Size		spaceAllowed;	/* upper limit for space used */

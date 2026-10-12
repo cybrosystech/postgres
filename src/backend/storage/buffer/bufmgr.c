@@ -67,6 +67,7 @@
 #include "storage/smgr.h"
 #include "storage/standby.h"
 #include "utils/memdebug.h"
+#include "utils/guc_hooks.h"
 #include "utils/hsearch.h"
 #include "utils/ps_status.h"
 #include "utils/relfilenumbermap.h"
@@ -98,6 +99,53 @@
  * the buffers by doing lookups in BufMapping table.
  */
 #define BUF_DROP_FULL_SCAN_THRESHOLD		(uint64) (NBuffers / 32)
+
+/*
+ * check_dbblue_pinner_database
+ *		Accept only a plausible single database name.
+ *
+ * The pinner worker connects to exactly one database and passes this string
+ * to the connection code as that database's name.  A value such as
+ * 'db_odoo,postgres' would be taken as one (nonexistent) name, and the worker
+ * would then fail and be restarted forever, so reject lists and other
+ * obviously wrong values when the setting is made.  Whether the database
+ * actually exists cannot be checked here (the postmaster has no catalogs).
+ */
+bool
+check_dbblue_pinner_database(char **newval, void **extra, GucSource source)
+{
+	const char *name = *newval;
+	size_t		len;
+
+	if (name == NULL || name[0] == '\0')
+	{
+		GUC_check_errmsg("\"dbblue_pinner_database\" must not be empty");
+		return false;
+	}
+
+	len = strlen(name);
+	if (len >= NAMEDATALEN)
+	{
+		GUC_check_errmsg("\"dbblue_pinner_database\" is too long for a database name (maximum %d bytes)",
+						 NAMEDATALEN - 1);
+		return false;
+	}
+
+	if (strchr(name, ',') != NULL)
+	{
+		GUC_check_errmsg("\"dbblue_pinner_database\" takes a single database name, not a list");
+		GUC_check_errhint("The pinner connects to one database; a list such as \"db1,db2\" is not supported.");
+		return false;
+	}
+
+	if (isspace((unsigned char) name[0]) || isspace((unsigned char) name[len - 1]))
+	{
+		GUC_check_errmsg("\"dbblue_pinner_database\" must not start or end with whitespace");
+		return false;
+	}
+
+	return true;
+}
 
 /*
  * DBBlueRegisterPinnerWorker — register the dbblue soft-pin background worker

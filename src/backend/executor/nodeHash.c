@@ -468,7 +468,7 @@ ExecEndHash(HashState *node)
  * ----------------------------------------------------------------
  */
 HashJoinTable
-ExecHashTableCreate(HashState *state)
+ExecHashTableCreate(HashState *state, Size extraTupleSpace)
 {
 	Hash	   *node;
 	HashJoinTable hashtable;
@@ -497,6 +497,7 @@ ExecHashTableCreate(HashState *state)
 	rows = node->plan.parallel_aware ? node->rows_total : outerNode->plan_rows;
 
 	ExecChooseHashTableSize(rows, outerNode->plan_width,
+							extraTupleSpace,
 							OidIsValid(node->skewTable),
 							state->parallel_state != NULL,
 							state->parallel_state != NULL ?
@@ -532,6 +533,7 @@ ExecHashTableCreate(HashState *state)
 	hashtable->nbatch_original = nbatch;
 	hashtable->nbatch_outstart = nbatch;
 	hashtable->growEnabled = true;
+	hashtable->extraTupleSpace = extraTupleSpace;	/* dbblue */
 	hashtable->totalTuples = 0;
 	hashtable->reportTuples = 0;
 	hashtable->skewTuples = 0;
@@ -680,7 +682,8 @@ ExecHashTableCreate(HashState *state)
 #define NTUP_PER_BUCKET			1
 
 void
-ExecChooseHashTableSize(double ntuples, int tupwidth, bool useskew,
+ExecChooseHashTableSize(double ntuples, int tupwidth,
+						Size extraTupleSpace, bool useskew,
 						bool try_combined_hash_mem,
 						int parallel_workers,
 						size_t *space_allowed,
@@ -709,6 +712,20 @@ ExecChooseHashTableSize(double ntuples, int tupwidth, bool useskew,
 	tupsize = HJTUPLE_OVERHEAD +
 		MAXALIGN(SizeofMinimalTupleHeader) +
 		MAXALIGN(tupwidth);
+
+	/*
+	 * dbblue: a fused HashGroupJoin stores each group's aggregate transition
+	 * states alongside the tuple (HJTUPLE_EXTRA), so its entries are wider
+	 * than the tuple alone.  This is an exact figure, not an estimate -- it is
+	 * sizeof(AggStatePerGroupData) times the number of transitions -- so
+	 * folding it in here simply removes a systematic undercount.  Leaving it
+	 * out does not give the wrong batch count in the end, because spaceUsed is
+	 * tracked with the extra area included and the table just splits again at
+	 * run time; it only means paying for a repartition pass that could have
+	 * been avoided.
+	 */
+	tupsize += extraTupleSpace;
+
 	inner_rel_bytes = ntuples * tupsize;
 
 	/*
@@ -831,7 +848,8 @@ ExecChooseHashTableSize(double ntuples, int tupwidth, bool useskew,
 		 */
 		if (try_combined_hash_mem)
 		{
-			ExecChooseHashTableSize(ntuples, tupwidth, useskew,
+			ExecChooseHashTableSize(ntuples, tupwidth, extraTupleSpace,
+									useskew,
 									false, parallel_workers,
 									space_allowed,
 									numbuckets,
@@ -1149,6 +1167,11 @@ ExecHashIncreaseNumBatches(HashJoinTable hashtable)
 			int			hashTupleSize = (HJTUPLE_OVERHEAD + tuple->t_len);
 			int			bucketno;
 			int			batchno;
+
+			/* dbblue: keep the per-tuple aggregate state area when relocating */
+			if (hashtable->extraTupleSpace > 0)
+				hashTupleSize = HJTUPLE_OVERHEAD + MAXALIGN(tuple->t_len) +
+					hashtable->extraTupleSpace;
 
 			ninmemory++;
 			ExecHashGetBucketAndBatch(hashtable, hashTuple->hashvalue,
@@ -1661,9 +1684,25 @@ ExecHashIncreaseNumBuckets(HashJoinTable hashtable)
 			hashTuple->next.unshared = hashtable->buckets.unshared[bucketno];
 			hashtable->buckets.unshared[bucketno] = hashTuple;
 
-			/* advance index past the tuple */
-			idx += MAXALIGN(HJTUPLE_OVERHEAD +
-							HJTUPLE_MINTUPLE(hashTuple)->t_len);
+			/*
+			 * Advance index past the tuple.
+			 *
+			 * dbblue: when entries carry an extra per-tuple state area, the
+			 * allocation stride is wider than the tuple itself, so it has to
+			 * be recomputed exactly as ExecHashTableInsert() laid it out.
+			 * Using the plain tuple length would desynchronize this walk from
+			 * the chunk after the first entry and reinterpret arbitrary bytes
+			 * as a HashJoinTuple.  Note this path is reachable whenever the
+			 * bucket count is revised upward, which does not depend on
+			 * growEnabled or on the join being multi-batch.
+			 */
+			if (hashtable->extraTupleSpace > 0)
+				idx += MAXALIGN(HJTUPLE_OVERHEAD +
+								MAXALIGN(HJTUPLE_MINTUPLE(hashTuple)->t_len) +
+								hashtable->extraTupleSpace);
+			else
+				idx += MAXALIGN(HJTUPLE_OVERHEAD +
+								HJTUPLE_MINTUPLE(hashTuple)->t_len);
 		}
 
 		/* allow this loop to be cancellable */
@@ -1796,6 +1835,10 @@ ExecHashTableInsert(HashJoinTable hashtable,
 
 		/* Create the HashJoinTuple */
 		hashTupleSize = HJTUPLE_OVERHEAD + tuple->t_len;
+		/* dbblue: room for per-tuple aggregate state, if requested */
+		if (hashtable->extraTupleSpace > 0)
+			hashTupleSize = HJTUPLE_OVERHEAD + MAXALIGN(tuple->t_len) +
+				hashtable->extraTupleSpace;
 		hashTuple = (HashJoinTuple) dense_alloc(hashtable, hashTupleSize);
 
 		hashTuple->hashvalue = hashvalue;

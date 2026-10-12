@@ -2993,6 +2993,35 @@ finalize_plan(PlannerInfo *root, Plan *plan,
 							  &context);
 			break;
 
+		case T_HashGroupJoin:
+			{
+				/* dbblue: the join half, as T_HashJoin above ... */
+				HashGroupJoin *hgj = (HashGroupJoin *) plan;
+				finalize_primnode_context aggcontext;
+
+				finalize_primnode((Node *) hgj->join.joinqual, &context);
+				finalize_primnode((Node *) hgj->hashclauses, &context);
+				finalize_primnode((Node *) hgj->havingQual, &context);
+
+				/*
+				 * ... and the aggregation half, as T_Agg below.  This node
+				 * always aggregates via a hash table, so it unconditionally
+				 * needs to know which Params are referenced in aggregate
+				 * calls (the AGG_HASHED case there).  HAVING is scanned too,
+				 * since for this node it lives outside plan.qual.
+				 */
+				aggcontext.root = root;
+				aggcontext.paramids = NULL;
+				finalize_agg_primnode((Node *) hgj->join.plan.targetlist,
+									  &aggcontext);
+				finalize_agg_primnode((Node *) hgj->join.plan.qual,
+									  &aggcontext);
+				finalize_agg_primnode((Node *) hgj->havingQual,
+									  &aggcontext);
+				hgj->aggParams = aggcontext.paramids;
+			}
+			break;
+
 		case T_Hash:
 			finalize_primnode((Node *) ((Hash *) plan)->hashkeys,
 							  &context);
