@@ -1,0 +1,31 @@
+--
+-- dbblue: amcheck on a GLOBAL partition index.
+--
+-- A global index is one physical btree spanning every partition; its indrelid
+-- is the partitioned parent, which has no heap of its own and whose relcache
+-- entry has no table access method (rd_tableam is NULL).  Structural checks are
+-- fine, but heapallindexed would hand that parent to table_beginscan() and
+-- dereference the NULL rd_tableam, crashing the backend and restarting the
+-- whole cluster.  It must raise a clean error instead.
+--
+SET client_min_messages = warning;      -- hide the "created as GLOBAL index" notice
+CREATE EXTENSION IF NOT EXISTS amcheck;
+
+CREATE TABLE gidx_part (id int, ts int, v text) PARTITION BY RANGE (ts);
+CREATE TABLE gidx_part_1 PARTITION OF gidx_part FOR VALUES FROM (0) TO (100);
+CREATE TABLE gidx_part_2 PARTITION OF gidx_part FOR VALUES FROM (100) TO (200);
+
+-- id excludes the partition key (ts), so this is backed by a global index
+SET dbblue_auto_global_index = on;
+CREATE UNIQUE INDEX gidx_global ON gidx_part (id);
+INSERT INTO gidx_part SELECT g, g, 'v' || g FROM generate_series(1, 150) g;
+
+-- Structural verification does not scan the heap and works.
+SELECT bt_index_check('gidx_global', false);
+
+-- heapallindexed must be refused cleanly (it used to crash the server).
+SELECT bt_index_check('gidx_global', true);
+
+-- cleanup
+RESET dbblue_auto_global_index;
+DROP TABLE gidx_part;
