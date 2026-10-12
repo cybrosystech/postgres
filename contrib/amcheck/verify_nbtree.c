@@ -33,6 +33,7 @@
 #include "verify_common.h"
 #include "catalog/index.h"
 #include "catalog/pg_am.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_opfamily_d.h"
 #include "common/pg_prng.h"
 #include "lib/bloomfilter.h"
@@ -418,6 +419,25 @@ bt_check_every_level(Relation rel, Relation heaprel, bool heapkeyspace,
 		int64		total_pages;
 		int64		total_elems;
 		uint64		seed;
+
+		/*
+		 * A dbblue global partition index has no single heap to scan: its
+		 * indrelid is the partitioned parent, which has no storage and whose
+		 * relcache entry carries no table access method (rd_tableam is NULL).
+		 * heapallindexed would hand that parent to table_beginscan() and
+		 * dereference the NULL rd_tableam, crashing the backend and forcing a
+		 * cluster-wide restart.  Refuse it with a clear error instead.
+		 * Structural verification (heapallindexed = false) does not scan the
+		 * heap and is unaffected.
+		 */
+		if (heaprel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+			ereport(ERROR,
+					errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("heapallindexed verification is not supported on a global partition index"),
+					errdetail("Index \"%s\" spans all partitions of \"%s\", which has no heap of its own.",
+							  RelationGetRelationName(rel),
+							  RelationGetRelationName(heaprel)),
+					errhint("Run the check with heapallindexed set to false, or verify each partition's own index."));
 
 		/*
 		 * Size Bloom filter based on estimated number of tuples in index,
