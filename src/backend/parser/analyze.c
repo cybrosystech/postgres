@@ -438,6 +438,19 @@ qual_reaches_result_rel(Query *query, Node *qual)
 	if (query->resultRelation <= 0)
 		return true;
 
+	/*
+	 * A view left as the result relation after rewriting is modified through
+	 * an INSTEAD OF trigger: auto-updatable views and DO INSTEAD rules
+	 * re-point the statement onto a base table, so the result relation would
+	 * not still be the view.  For such a view the rewriter duplicates its RTE
+	 * -- one copy is scanned (and carries the WHERE), the other is the target
+	 * -- so the qual never mentions the target RTE and this test would always
+	 * fail.  The trigger only fires for the WHERE-selected rows and the
+	 * parse-time check already verified that WHERE restricts, so accept it.
+	 */
+	if (rt_fetch(query->resultRelation, query->rtable)->relkind == RELKIND_VIEW)
+		return true;
+
 	varnos = pull_varnos(NULL, qual);
 	return bms_is_member(query->resultRelation, varnos);
 }
