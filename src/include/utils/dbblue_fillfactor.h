@@ -1,8 +1,17 @@
 #ifndef DBBLUE_FILLFACTOR_H
 #define DBBLUE_FILLFACTOR_H
 
+#include "utils/guc.h"
+
 /* GUC variable - declared here, defined in dbblue_fillfactor.c */
 extern char *dbblue_fillfactor_map;
+
+/*
+* GUC check hook: validates dbblue_fillfactor_map, rejecting a malformed
+* value at SET / configuration-reload time.
+*/
+extern bool dbblue_fillfactor_check_hook(char **newval, void **extra,
+										 GucSource source);
 
 /*
 * Call once after GUC is initialised.
