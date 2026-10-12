@@ -190,6 +190,17 @@ static MemoryContext advisor_cxt = NULL;
 static bool advisor_env_ready = false;
 
 /*
+ * Schemas (already quoted) that pg_stat_statements and hypopg live in,
+ * resolved once in advisor_ensure_environment.  The worker runs as the
+ * bootstrap superuser, so every call it makes to those extensions is
+ * schema-qualified with these: an unqualified name could otherwise be
+ * resolved to an object an unprivileged user planted earlier on the
+ * search_path and then run with superuser rights.
+ */
+static char *advisor_pgss_schema = NULL;
+static char *advisor_hypopg_schema = NULL;
+
+/*
  * One database the launcher will start a worker in this sweep.  The name is
  * carried alongside the OID only for log messages; the worker is addressed by
  * OID, which stays correct even if the database is renamed mid-sweep.
@@ -574,6 +585,43 @@ advisor_exec_in_subxact(const char *sql, const char *what)
 }
 
 /*
+ * advisor_extension_schema
+ *		Return the (already quote_ident'd) schema an extension lives in, copied
+ *		into TopMemoryContext, or NULL if it cannot be found.  Caller must hold
+ *		an SPI connection.  Used so the worker can schema-qualify its calls into
+ *		pg_stat_statements and hypopg instead of resolving them through the
+ *		search_path while it holds superuser rights.
+ */
+static char *
+advisor_extension_schema(const char *extname)
+{
+	char	   *sql;
+	char	   *result = NULL;
+	int			ret;
+
+	sql = psprintf("SELECT quote_ident(n.nspname) "
+				   "FROM pg_catalog.pg_extension e "
+				   "JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace "
+				   "WHERE e.extname = %s",
+				   quote_literal_cstr(extname));
+	ret = SPI_execute(sql, true, 1);
+	pfree(sql);
+
+	if (ret == SPI_OK_SELECT && SPI_processed == 1)
+	{
+		char	   *val = SPI_getvalue(SPI_tuptable->vals[0],
+									   SPI_tuptable->tupdesc, 1);
+
+		if (val)
+		{
+			result = MemoryContextStrdup(TopMemoryContext, val);
+			pfree(val);
+		}
+	}
+	return result;
+}
+
+/*
  * advisor_ensure_environment
  *		Make sure pg_stat_statements, hypopg and the results table exist
  *		in the connected database.  Sets advisor_env_ready when all three
@@ -725,12 +773,31 @@ advisor_ensure_environment(void)
 		}
 	}
 
+	/*
+	 * Resolve the schemas the two extensions ended up in, so every later call
+	 * into them is schema-qualified rather than resolved through search_path
+	 * under the worker's superuser identity.
+	 */
+	if (pgss_ok)
+	{
+		if (advisor_pgss_schema)
+			pfree(advisor_pgss_schema);
+		advisor_pgss_schema = advisor_extension_schema("pg_stat_statements");
+	}
+	if (hypopg_ok)
+	{
+		if (advisor_hypopg_schema)
+			pfree(advisor_hypopg_schema);
+		advisor_hypopg_schema = advisor_extension_schema("hypopg");
+	}
+
 	SPI_finish();
 	PopActiveSnapshot();
 	CommitTransactionCommand();
 	pgstat_report_activity(STATE_IDLE, NULL);
 
-	advisor_env_ready = pgss_ok && hypopg_ok && table_ok;
+	advisor_env_ready = pgss_ok && hypopg_ok && table_ok &&
+		advisor_pgss_schema != NULL && advisor_hypopg_schema != NULL;
 
 	if (advisor_env_ready)
 		ereport(DEBUG1,
@@ -1208,7 +1275,12 @@ add_candidate(List **candidates, Oid relid, int nkeys, const AttrNumber *keys)
 	index_name = candidate_index_name(table_name, cand->colnames);
 
 	initStringInfo(&ddl);
-	appendStringInfo(&ddl, "CREATE INDEX IF NOT EXISTS %s ON %s (",
+	/*
+	 * Suggest CONCURRENTLY so that applying the recommendation on a live Odoo
+	 * table does not take a lock that blocks writes for the whole build.  The
+	 * DBA must run it outside a transaction block (a CONCURRENTLY restriction).
+	 */
+	appendStringInfo(&ddl, "CREATE INDEX CONCURRENTLY IF NOT EXISTS %s ON %s (",
 					 quote_identifier(index_name),
 					 quote_qualified_identifier(schema_name, table_name));
 	foreach(lc, cand->colnames)
@@ -1537,7 +1609,8 @@ advisor_evaluate_candidate(WorkloadEntry *entry, IndexCandidate *cand,
 		char	   *hypo_sql;
 		double		hypo_cost;
 
-		hypo_sql = psprintf("SELECT hypopg_create_index(%s)",
+		hypo_sql = psprintf("SELECT %s.hypopg_create_index(%s)",
+							advisor_hypopg_schema,
 							quote_literal_cstr(cand->ddl));
 		(void) SPI_execute(hypo_sql, false, 0);
 		pfree(hypo_sql);
@@ -1591,8 +1664,14 @@ advisor_evaluate_candidate(WorkloadEntry *entry, IndexCandidate *cand,
 	 * not rolled back with the subtransaction, so always drop them before
 	 * the next candidate is priced.
 	 */
-	(void) advisor_exec_in_subxact("SELECT hypopg_reset()",
-								   "resetting hypothetical indexes");
+	{
+		char	   *reset_sql = psprintf("SELECT %s.hypopg_reset()",
+										 advisor_hypopg_schema);
+
+		(void) advisor_exec_in_subxact(reset_sql,
+									   "resetting hypothetical indexes");
+		pfree(reset_sql);
+	}
 }
 
 /*
@@ -1741,8 +1820,14 @@ advisor_process_entry(WorkloadEntry *entry)
 	if (candidates != NIL)
 	{
 		/* Make sure no hypothetical leftovers skew the baseline. */
-		(void) advisor_exec_in_subxact("SELECT hypopg_reset()",
-									   "resetting hypothetical indexes");
+		{
+			char	   *reset_sql = psprintf("SELECT %s.hypopg_reset()",
+											 advisor_hypopg_schema);
+
+			(void) advisor_exec_in_subxact(reset_sql,
+										   "resetting hypothetical indexes");
+			pfree(reset_sql);
+		}
 
 		baseline = -1.0;
 
@@ -1833,11 +1918,12 @@ advisor_load_workload(void)
 						   "dbblue index advisor: reading pg_stat_statements");
 
 	sql = psprintf("SELECT queryid, calls, total_exec_time, query, userid "
-				   "FROM pg_stat_statements "
+				   "FROM %s.pg_stat_statements "
 				   "WHERE dbid = %u AND toplevel "
 				   "AND queryid IS NOT NULL AND calls >= %d "
 				   "ORDER BY total_exec_time DESC "
 				   "LIMIT %d",
+				   advisor_pgss_schema,
 				   MyDatabaseId,
 				   dbblue_auto_index_suggestion_min_calls,
 				   dbblue_auto_index_suggestion_top_n_queries);
