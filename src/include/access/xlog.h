@@ -87,6 +87,19 @@ typedef enum WalCompression
 	WAL_COMPRESSION_ZSTD,
 } WalCompression;
 
+/*
+ * Default for wal_compression.  LZ4 where the build supports it (much cheaper
+ * than pglz for full-page images), otherwise pglz, which is always compiled
+ * in.  This must be a value valid for the current build: a plain LZ4 default
+ * on a build without liblz4 makes initdb and every full-page write PANIC with
+ * "LZ4 is not supported by this build".  Mirrors DEFAULT_TOAST_COMPRESSION.
+ */
+#ifdef USE_LZ4
+#define DEFAULT_WAL_COMPRESSION		WAL_COMPRESSION_LZ4
+#else
+#define DEFAULT_WAL_COMPRESSION		WAL_COMPRESSION_PGLZ
+#endif
+
 /* Recovery states */
 typedef enum RecoveryState
 {
