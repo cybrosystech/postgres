@@ -2760,6 +2760,37 @@ RelationSupportsRawBulkInsert(Relation rel)
 }
 
 /*
+ * Guard against a second writer touching the relation during a raw bulk load.
+ *
+ * The raw bulk insert path bypasses the buffer manager and assumes it is the
+ * sole writer of this brand-new relation, laying pages down from block 0 under
+ * that assumption (see heap_raw_bulk_insert_begin()).  If anything inserts into
+ * the same relation through the ordinary buffer-managed path while the load is
+ * in progress -- for example a volatile function or data-modifying CTE in a
+ * CREATE TABLE AS ... SELECT that writes back into the table being created --
+ * the two writers both start at block 0 and silently overwrite each other,
+ * losing rows.
+ *
+ * Every buffer-managed insert records a target block on the relcache entry
+ * (RelationGetBufferForTuple -> RelationSetTargetBlock), which this path never
+ * does, so a target block that has become valid is a reliable, cheap signal
+ * that such a second writer exists.  It is a hard error: a CTAS / matview
+ * refresh is a single transaction, so erroring rolls the whole load back and
+ * discards the partially written relation rather than leaving silently
+ * corrupted contents behind.  The ordinary case -- a SELECT that does not write
+ * to its own target -- never trips this and keeps the fast path.
+ */
+static inline void
+heap_raw_bulk_insert_check_sole_writer(Relation relation)
+{
+	if (RelationGetTargetBlock(relation) != InvalidBlockNumber)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot bulk-load relation \"%s\" that is being modified by the same command",
+						RelationGetRelationName(relation))));
+}
+
+/*
  * heap_raw_bulk_insert_begin - start a raw bulk insert operation
  *
  * This is a fast path for populating the initial contents of a brand-new,
@@ -2828,6 +2859,12 @@ heap_raw_bulk_insert_tuple(HeapRawBulkInsertState state, TupleTableSlot *slot)
 	bool		shouldFree;
 
 	AssertHasSnapshotForToast(relation);
+
+	/*
+	 * Bail out if a buffer-managed writer has touched this relation since the
+	 * load began; continuing would silently overwrite its rows (or ours).
+	 */
+	heap_raw_bulk_insert_check_sole_writer(relation);
 
 	tuple = ExecFetchSlotHeapTuple(slot, true, &shouldFree);
 	slot->tts_tableOid = RelationGetRelid(relation);
@@ -2939,6 +2976,14 @@ heap_raw_bulk_insert_tuple(HeapRawBulkInsertState state, TupleTableSlot *slot)
 void
 heap_raw_bulk_insert_end(HeapRawBulkInsertState state)
 {
+	/*
+	 * A buffer-managed writer may have touched the relation after the last
+	 * tuple was handed to us, which heap_raw_bulk_insert_tuple() could not
+	 * have seen.  Catch it here, before flushing our final page over whatever
+	 * that writer left behind.
+	 */
+	heap_raw_bulk_insert_check_sole_writer(state->rel);
+
 	if (state->buffer != NULL)
 		smgr_bulk_write(state->bulkstate, state->blockno, state->buffer, true);
 
