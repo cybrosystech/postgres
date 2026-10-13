@@ -331,4 +331,36 @@ command_fails(
 	[ 'pg_checksums', '--pgdata' => $datadir_nochecksums ],
 	"pg_checksums fails with data checksum disabled");
 
+# ---------------------------------------------------------------------------
+# dbblue auto-tune invariants.  The "successful creation" initdb above tuned
+# postgresql.conf from the detected host, so reuse that data directory rather
+# than paying for another initdb.  Assert the relationships the auto-tune fixes
+# guarantee, not host-specific numbers.  These GUCs are uncommented only when
+# auto-tune could read the host specs; max_worker_processes left commented is
+# the signal that it fell back to upstream defaults, so there is nothing to
+# check.
+# ---------------------------------------------------------------------------
+my $atconf = slurp_file("$datadir/postgresql.conf");
+SKIP:
+{
+	skip "auto-tune inactive on this host (upstream defaults written)", 4
+	  unless $atconf =~ /^max_worker_processes = (\d+)/m;
+	my $mwp = $1;
+	my ($mpw) = $atconf =~ /^max_parallel_workers = (\d+)/m;
+	my ($maxwal) = $atconf =~ /^max_wal_size = (\d+)MB/m;
+	my ($minwal) = $atconf =~ /^min_wal_size = (\d+)MB/m;
+
+	# The background-worker pool must sit above the parallel-query budget, so
+	# the always-on launchers cannot starve parallel query of its slots.
+	cmp_ok($mwp, '>', $mpw,
+		'auto-tune: max_worker_processes has headroom above max_parallel_workers');
+
+	# WAL is scaled within [1 GB, 8 GB] with min a quarter of max, rather than
+	# a fixed 2 GB/8 GB a small host cannot back.
+	cmp_ok($maxwal, '>=', 1024, 'auto-tune: max_wal_size is at least 1 GB');
+	cmp_ok($maxwal, '<=', 8192, 'auto-tune: max_wal_size is at most 8 GB');
+	is($minwal, int($maxwal / 4),
+		'auto-tune: min_wal_size is a quarter of max_wal_size');
+}
+
 done_testing();
