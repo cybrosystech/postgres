@@ -1,0 +1,123 @@
+# Checking port 13199
+# Found port 13199
+Name: auto_brin
+Version: 19beta2
+Data directory: tmp_check/t_001_auto_brin_auto_brin_data/pgdata
+Backup directory: tmp_check/t_001_auto_brin_auto_brin_data/backup
+Archive directory: tmp_check/t_001_auto_brin_auto_brin_data/archives
+Connection string: port=13199 host=/tmp/CG7iBz24CW
+Log file: log/001_auto_brin_auto_brin.log
+[19:20:40.840](0.020s) # initializing database system by running initdb
+# Running: initdb --no-sync --pgdata tmp_check/t_001_auto_brin_auto_brin_data/pgdata --auth trust
+The files belonging to this database system will be owned by user "cybrosys".
+This user must also own the server process.
+
+The database cluster will be initialized with this locale configuration:
+  locale provider:   libc
+  LC_COLLATE:  en_IN
+  LC_CTYPE:    en_IN
+  LC_MESSAGES: C
+  LC_MONETARY: en_IN
+  LC_NUMERIC:  C
+  LC_TIME:     en_IN
+The default database encoding has accordingly been set to "UTF8".
+The default text search configuration will be set to "english".
+
+Data page checksums are enabled.
+
+creating directory tmp_check/t_001_auto_brin_auto_brin_data/pgdata ... ok
+creating subdirectories ... ok
+selecting dynamic shared memory implementation ... posix
+selecting default "max_connections" ... 100
+selecting default "shared_buffers" ... 128MB
+selecting default time zone ... Asia/Kolkata
+auto-tune: detected 30843 MB RAM, 16 CPU(s), storage=ssd
+auto-tune: probing "shared_buffers" = 8GB ... ok
+creating configuration files ... ok
+running bootstrap script ... ok
+performing post-bootstrap initialization ... 2026-10-12 19:20:41.811 IST [505732] LOG:  registered custom resource manager "pg_tde" with ID 140
+2026-10-12 19:20:41.811 IST [505732] LOG:  tde_shmem_request: requested 17649200 bytes
+2026-10-12 19:20:42.037 IST [505732] LOG:  creating DSA area of size 262144
+2026-10-12 19:20:42.478 IST [505732] LOG:  Setting principal key [odoo_default_key : global_file_provider] for the database
+2026-10-12 19:20:42.478 IST [505732] STATEMENT:  SELECT public.pg_tde_set_server_key_using_global_key_provider('odoo_default_key', 'global_file_provider');
+	
+2026-10-12 19:20:42.478 IST [505732] LOG:  Setting principal key [odoo_default_key : global_file_provider] for the database
+2026-10-12 19:20:42.478 IST [505732] STATEMENT:  SELECT public.pg_tde_set_default_key_using_global_key_provider('odoo_default_key', 'global_file_provider');
+	
+ok
+
+Sync to disk skipped.
+The data directory might become corrupt if the operating system crashes.
+
+Success. You can now start the database server using:
+
+    pg_ctl -D tmp_check/t_001_auto_brin_auto_brin_data/pgdata -l logfile start
+
+# Running: /home/cybrosys/global_partition_index/postgres/src/test/regress/pg_regress --config-auth tmp_check/t_001_auto_brin_auto_brin_data/pgdata
+### Starting node "auto_brin"
+# Running: pg_ctl --wait --pgdata tmp_check/t_001_auto_brin_auto_brin_data/pgdata --log log/001_auto_brin_auto_brin.log --options --cluster-name=auto_brin start
+waiting for server to start.... done
+server started
+# Postmaster PID for node "auto_brin" is 505744
+[19:20:43.322](2.481s) ok 1 - create_date is highly correlated, so the worker should index it
+### Reloading node "auto_brin"
+# Running: pg_ctl --pgdata tmp_check/t_001_auto_brin_auto_brin_data/pgdata reload
+server signaled
+[19:20:43.476](0.154s) ok 2 - a valid BRIN index on create_date was created
+[19:20:43.490](0.014s) ok 3 - the index is named <table>_create_date_brin_idx
+[19:20:43.531](0.041s) # connect output:
+# {
+#   'stderr' => 'background_psql: ready
+# ',
+#   'stdout' => 'background_psql: ready
+# '
+# }
+[19:20:43.531](0.000s) # issuing query 1 via background psql: BEGIN
+[19:20:43.532](0.001s) # results query 1:
+# {
+#   'stderr' => 'background_psql: QUERY_SEPARATOR 1:
+# ',
+#   'stdout' => 'background_psql: QUERY_SEPARATOR 1:
+# '
+# }
+[19:20:43.533](0.000s) # issuing query 2 via background psql: INSERT INTO sale_order (create_date, amount) VALUES (now(), 1)
+[19:20:43.535](0.003s) # results query 2:
+# {
+#   'stderr' => 'background_psql: QUERY_SEPARATOR 2:
+# ',
+#   'stdout' => 'background_psql: QUERY_SEPARATOR 2:
+# '
+# }
+### Reloading node "auto_brin"
+# Running: pg_ctl --pgdata tmp_check/t_001_auto_brin_auto_brin_data/pgdata reload
+server signaled
+[19:20:43.689](0.154s) ok 4 - the concurrent build holds ShareUpdateExclusiveLock, not ShareLock
+[19:20:43.702](0.014s) ok 5 - writes are not blocked during the concurrent build
+[19:20:43.703](0.000s) # issuing query 3 via background psql: COMMIT
+[19:20:43.706](0.003s) # results query 3:
+# {
+#   'stderr' => 'background_psql: QUERY_SEPARATOR 3:
+# ',
+#   'stdout' => 'background_psql: QUERY_SEPARATOR 3:
+# '
+# }
+[19:20:43.845](0.139s) ok 6 - the concurrent build finished and the index is valid
+### Reloading node "auto_brin"
+# Running: pg_ctl --pgdata tmp_check/t_001_auto_brin_auto_brin_data/pgdata reload
+server signaled
+[19:20:43.973](0.128s) ok 7 - a name collision is reported as a warning
+### Reloading node "auto_brin"
+# Running: pg_ctl --pgdata tmp_check/t_001_auto_brin_auto_brin_data/pgdata reload
+server signaled
+[19:20:44.078](0.105s) ok 8 - no phantom "created" is logged while the name stays taken
+[19:20:44.093](0.015s) ok 9 - no BRIN index is created while the name is taken
+### Reloading node "auto_brin"
+# Running: pg_ctl --pgdata tmp_check/t_001_auto_brin_auto_brin_data/pgdata reload
+server signaled
+[19:20:44.259](0.165s) ok 10 - the worker builds the index once the conflicting name is freed
+### Stopping node "auto_brin" using mode fast
+# Running: pg_ctl --pgdata tmp_check/t_001_auto_brin_auto_brin_data/pgdata --mode fast stop
+waiting for server to shut down.... done
+server stopped
+# No postmaster PID for node "auto_brin"
+[19:20:44.364](0.105s) 1..10
