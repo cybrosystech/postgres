@@ -188,6 +188,12 @@ test: dbblue_fillfactor
 # AutoPrepare caches it.  Self-contained, dsu_ objects; run alone.
 test: dbblue_safe_update
 
+# DBblue: the raw bulk-insert fast path (dbblue_enable_tableam_multi_insert)
+# refuses a CREATE TABLE AS whose SELECT writes into the table being created,
+# rather than silently overwriting rows, while a plain CTAS still works.
+# Self-contained, dbi_ objects; run alone.
+test: dbblue_bulk_insert
+
 # run tablespace test at the end because it drops the tablespace created during
 # setup that other tests may use.
 test: tablespace
