@@ -1,0 +1,51 @@
+--
+-- DBblue raw bulk insert (dbblue_enable_tableam_multi_insert).
+--
+-- The fast path for populating a brand-new relation (CREATE TABLE AS, CREATE
+-- MATERIALIZED VIEW) bypasses the buffer manager and assumes it is the sole
+-- writer, laying pages down from block 0.  A SELECT that writes into the very
+-- table being created -- a volatile function or data-modifying CTE -- is a
+-- second writer that would otherwise silently overwrite rows.  The load must
+-- fail cleanly instead, and (being a single transaction) leave no table behind.
+--
+-- A plain SELECT that does not touch its own target still takes the fast path.
+--
+-- Self-contained: dbi_ objects.  Assumes the fast path is active, i.e. not
+-- wal_level = logical (XLogLogicalInfoActive()), which the default regression
+-- configuration satisfies.
+
+SET client_min_messages = warning;
+\set VERBOSITY terse
+
+CREATE FUNCTION dbi_sneak() RETURNS int LANGUAGE plpgsql AS
+  $$ BEGIN EXECUTE 'INSERT INTO dbi_t VALUES (-1, ''sneaked'')'; RETURN 0; END $$;
+
+SET dbblue_enable_tableam_multi_insert = on;
+
+-- A CTAS whose SELECT writes into the table being created must error rather
+-- than silently lose rows.  (The WHERE calls dbi_sneak() once, on g = 1.)
+CREATE TABLE dbi_t AS
+  SELECT g AS id, 'ctas'::text AS src FROM generate_series(1, 1000) g
+  WHERE (g <> 1) OR (dbi_sneak() = 0);
+
+-- ... and must leave nothing behind: the whole CTAS rolled back.
+SELECT count(*) FROM dbi_t;
+
+-- A normal CTAS (the SELECT does not touch its target) still works, on the
+-- fast path.
+CREATE TABLE dbi_ok AS
+  SELECT g AS id, 'ctas'::text AS src FROM generate_series(1, 1000) g;
+SELECT count(*) FROM dbi_ok;
+
+-- With the fast path off, the same self-writing CTAS is allowed -- both writers
+-- go through the buffer manager -- and loses nothing: 1000 rows + 1 sneaked.
+SET dbblue_enable_tableam_multi_insert = off;
+CREATE TABLE dbi_t AS
+  SELECT g AS id, 'ctas'::text AS src FROM generate_series(1, 1000) g
+  WHERE (g <> 1) OR (dbi_sneak() = 0);
+SELECT count(*) FROM dbi_t;
+
+-- cleanup
+DROP TABLE dbi_t;
+DROP TABLE dbi_ok;
+DROP FUNCTION dbi_sneak();
