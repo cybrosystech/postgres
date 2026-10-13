@@ -28,6 +28,8 @@ typedef struct AutoTuneSettings
 	/* True if total_ram_bytes came from a cgroup limit, not physical RAM. */
 	bool		ram_from_cgroup;
 	int			cpu_count;
+	/* True if cpu_count came from a cgroup CPU quota, not the online count. */
+	bool		cpu_from_cgroup;
 	bool		ssd_storage;
 
 	/* Memory settings, in kilobytes */

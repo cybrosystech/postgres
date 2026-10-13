@@ -33,6 +33,22 @@
 #define KB_PER_GB			(1024 * 1024)
 
 /*
+ * Background-worker slots to hold back from the parallel-query budget.
+ *
+ * max_worker_processes is the whole pool that max_parallel_workers draws from,
+ * and this fork keeps a fleet of always-on launchers running in it -- the
+ * logical-replication launcher plus the dbblue BRIN, repack, index advisor,
+ * audit pruner, backup, create-standby and wait-sampler launchers -- several
+ * of which also spawn a per-database dynamic worker during a scan cycle.  Sized
+ * from the CPU count alone, the pool would be eaten into by those workers and a
+ * parallel query could never obtain its full max_parallel_workers.  So the pool
+ * is widened by this many slots above the parallel budget.  It is a deliberate
+ * over-estimate (the launchers rarely all run a dynamic worker at once); growing
+ * the fleet past it just means an admin may want to raise max_worker_processes.
+ */
+#define RESERVED_BGWORKER_SLOTS		12
+
+/*
  * Detect total physical RAM.  Returns 0 on failure.
  */
 static uint64
@@ -256,6 +272,180 @@ detect_cgroup_memory_limit(uint64 *limit)
 	return false;
 }
 
+/*
+ * Turn a CFS quota/period pair (both in microseconds) into a whole CPU count.
+ * Rounds up, so a fractional allowance such as 1.5 CPUs still tunes as 2, and
+ * never returns less than 1.  Returns 0 for "no limit" (quota <= 0), which both
+ * cgroup versions use to mean unconfined.
+ */
+static int
+cpus_from_cfs(long long quota_us, long long period_us)
+{
+	long long	cpus;
+
+	if (quota_us <= 0 || period_us <= 0)
+		return 0;
+
+	cpus = (quota_us + period_us - 1) / period_us;	/* ceil */
+	if (cpus < 1)
+		cpus = 1;
+	if (cpus > INT_MAX)
+		cpus = INT_MAX;
+	return (int) cpus;
+}
+
+/*
+ * Read a cgroup v2 cpu.max file, whose single line is "<quota> <period>" with
+ * quota either a microsecond count or the literal "max" (no limit).  Sets
+ * *cpus to the whole-CPU allowance and returns true only when a real limit is
+ * present, so an unlimited level is skipped and the scan keeps looking upward.
+ */
+static bool
+read_cgroup_cpu_v2(const char *path, int *cpus)
+{
+	FILE	   *fp;
+	char		quota[64];
+	long long	period;
+	long long	q;
+	int			n;
+
+	fp = fopen(path, "r");
+	if (fp == NULL)
+		return false;
+	n = fscanf(fp, "%63s %lld", quota, &period);
+	fclose(fp);
+
+	if (n != 2 || strcmp(quota, "max") == 0)
+		return false;
+	if (sscanf(quota, "%lld", &q) != 1)
+		return false;
+
+	*cpus = cpus_from_cfs(q, period);
+	return (*cpus > 0);
+}
+
+/*
+ * Read a cgroup v1 cpu controller directory, whose quota and period live in
+ * separate files (cpu.cfs_quota_us is -1 when unconfined).  Same contract as
+ * read_cgroup_cpu_v2.
+ */
+static bool
+read_cgroup_cpu_v1(const char *dir, int *cpus)
+{
+	char		path[MAXPGPATH];
+	FILE	   *fp;
+	long long	quota;
+	long long	period;
+
+	snprintf(path, MAXPGPATH, "%s/cpu.cfs_quota_us", dir);
+	fp = fopen(path, "r");
+	if (fp == NULL)
+		return false;
+	if (fscanf(fp, "%lld", &quota) != 1)
+	{
+		fclose(fp);
+		return false;
+	}
+	fclose(fp);
+
+	snprintf(path, MAXPGPATH, "%s/cpu.cfs_period_us", dir);
+	fp = fopen(path, "r");
+	if (fp == NULL)
+		return false;
+	if (fscanf(fp, "%lld", &period) != 1)
+	{
+		fclose(fp);
+		return false;
+	}
+	fclose(fp);
+
+	*cpus = cpus_from_cfs(quota, period);
+	return (*cpus > 0);
+}
+
+/*
+ * Walk a cpu cgroup hierarchy from this process's cgroup up to the root,
+ * keeping the smallest CPU allowance found: a quota on any ancestor binds just
+ * as tightly as one on the leaf.  relpath is consumed in place.  Returns 0 if
+ * no level carries a quota.
+ */
+static int
+scan_cgroup_cpu(const char *root, bool v2, char *relpath)
+{
+	char		dir[MAXPGPATH];
+	int			best = 0;
+
+	for (;;)
+	{
+		int			cpus = 0;
+		bool		found;
+
+		snprintf(dir, MAXPGPATH, "%s%s", root, relpath);
+		if (v2)
+		{
+			char		path[MAXPGPATH];
+
+			snprintf(path, MAXPGPATH, "%s/cpu.max", dir);
+			found = read_cgroup_cpu_v2(path, &cpus);
+		}
+		else
+			found = read_cgroup_cpu_v1(dir, &cpus);
+
+		if (found && cpus > 0 && (best == 0 || cpus < best))
+			best = cpus;
+
+		/* Stop once we have just examined the hierarchy root itself. */
+		if (relpath[0] == '\0')
+			break;
+		{
+			char	   *slash = strrchr(relpath, '/');
+
+			if (slash == NULL)
+				break;
+			*slash = '\0';
+		}
+	}
+
+	return best;
+}
+
+/*
+ * Detect the CPU allowance a cgroup CPU quota imposes on this process, as a
+ * whole CPU count, or 0 when unconfined or indeterminable.  This is the CPU
+ * counterpart of detect_cgroup_memory_limit(): initdb is very often run inside
+ * a container pinned to a fraction of the host's cores, where the online count
+ * would over-size every worker and parallelism setting.
+ */
+static int
+detect_cgroup_cpu_limit(void)
+{
+	char		relpath[MAXPGPATH];
+	int			cpus;
+
+	/* cgroup v2 unified hierarchy. */
+	if (find_cgroup_path(NULL, relpath, sizeof(relpath)))
+	{
+		cpus = scan_cgroup_cpu("/sys/fs/cgroup", true, relpath);
+		if (cpus > 0)
+			return cpus;
+	}
+
+	/* cgroup v1, whose cpu controller mounts in its own subdirectory. */
+	if (find_cgroup_path("cpu", relpath, sizeof(relpath)))
+	{
+		cpus = scan_cgroup_cpu("/sys/fs/cgroup/cpu", false, relpath);
+		if (cpus > 0)
+			return cpus;
+	}
+
+	/* Last resort: a container's own cpu.max bind-mounted at the root. */
+	cpus = 0;
+	if (read_cgroup_cpu_v2("/sys/fs/cgroup/cpu.max", &cpus) && cpus > 0)
+		return cpus;
+
+	return 0;
+}
+
 #endif							/* __linux__ */
 
 /*
@@ -295,10 +485,10 @@ detect_total_ram(bool *from_cgroup)
 }
 
 /*
- * Detect online CPU count.  Returns 0 on failure.
+ * Detect the number of online CPUs on the host.  Returns 0 on failure.
  */
 static int
-detect_cpu_count(void)
+detect_online_cpus(void)
 {
 #ifdef WIN32
 	SYSTEM_INFO si;
@@ -316,6 +506,36 @@ detect_cpu_count(void)
 #endif
 	return 0;
 #endif
+}
+
+/*
+ * Detect the number of CPUs this cluster may actually use: the online count,
+ * or a cgroup CPU quota when one applies and is the tighter of the two.  Sets
+ * *from_cgroup so initdb can say which it used.  Returns 0 on failure.
+ *
+ * As with memory, the quota is the ceiling that matters for sizing a long-lived
+ * cluster, not whatever load average happens to hold during initdb.
+ */
+static int
+detect_cpu_count(bool *from_cgroup)
+{
+	int			cpus = detect_online_cpus();
+
+	*from_cgroup = false;
+
+#if defined(__linux__)
+	{
+		int			limit = detect_cgroup_cpu_limit();
+
+		if (limit > 0 && (cpus == 0 || limit < cpus))
+		{
+			*from_cgroup = true;
+			return limit;
+		}
+	}
+#endif
+
+	return cpus;
 }
 
 /*
@@ -403,6 +623,7 @@ auto_tune_compute(int max_connections)
 	uint64		ram_bytes;
 	bool		ram_from_cgroup;
 	int			cpus;
+	bool		cpu_from_cgroup;
 	bool		ssd;
 	int			ram_kb;
 	int			shared_kb;
@@ -411,7 +632,7 @@ auto_tune_compute(int max_connections)
 	memset(&s, 0, sizeof(s));
 
 	ram_bytes = detect_total_ram(&ram_from_cgroup);
-	cpus = detect_cpu_count();
+	cpus = detect_cpu_count(&cpu_from_cgroup);
 	ssd = detect_ssd();
 
 	if (ram_bytes == 0 || cpus <= 0 || max_connections <= 0)
@@ -423,6 +644,7 @@ auto_tune_compute(int max_connections)
 	s.total_ram_bytes = ram_bytes;
 	s.ram_from_cgroup = ram_from_cgroup;
 	s.cpu_count = cpus;
+	s.cpu_from_cgroup = cpu_from_cgroup;
 	s.ssd_storage = ssd;
 
 	/*
@@ -463,8 +685,16 @@ auto_tune_compute(int max_connections)
 	 * so we allow up to CPU/2 per gather, capped at 4 to keep one big
 	 * report from starving everyone else.
 	 */
-	s.max_worker_processes = clamp_int(cpus, 8, 1024);
 	s.max_parallel_workers = clamp_int(cpus, 8, 1024);
+	/*
+	 * max_worker_processes is the whole pool max_parallel_workers draws from,
+	 * so it must be wider than the parallel budget by the slots this fork's
+	 * always-on launchers (and their dynamic workers) occupy; otherwise those
+	 * workers starve parallel query of the slots it was just promised.  See
+	 * RESERVED_BGWORKER_SLOTS.
+	 */
+	s.max_worker_processes = clamp_int(s.max_parallel_workers +
+									   RESERVED_BGWORKER_SLOTS, 8, 1024);
 	parallel_per_gather = cpus / 2;
 	if (parallel_per_gather < 2)
 		parallel_per_gather = (cpus >= 2) ? 2 : 1;
@@ -507,11 +737,15 @@ auto_tune_compute(int max_connections)
 
 	/*
 	 * WAL sizing: Odoo writes constantly (every business action is a
-	 * transaction) so size for sustained throughput without forcing
-	 * frequent checkpoints.
+	 * transaction) so size for sustained throughput without forcing frequent
+	 * checkpoints.  Scaled to RAM rather than fixed, so a small VM does not
+	 * reserve up to 8 GB of WAL it has neither the write rate nor the disk for,
+	 * while a well-provisioned host still reaches the 8 GB that busy Odoo wants.
+	 * min_wal_size trails at a quarter of the ceiling, the usual ratio.
 	 */
-	s.min_wal_size_mb = 2048;
-	s.max_wal_size_mb = 8192;
+	s.max_wal_size_mb = clamp_int((int) ((int64) ram_kb / 4 / KB_PER_MB),
+								  1024, 8192);
+	s.min_wal_size_mb = s.max_wal_size_mb / 4;
 
 	/*
 	 * Odoo joins many tables (res_partner, res_users, account_move_line, ...)

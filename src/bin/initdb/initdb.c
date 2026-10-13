@@ -1351,10 +1351,11 @@ apply_auto_tune(void)
 		return;
 	}
 
-	printf(_("auto-tune: detected %lu MB RAM%s, %d CPU(s), storage=%s\n"),
+	printf(_("auto-tune: detected %lu MB RAM%s, %d CPU(s)%s, storage=%s\n"),
 		   (unsigned long) (s.total_ram_bytes / (1024 * 1024)),
 		   s.ram_from_cgroup ? _(" (cgroup limit)") : "",
 		   s.cpu_count,
+		   s.cpu_from_cgroup ? _(" (cgroup limit)") : "",
 		   s.ssd_storage ? "ssd" : "hdd");
 
 	/*
