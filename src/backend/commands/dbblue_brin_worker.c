@@ -69,11 +69,16 @@
 #include "executor/spi.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
+#include "nodes/parsenodes.h"
+#include "nodes/plannodes.h"
 #include "pgstat.h"
 #include "postmaster/bgworker.h"
 #include "postmaster/interrupt.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
+#include "tcop/dest.h"
+#include "tcop/tcopprot.h"
+#include "tcop/utility.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
@@ -116,6 +121,9 @@ static void brin_scan_one_database(const BrinDatabase *db);
 static void brin_wait_for_worker(BackgroundWorkerHandle *handle,
 								 const BrinDatabase *db);
 static void run_brin_scan(const char *dbname);
+static char *brin_build_check_sql(const char *schemaname,
+								   const char *tablename);
+static void brin_create_index_concurrently(const char *create_sql);
 
 /*
  * dbblue_check_brin_database
@@ -343,6 +351,116 @@ brin_scan_one_database(const BrinDatabase *db)
 }
 
 /*
+ * Build the SQL that asks whether a BRIN index on create_date already exists
+ * for schemaname.tablename.  Returned palloc'd in the caller's context, and
+ * run with a one-row limit by both the pre-create check and the post-create
+ * verification, so the single wording of the catalog join lives in one place.
+ *
+ * Asked of the catalogs rather than by pattern-matching pg_indexes.indexdef --
+ * the obvious "indexdef ILIKE '%%brin%%create_date%%'" -- is the whole CREATE
+ * INDEX text, schema, table and index names included, so any table whose *name*
+ * contains "brin" and which has any create_date index matches it and is skipped
+ * forever without a BRIN index ever being created.  A table called
+ * brin_create_date_log needs no index of its own to trip that: its plain
+ * primary key definition already contains both words.
+ *
+ * The index relation's own attribute carries the indexed column's name, so
+ * joining it against pg_am asks exactly the intended question: is there a BRIN
+ * index on this table, over create_date?
+ */
+static char *
+brin_build_check_sql(const char *schemaname, const char *tablename)
+{
+	return psprintf(
+		"SELECT 1 "
+		"FROM pg_class t "
+		"JOIN pg_namespace n ON n.oid = t.relnamespace "
+		"JOIN pg_index i ON i.indrelid = t.oid "
+		"JOIN pg_class ic ON ic.oid = i.indexrelid "
+		"JOIN pg_am am ON am.oid = ic.relam "
+		"JOIN pg_attribute ia ON ia.attrelid = i.indexrelid "
+		"  AND ia.attnum > 0 "
+		"WHERE n.nspname = %s AND t.relname = %s "
+		"  AND am.amname = 'brin' "
+		"  AND ia.attname = 'create_date' "
+		"LIMIT 1",
+		quote_literal_cstr(schemaname),
+		quote_literal_cstr(tablename));
+}
+
+/*
+ * Run a single CREATE INDEX CONCURRENTLY statement.
+ *
+ * CONCURRENTLY is why this worker exists: a plain CREATE INDEX holds a lock
+ * that blocks writes for the whole build, which on a large Odoo table can be
+ * tens of seconds.  CONCURRENTLY takes only ShareUpdateExclusiveLock and lets
+ * writes continue.  But it manages its own transactions -- it commits the
+ * catalog entry, then builds in further transactions of its own -- so it
+ * cannot be run through SPI, which is always inside a transaction, nor inside
+ * the StartTransactionCommand()/CommitTransactionCommand() bracket the caller
+ * uses for the checks.  It therefore gets run here the way exec_simple_query
+ * runs a utility statement: parse, analyse and plan the command, then hand the
+ * PlannedStmt to ProcessUtility as a top-level command so DefineIndex is free
+ * to drive the transaction boundaries itself.
+ *
+ * Must be called with NO transaction in progress.  Everything -- the parse
+ * and plan trees, and the ParseState standard_ProcessUtility builds and frees
+ * around DefineIndex -- is allocated in the worker's own long-lived context,
+ * not the transaction's.  CONCURRENTLY's first internal commit deletes the
+ * transaction's memory context, so anything left there would be read back as
+ * freed memory once ProcessUtility resumes after that commit.
+ */
+static void
+brin_create_index_concurrently(const char *create_sql)
+{
+	List	   *parsetree_list;
+	RawStmt    *rawstmt;
+	List	   *querytree_list;
+	List	   *plantree_list;
+	PlannedStmt *pstmt;
+
+	StartTransactionCommand();
+
+	/*
+	 * Switch to the worker context and stay there across ProcessUtility: it is
+	 * not only the parse/plan trees that must outlive CONCURRENTLY's internal
+	 * commits but the ParseState standard_ProcessUtility allocates in the
+	 * current context and frees only after DefineIndex returns.  A utility
+	 * statement needs no snapshot for parse analysis.
+	 */
+	MemoryContextSwitchTo(brin_worker_cxt);
+	parsetree_list = pg_parse_query(create_sql);
+	rawstmt = linitial_node(RawStmt, parsetree_list);
+	querytree_list = pg_analyze_and_rewrite_fixedparams(rawstmt, create_sql,
+														NULL, 0, NULL);
+	plantree_list = pg_plan_queries(querytree_list, create_sql,
+									CURSOR_OPT_PARALLEL_OK, NULL);
+	pstmt = linitial_node(PlannedStmt, plantree_list);
+
+	/*
+	 * CREATE INDEX wants an active snapshot for execution; DefineIndex's
+	 * concurrent path pops it before its first internal commit, so by the time
+	 * ProcessUtility returns the stack is empty again -- guard the pop.
+	 * PROCESS_UTILITY_TOPLEVEL is required: CONCURRENTLY calls
+	 * PreventInTransactionBlock(isTopLevel), which that context satisfies.
+	 */
+	PushActiveSnapshot(GetTransactionSnapshot());
+	ProcessUtility(pstmt, create_sql, false, PROCESS_UTILITY_TOPLEVEL,
+				   NULL, NULL, None_Receiver, NULL);
+	if (ActiveSnapshotSet())
+		PopActiveSnapshot();
+
+	CommitTransactionCommand();
+
+	/*
+	 * CONCURRENTLY's internal commits left the current context pointing into
+	 * freed transaction memory; put it back on the worker context the caller
+	 * expects before returning.
+	 */
+	MemoryContextSwitchTo(brin_worker_cxt);
+}
+
+/*
  * Run one scan cycle: find eligible create_date columns and create BRIN
  * indexes.  Each index creation runs in its own transaction to avoid
  * holding locks across the whole cycle.
@@ -426,9 +544,12 @@ run_brin_scan(const char *dbname)
 		char	   *schemaname = schemas[i];
 		char	   *tablename = tables[i];
 		char	   *indexname;
-		char	   *check_sql;
 		char	   *create_sql;
-		int		    check_ret;
+		char	   *check_sql;
+		int			check_ret;
+		bool		need_create = false;
+		bool		name_taken = false;
+		bool		created = false;
 
 		/*
 		 * Stop between tables on shutdown, so a long cycle does not delay
@@ -441,6 +562,23 @@ run_brin_scan(const char *dbname)
 
 		CHECK_FOR_INTERRUPTS();
 
+		/*
+		 * The index name is reused across the check, the concurrent build and
+		 * the verification, each in a different transaction, so it is built in
+		 * the worker's own context rather than a transaction's.
+		 */
+		oldctx = MemoryContextSwitchTo(brin_worker_cxt);
+		indexname = psprintf("%s_create_date_brin_idx", tablename);
+		MemoryContextSwitchTo(oldctx);
+
+		/*
+		 * ---- Check transaction ----
+		 *
+		 * Decide, inside one short read transaction, whether this table still
+		 * needs a BRIN index and whether the name this worker would give it is
+		 * free.  The build itself happens afterwards, outside any transaction,
+		 * because CONCURRENTLY cannot run inside one.
+		 */
 		StartTransactionCommand();
 		PushActiveSnapshot(GetTransactionSnapshot());
 
@@ -451,40 +589,7 @@ run_brin_scan(const char *dbname)
 			continue;
 		}
 
-		indexname = psprintf("%s_create_date_brin_idx", tablename);
-
-		/*
-		 * Does a BRIN index on create_date already exist for this table?
-		 *
-		 * Asked of the catalogs rather than by pattern-matching pg_indexes.
-		 * indexdef -- the obvious "indexdef ILIKE '%%brin%%create_date%%'" --
-		 * is the whole CREATE INDEX text, schema, table and index names
-		 * included, so any table whose *name* contains "brin" and which has
-		 * any create_date index matches it and is skipped forever without a
-		 * BRIN index ever being created.  A table called
-		 * brin_create_date_log needs no index of its own to trip that: its
-		 * plain primary key definition already contains both words.
-		 *
-		 * The index relation's own attribute carries the indexed column's
-		 * name, so joining it against pg_am asks exactly the intended
-		 * question: is there a BRIN index on this table, over create_date?
-		 */
-		check_sql = psprintf(
-			"SELECT 1 "
-			"FROM pg_class t "
-			"JOIN pg_namespace n ON n.oid = t.relnamespace "
-			"JOIN pg_index i ON i.indrelid = t.oid "
-			"JOIN pg_class ic ON ic.oid = i.indexrelid "
-			"JOIN pg_am am ON am.oid = ic.relam "
-			"JOIN pg_attribute ia ON ia.attrelid = i.indexrelid "
-			"  AND ia.attnum > 0 "
-			"WHERE n.nspname = %s AND t.relname = %s "
-			"  AND am.amname = 'brin' "
-			"  AND ia.attname = 'create_date' "
-			"LIMIT 1",
-			quote_literal_cstr(schemaname),
-			quote_literal_cstr(tablename));
-
+		check_sql = brin_build_check_sql(schemaname, tablename);
 		check_ret = SPI_execute(check_sql, true, 1);
 
 		if (check_ret != SPI_OK_SELECT)
@@ -494,41 +599,110 @@ run_brin_scan(const char *dbname)
 					(errmsg("dbblue BRIN: failed to check existing indexes for %s.%s in database \"%s\" (SPI ret=%d)",
 							schemaname, tablename, dbname, check_ret)));
 		}
-		else if (SPI_processed == 0)
-		{
-			/* No BRIN index yet — create one */
-			create_sql = psprintf(
-				"CREATE INDEX IF NOT EXISTS %s ON %s.%s USING brin (create_date)",
-				quote_identifier(indexname),
-				quote_identifier(schemaname),
-				quote_identifier(tablename));
-
-			ereport(LOG,
-					(errmsg("dbblue BRIN: creating index on %s.%s in database \"%s\"",
-							schemaname, tablename, dbname)));
-
-			ret = SPI_execute(create_sql, false, 0);
-
-			if (ret == SPI_OK_UTILITY)
-				ereport(LOG,
-						(errmsg("dbblue BRIN: created index %s on %s.%s in database \"%s\"",
-								indexname, schemaname, tablename, dbname)));
-			else
-				ereport(WARNING,
-						(errmsg("dbblue BRIN: failed to create index on %s.%s in database \"%s\" (ret=%d)",
-								schemaname, tablename, dbname, ret)));
-		}
-		else
+		else if (SPI_processed > 0)
 		{
 			/* Index exists — skip */
 			ereport(DEBUG1,
 					(errmsg("dbblue BRIN: index already exists for %s.%s in database \"%s\", skipping",
 							schemaname, tablename, dbname)));
 		}
+		else
+		{
+			/*
+			 * No BRIN index yet.  Is the name this worker would use already
+			 * taken by some other relation in the same schema?  If so, the
+			 * build below would be a silent no-op that leaves the table
+			 * without its index -- and, since nothing on disk changes, it
+			 * would be retried and skipped on every cycle forever.  Detect
+			 * that here and warn once per cycle instead.
+			 */
+			char	   *name_sql;
+			int			name_ret;
+
+			name_sql = psprintf(
+				"SELECT 1 FROM pg_class c "
+				"JOIN pg_namespace n ON n.oid = c.relnamespace "
+				"WHERE n.nspname = %s AND c.relname = %s LIMIT 1",
+				quote_literal_cstr(schemaname),
+				quote_literal_cstr(indexname));
+			name_ret = SPI_execute(name_sql, true, 1);
+
+			if (name_ret == SPI_OK_SELECT && SPI_processed > 0)
+				name_taken = true;
+			else
+				need_create = true;
+		}
 
 		SPI_finish();
 		PopActiveSnapshot();
 		CommitTransactionCommand();
+
+		if (name_taken)
+		{
+			ereport(WARNING,
+					(errmsg("dbblue BRIN: cannot create index on %s.%s in database \"%s\": name \"%s\" is already in use",
+							schemaname, tablename, dbname, indexname),
+					 errhint("Drop or rename the conflicting object, or create a BRIN index on create_date by hand.")));
+			continue;
+		}
+
+		if (!need_create)
+			continue;
+
+		/*
+		 * ---- Concurrent build, outside any transaction ----
+		 *
+		 * IF NOT EXISTS guards the window between the check above and this
+		 * build, in case the name was taken in between; the verification that
+		 * follows is what actually confirms the index now exists, so a silent
+		 * IF NOT EXISTS skip is reported honestly rather than as a success.
+		 */
+		oldctx = MemoryContextSwitchTo(brin_worker_cxt);
+		create_sql = psprintf(
+			"CREATE INDEX CONCURRENTLY IF NOT EXISTS %s ON %s.%s USING brin (create_date)",
+			quote_identifier(indexname),
+			quote_identifier(schemaname),
+			quote_identifier(tablename));
+		MemoryContextSwitchTo(oldctx);
+
+		ereport(LOG,
+				(errmsg("dbblue BRIN: creating index on %s.%s in database \"%s\"",
+						schemaname, tablename, dbname)));
+
+		brin_create_index_concurrently(create_sql);
+
+		/*
+		 * ---- Verify transaction ----
+		 *
+		 * Trust the catalogs, not the command's return: a concurrent build can
+		 * be rolled back and left INVALID, and IF NOT EXISTS can skip, both of
+		 * which would otherwise be logged as a success that never happened.
+		 */
+		StartTransactionCommand();
+		PushActiveSnapshot(GetTransactionSnapshot());
+
+		if (SPI_connect() == SPI_OK_CONNECT)
+		{
+			char	   *verify_sql = brin_build_check_sql(schemaname, tablename);
+
+			if (SPI_execute(verify_sql, true, 1) == SPI_OK_SELECT &&
+				SPI_processed > 0)
+				created = true;
+
+			SPI_finish();
+		}
+
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+
+		if (created)
+			ereport(LOG,
+					(errmsg("dbblue BRIN: created index %s on %s.%s in database \"%s\"",
+							indexname, schemaname, tablename, dbname)));
+		else
+			ereport(WARNING,
+					(errmsg("dbblue BRIN: index creation did not leave a valid BRIN index on %s.%s in database \"%s\"",
+							schemaname, tablename, dbname)));
 	}
 }
 
@@ -565,6 +739,18 @@ DBBlueBrinWorkerMain(Datum main_arg)
 	 * dbblue_create_brin below is this database's value.
 	 */
 	BackgroundWorkerInitializeConnectionByOid(dboid, InvalidOid, 0);
+
+	/*
+	 * This worker connects as a superuser and runs DDL, so pin its search_path
+	 * to the system catalogs before it does anything.  Every object it names
+	 * is schema-qualified, but a pinned path is defence in depth: no relation
+	 * or function an unprivileged user could create in a searched schema can
+	 * then shadow an unqualified name resolved here.  PGC_S_SESSION outlives
+	 * the many short transactions below, and InitPostgres has already applied
+	 * this database's own settings, so this is the value that stands.
+	 */
+	SetConfigOption("search_path", "pg_catalog, pg_temp",
+					PGC_SUSET, PGC_S_SESSION);
 
 	brin_worker_cxt = AllocSetContextCreate(TopMemoryContext,
 											"dbblue BRIN worker",
@@ -647,6 +833,10 @@ DBBlueBrinLauncherMain(Datum main_arg)
 	 * on an enabled database is not blocked by the feature being on.
 	 */
 	BackgroundWorkerInitializeConnection(NULL, NULL, 0);
+
+	/* Same defence-in-depth pin as the worker; see DBBlueBrinWorkerMain. */
+	SetConfigOption("search_path", "pg_catalog, pg_temp",
+					PGC_SUSET, PGC_S_SESSION);
 
 	ereport(LOG, (errmsg("dbblue BRIN launcher started")));
 
