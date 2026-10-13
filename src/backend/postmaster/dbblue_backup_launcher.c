@@ -45,6 +45,7 @@
 #include <unistd.h>
 
 #include "access/xact.h"
+#include "catalog/pg_authid.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_type.h"
 #include "executor/spi.h"
@@ -140,6 +141,15 @@ static bool launcher_connected = false;
 static bool environment_ready = false;
 static char pg_dump_path[MAXPGPATH];
 static char *socket_dir = NULL;	/* NULL means "let libpq pick the default" */
+
+/*
+ * Role name pg_dump connects as (-U), cached in TopMemoryContext.  This is the
+ * bootstrap superuser -- the identity the launcher itself attaches as -- named
+ * explicitly so pg_dump does not fall back to the operating-system user name,
+ * which need not be a valid or privileged database role.  Resolved in
+ * ensure_schema(), which runs with catalog access.
+ */
+static char *backup_role = NULL;
 
 static bool ensure_schema(void);
 static bool resolve_environment(void);
@@ -533,6 +543,19 @@ ensure_schema(void)
 		ereport(WARNING,
 				(errmsg("dbblue backup launcher: failed to create table dbblue_backup_history")));
 
+	/*
+	 * While we have catalog access, cache the bootstrap superuser's name for
+	 * pg_dump's -U (see backup_role).  Done once; it never changes under us.
+	 */
+	if (backup_role == NULL)
+	{
+		char	   *name = GetUserNameFromId(BOOTSTRAP_SUPERUSERID, false);
+		ereport(LOG,errmsg("name of the user taking backup : %c",*name));
+
+		backup_role = MemoryContextStrdup(TopMemoryContext, name);
+		pfree(name);
+	}
+
 	SPI_finish();
 	PopActiveSnapshot();
 	CommitTransactionCommand();
@@ -857,6 +880,16 @@ backup_one_database(const char *dbname)
 	ok &= append_shell_quoted(&cmd, pg_dump_path);
 	appendStringInfoString(&cmd, " -Fc --no-password");
 
+	/*
+	 * Connect as the bootstrap superuser rather than letting pg_dump default
+	 * to the OS user name, which need not be a valid or privileged role.
+	 */
+	if (backup_role != NULL)
+	{
+		appendStringInfoString(&cmd, " -U ");
+		ok &= append_shell_quoted(&cmd, backup_role);
+	}
+
 	if (socket_dir != NULL)
 	{
 		appendStringInfoString(&cmd, " -h ");
@@ -1009,7 +1042,17 @@ enforce_retention(const char *dbname, const char *status)
 
 	select_values[0] = CStringGetTextDatum(dbname);
 	select_values[1] = CStringGetTextDatum(status);
-	select_values[2] = Int64GetDatum((int64) dbblue_backup_retention_count);
+
+	/*
+	 * Keep at least the newest backup.  dbblue_backup_retention_count is
+	 * documented as "0 keeps only the newest", and this OFFSET selects the
+	 * rows to delete -- the ones past the first N -- so a literal OFFSET 0
+	 * would match and delete every row, including the backup just recorded a
+	 * moment ago.  Floor the offset at 1 so retention 0 keeps exactly the
+	 * newest, as documented, and it is never possible to prune away the last
+	 * remaining backup.
+	 */
+	select_values[2] = Int64GetDatum((int64) Max(dbblue_backup_retention_count, 1));
 
 	StartTransactionCommand();
 	SPI_connect();

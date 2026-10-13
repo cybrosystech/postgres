@@ -2,6 +2,7 @@
 
 subdir('brin')
 subdir('commit_ts')
+subdir('dbblue_backup')
 subdir('dbblue_brin')
 subdir('delay_execution')
 subdir('dummy_index_am')

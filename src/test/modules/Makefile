@@ -7,6 +7,7 @@ include $(top_builddir)/src/Makefile.global
 SUBDIRS = \
 		  brin \
 		  commit_ts \
+		  dbblue_backup \
 		  dbblue_brin \
 		  delay_execution \
 		  dummy_index_am \
