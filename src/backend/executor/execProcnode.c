@@ -104,6 +104,7 @@
 #include "executor/nodeNestloop.h"
 #include "executor/nodeProjectSet.h"
 #include "executor/nodeRecursiveunion.h"
+#include "executor/nodeRepartition.h"
 #include "executor/nodeResult.h"
 #include "executor/nodeSamplescan.h"
 #include "executor/nodeSeqscan.h"
@@ -368,6 +369,11 @@ ExecInitNode(Plan *node, EState *estate, int eflags)
 													   estate, eflags);
 			break;
 
+		case T_Repartition:
+			result = (PlanState *) ExecInitRepartition((Repartition *) node,
+													   estate, eflags);
+			break;
+
 		case T_Hash:
 			result = (PlanState *) ExecInitHash((Hash *) node,
 												estate, eflags);
@@ -617,6 +623,10 @@ ExecEndNode(PlanState *node)
 
 		case T_GatherState:
 			ExecEndGather((GatherState *) node);
+			break;
+
+		case T_RepartitionState:
+			ExecEndRepartition((RepartitionState *) node);
 			break;
 
 		case T_GatherMergeState:

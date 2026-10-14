@@ -1448,6 +1448,32 @@ typedef struct Gather
 } Gather;
 
 /* ------------
+ *		repartition node
+ *
+ * Exchange operator used below a parallel-safe Finalize hash aggregate.  Each
+ * participant of the enclosing Gather drains its child (a Partial aggregate),
+ * hashes every row on the grouping columns and writes it to one of
+ * num_partitions shared tuplestores.  Once every participant has finished
+ * writing, participants claim whole partitions and return their rows, so all
+ * partial rows of any one group are seen by exactly one participant.
+ * ------------
+ */
+typedef struct Repartition
+{
+	Plan		plan;
+	/* number of partitions the key space is split into */
+	int			num_partitions;
+	/* number of participants (planned workers + leader) */
+	int			num_participants;
+	/* number of key columns and their positions in the child's tlist */
+	int			numCols;
+	AttrNumber *keyColIdx pg_node_attr(array_size(numCols));
+	/* equality operators and collations of the key columns */
+	Oid		   *keyOperators pg_node_attr(array_size(numCols));
+	Oid		   *keyCollations pg_node_attr(array_size(numCols));
+} Repartition;
+
+/* ------------
  *		gather merge node
  * ------------
  */

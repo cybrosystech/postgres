@@ -154,6 +154,7 @@ RECOVERY_CONFLICT_TABLESPACE	"Waiting for recovery conflict resolution for dropp
 RECOVERY_END_COMMAND	"Waiting for <xref linkend="guc-recovery-end-command"/> to complete."
 RECOVERY_PAUSE	"Waiting for recovery to be resumed."
 REPACK_WORKER_EXPORT	"Waiting for decoding worker to export a new output file."
+REPARTITION_WRITE	"Waiting for other Repartition participants to finish writing partial aggregate rows."
 REPLICATION_ORIGIN_DROP	"Waiting for a replication origin to become inactive so it can be dropped."
 REPLICATION_SLOT_DROP	"Waiting for a replication slot to become inactive so it can be dropped."
 RESTORE_COMMAND	"Waiting for <xref linkend="guc-restore-command"/> to complete."

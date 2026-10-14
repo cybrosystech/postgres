@@ -669,6 +669,15 @@
   boot_val => 'false',
 },
 
+# dbblue: parallel final merge of hash aggregates through a hash exchange.
+{ name => 'dbblue_enable_repartition_agg', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
+  short_desc => 'Enables the planner\'s use of parallel hash aggregation with a hash exchange between the partial and final steps.',
+  long_desc => 'Instead of gathering all partial aggregate rows into the leader, redistribute them by group key among the workers so that the final aggregation runs in parallel.',
+  flags => 'GUC_EXPLAIN',
+  variable => 'dbblue_enable_repartition_agg',
+  boot_val => 'false',
+},
+
 { name => 'dbblue_groupjoin_planner_only', type => 'bool', context => 'PGC_USERSET', group => 'DEVELOPER_OPTIONS',
   short_desc => 'Logs candidate fused groupjoin plans without using them.',
   long_desc => 'For development only: reports which queries match the groupjoin shape, without ever offering the path to the planner.',

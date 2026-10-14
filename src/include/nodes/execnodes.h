@@ -2367,6 +2367,27 @@ typedef struct MaterialState
 	Tuplestorestate *tuplestorestate;
 } MaterialState;
 
+/* ----------------
+ *	 RepartitionState information
+ *
+ *		Hash-exchange of partial aggregate rows between parallel participants.
+ *		See nodeRepartition.c.
+ * ----------------
+ */
+struct SharedRepartitionState;
+struct SharedTuplestoreAccessor;
+
+typedef struct RepartitionState
+{
+	PlanState	ps;				/* its first field is NodeTag */
+	struct SharedRepartitionState *shared;	/* NULL => no parallel, pass-through */
+	struct SharedTuplestoreAccessor **accessors;	/* one per partition */
+	ExprState  *hashexpr;		/* computes hash of the key columns */
+	int			participant;	/* my participant number */
+	int			state;			/* where we are, see RS_* in nodeRepartition.c */
+	int			cur_partition;	/* partition being read, or -1 */
+} RepartitionState;
+
 struct MemoizeEntry;
 struct MemoizeTuple;
 struct MemoizeKey;

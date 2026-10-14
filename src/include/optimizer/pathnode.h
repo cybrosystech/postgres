@@ -124,6 +124,10 @@ extern MemoizePath *create_memoize_path(PlannerInfo *root,
 										bool singlerow,
 										bool binary_mode,
 										Cardinality est_calls);
+extern RepartitionPath *create_repartition_path(PlannerInfo *root,
+												RelOptInfo *rel,
+												Path *subpath,
+												List *groupClause);
 extern GatherPath *create_gather_path(PlannerInfo *root,
 									  RelOptInfo *rel, Path *subpath, PathTarget *target,
 									  Relids required_outer, double *rows);

@@ -1460,6 +1460,9 @@ ExplainNode(PlanState *planstate, List *ancestors,
 		case T_GatherMerge:
 			pname = sname = "Gather Merge";
 			break;
+		case T_Repartition:
+			pname = sname = "Repartition";
+			break;
 		case T_IndexScan:
 			pname = sname = "Index Scan";
 			break;
@@ -2066,6 +2069,10 @@ ExplainNode(PlanState *planstate, List *ancestors,
 				if (gather->single_copy || es->format != EXPLAIN_FORMAT_TEXT)
 					ExplainPropertyBool("Single Copy", gather->single_copy, es);
 			}
+			break;
+		case T_Repartition:
+			ExplainPropertyInteger("Partitions", NULL,
+								   ((Repartition *) plan)->num_partitions, es);
 			break;
 		case T_GatherMerge:
 			{

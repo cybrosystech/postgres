@@ -283,6 +283,11 @@ static Path *make_ordered_path(PlannerInfo *root,
 							   List *pathkeys,
 							   double limit_tuples);
 static void gather_grouping_paths(PlannerInfo *root, RelOptInfo *rel);
+static void add_repartition_agg_path(PlannerInfo *root,
+									 RelOptInfo *grouped_rel,
+									 RelOptInfo *partially_grouped_rel,
+									 grouping_sets_data *gd,
+									 GroupPathExtraData *extra);
 static bool can_partial_agg(PlannerInfo *root);
 static void apply_scanjoin_target_to_paths(PlannerInfo *root,
 										   RelOptInfo *rel,
@@ -7602,6 +7607,17 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 									 agg_final_costs,
 									 dNumFinalGroups));
 		}
+
+		/*
+		 * dbblue: also offer a parallel Finalize HashAgg, fed through a hash
+		 * exchange, as a partial path.  It is gathered below, together with
+		 * any other partial paths of grouped_rel.
+		 */
+		if (dbblue_enable_repartition_agg &&
+			partially_grouped_rel != NULL &&
+			partially_grouped_rel->partial_pathlist != NIL)
+			add_repartition_agg_path(root, grouped_rel, partially_grouped_rel,
+									 gd, extra);
 	}
 
 	/*
@@ -7612,6 +7628,77 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 	 */
 	if (grouped_rel->partial_pathlist != NIL)
 		gather_grouping_paths(root, grouped_rel);
+}
+
+/*
+ * add_repartition_agg_path
+ *		Add a partial path to grouped_rel that finalizes partial aggregates in
+ *		parallel instead of in the leader.
+ *
+ * The usual way to finish a parallel aggregation is to Gather the Partial
+ * aggregate rows of all workers and run the Finalize aggregate over all of
+ * them in the leader.  With many groups that is a serial bottleneck, as the
+ * leader sees about (number of groups) * (number of workers) rows.  Here
+ * instead the workers hash-exchange the partial rows by group key (see
+ * nodeRepartition.c) so that every group lands in exactly one worker, which
+ * finalizes it.  What reaches the Gather are then final rows, one per group.
+ *
+ *		Gather
+ *		  -> Finalize HashAggregate
+ *			   -> Repartition
+ *					-> Partial HashAggregate
+ *						 -> Parallel Seq Scan ...
+ */
+static void
+add_repartition_agg_path(PlannerInfo *root, RelOptInfo *grouped_rel,
+						 RelOptInfo *partially_grouped_rel,
+						 grouping_sets_data *gd, GroupPathExtraData *extra)
+{
+	Query	   *parse = root->parse;
+	Path	   *partial_path;
+	RepartitionPath *rpath;
+	double		total_partial_rows;
+	double		num_final_groups;
+
+	/* Plain hash grouping on a normal GROUP BY only. */
+	if (!grouped_rel->consider_parallel ||
+		!(extra->flags & GROUPING_CAN_USE_HASH) ||
+		!parse->hasAggs ||
+		parse->groupingSets ||
+		root->processed_groupClause == NIL ||
+		extra->patype != PARTITIONWISE_AGGREGATE_NONE)
+		return;
+
+	/* the cheapest partial path of the partially grouped rel */
+	partial_path = linitial(partially_grouped_rel->partial_pathlist);
+	if (!partial_path->parallel_safe || partial_path->parallel_workers < 1)
+		return;
+
+	/*
+	 * Number of groups the final phase will produce, for the rows of all
+	 * participants together; each participant is expected to produce its
+	 * share of them.
+	 */
+	total_partial_rows = compute_gather_rows(partial_path);
+	num_final_groups = get_number_of_groups(root, total_partial_rows, gd,
+											extra->targetList);
+	num_final_groups = clamp_row_est(num_final_groups *
+									 (partial_path->rows / total_partial_rows));
+
+	rpath = create_repartition_path(root, partially_grouped_rel, partial_path,
+									root->processed_groupClause);
+
+	add_partial_path(grouped_rel, (Path *)
+					 create_agg_path(root,
+									 grouped_rel,
+									 (Path *) rpath,
+									 grouped_rel->reltarget,
+									 AGG_HASHED,
+									 AGGSPLIT_FINAL_DESERIAL,
+									 root->processed_groupClause,
+									 (List *) extra->havingQual,
+									 &extra->agg_final_costs,
+									 num_final_groups));
 }
 
 /*
