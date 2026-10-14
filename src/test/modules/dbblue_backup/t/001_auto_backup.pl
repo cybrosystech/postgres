@@ -72,5 +72,36 @@ ok( $node->log_contains(
 		qr/dbblue backup launcher: executing ".*pg_dump.* -U /),
 	'pg_dump is invoked with an explicit -U role');
 
+# ---------------------------------------------------------------------------
+# End-of-options marker: the database name is passed after "--" so a name
+# beginning with "-" is taken as the dbname, not parsed as a pg_dump option.
+# ---------------------------------------------------------------------------
+ok( $node->log_contains(
+		qr/dbblue backup launcher: executing ".*pg_dump.* -- /),
+	'pg_dump receives the database name after a "--" end-of-options marker');
+
+# ---------------------------------------------------------------------------
+# Read-only grants: the history table is SELECT-able by any role but writable
+# by none.
+# ---------------------------------------------------------------------------
+$node->safe_psql('postgres', 'CREATE ROLE dbblue_reader LOGIN');
+
+is( $node->safe_psql(
+		'postgres',
+		'SELECT 1 FROM public.dbblue_backup_history LIMIT 1',
+		extra_params => [ '-U', 'dbblue_reader' ]),
+	'1', 'a non-superuser can SELECT the backup history');
+
+my $err = '';
+my $rc = $node->psql(
+	'postgres',
+	"INSERT INTO public.dbblue_backup_history (database_name, backup_started_at, status) "
+	  . "VALUES ('x', now(), 'y')",
+	extra_params => [ '-U', 'dbblue_reader' ],
+	stderr => \$err,
+	on_error_die => 0);
+ok( $rc != 0 && $err =~ /permission denied/,
+	'a non-superuser cannot INSERT into the backup history');
+
 $node->stop;
 done_testing();
