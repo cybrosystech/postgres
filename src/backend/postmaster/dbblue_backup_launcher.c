@@ -40,7 +40,9 @@
  */
 #include "postgres.h"
 
+#include <signal.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -534,6 +536,20 @@ ensure_schema(void)
 
 	if (table_ok)
 	{
+		/*
+		 * Read-only to everyone, writable by no one but the owning worker.
+		 * Strip any privilege PUBLIC might already hold (defensive, in case the
+		 * table pre-existed), then grant back SELECT alone so a non-superuser
+		 * pg_dump can still include it.  INSERT/UPDATE/DELETE/TRUNCATE are not
+		 * granted; DROP and TRUNCATE are owner-only in PostgreSQL and cannot be
+		 * granted to PUBLIC at all, so non-owners get read access and nothing
+		 * more.
+		 */
+		if (SPI_execute("REVOKE ALL ON public.dbblue_backup_history FROM PUBLIC",
+						false, 0) != SPI_OK_UTILITY)
+			ereport(WARNING,
+					(errmsg("dbblue backup launcher: failed to revoke public privileges on dbblue_backup_history")));
+
 		if (SPI_execute("GRANT SELECT ON public.dbblue_backup_history TO PUBLIC",
 						false, 0) != SPI_OK_UTILITY)
 			ereport(WARNING,
@@ -550,7 +566,7 @@ ensure_schema(void)
 	if (backup_role == NULL)
 	{
 		char	   *name = GetUserNameFromId(BOOTSTRAP_SUPERUSERID, false);
-		ereport(LOG,errmsg("name of the user taking backup : %c",*name));
+		ereport(LOG, errmsg("name of the user taking backup : %s", name));
 
 		backup_role = MemoryContextStrdup(TopMemoryContext, name);
 		pfree(name);
@@ -816,6 +832,140 @@ run_backup_cycle(void)
 }
 
 /*
+ * run_backup_command
+ *		Run one backup shell command as a child process, staying responsive to
+ *		a shutdown request while it runs.
+ *
+ * Returns the child's wait status in the same encoding system() uses -- and
+ * that wait_result_to_str() decodes -- so the caller handles the result exactly
+ * as it handled system()'s return: 0 means a clean exit, anything else a
+ * failure.  The difference from system() is that this does not block the worker
+ * for the whole (possibly hour-long) dump: it polls the child once a second and
+ * wakes immediately on its latch, so a SIGTERM (fast shutdown) is acted on at
+ * once -- the child's whole process group is signalled and reaped, and the
+ * non-zero status makes the backup record as failed rather than succeed.
+ */
+static int
+run_backup_command(const char *cmd)
+{
+	pid_t		pid;
+	int			status = -1;
+
+	/* Flush our own buffers before forking, as system() does. */
+	fflush(NULL);
+
+	pid = fork();
+	if (pid < 0)
+	{
+		ereport(WARNING,
+				(errmsg("dbblue backup launcher: could not fork to run pg_dump: %m")));
+		return -1;
+	}
+	if (pid == 0)
+	{
+		/*
+		 * Child: start a new process group so the whole pipeline (the "timeout"
+		 * wrapper and the pg_dump beneath it) can be signalled together, then
+		 * run exactly the command the caller built, via the shell as system()
+		 * would.
+		 */
+		setpgid(0, 0);
+		execl("/bin/sh", "sh", "-c", cmd, (char *) NULL);
+		_exit(127);				/* only reached if exec itself failed */
+	}
+
+	/* Parent: set the group too, race-free (harmless if the child already did). */
+	setpgid(pid, pid);
+
+	{
+		time_t		start = time(NULL);
+		bool		term_sent = false;	/* SIGTERM (timeout/shutdown) sent? */
+		time_t		term_at = 0;		/* when, so SIGKILL can follow after grace */
+
+		for (;;)
+		{
+			pid_t		w = waitpid(pid, &status, WNOHANG);
+
+			if (w == pid)
+				break;			/* finished; 'status' holds the wait result */
+			if (w < 0 && errno != EINTR)
+			{
+				ereport(WARNING,
+						(errmsg("dbblue backup launcher: waitpid for pg_dump failed: %m")));
+				status = -1;
+				break;
+			}
+
+			/* Still running: nap on the latch so a signal wakes us at once. */
+			{
+				int			wl = WaitLatch(MyLatch,
+										   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
+										   1000L,
+										   WAIT_EVENT_DBBLUE_BACKUP_LAUNCHER_MAIN);
+
+				ResetLatch(MyLatch);
+
+				/* Postmaster gone: kill the dump's group hard and exit. */
+				if (wl & WL_POSTMASTER_DEATH)
+				{
+					kill(-pid, SIGKILL);
+					(void) waitpid(pid, &status, 0);
+					proc_exit(1);
+				}
+			}
+
+			CHECK_FOR_INTERRUPTS();
+
+			/*
+			 * Fast shutdown requested: stop the in-flight dump promptly instead
+			 * of blocking until it finishes.  Signal the whole process group so
+			 * pg_dump (not just the shell) is terminated.
+			 */
+			if (ShutdownRequestPending && !term_sent)
+			{
+				kill(-pid, SIGTERM);
+				term_sent = true;
+				term_at = time(NULL);
+				continue;
+			}
+
+			/*
+			 * Timeout enforcement (formerly the external "timeout" wrapper):
+			 * after dbblue_backup_timeout seconds send SIGTERM to the group,
+			 * and if it has not died within the grace period, SIGKILL it.  A
+			 * timeout of 0 disables the limit.
+			 */
+			if (!term_sent && dbblue_backup_timeout > 0 &&
+				time(NULL) - start >= dbblue_backup_timeout)
+			{
+				ereport(WARNING,
+						(errmsg("dbblue backup launcher: pg_dump exceeded dbblue_backup_timeout (%d s), terminating",
+								dbblue_backup_timeout)));
+				kill(-pid, SIGTERM);
+				term_sent = true;
+				term_at = time(NULL);
+				continue;
+			}
+
+			/* Escalate to SIGKILL if the group ignored SIGTERM past the grace. */
+			if (term_sent && time(NULL) - term_at >= DBBLUE_BACKUP_KILL_GRACE_S)
+				kill(-pid, SIGKILL);
+		}
+	}
+
+	/*
+	 * The poll loop above called ResetLatch, which consumed the latch the
+	 * shutdown signal set.  Re-arm it so the caller's own WaitLatch returns at
+	 * once and the worker exits promptly, rather than napping out the backup
+	 * interval before it notices the pending shutdown.
+	 */
+	if (ShutdownRequestPending)
+		SetLatch(MyLatch);
+
+	return status;
+}
+
+/*
  * backup_one_database
  *		pg_dump (custom format) one database to its own subdirectory
  *		under dbblue_backup_directory, record the outcome in
@@ -871,12 +1021,14 @@ backup_one_database(const char *dbname)
 
 	initStringInfo(&cmd);
 
-	if (dbblue_backup_timeout > 0)
-	{
-		appendStringInfo(&cmd, "timeout --signal=TERM --kill-after=%ds %ds ",
-						 DBBLUE_BACKUP_KILL_GRACE_S, dbblue_backup_timeout);
-	}
-
+	/*
+	 * The dbblue_backup_timeout is enforced by run_backup_command() below, not
+	 * by wrapping the command in the external "timeout" binary: that wrapper
+	 * put pg_dump in a process group of its own, so a kill of the shell's group
+	 * on shutdown left pg_dump orphaned.  Running pg_dump directly under the
+	 * shell keeps it in the child's own group, where run_backup_command() can
+	 * signal it for both the timeout and a fast-shutdown.
+	 */
 	ok &= append_shell_quoted(&cmd, pg_dump_path);
 	appendStringInfoString(&cmd, " -Fc --no-password");
 
@@ -898,7 +1050,13 @@ backup_one_database(const char *dbname)
 
 	appendStringInfo(&cmd, " -p %d -f ", PostPortNumber);
 	ok &= append_shell_quoted(&cmd, outfile);
-	appendStringInfoChar(&cmd, ' ');
+	/*
+	 * End-of-options marker before the database name: shell-quoting stops the
+	 * shell from misreading it, but pg_dump's own getopt would still treat a
+	 * name beginning with '-' as an option.  "--" forces it to be taken as the
+	 * positional dbname.
+	 */
+	appendStringInfoString(&cmd, " -- ");
 	ok &= append_shell_quoted(&cmd, dbname);
 
 	if (!ok)
@@ -919,8 +1077,7 @@ backup_one_database(const char *dbname)
 	ereport(DEBUG3,
 			(errmsg_internal("dbblue backup launcher: executing \"%s\"", cmd.data)));
 
-	fflush(NULL);
-	rc = system(cmd.data);
+	rc = run_backup_command(cmd.data);
 	pfree(cmd.data);
 
 	pgstat_report_activity(STATE_IDLE, NULL);
