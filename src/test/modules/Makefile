@@ -9,6 +9,7 @@ SUBDIRS = \
 		  commit_ts \
 		  dbblue_backup \
 		  dbblue_brin \
+		  dbblue_wait_sampling \
 		  delay_execution \
 		  dummy_index_am \
 		  dummy_seclabel \

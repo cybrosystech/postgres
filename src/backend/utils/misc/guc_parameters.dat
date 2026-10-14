@@ -1118,6 +1118,7 @@
   short_desc => 'Enables the dbblue wait sampling collector process.',
   variable => 'dbblue_wait_sampling_enabled',
   boot_val => 'false',
+  check_hook => 'dbblue_check_wait_sampling_enabled',
 },
 
 { name => 'dbblue_wait_sampling_flush_interval', type => 'int', context => 'PGC_SIGHUP', group => 'STATS_MONITORING',
