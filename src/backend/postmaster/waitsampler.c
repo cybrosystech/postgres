@@ -36,6 +36,7 @@
 #include "access/htup_details.h"
 #include "access/xact.h"
 #include "access/xlog.h"
+#include "catalog/pg_database.h"
 #include "catalog/pg_type.h"
 #include "executor/spi.h"
 #include "lib/stringinfo.h"
@@ -44,6 +45,7 @@
 #include "postmaster/bgworker.h"
 #include "postmaster/interrupt.h"
 #include "postmaster/waitsampler.h"
+#include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/lwlock.h"
 #include "storage/proc.h"
@@ -73,6 +75,9 @@ char	   *dbblue_wait_sampling_database = NULL;
 
 /* How often the retention sweep runs, regardless of history_retention's value */
 #define DBBLUE_WS_RETENTION_SWEEP_MS	(60 * 60 * 1000)
+
+/* After a caught error, wait this long before retrying the SPI work. */
+#define DBBLUE_WS_ERROR_BACKOFF_MS		5000
 
 /* Per-proc-slot tracked wait interval, kept in process-private memory */
 typedef struct
@@ -113,6 +118,43 @@ static void flush_history(void);
 static void flush_profile(void);
 static void run_retention(void);
 static HTAB *make_profile_hash(void);
+
+/*
+ * dbblue_check_wait_sampling_enabled
+ *		GUC check hook for dbblue_wait_sampling_enabled.
+ *
+ * Turning the sampler on is only useful if dbblue_wait_sampling_database names
+ * an existing database for it to connect to; otherwise the worker FATALs on
+ * connect and is restarted until the database exists.  Warn at the moment the
+ * feature is enabled -- when there is catalog access to check -- rather than
+ * letting the misconfiguration show up only as a silent restart loop in the
+ * log.  Warn, never reject: the database may legitimately be created later.
+ */
+bool
+dbblue_check_wait_sampling_enabled(bool *newval, void **extra, GucSource source)
+{
+	if (!*newval || dbblue_wait_sampling_enabled)
+		return true;
+
+	/* No catalog access during startup GUC processing; defer to the worker. */
+	if (!IsUnderPostmaster || !IsTransactionState())
+		return true;
+
+	if (dbblue_wait_sampling_database == NULL ||
+		dbblue_wait_sampling_database[0] == '\0')
+		ereport(WARNING,
+				(errmsg("dbblue_wait_sampling_enabled is on, but dbblue_wait_sampling_database is not set"),
+				 errdetail("With no database configured the wait sampler worker will fail to connect."),
+				 errhint("Set dbblue_wait_sampling_database to an existing database (changing it requires a server restart).")));
+	else if (!OidIsValid(get_database_oid(dbblue_wait_sampling_database, true)))
+		ereport(WARNING,
+				(errmsg("dbblue wait sampler database \"%s\" does not exist",
+						dbblue_wait_sampling_database),
+				 errdetail("The sampler worker will fail to connect and will be retried until the database exists."),
+				 errhint("Create the database, or point dbblue_wait_sampling_database at an existing one (changing it requires a server restart).")));
+
+	return true;
+}
 
 /*
  * Register the dbblue wait sampler as a static background worker.  Called
@@ -165,15 +207,24 @@ WaitSamplerMain(Datum main_arg)
 				next_sample,
 				next_flush,
 				next_profile,
-				next_retention;
+				next_retention,
+				retry_after = 0;	/* after an error, don't retry SPI before this */
+	bool		connected = false;	/* attached to the sampling database yet? */
+	sigjmp_buf	local_sigjmp_buf;
 
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	pqsignal(SIGTERM, die);
 
 	BackgroundWorkerUnblockSignals();
 
-	BackgroundWorkerInitializeConnection(dbblue_wait_sampling_database, NULL, 0);
-
+	/*
+	 * The connection to dbblue_wait_sampling_database is deferred to the loop
+	 * below and made only once the feature is enabled.  Connecting eagerly here
+	 * had two problems: it pinned the sampling database against DROP DATABASE
+	 * even while sampling was off, and -- if that database did not exist --
+	 * InitPostgres raised FATAL, so the postmaster just restarted the worker
+	 * every few seconds forever, even with the feature disabled.
+	 */
 	waitsampler_cxt = AllocSetContextCreate(TopMemoryContext,
 											 "dbblue wait sampler",
 											 ALLOCSET_DEFAULT_SIZES);
@@ -187,6 +238,43 @@ WaitSamplerMain(Datum main_arg)
 	next_flush = now;
 	next_profile = now;
 	next_retention = now;
+
+	/*
+	 * Recover from an unexpected error rather than letting it become a FATAL
+	 * that restarts the whole worker (losing the in-memory profile) in a tight
+	 * loop.  Report it, unwind any open transaction, drop half-built state, and
+	 * back off before the loop retries the SPI work.
+	 */
+	if (sigsetjmp(local_sigjmp_buf, 1) != 0)
+	{
+		error_context_stack = NULL;
+		HOLD_INTERRUPTS();
+		EmitErrorReport();
+		FlushErrorState();
+		AbortOutOfAnyTransaction();
+		MemoryContextSwitchTo(TopMemoryContext);
+
+		schema_ready = false;
+		if (tracked != NULL)
+		{
+			int			j;
+
+			for (j = 0; j < tracked_count; j++)
+				tracked[j].valid = false;
+		}
+		if (profile_hash != NULL && hash_get_num_entries(profile_hash) > 0)
+		{
+			hash_destroy(profile_hash);
+			profile_hash = make_profile_hash();
+		}
+
+		retry_after = GetCurrentTimestamp() +
+			DBBLUE_WS_ERROR_BACKOFF_MS * INT64CONST(1000);
+
+		pgstat_report_activity(STATE_IDLE, NULL);
+		RESUME_INTERRUPTS();
+	}
+	PG_exception_stack = &local_sigjmp_buf;
 
 	for (;;)
 	{
@@ -204,50 +292,86 @@ WaitSamplerMain(Datum main_arg)
 
 		if (dbblue_wait_sampling_enabled && !RecoveryInProgress())
 		{
-			if (!schema_ready)
+			/*
+			 * Attach to the sampling database on first need.  A non-existent
+			 * database still FATALs here and the worker is restarted -- but
+			 * only now, when the feature is actually on, not merely because the
+			 * server started; dbblue_check_wait_sampling_enabled warns at
+			 * enable time to catch the typo before it reaches this point.
+			 */
+			if (!connected)
 			{
-				ensure_schema();
-				schema_ready = true;
-				now = GetCurrentTimestamp();
-				next_sample = now;
-				next_flush = now + dbblue_wait_sampling_flush_interval * INT64CONST(1000);
-				next_profile = now + dbblue_wait_sampling_profile_period * INT64CONST(1000);
-				next_retention = now + DBBLUE_WS_RETENTION_SWEEP_MS * INT64CONST(1000);
+				BackgroundWorkerInitializeConnection(dbblue_wait_sampling_database,
+													 NULL, 0);
+				connected = true;
 			}
 
-			if (now >= next_sample)
+			if (now >= retry_after)
 			{
-				probe_waits();
-				next_sample = now + dbblue_wait_sampling_period * INT64CONST(1000);
-			}
+				if (!schema_ready)
+				{
+					ensure_schema();
+					schema_ready = true;
+					now = GetCurrentTimestamp();
+					next_sample = now;
+					next_flush = now + dbblue_wait_sampling_flush_interval * INT64CONST(1000);
+					next_profile = now + dbblue_wait_sampling_profile_period * INT64CONST(1000);
+					next_retention = now + DBBLUE_WS_RETENTION_SWEEP_MS * INT64CONST(1000);
+				}
 
-			if (now >= next_flush)
+				if (now >= next_sample)
+				{
+					probe_waits();
+					next_sample = now + dbblue_wait_sampling_period * INT64CONST(1000);
+				}
+
+				if (now >= next_flush)
+				{
+					flush_history();
+					next_flush = now + dbblue_wait_sampling_flush_interval * INT64CONST(1000);
+				}
+
+				if (now >= next_profile)
+				{
+					flush_profile();
+					next_profile = now + dbblue_wait_sampling_profile_period * INT64CONST(1000);
+				}
+
+				if (now >= next_retention)
+				{
+					run_retention();
+					next_retention = now + DBBLUE_WS_RETENTION_SWEEP_MS * INT64CONST(1000);
+				}
+
+				sleep_ms = dbblue_wait_sampling_period;
+			}
+			else
 			{
-				flush_history();
-				next_flush = now + dbblue_wait_sampling_flush_interval * INT64CONST(1000);
+				/* In error backoff: idle until retry_after instead of spinning. */
+				sleep_ms = DBBLUE_WS_ERROR_BACKOFF_MS;
 			}
-
-			if (now >= next_profile)
-			{
-				flush_profile();
-				next_profile = now + dbblue_wait_sampling_profile_period * INT64CONST(1000);
-			}
-
-			if (now >= next_retention)
-			{
-				run_retention();
-				next_retention = now + DBBLUE_WS_RETENTION_SWEEP_MS * INT64CONST(1000);
-			}
-
-			sleep_ms = dbblue_wait_sampling_period;
 		}
 		else
 		{
 			/*
-			 * Disabled (or a standby): nothing to do, just idle.  Discard
-			 * whatever we were tracking so re-enabling starts from a clean
-			 * slate instead of resurrecting stale intervals/counters from
-			 * before the feature was turned off.
+			 * Disabled (or a standby).  If we had attached to the sampling
+			 * database, exit cleanly to release that connection: the postmaster
+			 * restarts us within bgw_restart_time into this same idle,
+			 * unconnected state, which is what lets DROP DATABASE on the
+			 * sampling database succeed once sampling is turned off.
+			 */
+			if (connected)
+			{
+				ereport(LOG,
+						(errmsg("dbblue wait sampler: sampling disabled, releasing connection to database \"%s\"",
+								dbblue_wait_sampling_database)));
+				proc_exit(0);
+			}
+
+			/*
+			 * Not connected: just idle.  Discard whatever we were tracking so
+			 * re-enabling starts from a clean slate instead of resurrecting
+			 * stale intervals/counters from before the feature was turned off.
 			 */
 			schema_ready = false;
 

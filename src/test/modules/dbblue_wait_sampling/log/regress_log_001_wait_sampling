@@ -1,0 +1,88 @@
+# Checking port 24098
+# Found port 24098
+Name: wait_sampling
+Version: 19beta2
+Data directory: /home/cybrosys/global_partition_index/postgres/src/test/modules/dbblue_wait_sampling/tmp_check/t_001_wait_sampling_wait_sampling_data/pgdata
+Backup directory: /home/cybrosys/global_partition_index/postgres/src/test/modules/dbblue_wait_sampling/tmp_check/t_001_wait_sampling_wait_sampling_data/backup
+Archive directory: /home/cybrosys/global_partition_index/postgres/src/test/modules/dbblue_wait_sampling/tmp_check/t_001_wait_sampling_wait_sampling_data/archives
+Connection string: port=24098 host=/tmp/ZLiziMgz85
+Log file: log/001_wait_sampling_wait_sampling.log
+[12:18:08.971](0.015s) # initializing database system by running initdb
+# Running: initdb --no-sync --pgdata /home/cybrosys/global_partition_index/postgres/src/test/modules/dbblue_wait_sampling/tmp_check/t_001_wait_sampling_wait_sampling_data/pgdata --auth trust
+The files belonging to this database system will be owned by user "cybrosys".
+This user must also own the server process.
+
+The database cluster will be initialized with this locale configuration:
+  locale provider:   libc
+  LC_COLLATE:  en_IN
+  LC_CTYPE:    en_IN
+  LC_MESSAGES: C
+  LC_MONETARY: en_IN
+  LC_NUMERIC:  C
+  LC_TIME:     en_IN
+The default database encoding has accordingly been set to "UTF8".
+The default text search configuration will be set to "english".
+
+Data page checksums are enabled.
+
+creating directory /home/cybrosys/global_partition_index/postgres/src/test/modules/dbblue_wait_sampling/tmp_check/t_001_wait_sampling_wait_sampling_data/pgdata ... ok
+creating subdirectories ... ok
+selecting dynamic shared memory implementation ... posix
+selecting default "max_connections" ... 100
+selecting default "shared_buffers" ... 128MB
+selecting default time zone ... Asia/Kolkata
+auto-tune: detected 30843 MB RAM, 16 CPU(s), storage=ssd
+auto-tune: probing "shared_buffers" = 8GB ... ok
+creating configuration files ... ok
+running bootstrap script ... ok
+performing post-bootstrap initialization ... 2026-10-14 12:18:09.544 IST [166877] LOG:  registered custom resource manager "pg_tde" with ID 140
+2026-10-14 12:18:09.544 IST [166877] LOG:  tde_shmem_request: requested 17689136 bytes
+2026-10-14 12:18:09.683 IST [166877] LOG:  creating DSA area of size 262144
+2026-10-14 12:18:10.087 IST [166877] LOG:  Setting principal key [odoo_default_key : global_file_provider] for the database
+2026-10-14 12:18:10.087 IST [166877] STATEMENT:  SELECT public.pg_tde_set_server_key_using_global_key_provider('odoo_default_key', 'global_file_provider');
+	
+2026-10-14 12:18:10.087 IST [166877] LOG:  Setting principal key [odoo_default_key : global_file_provider] for the database
+2026-10-14 12:18:10.087 IST [166877] STATEMENT:  SELECT public.pg_tde_set_default_key_using_global_key_provider('odoo_default_key', 'global_file_provider');
+	
+ok
+
+Sync to disk skipped.
+The data directory might become corrupt if the operating system crashes.
+
+Success. You can now start the database server using:
+
+    pg_ctl -D /home/cybrosys/global_partition_index/postgres/src/test/modules/dbblue_wait_sampling/tmp_check/t_001_wait_sampling_wait_sampling_data/pgdata -l logfile start
+
+# Running: /home/cybrosys/global_partition_index/postgres/src/test/regress/pg_regress --config-auth /home/cybrosys/global_partition_index/postgres/src/test/modules/dbblue_wait_sampling/tmp_check/t_001_wait_sampling_wait_sampling_data/pgdata
+### Starting node "wait_sampling"
+# Running: pg_ctl --wait --pgdata /home/cybrosys/global_partition_index/postgres/src/test/modules/dbblue_wait_sampling/tmp_check/t_001_wait_sampling_wait_sampling_data/pgdata --log log/001_wait_sampling_wait_sampling.log --options --cluster-name=wait_sampling start
+waiting for server to start.... done
+server started
+# Postmaster PID for node "wait_sampling" is 166893
+[12:18:13.692](4.721s) ok 1 - disabled sampler with a missing database does not FATAL-loop
+[12:18:13.709](0.017s) ok 2 - disabled sampler holds no database connection
+#### Begin standard error
+psql:<stdin>:1: WARNING:  database "ws_sampledb" will use the builtin "C.UTF-8" locale with UTF8 encoding
+DETAIL:  It is created from template0, so template1 and anything installed in it (extensions, schemas, seed data) are not copied.
+HINT:  Set dbblue_default_builtin_locale to off, or name a TEMPLATE, LOCALE or ENCODING explicitly, to get the standard behaviour.
+#### End standard error
+#### Begin standard error
+psql:<stdin>:1: WARNING:  dbblue wait sampler database "ws_nonexistent" does not exist
+DETAIL:  The sampler worker will fail to connect and will be retried until the database exists.
+HINT:  Create the database, or point dbblue_wait_sampling_database at an existing one (changing it requires a server restart).
+#### End standard error
+### Restarting node "wait_sampling"
+# Running: pg_ctl --wait --pgdata /home/cybrosys/global_partition_index/postgres/src/test/modules/dbblue_wait_sampling/tmp_check/t_001_wait_sampling_wait_sampling_data/pgdata --log log/001_wait_sampling_wait_sampling.log restart
+waiting for server to shut down.... done
+server stopped
+waiting for server to start.... done
+server started
+# Postmaster PID for node "wait_sampling" is 166997
+[12:18:19.294](5.585s) ok 3 - DROP DATABASE is blocked while the sampler is attached
+[12:18:19.379](0.085s) ok 4 - DROP DATABASE succeeds once sampling is disabled
+### Stopping node "wait_sampling" using mode fast
+# Running: pg_ctl --pgdata /home/cybrosys/global_partition_index/postgres/src/test/modules/dbblue_wait_sampling/tmp_check/t_001_wait_sampling_wait_sampling_data/pgdata --mode fast stop
+waiting for server to shut down.... done
+server stopped
+# No postmaster PID for node "wait_sampling"
+[12:18:19.484](0.105s) 1..4

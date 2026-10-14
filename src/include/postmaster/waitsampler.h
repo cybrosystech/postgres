@@ -15,6 +15,8 @@
 #ifndef WAITSAMPLER_H
 #define WAITSAMPLER_H
 
+#include "utils/guc.h"
+
 typedef enum
 {
 	DBBLUE_WS_PROFILE_QUERIES_NONE,	/* don't tag rows with queryid */
@@ -33,5 +35,8 @@ extern PGDLLIMPORT char *dbblue_wait_sampling_database;
 
 extern void WaitSamplerRegister(void);
 extern void WaitSamplerMain(Datum main_arg);
+
+extern bool dbblue_check_wait_sampling_enabled(bool *newval, void **extra,
+											   GucSource source);
 
 #endif							/* WAITSAMPLER_H */

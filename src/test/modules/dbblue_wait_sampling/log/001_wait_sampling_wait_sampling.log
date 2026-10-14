@@ -1,0 +1,94 @@
+2026-10-14 12:18:10.408 IST postmaster[166893] LOG:  registered custom resource manager "pg_tde" with ID 140
+2026-10-14 12:18:10.408 IST postmaster[166893] LOG:  tde_shmem_request: requested 17655856 bytes
+2026-10-14 12:18:10.637 IST postmaster[166893] LOG:  creating DSA area of size 262144
+2026-10-14 12:18:10.638 IST postmaster[166893] LOG:  starting PostgreSQL 19beta2 on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0, 64-bit
+2026-10-14 12:18:10.638 IST postmaster[166893] LOG:  listening on Unix socket "/tmp/ZLiziMgz85/.s.PGSQL.24098"
+2026-10-14 12:18:10.643 IST startup[166898] LOG:  database system was shut down at 2026-10-14 12:18:10 IST
+2026-10-14 12:18:10.648 IST postmaster[166893] LOG:  database system is ready to accept connections
+2026-10-14 12:18:10.651 IST dbblue backup launcher[166901] LOG:  dbblue backup launcher started
+2026-10-14 12:18:10.651 IST dbblue wait sampler[166902] LOG:  dbblue wait sampler started
+2026-10-14 12:18:10.652 IST dbblue audit prune launcher[166903] LOG:  dbblue audit prune launcher started
+2026-10-14 12:18:10.653 IST dbblue repack launcher[166904] LOG:  dbblue repack launcher started
+2026-10-14 12:18:10.653 IST dbblue index advisor launcher[166905] LOG:  dbblue index advisor launcher started
+2026-10-14 12:18:10.653 IST dbblue create standby[166906] LOG:  dbblue create standby worker started (dbblue_create_standby=off)
+2026-10-14 12:18:10.655 IST dbblue BRIN launcher[166907] LOG:  dbblue BRIN launcher started
+2026-10-14 12:18:13.702 IST client backend[166989] 001_wait_sampling.pl LOG:  statement: SELECT count(*) FROM pg_stat_activity
+		WHERE backend_type = 'dbblue wait sampler'
+2026-10-14 12:18:13.719 IST client backend[166991] 001_wait_sampling.pl LOG:  statement: CREATE DATABASE ws_sampledb
+2026-10-14 12:18:13.719 IST client backend[166991] 001_wait_sampling.pl WARNING:  database "ws_sampledb" will use the builtin "C.UTF-8" locale with UTF8 encoding
+2026-10-14 12:18:13.719 IST client backend[166991] 001_wait_sampling.pl DETAIL:  It is created from template0, so template1 and anything installed in it (extensions, schemas, seed data) are not copied.
+2026-10-14 12:18:13.719 IST client backend[166991] 001_wait_sampling.pl HINT:  Set dbblue_default_builtin_locale to off, or name a TEMPLATE, LOCALE or ENCODING explicitly, to get the standard behaviour.
+2026-10-14 12:18:13.840 IST client backend[166993] 001_wait_sampling.pl LOG:  statement: ALTER SYSTEM SET dbblue_wait_sampling_database = 'ws_sampledb'
+2026-10-14 12:18:13.852 IST client backend[166995] 001_wait_sampling.pl LOG:  statement: ALTER SYSTEM SET dbblue_wait_sampling_enabled = on
+2026-10-14 12:18:13.852 IST client backend[166995] 001_wait_sampling.pl WARNING:  dbblue wait sampler database "ws_nonexistent" does not exist
+2026-10-14 12:18:13.852 IST client backend[166995] 001_wait_sampling.pl DETAIL:  The sampler worker will fail to connect and will be retried until the database exists.
+2026-10-14 12:18:13.852 IST client backend[166995] 001_wait_sampling.pl HINT:  Create the database, or point dbblue_wait_sampling_database at an existing one (changing it requires a server restart).
+2026-10-14 12:18:13.857 IST postmaster[166893] LOG:  received fast shutdown request
+2026-10-14 12:18:13.857 IST postmaster[166893] LOG:  aborting any active transactions
+2026-10-14 12:18:13.857 IST dbblue BRIN launcher[166907] LOG:  dbblue BRIN launcher shutting down
+2026-10-14 12:18:13.857 IST dbblue create standby[166906] LOG:  dbblue create standby worker shutting down
+2026-10-14 12:18:13.857 IST dbblue repack launcher[166904] LOG:  dbblue repack launcher shutting down
+2026-10-14 12:18:13.857 IST dbblue audit prune launcher[166903] LOG:  dbblue audit prune launcher shutting down
+2026-10-14 12:18:13.857 IST dbblue index advisor launcher[166905] LOG:  dbblue index advisor launcher shutting down
+2026-10-14 12:18:13.857 IST dbblue backup launcher[166901] LOG:  dbblue backup launcher shutting down
+2026-10-14 12:18:13.857 IST dbblue wait sampler[166902] FATAL:  terminating background worker "dbblue wait sampler" due to administrator command
+2026-10-14 12:18:13.857 IST dbblue wait sampler[166902] DETAIL:  Signal sent by PID 166893, UID 1000.
+2026-10-14 12:18:13.861 IST postmaster[166893] LOG:  background worker "dbblue audit prune launcher" (PID 166903) exited with exit code 1
+2026-10-14 12:18:13.861 IST postmaster[166893] LOG:  background worker "dbblue BRIN launcher" (PID 166907) exited with exit code 1
+2026-10-14 12:18:13.862 IST postmaster[166893] LOG:  background worker "dbblue backup launcher" (PID 166901) exited with exit code 1
+2026-10-14 12:18:13.862 IST postmaster[166893] LOG:  background worker "dbblue wait sampler" (PID 166902) exited with exit code 1
+2026-10-14 12:18:13.862 IST postmaster[166893] LOG:  background worker "dbblue repack launcher" (PID 166904) exited with exit code 1
+2026-10-14 12:18:13.862 IST postmaster[166893] LOG:  background worker "logical replication launcher" (PID 166908) exited with exit code 1
+2026-10-14 12:18:13.863 IST postmaster[166893] LOG:  background worker "dbblue index advisor launcher" (PID 166905) exited with exit code 1
+2026-10-14 12:18:13.863 IST checkpointer[166896] LOG:  shutting down
+2026-10-14 12:18:13.863 IST checkpointer[166896] LOG:  checkpoint starting: shutdown fast
+2026-10-14 12:18:13.899 IST checkpointer[166896] LOG:  checkpoint complete: shutdown fast: wrote 994 buffers (0.1%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.035 s, sync=0.001 s, total=0.036 s; sync files=0, longest=0.000 s, average=0.000 s; distance=1950 kB, estimate=1950 kB; lsn=0/01664890, redo lsn=0/01664890
+2026-10-14 12:18:13.961 IST postmaster[166893] LOG:  database system is shut down
+2026-10-14 12:18:14.074 IST postmaster[166997] LOG:  registered custom resource manager "pg_tde" with ID 140
+2026-10-14 12:18:14.075 IST postmaster[166997] LOG:  tde_shmem_request: requested 17655856 bytes
+2026-10-14 12:18:14.227 IST postmaster[166997] LOG:  creating DSA area of size 262144
+2026-10-14 12:18:14.228 IST postmaster[166997] LOG:  starting PostgreSQL 19beta2 on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0, 64-bit
+2026-10-14 12:18:14.228 IST postmaster[166997] LOG:  listening on Unix socket "/tmp/ZLiziMgz85/.s.PGSQL.24098"
+2026-10-14 12:18:14.232 IST startup[167011] LOG:  database system was shut down at 2026-10-14 12:18:13 IST
+2026-10-14 12:18:14.237 IST postmaster[166997] LOG:  database system is ready to accept connections
+2026-10-14 12:18:14.239 IST dbblue backup launcher[167014] LOG:  dbblue backup launcher started
+2026-10-14 12:18:14.240 IST dbblue wait sampler[167015] LOG:  dbblue wait sampler started
+2026-10-14 12:18:14.240 IST dbblue audit prune launcher[167016] LOG:  dbblue audit prune launcher started
+2026-10-14 12:18:14.241 IST dbblue repack launcher[167017] LOG:  dbblue repack launcher started
+2026-10-14 12:18:14.241 IST dbblue index advisor launcher[167018] LOG:  dbblue index advisor launcher started
+2026-10-14 12:18:14.241 IST dbblue create standby[167019] LOG:  dbblue create standby worker started (dbblue_create_standby=off)
+2026-10-14 12:18:14.243 IST dbblue BRIN launcher[167020] LOG:  dbblue BRIN launcher started
+2026-10-14 12:18:14.271 IST client backend[167031] 001_wait_sampling.pl LOG:  statement: SELECT count(*) FROM pg_stat_activity
+		WHERE backend_type = 'dbblue wait sampler' AND datname = 'ws_sampledb'
+2026-10-14 12:18:14.287 IST client backend[167033] 001_wait_sampling.pl LOG:  statement: DROP DATABASE ws_sampledb
+2026-10-14 12:18:19.292 IST client backend[167033] 001_wait_sampling.pl ERROR:  database "ws_sampledb" is being accessed by other users
+2026-10-14 12:18:19.292 IST client backend[167033] 001_wait_sampling.pl DETAIL:  There is 1 other session using the database.
+2026-10-14 12:18:19.292 IST client backend[167033] 001_wait_sampling.pl STATEMENT:  DROP DATABASE ws_sampledb
+2026-10-14 12:18:19.302 IST client backend[167129] 001_wait_sampling.pl LOG:  statement: ALTER SYSTEM SET dbblue_wait_sampling_enabled = off
+2026-10-14 12:18:19.313 IST client backend[167131] 001_wait_sampling.pl LOG:  statement: SELECT pg_reload_conf()
+2026-10-14 12:18:19.313 IST postmaster[166997] LOG:  received SIGHUP, reloading configuration files
+2026-10-14 12:18:19.314 IST postmaster[166997] LOG:  parameter "dbblue_wait_sampling_enabled" changed to "off"
+2026-10-14 12:18:19.315 IST dbblue wait sampler[167015] LOG:  dbblue wait sampler: sampling disabled, releasing connection to database "ws_sampledb"
+2026-10-14 12:18:19.325 IST client backend[167137] 001_wait_sampling.pl LOG:  statement: SELECT count(*) FROM pg_stat_activity
+		WHERE backend_type = 'dbblue wait sampler' AND datname = 'ws_sampledb'
+2026-10-14 12:18:19.341 IST client backend[167143] 001_wait_sampling.pl LOG:  statement: DROP DATABASE ws_sampledb
+2026-10-14 12:18:19.350 IST checkpointer[167009] LOG:  checkpoint starting: fast force wait
+2026-10-14 12:18:19.365 IST checkpointer[167009] LOG:  checkpoint complete: fast force wait: wrote 1 buffers (0.0%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.015 s, sync=0.001 s, total=0.016 s; sync files=0, longest=0.000 s, average=0.000 s; distance=123 kB, estimate=123 kB; lsn=0/016837D8, redo lsn=0/016837B0
+2026-10-14 12:18:19.382 IST postmaster[166997] LOG:  received fast shutdown request
+2026-10-14 12:18:19.382 IST postmaster[166997] LOG:  aborting any active transactions
+2026-10-14 12:18:19.382 IST dbblue BRIN launcher[167020] LOG:  dbblue BRIN launcher shutting down
+2026-10-14 12:18:19.382 IST dbblue repack launcher[167017] LOG:  dbblue repack launcher shutting down
+2026-10-14 12:18:19.382 IST dbblue index advisor launcher[167018] LOG:  dbblue index advisor launcher shutting down
+2026-10-14 12:18:19.382 IST dbblue audit prune launcher[167016] LOG:  dbblue audit prune launcher shutting down
+2026-10-14 12:18:19.382 IST dbblue create standby[167019] LOG:  dbblue create standby worker shutting down
+2026-10-14 12:18:19.382 IST dbblue backup launcher[167014] LOG:  dbblue backup launcher shutting down
+2026-10-14 12:18:19.386 IST postmaster[166997] LOG:  background worker "dbblue backup launcher" (PID 167014) exited with exit code 1
+2026-10-14 12:18:19.387 IST postmaster[166997] LOG:  background worker "dbblue BRIN launcher" (PID 167020) exited with exit code 1
+2026-10-14 12:18:19.387 IST postmaster[166997] LOG:  background worker "dbblue repack launcher" (PID 167017) exited with exit code 1
+2026-10-14 12:18:19.387 IST postmaster[166997] LOG:  background worker "logical replication launcher" (PID 167021) exited with exit code 1
+2026-10-14 12:18:19.387 IST postmaster[166997] LOG:  background worker "dbblue index advisor launcher" (PID 167018) exited with exit code 1
+2026-10-14 12:18:19.387 IST postmaster[166997] LOG:  background worker "dbblue audit prune launcher" (PID 167016) exited with exit code 1
+2026-10-14 12:18:19.387 IST checkpointer[167009] LOG:  shutting down
+2026-10-14 12:18:19.388 IST checkpointer[167009] LOG:  checkpoint starting: shutdown fast
+2026-10-14 12:18:19.400 IST checkpointer[167009] LOG:  checkpoint complete: shutdown fast: wrote 0 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.012 s, sync=0.001 s, total=0.013 s; sync files=0, longest=0.000 s, average=0.000 s; distance=0 kB, estimate=111 kB; lsn=0/016838C0, redo lsn=0/016838C0
+2026-10-14 12:18:19.461 IST postmaster[166997] LOG:  database system is shut down
