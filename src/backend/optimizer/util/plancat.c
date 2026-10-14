@@ -27,7 +27,6 @@
 #include "access/xlog.h"
 #include "catalog/catalog.h"
 #include "catalog/heap.h"
-#include "catalog/index.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_statistic_ext.h"
@@ -924,10 +923,14 @@ infer_arbiter_indexes(PlannerInfo *root)
 		idxRel = index_open(indexoid, rte->rellockmode);
 
 		/*
-		 * A global index can be an arbiter too.  It has no per-partition
-		 * counterparts; the executor checks it directly, and its conflicting
-		 * row may be in any partition (see ExecInsert()).
+		 * A global index cannot be an ON CONFLICT arbiter: arbiters are
+		 * mapped to per-partition indexes, which it does not have.
 		 */
+		if (idxRel->rd_index->indglobal)
+		{
+			index_close(idxRel, NoLock);
+			continue;
+		}
 		indexRelList = lappend(indexRelList, idxRel);
 	}
 
@@ -948,6 +951,23 @@ infer_arbiter_indexes(PlannerInfo *root)
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 					 errmsg("constraint in ON CONFLICT clause has no associated index")));
 
+		/* Global indexes were left out of indexRelList above */
+		{
+			HeapTuple	idxtup = SearchSysCache1(INDEXRELID,
+												 ObjectIdGetDatum(indexOidFromConstraint));
+
+			if (HeapTupleIsValid(idxtup))
+			{
+				bool		isglobal = ((Form_pg_index) GETSTRUCT(idxtup))->indglobal;
+
+				ReleaseSysCache(idxtup);
+				if (isglobal)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("ON CONFLICT is not supported for constraints backed by a global index")));
+			}
+		}
+
 		/*
 		 * Find the named constraint index to extract its attributes and
 		 * predicates.
@@ -966,8 +986,7 @@ infer_arbiter_indexes(PlannerInfo *root)
 				 * constraint index, so that we can match them in the loop
 				 * below.
 				 */
-				/* only the user's columns of a global index, see below */
-				for (int natt = 0; natt < IndexGlobalNumUserKeys(idxForm); natt++)
+				for (int natt = 0; natt < idxForm->indnkeyatts; natt++)
 				{
 					int			attno;
 
@@ -1093,13 +1112,9 @@ infer_arbiter_indexes(PlannerInfo *root)
 		if (idxForm->indisexclusion)
 			continue;
 
-		/*
-		 * Build BMS representation of plain (non expression) index attrs.  A
-		 * global index's trailing partition key columns are not part of its
-		 * definition, so they are not matched against ON CONFLICT (...).
-		 */
+		/* Build BMS representation of plain (non expression) index attrs */
 		indexedAttrs = NULL;
-		for (natt = 0; natt < IndexGlobalNumUserKeys(idxForm); natt++)
+		for (natt = 0; natt < idxForm->indnkeyatts; natt++)
 		{
 			int			attno = idxRel->rd_index->indkey.values[natt];
 
