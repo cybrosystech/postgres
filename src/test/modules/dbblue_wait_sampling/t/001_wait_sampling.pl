@@ -44,6 +44,18 @@ is( $node->safe_psql('postgres', $sampler_conns),
 # Bug 2: an attached sampler blocks DROP DATABASE; disabling releases it.
 # ---------------------------------------------------------------------------
 $node->safe_psql('postgres', 'CREATE DATABASE ws_sampledb');
+
+# Hardening (search_path pin): the worker connects to the sampling database as a
+# superuser.  Give that database a hostile default search_path and a relation
+# that shadows the worker's table name.  Because the worker pins its path to
+# pg_catalog,pg_temp and names every object as dbblue_catalog.*, it must keep
+# writing only to its own catalog and never touch the attacker-planted object.
+$node->safe_psql('ws_sampledb', q(
+	CREATE SCHEMA hostile;
+	CREATE TABLE hostile.wait_history(evil int);
+	ALTER DATABASE ws_sampledb SET search_path = 'hostile, public';
+));
+
 # dbblue_wait_sampling_database is PGC_POSTMASTER, so set it and restart.
 $node->safe_psql('postgres',
 	"ALTER SYSTEM SET dbblue_wait_sampling_database = 'ws_sampledb'");
@@ -54,6 +66,19 @@ $node->poll_query_until('postgres', q{
 	SELECT count(*) FROM pg_stat_activity
 	WHERE backend_type = 'dbblue wait sampler' AND datname = 'ws_sampledb'}, '1')
   or die "timed out waiting for the sampler to attach to ws_sampledb";
+
+# Even under the hostile default search_path, the worker must build its own
+# (fully schema-qualified) catalog -- proof the pin does not break qualified
+# access to dbblue_catalog.*.
+$node->poll_query_until('ws_sampledb', q{
+	SELECT count(*) FROM pg_tables
+	WHERE schemaname = 'dbblue_catalog' AND tablename = 'wait_history'}, '1')
+  or die "sampler did not create dbblue_catalog.wait_history under a hostile search_path";
+pass('sampler builds its qualified catalog despite a hostile default search_path');
+
+# ... and it must never have written to the search_path-shadowing relation.
+is($node->safe_psql('ws_sampledb', 'SELECT count(*) FROM hostile.wait_history'),
+	'0', 'worker ignores a search_path-shadowing wait_history relation');
 
 # DROP must be blocked while the sampler is attached.
 my ($err1, $err2) = ('', '');
