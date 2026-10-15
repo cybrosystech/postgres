@@ -36,6 +36,7 @@
 #include "access/htup_details.h"
 #include "access/xact.h"
 #include "access/xlog.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_type.h"
 #include "executor/spi.h"
@@ -113,6 +114,8 @@ static bool schema_ready = false;
 static uint32 waitsampler_wait_event = 0;
 
 static void ensure_schema(void);
+static void ws_verify_self_owned_schema(void);
+static void ws_verify_self_owned_table(const char *relname);
 static void probe_waits(void);
 static void flush_history(void);
 static void flush_profile(void);
@@ -303,6 +306,23 @@ WaitSamplerMain(Datum main_arg)
 			{
 				BackgroundWorkerInitializeConnection(dbblue_wait_sampling_database,
 													 NULL, 0);
+
+				/*
+				 * This worker connects as a superuser and runs DDL/DML in a user
+				 * database, so pin its search_path to the system catalogs before
+				 * it does anything.  Every object it names is schema-qualified
+				 * (dbblue_catalog.*), so the pin never affects where those are
+				 * found; it only governs the unqualified built-ins the SQL uses
+				 * (now(), make_interval(), casts, operators).  With the path
+				 * pinned, no relation or function an unprivileged user could
+				 * create in a searched schema (e.g. public) can shadow one of
+				 * those names and run with this worker's superuser rights.
+				 * PGC_S_SESSION outlives the many short transactions below, and
+				 * is re-applied here on every reconnect after a disable/restart.
+				 */
+				SetConfigOption("search_path", "pg_catalog, pg_temp",
+								PGC_SUSET, PGC_S_SESSION);
+
 				connected = true;
 			}
 
@@ -403,6 +423,91 @@ WaitSamplerMain(Datum main_arg)
 }
 
 /*
+ * Confirm the dbblue_catalog schema was actually created by this worker --
+ * i.e. is owned by the role the worker connects as (the bootstrap superuser) --
+ * rather than pre-created by someone else and merely adopted by the preceding
+ * CREATE SCHEMA IF NOT EXISTS (which matches on name only).
+ *
+ * The sampling database is, in an Odoo deployment, owned by a non-superuser
+ * (the Odoo role); that role, or any role able to CREATE a schema there, could
+ * otherwise plant a "dbblue_catalog" ahead of the worker and have this superuser
+ * worker grant on it and write into tables inside it.  Note this is *object*
+ * ownership, not database ownership: the database owner is exactly the identity
+ * we refuse to trust.  Refuse with ERROR (not FATAL) so the worker's recovery
+ * loop backs off and retries, loudly logged, instead of writing into a schema
+ * it does not control.
+ */
+static void
+ws_verify_self_owned_schema(void)
+{
+	Oid			me = GetUserId();
+	Oid			owner;
+	bool		isnull;
+
+	/* read_only = false: must see the schema this transaction just created */
+	if (SPI_execute("SELECT nspowner FROM pg_catalog.pg_namespace "
+					"WHERE nspname = 'dbblue_catalog'", false, 0) != SPI_OK_SELECT)
+		elog(ERROR, "dbblue wait sampler: could not look up owner of schema dbblue_catalog");
+	if (SPI_processed != 1)
+		elog(ERROR, "dbblue wait sampler: schema dbblue_catalog unexpectedly absent after create");
+
+	owner = DatumGetObjectId(SPI_getbinval(SPI_tuptable->vals[0],
+										   SPI_tuptable->tupdesc, 1, &isnull));
+
+	if (isnull || owner != me)
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("dbblue wait sampler: schema \"dbblue_catalog\" exists but is not owned by the sampler; refusing to use it"),
+				 errdetail("A schema with this name already existed, owned by another role, in database \"%s\".",
+						   dbblue_wait_sampling_database),
+				 errhint("Drop the schema (or reassign it to the bootstrap superuser), or point dbblue_wait_sampling_database at a database without a foreign dbblue_catalog schema.")));
+}
+
+/*
+ * Confirm dbblue_catalog.<relname> is an ordinary table owned by this worker,
+ * not a view/foreign table/etc. a non-superuser squatted under the expected
+ * name (a view with an INSTEAD OF trigger would run attacker code as the
+ * superuser worker on INSERT).  Same rationale and ERROR-not-FATAL contract as
+ * ws_verify_self_owned_schema().
+ */
+static void
+ws_verify_self_owned_table(const char *relname)
+{
+	Oid			me = GetUserId();
+	Oid			argtype = TEXTOID;
+	Datum		arg = CStringGetTextDatum(relname);
+	char		relkind;
+	Oid			relowner;
+	bool		isnull;
+
+	/* read_only = false: must see the table this transaction just created */
+	if (SPI_execute_with_args(
+			"SELECT c.relkind, c.relowner FROM pg_catalog.pg_class c "
+			"JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+			"WHERE n.nspname = 'dbblue_catalog' AND c.relname = $1",
+			1, &argtype, &arg, NULL, false, 0) != SPI_OK_SELECT)
+		elog(ERROR, "dbblue wait sampler: could not look up dbblue_catalog.%s", relname);
+	if (SPI_processed != 1)
+		elog(ERROR, "dbblue wait sampler: dbblue_catalog.%s unexpectedly absent after create", relname);
+
+	relkind = DatumGetChar(SPI_getbinval(SPI_tuptable->vals[0],
+										 SPI_tuptable->tupdesc, 1, &isnull));
+	if (isnull)
+		relkind = '\0';
+	relowner = DatumGetObjectId(SPI_getbinval(SPI_tuptable->vals[0],
+											  SPI_tuptable->tupdesc, 2, &isnull));
+
+	if (relkind != RELKIND_RELATION || isnull || relowner != me)
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("dbblue wait sampler: \"dbblue_catalog.%s\" is not a table owned by the sampler; refusing to use it",
+						relname),
+				 errdetail("Expected an ordinary table owned by the sampler, but found a conflicting object in database \"%s\".",
+						   dbblue_wait_sampling_database),
+				 errhint("Drop the conflicting object so the wait sampler can create and manage its own.")));
+}
+
+/*
  * Create the dbblue_catalog schema and its two tables if they don't
  * already exist.  Only ever called once dbblue_wait_sampling_enabled has
  * been observed to be on, so nothing is created while the feature is off.
@@ -419,6 +524,9 @@ ensure_schema(void)
 	if (SPI_execute("CREATE SCHEMA IF NOT EXISTS dbblue_catalog", false, 0) != SPI_OK_UTILITY)
 		elog(FATAL, "dbblue wait sampler: failed to create schema dbblue_catalog");
 
+	/* Refuse to adopt a dbblue_catalog someone else created (object squatting). */
+	ws_verify_self_owned_schema();
+
 	if (SPI_execute("GRANT USAGE ON SCHEMA dbblue_catalog TO PUBLIC", false, 0) != SPI_OK_UTILITY)
 		elog(FATAL, "dbblue wait sampler: failed to grant usage on schema dbblue_catalog");
 
@@ -433,6 +541,9 @@ ensure_schema(void)
 					"CONSTRAINT wait_history_pid_start_ts_key UNIQUE (pid, start_ts))",
 					false, 0) != SPI_OK_UTILITY)
 		elog(FATAL, "dbblue wait sampler: failed to create table wait_history");
+
+	/* Must be our own ordinary table before we index or write to it. */
+	ws_verify_self_owned_table("wait_history");
 
 	if (SPI_execute("CREATE INDEX IF NOT EXISTS wait_history_start_ts_idx "
 					"ON dbblue_catalog.wait_history (start_ts)",
@@ -450,6 +561,9 @@ ensure_schema(void)
 					"count bigint NOT NULL)",
 					false, 0) != SPI_OK_UTILITY)
 		elog(FATAL, "dbblue wait sampler: failed to create table wait_profile");
+
+	/* Must be our own ordinary table before we index or write to it. */
+	ws_verify_self_owned_table("wait_profile");
 
 	if (SPI_execute("CREATE INDEX IF NOT EXISTS wait_profile_snapshot_ts_idx "
 					"ON dbblue_catalog.wait_profile (snapshot_ts)",

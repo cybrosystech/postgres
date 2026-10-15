@@ -1059,7 +1059,8 @@ PostmasterMain(int argc, char *argv[])
 	InitializeWalConsistencyChecking();
 
 	/*
-	 * If -C was specified with a runtime-computed GUC, we held off printing
+	 * If -C was specified with a runtime-compute
+	/*d GUC, we held off printing
 	 * the value earlier, as the GUC was not yet initialized.  We handle -C
 	 * for most GUCs before we lock the data directory so that the option may
 	 * be used on a running server.  However, a handful of GUCs are runtime-
