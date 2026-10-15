@@ -1,0 +1,5 @@
+# dbblue_toast_tools extension
+comment = 'audit and normalize TOAST compression methods'
+default_version = '1.0'
+module_pathname = '$libdir/dbblue_toast_tools'
+relocatable = true

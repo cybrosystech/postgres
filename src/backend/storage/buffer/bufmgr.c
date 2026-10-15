@@ -34,6 +34,7 @@
  */
 #include "postgres.h"
 
+#include <math.h>
 #include <sys/file.h>
 #include <unistd.h>
 
@@ -45,8 +46,10 @@
 #include "catalog/storage_xlog.h"
 #include "common/hashfn.h"
 #include "executor/instrument.h"
+#include "funcapi.h"
 #include "lib/binaryheap.h"
 #include "miscadmin.h"
+#include "postmaster/bgworker.h"
 #include "pg_trace.h"
 #include "pgstat.h"
 #include "postmaster/bgwriter.h"
@@ -64,7 +67,11 @@
 #include "storage/smgr.h"
 #include "storage/standby.h"
 #include "utils/memdebug.h"
+#include "utils/guc_hooks.h"
+#include "utils/hsearch.h"
 #include "utils/ps_status.h"
+#include "utils/relfilenumbermap.h"
+#include "utils/tuplestore.h"
 #include "utils/rel.h"
 #include "utils/resowner.h"
 #include "utils/timestamp.h"
@@ -93,147 +100,84 @@
  */
 #define BUF_DROP_FULL_SCAN_THRESHOLD		(uint64) (NBuffers / 32)
 
-/* ---------------------------------------------------------------------
- * Odoo pinner: ring-buffer forced-relations table.
+/*
+ * check_dbblue_pinner_database
+ *		Accept only a plausible single database name.
  *
- * A small fixed-size shared-memory registry of relfilenodes whose
- * sequential reads must be funnelled through a 256KB ring buffer (the
- * existing BAS_BULKREAD strategy). Lets the operator name large
- * report tables that should never pollute shared_buffers.
- * ---------------------------------------------------------------------
+ * The pinner worker connects to exactly one database and passes this string
+ * to the connection code as that database's name.  A value such as
+ * 'db_odoo,postgres' would be taken as one (nonexistent) name, and the worker
+ * would then fail and be restarted forever, so reject lists and other
+ * obviously wrong values when the setting is made.  Whether the database
+ * actually exists cannot be checked here (the postmaster has no catalogs).
  */
-#define MAX_RING_BUFFER_RELATIONS	64
-
-typedef struct RingBufferEntry
+bool
+check_dbblue_pinner_database(char **newval, void **extra, GucSource source)
 {
-	Oid			relfileOid;
-	bool		active;
-} RingBufferEntry;
+	const char *name = *newval;
+	size_t		len;
 
-typedef struct RingBufferTable
-{
-	LWLock		lock;
-	int			num_entries;
-	RingBufferEntry entries[MAX_RING_BUFFER_RELATIONS];
-} RingBufferTable;
-
-static RingBufferTable *RingBufferRelations = NULL;
-
-Size
-RingBufferShmemSize(void)
-{
-	return sizeof(RingBufferTable);
-}
-
-void
-InitRingBufferTable(void)
-{
-	bool		found;
-
-	RingBufferRelations = (RingBufferTable *)
-		ShmemInitStruct("RingBufferRelations",
-						sizeof(RingBufferTable),
-						&found);
-
-	if (!found)
+	if (name == NULL || name[0] == '\0')
 	{
-		MemSet(RingBufferRelations, 0, sizeof(RingBufferTable));
-		LWLockInitialize(&RingBufferRelations->lock,
-						 LWTRANCHE_RING_BUFFER_TABLE);
-	}
-}
-
-void
-RegisterRingBufferRelation(Oid relfileOid)
-{
-	int			i;
-
-	LWLockAcquire(&RingBufferRelations->lock, LW_EXCLUSIVE);
-
-	for (i = 0; i < MAX_RING_BUFFER_RELATIONS; i++)
-	{
-		if (RingBufferRelations->entries[i].active &&
-			RingBufferRelations->entries[i].relfileOid == relfileOid)
-		{
-			LWLockRelease(&RingBufferRelations->lock);
-			return;
-		}
+		GUC_check_errmsg("\"dbblue_pinner_database\" must not be empty");
+		return false;
 	}
 
-	for (i = 0; i < MAX_RING_BUFFER_RELATIONS; i++)
+	len = strlen(name);
+	if (len >= NAMEDATALEN)
 	{
-		if (!RingBufferRelations->entries[i].active)
-		{
-			RingBufferRelations->entries[i].relfileOid = relfileOid;
-			RingBufferRelations->entries[i].active = true;
-			RingBufferRelations->num_entries++;
-
-			elog(DEBUG1,
-				 "bufmgr: registered relfileOid %u for ring buffer forcing",
-				 relfileOid);
-
-			LWLockRelease(&RingBufferRelations->lock);
-			return;
-		}
+		GUC_check_errmsg("\"dbblue_pinner_database\" is too long for a database name (maximum %d bytes)",
+						 NAMEDATALEN - 1);
+		return false;
 	}
 
-	LWLockRelease(&RingBufferRelations->lock);
-
-	elog(WARNING,
-		 "RegisterRingBufferRelation: table full (%d entries), "
-		 "cannot add relfileOid %u. Increase MAX_RING_BUFFER_RELATIONS.",
-		 MAX_RING_BUFFER_RELATIONS, relfileOid);
-}
-
-void
-UnregisterRingBufferRelation(Oid relfileOid)
-{
-	int			i;
-
-	LWLockAcquire(&RingBufferRelations->lock, LW_EXCLUSIVE);
-
-	for (i = 0; i < MAX_RING_BUFFER_RELATIONS; i++)
+	if (strchr(name, ',') != NULL)
 	{
-		if (RingBufferRelations->entries[i].active &&
-			RingBufferRelations->entries[i].relfileOid == relfileOid)
-		{
-			RingBufferRelations->entries[i].active = false;
-			RingBufferRelations->entries[i].relfileOid = InvalidOid;
-			RingBufferRelations->num_entries--;
-			break;
-		}
+		GUC_check_errmsg("\"dbblue_pinner_database\" takes a single database name, not a list");
+		GUC_check_errhint("The pinner connects to one database; a list such as \"db1,db2\" is not supported.");
+		return false;
 	}
 
-	LWLockRelease(&RingBufferRelations->lock);
+	if (isspace((unsigned char) name[0]) || isspace((unsigned char) name[len - 1]))
+	{
+		GUC_check_errmsg("\"dbblue_pinner_database\" must not start or end with whitespace");
+		return false;
+	}
+
+	return true;
 }
 
 /*
- * IsRingBufferForced — fast check on every read of a relation. Uses a
- * shared lock so concurrent readers don't serialize.
+ * DBBlueRegisterPinnerWorker — register the dbblue soft-pin background worker
+ * as a static bgworker, gated by the dbblue_pinner_enabled GUC.
+ *
+ * Called from the postmaster (PostmasterMain), before shared memory is set up,
+ * so the feature no longer needs pg_prewarm in shared_preload_libraries: the
+ * worker's code lives in the pg_prewarm library, loaded lazily when the worker
+ * process starts (bgw_library_name = "pg_prewarm"). Flip dbblue_pinner_enabled
+ * = on and restart — core brings the worker up.
  */
-static bool
-IsRingBufferForced(Oid relfileOid)
+void
+DBBlueRegisterPinnerWorker(void)
 {
-	int			i;
-	bool		result = false;
+	BackgroundWorker worker;
 
-	if (RingBufferRelations->num_entries == 0)
-		return false;
+	if (!DBBluePinner_enabled)
+		return;
 
-	LWLockAcquire(&RingBufferRelations->lock, LW_SHARED);
+	MemSet(&worker, 0, sizeof(worker));
+	worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
+		BGWORKER_BACKEND_DATABASE_CONNECTION;
+	worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+	worker.bgw_restart_time = 10;
+	strlcpy(worker.bgw_library_name, "pg_prewarm",
+			sizeof(worker.bgw_library_name));
+	strlcpy(worker.bgw_function_name, "DBBluePinnerMain",
+			sizeof(worker.bgw_function_name));
+	strlcpy(worker.bgw_name, "db_blue pinner", sizeof(worker.bgw_name));
+	strlcpy(worker.bgw_type, "db_blue pinner", sizeof(worker.bgw_type));
 
-	for (i = 0; i < MAX_RING_BUFFER_RELATIONS; i++)
-	{
-		if (RingBufferRelations->entries[i].active &&
-			RingBufferRelations->entries[i].relfileOid == relfileOid)
-		{
-			result = true;
-			break;
-		}
-	}
-
-	LWLockRelease(&RingBufferRelations->lock);
-	return result;
+	RegisterBackgroundWorker(&worker);
 }
 
 /*
@@ -367,7 +311,7 @@ int			bgwriter_flush_after = DEFAULT_BGWRITER_FLUSH_AFTER;
 int			backend_flush_after = DEFAULT_BACKEND_FLUSH_AFTER;
 
 /*
- * dbblue soft-pin / ring-buffer GUC variables.
+ * dbblue soft-pin GUC variables.
  *
  * These back the core dbblue_* GUCs defined in guc_parameters.dat. They live
  * in core (rather than the pg_prewarm contrib module) because flat, dotless
@@ -377,7 +321,6 @@ int			backend_flush_after = DEFAULT_BACKEND_FLUSH_AFTER;
  */
 bool		DBBluePinner_enabled = false;	/* master switch: register the pinner worker? */
 char	   *DBBluePinner_pinned_tables = NULL;
-char	   *DBBluePinner_ring_buffer_tables = NULL;
 char	   *DBBluePinner_database = NULL;
 int			DBBluePinner_check_interval = 0;
 int			DBBluePinner_max_pin_percent = 35;
@@ -1517,25 +1460,6 @@ ReadBuffer_common(Relation rel, SMgrRelation smgr, char smgr_persistence,
 	operation.persistence = persistence;
 	operation.forknum = forkNum;
 
-	/*
-	 * Odoo pinner: substitute a BAS_BULKREAD ring-buffer strategy if this
-	 * relation is registered for forced ring-buffering and the caller
-	 * didn't already pick a strategy. Skipped for temp relations (which
-	 * use local buffers, not shared_buffers).
-	 */
-	if (strategy == NULL && persistence != RELPERSISTENCE_TEMP)
-	{
-		Oid			relfileOid = InvalidOid;
-
-		if (rel != NULL)
-			relfileOid = rel->rd_locator.relNumber;
-		else if (smgr != NULL)
-			relfileOid = smgr->smgr_rlocator.locator.relNumber;
-
-		if (OidIsValid(relfileOid) && IsRingBufferForced(relfileOid))
-			strategy = GetAccessStrategy(BAS_BULKREAD);
-	}
-
 	operation.strategy = strategy;
 	if (StartReadBuffer(&operation,
 						&buffer,
@@ -2626,7 +2550,7 @@ retry:
 	 */
 	oldFlags = buf_state & BUF_FLAG_MASK;
 	ClearBufferTag(&buf->tag);
-	buf->soft_pin_tier = SOFT_PIN_TIER_NONE;
+	SoftPinSetTier(buf, SOFT_PIN_TIER_NONE);
 
 	UnlockBufHdrExt(buf, buf_state,
 					0,
@@ -2716,7 +2640,7 @@ InvalidateVictimBuffer(BufferDesc *buf_hdr)
 	 * leak protection onto the new occupant.
 	 */
 	ClearBufferTag(&buf_hdr->tag);
-	buf_hdr->soft_pin_tier = SOFT_PIN_TIER_NONE;
+	SoftPinSetTier(buf_hdr, SOFT_PIN_TIER_NONE);
 	UnlockBufHdrExt(buf_hdr, buf_state,
 					0,
 					BUF_FLAG_MASK | BUF_USAGECOUNT_MASK,
@@ -9205,52 +9129,50 @@ const PgAioHandleCallbacks aio_local_buffer_readv_cb = {
  */
 
 /*
- * ComputePoolPressure — single-pass pool scan that resolves both the
- * "under pressure" (<5% evictable) and "critical pressure" (<2% evictable)
- * flags in one walk.
+ * ComputePoolPressure — resolve both the "under pressure" (<5% of the pool
+ * not soft-pinned) and "critical pressure" (<2%) flags.
  *
- * Hot-path callers (StrategyGetBuffer) should compute this once per
- * StrategyGetBuffer call and reuse the cached result for every soft-pin
- * encounter. Calling separate per-tier helpers per encounter turns the
- * clock sweep into O(N^2) under sustained pressure with many pinned
- * buffers, which is the issue this function is designed to avoid.
+ * This is O(1): it reads the count of soft-pinned buffers that
+ * SoftPinSetTier() keeps in StrategyControl, instead of walking every buffer
+ * header.  (The earlier walk cost grew with shared_buffers -- about a
+ * millisecond per call at 16GB -- and ran on nearly every buffer allocation
+ * once a large share of the pool was pinned.)
  *
- * Counts buffers as "evictable" iff refcount==0 and soft_pin_tier==NONE.
- * Reads soft_pin_tier non-atomically (a uint8); benign races with the
- * pinner are tolerated — the threshold checks are coarse and a stale
- * read by ±1 buffer cannot flip pressure state in any meaningful way.
- *
- * Early-exit: once free_count crosses the 5% threshold, both flags are
- * known to be false and we return immediately without finishing the walk.
+ * Unlike the walk, buffers that are merely pinned by a backend at this
+ * instant (refcount > 0) are no longer subtracted.  Only a handful are in use
+ * at a time, so the thresholds, which are coarse, are unaffected.
  */
 void
 ComputePoolPressure(bool *under_pressure, bool *critical_pressure)
 {
-	int			free_count = 0;
-	int			under_threshold = NBuffers / 20;	/* 5% */
-	int			critical_threshold = NBuffers / 50; /* 2% */
-	int			i;
+	uint32		evictable = NBuffers - StrategySoftPinCount();
 
-	for (i = 0; i < NBuffers; i++)
+	*under_pressure = (evictable < (uint32) (NBuffers / 20));	/* 5% */
+	*critical_pressure = (evictable < (uint32) (NBuffers / 50));	/* 2% */
+}
+
+/*
+ * RecountSoftPinnedBuffers — recompute the soft-pinned buffer count by
+ * walking the pool, and store it.  Called by the pinner worker once per cycle
+ * to correct any drift; never on a hot path.  A transition that happens
+ * during the walk may be missed, which the next cycle corrects.
+ */
+void
+RecountSoftPinnedBuffers(void)
+{
+	uint32		count = 0;
+
+	for (int i = 0; i < NBuffers; i++)
 	{
-		BufferDesc *buf = GetBufferDescriptor(i);
-		uint64		buf_state = pg_atomic_read_u64(&buf->state);
-
-		if (BUF_STATE_GET_REFCOUNT(buf_state) == 0 &&
-			buf->soft_pin_tier == SOFT_PIN_TIER_NONE)
-		{
-			if (++free_count >= under_threshold)
-			{
-				*under_pressure = false;
-				*critical_pressure = false;
-				return;
-			}
-		}
+		if (pg_atomic_read_u32(&GetBufferDescriptor(i)->soft_pin_tier) !=
+			SOFT_PIN_TIER_NONE)
+			count++;
 	}
 
-	/* did not reach 5% — definitely under pressure */
-	*under_pressure = true;
-	*critical_pressure = (free_count < critical_threshold);
+	if (StrategySoftPinCount() != count)
+		elog(DEBUG1, "soft-pinned buffer count drifted: was %u, recounted %u",
+			 StrategySoftPinCount(), count);
+	StrategySoftPinSetCount(count);
 }
 
 /*
@@ -9325,7 +9247,7 @@ SoftPinRelationBuffers(Oid relspcOid, Oid reldbOid,
 			buf->tag.dbOid == reldbOid &&
 			(buf_state & BM_VALID))
 		{
-			buf->soft_pin_tier = tier;
+			SoftPinSetTier(buf, tier);
 			pinned++;
 		}
 
@@ -9339,19 +9261,29 @@ SoftPinRelationBuffers(Oid relspcOid, Oid reldbOid,
 
 /*
  * ClearSoftPinForRelation — drop soft_pin_tier from every buffer of a
- * relation. Called when the operator removes a table from
- * odoo_pinner.pinned_tables.
+ * relation.  Called by the pinner when a relation leaves
+ * dbblue_pinned_tables (or stops being pinned, e.g. over budget), so its
+ * pages become evictable again.  Matches buffers exactly as
+ * SoftPinRelationBuffers() selects them.
  */
 void
 ClearSoftPinForRelation(Oid relspcOid, Oid reldbOid, Oid relfileOid)
 {
-	int			i;
+	int			cleared = 0;
 
-	for (i = 0; i < NBuffers; i++)
+	for (int i = 0; i < NBuffers; i++)
 	{
 		BufferDesc *buf = GetBufferDescriptor(i);
 
+		/* cheap unlocked pre-checks; re-verified under the header lock */
 		if (buf->tag.relNumber != relfileOid)
+			continue;
+		if (buf->tag.dbOid != reldbOid)
+			continue;
+		if (buf->tag.spcOid != relspcOid &&
+			buf->tag.spcOid != DEFAULTTABLESPACE_OID)
+			continue;
+		if (pg_atomic_read_u32(&buf->soft_pin_tier) == SOFT_PIN_TIER_NONE)
 			continue;
 
 		(void) LockBufHdr(buf);
@@ -9359,9 +9291,129 @@ ClearSoftPinForRelation(Oid relspcOid, Oid reldbOid, Oid relfileOid)
 		if (buf->tag.relNumber == relfileOid &&
 			buf->tag.dbOid == reldbOid)
 		{
-			buf->soft_pin_tier = SOFT_PIN_TIER_NONE;
+			SoftPinSetTier(buf, SOFT_PIN_TIER_NONE);
+			cleared++;
 		}
 
 		UnlockBufHdr(buf);
 	}
+
+	elog(DEBUG1,
+		 "ClearSoftPinForRelation: unpinned %d buffers for relfileOid %u",
+		 cleared, relfileOid);
+}
+
+/*
+ * ClearAllSoftPins — drop every soft pin.  The pinner calls this when it
+ * starts, so pins left by a previous incarnation of the worker (which
+ * exited without remembering what it had pinned) cannot linger.
+ */
+void
+ClearAllSoftPins(void)
+{
+	for (int i = 0; i < NBuffers; i++)
+		SoftPinSetTier(GetBufferDescriptor(i), SOFT_PIN_TIER_NONE);
+}
+
+/*
+ * dbblue_pinned_buffers() -- SQL-callable report of soft-pinned buffers.
+ *
+ * Returns one row per (database, relfilenode, tier) with the number of
+ * shared buffers currently soft-pinned for it.  For relations of the current
+ * database, relid is the regclass of the relation, so the pin status of a
+ * table can be read directly; it is NULL for other databases or when the
+ * filenode cannot be mapped (e.g. a relation dropped since).  Indexes show
+ * up as their own rows, as the pinner pins each index separately.  size_mb
+ * is buffers * BLCKSZ in megabytes, rounded to two decimals.
+ *
+ * Reads the buffer pool without a consistent snapshot, so counts are
+ * approximate while pinning or eviction is going on.
+ */
+typedef struct PinnedBufKey
+{
+	Oid			dbOid;
+	Oid			spcOid;
+	RelFileNumber relNumber;
+	uint32		tier;
+} PinnedBufKey;
+
+typedef struct PinnedBufEntry
+{
+	PinnedBufKey key;			/* hash key */
+	int64		buffers;
+} PinnedBufEntry;
+
+PG_FUNCTION_INFO_V1(dbblue_pinned_buffers);
+
+Datum
+dbblue_pinned_buffers(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	HASHCTL		ctl;
+	HTAB	   *counts;
+	HASH_SEQ_STATUS seq;
+	PinnedBufEntry *ent;
+
+	InitMaterializedSRF(fcinfo, 0);
+
+	ctl.keysize = sizeof(PinnedBufKey);
+	ctl.entrysize = sizeof(PinnedBufEntry);
+	ctl.hcxt = CurrentMemoryContext;
+	counts = hash_create("dbblue pinned buffers", 256, &ctl,
+						 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+
+	for (int i = 0; i < NBuffers; i++)
+	{
+		BufferDesc *buf = GetBufferDescriptor(i);
+		PinnedBufKey key;
+		bool		found;
+
+		/* unlocked pre-check keeps the common (unpinned) case cheap */
+		if (pg_atomic_read_u32(&buf->soft_pin_tier) == SOFT_PIN_TIER_NONE)
+			continue;
+
+		(void) LockBufHdr(buf);
+		memset(&key, 0, sizeof(key));
+		key.tier = pg_atomic_read_u32(&buf->soft_pin_tier);
+		key.dbOid = buf->tag.dbOid;
+		key.spcOid = buf->tag.spcOid;
+		key.relNumber = buf->tag.relNumber;
+		UnlockBufHdr(buf);
+
+		if (key.tier == SOFT_PIN_TIER_NONE)
+			continue;
+
+		ent = (PinnedBufEntry *) hash_search(counts, &key, HASH_ENTER, &found);
+		if (!found)
+			ent->buffers = 0;
+		ent->buffers++;
+	}
+
+	hash_seq_init(&seq, counts);
+	while ((ent = (PinnedBufEntry *) hash_seq_search(&seq)) != NULL)
+	{
+		Datum		values[6];
+		bool		nulls[6] = {false};
+		Oid			relid = InvalidOid;
+
+		if (ent->key.dbOid == MyDatabaseId)
+			relid = RelidByRelfilenumber(ent->key.spcOid, ent->key.relNumber);
+
+		values[0] = ObjectIdGetDatum(ent->key.dbOid);
+		values[1] = ObjectIdGetDatum(ent->key.relNumber);
+		if (OidIsValid(relid))
+			values[2] = ObjectIdGetDatum(relid);
+		else
+			nulls[2] = true;
+		values[3] = Int32GetDatum((int32) ent->key.tier);
+		values[4] = Int64GetDatum(ent->buffers);
+		/* buffers are BLCKSZ pages; report the memory they use, in MB */
+		values[5] = Float8GetDatum(floor((double) ent->buffers * BLCKSZ /
+										 (1024.0 * 1024.0) * 100.0 + 0.5) / 100.0);
+
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+
+	hash_destroy(counts);
+	return (Datum) 0;
 }

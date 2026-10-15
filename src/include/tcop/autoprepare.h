@@ -20,7 +20,7 @@
 #include "nodes/parsenodes.h"
 #include "utils/plancache.h"
 
-/* GUCs (registered in autoprepare.c) */
+/* GUCs (defined in src/backend/utils/misc/guc_parameters.dat) */
 extern PGDLLIMPORT bool autoprepare_enabled;
 extern PGDLLIMPORT int	autoprepare_threshold;	/* cache after N sightings */
 extern PGDLLIMPORT int	autoprepare_limit;		/* max cached shapes/backend */
@@ -51,10 +51,44 @@ extern AutoprepareResult AutoprepareConsult(Query *analyzed_query,
 											 CachedPlanSource **plansource_out,
 											 ParamListInfo *boundParams_out);
 
-/* Drop everything (called for DISCARD ALL / DEALLOCATE ALL). */
+/*
+ * Planning time of the statement AutoprepareConsult() just returned
+ * APREP_MISS for; the eviction policy values shapes by it.
+ */
+extern void AutoprepareNotePlanTime(double plan_ms);
+
+/* Time GetCachedPlan() took for a statement that got APREP_HIT. */
+extern void AutoprepareNoteReuseTime(double plan_ms);
+
+/* Drop everything (called for DISCARD PLANS; not DISCARD ALL, see discard.c). */
 extern void AutoprepareReset(void);
 
-/* GUC registration; call once from backend startup or _PG_init. */
+/*
+ * dbblue_autoprepare_reset() support: the signal handler only sets a flag;
+ * the table is cleared at the start of the next AutoprepareConsult().
+ */
+extern void HandleAutoprepareResetInterrupt(void);
+
+/*
+ * Backend-startup hook, called once from PostgresMain.  The GUCs are core
+ * GUCs now; this only turns query-id computation on if autoprepare starts
+ * enabled (assign_dbblue_autoprepare_enabled() handles later changes).
+ */
 extern void AutoprepareRegisterGUCs(void);
+
+/*
+ * dbblue_log_autoprepare_shapes(pid) support: the signal handler only sets
+ * LogAutoprepareShapesPending; ProcessInterrupts() then does the logging.
+ */
+extern void HandleLogAutoprepareShapesInterrupt(void);
+extern void ProcessLogAutoprepareShapesInterrupt(void);
+
+/*
+ * dbblue_autoprepare_shapes() / dbblue_autoprepare_stats() support: another
+ * backend asked for our table; ProcessInterrupts() sends it back over the
+ * requester's shm_mq.
+ */
+extern void HandleAutoprepareReportInterrupt(void);
+extern void ProcessAutoprepareReportInterrupt(void);
 
 #endif							/* AUTOPREPARE_H */

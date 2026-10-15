@@ -622,6 +622,15 @@
   check_hook => 'check_datestyle',
   assign_hook => 'assign_datestyle',
 },
+
+{ name => 'dbblue_allow_zstd', type => 'bool', context => 'PGC_POSTMASTER', group => 'CLIENT_CONN_STATEMENT',
+  short_desc => 'Allows zstd to be selected as a TOAST compression method.',
+  long_desc => 'When off, zstd cannot be chosen as default_toast_compression or per column, and columns still marked zstd fall back to pglz when written. Use this on a cluster that must stay readable by a server without zstd support, such as one feeding a vanilla PostgreSQL physical standby.',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'dbblue_allow_zstd',
+  boot_val => 'true',
+},
+
 { name => 'dbblue_audit_changed_columns_only', type => 'bool', context => 'PGC_SUSET', group => 'CUSTOM_OPTIONS',
   short_desc => 'Records only the columns an UPDATE actually changed.',
   long_desc => 'By default an UPDATE writes every column of the row into both old_data and new_data, so changing one field on a wide table can write hundreds of times more than it altered. When this is on, columns whose value is identical in both images are omitted, and only the primary key is always kept so the audit row still identifies its row. INSERT and DELETE are unaffected, and a table without a primary key is not filtered at all. The trade-off is that an audit row alone no longer shows the full record state; reconstructing it means walking the history.',
@@ -777,15 +786,18 @@
 
 { name => 'dbblue_autoprepare_enabled', type => 'bool', context => 'PGC_SUSET', group => 'QUERY_TUNING_OTHER',
   short_desc => 'Cache and reuse plans for repeated query shapes.',
-  flags => 'GUC_NOT_IN_SAMPLE',
+  flags => 'GUC_NOT_IN_SAMPLE | GUC_EXPLAIN',
   variable => 'autoprepare_enabled',
   boot_val => 'false',
+  assign_hook => 'assign_dbblue_autoprepare_enabled',
 },
 
 { name => 'dbblue_autoprepare_limit', type => 'int', context => 'PGC_SUSET', group => 'QUERY_TUNING_OTHER',
   short_desc => 'Maximum number of cached query shapes per backend.',
-  flags => 'GUC_NOT_IN_SAMPLE',
+  long_desc => 'Rejected if the worst case across all backends (max_connections times this value times an assumed 32kB per cached shape) would use more than 10% of the RAM left after shared_buffers.',
+  flags => 'GUC_NOT_IN_SAMPLE | GUC_EXPLAIN',
   variable => 'autoprepare_limit',
+  check_hook => 'check_dbblue_autoprepare_limit',
   boot_val => '1024',
   min => '1',
   max => 'INT_MAX',
@@ -793,7 +805,7 @@
 
 { name => 'dbblue_autoprepare_threshold', type => 'int', context => 'PGC_SUSET', group => 'QUERY_TUNING_OTHER',
   short_desc => 'Cache a query shape after it is seen this many times.',
-  flags => 'GUC_NOT_IN_SAMPLE',
+  flags => 'GUC_NOT_IN_SAMPLE | GUC_EXPLAIN',
   variable => 'autoprepare_threshold',
   boot_val => '2',
   min => '1',
@@ -912,6 +924,16 @@
   boot_val => 'true',
 },
 
+# dbblue: fused hash join + GROUP BY.  These are two flags on purpose and
+# must not be collapsed into one -- see dbblue_groupjoin.md T4-6.
+{ name => 'dbblue_enable_groupjoin', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
+  short_desc => 'Enables the planner\'s use of fused hash join and grouping plans.',
+  long_desc => 'Only takes effect for a join whose build side is provably unique on the join key, and whose GROUP BY key is that same key.',
+  flags => 'GUC_EXPLAIN',
+  variable => 'dbblue_enable_groupjoin',
+  boot_val => 'false',
+},
+
 { name => 'dbblue_enable_tableam_multi_insert', type => 'bool', context => 'PGC_USERSET', group => 'RESOURCES_IO',
   short_desc => 'Enables batched bulk-insert of initial data for CREATE TABLE AS, CREATE MATERIALIZED VIEW, and REFRESH MATERIALIZED VIEW.',
   variable => 'dbblue_enable_tableam_multi_insert',
@@ -924,6 +946,16 @@
   variable => 'dbblue_fillfactor_map',
   boot_val => '""',
   assign_hook => 'dbblue_fillfactor_assign_hook',
+},
+
+# dbblue: companion to dbblue_enable_groupjoin above; kept as a separate
+# flag on purpose -- see dbblue_groupjoin.md T4-6.
+{ name => 'dbblue_groupjoin_planner_only', type => 'bool', context => 'PGC_USERSET', group => 'DEVELOPER_OPTIONS',
+  short_desc => 'Logs candidate fused groupjoin plans without using them.',
+  long_desc => 'For development only: reports which queries match the groupjoin shape, without ever offering the path to the planner.',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'dbblue_groupjoin_planner_only',
+  boot_val => 'false',
 },
 
 { name => 'dbblue_heap_bulk_extend_size', type => 'int', context => 'PGC_USERSET', group => 'RESOURCES_IO',
@@ -982,13 +1014,15 @@
 
 { name => 'dbblue_pinner_database', type => 'string', context => 'PGC_POSTMASTER', group => 'RESOURCES_MEM',
   short_desc => 'Database the pinner background worker connects to.',
+  long_desc => 'A single database name; a list of databases is not supported.',
   flags => 'GUC_NOT_IN_SAMPLE',
   variable => 'DBBluePinner_database',
   boot_val => '"postgres"',
+  check_hook => 'check_dbblue_pinner_database',
 },
 
 { name => 'dbblue_pinner_enabled', type => 'bool', context => 'PGC_POSTMASTER', group => 'RESOURCES_MEM',
-  short_desc => 'Enables the dbblue soft-pin / ring-buffer background worker.',
+  short_desc => 'Enables the dbblue soft-pin background worker.',
   long_desc => 'When off, the pinner worker is not registered even if pg_prewarm is preloaded, keeping advanced caching fully disabled.',
   flags => 'GUC_NOT_IN_SAMPLE',
   variable => 'DBBluePinner_enabled',
@@ -1048,13 +1082,6 @@
   boot_val => '1.5',
   min => '1.01',
   max => '100.0',
-},
-
-{ name => 'dbblue_ring_buffer_tables', type => 'string', context => 'PGC_SIGHUP', group => 'RESOURCES_MEM',
-  short_desc => 'Tables whose scans must never pollute shared_buffers.',
-  flags => 'GUC_NOT_IN_SAMPLE',
-  variable => 'DBBluePinner_ring_buffer_tables',
-  boot_val => '""',
 },
 
 { name => 'dbblue_safe_mode', type => 'bool', context => 'PGC_SUSET', group => 'CLIENT_CONN_STATEMENT',
@@ -1310,6 +1337,7 @@
   variable => 'default_toast_compression',
   boot_val => 'DEFAULT_TOAST_COMPRESSION',
   options => 'default_toast_compression_options',
+  check_hook => 'check_default_toast_compression',
 },
 
 { name => 'default_transaction_deferrable', type => 'bool', context => 'PGC_USERSET', group => 'CLIENT_CONN_STATEMENT',

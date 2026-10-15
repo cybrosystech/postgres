@@ -357,8 +357,12 @@ typedef struct BufferDesc
 	 */
 	proclist_head lock_waiters;
 
-	/* Soft-pin tier (Odoo pinner). Non-atomic; benign races are tolerated. */
-	uint8		soft_pin_tier;
+	/*
+	 * Soft-pin tier (dbblue pinner).  Atomic so that every transition between
+	 * "not pinned" and "pinned" can be counted exactly once in
+	 * StrategyControl->nSoftPinned; always change it with SoftPinSetTier().
+	 */
+	pg_atomic_uint32 soft_pin_tier;
 } BufferDesc;
 
 #define SOFT_PIN_TIER_NONE	0	/* not pinned */
@@ -600,6 +604,34 @@ extern bool StrategyRejectBuffer(BufferAccessStrategy strategy,
 
 extern int	StrategySyncStart(uint32 *complete_passes, uint32 *num_buf_alloc);
 extern void StrategyNotifyBgWriter(int bgwprocno);
+
+/* dbblue soft-pin: count of buffers whose soft_pin_tier is not NONE */
+extern void StrategySoftPinAdjust(int delta);
+extern uint32 StrategySoftPinCount(void);
+extern void StrategySoftPinSetCount(uint32 count);
+
+/*
+ * SoftPinSetTier -- change a buffer's soft-pin tier and keep the global count
+ * of soft-pinned buffers in step.  The exchange is atomic, so when several
+ * backends race to clear the same buffer exactly one of them sees the old
+ * non-NONE value and decrements the count.
+ */
+static inline void
+SoftPinSetTier(BufferDesc *buf, uint32 newtier)
+{
+	uint32		oldtier;
+
+	/* common case on buffer invalidation: nothing to do, avoid the atomic op */
+	if (newtier == SOFT_PIN_TIER_NONE &&
+		pg_atomic_read_u32(&buf->soft_pin_tier) == SOFT_PIN_TIER_NONE)
+		return;
+
+	oldtier = pg_atomic_exchange_u32(&buf->soft_pin_tier, newtier);
+	if (oldtier == SOFT_PIN_TIER_NONE && newtier != SOFT_PIN_TIER_NONE)
+		StrategySoftPinAdjust(1);
+	else if (oldtier != SOFT_PIN_TIER_NONE && newtier == SOFT_PIN_TIER_NONE)
+		StrategySoftPinAdjust(-1);
+}
 
 /* buf_table.c */
 extern uint32 BufTableHashCode(BufferTag *tagPtr);
