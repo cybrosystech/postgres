@@ -34,6 +34,7 @@ backend_sources += files(
   'nodeGatherMerge.c',
   'nodeGroup.c',
   'nodeHash.c',
+  'nodeHashgroupjoin.c',
   'nodeHashjoin.c',
   'nodeIncrementalSort.c',
   'nodeIndexonlyscan.c',

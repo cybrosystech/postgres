@@ -429,6 +429,8 @@
 
 # - Planner Method Configuration -
 
+#dbblue_enable_groupjoin = off		# dbblue: fuse a hash join with the
+					# GROUP BY above it (opt-in per session)
 #enable_async_append = on
 #enable_bitmapscan = on
 #enable_gathermerge = on
@@ -809,7 +811,7 @@
 #row_security = on
 #default_table_access_method = 'heap'
 #default_tablespace = ''                # a tablespace name, '' uses the default
-#default_toast_compression = lz4       # pglz or lz4
+#default_toast_compression = zstd       # pglz, lz4, or zstd (dbblue default: zstd)
 #temp_tablespaces = ''                  # a list of tablespace names, '' uses
                                         # only default tablespace
 #check_function_bodies = on
