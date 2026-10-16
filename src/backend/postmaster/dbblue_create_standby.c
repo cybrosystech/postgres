@@ -35,6 +35,7 @@
 #include "postgres.h"
 
 #include <dirent.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <sys/socket.h>
@@ -68,6 +69,15 @@ char	   *dbblue_standby_user = NULL;
 
 /* Stop retrying after this many consecutive failures (reset on SIGHUP). */
 #define DBBLUE_STANDBY_MAX_FAILURES		5
+
+/*
+ * pg_tde layout, as in src/include/tde/pg_tde.h.  Spelled out here rather
+ * than included because that header drags in pg_tde's own definitions,
+ * which the core backend does not otherwise need.
+ */
+#define DBBLUE_TDE_DIR				"pg_tde"
+#define DBBLUE_TDE_WAL_KEYS			"wal_keys"
+#define DBBLUE_TDE_GLOBAL_PROVIDERS	"1664_providers"
 
 static int	consecutive_failures = 0;
 
@@ -167,6 +177,164 @@ standby_has_data(const char *dir)
 
 	snprintf(path, sizeof(path), "%s/PG_VERSION", dir);
 	return (stat(path, &st) == 0 && S_ISREG(st.st_mode));
+}
+
+/*
+ * primary_uses_wal_encryption
+ *		True if this cluster has pg_tde WAL keys, i.e. its WAL on disk is
+ *		encrypted and a base backup of it must be taken with -E.
+ */
+static bool
+primary_uses_wal_encryption(void)
+{
+	char		path[MAXPGPATH];
+	struct stat st;
+
+	snprintf(path, sizeof(path), "%s/%s/%s",
+			 DataDir, DBBLUE_TDE_DIR, DBBLUE_TDE_WAL_KEYS);
+	return (stat(path, &st) == 0 && S_ISREG(st.st_mode));
+}
+
+/*
+ * copy_tde_file
+ *		Copy one small pg_tde file.  Reports a WARNING and returns false on
+ *		failure instead of raising an ERROR, so a transient problem costs one
+ *		failed tick rather than the worker itself.
+ */
+static bool
+copy_tde_file(const char *from, const char *to)
+{
+	char		buf[8192];
+	int			srcfd;
+	int			dstfd;
+	ssize_t		nread;
+	bool		ok = true;
+
+	srcfd = open(from, O_RDONLY | PG_BINARY, 0);
+	if (srcfd < 0)
+	{
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("dbblue create standby: could not open \"%s\": %m", from)));
+		return false;
+	}
+
+	dstfd = open(to, O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY, S_IRUSR | S_IWUSR);
+	if (dstfd < 0)
+	{
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("dbblue create standby: could not create \"%s\": %m", to)));
+		close(srcfd);
+		return false;
+	}
+
+	while ((nread = read(srcfd, buf, sizeof(buf))) > 0)
+	{
+		if (write(dstfd, buf, nread) != nread)
+		{
+			if (errno == 0)
+				errno = ENOSPC;
+			ereport(WARNING,
+					(errcode_for_file_access(),
+					 errmsg("dbblue create standby: could not write \"%s\": %m", to)));
+			ok = false;
+			break;
+		}
+	}
+	if (nread < 0)
+	{
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("dbblue create standby: could not read \"%s\": %m", from)));
+		ok = false;
+	}
+
+	close(srcfd);
+	if (close(dstfd) != 0 && ok)
+	{
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("dbblue create standby: could not close \"%s\": %m", to)));
+		ok = false;
+	}
+	return ok;
+}
+
+/*
+ * seed_standby_tde_dir
+ *		Prepare dir for "pg_basebackup -E".
+ *
+ * -E re-encrypts the WAL streamed during the copy with a fresh WAL key, and
+ * wraps that key with the server principal key.  It finds the server key
+ * through <dir>/pg_tde before the backup starts, so the two files it reads
+ * there must already be in place: wal_keys (whose header records the server
+ * key) and 1664_providers (which says where the keyring is).  Every other
+ * pg_tde file arrives with the backup itself and overwrites whatever is
+ * seeded here, and pg_basebackup skips the server's wal_keys under -E and
+ * writes its own, so it does not matter if a key file changes while we copy.
+ *
+ * A pg_tde directory left behind by an earlier failed attempt is replaced.
+ */
+static bool
+seed_standby_tde_dir(const char *dir)
+{
+	char		dirbuf[MAXPGPATH];
+	char		tdedir[MAXPGPATH];
+	char		from[MAXPGPATH];
+	char		to[MAXPGPATH];
+	struct stat st;
+	static const char *const files[] = {
+		DBBLUE_TDE_WAL_KEYS,
+		DBBLUE_TDE_GLOBAL_PROVIDERS,
+	};
+
+	/* pg_mkdir_p scribbles on its argument */
+	strlcpy(dirbuf, dir, sizeof(dirbuf));
+	if (pg_mkdir_p(dirbuf, S_IRWXU) != 0 && errno != EEXIST)
+	{
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("dbblue create standby: could not create directory \"%s\": %m",
+						dir)));
+		return false;
+	}
+	/* pg_basebackup refuses a target directory with group/other access */
+	if (chmod(dir, S_IRWXU) != 0)
+	{
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("dbblue create standby: could not set permissions on \"%s\": %m",
+						dir)));
+		return false;
+	}
+
+	snprintf(tdedir, sizeof(tdedir), "%s/%s", dir, DBBLUE_TDE_DIR);
+	if (stat(tdedir, &st) == 0 && !rmtree(tdedir, true))
+	{
+		ereport(WARNING,
+				(errmsg("dbblue create standby: could not remove stale \"%s\"",
+						tdedir)));
+		return false;
+	}
+	if (mkdir(tdedir, S_IRWXU) != 0)
+	{
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("dbblue create standby: could not create directory \"%s\": %m",
+						tdedir)));
+		return false;
+	}
+
+	for (int i = 0; i < lengthof(files); i++)
+	{
+		snprintf(from, sizeof(from), "%s/%s/%s", DataDir, DBBLUE_TDE_DIR, files[i]);
+		snprintf(to, sizeof(to), "%s/%s", tdedir, files[i]);
+		if (!copy_tde_file(from, to))
+			return false;
+	}
+
+	return true;
 }
 
 /*
@@ -407,6 +575,7 @@ run_standby_tick(void)
 	char	   *cmd;
 	int			port;
 	bool		ok;
+	bool		encrypt_wal;
 
 	dir = resolve_standby_directory();
 	if (dir == NULL)
@@ -445,8 +614,14 @@ run_standby_tick(void)
 
 				while ((de = readdir(d)) != NULL)
 				{
+					/*
+					 * A lone pg_tde directory is our own seed from an
+					 * attempt that died before pg_basebackup could clean
+					 * up; seed_standby_tde_dir() replaces it.
+					 */
 					if (strcmp(de->d_name, ".") != 0 &&
-						strcmp(de->d_name, "..") != 0)
+						strcmp(de->d_name, "..") != 0 &&
+						strcmp(de->d_name, DBBLUE_TDE_DIR) != 0)
 					{
 						empty = false;
 						break;
@@ -477,6 +652,24 @@ run_standby_tick(void)
 			}
 		}
 
+		/*
+		 * With pg_tde WAL encryption on, the walsender hands pg_basebackup
+		 * plaintext WAL while the copied pg_tde/wal_keys says that range is
+		 * encrypted.  Without -E the standby's own WAL from the copy window
+		 * would therefore be plaintext on disk and unreadable to it, and it
+		 * could only start by re-fetching that WAL from us -- impossible
+		 * once we have recycled it.  -E re-encrypts that WAL with a fresh
+		 * key and writes a matching wal_keys, but needs pg_tde seeded first.
+		 */
+		encrypt_wal = primary_uses_wal_encryption();
+		if (encrypt_wal && !seed_standby_tde_dir(dir))
+		{
+			rmtree(dir, false);
+			pfree(logfile);
+			pfree(dir);
+			return false;
+		}
+
 		resolve_bin_path("pg_basebackup", binpath, sizeof(binpath));
 		qbin = shell_quote(binpath);
 		qdir = shell_quote(dir);
@@ -484,22 +677,24 @@ run_standby_tick(void)
 		/*
 		 * -R writes standby.signal and primary_conninfo; -X stream keeps up
 		 * with WAL during the copy; -c fast avoids waiting for a checkpoint;
-		 * -w forbids password prompts (there is no terminal to prompt on).
-		 * An empty dbblue_standby_user means "connect as the OS user", which
-		 * works out of the box with initdb's default replication pg_hba
-		 * entries.
+		 * -w forbids password prompts (there is no terminal to prompt on);
+		 * -E encrypts the streamed WAL, see above.  An empty
+		 * dbblue_standby_user means "connect as the OS user", which works
+		 * out of the box with initdb's default replication pg_hba entries.
 		 */
 		if (dbblue_standby_user != NULL && dbblue_standby_user[0] != '\0')
 		{
 			char	   *quser = shell_quote(dbblue_standby_user);
 
-			cmd = psprintf("%s -h localhost -p %d -U %s -D %s -X stream -c fast -R -w",
-						   qbin, PostPortNumber, quser, qdir);
+			cmd = psprintf("%s -h localhost -p %d -U %s -D %s -X stream -c fast%s -R -w",
+						   qbin, PostPortNumber, quser, qdir,
+						   encrypt_wal ? " -E" : "");
 			pfree(quser);
 		}
 		else
-			cmd = psprintf("%s -h localhost -p %d -D %s -X stream -c fast -R -w",
-						   qbin, PostPortNumber, qdir);
+			cmd = psprintf("%s -h localhost -p %d -D %s -X stream -c fast%s -R -w",
+						   qbin, PostPortNumber, qdir,
+						   encrypt_wal ? " -E" : "");
 
 		ereport(LOG,
 				(errmsg("dbblue create standby: creating standby in \"%s\" from primary on port %d",
@@ -512,6 +707,14 @@ run_standby_tick(void)
 
 		if (!ok)
 		{
+			/*
+			 * pg_basebackup removes what it wrote, but a crash or kill can
+			 * leave a partial copy, and the seeded pg_tde must not survive
+			 * either way.  The directory was empty, or held only our seed,
+			 * when we started, so clearing its contents loses nothing.
+			 */
+			if (stat(dir, &st) == 0)
+				rmtree(dir, false);
 			pfree(logfile);
 			pfree(dir);
 			return false;
