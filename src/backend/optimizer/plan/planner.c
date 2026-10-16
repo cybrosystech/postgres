@@ -284,6 +284,7 @@ static Path *make_ordered_path(PlannerInfo *root,
 							   double limit_tuples);
 static void gather_grouping_paths(PlannerInfo *root, RelOptInfo *rel);
 static void add_repartition_agg_path(PlannerInfo *root,
+									 RelOptInfo *input_rel,
 									 RelOptInfo *grouped_rel,
 									 RelOptInfo *partially_grouped_rel,
 									 grouping_sets_data *gd,
@@ -7616,8 +7617,8 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 		if (dbblue_enable_repartition_agg &&
 			partially_grouped_rel != NULL &&
 			partially_grouped_rel->partial_pathlist != NIL)
-			add_repartition_agg_path(root, grouped_rel, partially_grouped_rel,
-									 gd, extra);
+			add_repartition_agg_path(root, input_rel, grouped_rel,
+									 partially_grouped_rel, gd, extra);
 	}
 
 	/*
@@ -7650,7 +7651,8 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
  *						 -> Parallel Seq Scan ...
  */
 static void
-add_repartition_agg_path(PlannerInfo *root, RelOptInfo *grouped_rel,
+add_repartition_agg_path(PlannerInfo *root, RelOptInfo *input_rel,
+						 RelOptInfo *grouped_rel,
 						 RelOptInfo *partially_grouped_rel,
 						 grouping_sets_data *gd, GroupPathExtraData *extra)
 {
@@ -7665,8 +7667,21 @@ add_repartition_agg_path(PlannerInfo *root, RelOptInfo *grouped_rel,
 		!(extra->flags & GROUPING_CAN_USE_HASH) ||
 		!parse->hasAggs ||
 		parse->groupingSets ||
-		root->processed_groupClause == NIL ||
-		extra->patype != PARTITIONWISE_AGGREGATE_NONE)
+		root->processed_groupClause == NIL)
+		return;
+
+	/*
+	 * Stay out of the way of partitionwise aggregation.  Do not look at
+	 * extra->patype alone for that: when enable_partitionwise_aggregate is
+	 * on, create_grouping_paths() sets it to FULL for every query, whether or
+	 * not input_rel is partitioned, and create_ordinary_grouping_paths() then
+	 * decides for itself whether partitionwise aggregation is really
+	 * possible.  Make the same test here.  Also skip grouped rels of
+	 * individual partitions, which inherit patype from their parent.
+	 */
+	if (IS_OTHER_REL(grouped_rel) ||
+		(extra->patype != PARTITIONWISE_AGGREGATE_NONE &&
+		 IS_PARTITIONED_REL(input_rel)))
 		return;
 
 	/* the cheapest partial path of the partially grouped rel */
