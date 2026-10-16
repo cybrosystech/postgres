@@ -748,6 +748,16 @@ auto_tune_compute(int max_connections)
 	s.min_wal_size_mb = s.max_wal_size_mb / 4;
 
 	/*
+	 * Cap the WAL a replication slot may hold back.  The default of -1 lets a
+	 * slot whose standby never returns (dbblue_create_standby's, or any other)
+	 * retain WAL until the disk fills and the primary stops.  Two
+	 * max_wal_size cycles of headroom still lets a standby that was down
+	 * across a couple of checkpoints catch up; beyond that the slot is
+	 * invalidated and the standby must be rebuilt, but the primary survives.
+	 */
+	s.max_slot_wal_keep_size_mb = s.max_wal_size_mb * 2;
+
+	/*
 	 * Odoo joins many tables (res_partner, res_users, account_move_line, ...)
 	 * with selective filters where better histograms pay off.  Bump from
 	 * the upstream default of 100.
