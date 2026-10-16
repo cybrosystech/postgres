@@ -10,7 +10,8 @@
  *      "<DataDir>_standby") does not exist yet, it is created with
  *      pg_basebackup -R against the local primary.
  *   2. A free TCP port is picked by probing PostPortNumber+1, +2, ...
- *      and appended to the standby's postgresql.auto.conf.
+ *      and written, along with the primary's unix_socket_directories,
+ *      to the standby's postgresql.auto.conf.
  *   3. The standby is started with pg_ctl, and the chosen port is
  *      reported in the server log and written to
  *      <DataDir>/dbblue_standby.port so tooling (e.g. an odoo.conf
@@ -416,34 +417,123 @@ find_free_port(void)
 }
 
 /*
- * append_standby_port
- *		Append a port setting to the standby's postgresql.auto.conf, the
- *		same file pg_basebackup -R appends primary_conninfo to.  Duplicate
- *		entries are harmless: the last one in the file wins.
+ * conf_line_sets
+ *		Does this postgresql.auto.conf line assign the named parameter?
  */
 static bool
-append_standby_port(const char *dir, int port)
+conf_line_sets(const char *line, const char *name)
+{
+	size_t		len = strlen(name);
+
+	while (*line == ' ' || *line == '\t')
+		line++;
+	if (pg_strncasecmp(line, name, len) != 0)
+		return false;
+	line += len;
+	while (*line == ' ' || *line == '\t')
+		line++;
+	return *line == '=';
+}
+
+/*
+ * write_standby_settings
+ *		Set port and unix_socket_directories in the standby's
+ *		postgresql.auto.conf, the same file pg_basebackup -R appends
+ *		primary_conninfo to.
+ *
+ * unix_socket_directories is copied from the primary's live value: the
+ * primary may have got it from the command line (pg_ctl -o "-k /tmp"),
+ * which pg_basebackup cannot copy, and the compiled-in default directory
+ * is often not writable by the user the cluster runs as.
+ *
+ * Earlier assignments of either parameter are dropped, so retries and
+ * restarts do not keep growing the file.
+ */
+static bool
+write_standby_settings(const char *dir, int port)
 {
 	char		path[MAXPGPATH];
+	char		tmppath[MAXPGPATH];
+	StringInfoData buf;
 	FILE	   *fp;
+	char		line[1024];
+	const char *s;
 
 	snprintf(path, sizeof(path), "%s/postgresql.auto.conf", dir);
-	fp = fopen(path, "a");
-	if (fp == NULL)
+	snprintf(tmppath, sizeof(tmppath), "%s.tmp", path);
+
+	initStringInfo(&buf);
+
+	fp = fopen(path, "r");
+	if (fp == NULL && errno != ENOENT)
 	{
 		ereport(WARNING,
 				(errcode_for_file_access(),
 				 errmsg("dbblue create standby: could not open \"%s\": %m",
 						path)));
+		pfree(buf.data);
 		return false;
 	}
-	fprintf(fp, "port = %d\n", port);
-	if (fclose(fp) != 0)
+	if (fp != NULL)
+	{
+		bool		skipping = false;
+
+		while (fgets(line, sizeof(line), fp) != NULL)
+		{
+			/* the tail of an over-long line follows its head's fate */
+			if (!skipping)
+				skipping = conf_line_sets(line, "port") ||
+					conf_line_sets(line, "unix_socket_directories");
+			if (!skipping)
+				appendStringInfoString(&buf, line);
+			if (strchr(line, '\n') != NULL)
+				skipping = false;
+		}
+		fclose(fp);
+		if (buf.len > 0 && buf.data[buf.len - 1] != '\n')
+			appendStringInfoChar(&buf, '\n');
+	}
+
+	appendStringInfo(&buf, "port = %d\n", port);
+	appendStringInfoString(&buf, "unix_socket_directories = '");
+	for (s = Unix_socket_directories ? Unix_socket_directories : ""; *s; s++)
+	{
+		if (*s == '\'')
+			appendStringInfoChar(&buf, '\'');
+		appendStringInfoChar(&buf, *s);
+	}
+	appendStringInfoString(&buf, "'\n");
+
+	fp = fopen(tmppath, "w");
+	if (fp == NULL)
+	{
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("dbblue create standby: could not create \"%s\": %m",
+						tmppath)));
+		pfree(buf.data);
+		return false;
+	}
+	if (fwrite(buf.data, 1, buf.len, fp) != (size_t) buf.len ||
+		fclose(fp) != 0)
 	{
 		ereport(WARNING,
 				(errcode_for_file_access(),
 				 errmsg("dbblue create standby: could not write \"%s\": %m",
-						path)));
+						tmppath)));
+		unlink(tmppath);
+		pfree(buf.data);
+		return false;
+	}
+	pfree(buf.data);
+
+	if (rename(tmppath, path) != 0)
+	{
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("dbblue create standby: could not rename \"%s\" to \"%s\": %m",
+						tmppath, path)));
+		unlink(tmppath);
 		return false;
 	}
 	return true;
@@ -737,7 +827,7 @@ run_standby_tick(void)
 		return false;
 	}
 
-	if (!append_standby_port(dir, port))
+	if (!write_standby_settings(dir, port))
 	{
 		pfree(logfile);
 		pfree(dir);
