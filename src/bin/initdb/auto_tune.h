@@ -52,6 +52,7 @@ typedef struct AutoTuneSettings
 	double		checkpoint_completion_target;
 	int			min_wal_size_mb;
 	int			max_wal_size_mb;
+	int			max_slot_wal_keep_size_mb;
 
 	/* Statistics */
 	int			default_statistics_target;

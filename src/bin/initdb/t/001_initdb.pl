@@ -343,12 +343,13 @@ command_fails(
 my $atconf = slurp_file("$datadir/postgresql.conf");
 SKIP:
 {
-	skip "auto-tune inactive on this host (upstream defaults written)", 4
+	skip "auto-tune inactive on this host (upstream defaults written)", 5
 	  unless $atconf =~ /^max_worker_processes = (\d+)/m;
 	my $mwp = $1;
 	my ($mpw) = $atconf =~ /^max_parallel_workers = (\d+)/m;
 	my ($maxwal) = $atconf =~ /^max_wal_size = (\d+)MB/m;
 	my ($minwal) = $atconf =~ /^min_wal_size = (\d+)MB/m;
+	my ($slotcap) = $atconf =~ /^max_slot_wal_keep_size = (\d+)MB/m;
 
 	# The background-worker pool must sit above the parallel-query budget, so
 	# the always-on launchers cannot starve parallel query of its slots.
@@ -361,6 +362,11 @@ SKIP:
 	cmp_ok($maxwal, '<=', 8192, 'auto-tune: max_wal_size is at most 8 GB');
 	is($minwal, int($maxwal / 4),
 		'auto-tune: min_wal_size is a quarter of max_wal_size');
+
+	# A replication slot whose standby never returns must not be able to hold
+	# back WAL until the disk fills.
+	is($slotcap, $maxwal * 2,
+		'auto-tune: max_slot_wal_keep_size caps slots at twice max_wal_size');
 }
 
 done_testing();

@@ -1620,6 +1620,9 @@ setup_config(void)
 		snprintf(repltok, sizeof(repltok), "%dMB", t->max_wal_size_mb);
 		conflines = replace_guc_value(conflines, "max_wal_size",
 									  repltok, false);
+		snprintf(repltok, sizeof(repltok), "%dMB", t->max_slot_wal_keep_size_mb);
+		conflines = replace_guc_value(conflines, "max_slot_wal_keep_size",
+									  repltok, false);
 
 		snprintf(repltok, sizeof(repltok), "%d", t->default_statistics_target);
 		conflines = replace_guc_value(conflines, "default_statistics_target",
