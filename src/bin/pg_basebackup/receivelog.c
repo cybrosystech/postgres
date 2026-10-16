@@ -1184,6 +1184,15 @@ ProcessWALDataMsg(PGconn *conn, StreamCtl *stream, char *copybuf, int len,
 
 			xlogoff = 0;
 
+			/*
+			 * The rest of this message, if any, belongs to the next segment.
+			 * segno feeds the encryption position used by stream->encrypt
+			 * above, so it must advance with xlogoff; otherwise that part
+			 * would be encrypted as if it sat at the start of the segment
+			 * just closed, and could never be decrypted on restore.
+			 */
+			XLByteToSeg(*blockpos, segno, WalSegSz);
+
 			if (still_sending && stream->stream_stop(*blockpos, stream->timeline, true))
 			{
 				if (PQputCopyEnd(conn, NULL) <= 0 || PQflush(conn))
