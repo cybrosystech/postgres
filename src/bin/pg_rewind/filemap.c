@@ -788,17 +788,19 @@ decide_file_action(file_entry_t *entry, XLogSegNo last_common_segno)
 		return FILE_ACTION_NONE;
 
 	/*
-	 * Skip the keyring as well.  Upstream keeps it outside PGDATA and so never
-	 * meets it here, but dbblue's initdb defaults it to PGDATA/pg_tde_keys --
-	 * where pg_rewind would happily sync it.  That is fatal rather than merely
-	 * wasteful: the key provider stores an absolute path, which for a cluster
-	 * pair still points at the target's own keyring, and open_target_file()
-	 * truncates a file before its contents are fetched.  We would destroy the
-	 * principal key we are in the middle of decrypting with.
+	 * Skip the keyring as well.  dbblue's initdb now puts it beside PGDATA
+	 * ("<PGDATA>_tde_keys"), where we never meet it, but clusters initialized
+	 * earlier have it at PGDATA/pg_tde_keys -- where pg_rewind would happily
+	 * sync it.  That is fatal rather than merely wasteful: the key provider
+	 * stores an absolute path, which the target may itself be using (for a
+	 * pair built by pg_basebackup, both clusters' providers name the
+	 * original primary's keyring), and open_target_file() truncates a file
+	 * before its contents are fetched.  We would destroy the principal key we
+	 * are in the middle of decrypting with.
 	 *
-	 * Leaving the target's keyring alone is also correct: it holds the same
-	 * principal key the source's catalog is wrapped with, having been copied
-	 * by pg_basebackup when the pair was built.
+	 * Leaving the target's copy alone loses nothing: the key the clusters
+	 * actually use is in whichever keyring their provider names, not in a
+	 * copy that happens to sit in PGDATA.
 	 */
 	if (strncmp(path, PG_TDE_KEYRING_DIR "/", sizeof(PG_TDE_KEYRING_DIR)) == 0)
 		return FILE_ACTION_NONE;
