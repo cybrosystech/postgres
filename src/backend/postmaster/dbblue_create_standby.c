@@ -8,7 +8,8 @@
  *
  *   1. If the standby data directory (dbblue_standby_directory, default
  *      "<DataDir>_standby") does not exist yet, it is created with
- *      pg_basebackup -R against the local primary.
+ *      pg_basebackup -R against the local primary, together with the
+ *      physical replication slot "dbblue_standby" it streams through.
  *   2. A free TCP port is picked by probing PostPortNumber+1, +2, ...
  *      and written, along with the primary's unix_socket_directories,
  *      to the standby's postgresql.auto.conf.
@@ -52,6 +53,7 @@
 #include "postmaster/dbblue_create_standby.h"
 #include "postmaster/interrupt.h"
 #include "postmaster/postmaster.h"
+#include "replication/slot.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "utils/guc.h"
@@ -79,6 +81,21 @@ char	   *dbblue_standby_user = NULL;
 #define DBBLUE_TDE_DIR				"pg_tde"
 #define DBBLUE_TDE_WAL_KEYS			"wal_keys"
 #define DBBLUE_TDE_GLOBAL_PROVIDERS	"1664_providers"
+
+/*
+ * Physical replication slot the managed standby streams through, so that we
+ * never recycle WAL it has not received yet.  pg_basebackup -C creates it and
+ * -R writes it into the standby's primary_slot_name.  How much WAL it may hold
+ * back is capped by max_slot_wal_keep_size, which initdb's auto-tune sets.
+ */
+#define DBBLUE_STANDBY_SLOT			"dbblue_standby"
+
+typedef enum
+{
+	STANDBY_SLOT_ABSENT,
+	STANDBY_SLOT_IDLE,
+	STANDBY_SLOT_ACTIVE,
+} StandbySlotState;
 
 static int	consecutive_failures = 0;
 
@@ -614,6 +631,110 @@ run_shell(const char *cmd, const char *logfile, const char *what)
 }
 
 /*
+ * replication_conn_opts
+ *		Connection options for the client programs we run against ourselves
+ *		(pg_basebackup, pg_receivewal).  An empty dbblue_standby_user means
+ *		"connect as the OS user", which works out of the box with initdb's
+ *		default replication pg_hba entries.  Result is palloc'd.
+ */
+static char *
+replication_conn_opts(void)
+{
+	char	   *quser;
+	char	   *opts;
+
+	if (dbblue_standby_user == NULL || dbblue_standby_user[0] == '\0')
+		return psprintf("-h localhost -p %d", PostPortNumber);
+
+	quser = shell_quote(dbblue_standby_user);
+	opts = psprintf("-h localhost -p %d -U %s", PostPortNumber, quser);
+	pfree(quser);
+	return opts;
+}
+
+/*
+ * standby_slot_state
+ *		Does our replication slot exist, and is a process streaming from it?
+ */
+static StandbySlotState
+standby_slot_state(void)
+{
+	ReplicationSlot *slot;
+	StandbySlotState state = STANDBY_SLOT_ABSENT;
+
+	LWLockAcquire(ReplicationSlotControlLock, LW_SHARED);
+	slot = SearchNamedReplicationSlot(DBBLUE_STANDBY_SLOT, false);
+	if (slot != NULL)
+	{
+		SpinLockAcquire(&slot->mutex);
+		state = (slot->active_proc != INVALID_PROC_NUMBER) ?
+			STANDBY_SLOT_ACTIVE : STANDBY_SLOT_IDLE;
+		SpinLockRelease(&slot->mutex);
+	}
+	LWLockRelease(ReplicationSlotControlLock);
+
+	return state;
+}
+
+/*
+ * drop_standby_slot
+ *		Drop our replication slot if it exists.  Returns true if, afterwards,
+ *		there is no such slot.
+ *
+ * This is only called when we are about to build a standby from scratch, or
+ * have just failed to, so an existing slot belongs to a standby that is gone:
+ * its folder was removed, or an earlier attempt failed after pg_basebackup -C
+ * had created the slot.  Left in place it would hold back WAL for nobody,
+ * and it would make the next pg_basebackup -C fail with "already exists".
+ *
+ * A slot something is still streaming from is not ours to drop -- most
+ * likely a standby still running although its folder was deleted under it,
+ * or another standby configured with the same slot name.  Refuse, and let
+ * the operator sort it out.
+ */
+static bool
+drop_standby_slot(const char *logfile)
+{
+	char		binpath[MAXPGPATH];
+	char	   *qbin;
+	char	   *connopts;
+	char	   *cmd;
+	bool		ok;
+
+	switch (standby_slot_state())
+	{
+		case STANDBY_SLOT_ABSENT:
+			return true;
+		case STANDBY_SLOT_ACTIVE:
+			ereport(WARNING,
+					(errmsg("dbblue create standby: replication slot \"%s\" is in use by another process",
+							DBBLUE_STANDBY_SLOT),
+					 errhint("Stop whatever is streaming from it, or drop it with pg_drop_replication_slot('%s').",
+							 DBBLUE_STANDBY_SLOT)));
+			return false;
+		case STANDBY_SLOT_IDLE:
+			break;
+	}	
+
+	ereport(LOG,
+			(errmsg("dbblue create standby: dropping stale replication slot \"%s\"",
+					DBBLUE_STANDBY_SLOT)));
+
+	resolve_bin_path("pg_receivewal", binpath, sizeof(binpath));
+	qbin = shell_quote(binpath);
+	connopts = replication_conn_opts();
+	cmd = psprintf("%s %s --drop-slot -S %s -w",
+				   qbin, connopts, DBBLUE_STANDBY_SLOT);
+
+	ok = run_shell(cmd, logfile, "pg_receivewal --drop-slot");
+
+	pfree(cmd);
+	pfree(connopts);
+	pfree(qbin);
+	return ok;
+}
+
+/*
  * verify_port_still_free
  *		Double-check that a port is still available to bind after discovery.
  *		Returns true if the port is free, false otherwise.
@@ -666,6 +787,7 @@ run_standby_tick(void)
 	int			port;
 	bool		ok;
 	bool		encrypt_wal;
+	char	   *connopts;
 
 	dir = resolve_standby_directory();
 	if (dir == NULL)
@@ -751,6 +873,18 @@ run_standby_tick(void)
 		 * once we have recycled it.  -E re-encrypts that WAL with a fresh
 		 * key and writes a matching wal_keys, but needs pg_tde seeded first.
 		 */
+		/*
+		 * A fresh standby gets a fresh slot.  Any slot of that name left
+		 * behind belongs to a standby that no longer exists; see
+		 * drop_standby_slot().
+		 */
+		if (!drop_standby_slot(logfile))
+		{
+			pfree(logfile);
+			pfree(dir);
+			return false;
+		}
+
 		encrypt_wal = primary_uses_wal_encryption();
 		if (encrypt_wal && !seed_standby_tde_dir(dir))
 		{
@@ -763,28 +897,26 @@ run_standby_tick(void)
 		resolve_bin_path("pg_basebackup", binpath, sizeof(binpath));
 		qbin = shell_quote(binpath);
 		qdir = shell_quote(dir);
+		connopts = replication_conn_opts();
 
 		/*
-		 * -R writes standby.signal and primary_conninfo; -X stream keeps up
-		 * with WAL during the copy; -c fast avoids waiting for a checkpoint;
-		 * -w forbids password prompts (there is no terminal to prompt on);
-		 * -E encrypts the streamed WAL, see above.  An empty
-		 * dbblue_standby_user means "connect as the OS user", which works
-		 * out of the box with initdb's default replication pg_hba entries.
+		 * -R writes standby.signal and primary_conninfo, and with -S also
+		 * primary_slot_name; -X stream keeps up with WAL during the copy;
+		 * -c fast avoids waiting for a checkpoint; -w forbids password
+		 * prompts (there is no terminal to prompt on); -E encrypts the
+		 * streamed WAL, see above.
+		 *
+		 * -C -S creates the replication slot before the copy starts and
+		 * streams the copy-window WAL through it.  From then on we keep every
+		 * WAL file the standby has not received, so one that was down across
+		 * a checkpoint can still catch up instead of looping forever on
+		 * "requested WAL segment has already been removed".
 		 */
-		if (dbblue_standby_user != NULL && dbblue_standby_user[0] != '\0')
-		{
-			char	   *quser = shell_quote(dbblue_standby_user);
-
-			cmd = psprintf("%s -h localhost -p %d -U %s -D %s -X stream -c fast%s -R -w",
-						   qbin, PostPortNumber, quser, qdir,
-						   encrypt_wal ? " -E" : "");
-			pfree(quser);
-		}
-		else
-			cmd = psprintf("%s -h localhost -p %d -D %s -X stream -c fast%s -R -w",
-						   qbin, PostPortNumber, qdir,
-						   encrypt_wal ? " -E" : "");
+		cmd = psprintf("%s %s -D %s -X stream -c fast%s -C -S %s -R -w",
+					   qbin, connopts, qdir,
+					   encrypt_wal ? " -E" : "",
+					   DBBLUE_STANDBY_SLOT);
+		pfree(connopts);
 
 		ereport(LOG,
 				(errmsg("dbblue create standby: creating standby in \"%s\" from primary on port %d",
@@ -805,6 +937,13 @@ run_standby_tick(void)
 			 */
 			if (stat(dir, &st) == 0)
 				rmtree(dir, false);
+
+			/*
+			 * -C creates the slot before the copy starts, so a failure after
+			 * that point leaves it behind, holding WAL for a standby that
+			 * does not exist.
+			 */
+			(void) drop_standby_slot(logfile);
 			pfree(logfile);
 			pfree(dir);
 			return false;
