@@ -85,9 +85,6 @@
 
 #include "auto_tune.h"
 
-/* for PG_TDE_KEYRING_DIR only; initdb does not link libpgtde */
-#include "pg_tde.h"
-
 
 /* Ideally this would be in a .h file, but it hardly seems worth the trouble */
 extern const char *select_default_timezone(const char *share_path);
@@ -184,13 +181,21 @@ static bool sync_data_files = true;
  * any data is loaded, which is easy to forget and impossible to retrofit
  * cleanly onto tables that were already written unencrypted.
  *
- * The keyring lands inside PGDATA unless --tde-keyring-dir says otherwise.
- * That always works and keeps clusters on the same host from sharing one
- * keyring, but it does put the principal key next to the data it protects;
- * production installs should point this at separate storage.
+ * Unless --tde-keyring-dir says otherwise, the keyring lands in a sibling of
+ * PGDATA named after it ("<PGDATA>_tde_keys"), not inside PGDATA.  Inside, it
+ * would be copied by every pg_basebackup, putting the principal key next to
+ * the data it protects, and a standby built from this cluster -- whose key
+ * provider records the same absolute path -- would lose its key along with
+ * this data directory.  Naming it after PGDATA keeps clusters that share a
+ * parent directory from colliding on one keyring.  Production installs
+ * should still point this at separate storage.
  */
 static char *tde_keyring_dir = NULL;
 static char *tde_keyring_file = NULL;
+static bool made_new_tde_keyring_dir = false;
+static bool found_existing_tde_keyring_dir = false;
+
+#define TDE_KEYRING_DIR_SUFFIX	"_tde_keys"
 
 #define TDE_PROVIDER_NAME	"global_file_provider"
 #define TDE_KEY_NAME		"odoo_default_key"
@@ -816,6 +821,28 @@ cleanup_directories_atexit(void)
 
 	if (!noclean)
 	{
+		/*
+		 * The keyring normally lives outside PGDATA, so removing the data
+		 * directory does not take it along; left behind, it would make the
+		 * next initdb refuse to run.  If the directory was already there,
+		 * remove only the keyring file: we checked it did not exist before
+		 * we started, so it is ours, but anything else in there is not.
+		 */
+		if (made_new_tde_keyring_dir)
+		{
+			pg_log_info("removing TDE keyring directory \"%s\"", tde_keyring_dir);
+			if (!rmtree(tde_keyring_dir, true))
+				pg_log_error("failed to remove TDE keyring directory");
+		}
+		else if (found_existing_tde_keyring_dir)
+		{
+			if (unlink(tde_keyring_file) == 0)
+				pg_log_info("removed TDE keyring file \"%s\"", tde_keyring_file);
+			else if (errno != ENOENT)
+				pg_log_error("failed to remove TDE keyring file \"%s\": %m",
+							 tde_keyring_file);
+		}
+
 		if (made_new_pgdata)
 		{
 			pg_log_info("removing data directory \"%s\"", pg_data);
@@ -853,6 +880,10 @@ cleanup_directories_atexit(void)
 		if (made_new_xlogdir || found_existing_xlogdir)
 			pg_log_info("WAL directory \"%s\" not removed at user's request",
 						xlog_dir);
+
+		if (made_new_tde_keyring_dir || found_existing_tde_keyring_dir)
+			pg_log_info("TDE keyring directory \"%s\" not removed at user's request",
+						tde_keyring_dir);
 	}
 }
 
@@ -2849,7 +2880,7 @@ usage(const char *progname)
 	printf(_("      --sync-method=METHOD  set method for syncing files to disk\n"));
 	printf(_("  -S, --sync-only           only sync database files to disk, then exit\n"));
 	printf(_("      --tde-keyring-dir=DIR  where pg_tde keeps the principal key\n"
-			 "                            (default: PGDATA/pg_tde_keys)\n"));
+			 "                            (default: PGDATA_tde_keys, next to PGDATA)\n"));
 	printf(_("\nOther options:\n"));
 	printf(_("  -V, --version             output version information, then exit\n"));
 	printf(_("  -?, --help                show this help, then exit\n"));
@@ -3358,6 +3389,9 @@ initialize_data_directory(void)
 	if (tde_keyring_dir == NULL)
 	{
 		/*
+		 * Default to "<PGDATA>_tde_keys", beside PGDATA; see the comment at
+		 * tde_keyring_dir for why not inside it.
+		 *
 		 * Anchor the default against the current directory when -D was given
 		 * as a relative path.  canonicalize_path() tidies pg_data but does not
 		 * make it absolute, and the path we derive here is stored in pg_tde's
@@ -3366,7 +3400,7 @@ initialize_data_directory(void)
 		 * place and the cluster cannot find its own keyring.
 		 */
 		if (is_absolute_path(pg_data))
-			tde_keyring_dir = psprintf("%s/%s", pg_data, PG_TDE_KEYRING_DIR);
+			tde_keyring_dir = psprintf("%s%s", pg_data, TDE_KEYRING_DIR_SUFFIX);
 		else
 		{
 			char		cwd[MAXPGPATH];
@@ -3374,7 +3408,7 @@ initialize_data_directory(void)
 			if (getcwd(cwd, sizeof(cwd)) == NULL)
 				pg_fatal("could not determine current directory: %m");
 
-			tde_keyring_dir = psprintf("%s/%s/%s", cwd, pg_data, PG_TDE_KEYRING_DIR);
+			tde_keyring_dir = psprintf("%s/%s%s", cwd, pg_data, TDE_KEYRING_DIR_SUFFIX);
 			canonicalize_path(tde_keyring_dir);
 		}
 	}
@@ -3429,12 +3463,23 @@ initialize_data_directory(void)
 	 * Create the directory pg_tde will keep the principal key in, so that
 	 * setup_pg_tde() can point a file key provider at it later.  The path was
 	 * settled and validated at the top of this function; parents may still be
-	 * missing when --tde-keyring-dir points outside PGDATA, so create the
-	 * whole path, and reassert the mode because pg_mkdir_p leaves an existing
-	 * directory's permissions alone.
+	 * missing when --tde-keyring-dir points elsewhere, so create the whole
+	 * path, and reassert the mode because pg_mkdir_p leaves an existing
+	 * directory's permissions alone.  Remember whether it was already there,
+	 * so that cleanup on failure knows how much of it is ours to remove.
 	 */
-	if (pg_mkdir_p(tde_keyring_dir, pg_dir_create_mode) != 0)
-		pg_fatal("could not create directory \"%s\": %m", tde_keyring_dir);
+	{
+		struct stat st;
+		bool		keyring_dir_existed = (stat(tde_keyring_dir, &st) == 0);
+
+		if (pg_mkdir_p(tde_keyring_dir, pg_dir_create_mode) != 0)
+			pg_fatal("could not create directory \"%s\": %m", tde_keyring_dir);
+
+		if (keyring_dir_existed)
+			found_existing_tde_keyring_dir = true;
+		else
+			made_new_tde_keyring_dir = true;
+	}
 
 	if (chmod(tde_keyring_dir, pg_dir_create_mode) != 0)
 		pg_fatal("could not change permissions of \"%s\": %m", tde_keyring_dir);
@@ -3927,6 +3972,12 @@ main(int argc, char *argv[])
 			   start_db_cmd->data);
 
 		destroyPQExpBuffer(start_db_cmd);
+
+		printf(_("The pg_tde principal key is stored in\n"
+				 "    %s\n"
+				 "Back it up separately from the data: without it this cluster, and any\n"
+				 "standby or backup made from it, cannot be decrypted.\n\n"),
+			   tde_keyring_file);
 	}
 
 
