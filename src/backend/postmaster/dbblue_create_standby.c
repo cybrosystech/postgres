@@ -11,8 +11,9 @@
  *      pg_basebackup -R against the local primary, together with the
  *      physical replication slot "dbblue_standby" it streams through.
  *   2. A free TCP port is picked by probing PostPortNumber+1, +2, ...
- *      and written, along with the primary's unix_socket_directories,
- *      to the standby's postgresql.auto.conf.
+ *      and written, along with the primary's unix_socket_directories
+ *      and dbblue_create_standby = off, to the standby's
+ *      postgresql.auto.conf.
  *   3. The standby is started with pg_ctl, and the chosen port is
  *      reported in the server log and written to
  *      <DataDir>/dbblue_standby.port so tooling (e.g. an odoo.conf
@@ -23,9 +24,10 @@
  * running when the primary shuts down — it remains usable for read-only
  * traffic and simply resumes streaming when the primary returns.
  *
- * The worker never runs on a cluster that is itself in recovery, which
- * stops the freshly created standby (whose copied configuration also has
- * dbblue_create_standby=on) from recursively spawning standbys of its own.
+ * The standby must not spawn standbys of its own, neither while it is one
+ * nor once promoted, so its copy of dbblue_create_standby is turned off.
+ * The worker also never runs on a cluster that is itself in recovery, which
+ * covers standbys built by other means that still carry the setting.
  *
  * Portions Copyright (c) 2026, dbblue / Cybrosys Technologies.
  *
@@ -453,32 +455,68 @@ conf_line_sets(const char *line, const char *name)
 }
 
 /*
+ * next_conf_line
+ *		Return the start of the line after the one at line, or the end of the
+ *		string if line is the last one.
+ */
+static const char *
+next_conf_line(const char *line)
+{
+	const char *nl = strchr(line, '\n');
+
+	return nl ? nl + 1 : line + strlen(line);
+}
+
+/*
  * write_standby_settings
- *		Set port and unix_socket_directories in the standby's
- *		postgresql.auto.conf, the same file pg_basebackup -R appends
- *		primary_conninfo to.
+ *		Rewrite the standby's postgresql.auto.conf -- our own copy, which
+ *		pg_basebackup -R then appended primary_conninfo and primary_slot_name
+ *		to -- so that it runs as our standby rather than as a second us.
  *
- * unix_socket_directories is copied from the primary's live value: the
- * primary may have got it from the command line (pg_ctl -o "-k /tmp"),
- * which pg_basebackup cannot copy, and the compiled-in default directory
- * is often not writable by the user the cluster runs as.
+ * port and unix_socket_directories are set for the standby.  The latter is
+ * copied from the primary's live value: the primary may have got it from the
+ * command line (pg_ctl -o "-k /tmp"), which pg_basebackup cannot copy, and
+ * the compiled-in default directory is often not writable by the user the
+ * cluster runs as.
  *
- * Earlier assignments of either parameter are dropped, so retries and
- * restarts do not keep growing the file.
+ * dbblue_create_standby is turned off.  The copied value is ours, on, and
+ * the standby only ignores it while in recovery: promoted, it would at once
+ * build a standby of its own, and that one another after its own promotion.
+ * Whether a promoted standby should get a replica is for the operator to
+ * decide, with ALTER SYSTEM.
+ *
+ * Only the last primary_conninfo and primary_slot_name are kept, which are
+ * the ones -R just appended.  Any earlier ones came with the copy -- we were
+ * a standby once ourselves, and promoted -- and point at our old primary.
+ * They are harmless, since the last assignment wins, but would otherwise
+ * pile up one more pair with every link of a chain of promotions.
+ *
+ * Everything else is kept.  The standby needs settings such as
+ * pg_tde.wal_encrypt and default_table_access_method to stay encrypted, and
+ * max_connections and friends at least as high as ours to start at all.
+ *
+ * This runs before every start, not just after the build, so it drops
+ * earlier assignments of what it sets instead of adding to them.
  */
 static bool
 write_standby_settings(const char *dir, int port)
 {
 	char		path[MAXPGPATH];
 	char		tmppath[MAXPGPATH];
+	StringInfoData old;
 	StringInfoData buf;
 	FILE	   *fp;
-	char		line[1024];
+	char		chunk[1024];
+	size_t		nread;
+	const char *line;
+	const char *last_conninfo = NULL;
+	const char *last_slot_name = NULL;
 	const char *s;
 
 	snprintf(path, sizeof(path), "%s/postgresql.auto.conf", dir);
 	snprintf(tmppath, sizeof(tmppath), "%s.tmp", path);
 
+	initStringInfo(&old);
 	initStringInfo(&buf);
 
 	fp = fopen(path, "r");
@@ -488,28 +526,58 @@ write_standby_settings(const char *dir, int port)
 				(errcode_for_file_access(),
 				 errmsg("dbblue create standby: could not open \"%s\": %m",
 						path)));
+		pfree(old.data);
 		pfree(buf.data);
 		return false;
 	}
 	if (fp != NULL)
 	{
-		bool		skipping = false;
-
-		while (fgets(line, sizeof(line), fp) != NULL)
+		while ((nread = fread(chunk, 1, sizeof(chunk), fp)) > 0)
+			appendBinaryStringInfo(&old, chunk, nread);
+		if (ferror(fp))
 		{
-			/* the tail of an over-long line follows its head's fate */
-			if (!skipping)
-				skipping = conf_line_sets(line, "port") ||
-					conf_line_sets(line, "unix_socket_directories");
-			if (!skipping)
-				appendStringInfoString(&buf, line);
-			if (strchr(line, '\n') != NULL)
-				skipping = false;
+			ereport(WARNING,
+					(errcode_for_file_access(),
+					 errmsg("dbblue create standby: could not read \"%s\": %m",
+							path)));
+			fclose(fp);
+			pfree(old.data);
+			pfree(buf.data);
+			return false;
 		}
 		fclose(fp);
-		if (buf.len > 0 && buf.data[buf.len - 1] != '\n')
-			appendStringInfoChar(&buf, '\n');
 	}
+
+	for (line = old.data; *line; line = next_conf_line(line))
+	{
+		if (conf_line_sets(line, "primary_conninfo"))
+			last_conninfo = line;
+		else if (conf_line_sets(line, "primary_slot_name"))
+			last_slot_name = line;
+	}
+
+	for (line = old.data; *line; line = next_conf_line(line))
+	{
+		bool		keep;
+
+		if (conf_line_sets(line, "port") ||
+			conf_line_sets(line, "unix_socket_directories") ||
+			conf_line_sets(line, "dbblue_create_standby"))
+			keep = false;
+		else if (conf_line_sets(line, "primary_conninfo"))
+			keep = (line == last_conninfo);
+		else if (conf_line_sets(line, "primary_slot_name"))
+			keep = (line == last_slot_name);
+		else
+			keep = true;
+
+		if (keep)
+			appendBinaryStringInfo(&buf, line, next_conf_line(line) - line);
+	}
+	pfree(old.data);
+
+	if (buf.len > 0 && buf.data[buf.len - 1] != '\n')
+		appendStringInfoChar(&buf, '\n');
 
 	appendStringInfo(&buf, "port = %d\n", port);
 	appendStringInfoString(&buf, "unix_socket_directories = '");
@@ -520,6 +588,7 @@ write_standby_settings(const char *dir, int port)
 		appendStringInfoChar(&buf, *s);
 	}
 	appendStringInfoString(&buf, "'\n");
+	appendStringInfoString(&buf, "dbblue_create_standby = off\n");
 
 	fp = fopen(tmppath, "w");
 	if (fp == NULL)
