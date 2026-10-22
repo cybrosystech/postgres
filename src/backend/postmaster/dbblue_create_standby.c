@@ -11,9 +11,9 @@
  *      pg_basebackup -R against the local primary, together with the
  *      physical replication slot "dbblue_standby" it streams through.
  *   2. A free TCP port is picked by probing PostPortNumber+1, +2, ...
- *      and written, along with the primary's unix_socket_directories
- *      and dbblue_create_standby = off, to the standby's
- *      postgresql.auto.conf.
+ *      and written, along with the primary's unix_socket_directories,
+ *      hot_standby_feedback = on and dbblue_create_standby = off, to the
+ *      standby's postgresql.auto.conf.
  *   3. The standby is started with pg_ctl, and the chosen port is
  *      reported in the server log and written to
  *      <DataDir>/dbblue_standby.port so tooling (e.g. an odoo.conf
@@ -607,6 +607,14 @@ next_conf_line(const char *line)
  * the compiled-in default directory is often not writable by the user the
  * cluster runs as.
  *
+ * hot_standby_feedback is turned on.  Odoo sends its read-only cursors
+ * (db_replica_host/db_replica_port) here, and reports over large tables can
+ * run long; without feedback, VACUUM on the primary removes rows they still
+ * see and they are cancelled with a recovery conflict.  The xmin it holds
+ * back is kept in our slot, which max_slot_wal_keep_size eventually
+ * invalidates if the standby dies, so a dead standby does not hold back
+ * VACUUM for good.
+ *
  * dbblue_create_standby is turned off.  The copied value is ours, on, and
  * the standby only ignores it while in recovery: promoted, it would at once
  * build a standby of its own, and that one another after its own promotion.
@@ -690,6 +698,7 @@ write_standby_settings(const char *dir, int port)
 
 		if (conf_line_sets(line, "port") ||
 			conf_line_sets(line, "unix_socket_directories") ||
+			conf_line_sets(line, "hot_standby_feedback") ||
 			conf_line_sets(line, "dbblue_create_standby"))
 			keep = false;
 		else if (conf_line_sets(line, "primary_conninfo"))
@@ -716,6 +725,7 @@ write_standby_settings(const char *dir, int port)
 		appendStringInfoChar(&buf, *s);
 	}
 	appendStringInfoString(&buf, "'\n");
+	appendStringInfoString(&buf, "hot_standby_feedback = on\n");
 	appendStringInfoString(&buf, "dbblue_create_standby = off\n");
 
 	fp = fopen(tmppath, "w");
