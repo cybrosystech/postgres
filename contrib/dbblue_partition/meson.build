@@ -19,6 +19,7 @@ install_data(
   # see the Makefile: the base script, then upgrade scripts
   'dbblue_partition--1.0.sql',
   'dbblue_partition--1.0--1.1.sql',
+  'dbblue_partition--1.1--1.2.sql',
   kwargs: contrib_data_args,
 )
 

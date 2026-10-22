@@ -25,7 +25,8 @@ data move, retention, background maintenance) is delegated to pg_partman.
 
 | Call | Purpose |
 |---|---|
-| `CALL dbblue_partition_model(model, control, interval, schema, premake, batch_interval, single_transaction, analyze)` | Convert a table. Only the first argument is required; defaults are `create_date`, `1 month`, `public`, 4 premade partitions. |
+| `CALL dbblue_partition_model(model, control, interval, schema, premake, batch_interval, single_transaction, analyze)` | Convert a table. Only the first argument is required; defaults are `create_date`, `1 year`, `public`, 4 premade partitions, one transaction. |
+| `SELECT * FROM dbblue_partition_estimate(model, ...same arguments...)` | Predict how long that exact `CALL` will take, and how long the table stays locked, before running it. Read-only; never blocks the application. |
 | `SELECT * FROM dbblue_partition_status([model])` | Progress/inspection: state, rows moved, partition count, DEFAULT-partition rows, backup state. Never throws for dropped objects. |
 | `SELECT dbblue_partition_drop_backup(model)` | Drop `<table>_old` once the conversion is complete and the backup is empty (`p_force => true` overrides). |
 | `CALL dbblue_partition_undo(model)` | Restore the original plain table while the backup still exists. Single transaction, atomic. |
@@ -67,6 +68,47 @@ reserved SQL keywords, so `SET`/`SHOW` always work.
 
 Conversion state lives in `dbblue_partition_catalog`, registered with
 `pg_extension_config_dump()` so `pg_dump` carries it.
+
+## Estimating the duration
+
+Call `dbblue_partition_estimate()` with the arguments you will pass to
+`dbblue_partition_model()`; an application can hold its screen (or run a
+progress bar) for the returned time:
+
+```sql
+SELECT estimated_seconds, estimated_seconds_high, table_locked_seconds, notes
+FROM dbblue_partition_estimate('sale.order', 'create_date', '1 year');
+```
+
+It takes about a second.  It measures this server on this table (read
+speed, one partition's DDL, the per-row cost of the exact `DELETE ...
+RETURNING` / `INSERT` statement each batch runs, the batch filter, ANALYZE,
+an FK validation join) on a sample moved into scratch tables that are
+always rolled back, then scales those measurements by the row count,
+partition count, batch count and FK-related table sizes from the catalogs.
+The table is only read, so the application is never blocked.
+
+- `estimated_seconds` — the expected duration.  Against real conversions
+  (50k–3M rows, 1–61 batches, single and batched mode) it landed within
+  ±5%; `estimated_seconds_high` (×1.25) is the figure to wait for before
+  assuming something is wrong.
+- `table_locked_seconds` — how long the table is unavailable: the whole
+  run with `p_single_transaction => true` (the default), only the
+  structural swap otherwise.
+- `breakdown` — seconds per phase plus the raw measurements.
+- `notes` — what makes it slow and how to avoid it, e.g. a control column
+  without an index, or many batches.
+
+Two things dominate on large tables.  Every batch rescans every row still
+waiting in the backup, because pg_partman compares the control column as
+text (so no index helps that scan); a coarser `p_interval` means fewer
+batches and is much faster.  And every outgoing FK is validated once per
+partition against the whole referenced table.
+
+The estimate cannot foresee load that arrives after it ran (other
+sessions, checkpoints, autovacuum, a slow standby).  A table larger than
+RAM is read from disk and runs slower than the warm sample; `notes` says
+so when that applies.
 
 ## Documented trade-offs — read before partitioning
 
