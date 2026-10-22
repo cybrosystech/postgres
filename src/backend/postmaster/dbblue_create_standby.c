@@ -20,7 +20,11 @@
  *      generator setting db_replica_port) can pick it up.
  *
  * The worker then babysits the standby: every tick it checks the standby
- * postmaster is still alive and restarts it if not.  The standby is left
+ * postmaster is still alive and restarts it if not.  It also checks the
+ * standby is still usable: if our replication slot has been invalidated,
+ * the standby can never catch up and is rebuilt; if the directory holds a
+ * promoted copy of us or a different cluster altogether, it is left alone,
+ * and neither started nor reported.  The standby is left
  * running when the primary shuts down — it remains usable for read-only
  * traffic and simply resumes streaming when the primary returns.
  *
@@ -47,6 +51,8 @@
 #include <unistd.h>
 
 #include "access/xlog.h"
+#include "access/xlog_internal.h"
+#include "catalog/pg_control.h"
 #include "lib/stringinfo.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
@@ -54,6 +60,7 @@
 #include "postmaster/bgworker.h"
 #include "postmaster/dbblue_create_standby.h"
 #include "postmaster/interrupt.h"
+#include "port/pg_crc32c.h"
 #include "postmaster/postmaster.h"
 #include "replication/slot.h"
 #include "storage/ipc.h"
@@ -97,7 +104,18 @@ typedef enum
 	STANDBY_SLOT_ABSENT,
 	STANDBY_SLOT_IDLE,
 	STANDBY_SLOT_ACTIVE,
+	STANDBY_SLOT_INVALIDATED,	/* WAL it needed is gone; see
+								 * vet_existing_standby() */
 } StandbySlotState;
+
+/* What an existing standby directory holds; see standby_identity(). */
+typedef enum
+{
+	STANDBY_OURS,				/* a standby of this cluster */
+	STANDBY_PROMOTED,			/* a copy of this cluster, since promoted */
+	STANDBY_FOREIGN,			/* a different cluster altogether */
+	STANDBY_UNREADABLE,			/* cannot tell; pg_control unreadable */
+} StandbyIdentity;
 
 static int	consecutive_failures = 0;
 
@@ -197,6 +215,116 @@ standby_has_data(const char *dir)
 
 	snprintf(path, sizeof(path), "%s/PG_VERSION", dir);
 	return (stat(path, &st) == 0 && S_ISREG(st.st_mode));
+}
+
+/*
+ * read_system_identifier
+ *		Read the system identifier from dir's pg_control.  Reports a WARNING
+ *		and returns false if that cannot be done.
+ *
+ * get_controlfile() would do, but raises an ERROR on any problem, which
+ * would cost us the worker rather than one tick.  Like its frontend flavor,
+ * retry on a bad CRC: the standby may be rewriting the file as we read it.
+ */
+static bool
+read_system_identifier(const char *dir, uint64 *sysid)
+{
+	char		path[MAXPGPATH];
+	ControlFileData control;
+	pg_crc32c	crc;
+
+	snprintf(path, sizeof(path), "%s/%s", dir, XLOG_CONTROL_FILE);
+
+	for (int attempt = 0; attempt < 10; attempt++)
+	{
+		int			fd;
+		ssize_t		nread;
+
+		fd = open(path, O_RDONLY | PG_BINARY, 0);
+		if (fd < 0)
+		{
+			ereport(WARNING,
+					(errcode_for_file_access(),
+					 errmsg("dbblue create standby: could not open \"%s\": %m",
+							path)));
+			return false;
+		}
+		nread = read(fd, &control, sizeof(control));
+		close(fd);
+		if (nread != sizeof(control))
+		{
+			ereport(WARNING,
+					(errmsg("dbblue create standby: could not read \"%s\"",
+							path)));
+			return false;
+		}
+
+		INIT_CRC32C(crc);
+		COMP_CRC32C(crc, &control, offsetof(ControlFileData, crc));
+		FIN_CRC32C(crc);
+		if (EQ_CRC32C(crc, control.crc))
+		{
+			*sysid = control.system_identifier;
+			return true;
+		}
+
+		pg_usleep(10000L);
+	}
+
+	ereport(WARNING,
+			(errmsg("dbblue create standby: \"%s\" has an invalid checksum",
+					path)));
+	return false;
+}
+
+/*
+ * standby_identity
+ *		Is the cluster in dir really a standby of ours?
+ *
+ * Its PG_VERSION only says it is some cluster.  It may also be a copy of us
+ * that has since been promoted -- leaving us, most likely, the old primary
+ * of that failover -- or a different cluster entirely, typically the
+ * standby of an earlier cluster that lived in our data directory before
+ * this one was initialized.  Neither can stream from us, and neither is
+ * ours to start, report, or delete.
+ *
+ * On STANDBY_FOREIGN, *their_sysid is set to the identifier found.
+ */
+static StandbyIdentity
+standby_identity(const char *dir, uint64 *their_sysid)
+{
+	char		path[MAXPGPATH];
+	struct stat st;
+
+	if (!read_system_identifier(dir, their_sysid))
+		return STANDBY_UNREADABLE;
+	if (*their_sysid != GetSystemIdentifier())
+		return STANDBY_FOREIGN;
+
+	snprintf(path, sizeof(path), "%s/%s", dir, STANDBY_SIGNAL_FILE);
+	if (stat(path, &st) != 0)
+		return STANDBY_PROMOTED;
+
+	return STANDBY_OURS;
+}
+
+/*
+ * forget_standby_port
+ *		Remove <DataDir>/dbblue_standby.port, so that tooling reading it does
+ *		not keep sending read-only traffic to a server that is no longer our
+ *		standby.
+ */
+static void
+forget_standby_port(void)
+{
+	char		path[MAXPGPATH];
+
+	snprintf(path, sizeof(path), "%s/dbblue_standby.port", DataDir);
+	if (unlink(path) != 0 && errno != ENOENT)
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("dbblue create standby: could not remove \"%s\": %m",
+						path)));
 }
 
 /*
@@ -723,7 +851,8 @@ replication_conn_opts(void)
 
 /*
  * standby_slot_state
- *		Does our replication slot exist, and is a process streaming from it?
+ *		Does our replication slot exist, is it still usable, and is a process
+ *		streaming from it?
  */
 static StandbySlotState
 standby_slot_state(void)
@@ -736,8 +865,12 @@ standby_slot_state(void)
 	if (slot != NULL)
 	{
 		SpinLockAcquire(&slot->mutex);
-		state = (slot->active_proc != INVALID_PROC_NUMBER) ?
-			STANDBY_SLOT_ACTIVE : STANDBY_SLOT_IDLE;
+		if (slot->data.invalidated != RS_INVAL_NONE)
+			state = STANDBY_SLOT_INVALIDATED;
+		else if (slot->active_proc != INVALID_PROC_NUMBER)
+			state = STANDBY_SLOT_ACTIVE;
+		else
+			state = STANDBY_SLOT_IDLE;
 		SpinLockRelease(&slot->mutex);
 	}
 	LWLockRelease(ReplicationSlotControlLock);
@@ -782,8 +915,9 @@ drop_standby_slot(const char *logfile)
 							 DBBLUE_STANDBY_SLOT)));
 			return false;
 		case STANDBY_SLOT_IDLE:
+		case STANDBY_SLOT_INVALIDATED:
 			break;
-	}	
+	}
 
 	ereport(LOG,
 			(errmsg("dbblue create standby: dropping stale replication slot \"%s\"",
@@ -840,6 +974,112 @@ verify_port_still_free(int port)
 }
 
 /*
+ * stop_standby
+ *		Stop the standby postmaster in dir, if it is running.
+ */
+static bool
+stop_standby(const char *dir, const char *logfile)
+{
+	char		binpath[MAXPGPATH];
+	char	   *qbin;
+	char	   *qdir;
+	char	   *cmd;
+	bool		ok;
+
+	if (!standby_is_running(dir))
+		return true;
+
+	resolve_bin_path("pg_ctl", binpath, sizeof(binpath));
+	qbin = shell_quote(binpath);
+	qdir = shell_quote(dir);
+	cmd = psprintf("%s -D %s -m fast -w -t 60 stop", qbin, qdir);
+
+	ok = run_shell(cmd, logfile, "pg_ctl stop");
+
+	pfree(cmd);
+	pfree(qdir);
+	pfree(qbin);
+	return ok;
+}
+
+/*
+ * vet_existing_standby
+ *		Check that the cluster in dir is a standby we can keep using.
+ *
+ * Returns true if it is, or if it was not but has been cleared away for
+ * run_standby_tick() to rebuild; false if it is unusable and must be left
+ * for the operator, after saying why.
+ *
+ * Only a standby of ours is ever stopped or deleted here, and only once our
+ * replication slot has been invalidated: it fell more than
+ * max_slot_wal_keep_size behind, the WAL it needs is gone, and it would
+ * otherwise sit there forever -- alive, so never restarted, serving ever
+ * staler reads.  Everything it holds is also here, so nothing is lost by
+ * building it again.
+ *
+ * A directory that is not our standby is not ours to delete, whatever it
+ * holds: a different cluster may be the last copy of a primary that is gone,
+ * and a promoted one is somebody's primary now.  We neither start nor report
+ * either, which would send read-only traffic to the wrong server.
+ */
+static bool
+vet_existing_standby(const char *dir, const char *logfile)
+{
+	uint64		their_sysid = 0;
+
+	switch (standby_identity(dir, &their_sysid))
+	{
+		case STANDBY_OURS:
+			break;
+		case STANDBY_PROMOTED:
+			forget_standby_port();
+			ereport(WARNING,
+					(errmsg("dbblue create standby: \"%s\" is no longer a standby of this server",
+							dir),
+					 errdetail("It has been promoted, and is now a primary in its own right; this server may be the old primary of that failover."),
+					 errhint("If this server is to stay the primary, remove \"%s\" to have a new standby built. Otherwise turn dbblue_create_standby off here, and make this server a standby of the new primary.",
+							 dir)));
+			return false;
+		case STANDBY_FOREIGN:
+			forget_standby_port();
+			ereport(WARNING,
+					(errmsg("dbblue create standby: \"%s\" holds a different database cluster, not a standby of this server",
+							dir),
+					 errdetail("Its system identifier is %" PRIu64 ", this server's is %" PRIu64 ".",
+							   their_sysid, GetSystemIdentifier()),
+					 errhint("It is most likely the standby of a cluster that this data directory held before. Remove it, or point dbblue_standby_directory elsewhere, to have a standby of this server built.")));
+			return false;
+		case STANDBY_UNREADABLE:
+			/* read_system_identifier() has said why */
+			return false;
+	}
+
+	if (standby_slot_state() != STANDBY_SLOT_INVALIDATED)
+		return true;
+
+	forget_standby_port();
+	ereport(WARNING,
+			(errmsg("dbblue create standby: replication slot \"%s\" has been invalidated, rebuilding the standby in \"%s\"",
+					DBBLUE_STANDBY_SLOT, dir),
+			 errdetail("The standby fell more than max_slot_wal_keep_size behind, and the WAL it still needed has been removed.")));
+
+	if (!stop_standby(dir, logfile))
+		return false;
+
+	/* the directory itself may be the operator's, with its permissions */
+	if (!rmtree(dir, false))
+	{
+		ereport(WARNING,
+				(errmsg("dbblue create standby: could not remove the contents of \"%s\"",
+						dir)));
+		return false;
+	}
+
+	/* the build drops the invalidated slot before making a new one */
+	return true;
+}
+
+/*
  * run_standby_tick
  *		Create the standby if needed and make sure it is running.
  *		Returns true if the standby is (now) up, false on failure.
@@ -865,14 +1105,26 @@ run_standby_tick(void)
 		return false;
 	}
 
+	logfile = psprintf("%s.log", dir);
+
+	/*
+	 * A standby that exists is only fine if it is ours and can still stream.
+	 * Vetting it may also clear it out for a rebuild, below.
+	 */
+	if (standby_has_data(dir) && !vet_existing_standby(dir, logfile))
+	{
+		pfree(logfile);
+		pfree(dir);
+		return false;
+	}
+
 	/* Nothing to do while the standby postmaster is alive. */
 	if (standby_is_running(dir))
 	{
+		pfree(logfile);
 		pfree(dir);
 		return true;
 	}
-
-	logfile = psprintf("%s.log", dir);
 
 	if (!standby_has_data(dir))
 	{
