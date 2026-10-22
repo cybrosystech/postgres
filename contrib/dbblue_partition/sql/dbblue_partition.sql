@@ -327,4 +327,54 @@ SELECT count(*) FROM mv_t_agg;                          -- matview survived the 
 DROP MATERIALIZED VIEW mv_t_agg, mv_t_empty;
 DROP TABLE mv_t;
 
+-- ---------------------------------------------------------------------
+-- 1.2: dbblue_partition_estimate predicts a conversion without changing
+-- anything.  Timings vary by machine; the shape of the work does not.
+-- ---------------------------------------------------------------------
+CREATE TABLE est_t (id serial PRIMARY KEY, v text UNIQUE, create_date timestamp NOT NULL);
+CREATE TABLE est_child (id serial PRIMARY KEY, t_id int REFERENCES est_t (id));
+INSERT INTO est_t (v, create_date)
+    SELECT 'v' || g, timestamp '2021-01-01' + (g || ' days')::interval
+    FROM generate_series(1, 1000) g;
+INSERT INTO est_child (t_id) SELECT g FROM generate_series(1, 1000) g;
+ANALYZE est_t, est_child;
+SET max_parallel_workers_per_gather = 3;
+
+SELECT table_name, index_count, partition_count > 4 AS covers_data_and_premake,
+       batch_count, control_indexed, fks_to_validate,
+       estimated_seconds > 0 AS positive,
+       estimated_seconds_high >= estimated_seconds AS high_not_below,
+       table_locked_seconds = estimated_seconds AS locked_throughout,
+       breakdown ?& array['structural_swap', 'data_move', 'batch_scans',
+                          'row_count_checks', 'fk_validation', 'analyze'] AS all_phases,
+       (breakdown -> 'measured' ->> 'sampled_rows')::int AS sampled_rows,
+       notes
+FROM dbblue_partition_estimate('est.t');
+
+-- batched mode holds the lock only for the structural swap
+SELECT table_locked_seconds < estimated_seconds AS lock_released_early
+FROM dbblue_partition_estimate('est_t', p_single_transaction => false);
+
+-- an index on the control column removes the per-batch min() scan
+CREATE INDEX est_t_create_date ON est_t (create_date);
+SELECT control_indexed, batch_count, notes
+FROM dbblue_partition_estimate('est_t', p_sample_rows => 100);
+
+-- nothing persists, the caller's settings survive, and an enclosing
+-- transaction carries on
+BEGIN;
+SELECT estimated_seconds > 0 AS positive FROM dbblue_partition_estimate('est_t');
+SELECT count(*) AS scratch_left FROM pg_class WHERE relname LIKE 'dbblue\_est\_%';
+COMMIT;
+SHOW max_parallel_workers_per_gather;
+RESET max_parallel_workers_per_gather;
+SELECT count(*) AS cataloged FROM dbblue_partition_catalog WHERE parent_table = 'est_t';
+
+SELECT estimated_seconds FROM dbblue_partition_estimate('no_such_table');
+SELECT estimated_seconds FROM dbblue_partition_estimate('est_t', 'v');	-- wrong type
+CALL dbblue_partition_model('est_t');
+SELECT estimated_seconds FROM dbblue_partition_estimate('est_t');	-- already converted
+DROP TABLE est_child, est_t, est_t_old;
+DROP TABLE dbblue_tpl_est_t;
+
 \set SHOW_CONTEXT errors

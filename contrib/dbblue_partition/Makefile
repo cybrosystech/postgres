@@ -9,7 +9,9 @@ MODULES = src/dbblue_partition_bgw
 # release adds dbblue_partition--1.0--1.1.sql beside it.
 # 1.1: dbblue_partition_undo recreates indexes and unique constraints that
 # were added to the partitioned table after the conversion.
-DATA = dbblue_partition--1.0.sql dbblue_partition--1.0--1.1.sql
+# 1.2: dbblue_partition_estimate predicts the duration of a conversion.
+DATA = dbblue_partition--1.0.sql dbblue_partition--1.0--1.1.sql \
+	dbblue_partition--1.1--1.2.sql
 PGFILEDESC = "dbblue_partition - convert live Odoo tables to native range partitioning"
 
 REGRESS = dbblue_partition
