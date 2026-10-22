@@ -7693,12 +7693,20 @@ add_repartition_agg_path(PlannerInfo *root, RelOptInfo *input_rel,
 	 * Number of groups the final phase will produce, for the rows of all
 	 * participants together; each participant is expected to produce its
 	 * share of them.
+	 *
+	 * Divide by the real parallel divisor and do not round the result: the
+	 * Gather that goes on top multiplies the per-participant rows by that same
+	 * divisor and rounds once, which then gives exactly the estimate the
+	 * other plans get for the whole query.  Rounding the share here as well,
+	 * or deriving it from an already rounded total, makes the estimate off by
+	 * a row, and add_path(), which prefers the path with fewer rows when costs
+	 * are fuzzily equal, would then break such ties for the wrong reason.
 	 */
 	total_partial_rows = compute_gather_rows(partial_path);
 	num_final_groups = get_number_of_groups(root, total_partial_rows, gd,
 											extra->targetList);
-	num_final_groups = clamp_row_est(num_final_groups *
-									 (partial_path->rows / total_partial_rows));
+	num_final_groups = Max(1.0, num_final_groups /
+						   get_parallel_divisor(partial_path));
 
 	rpath = create_repartition_path(root, partially_grouped_rel, partial_path,
 									root->processed_groupClause);

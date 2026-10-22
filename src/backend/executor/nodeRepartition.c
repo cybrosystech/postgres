@@ -269,6 +269,9 @@ ExecRepartition(PlanState *pstate)
 
 	CHECK_FOR_INTERRUPTS();
 
+	/* A parallel worker must always have joined the exchange, see above. */
+	Assert(!IsParallelWorker() || shared != NULL);
+
 	/* Not running in parallel: there is nobody to exchange rows with. */
 	if (shared == NULL)
 	{
@@ -459,9 +462,14 @@ ExecRepartitionInitializeWorker(RepartitionState *node,
 	Repartition *plan = (Repartition *) node->ps.plan;
 	SharedRepartitionState *shared;
 
-	shared = shm_toc_lookup(pwcxt->toc, plan->plan.plan_node_id, true);
-	if (shared == NULL)
-		return;
+	/*
+	 * The leader always stores the shared state before it launches workers.
+	 * If it is missing something is badly wrong, and carrying on would make
+	 * this participant run as a plain pass-through node, i.e. feed its partial
+	 * rows straight to the Finalize aggregate above without them having been
+	 * exchanged, and silently return wrong groups.  So fail loudly instead.
+	 */
+	shared = shm_toc_lookup(pwcxt->toc, plan->plan.plan_node_id, false);
 
 	SharedFileSetAttach(&shared->fileset, pwcxt->seg);
 

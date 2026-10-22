@@ -194,6 +194,7 @@ extern void cost_gather_merge(GatherMergePath *path, PlannerInfo *root,
 							  int input_disabled_nodes,
 							  Cost input_startup_cost, Cost input_total_cost,
 							  double *rows);
+extern void cost_repartition(RepartitionPath *path, int num_partitions);
 extern void cost_subplan(PlannerInfo *root, SubPlan *subplan, Plan *plan);
 extern void cost_qual_eval(QualCost *cost, List *quals, PlannerInfo *root);
 extern void cost_qual_eval_node(QualCost *cost, Node *qual, PlannerInfo *root);
@@ -234,5 +235,6 @@ extern double compute_bitmap_pages(PlannerInfo *root, RelOptInfo *baserel,
 								   Path *bitmapqual, double loop_count,
 								   Cost *cost_p, double *tuples_p);
 extern double compute_gather_rows(Path *path);
+extern double get_parallel_divisor(Path *path);
 
 #endif							/* COST_H */

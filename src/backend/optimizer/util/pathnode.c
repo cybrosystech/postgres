@@ -1896,13 +1896,10 @@ create_gather_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 }
 
 /*
- * Tuning constants for create_repartition_path().  A participant creates one
- * temporary file for each partition it has rows for; creating, flushing and
- * later removing such a file costs roughly as much as a few sequential page
- * reads.  Partitions are only worth having when they hold a decent number of
- * rows.
+ * Tuning constant for create_repartition_path(): partitions are only worth
+ * having when they hold a decent number of rows, because every (participant,
+ * partition) pair that sees any row costs a temporary file.
  */
-#define REPARTITION_FILE_COST			5.0
 #define REPARTITION_ROWS_PER_PARTITION	20000.0
 
 /*
@@ -1953,19 +1950,11 @@ create_repartition_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 				(int) Min(total_rows / REPARTITION_ROWS_PER_PARTITION, 64)));
 
 	/*
-	 * Each participant gets about as many rows back as it put in.  Nothing
-	 * can be returned before the whole input has been written, so the whole
-	 * cost of the input, plus writing it out, is startup cost.  Reading the
-	 * rows back is the run cost.  Both are charged at the same rate as
-	 * passing a tuple through any other node.
+	 * Each participant gets about as many rows back as it put in.  The cost,
+	 * including the I/O for the temporary partition files, is worked out by
+	 * cost_repartition().
 	 */
-	pathnode->path.rows = subpath->rows;
-	pathnode->path.disabled_nodes = subpath->disabled_nodes;
-	pathnode->path.startup_cost = subpath->total_cost +
-		cpu_tuple_cost * subpath->rows +
-		REPARTITION_FILE_COST * pathnode->num_partitions * nparticipants;
-	pathnode->path.total_cost = pathnode->path.startup_cost +
-		cpu_tuple_cost * subpath->rows;
+	cost_repartition(pathnode, pathnode->num_partitions);
 
 	return pathnode;
 }
