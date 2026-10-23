@@ -184,6 +184,18 @@ static uint64 aprep_clock = 0;
  */
 #define APREP_MIN_AGE			100.0
 
+/*
+ * A promoted entry's first few reuses are always a forced custom-plan
+ * rebuild (the plancache's own choose_custom_plan() does this for its first
+ * 5 reuses, "arbitrary" per its own comment, before it will even consider the
+ * generic plan).  Below this many reuses, aprep_entry_score() assumes the
+ * best case (full plan_ms saved per reuse) rather than judging the entry by
+ * a measured average that is still entirely from that forced-custom window --
+ * otherwise a shape that is about to become a big win, once it reaches the
+ * generic plan, could be evicted before it gets the chance.
+ */
+#define APREP_SCORE_MATURE_HITS	5
+
 /* Sighting-count sketch; see aprep_sketch_add(). */
 #define APREP_SKETCH_ROWS		4
 #define APREP_SKETCH_WIDTH		2048	/* power of 2 */
@@ -868,14 +880,40 @@ aprep_note_reuse(AutoprepareEntry *entry)
  * A promoted entry saves a normal planning run; a declined one only saves
  * re-attempting the promotion build.  The small constant keeps the rate
  * deciding when the time is unknown or rounds to zero.
+ *
+ * For a promoted entry, "saves" is not always the full plan_ms: once there
+ * have been enough reuses to get past the plancache's forced-custom-plan
+ * window (APREP_SCORE_MATURE_HITS), it is the *measured* average saving,
+ * plan_ms minus avg reuse cost (reuse_plan_total_ms / reuse_plans) -- a shape
+ * stuck permanently rebuilding a custom plan on every reuse (never reaching
+ * the generic plan) measures close to zero here, or even negative, and is
+ * scored accordingly, rather than being credited the full plan_ms it is not
+ * actually saving.  Before that many reuses, the measured average is still
+ * entirely from the forced-custom window and would unfairly judge a shape
+ * that has not yet had the chance to reach the generic plan, so plan_ms (the
+ * optimistic assumption) is used instead.
  */
 static double
 aprep_entry_score(AutoprepareEntry *entry)
 {
-	double		saves_ms = entry->promoted ? entry->plan_ms : entry->build_ms;
-	double		age = Max((double) (aprep_clock - entry->first_seen),
-						  APREP_MIN_AGE);
-	double		window = APREP_REUSE_HALF_LIFE / M_LN2 *
+	double		saves_ms;
+	double		age;
+	double		window;
+
+	if (entry->promoted)
+	{
+		if (entry->reuse_plans >= APREP_SCORE_MATURE_HITS)
+			saves_ms = entry->plan_ms -
+				(entry->reuse_plan_total_ms / entry->reuse_plans);
+		else
+			saves_ms = entry->plan_ms;
+	}
+	else
+		saves_ms = entry->build_ms;
+
+	age = Max((double) (aprep_clock - entry->first_seen),
+			 APREP_MIN_AGE);
+	window = APREP_REUSE_HALF_LIFE / M_LN2 *
 		(1.0 - exp2(-age / APREP_REUSE_HALF_LIFE));
 
 	return aprep_current_reuse(entry) / window * (saves_ms + 0.001);
@@ -1523,7 +1561,10 @@ typedef struct AprepMsgShape
 	int64		num_generic_plans;	/* -1: not promoted */
 	double		generic_cost;	/* plancache's own field; < 0: not known/not promoted */
 	double		avg_custom_cost;	/* total_custom_cost / num_custom_plans; < 0: none yet */
-	double		score;			/* < 0: not applicable (tracking) */
+	double		score;			/* NaN: not applicable (tracking) -- unlike the
+								 * other fields above, this one can legitimately
+								 * be negative (a mature entry saving nothing),
+								 * so -1 cannot be used as its sentinel */
 	int32		query_len;		/* -1: no text; else text follows */
 } AprepMsgShape;
 
@@ -1733,7 +1774,7 @@ aprep_emit_report(bool want_shapes, AprepEmitFn emit, void *arg)
 				hdr.avg_custom_cost = -1;
 			}
 			hdr.score = (entry->promoted || entry->declined) ?
-				aprep_entry_score(entry) : -1;
+				aprep_entry_score(entry) : NAN;
 			hdr.query_len = (qs != NULL) ? (int32) strlen(qs) : -1;
 
 			resetStringInfo(&buf);
@@ -1858,7 +1899,7 @@ aprep_consume(void *arg, const void *data, Size len)
 					values[11] = Float8GetDatum(h.avg_custom_cost);
 				else
 					nulls[11] = true;
-				if (h.score >= 0)
+				if (!isnan(h.score))
 					values[12] = Float8GetDatum(h.score);
 				else
 					nulls[12] = true;
