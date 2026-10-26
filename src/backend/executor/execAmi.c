@@ -47,6 +47,7 @@
 #include "executor/nodeNestloop.h"
 #include "executor/nodeProjectSet.h"
 #include "executor/nodeRecursiveunion.h"
+#include "executor/nodeRepartition.h"
 #include "executor/nodeResult.h"
 #include "executor/nodeSamplescan.h"
 #include "executor/nodeSeqscan.h"
@@ -174,6 +175,10 @@ ExecReScan(PlanState *node)
 
 		case T_GatherState:
 			ExecReScanGather((GatherState *) node);
+			break;
+
+		case T_RepartitionState:
+			ExecReScanRepartition((RepartitionState *) node);
 			break;
 
 		case T_GatherMergeState:

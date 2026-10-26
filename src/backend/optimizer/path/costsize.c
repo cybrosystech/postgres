@@ -157,6 +157,7 @@ bool		enable_memoize = true;
 bool		enable_mergejoin = true;
 bool		enable_hashjoin = true;
 bool		enable_gathermerge = true;
+bool		dbblue_enable_repartition_agg = false;
 bool		enable_partitionwise_join = false;
 bool		enable_partitionwise_aggregate = false;
 bool		enable_parallel_append = true;
@@ -215,7 +216,6 @@ static void set_rel_width(PlannerInfo *root, RelOptInfo *rel);
 static int32 get_expr_width(PlannerInfo *root, const Node *expr);
 static double relation_byte_size(double tuples, int width);
 static double page_size(double tuples, int width);
-static double get_parallel_divisor(Path *path);
 
 
 /*
@@ -533,6 +533,59 @@ cost_gather_merge(GatherMergePath *path, PlannerInfo *root,
 		+ ((rel->pgs_mask & PGS_GATHER_MERGE) != 0 ? 0 : 1);
 	path->path.startup_cost = startup_cost + input_startup_cost;
 	path->path.total_cost = (startup_cost + run_cost + input_total_cost);
+}
+
+/*
+ * Cost of creating, flushing and later removing the temporary file that a
+ * participant needs for each partition it has rows for.  Roughly as much as a
+ * few sequential page reads.  See nodeRepartition.c.
+ */
+#define REPARTITION_FILE_COST	5.0
+
+/*
+ * cost_repartition
+ *	  Determines and sets the cost of a RepartitionPath.
+ *
+ * A Repartition node (see nodeRepartition.c) first drains its whole input,
+ * writing every row to a temporary partition file, and only then returns rows
+ * by reading the files back.  So the cost of the input plus the cost of
+ * writing is startup cost, and reading back is run cost.
+ *
+ * Every row goes through a temporary file, so besides the per-tuple CPU cost
+ * we must charge for the I/O, which depends on how many bytes are written,
+ * i.e. on the width of the rows and not just on their number.  We price it
+ * like cost_material() prices spilled tuples: one sequential page access per
+ * page written and one per page read back.  Unlike a Material node there is
+ * no case where everything stays in memory, so this is charged unconditionally.
+ *
+ * Path costs for partial paths are per participant, so the row count used
+ * here is the number of rows one participant writes (and about as many it
+ * reads back, since each participant gets a similar share of the groups).
+ */
+void
+cost_repartition(RepartitionPath *path, int num_partitions)
+{
+	Path	   *subpath = path->subpath;
+	double		rows = subpath->rows;
+	double		nbytes = relation_byte_size(rows, subpath->pathtarget->width);
+	double		npages = ceil(nbytes / BLCKSZ);
+	Cost		startup_cost;
+	Cost		run_cost;
+
+	/* all of the input must be consumed, and written, before any row is returned */
+	startup_cost = subpath->total_cost;
+	startup_cost += cpu_tuple_cost * rows;	/* hash and write each row */
+	startup_cost += seq_page_cost * npages; /* write the temporary files */
+	startup_cost += REPARTITION_FILE_COST * num_partitions * path->num_participants;
+
+	/* then every row is read back */
+	run_cost = cpu_tuple_cost * rows;
+	run_cost += seq_page_cost * npages;
+
+	path->path.rows = rows;
+	path->path.disabled_nodes = subpath->disabled_nodes;
+	path->path.startup_cost = startup_cost;
+	path->path.total_cost = startup_cost + run_cost;
 }
 
 /*
@@ -6778,7 +6831,7 @@ page_size(double tuples, int width)
  * Estimate the fraction of the work that each worker will do given the
  * number of workers budgeted for the path.
  */
-static double
+double
 get_parallel_divisor(Path *path)
 {
 	double		parallel_divisor = path->parallel_workers;

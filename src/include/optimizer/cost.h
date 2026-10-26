@@ -63,6 +63,7 @@ extern PGDLLIMPORT bool enable_memoize;
 extern PGDLLIMPORT bool enable_mergejoin;
 extern PGDLLIMPORT bool enable_hashjoin;
 extern PGDLLIMPORT bool enable_gathermerge;
+extern PGDLLIMPORT bool dbblue_enable_repartition_agg;
 extern PGDLLIMPORT bool enable_partitionwise_join;
 extern PGDLLIMPORT bool enable_partitionwise_aggregate;
 extern PGDLLIMPORT bool enable_parallel_append;
@@ -193,6 +194,7 @@ extern void cost_gather_merge(GatherMergePath *path, PlannerInfo *root,
 							  int input_disabled_nodes,
 							  Cost input_startup_cost, Cost input_total_cost,
 							  double *rows);
+extern void cost_repartition(RepartitionPath *path, int num_partitions);
 extern void cost_subplan(PlannerInfo *root, SubPlan *subplan, Plan *plan);
 extern void cost_qual_eval(QualCost *cost, List *quals, PlannerInfo *root);
 extern void cost_qual_eval_node(QualCost *cost, Node *qual, PlannerInfo *root);
@@ -233,5 +235,6 @@ extern double compute_bitmap_pages(PlannerInfo *root, RelOptInfo *baserel,
 								   Path *bitmapqual, double loop_count,
 								   Cost *cost_p, double *tuples_p);
 extern double compute_gather_rows(Path *path);
+extern double get_parallel_divisor(Path *path);
 
 #endif							/* COST_H */

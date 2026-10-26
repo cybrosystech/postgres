@@ -54,6 +54,7 @@ OBJS = \
 	nodeLimit.o \
 	nodeLockRows.o \
 	nodeMaterial.o \
+	nodeRepartition.o \
 	nodeMemoize.o \
 	nodeMergeAppend.o \
 	nodeMergejoin.o \

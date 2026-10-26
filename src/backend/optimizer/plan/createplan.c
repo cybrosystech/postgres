@@ -95,6 +95,8 @@ static Material *create_material_plan(PlannerInfo *root, MaterialPath *best_path
 static Memoize *create_memoize_plan(PlannerInfo *root, MemoizePath *best_path,
 									int flags);
 static Gather *create_gather_plan(PlannerInfo *root, GatherPath *best_path);
+static Repartition *create_repartition_plan(PlannerInfo *root,
+											RepartitionPath *best_path);
 static Plan *create_projection_plan(PlannerInfo *root,
 									ProjectionPath *best_path,
 									int flags);
@@ -494,6 +496,10 @@ create_plan_recurse(PlannerInfo *root, Path *best_path, int flags)
 		case T_Gather:
 			plan = (Plan *) create_gather_plan(root,
 											   (GatherPath *) best_path);
+			break;
+		case T_Repartition:
+			plan = (Plan *) create_repartition_plan(root,
+													(RepartitionPath *) best_path);
 			break;
 		case T_Sort:
 			plan = (Plan *) create_sort_plan(root,
@@ -1813,6 +1819,45 @@ create_gather_plan(PlannerInfo *root, GatherPath *best_path)
 	root->glob->parallelModeNeeded = true;
 
 	return gather_plan;
+}
+
+/*
+ * create_repartition_plan
+ *
+ *	  Create a Repartition plan for 'best_path' and (recursively) plans for
+ *	  its subpath.
+ */
+static Repartition *
+create_repartition_plan(PlannerInfo *root, RepartitionPath *best_path)
+{
+	Repartition *plan;
+	Plan	   *subplan;
+
+	/*
+	 * The node does not project: it passes the child's rows, as minimal
+	 * tuples, through shared tuplestores.  So take the child's tlist as it
+	 * comes, and we need the grouping columns to be in it.
+	 */
+	subplan = create_plan_recurse(root, best_path->subpath, CP_EXACT_TLIST);
+
+	plan = makeNode(Repartition);
+	plan->plan.targetlist = subplan->targetlist;
+	plan->plan.qual = NIL;
+	plan->plan.lefttree = subplan;
+	plan->plan.righttree = NULL;
+
+	plan->num_partitions = best_path->num_partitions;
+	plan->num_participants = best_path->num_participants;
+	plan->numCols = list_length(best_path->groupClause);
+	plan->keyColIdx = extract_grouping_cols(best_path->groupClause,
+											subplan->targetlist);
+	plan->keyOperators = extract_grouping_ops(best_path->groupClause);
+	plan->keyCollations = extract_grouping_collations(best_path->groupClause,
+													  subplan->targetlist);
+
+	copy_generic_path_info(&plan->plan, &best_path->path);
+
+	return plan;
 }
 
 /*

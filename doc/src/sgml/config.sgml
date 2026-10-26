@@ -6103,6 +6103,40 @@ ANY <replaceable class="parameter">num_sync</replaceable> ( <replaceable class="
       </listitem>
      </varlistentry>
 
+     <varlistentry id="guc-dbblue-enable-repartition-agg" xreflabel="dbblue_enable_repartition_agg">
+      <term><varname>dbblue_enable_repartition_agg</varname> (<type>boolean</type>)
+      <indexterm>
+       <primary><varname>dbblue_enable_repartition_agg</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Enables or disables the query planner's use of a parallel final step
+        for hash aggregation.  Normally a parallel aggregate gathers the
+        partial results of all workers into the leader process, which then
+        combines them.  With many groups, that step in the leader becomes the
+        bottleneck.  When this setting is on, the planner can instead add a
+        <literal>Parallel Repartition</literal> node between the partial and the
+        final aggregate: the workers redistribute the partial rows by group key
+        through temporary files, so that each group reaches exactly one
+        participant, and the final aggregate runs in parallel.  The leader then
+        only collects finished rows.
+       </para>
+       <para>
+        The planner uses this plan only when it estimates it to be cheaper than
+        the alternatives.  When the best alternative is already a parallel plan,
+        the saving must be at least 2%.  The node needs a parallel plan with at
+        least one worker, a <literal>GROUP BY</literal> whose columns can be
+        hashed, and aggregates that support partial aggregation.  It is not used
+        for <literal>DISTINCT</literal> or ordered aggregates, ordered-set
+        aggregates, grouping sets, or when partitionwise aggregation applies.
+        Because the exchange writes the partial rows to temporary files, the
+        extra I/O is visible in <command>EXPLAIN (ANALYZE, BUFFERS)</command>
+        as temporary buffer usage.  The default value is <literal>off</literal>.
+       </para>
+      </listitem>
+     </varlistentry>
+
      <varlistentry id="guc-enable-presorted-aggregate" xreflabel="enable_presorted_aggregate">
       <term><varname>enable_presorted_aggregate</varname> (<type>boolean</type>)
       <indexterm>

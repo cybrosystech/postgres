@@ -2327,6 +2327,20 @@ typedef struct GroupResultPath
 } GroupResultPath;
 
 /*
+ * RepartitionPath represents a hash-exchange of a partially aggregated
+ * partial path among the participants of a Gather, so that the Finalize
+ * aggregate above can itself run in parallel.  See Repartition plan node.
+ */
+typedef struct RepartitionPath
+{
+	Path		path;
+	Path	   *subpath;
+	List	   *groupClause;	/* SortGroupClauses to hash on */
+	int			num_partitions;
+	int			num_participants;
+} RepartitionPath;
+
+/*
  * MaterialPath represents use of a Material plan node, i.e., caching of
  * the output of its subpath.  This is used when the subpath is expensive
  * and needs to be scanned repeatedly, or when we need mark/restore ability

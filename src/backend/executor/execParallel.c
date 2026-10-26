@@ -37,6 +37,7 @@
 #include "executor/nodeIndexonlyscan.h"
 #include "executor/nodeIndexscan.h"
 #include "executor/nodeMemoize.h"
+#include "executor/nodeRepartition.h"
 #include "executor/nodeSeqscan.h"
 #include "executor/nodeSort.h"
 #include "executor/nodeSubplan.h"
@@ -334,6 +335,11 @@ ExecParallelEstimate(PlanState *planstate, ExecParallelEstimateContext *e)
 			/* even when not parallel-aware, for EXPLAIN ANALYZE */
 			ExecAggEstimate((AggState *) planstate, e->pcxt);
 			break;
+		case T_RepartitionState:
+			if (planstate->plan->parallel_aware)
+				ExecRepartitionEstimate((RepartitionState *) planstate,
+										e->pcxt);
+			break;
 		case T_MemoizeState:
 			/* even when not parallel-aware, for EXPLAIN ANALYZE */
 			ExecMemoizeEstimate((MemoizeState *) planstate, e->pcxt);
@@ -565,6 +571,11 @@ ExecParallelInitializeDSM(PlanState *planstate,
 			if (planstate->plan->parallel_aware)
 				ExecHashJoinInitializeDSM((HashJoinState *) planstate,
 										  d->pcxt);
+			break;
+		case T_RepartitionState:
+			if (planstate->plan->parallel_aware)
+				ExecRepartitionInitializeDSM((RepartitionState *) planstate,
+											 d->pcxt);
 			break;
 		case T_HashState:
 			/* even when not parallel-aware, for EXPLAIN ANALYZE */
@@ -1071,6 +1082,11 @@ ExecParallelReInitializeDSM(PlanState *planstate,
 				ExecHashJoinReInitializeDSM((HashJoinState *) planstate,
 											pcxt);
 			break;
+		case T_RepartitionState:
+			if (planstate->plan->parallel_aware)
+				ExecRepartitionReInitializeDSM((RepartitionState *) planstate,
+											   pcxt);
+			break;
 		case T_BitmapIndexScanState:
 		case T_HashState:
 		case T_SortState:
@@ -1464,6 +1480,11 @@ ExecParallelInitializeWorker(PlanState *planstate, ParallelWorkerContext *pwcxt)
 			if (planstate->plan->parallel_aware)
 				ExecHashJoinInitializeWorker((HashJoinState *) planstate,
 											 pwcxt);
+			break;
+		case T_RepartitionState:
+			if (planstate->plan->parallel_aware)
+				ExecRepartitionInitializeWorker((RepartitionState *) planstate,
+												pwcxt);
 			break;
 		case T_HashState:
 			/* even when not parallel-aware, for EXPLAIN ANALYZE */

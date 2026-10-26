@@ -283,6 +283,12 @@ static Path *make_ordered_path(PlannerInfo *root,
 							   List *pathkeys,
 							   double limit_tuples);
 static void gather_grouping_paths(PlannerInfo *root, RelOptInfo *rel);
+static void add_repartition_agg_path(PlannerInfo *root,
+									 RelOptInfo *input_rel,
+									 RelOptInfo *grouped_rel,
+									 RelOptInfo *partially_grouped_rel,
+									 grouping_sets_data *gd,
+									 GroupPathExtraData *extra);
 static bool can_partial_agg(PlannerInfo *root);
 static void apply_scanjoin_target_to_paths(PlannerInfo *root,
 										   RelOptInfo *rel,
@@ -7602,6 +7608,17 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 									 agg_final_costs,
 									 dNumFinalGroups));
 		}
+
+		/*
+		 * dbblue: also offer a parallel Finalize HashAgg, fed through a hash
+		 * exchange, as a partial path.  It is gathered below, together with
+		 * any other partial paths of grouped_rel.
+		 */
+		if (dbblue_enable_repartition_agg &&
+			partially_grouped_rel != NULL &&
+			partially_grouped_rel->partial_pathlist != NIL)
+			add_repartition_agg_path(root, input_rel, grouped_rel,
+									 partially_grouped_rel, gd, extra);
 	}
 
 	/*
@@ -7612,6 +7629,175 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 	 */
 	if (grouped_rel->partial_pathlist != NIL)
 		gather_grouping_paths(root, grouped_rel);
+}
+
+/*
+ * Minimum estimated saving, as a fraction of cost, that Repartition needs to
+ * replace a plan that is already parallel.
+ */
+#define REPARTITION_MIN_SAVING	0.02
+
+/* does this path have a Gather or Gather Merge below its single-child chain? */
+static bool
+path_has_gather(Path *path)
+{
+	for (;;)
+	{
+		switch (nodeTag(path))
+		{
+			case T_GatherPath:
+			case T_GatherMergePath:
+				return true;
+			case T_AggPath:
+				path = ((AggPath *) path)->subpath;
+				break;
+			case T_GroupPath:
+				path = ((GroupPath *) path)->subpath;
+				break;
+			case T_SortPath:
+				path = ((SortPath *) path)->subpath;
+				break;
+			case T_IncrementalSortPath:
+				path = ((IncrementalSortPath *) path)->spath.subpath;
+				break;
+			case T_ProjectionPath:
+				path = ((ProjectionPath *) path)->subpath;
+				break;
+			default:
+				return false;
+		}
+	}
+}
+
+/*
+ * add_repartition_agg_path
+ *		Add a partial path to grouped_rel that finalizes partial aggregates in
+ *		parallel instead of in the leader.
+ *
+ * The usual way to finish a parallel aggregation is to Gather the Partial
+ * aggregate rows of all workers and run the Finalize aggregate over all of
+ * them in the leader.  With many groups that is a serial bottleneck, as the
+ * leader sees about (number of groups) * (number of workers) rows.  Here
+ * instead the workers hash-exchange the partial rows by group key (see
+ * nodeRepartition.c) so that every group lands in exactly one worker, which
+ * finalizes it.  What reaches the Gather are then final rows, one per group.
+ *
+ *		Gather
+ *		  -> Finalize HashAggregate
+ *			   -> Repartition
+ *					-> Partial HashAggregate
+ *						 -> Parallel Seq Scan ...
+ */
+static void
+add_repartition_agg_path(PlannerInfo *root, RelOptInfo *input_rel,
+						 RelOptInfo *grouped_rel,
+						 RelOptInfo *partially_grouped_rel,
+						 grouping_sets_data *gd, GroupPathExtraData *extra)
+{
+	Query	   *parse = root->parse;
+	Path	   *partial_path;
+	RepartitionPath *rpath;
+	AggPath    *apath;
+	double		total_partial_rows;
+	double		num_final_groups;
+
+	/* Plain hash grouping on a normal GROUP BY only. */
+	if (!grouped_rel->consider_parallel ||
+		!(extra->flags & GROUPING_CAN_USE_HASH) ||
+		!parse->hasAggs ||
+		parse->groupingSets ||
+		root->processed_groupClause == NIL)
+		return;
+
+	/*
+	 * Stay out of the way of partitionwise aggregation.  Do not look at
+	 * extra->patype alone for that: when enable_partitionwise_aggregate is
+	 * on, create_grouping_paths() sets it to FULL for every query, whether or
+	 * not input_rel is partitioned, and create_ordinary_grouping_paths() then
+	 * decides for itself whether partitionwise aggregation is really
+	 * possible.  Make the same test here.  Also skip grouped rels of
+	 * individual partitions, which inherit patype from their parent.
+	 */
+	if (IS_OTHER_REL(grouped_rel) ||
+		(extra->patype != PARTITIONWISE_AGGREGATE_NONE &&
+		 IS_PARTITIONED_REL(input_rel)))
+		return;
+
+	/* the cheapest partial path of the partially grouped rel */
+	partial_path = linitial(partially_grouped_rel->partial_pathlist);
+	if (!partial_path->parallel_safe || partial_path->parallel_workers < 1)
+		return;
+
+	/*
+	 * Number of groups the final phase will produce, for the rows of all
+	 * participants together; each participant is expected to produce its
+	 * share of them.
+	 *
+	 * Divide by the real parallel divisor and do not round the result: the
+	 * Gather that goes on top multiplies the per-participant rows by that same
+	 * divisor and rounds once, which then gives exactly the estimate the
+	 * other plans get for the whole query.  Rounding the share here as well,
+	 * or deriving it from an already rounded total, makes the estimate off by
+	 * a row, and add_path(), which prefers the path with fewer rows when costs
+	 * are fuzzily equal, would then break such ties for the wrong reason.
+	 */
+	total_partial_rows = compute_gather_rows(partial_path);
+	num_final_groups = get_number_of_groups(root, total_partial_rows, gd,
+											extra->targetList);
+	num_final_groups = Max(1.0, num_final_groups /
+						   get_parallel_divisor(partial_path));
+
+	rpath = create_repartition_path(root, partially_grouped_rel, partial_path,
+									root->processed_groupClause);
+
+	apath = create_agg_path(root,
+							grouped_rel,
+							(Path *) rpath,
+							grouped_rel->reltarget,
+							AGG_HASHED,
+							AGGSPLIT_FINAL_DESERIAL,
+							root->processed_groupClause,
+							(List *) extra->havingQual,
+							&extra->agg_final_costs,
+							num_final_groups);
+
+	/*
+	 * When the best plan so far is already parallel, only offer the path if it
+	 * is clearly cheaper.  The exchange costs real I/O that the estimates only
+	 * roughly capture, and measured on Odoo queries a saving of a fraction of
+	 * a percent over a stock parallel plan was as often a loss as a gain.  A
+	 * serial plan needs no such margin: replacing one with a parallel plan won
+	 * in nearly every measurement, and the estimated saving did not predict the
+	 * size of the gain.  Compare the finished plan, i.e. with the Gather on
+	 * top, against the cheapest path of grouped_rel.
+	 */
+	if (grouped_rel->pathlist != NIL)
+	{
+		Path	   *best = NULL;
+		ListCell   *lc;
+
+		foreach(lc, grouped_rel->pathlist)
+		{
+			Path	   *p = (Path *) lfirst(lc);
+
+			if (best == NULL || p->total_cost < best->total_cost)
+				best = p;
+		}
+
+		if (path_has_gather(best))
+		{
+			Path	   *gathered = (Path *) create_gather_path(root, grouped_rel,
+															(Path *) apath,
+															apath->path.pathtarget,
+															NULL, NULL);
+
+			if (gathered->total_cost >
+				best->total_cost * (1.0 - REPARTITION_MIN_SAVING))
+				return;
+		}
+	}
+
+	add_partial_path(grouped_rel, (Path *) apath);
 }
 
 /*

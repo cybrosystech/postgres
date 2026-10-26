@@ -1896,6 +1896,70 @@ create_gather_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 }
 
 /*
+ * Tuning constant for create_repartition_path(): partitions are only worth
+ * having when they hold a decent number of rows, because every (participant,
+ * partition) pair that sees any row costs a temporary file.
+ */
+#define REPARTITION_ROWS_PER_PARTITION	20000.0
+
+/*
+ * create_repartition_path
+ *	  Creates a path that hash-exchanges the rows of a partially aggregated
+ *	  partial path among the participants of a Gather, so that the Finalize
+ *	  aggregate that sits on top of it can run in parallel too.
+ *
+ * 'subpath' must be a parallel-safe partial path whose output rows are
+ * partial aggregate states, and 'groupClause' the grouping that identifies
+ * the groups in those rows.  The caller is responsible for putting a
+ * Finalize aggregate on top.
+ */
+RepartitionPath *
+create_repartition_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
+						List *groupClause)
+{
+	RepartitionPath *pathnode = makeNode(RepartitionPath);
+	int			nparticipants = subpath->parallel_workers + 1;
+	double		total_rows;
+
+	Assert(subpath->parallel_safe && subpath->parallel_workers > 0);
+
+	pathnode->path.pathtype = T_Repartition;
+	pathnode->path.parent = rel;
+	pathnode->path.pathtarget = subpath->pathtarget;
+	pathnode->path.param_info = NULL;
+	pathnode->path.parallel_aware = true;
+	pathnode->path.parallel_safe = true;
+	pathnode->path.parallel_workers = subpath->parallel_workers;
+	pathnode->path.pathkeys = NIL;	/* rows come back in no particular order */
+
+	pathnode->subpath = subpath;
+	pathnode->groupClause = groupClause;
+	pathnode->num_participants = nparticipants;
+
+	/*
+	 * Use several partitions per participant, so that the work evens out even
+	 * if the partitions differ in size or participants start late.  But every
+	 * (participant, partition) pair that sees any row costs a temporary file,
+	 * so do not split finer than the amount of data justifies: with few rows
+	 * one partition per participant will do.
+	 */
+	total_rows = compute_gather_rows(subpath);
+	pathnode->num_partitions =
+		Max(nparticipants,
+			Min(Min(4 * nparticipants, 64),
+				(int) Min(total_rows / REPARTITION_ROWS_PER_PARTITION, 64)));
+
+	/*
+	 * Each participant gets about as many rows back as it put in.  The cost,
+	 * including the I/O for the temporary partition files, is worked out by
+	 * cost_repartition().
+	 */
+	cost_repartition(pathnode, pathnode->num_partitions);
+
+	return pathnode;
+}
+
+/*
  * create_subqueryscan_path
  *	  Creates a path corresponding to a scan of a subquery,
  *	  returning the pathnode.

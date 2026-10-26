@@ -425,6 +425,8 @@
 
 #dbblue_enable_groupjoin = off		# dbblue: fuse a hash join with the
 					# GROUP BY above it (opt-in per session)
+#dbblue_enable_repartition_agg = off	# dbblue: finalize hash aggregates in
+					# parallel via a hash exchange
 #enable_async_append = on
 #enable_bitmapscan = on
 #enable_gathermerge = on

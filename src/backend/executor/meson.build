@@ -42,6 +42,7 @@ backend_sources += files(
   'nodeLimit.c',
   'nodeLockRows.c',
   'nodeMaterial.c',
+  'nodeRepartition.c',
   'nodeMemoize.c',
   'nodeMergeAppend.c',
   'nodeMergejoin.c',
