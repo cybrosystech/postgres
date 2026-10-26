@@ -630,6 +630,7 @@ static void addFkRecurseReferenced(Constraint *fkconstraint,
 								   bool old_check_ok,
 								   Oid parentDelTrigger, Oid parentUpdTrigger,
 								   bool with_period);
+static Oid	fkReferencedPartitionIndex(Relation partRel, Oid indexOid);
 static void addFkRecurseReferencing(List **wqueue, Constraint *fkconstraint,
 									Relation rel, Relation pkrel, Oid indexOid, Oid parentConstr,
 									int numfks, int16 *pkattnum, int16 *fkattnum,
@@ -783,8 +784,8 @@ static void validatePartitionedIndex(Relation partedIdx, Relation partedTbl);
 static void refuseDupeIndexAttach(Relation parentIdx, Relation partIdx,
 								  Relation partitionTbl);
 static void verifyPartitionIndexNotNull(IndexInfo *iinfo, Relation partition);
-static List *GetParentedForeignKeyRefs(Relation partition);
-static void ATDetachCheckNoForeignKeyRefs(Relation partition);
+static List *GetParentedForeignKeyRefs(Relation parent, Relation partition);
+static void ATDetachCheckNoForeignKeyRefs(Relation parent, Relation partition);
 static char GetAttributeCompression(Oid atttypid, const char *compression);
 static char GetAttributeStorage(Oid atttypid, const char *storagemode);
 
@@ -10142,7 +10143,7 @@ ATExecAddIndexConstraint(AlteredTableInfo *tab, Relation rel,
 
 	/* Extra checks needed if making primary key */
 	if (stmt->primary)
-		index_check_primary_key(rel, indexInfo, true, stmt);
+		index_check_primary_key(rel, indexInfo, true, stmt, false);
 
 	/* Note we currently don't support EXCLUSION constraints here */
 	if (stmt->primary)
@@ -11276,7 +11277,9 @@ addFkConstraint(addFkConstraintSides fkside,
  * fkconstraint: the constraint being added
  * rel: the root referencing relation
  * pkrel: the referenced relation; might be a partition, if recursing
- * indexOid: the OID of the index (on pkrel) implementing this constraint
+ * indexOid: the OID of the index (on pkrel) implementing this constraint;
+ *      for a partition, a global index on its parent (see
+ *      fkReferencedPartitionIndex)
  * parentConstr: the OID of a parent constraint; InvalidOid if this is a
  *      top-level constraint
  * numfks: the number of columns in the foreign key
@@ -11360,10 +11363,7 @@ addFkRecurseReferenced(Constraint *fkconstraint, Relation rel,
 				mapped_pkattnum = pkattnum;
 
 			/* Determine the index to use at this level */
-			partIndexId = index_get_partition(partRel, indexOid);
-			if (!OidIsValid(partIndexId))
-				elog(ERROR, "index for %u not found in partition %s",
-					 indexOid, RelationGetRelationName(partRel));
+			partIndexId = fkReferencedPartitionIndex(partRel, indexOid);
 
 			/* Create entry at this level ... */
 			address = addFkConstraint(addFkReferencedSide,
@@ -11392,6 +11392,41 @@ addFkRecurseReferenced(Constraint *fkconstraint, Relation rel,
 			}
 		}
 	}
+}
+
+/*
+ * fkReferencedPartitionIndex
+ *		Return the index to record in the referenced-side pg_constraint row of
+ *		a foreign key for partition partRel, given indexOid, the index of its
+ *		parent that the parent's row uses.
+ *
+ * That is normally the partition's own index attached to indexOid.  A DBblue
+ * global index has no per-partition counterparts: it is a single index on
+ * the parent that covers the rows of every partition, so the partition's row
+ * uses the global index itself.
+ */
+static Oid
+fkReferencedPartitionIndex(Relation partRel, Oid indexOid)
+{
+	HeapTuple	indexTuple;
+	bool		isglobal;
+	Oid			partIndexId;
+
+	indexTuple = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(indexOid));
+	if (!HeapTupleIsValid(indexTuple))
+		elog(ERROR, "cache lookup failed for index %u", indexOid);
+	isglobal = ((Form_pg_index) GETSTRUCT(indexTuple))->indglobal;
+	ReleaseSysCache(indexTuple);
+
+	if (isglobal)
+		return indexOid;
+
+	partIndexId = index_get_partition(partRel, indexOid);
+	if (!OidIsValid(partIndexId))
+		elog(ERROR, "index for %u not found in partition %s",
+			 indexOid, RelationGetRelationName(partRel));
+
+	return partIndexId;
 }
 
 /*
@@ -11779,10 +11814,7 @@ CloneFkReferenced(Relation parentRel, Relation partitionRel)
 		 * Because this new partition appears in the referenced side of the
 		 * constraint, we don't need to set up for Phase 3 check.
 		 */
-		partIndexId = index_get_partition(partitionRel, indexOid);
-		if (!OidIsValid(partIndexId))
-			elog(ERROR, "index for %u not found in partition %s",
-				 indexOid, RelationGetRelationName(partitionRel));
+		partIndexId = fkReferencedPartitionIndex(partitionRel, indexOid);
 
 		/*
 		 * Get the "action" triggers belonging to the constraint to pass as
@@ -14177,6 +14209,7 @@ transformFkeyGetPrimaryKey(Relation pkrel, Oid *indexOid,
 	Form_pg_index indexStruct = NULL;
 	Datum		indclassDatum;
 	oidvector  *indclass;
+	int			nkeys;
 	int			i;
 
 	/*
@@ -14233,10 +14266,13 @@ transformFkeyGetPrimaryKey(Relation pkrel, Oid *indexOid,
 
 	/*
 	 * Now build the list of PK attributes from the indkey definition (we
-	 * assume a primary key cannot have expressional elements)
+	 * assume a primary key cannot have expressional elements).  A DBblue
+	 * global index has the partition key as trailing routing columns, which
+	 * are not part of the primary key.
 	 */
 	*attnamelist = NIL;
-	for (i = 0; i < indexStruct->indnkeyatts; i++)
+	nkeys = IndexGlobalNumUserKeys(indexStruct);
+	for (i = 0; i < nkeys; i++)
 	{
 		int			pkattno = indexStruct->indkey.values[i];
 
@@ -14390,6 +14426,12 @@ transformFkeyCheckAttrs(Relation pkrel,
 	 * appear across partitions, referential actions are applied per leaf
 	 * partition and will misbehave.  This trade-off is accepted; see the
 	 * DBblue documentation.
+	 *
+	 * A DBblue global index needs none of this: it enforces uniqueness of
+	 * its user columns across all partitions, so it is matched on those
+	 * columns exactly like an index on a plain table.  Its trailing
+	 * partition key columns only route entries to partitions (see
+	 * IndexGlobalNumUserKeys) and are ignored here.
 	 */
 	bool		pk_is_partitioned = (pkrel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE);
 
@@ -14425,12 +14467,14 @@ transformFkeyCheckAttrs(Relation pkrel,
 	{
 		HeapTuple	indexTuple;
 		Form_pg_index indexStruct;
+		int			nkeys;
 
 		indexoid = lfirst_oid(indexoidscan);
 		indexTuple = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(indexoid));
 		if (!HeapTupleIsValid(indexTuple))
 			elog(ERROR, "cache lookup failed for index %u", indexoid);
 		indexStruct = (Form_pg_index) GETSTRUCT(indexTuple);
+		nkeys = IndexGlobalNumUserKeys(indexStruct);
 
 		/*
 		 * Must have the right number of columns (or, for non-temporal FKs on
@@ -14438,13 +14482,12 @@ transformFkeyCheckAttrs(Relation pkrel,
 		 * with every surplus column being a partition key column); must be
 		 * unique (or if temporal then exclusion instead) and not a partial
 		 * index; forget it if there are any expressions, too. Invalid indexes
-		 * are out as well, and so are global indexes, which have no
-		 * per-partition indexes to attach the foreign key to.
+		 * are out as well.  A global index counts its user columns only, and
+		 * gets no surplus-column relaxation: it is unique on exactly those.
 		 */
-		if (!indexStruct->indglobal &&
-			(indexStruct->indnkeyatts == numattrs ||
-			 (pk_is_partitioned && !with_period &&
-			  indexStruct->indnkeyatts > numattrs &&
+		if ((nkeys == numattrs ||
+			 (pk_is_partitioned && !with_period && !indexStruct->indglobal &&
+			  nkeys > numattrs &&
 			  dbblue_index_extras_are_partkey(partkey, indexStruct,
 											  numattrs, attnums))) &&
 			(with_period ? indexStruct->indisexclusion : indexStruct->indisunique) &&
@@ -14469,13 +14512,13 @@ transformFkeyCheckAttrs(Relation pkrel,
 			 * numattrs (verified above), so as attnums[] is duplicate-free
 			 * per the test at the start of this function, this is a
 			 * one-to-one match check.  For partitioned tables the index may
-			 * have extra partition key columns; we search all indnkeyatts
+			 * have extra partition key columns; we search all nkeys
 			 * positions to locate each FK column anywhere within the index.
 			 */
 			for (i = 0; i < numattrs; i++)
 			{
 				found = false;
-				for (j = 0; j < indexStruct->indnkeyatts; j++)
+				for (j = 0; j < nkeys; j++)
 				{
 					if (attnums[i] == indexStruct->indkey.values[j])
 					{
@@ -22181,7 +22224,7 @@ ATExecDetachPartition(List **wqueue, AlteredTableInfo *tab, Relation rel,
 	 * mode, it is critical that the partition appears as no longer attached
 	 * for the RI queries as soon as the first transaction commits.
 	 */
-	ATDetachCheckNoForeignKeyRefs(partRel);
+	ATDetachCheckNoForeignKeyRefs(rel, partRel);
 
 	/*
 	 * Concurrent mode has to work harder; first we add a new constraint to
@@ -22499,7 +22542,7 @@ DetachPartitionFinalize(Relation rel, Relation partRel, bool concurrent,
 	 * constraint have to be removed.  This partition is no longer part of the
 	 * key space of the constraint.
 	 */
-	foreach(cell, GetParentedForeignKeyRefs(partRel))
+	foreach(cell, GetParentedForeignKeyRefs(rel, partRel))
 	{
 		Oid			constrOid = lfirst_oid(cell);
 		ObjectAddress constraint;
@@ -23113,11 +23156,39 @@ verifyPartitionIndexNotNull(IndexInfo *iinfo, Relation partition)
 }
 
 /*
+ * Report whether rel has a DBblue global partition index.
+ */
+static bool
+relationHasGlobalIndex(Relation rel)
+{
+	List	   *indexoidlist = RelationGetIndexList(rel);
+	bool		result = false;
+
+	foreach_oid(indexoid, indexoidlist)
+	{
+		HeapTuple	indexTuple;
+
+		indexTuple = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(indexoid));
+		if (!HeapTupleIsValid(indexTuple))
+			elog(ERROR, "cache lookup failed for index %u", indexoid);
+		result = ((Form_pg_index) GETSTRUCT(indexTuple))->indglobal;
+		ReleaseSysCache(indexTuple);
+		if (result)
+			break;
+	}
+	list_free(indexoidlist);
+
+	return result;
+}
+
+/*
  * Return an OID list of constraints that reference the given relation
  * that are marked as having a parent constraints.
+ *
+ * parent is the partitioned table that partition belongs to.
  */
 static List *
-GetParentedForeignKeyRefs(Relation partition)
+GetParentedForeignKeyRefs(Relation parent, Relation partition)
 {
 	Relation	pg_constraint;
 	HeapTuple	tuple;
@@ -23127,11 +23198,14 @@ GetParentedForeignKeyRefs(Relation partition)
 
 	/*
 	 * If no indexes, or no columns are referenceable by FKs, we can avoid the
-	 * scan.
+	 * scan.  Not so if the parent has a global index: it backs foreign keys
+	 * referencing the partition without the partition having an index of its
+	 * own (see fkReferencedPartitionIndex).
 	 */
-	if (RelationGetIndexList(partition) == NIL ||
-		bms_is_empty(RelationGetIndexAttrBitmap(partition,
-												INDEX_ATTR_BITMAP_KEY)))
+	if ((RelationGetIndexList(partition) == NIL ||
+		 bms_is_empty(RelationGetIndexAttrBitmap(partition,
+												 INDEX_ATTR_BITMAP_KEY))) &&
+		!relationHasGlobalIndex(parent))
 		return NIL;
 
 	/* Search for constraints referencing this table */
@@ -23170,12 +23244,12 @@ GetParentedForeignKeyRefs(Relation partition)
  * referenced values exist.
  */
 static void
-ATDetachCheckNoForeignKeyRefs(Relation partition)
+ATDetachCheckNoForeignKeyRefs(Relation parent, Relation partition)
 {
 	List	   *constraints;
 	ListCell   *cell;
 
-	constraints = GetParentedForeignKeyRefs(partition);
+	constraints = GetParentedForeignKeyRefs(parent, partition);
 
 	foreach(cell, constraints)
 	{

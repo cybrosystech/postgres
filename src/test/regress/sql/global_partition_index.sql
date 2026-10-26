@@ -301,6 +301,61 @@ CLUSTER gpi_rx.t USING gpi_rx_d_idx;
 INSERT INTO gpi_rx.t VALUES (7, '2024-06-06');	-- fails
 DROP SCHEMA gpi_rx CASCADE;
 
+-- A PRIMARY KEY lacking the partition key is a global index too.  The
+-- constraint keeps the user's columns, so GROUP BY on it allows the other
+-- columns of the table, and foreign keys can reference it: each partition's
+-- constraint row uses the global index, as no partition has one of its own.
+CREATE TABLE gpi_pk (id int, name text, d date) PARTITION BY RANGE (d);
+CREATE TABLE gpi_pk_y2023 PARTITION OF gpi_pk FOR VALUES FROM ('2023-01-01') TO ('2024-01-01');
+CREATE TABLE gpi_pk_y2024 PARTITION OF gpi_pk FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+CREATE TABLE gpi_pk_def PARTITION OF gpi_pk DEFAULT;
+INSERT INTO gpi_pk VALUES (1, 'a', '2023-05-01'), (2, 'b', '2024-05-01'), (3, 'c', NULL);
+ALTER TABLE gpi_pk ADD PRIMARY KEY (id) DEFERRABLE;	-- fails
+ALTER TABLE gpi_pk ADD PRIMARY KEY (id);
+\d gpi_pk
+SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'gpi_pk_pkey';
+SELECT attname, attnotnull FROM pg_attribute
+WHERE attrelid = 'gpi_pk'::regclass AND attnum > 0 ORDER BY attnum;
+ALTER TABLE gpi_pk ADD PRIMARY KEY (id);	-- fails
+INSERT INTO gpi_pk VALUES (1, 'dup', '2024-06-01');	-- fails
+INSERT INTO gpi_pk VALUES (NULL, 'x', '2024-06-01');	-- fails
+SELECT p.id, p.name FROM gpi_pk p GROUP BY p.id ORDER BY count(*) DESC, p.name;
+CREATE VIEW gpi_pk_v AS SELECT p.id, p.name FROM gpi_pk p GROUP BY p.id;
+CREATE TABLE gpi_fk (id int PRIMARY KEY, pid int REFERENCES gpi_pk (id) ON DELETE CASCADE);
+CREATE TABLE gpi_fk2 (pid int REFERENCES gpi_pk ON DELETE RESTRICT);	-- the primary key
+ALTER TABLE gpi_pk ADD COLUMN parent int REFERENCES gpi_pk (id) ON DELETE SET NULL;
+SELECT conrelid::regclass, confrelid::regclass, conindid::regclass, conparentid <> 0 AS clone
+FROM pg_constraint WHERE contype = 'f' ORDER BY 1, 2;
+INSERT INTO gpi_fk VALUES (1, 1), (2, 2), (3, 3);
+INSERT INTO gpi_fk VALUES (4, 42);	-- fails
+INSERT INTO gpi_fk2 VALUES (1);
+UPDATE gpi_pk SET parent = 1 WHERE id = 2;
+DELETE FROM gpi_pk WHERE id = 1;	-- fails, gpi_fk2 restricts
+DELETE FROM gpi_fk2;
+DELETE FROM gpi_pk WHERE id = 1;
+SELECT * FROM gpi_fk ORDER BY id;
+SELECT id, parent FROM gpi_pk ORDER BY id;
+UPDATE gpi_pk SET id = 20 WHERE id = 2;	-- fails, still referenced
+UPDATE gpi_pk SET d = '2023-07-01' WHERE id = 2;	-- moves partitions
+-- a new or attached partition gets its constraint rows
+CREATE TABLE gpi_pk_y2025 PARTITION OF gpi_pk FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+SELECT conrelid::regclass, conindid::regclass FROM pg_constraint
+WHERE confrelid = 'gpi_pk_y2025'::regclass ORDER BY 1;
+INSERT INTO gpi_pk VALUES (5, 'e', '2025-02-01');
+INSERT INTO gpi_fk VALUES (5, 5);
+-- DETACH checks the references and drops the partition's constraint rows
+ALTER TABLE gpi_pk DETACH PARTITION gpi_pk_y2025;	-- fails
+DELETE FROM gpi_fk WHERE pid = 5;
+ALTER TABLE gpi_pk DETACH PARTITION gpi_pk_y2025;
+SELECT count(*) FROM pg_constraint WHERE confrelid = 'gpi_pk_y2025'::regclass;
+ALTER TABLE gpi_pk ATTACH PARTITION gpi_pk_y2025 FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+SELECT conrelid::regclass, conindid::regclass FROM pg_constraint
+WHERE confrelid = 'gpi_pk_y2025'::regclass ORDER BY 1;
+TRUNCATE gpi_pk_y2023;	-- fails
+ALTER TABLE gpi_pk DROP CONSTRAINT gpi_pk_pkey;	-- fails
+DROP VIEW gpi_pk_v;
+DROP TABLE gpi_fk, gpi_fk2, gpi_pk;
+
 DROP TABLE gpi;
 DROP FUNCTION gpi_check(regclass);
 DROP FUNCTION gpi_reset();

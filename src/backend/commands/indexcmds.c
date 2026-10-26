@@ -765,13 +765,13 @@ DefineIndex(ParseState *pstate,
 	partitioned = rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE;
 
 	/*
-	 * A plain UNIQUE index on a partitioned table must normally include the
-	 * partition key, otherwise uniqueness could only be enforced per
-	 * partition.  Applications such as Odoo issue "CREATE UNIQUE INDEX" or
-	 * "ALTER TABLE ... ADD CONSTRAINT ... UNIQUE" on tables that were
-	 * partitioned behind their back, so instead of failing we transparently
-	 * create such an index as a GLOBAL index, which enforces uniqueness
-	 * across all partitions.
+	 * A plain UNIQUE index or PRIMARY KEY on a partitioned table must
+	 * normally include the partition key, otherwise uniqueness could only be
+	 * enforced per partition.  Applications such as Odoo issue "CREATE
+	 * UNIQUE INDEX", "ALTER TABLE ... ADD CONSTRAINT ... UNIQUE" or "...
+	 * PRIMARY KEY" on tables that were partitioned behind their back, so
+	 * instead of failing we transparently create such an index as a GLOBAL
+	 * index, which enforces uniqueness across all partitions.
 	 */
 	if (partitioned && dbblue_auto_global_index && !global &&
 		!OidIsValid(parentIndexId) &&
@@ -779,8 +779,9 @@ DefineIndex(ParseState *pstate,
 	{
 		global = true;
 		ereport(NOTICE,
-				(errmsg("creating unique %s%s%s%s on partitioned table \"%s\" as a GLOBAL index",
-						stmt->isconstraint ? "constraint" : "index",
+				(errmsg("creating %s%s%s%s on partitioned table \"%s\" as a GLOBAL index",
+						stmt->primary ? "primary key" :
+						stmt->isconstraint ? "unique constraint" : "unique index",
 						stmt->idxname ? " \"" : "",
 						stmt->idxname ? stmt->idxname : "",
 						stmt->idxname ? "\"" : "",
@@ -811,16 +812,18 @@ DefineIndex(ParseState *pstate,
 								RelationGetRelationName(rel))));
 
 			/*
-			 * A global index can back a UNIQUE constraint, which then lives
-			 * on the parent only (there are no per-partition counterparts).
-			 * Its uniqueness is checked immediately after each insert, so it
-			 * cannot be deferrable, and it is not supported for PRIMARY KEY
-			 * or EXCLUDE constraints.
+			 * A global index can back a UNIQUE or PRIMARY KEY constraint,
+			 * which then lives on the parent only (there are no per-partition
+			 * counterparts).  A primary key keeps its user-specified columns
+			 * (pg_constraint.conkey excludes the routing columns appended
+			 * below), so e.g. "GROUP BY id" can rely on it.  Its uniqueness
+			 * is checked immediately after each insert, so it cannot be
+			 * deferrable, and it is not supported for EXCLUDE constraints.
 			 */
-			if (stmt->primary || exclusion)
+			if (exclusion)
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("global indexes cannot be used for PRIMARY KEY or EXCLUDE constraints")));
+						 errmsg("global indexes cannot be used for EXCLUDE constraints")));
 			if (stmt->deferrable)
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -1124,7 +1127,8 @@ DefineIndex(ParseState *pstate,
 	 * Extra checks when creating a PRIMARY KEY index.
 	 */
 	if (stmt->primary)
-		index_check_primary_key(rel, indexInfo, is_alter_table, stmt);
+		index_check_primary_key(rel, indexInfo, is_alter_table, stmt,
+								partitioned && global);
 
 	/*
 	 * If this table is partitioned and we're creating a unique index, primary
@@ -2033,9 +2037,9 @@ DefineIndex(ParseState *pstate,
  *		Decide whether a UNIQUE index about to be created on partitioned table
  *		'rel' should automatically be created as a GLOBAL index.
  *
- * That is the case for a btree UNIQUE index or non-deferrable UNIQUE
- * constraint whose key columns do not contain the partition key column,
- * which would otherwise be rejected.  Only single-column RANGE partition keys
+ * That is the case for a btree UNIQUE index or non-deferrable UNIQUE or
+ * PRIMARY KEY constraint whose key columns do not contain the partition key
+ * column, which would otherwise be rejected.  Only single-column RANGE partition keys
  * on a plain column are handled, as that is what global index routing
  * supports.
  */
@@ -2045,7 +2049,7 @@ UniqueIndexNeedsGlobal(Relation rel, const IndexStmt *stmt, bool exclusion)
 	PartitionKey key;
 	const char *partattname;
 
-	if (!stmt->unique || stmt->primary || stmt->deferrable || exclusion)
+	if (!stmt->unique || stmt->deferrable || exclusion)
 		return false;
 
 	/*

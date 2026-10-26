@@ -212,14 +212,21 @@ relationHasPrimaryKey(Relation rel)
  *
  * Caller had better have at least ShareLock on the table, else the not-null
  * checking isn't trustworthy.
+ *
+ * isglobal is true for a DBblue global partition index, whose trailing key
+ * columns are the partition key, appended for routing (see
+ * IndexGlobalNumUserKeys).  They are not part of the primary key, so only
+ * the leading, user-specified columns have to be NOT NULL.
  */
 void
 index_check_primary_key(Relation heapRel,
 						const IndexInfo *indexInfo,
 						bool is_alter_table,
-						const IndexStmt *stmt)
+						const IndexStmt *stmt,
+						bool isglobal)
 {
 	int			i;
+	int			nkeyatts = indexInfo->ii_NumIndexKeyAttrs;
 
 	/*
 	 * If ALTER TABLE or CREATE TABLE .. PARTITION OF, check that there isn't
@@ -254,7 +261,10 @@ index_check_primary_key(Relation heapRel,
 	 * null.  (We don't really expect to see that; it'd mean the parser messed
 	 * up.  But it seems wise to check anyway.)
 	 */
-	for (i = 0; i < indexInfo->ii_NumIndexKeyAttrs; i++)
+	if (isglobal)
+		nkeyatts -= RelationGetPartitionKey(heapRel)->partnatts;
+
+	for (i = 0; i < nkeyatts; i++)
 	{
 		AttrNumber	attnum = indexInfo->ii_IndexAttrNumbers[i];
 		HeapTuple	atttuple;

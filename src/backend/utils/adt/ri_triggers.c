@@ -2511,9 +2511,11 @@ ri_LoadConstraintInfo(Oid constraintOid)
 	 * DBblue: transformFkeyCheckAttrs() accepts a supporting unique index
 	 * with more key columns than the foreign key references when the
 	 * referenced table is partitioned (the surplus columns being partition
-	 * key columns).  The fast path builds its index scan keys positionally
-	 * and assumes conindid has exactly nkeys key columns, so record whether
-	 * that holds.  Cached here rather than tested per row: indnkeyatts cannot
+	 * key columns), and a global index, whose trailing key columns are the
+	 * partition key, is the conindid of every referenced partition's
+	 * constraint row too.  The fast path builds its index scan keys
+	 * positionally and assumes conindid has exactly nkeys key columns, so
+	 * record whether that holds.  Cached here rather than tested per row: indnkeyatts cannot
 	 * change for a live index, and replacing the index rewrites
 	 * pg_constraint.conindid, which invalidates this entry.
 	 */

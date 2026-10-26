@@ -63,7 +63,8 @@ typedef struct ValidateIndexState
 extern void index_check_primary_key(Relation heapRel,
 									const IndexInfo *indexInfo,
 									bool is_alter_table,
-									const IndexStmt *stmt);
+									const IndexStmt *stmt,
+									bool isglobal);
 
 #define	INDEX_CREATE_IS_PRIMARY				(1 << 0)
 #define	INDEX_CREATE_ADD_CONSTRAINT			(1 << 1)

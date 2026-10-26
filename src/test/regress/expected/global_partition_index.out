@@ -578,6 +578,170 @@ ERROR:  duplicate key value violates unique constraint "gpi_rx_id_key"
 DETAIL:  Key (id)=(7) already exists.
 DROP SCHEMA gpi_rx CASCADE;
 NOTICE:  drop cascades to table gpi_rx.t
+-- A PRIMARY KEY lacking the partition key is a global index too.  The
+-- constraint keeps the user's columns, so GROUP BY on it allows the other
+-- columns of the table, and foreign keys can reference it: each partition's
+-- constraint row uses the global index, as no partition has one of its own.
+CREATE TABLE gpi_pk (id int, name text, d date) PARTITION BY RANGE (d);
+CREATE TABLE gpi_pk_y2023 PARTITION OF gpi_pk FOR VALUES FROM ('2023-01-01') TO ('2024-01-01');
+CREATE TABLE gpi_pk_y2024 PARTITION OF gpi_pk FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+CREATE TABLE gpi_pk_def PARTITION OF gpi_pk DEFAULT;
+INSERT INTO gpi_pk VALUES (1, 'a', '2023-05-01'), (2, 'b', '2024-05-01'), (3, 'c', NULL);
+ALTER TABLE gpi_pk ADD PRIMARY KEY (id) DEFERRABLE;	-- fails
+ERROR:  PRIMARY KEY constraint on partitioned table must include all partitioning columns
+DETAIL:  PRIMARY KEY constraint on table "gpi_pk" lacks column "d" which is part of the partition key.
+ALTER TABLE gpi_pk ADD PRIMARY KEY (id);
+NOTICE:  creating primary key on partitioned table "gpi_pk" as a GLOBAL index
+DETAIL:  The index does not include the partition key, so uniqueness is enforced across all partitions by a global index.
+HINT:  Set "dbblue_auto_global_index" to off to get the standard error instead.
+\d gpi_pk
+         Partitioned table "public.gpi_pk"
+ Column |  Type   | Collation | Nullable | Default 
+--------+---------+-----------+----------+---------
+ id     | integer |           | not null | 
+ name   | text    |           |          | 
+ d      | date    |           |          | 
+Partition key: RANGE (d)
+Indexes:
+    "gpi_pk_pkey" PRIMARY KEY, btree (id) GLOBAL
+Number of partitions: 3 (Use \d+ to list them.)
+
+SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'gpi_pk_pkey';
+ pg_get_constraintdef 
+----------------------
+ PRIMARY KEY (id)
+(1 row)
+
+SELECT attname, attnotnull FROM pg_attribute
+WHERE attrelid = 'gpi_pk'::regclass AND attnum > 0 ORDER BY attnum;
+ attname | attnotnull 
+---------+------------
+ id      | t
+ name    | f
+ d       | f
+(3 rows)
+
+ALTER TABLE gpi_pk ADD PRIMARY KEY (id);	-- fails
+NOTICE:  creating primary key on partitioned table "gpi_pk" as a GLOBAL index
+DETAIL:  The index does not include the partition key, so uniqueness is enforced across all partitions by a global index.
+HINT:  Set "dbblue_auto_global_index" to off to get the standard error instead.
+ERROR:  multiple primary keys for table "gpi_pk" are not allowed
+INSERT INTO gpi_pk VALUES (1, 'dup', '2024-06-01');	-- fails
+ERROR:  duplicate key value violates unique constraint "gpi_pk_pkey"
+DETAIL:  Key (id)=(1) already exists.
+INSERT INTO gpi_pk VALUES (NULL, 'x', '2024-06-01');	-- fails
+ERROR:  null value in column "id" of relation "gpi_pk_y2024" violates not-null constraint
+DETAIL:  Failing row contains (null, x, 06-01-2024).
+SELECT p.id, p.name FROM gpi_pk p GROUP BY p.id ORDER BY count(*) DESC, p.name;
+ id | name 
+----+------
+  1 | a
+  2 | b
+  3 | c
+(3 rows)
+
+CREATE VIEW gpi_pk_v AS SELECT p.id, p.name FROM gpi_pk p GROUP BY p.id;
+CREATE TABLE gpi_fk (id int PRIMARY KEY, pid int REFERENCES gpi_pk (id) ON DELETE CASCADE);
+CREATE TABLE gpi_fk2 (pid int REFERENCES gpi_pk ON DELETE RESTRICT);	-- the primary key
+ALTER TABLE gpi_pk ADD COLUMN parent int REFERENCES gpi_pk (id) ON DELETE SET NULL;
+SELECT conrelid::regclass, confrelid::regclass, conindid::regclass, conparentid <> 0 AS clone
+FROM pg_constraint WHERE contype = 'f' ORDER BY 1, 2;
+   conrelid   |  confrelid   |  conindid   | clone 
+--------------+--------------+-------------+-------
+ gpi_pk       | gpi_pk       | gpi_pk_pkey | f
+ gpi_pk       | gpi_pk_y2023 | gpi_pk_pkey | t
+ gpi_pk       | gpi_pk_y2024 | gpi_pk_pkey | t
+ gpi_pk       | gpi_pk_def   | gpi_pk_pkey | t
+ gpi_pk_y2023 | gpi_pk       | gpi_pk_pkey | t
+ gpi_pk_y2024 | gpi_pk       | gpi_pk_pkey | t
+ gpi_pk_def   | gpi_pk       | gpi_pk_pkey | t
+ gpi_fk       | gpi_pk       | gpi_pk_pkey | f
+ gpi_fk       | gpi_pk_y2023 | gpi_pk_pkey | t
+ gpi_fk       | gpi_pk_y2024 | gpi_pk_pkey | t
+ gpi_fk       | gpi_pk_def   | gpi_pk_pkey | t
+ gpi_fk2      | gpi_pk       | gpi_pk_pkey | f
+ gpi_fk2      | gpi_pk_y2023 | gpi_pk_pkey | t
+ gpi_fk2      | gpi_pk_y2024 | gpi_pk_pkey | t
+ gpi_fk2      | gpi_pk_def   | gpi_pk_pkey | t
+(15 rows)
+
+INSERT INTO gpi_fk VALUES (1, 1), (2, 2), (3, 3);
+INSERT INTO gpi_fk VALUES (4, 42);	-- fails
+ERROR:  insert or update on table "gpi_fk" violates foreign key constraint "gpi_fk_pid_fkey"
+DETAIL:  Key (pid)=(42) is not present in table "gpi_pk".
+INSERT INTO gpi_fk2 VALUES (1);
+UPDATE gpi_pk SET parent = 1 WHERE id = 2;
+DELETE FROM gpi_pk WHERE id = 1;	-- fails, gpi_fk2 restricts
+ERROR:  update or delete on table "gpi_pk_y2023" violates RESTRICT setting of foreign key constraint "gpi_fk2_pid_fkey_1" on table "gpi_fk2"
+DETAIL:  Key (id)=(1) is referenced from table "gpi_fk2".
+DELETE FROM gpi_fk2;
+DELETE FROM gpi_pk WHERE id = 1;
+SELECT * FROM gpi_fk ORDER BY id;
+ id | pid 
+----+-----
+  2 |   2
+  3 |   3
+(2 rows)
+
+SELECT id, parent FROM gpi_pk ORDER BY id;
+ id | parent 
+----+--------
+  2 |       
+  3 |       
+(2 rows)
+
+UPDATE gpi_pk SET id = 20 WHERE id = 2;	-- fails, still referenced
+ERROR:  update or delete on table "gpi_pk_y2024" violates foreign key constraint "gpi_fk_pid_fkey_2" on table "gpi_fk"
+DETAIL:  Key (id)=(2) is still referenced from table "gpi_fk".
+UPDATE gpi_pk SET d = '2023-07-01' WHERE id = 2;	-- moves partitions
+-- a new or attached partition gets its constraint rows
+CREATE TABLE gpi_pk_y2025 PARTITION OF gpi_pk FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+SELECT conrelid::regclass, conindid::regclass FROM pg_constraint
+WHERE confrelid = 'gpi_pk_y2025'::regclass ORDER BY 1;
+ conrelid |  conindid   
+----------+-------------
+ gpi_pk   | gpi_pk_pkey
+ gpi_fk   | gpi_pk_pkey
+ gpi_fk2  | gpi_pk_pkey
+(3 rows)
+
+INSERT INTO gpi_pk VALUES (5, 'e', '2025-02-01');
+INSERT INTO gpi_fk VALUES (5, 5);
+-- DETACH checks the references and drops the partition's constraint rows
+ALTER TABLE gpi_pk DETACH PARTITION gpi_pk_y2025;	-- fails
+ERROR:  removing partition "gpi_pk_y2025" violates foreign key constraint "gpi_fk_pid_fkey_4"
+DETAIL:  Key (pid)=(5) is still referenced from table "gpi_fk".
+DELETE FROM gpi_fk WHERE pid = 5;
+ALTER TABLE gpi_pk DETACH PARTITION gpi_pk_y2025;
+SELECT count(*) FROM pg_constraint WHERE confrelid = 'gpi_pk_y2025'::regclass;
+ count 
+-------
+     0
+(1 row)
+
+ALTER TABLE gpi_pk ATTACH PARTITION gpi_pk_y2025 FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+SELECT conrelid::regclass, conindid::regclass FROM pg_constraint
+WHERE confrelid = 'gpi_pk_y2025'::regclass ORDER BY 1;
+ conrelid |  conindid   
+----------+-------------
+ gpi_pk   | gpi_pk_pkey
+ gpi_fk   | gpi_pk_pkey
+ gpi_fk2  | gpi_pk_pkey
+(3 rows)
+
+TRUNCATE gpi_pk_y2023;	-- fails
+ERROR:  cannot truncate a table referenced in a foreign key constraint
+DETAIL:  Table "gpi_pk" references "gpi_pk_y2023".
+HINT:  Truncate table "gpi_pk" at the same time, or use TRUNCATE ... CASCADE.
+ALTER TABLE gpi_pk DROP CONSTRAINT gpi_pk_pkey;	-- fails
+ERROR:  cannot drop constraint gpi_pk_pkey on table gpi_pk because other objects depend on it
+DETAIL:  constraint gpi_fk_pid_fkey on table gpi_fk depends on index gpi_pk_pkey
+constraint gpi_fk2_pid_fkey on table gpi_fk2 depends on index gpi_pk_pkey
+constraint gpi_pk_parent_fkey on table gpi_pk depends on index gpi_pk_pkey
+view gpi_pk_v depends on constraint gpi_pk_pkey on table gpi_pk
+HINT:  Use DROP ... CASCADE to drop the dependent objects too.
+DROP VIEW gpi_pk_v;
+DROP TABLE gpi_fk, gpi_fk2, gpi_pk;
 DROP TABLE gpi;
 DROP FUNCTION gpi_check(regclass);
 DROP FUNCTION gpi_reset();
