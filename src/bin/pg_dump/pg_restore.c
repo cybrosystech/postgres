@@ -540,9 +540,15 @@ main(int argc, char **argv)
 		else
 			numWorkers = 1;
 
+		/*
+		 * Report this even without --verbose, so the user can see that
+		 * parallelism was picked for them.  pg_log_info() would be filtered
+		 * out at pg_restore's default log level, and pg_log_warning() would
+		 * misleadingly label it a warning.
+		 */
 		if (numWorkers > 1)
-			pg_log_info("restoring with %d parallel jobs; use -j/--jobs to choose a different number",
-						numWorkers);
+			fprintf(stderr, _("%s: restoring with %d parallel jobs; use -j/--jobs to choose a different number\n"),
+					progname, numWorkers);
 	}
 
 	AH->numWorkers = numWorkers;
