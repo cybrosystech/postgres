@@ -14,8 +14,9 @@
  *      and written, along with the primary's unix_socket_directories,
  *      hot_standby_feedback = on and dbblue_create_standby = off, to the
  *      standby's postgresql.auto.conf.
- *   3. The standby is started with pg_ctl, and the chosen port is
- *      reported in the server log and written to
+ *   3. The standby is started with pg_ctl on the primary's configuration
+ *      files (which need not live in the copied data directory), and the
+ *      chosen port is reported in the server log and written to
  *      <DataDir>/dbblue_standby.port so tooling (e.g. an odoo.conf
  *      generator setting db_replica_port) can pick it up.
  *
@@ -66,6 +67,7 @@
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "utils/guc.h"
+#include "utils/varlena.h"
 #include "utils/wait_event.h"
 
 /* GUC-backed variables (real values come from guc_parameters.dat). */
@@ -838,6 +840,38 @@ run_shell(const char *cmd, const char *logfile, const char *what)
 }
 
 /*
+ * replication_host
+ *		Host the client programs we run against ourselves connect to: our
+ *		first Unix socket directory, or localhost if we have none.
+ *
+ * The socket gets the "local replication" entry of pg_hba.conf, which is
+ * peer both with initdb's defaults and with Debian's pg_createcluster.  The
+ * latter makes TCP replication connections ask for a password, which -w
+ * cannot supply.  pg_basebackup -R copies this host into the standby's
+ * primary_conninfo, so the standby streams over the same socket.  Result is
+ * palloc'd.
+ */
+static char *
+replication_host(void)
+{
+	char	   *host = NULL;
+
+	if (Unix_socket_directories != NULL && Unix_socket_directories[0] != '\0')
+	{
+		char	   *rawstring = pstrdup(Unix_socket_directories);
+		List	   *elemlist;
+
+		if (SplitDirectoriesString(rawstring, ',', &elemlist) &&
+			elemlist != NIL)
+			host = pstrdup((char *) linitial(elemlist));
+		list_free_deep(elemlist);
+		pfree(rawstring);
+	}
+
+	return host ? host : pstrdup("localhost");
+}
+
+/*
  * replication_conn_opts
  *		Connection options for the client programs we run against ourselves
  *		(pg_basebackup, pg_receivewal).  An empty dbblue_standby_user means
@@ -847,16 +881,82 @@ run_shell(const char *cmd, const char *logfile, const char *what)
 static char *
 replication_conn_opts(void)
 {
+	char	   *host = replication_host();
+	char	   *qhost = shell_quote(host);
 	char	   *quser;
 	char	   *opts;
 
 	if (dbblue_standby_user == NULL || dbblue_standby_user[0] == '\0')
-		return psprintf("-h localhost -p %d", PostPortNumber);
+		opts = psprintf("-h %s -p %d", qhost, PostPortNumber);
+	else
+	{
+		quser = shell_quote(dbblue_standby_user);
+		opts = psprintf("-h %s -p %d -U %s", qhost, PostPortNumber, quser);
+		pfree(quser);
+	}
 
-	quser = shell_quote(dbblue_standby_user);
-	opts = psprintf("-h localhost -p %d -U %s", PostPortNumber, quser);
-	pfree(quser);
+	pfree(qhost);
+	pfree(host);
 	return opts;
+}
+
+/*
+ * standby_server_opts
+ *		Server options pg_ctl passes to the standby's postgres, already quoted
+ *		for the shell pg_ctl starts it through.  Result is palloc'd.
+ *
+ * pg_basebackup copies only the data directory, so the standby gets our
+ * configuration files only where initdb leaves them, inside it.  Debian's
+ * pg_createcluster moves them to /etc/postgresql/<version>/<cluster>, and
+ * a standby started on the bare copy fails for want of postgresql.conf.  So
+ * the standby is pointed at our own files, which also keeps the settings it
+ * must match, such as max_connections, in step with ours.  What it sets
+ * differently, port and the like, is in its postgresql.auto.conf, which
+ * overrides postgresql.conf; see write_standby_settings().
+ *
+ * Such a postgresql.conf names our data directory in data_directory, and our
+ * PID file in external_pid_file.  Both are overridden here, as options on the
+ * command line take precedence over the file.  The standby's PID file goes
+ * next to its log, "<dir>.pid"; it cannot be cleared instead, as postgres
+ * tries to write even an empty external_pid_file.
+ */
+static char *
+standby_server_opts(const char *dir)
+{
+	StringInfoData buf;
+	char	   *pidfile = NULL;
+
+	if (external_pid_file != NULL && external_pid_file[0] != '\0')
+		pidfile = psprintf("%s.pid", dir);
+
+	{
+		const char *const settings[][2] = {
+			{"config_file", ConfigFileName},
+			{"hba_file", HbaFileName},
+			{"ident_file", IdentFileName},
+			{"data_directory", dir},
+			{"external_pid_file", pidfile},
+		};
+
+		initStringInfo(&buf);
+		for (int i = 0; i < lengthof(settings); i++)
+		{
+			char	   *qvalue;
+
+			/* nothing to override */
+			if (settings[i][1] == NULL)
+				continue;
+
+			qvalue = shell_quote(settings[i][1]);
+			appendStringInfo(&buf, "%s-c %s=%s", buf.len > 0 ? " " : "",
+							 settings[i][0], qvalue);
+			pfree(qvalue);
+		}
+	}
+
+	if (pidfile)
+		pfree(pidfile);
+	return buf.data;
 }
 
 /*
@@ -1324,8 +1424,13 @@ run_standby_tick(void)
 	qdir = shell_quote(dir);
 	{
 		char	   *qlog = shell_quote(logfile);
+		char	   *opts = standby_server_opts(dir);
+		char	   *qopts = shell_quote(opts);
 
-		cmd = psprintf("%s -D %s -l %s -w -t 60 start", qbin, qdir, qlog);
+		cmd = psprintf("%s -D %s -l %s -o %s -w -t 60 start",
+					   qbin, qdir, qlog, qopts);
+		pfree(qopts);
+		pfree(opts);
 		pfree(qlog);
 	}
 
