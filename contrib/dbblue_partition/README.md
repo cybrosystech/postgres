@@ -115,23 +115,41 @@ so when that applies.
 These are deliberate and inherent to PostgreSQL partitioning; do not "fix"
 them here.
 
-1. **The PK widens to `(id, create_date)`.**  PostgreSQL requires every
-   unique index on a partitioned table to include the partition key.
-   Odoo's single-column FKs (`REFERENCES sale_order(id)`) keep working
-   thanks to a DBblue core patch (`transformFkeyCheckAttrs()` accepts a
-   unique index whose *only* surplus columns are partition key columns),
-   but the FK is then backed by a non-unique key: **if duplicate ids ever
-   appear across partitions, referential actions misbehave** (`ON DELETE
-   CASCADE` can delete children whose parent still exists).  Odoo draws id
-   from a sequence, so this does not happen in normal operation.  Run this
-   after migrations, `setval()` changes, or restores:
+1. **The PK stays `(id)`, as a GLOBAL index** (since 1.3).  PostgreSQL
+   requires every unique index on a partitioned table to include the
+   partition key; a DBblue global index is exempt, because it is one btree
+   over all partitions and enforces `id` across them.  So:
+
+   - Odoo's `GROUP BY <table>.id` queries that also select or order by other
+     columns of the table keep working (PostgreSQL accepts those only when
+     the GROUP BY covers the *whole* primary key);
+   - Odoo's single-column FKs (`REFERENCES sale_order(id)`) are backed by a
+     real unique key;
+   - a duplicate `id` is rejected, whichever partition it would land in.
+
+   Beside it the conversion creates `<table>_pklocal`, a plain partitioned
+   index on `(id)`.  The planner does not use a global index to find rows a
+   statement locks, updates or deletes, so without it every FK check and
+   every `UPDATE`/`DELETE ... WHERE id = ...` would scan whole partitions.
+
+   The partitions have no primary key of their own.  For that reason the PK
+   still **widens to `(id, create_date)`** (with a WARNING naming the reason)
+   when the table is UNLOGGED, is published for logical replication without
+   `REPLICA IDENTITY FULL`, or uses `REPLICA IDENTITY USING INDEX`.  The
+   widened key is unique per partition only; Odoo's FKs keep working thanks
+   to a DBblue core patch (`transformFkeyCheckAttrs()` accepts a unique index
+   whose *only* surplus columns are partition key columns), but **if
+   duplicate ids ever appear across partitions, referential actions
+   misbehave**, and `GROUP BY id` queries selecting other columns fail.  For
+   such tables run this after migrations, `setval()` changes, or restores:
 
    ```sql
    SELECT id, count(*) FROM <table> GROUP BY id HAVING count(*) > 1;
    ```
 
-   The real fix is global indexes — see the `feature/global_partition_index`
-   branch.
+   Tables converted before 1.3 keep their widened key.  To switch one to a
+   global key while its backup still exists, run `dbblue_partition_undo()`
+   and convert it again.
 
 2. **UNIQUE constraints without the partition column become per-partition.**
    They are applied to every partition through pg_partman's template table
@@ -163,7 +181,9 @@ them here.
 5. **Odoo's `DROP NOT NULL` on the partition key is ignored** (WARNING
    instead of error) by a DBblue core patch in `ATExecDropNotNull()`,
    because Odoo issues it unconditionally for non-required fields and the
-   column must stay NOT NULL as part of the PK.  The catalog is never
+   column must stay NOT NULL as part of the PK (a global PK index carries
+   the partition key as a trailing routing column, so this holds for it
+   too; pg_partman needs the control column NOT NULL as well).  The catalog is never
    falsified — the statement is declined, not faked.
 
 6. **Odoo ORM recognition** — no longer a trade-off.  Older Odoo releases

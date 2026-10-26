@@ -153,6 +153,38 @@ ALTER TABLE sale_order ALTER COLUMN create_date DROP NOT NULL;
 SELECT attnotnull FROM pg_attribute
 WHERE attrelid = 'sale_order'::regclass AND attname = 'create_date';
 
+-- 1.3: the primary key stays (id), as a global index
+SELECT pg_get_constraintdef(c.oid) AS pk, i.indglobal
+FROM pg_constraint c JOIN pg_index i ON i.indexrelid = c.conindid
+WHERE c.conrelid = 'sale_order'::regclass AND c.contype = 'p';
+-- ... so Odoo's GROUP BY id may select other columns of the table
+SELECT so.id, so.name FROM sale_order so
+GROUP BY so.id ORDER BY count(*) DESC, so.id LIMIT 2;
+-- ... and id is unique across partitions
+INSERT INTO sale_order (id, name, partner_id, company_id, amount, create_date)
+    VALUES (1, 'SO-dupid', 2, 1, 1, timestamp '2024-02-02');
+-- the batched data move filled the global index (index and heap agree)
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT count(*) AS via_global_pk FROM sale_order WHERE id > 0;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+SELECT count(*) AS via_heap FROM sale_order;
+-- the incoming FK is backed by the global primary key
+SELECT conindid::regclass FROM pg_constraint
+WHERE conname = 'sale_order_line_order_id_fkey' AND conrelid = 'sale_order_line'::regclass;
+-- foreign key checks and writes by id find rows through the per-partition
+-- index beside it, on every partition
+SELECT (SELECT count(*) FROM pg_inherits WHERE inhparent = 'sale_order'::regclass) =
+       (SELECT count(*) FROM pg_inherits WHERE inhparent = 'sale_order_pklocal'::regclass)
+       AS every_partition_indexed;
+SET enable_seqscan = off;
+EXPLAIN (COSTS OFF)
+SELECT 1 FROM sale_order x
+WHERE id = 7 AND create_date >= '2025-01-01' AND create_date < '2025-01-02'
+FOR KEY SHARE OF x;
+RESET enable_seqscan;
+
 -- backup guarded, then dropped
 SELECT dbblue_partition_drop_backup('sale.order');
 SELECT backup_exists FROM dbblue_partition_status('sale.order');
