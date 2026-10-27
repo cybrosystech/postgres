@@ -51,8 +51,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
+#include "catalog/pg_authid.h"
 #include "catalog/pg_control.h"
 #include "lib/stringinfo.h"
 #include "libpq/pqsignal.h"
@@ -66,7 +68,10 @@
 #include "replication/slot.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
+#include "utils/builtins.h"
 #include "utils/guc.h"
+#include "utils/guc_hooks.h"
+#include "utils/syscache.h"
 #include "utils/varlena.h"
 #include "utils/wait_event.h"
 
@@ -122,18 +127,18 @@ typedef enum
 static int	consecutive_failures = 0;
 
 /*
- * resolve_standby_directory
- *		Return a palloc'd absolute path for the standby data directory.
+ * standby_directory_path
+ *		Return a palloc'd absolute path for the standby data directory named
+ *		by the setting value dir.
  *
- * An empty dbblue_standby_directory means "<DataDir>_standby".  Relative
- * paths are interpreted against the parent directory of DataDir, so the
- * standby never ends up inside the primary's data directory (which would
- * bloat every future base backup).
+ * An empty value means "<DataDir>_standby".  Relative paths are interpreted
+ * against the parent directory of DataDir, so the standby never ends up
+ * inside the primary's data directory (which would bloat every future base
+ * backup).
  */
 static char *
-resolve_standby_directory(void)
+standby_directory_path(const char *dir)
 {
-	const char *dir = dbblue_standby_directory;
 	char		parent[MAXPGPATH];
 	char	   *result;
 
@@ -148,16 +153,43 @@ resolve_standby_directory(void)
 		result = psprintf("%s/%s", parent, dir);
 	}
 
+	canonicalize_path(result);
+	return result;
+}
+
+/*
+ * resolve_standby_directory
+ *		Return a palloc'd absolute path for the standby data directory.
+ */
+static char *
+resolve_standby_directory(void)
+{
+	char	   *result = standby_directory_path(dbblue_standby_directory);
+
 	/*
 	 * Validate path length: must leave room for suffixes like "/PG_VERSION",
 	 * "/postgresql.auto.conf", "/postmaster.pid", etc. Reserve 32 bytes.
 	 */
 	if (strlen(result) >= MAXPGPATH - 32)
 	{
-		ereport(ERROR,
+		ereport(WARNING,
 				(errmsg("dbblue create standby: directory path is too long (exceeds %d bytes)",
 						MAXPGPATH - 32),
 				 errdetail("Path: %s", result)));
+		pfree(result);
+		return NULL;
+	}
+
+	/*
+	 * check_dbblue_standby_directory() refuses this for ALTER SYSTEM, but
+	 * not for a value read from the configuration file.
+	 */
+	if (path_is_prefix_of_path(DataDir, result))
+	{
+		ereport(WARNING,
+				(errmsg("dbblue create standby: directory \"%s\" is the data directory of this server or lies inside it",
+						result),
+				 errhint("Point dbblue_standby_directory elsewhere.")));
 		pfree(result);
 		return NULL;
 	}
@@ -217,6 +249,41 @@ standby_has_data(const char *dir)
 
 	snprintf(path, sizeof(path), "%s/PG_VERSION", dir);
 	return (stat(path, &st) == 0 && S_ISREG(st.st_mode));
+}
+
+/*
+ * standby_dir_is_empty
+ *		Set *empty to whether dir, which exists, holds nothing pg_basebackup
+ *		would refuse to write over.  Returns false, with errno set, if dir
+ *		cannot be read.
+ *
+ * A lone pg_tde directory counts as empty: it is our own seed from an
+ * attempt that died before pg_basebackup could clean up, and
+ * seed_standby_tde_dir() replaces it.
+ */
+static bool
+standby_dir_is_empty(const char *dir, bool *empty)
+{
+	DIR		   *d;
+	struct dirent *de;
+
+	d = opendir(dir);
+	if (d == NULL)
+		return false;
+
+	*empty = true;
+	while ((de = readdir(d)) != NULL)
+	{
+		if (strcmp(de->d_name, ".") != 0 &&
+			strcmp(de->d_name, "..") != 0 &&
+			strcmp(de->d_name, DBBLUE_TDE_DIR) != 0)
+		{
+			*empty = false;
+			break;
+		}
+	}
+	closedir(d);
+	return true;
 }
 
 /*
@@ -1245,36 +1312,13 @@ run_standby_tick(void)
 		 * pg_basebackup would fail on it anyway if non-empty, and we must
 		 * never guess about deleting an operator's data.
 		 */
-		if (stat(dir, &st) == 0 && !standby_has_data(dir))
+		if (stat(dir, &st) == 0)
 		{
 			/* an empty directory is fine, pg_basebackup accepts it */
-			DIR		   *d = opendir(dir);
-			bool		empty = true;
+			bool		empty;
 
-			if (d != NULL)
+			if (!standby_dir_is_empty(dir, &empty))
 			{
-				struct dirent *de;
-
-				while ((de = readdir(d)) != NULL)
-				{
-					/*
-					 * A lone pg_tde directory is our own seed from an
-					 * attempt that died before pg_basebackup could clean
-					 * up; seed_standby_tde_dir() replaces it.
-					 */
-					if (strcmp(de->d_name, ".") != 0 &&
-						strcmp(de->d_name, "..") != 0 &&
-						strcmp(de->d_name, DBBLUE_TDE_DIR) != 0)
-					{
-						empty = false;
-						break;
-					}
-				}
-				closedir(d);
-			}
-			else
-			{
-				/* opendir failed - report the error clearly */
 				ereport(WARNING,
 						(errcode_for_file_access(),
 						 errmsg("dbblue create standby: could not read directory \"%s\": %m",
@@ -1288,6 +1332,24 @@ run_standby_tick(void)
 			{
 				ereport(WARNING,
 						(errmsg("dbblue create standby: directory \"%s\" exists but is not a PostgreSQL cluster; remove it or point dbblue_standby_directory elsewhere",
+								dir)));
+				pfree(logfile);
+				pfree(dir);
+				return false;
+			}
+
+			/*
+			 * pg_basebackup keeps the permissions of a directory that already
+			 * exists, and the standby then refuses to start in one that group
+			 * members may write or others may access -- as one made by hand
+			 * with mkdir usually is.
+			 */
+			if ((st.st_mode & (S_IWGRP | S_IRWXO)) != 0 &&
+				chmod(dir, S_IRWXU) != 0)
+			{
+				ereport(WARNING,
+						(errcode_for_file_access(),
+						 errmsg("dbblue create standby: could not set permissions on \"%s\": %m",
 								dir)));
 				pfree(logfile);
 				pfree(dir);
@@ -1444,6 +1506,152 @@ run_standby_tick(void)
 
 	pfree(logfile);
 	pfree(dir);
+	return ok;
+}
+
+/*
+ * check_dbblue_standby_directory
+ *		GUC check hook for dbblue_standby_directory.
+ *
+ * The path is always canonicalized, so that a trailing slash does not put the
+ * standby's "<dir>.log" and "<dir>.pid" inside the standby directory, where
+ * pg_basebackup would find it not empty.
+ *
+ * When the value is set with ALTER SYSTEM, it must also not be our data
+ * directory or lie inside it, and the directory must already exist, belong
+ * to us, and be empty or hold a cluster.  That is only checked inside a
+ * transaction.  The configuration file is read outside one, at startup and
+ * on every reload, and no server must refuse to start over this setting:
+ * the standby's directory may be missing because the operator removed it to
+ * have the standby rebuilt, as the hints in vet_existing_standby() suggest,
+ * and every copy of this cluster, the standby included, carries the value in
+ * its postgresql.auto.conf, where it names that copy's own data directory.
+ * run_standby_tick() repeats the checks that matter at the time it builds.
+ * An empty value, "<DataDir>_standby", is created by pg_basebackup and need
+ * not exist.
+ */
+bool
+check_dbblue_standby_directory(char **newval, void **extra, GucSource source)
+{
+	char	   *dir;
+	struct stat st;
+	bool		empty;
+	bool		ok = false;
+
+	if (*newval == NULL || (*newval)[0] == '\0')
+		return true;
+
+	/* canonicalize_path never enlarges the string, so modify it in place */
+	canonicalize_path(*newval);
+
+	if (!IsTransactionState())
+		return true;
+
+	dir = standby_directory_path(*newval);
+
+	if (strlen(dir) >= MAXPGPATH - 32)
+		GUC_check_errdetail("Path \"%s\" is too long (maximum %d bytes).",
+							dir, MAXPGPATH - 33);
+	else if (path_is_prefix_of_path(DataDir, dir))
+	{
+		GUC_check_errdetail("Path \"%s\" is the data directory of this server or lies inside it.",
+							dir);
+		GUC_check_errhint("Every base backup would then copy the standby into itself.");
+	}
+	else if (stat(dir, &st) != 0)
+	{
+		if (errno == ENOENT)
+		{
+			GUC_check_errdetail("Directory \"%s\" does not exist.", dir);
+			GUC_check_errhint("Create it first, as the operating-system user the server runs as.");
+		}
+		else
+			GUC_check_errdetail("Could not access directory \"%s\": %m.", dir);
+	}
+	else if (!S_ISDIR(st.st_mode))
+		GUC_check_errdetail("\"%s\" is not a directory.", dir);
+	else if (st.st_uid != geteuid())
+	{
+		GUC_check_errdetail("Directory \"%s\" is not owned by the operating-system user the server runs as.",
+							dir);
+		GUC_check_errhint("A data directory must be owned by that user, or the standby cannot start in it.");
+	}
+	else if (access(dir, R_OK | W_OK | X_OK) != 0)
+		GUC_check_errdetail("The server cannot write to directory \"%s\": %m.", dir);
+	else if (standby_has_data(dir))
+		ok = true;
+	else if (!standby_dir_is_empty(dir, &empty))
+		GUC_check_errdetail("Could not read directory \"%s\": %m.", dir);
+	else if (!empty)
+	{
+		GUC_check_errdetail("Directory \"%s\" is not empty, and does not hold a PostgreSQL cluster.",
+							dir);
+		GUC_check_errhint("Use an empty directory, or the data directory of an existing standby of this server.");
+	}
+	else
+		ok = true;
+
+	pfree(dir);
+	return ok;
+}
+
+/*
+ * check_dbblue_standby_user
+ *		GUC check hook for dbblue_standby_user.
+ *
+ * pg_basebackup can only use a role that exists, may log in, and has
+ * REPLICATION or is a superuser.  As for default_tablespace, that can only be
+ * verified inside a transaction, which is to say for ALTER SYSTEM.  A value
+ * read from the configuration file is taken on faith, and a bad one shows up
+ * as a pg_basebackup failure.  So does a pg_hba.conf that lets the role in
+ * only with a password, which no check short of connecting can tell.
+ */
+bool
+check_dbblue_standby_user(char **newval, void **extra, GucSource source)
+{
+	HeapTuple	roletup;
+	Form_pg_authid roleform;
+	bool		ok = false;
+
+	/* empty means the operating-system user */
+	if (*newval == NULL || (*newval)[0] == '\0')
+		return true;
+
+	if (strlen(*newval) >= NAMEDATALEN)
+	{
+		GUC_check_errdetail("Role names can be at most %d bytes long.",
+							NAMEDATALEN - 1);
+		return false;
+	}
+
+	if (!IsTransactionState() || !OidIsValid(MyDatabaseId))
+		return true;
+
+	roletup = SearchSysCache1(AUTHNAME, CStringGetDatum(*newval));
+	if (!HeapTupleIsValid(roletup))
+	{
+		GUC_check_errdetail("Role \"%s\" does not exist.", *newval);
+		return false;
+	}
+	roleform = (Form_pg_authid) GETSTRUCT(roletup);
+
+	if (!roleform->rolcanlogin)
+	{
+		GUC_check_errdetail("Role \"%s\" is not permitted to log in.", *newval);
+		GUC_check_errhint("Grant it with ALTER ROLE %s LOGIN.",
+						  quote_identifier(*newval));
+	}
+	else if (!roleform->rolreplication && !roleform->rolsuper)
+	{
+		GUC_check_errdetail("Role \"%s\" has neither the REPLICATION nor the SUPERUSER attribute.",
+							*newval);
+		GUC_check_errhint("Grant it with ALTER ROLE %s REPLICATION.",
+						  quote_identifier(*newval));
+	}
+	else
+		ok = true;
+
+	ReleaseSysCache(roletup);
 	return ok;
 }
 

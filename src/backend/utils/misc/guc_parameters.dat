@@ -1102,18 +1102,20 @@
 
 { name => 'dbblue_standby_directory', type => 'string', context => 'PGC_SIGHUP', group => 'REPLICATION_PRIMARY',
   short_desc => 'Data directory of the standby managed by dbblue_create_standby.',
-  long_desc => 'An empty value (the default) means a sibling of the data directory named "<datadir>_standby". A relative path is interpreted against the parent directory of the data directory, so the standby never nests inside the primary.',
+  long_desc => 'An empty value (the default) means a sibling of the data directory named "<datadir>_standby", which pg_basebackup creates. A relative path is interpreted against the parent directory of the data directory, so the standby never nests inside the primary; neither may an absolute one. A value set with ALTER SYSTEM must name a directory that already exists, is owned by the operating-system user the server runs as, and is empty or holds a standby of this server.',
   flags => 'GUC_NOT_IN_SAMPLE',
   variable => 'dbblue_standby_directory',
   boot_val => '""',
+  check_hook => 'check_dbblue_standby_directory',
 },
 
 { name => 'dbblue_standby_user', type => 'string', context => 'PGC_SIGHUP', group => 'REPLICATION_PRIMARY',
   short_desc => 'Role pg_basebackup connects as when dbblue_create_standby provisions the standby.',
-  long_desc => 'The role must have REPLICATION privilege and a matching pg_hba.conf replication entry that does not require an interactive password (trust, peer, or a password from a passfile). An empty value (the default) connects as the operating-system user, which works with initdb\'s default pg_hba.conf. Set this to e.g. "replicator" if you use a dedicated replication role.',
+  long_desc => 'The role must have REPLICATION privilege and a matching pg_hba.conf replication entry that does not require an interactive password (trust, peer, or a password from a passfile). An empty value (the default) connects as the operating-system user, which works with initdb\'s default pg_hba.conf. Set this to e.g. "replicator" if you use a dedicated replication role. ALTER SYSTEM refuses a role that does not exist, cannot log in, or has neither REPLICATION nor SUPERUSER.',
   flags => 'GUC_NOT_IN_SAMPLE',
   variable => 'dbblue_standby_user',
   boot_val => '""',
+  check_hook => 'check_dbblue_standby_user',
 },
 
 { name => 'dbblue_wait_sampling_database', type => 'string', context => 'PGC_POSTMASTER', group => 'STATS_MONITORING',

@@ -42,6 +42,8 @@ extern void assign_checkpoint_completion_target(double newval, void *extra);
 extern void assign_dbblue_autoprepare_enabled(bool newval, void *extra);
 extern bool check_dbblue_autoprepare_limit(int *newval, void **extra, GucSource source);
 extern bool check_dbblue_pinner_database(char **newval, void **extra, GucSource source);
+extern bool check_dbblue_standby_directory(char **newval, void **extra, GucSource source);
+extern bool check_dbblue_standby_user(char **newval, void **extra, GucSource source);
 extern bool check_client_connection_check_interval(int *newval, void **extra,
 												   GucSource source);
 extern bool check_client_encoding(char **newval, void **extra, GucSource source);
