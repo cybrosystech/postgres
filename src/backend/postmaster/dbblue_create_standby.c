@@ -876,6 +876,13 @@ report_standby_port(const char *dir, int port)
  * run_shell
  *		Run a command via system(), appending its output to logfile.
  *		Returns true on exit status 0.
+ *
+ * Once shutdown has been requested, nothing new is started, and false is
+ * returned.  The postmaster cannot finish shutting down until we exit.  It
+ * signals our whole process group, so a command already running when the
+ * shutdown begins is killed along with us; but one started after that is
+ * never signalled, and would run to completion, a whole base backup perhaps,
+ * with the shutdown waiting on it.
  */
 static bool
 run_shell(const char *cmd, const char *logfile, const char *what)
@@ -884,6 +891,9 @@ run_shell(const char *cmd, const char *logfile, const char *what)
 	char	   *qlog;
 	int			rc;
 
+	if (ShutdownRequestPending)
+		return false;
+
 	qlog = shell_quote(logfile);
 	full = psprintf("%s >> %s 2>&1", cmd, qlog);
 
@@ -891,6 +901,17 @@ run_shell(const char *cmd, const char *logfile, const char *what)
 	pgstat_report_wait_start(WAIT_EVENT_DBBLUE_CREATE_STANDBY_MAIN);
 	rc = system(full);
 	pgstat_report_wait_end();
+
+	/* killed by the shutdown signal, which is no failure worth a warning */
+	if (rc != 0 && ShutdownRequestPending)
+	{
+		ereport(LOG,
+				(errmsg("dbblue create standby: %s interrupted by shutdown",
+						what)));
+		pfree(qlog);
+		pfree(full);
+		return false;
+	}
 
 	if (rc != 0)
 	{
@@ -1083,6 +1104,13 @@ drop_standby_slot(const char *logfile)
 	char	   *cmd;
 	bool		ok;
 
+	/*
+	 * run_shell() would not run pg_receivewal anyway, and the slot can wait:
+	 * the next build drops it.
+	 */
+	if (ShutdownRequestPending)
+		return false;
+
 	switch (standby_slot_state())
 	{
 		case STANDBY_SLOT_ABSENT:
@@ -1208,6 +1236,13 @@ vet_existing_standby(const char *dir, const char *logfile)
 			 errdetail("The standby fell more than max_slot_wal_keep_size behind, and the WAL it still needed has been removed.")));
 
 	if (!stop_standby(dir, logfile))
+		return false;
+
+	/*
+	 * Removing a whole standby takes a while, and the rebuild cannot start
+	 * before the next startup anyway; it finds the slot still invalidated.
+	 */
+	if (ShutdownRequestPending)
 		return false;
 
 	/* the directory itself may be the operator's, with its permissions */
