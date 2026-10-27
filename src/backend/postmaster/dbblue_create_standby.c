@@ -126,6 +126,9 @@ typedef enum
 
 static int	consecutive_failures = 0;
 
+/* Whether warn_unlimited_slot_wal() has spoken since the last reload. */
+static bool slot_wal_limit_warned = false;
+
 /*
  * standby_directory_path
  *		Return a palloc'd absolute path for the standby data directory named
@@ -1609,6 +1612,33 @@ check_dbblue_standby_user(char **newval, void **extra, GucSource source)
 }
 
 /*
+ * warn_unlimited_slot_wal
+ *		Warn, once per configuration load, if max_slot_wal_keep_size leaves
+ *		our replication slot free to retain WAL without limit.
+ *
+ * initdb's auto-tune sets a limit, but a cluster made without it, or before
+ * it did so, has PostgreSQL's default of -1.  A standby that stops streaming
+ * then holds back WAL until the disk fills and the primary stops, and as the
+ * slot is never invalidated, vet_existing_standby() never rebuilds it.  It is
+ * only a warning: some run without a limit on purpose, watching disk space
+ * by other means.
+ */
+static void
+warn_unlimited_slot_wal(void)
+{
+	if (max_slot_wal_keep_size_mb >= 0 || slot_wal_limit_warned)
+		return;
+
+	ereport(WARNING,
+			(errmsg("dbblue create standby: max_slot_wal_keep_size is -1, so replication slot \"%s\" may retain WAL without limit",
+					DBBLUE_STANDBY_SLOT),
+			 errdetail("If the standby stops streaming, WAL accumulates in pg_wal until the disk is full and this server stops; the slot is never invalidated, so the standby is never rebuilt either."),
+			 errhint("Set a limit, such as twice max_wal_size: ALTER SYSTEM SET max_slot_wal_keep_size = '%" PRId64 "MB'; SELECT pg_reload_conf();",
+					 (int64) max_wal_size_mb * 2)));
+	slot_wal_limit_warned = true;
+}
+
+/*
  * DbblueCreateStandbyMain
  *		Entry point for the dbblue create standby background worker.
  */
@@ -1633,6 +1663,8 @@ DbblueCreateStandbyMain(Datum main_arg)
 			ProcessConfigFile(PGC_SIGHUP);
 			/* give a hand-fixed setup a fresh set of attempts */
 			consecutive_failures = 0;
+			/* and repeat the warning if the limit is still missing */
+			slot_wal_limit_warned = false;
 		}
 
 		/*
@@ -1640,20 +1672,24 @@ DbblueCreateStandbyMain(Datum main_arg)
 		 * its own just because it inherited dbblue_create_standby=on from
 		 * the primary's configuration.
 		 */
-		if (dbblue_create_standby &&
-			!RecoveryInProgress() &&
-			consecutive_failures < DBBLUE_STANDBY_MAX_FAILURES)
+		if (dbblue_create_standby && !RecoveryInProgress())
 		{
-			if (run_standby_tick())
-				consecutive_failures = 0;
-			else
+			/* even once we have given up, as the slot then holds back WAL */
+			warn_unlimited_slot_wal();
+
+			if (consecutive_failures < DBBLUE_STANDBY_MAX_FAILURES)
 			{
-				consecutive_failures++;
-				if (consecutive_failures == DBBLUE_STANDBY_MAX_FAILURES)
-					ereport(WARNING,
-							(errmsg("dbblue create standby: giving up after %d consecutive failures",
-									consecutive_failures),
-							 errhint("Fix the underlying problem, then reload the configuration (SELECT pg_reload_conf()) to retry.")));
+				if (run_standby_tick())
+					consecutive_failures = 0;
+				else
+				{
+					consecutive_failures++;
+					if (consecutive_failures == DBBLUE_STANDBY_MAX_FAILURES)
+						ereport(WARNING,
+								(errmsg("dbblue create standby: giving up after %d consecutive failures",
+										consecutive_failures),
+								 errhint("Fix the underlying problem, then reload the configuration (SELECT pg_reload_conf()) to retry.")));
+				}
 			}
 		}
 
