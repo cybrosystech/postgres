@@ -226,6 +226,13 @@ static const struct exclude_list_item excludeFiles[] =
 	{"postmaster.pid", false},
 	{"postmaster.opts", false},
 
+	/*
+	 * Port of the standby that dbblue_create_standby runs for this server.
+	 * In a copy it would name a standby the copy does not have -- after a
+	 * promotion, the copy's own port.
+	 */
+	{"dbblue_standby.port", false},
+
 	/* end of list */
 	{NULL, false}
 };
