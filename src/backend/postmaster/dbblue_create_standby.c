@@ -1115,42 +1115,6 @@ drop_standby_slot(const char *logfile)
 }
 
 /*
- * verify_port_still_free
- *		Double-check that a port is still available to bind after discovery.
- *		Returns true if the port is free, false otherwise.
- *		Used to detect TOCTOU race: port may have been claimed between
- *		find_free_port() and starting the standby.
- */
-static bool
-verify_port_still_free(int port)
-{
-	int			sock;
-	struct sockaddr_in addr;
-	bool		free_port;
-
-	/*
-	 * Validate port is within valid TCP port range (1-65535).
-	 * Prevents integer overflow when casting to uint16.
-	 */
-	if (port < 1 || port > 65535)
-		return false;
-
-	sock = socket(AF_INET, SOCK_STREAM, 0);
-	if (sock < 0)
-		return false;
-
-	memset(&addr, 0, sizeof(addr));
-	addr.sin_family = AF_INET;
-	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-	addr.sin_port = htons((uint16) port);
-
-	free_port = (bind(sock, (struct sockaddr *) &addr, sizeof(addr)) == 0);
-	close(sock);
-
-	return free_port;
-}
-
-/*
  * stop_standby
  *		Stop the standby postmaster in dir, if it is running.
  */
@@ -1446,6 +1410,10 @@ run_standby_tick(void)
 	/*
 	 * Pick a free port now, just before starting: 5433 may have been free
 	 * when the standby was first created but taken since.
+	 *
+	 * Something may still take it before the standby binds it.  No probe
+	 * can rule that out, as the port is free until somebody binds it; the
+	 * standby then fails to start, and the next tick picks another port.
 	 */
 	port = find_free_port();
 	if (port < 0)
@@ -1461,21 +1429,6 @@ run_standby_tick(void)
 
 	if (!write_standby_settings(dir, port))
 	{
-		pfree(logfile);
-		pfree(dir);
-		return false;
-	}
-
-	/*
-	 * Verify the port is still free: it may have been claimed since we
-	 * discovered it. If not, don't penalize with a failure count; just
-	 * return false to retry on the next tick.
-	 */
-	if (!verify_port_still_free(port))
-	{
-		ereport(DEBUG1,
-				(errmsg("dbblue create standby: port %d was claimed after discovery; will retry",
-						port)));
 		pfree(logfile);
 		pfree(dir);
 		return false;
