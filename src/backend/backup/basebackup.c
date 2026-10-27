@@ -229,9 +229,11 @@ static const struct exclude_list_item excludeFiles[] =
 	/*
 	 * Port of the standby that dbblue_create_standby runs for this server.
 	 * In a copy it would name a standby the copy does not have -- after a
-	 * promotion, the copy's own port.
+	 * promotion, the copy's own port.  The temporary file it is written
+	 * through, too, should a crash have left one behind.
 	 */
 	{"dbblue_standby.port", false},
+	{"dbblue_standby.port.tmp", false},
 
 	/* end of list */
 	{NULL, false}

@@ -844,7 +844,9 @@ static void
 report_standby_port(const char *dir, int port)
 {
 	char		path[MAXPGPATH];
+	char		tmppath[MAXPGPATH];
 	FILE	   *fp;
+	bool		ok;
 
 	ereport(LOG,
 			(errmsg("dbblue create standby: standby is running on port %d (data directory \"%s\")",
@@ -853,22 +855,43 @@ report_standby_port(const char *dir, int port)
 					 port)));
 
 	snprintf(path, sizeof(path), "%s/dbblue_standby.port", DataDir);
-	fp = fopen(path, "w");
+	snprintf(tmppath, sizeof(tmppath), "%s.tmp", path);
+
+	/*
+	 * Write a temporary file and rename it into place, so that tooling reading
+	 * the file sees the old port or the new one, never an empty file.
+	 * fopen(path, "w") would empty it at once, and leave it empty if the
+	 * write then failed.  syslogger.c writes current_logfiles the same way.
+	 */
+	fp = fopen(tmppath, "w");
 	if (fp == NULL)
 	{
 		ereport(WARNING,
 				(errcode_for_file_access(),
-				 errmsg("dbblue create standby: could not write \"%s\": %m",
-						path)));
+				 errmsg("dbblue create standby: could not create \"%s\": %m",
+						tmppath)));
 		return;
 	}
-	fprintf(fp, "%d\n", port);
+	ok = (fprintf(fp, "%d\n", port) >= 0);
 	if (fclose(fp) != 0)
+		ok = false;
+	if (!ok)
 	{
 		ereport(WARNING,
 				(errcode_for_file_access(),
 				 errmsg("dbblue create standby: could not write \"%s\": %m",
-						path)));
+						tmppath)));
+		unlink(tmppath);
+		return;
+	}
+
+	if (rename(tmppath, path) != 0)
+	{
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("dbblue create standby: could not rename \"%s\" to \"%s\": %m",
+						tmppath, path)));
+		unlink(tmppath);
 	}
 }
 
