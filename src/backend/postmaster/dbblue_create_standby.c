@@ -70,9 +70,11 @@
 #include "port/pg_crc32c.h"
 #include "postmaster/postmaster.h"
 #include "replication/slot.h"
+#include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "utils/builtins.h"
+#include "utils/conffiles.h"
 #include "utils/guc.h"
 #include "utils/guc_hooks.h"
 #include "utils/pidfile.h"
@@ -141,6 +143,7 @@ typedef enum
 	STANDBY_OURS,				/* a standby of this cluster */
 	STANDBY_PROMOTED,			/* a copy of this cluster, since promoted */
 	STANDBY_FOREIGN,			/* a different cluster altogether */
+	STANDBY_OTHER_PRIMARY,		/* a standby of another copy of this cluster */
 	STANDBY_UNREADABLE,			/* cannot tell; pg_control unreadable */
 } StandbyIdentity;
 
@@ -370,6 +373,243 @@ read_system_identifier(const char *dir, uint64 *sysid)
 }
 
 /*
+ * conninfo_value
+ *		The value keyword has in the libpq connection string conninfo,
+ *		palloc'd, or NULL if it is not set there.
+ *
+ * Values are unquoted and unescaped as libpq does, and, as there, the last
+ * setting of a keyword wins.
+ */
+static char *
+conninfo_value(const char *conninfo, const char *keyword)
+{
+	const char *p = conninfo;
+	char	   *result = NULL;
+
+	for (;;)
+	{
+		const char *key;
+		size_t		keylen;
+		StringInfoData val;
+
+		while (isspace((unsigned char) *p))
+			p++;
+		if (*p == '\0')
+			break;
+
+		key = p;
+		while (*p && *p != '=' && !isspace((unsigned char) *p))
+			p++;
+		keylen = p - key;
+		while (isspace((unsigned char) *p))
+			p++;
+		/* not a connection string libpq would accept */
+		if (*p != '=')
+			break;
+		p++;
+		while (isspace((unsigned char) *p))
+			p++;
+
+		initStringInfo(&val);
+		if (*p == '\'')
+		{
+			for (p++; *p && *p != '\''; p++)
+			{
+				if (*p == '\\' && p[1] != '\0')
+					p++;
+				appendStringInfoChar(&val, *p);
+			}
+			if (*p == '\'')
+				p++;
+		}
+		else
+		{
+			for (; *p && !isspace((unsigned char) *p); p++)
+			{
+				if (*p == '\\' && p[1] != '\0')
+					p++;
+				appendStringInfoChar(&val, *p);
+			}
+		}
+
+		if (keylen == strlen(keyword) && strncmp(key, keyword, keylen) == 0)
+		{
+			if (result)
+				pfree(result);
+			result = val.data;
+		}
+		else
+			pfree(val.data);
+	}
+
+	return result;
+}
+
+/*
+ * standby_primary_conninfo
+ *		The primary_conninfo of the standby in dir, as its postgresql.auto.conf
+ *		sets it, palloc'd, or NULL if that file does not set it or cannot be
+ *		read.
+ *
+ * pg_basebackup -R writes it there, and the standby's postgresql.conf, which
+ * is ours (see standby_server_opts()), does not set it.
+ */
+static char *
+standby_primary_conninfo(const char *dir)
+{
+	char		path[MAXPGPATH];
+	FILE	   *fp;
+	ConfigVariable *head = NULL;
+	ConfigVariable *tail = NULL;
+	char	   *result = NULL;
+
+	snprintf(path, sizeof(path), "%s/%s", dir, PG_AUTOCONF_FILENAME);
+	fp = AllocateFile(path, "r");
+	if (fp == NULL)
+		return NULL;
+
+	/* a file the standby cannot parse either is for pg_ctl start to report */
+	if (ParseConfigFp(fp, path, CONF_FILE_START_DEPTH, DEBUG1, &head, &tail))
+	{
+		for (ConfigVariable *item = head; item != NULL; item = item->next)
+		{
+			if (item->name == NULL || item->ignore ||
+				pg_strcasecmp(item->name, "primary_conninfo") != 0)
+				continue;
+			if (result)
+				pfree(result);
+			result = pstrdup(item->value);
+		}
+	}
+
+	FreeConfigVariables(head);
+	FreeFile(fp);
+	return result;
+}
+
+/*
+ * standby_follows_us
+ *		Does the standby in dir stream from us, as far as its primary_conninfo
+ *		tells?  If not, and their_host and their_port are given, set them to
+ *		where it streams from instead, palloc'd.
+ *
+ * A copy of us -- a restored backup, a pg_basebackup taken by hand, or our
+ * data directory copied -- keeps our system identifier, and our
+ * dbblue_create_standby and dbblue_standby_directory with it.  On this host,
+ * an absolute directory, or a relative one beside a copy kept next to us,
+ * then names our standby for it too, and it would take that standby for its
+ * own: report its port, so that its read-only traffic would read our data,
+ * and start it, on a port of its choosing, whenever it found it stopped.
+ *
+ * The port tells the two apart, as two servers cannot listen on the same one;
+ * the Unix socket directory, too, unless the standby connects over TCP.
+ * What is not set falls back on libpq's defaults, in our environment, which
+ * is also the standby's as we start it.  A standby with no primary_conninfo,
+ * or one listing several hosts, as we never build, is left the benefit of the
+ * doubt.
+ *
+ * This also refuses our own standby once our port or socket directory has
+ * changed: that standby cannot stream from us either.
+ */
+static bool
+standby_follows_us(const char *dir, char **their_host, char **their_port)
+{
+	char	   *conninfo = standby_primary_conninfo(dir);
+	char	   *host;
+	char	   *port;
+	bool		tcp;
+	bool		follows;
+
+	if (conninfo == NULL)
+		return true;
+
+	host = conninfo_value(conninfo, "host");
+	if (host == NULL || host[0] == '\0')
+	{
+		if (host)
+			pfree(host);
+		host = conninfo_value(conninfo, "hostaddr");
+	}
+	if (host == NULL || host[0] == '\0')
+	{
+		const char *env = getenv("PGHOST");
+
+		if (host)
+			pfree(host);
+		if (env != NULL && env[0] != '\0')
+			host = pstrdup(env);
+		else
+			host = pstrdup(DEFAULT_PGSOCKET_DIR[0] != '\0' ?
+						   DEFAULT_PGSOCKET_DIR : "localhost");
+	}
+
+	port = conninfo_value(conninfo, "port");
+	if (port == NULL || port[0] == '\0')
+	{
+		const char *env = getenv("PGPORT");
+
+		if (port)
+			pfree(port);
+		port = (env != NULL && env[0] != '\0') ? pstrdup(env) :
+			psprintf("%d", DEF_PGPORT);
+	}
+	pfree(conninfo);
+
+	if (strchr(host, ',') != NULL || strchr(port, ',') != NULL)
+	{
+		pfree(host);
+		pfree(port);
+		return true;
+	}
+
+	follows = (atoi(port) == PostPortNumber);
+	tcp = !(is_absolute_path(host) || host[0] == '@');
+
+	if (follows && tcp)
+		follows = (ListenAddresses != NULL && ListenAddresses[0] != '\0');
+	else if (follows)
+	{
+		char	   *rawstring;
+		List	   *elemlist;
+		ListCell   *lc;
+
+		/* one of our socket directories, however written */
+		if (host[0] != '@')
+			canonicalize_path(host);
+		follows = false;
+		if (Unix_socket_directories != NULL)
+		{
+			rawstring = pstrdup(Unix_socket_directories);
+			if (SplitDirectoriesString(rawstring, ',', &elemlist))
+			{
+				foreach(lc, elemlist)
+				{
+					if (strcmp((const char *) lfirst(lc), host) == 0)
+					{
+						follows = true;
+						break;
+					}
+				}
+			}
+			list_free_deep(elemlist);
+			pfree(rawstring);
+		}
+	}
+
+	if (!follows && their_host != NULL && their_port != NULL)
+	{
+		*their_host = host;
+		*their_port = port;
+	}
+	else
+	{
+		pfree(host);
+		pfree(port);
+	}
+	return follows;
+}
+
+/*
  * standby_identity
  *		Is the cluster in dir really a standby of ours?
  *
@@ -377,8 +617,9 @@ read_system_identifier(const char *dir, uint64 *sysid)
  * that has since been promoted -- leaving us, most likely, the old primary
  * of that failover -- or a different cluster entirely, typically the
  * standby of an earlier cluster that lived in our data directory before
- * this one was initialized.  Neither can stream from us, and neither is
- * ours to start, report, or delete.
+ * this one was initialized.  Or it may be a standby of another copy of us,
+ * which shares our system identifier; see standby_follows_us().  None can
+ * stream from us, and none is ours to start, report, or delete.
  *
  * On STANDBY_FOREIGN, *their_sysid is set to the identifier found.
  */
@@ -396,6 +637,9 @@ standby_identity(const char *dir, uint64 *their_sysid)
 	snprintf(path, sizeof(path), "%s/%s", dir, STANDBY_SIGNAL_FILE);
 	if (stat(path, &st) != 0)
 		return STANDBY_PROMOTED;
+
+	if (!standby_follows_us(dir, NULL, NULL))
+		return STANDBY_OTHER_PRIMARY;
 
 	return STANDBY_OURS;
 }
@@ -1880,6 +2124,28 @@ vet_existing_standby(const char *dir, const char *logfile)
 					 errdetail("Its system identifier is %" PRIu64 ", this server's is %" PRIu64 ".",
 							   their_sysid, GetSystemIdentifier()),
 					 errhint("It is most likely the standby of a cluster that this data directory held before. Remove it, or point dbblue_standby_directory elsewhere, to have a standby of this server built.")));
+			return false;
+		case STANDBY_OTHER_PRIMARY:
+			{
+				char	   *their_host = NULL;
+				char	   *their_port = NULL;
+
+				forget_standby_port();
+				(void) standby_follows_us(dir, &their_host, &their_port);
+				ereport(WARNING,
+						(errmsg("dbblue create standby: \"%s\" is a standby of another server, not of this one",
+								dir),
+						 errdetail("Its primary_conninfo connects to port %s on \"%s\"; this server listens on port %d.",
+								   their_port ? their_port : "?",
+								   their_host ? their_host : "?",
+								   PostPortNumber),
+						 errhint("This server is most likely a copy of that one: point dbblue_standby_directory elsewhere, or turn dbblue_create_standby off here. If instead this server's port or socket directory has changed, remove \"%s\" to have a new standby built.",
+								 dir)));
+				if (their_host)
+					pfree(their_host);
+				if (their_port)
+					pfree(their_port);
+			}
 			return false;
 		case STANDBY_UNREADABLE:
 			/* read_system_identifier() has said why */
