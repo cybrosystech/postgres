@@ -71,6 +71,7 @@
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/guc_hooks.h"
+#include "utils/pidfile.h"
 #include "utils/syscache.h"
 #include "utils/varlena.h"
 #include "utils/wait_event.h"
@@ -904,6 +905,95 @@ report_standby_port(const char *dir, int port)
 }
 
 /*
+ * reported_standby_port
+ *		The port <DataDir>/dbblue_standby.port names, or -1 if it is missing
+ *		or holds no number.
+ */
+static int
+reported_standby_port(void)
+{
+	char		path[MAXPGPATH];
+	FILE	   *fp;
+	int			port;
+
+	snprintf(path, sizeof(path), "%s/dbblue_standby.port", DataDir);
+	fp = fopen(path, "r");
+	if (fp == NULL)
+		return -1;
+	if (fscanf(fp, "%d", &port) != 1)
+		port = -1;
+	fclose(fp);
+	return port;
+}
+
+/*
+ * standby_pidfile_port
+ *		Read, from the postmaster.pid of the standby in dir, the port it
+ *		listens on and whether it accepts connections yet.  Returns false if
+ *		the file cannot be read or is not complete, as it is for a moment
+ *		while the standby starts.
+ */
+static bool
+standby_pidfile_port(const char *dir, int *port, bool *ready)
+{
+	char		path[MAXPGPATH];
+	char		line[MAXPGPATH];
+	FILE	   *fp;
+	int			lineno = 0;
+	bool		have_port = false;
+	bool		have_status = false;
+
+	snprintf(path, sizeof(path), "%s/postmaster.pid", dir);
+	fp = fopen(path, "r");
+	if (fp == NULL)
+		return false;
+
+	while (fgets(line, sizeof(line), fp) != NULL)
+	{
+		lineno++;
+		if (lineno == LOCK_FILE_LINE_PORT)
+		{
+			*port = atoi(line);
+			have_port = (*port > 0 && *port <= 65535);
+		}
+		else if (lineno == LOCK_FILE_LINE_PM_STATUS)
+		{
+			*ready = (strncmp(line, PM_STATUS_READY, strlen(PM_STATUS_READY)) == 0 ||
+					  strncmp(line, PM_STATUS_STANDBY, strlen(PM_STATUS_STANDBY)) == 0);
+			have_status = true;
+		}
+	}
+	fclose(fp);
+
+	return have_port && have_status;
+}
+
+/*
+ * sync_standby_port
+ *		Make <DataDir>/dbblue_standby.port name the port the running standby
+ *		in dir listens on, once it accepts connections.
+ *
+ * report_standby_port() runs after a pg_ctl start that succeeds.  But pg_ctl
+ * stops waiting after 60 seconds, while a standby with much WAL to replay
+ * may take longer, and then comes up with nobody to report it.  The file may
+ * also have been removed since, or restored without it.  So every tick that
+ * finds the standby running compares the file with the port the standby's
+ * own postmaster.pid records, and rewrites it if they differ.
+ */
+static void
+sync_standby_port(const char *dir)
+{
+	int			port = 0;
+	bool		ready = false;
+
+	if (!standby_pidfile_port(dir, &port, &ready) || !ready)
+		return;
+
+	if (reported_standby_port() != port)
+		report_standby_port(dir, port);
+}
+
+/*
  * file_size
  *		Size of the file at path, or 0 if it does not exist.
  */
@@ -1640,9 +1730,13 @@ run_standby_tick(void)
 		return false;
 	}
 
-	/* Nothing to do while the standby postmaster is alive. */
+	/*
+	 * Nothing to do while the standby postmaster is alive, but to make sure
+	 * its port is reported.
+	 */
 	if (standby_is_running(dir))
 	{
+		sync_standby_port(dir);
 		pfree(logfile);
 		pfree(dir);
 		return true;
@@ -1823,6 +1917,12 @@ run_standby_tick(void)
 		return false;
 	}
 
+	/*
+	 * The port may differ from the last start's, and until the standby is up
+	 * there is none to report: tooling must not be sent to the old one.
+	 */
+	forget_standby_port();
+
 	resolve_bin_path("pg_ctl", binpath, sizeof(binpath));
 	qbin = shell_quote(binpath);
 	qdir = shell_quote(dir);
@@ -1864,6 +1964,16 @@ run_standby_tick(void)
 			pfree(output);
 		ok = false;
 	}
+
+	/*
+	 * pg_ctl also fails when it stops waiting after 60 seconds, but the
+	 * standby goes on starting, and sync_standby_port() reports its port
+	 * once it is up.  Say so, lest the warning read as a dead standby.
+	 */
+	if (!ok && !ShutdownRequestPending && standby_is_running(dir))
+		ereport(LOG,
+				(errmsg("dbblue create standby: standby in \"%s\" is still starting; its port will be reported once it accepts connections",
+						dir)));
 
 	if (ok)
 		report_standby_port(dir, port);
