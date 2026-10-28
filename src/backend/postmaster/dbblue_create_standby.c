@@ -1359,6 +1359,70 @@ drop_standby_slot(const char *logfile)
 }
 
 /*
+ * standby_parent_usable
+ *		Check that the parent directory of the standby directory dir exists
+ *		and that we may write to it, and say why not if not.
+ *
+ * The standby is built there, and the log of every command we run, which
+ * the shell opens before the command starts, is "<dir>.log" next to it.
+ * Without this check, a parent we cannot write to shows up as whichever of
+ * pg_receivewal, pg_basebackup or pg_ctl happens to run first failing.
+ *
+ * A missing parent is refused, not created.  ALTER SYSTEM refuses a standby
+ * directory that does not exist (see check_dbblue_standby_directory()), and
+ * the same must hold for what that check never sees: a value read from the
+ * configuration file, the default "<DataDir>_standby", or a directory
+ * removed since.  A typo must not quietly grow a new directory tree and a
+ * full copy of the database -- which pg_mkdir_p() in seed_standby_tde_dir()
+ * would otherwise do, but only when WAL is encrypted.
+ */
+static bool
+standby_parent_usable(const char *dir)
+{
+	char		parent[MAXPGPATH];
+	struct stat st;
+
+	strlcpy(parent, dir, sizeof(parent));
+	get_parent_directory(parent);
+
+	if (stat(parent, &st) != 0)
+	{
+		if (errno == ENOENT)
+			ereport(WARNING,
+					(errmsg("dbblue create standby: cannot use standby directory \"%s\": parent directory \"%s\" does not exist",
+							dir, parent),
+					 errhint("Create it, or point dbblue_standby_directory elsewhere.")));
+		else
+			ereport(WARNING,
+					(errcode_for_file_access(),
+					 errmsg("dbblue create standby: could not access directory \"%s\": %m",
+							parent)));
+		return false;
+	}
+
+	if (!S_ISDIR(st.st_mode))
+	{
+		ereport(WARNING,
+				(errmsg("dbblue create standby: cannot use standby directory \"%s\": \"%s\" is not a directory",
+						dir, parent)));
+		return false;
+	}
+
+	if (access(parent, W_OK | X_OK) != 0)
+	{
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("dbblue create standby: cannot use standby directory \"%s\": the server cannot write to its parent directory \"%s\": %m",
+						dir, parent),
+				 errhint("The standby's log file, \"%s.log\", is written there as well.",
+						 dir)));
+		return false;
+	}
+
+	return true;
+}
+
+/*
  * stop_standby
  *		Stop the standby postmaster in dir, if it is running.
  */
@@ -1517,6 +1581,14 @@ run_standby_tick(void)
 		pfree(logfile);
 		pfree(dir);
 		return true;
+	}
+
+	/* Building or starting it, from here on, needs its parent directory. */
+	if (!standby_parent_usable(dir))
+	{
+		pfree(logfile);
+		pfree(dir);
+		return false;
 	}
 
 	if (!standby_has_data(dir))
