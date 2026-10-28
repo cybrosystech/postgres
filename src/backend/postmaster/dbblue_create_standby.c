@@ -591,9 +591,95 @@ standby_is_running(const char *dir)
 }
 
 /*
+ * first_socket_directory
+ *		Our first Unix socket directory, palloc'd, or NULL if we have none.
+ *		The standby is given the same ones; see write_standby_settings().
+ */
+static char *
+first_socket_directory(void)
+{
+	char	   *dir = NULL;
+	char	   *rawstring;
+	List	   *elemlist;
+
+	if (Unix_socket_directories == NULL || Unix_socket_directories[0] == '\0')
+		return NULL;
+
+	rawstring = pstrdup(Unix_socket_directories);
+	if (SplitDirectoriesString(rawstring, ',', &elemlist) && elemlist != NIL)
+		dir = pstrdup((char *) linitial(elemlist));
+	list_free_deep(elemlist);
+	pfree(rawstring);
+	return dir;
+}
+
+/*
+ * socket_port_in_use
+ *		Does a live server hold the Unix socket for port in one of our socket
+ *		directories, which the standby is given too?
+ *
+ * A server uses its port number twice: for TCP, and to name its socket,
+ * "<dir>/.s.PGSQL.<port>", guarded by a ".lock" file beside it.  One that
+ * listens on the socket alone, or on addresses other than the loopback one,
+ * leaves the port free to bind on 127.0.0.1 but holds the lock, and a
+ * standby started on that port fails with "lock file ... already exists" --
+ * on every retry, as the TCP probe alone keeps choosing the same port.  As
+ * PostgreSQL itself does, a lock whose process is gone counts as stale, and
+ * the port as free.
+ */
+static bool
+socket_port_in_use(int port)
+{
+	char	   *rawstring;
+	List	   *elemlist;
+	ListCell   *lc;
+	bool		in_use = false;
+
+	if (Unix_socket_directories == NULL || Unix_socket_directories[0] == '\0')
+		return false;
+
+	rawstring = pstrdup(Unix_socket_directories);
+	if (SplitDirectoriesString(rawstring, ',', &elemlist))
+	{
+		foreach(lc, elemlist)
+		{
+			const char *dir = (const char *) lfirst(lc);
+			char		path[MAXPGPATH];
+			FILE	   *fp;
+			long		pid = 0;
+
+			/* an abstract socket (Linux "@name") has no lock file */
+			if (dir[0] == '@')
+				continue;
+
+			snprintf(path, sizeof(path), "%s/.s.PGSQL.%d.lock", dir, port);
+			fp = fopen(path, "r");
+			if (fp == NULL)
+				continue;
+			if (fscanf(fp, "%ld", &pid) != 1)
+				pid = 0;
+			fclose(fp);
+
+			/* a standalone backend writes its PID negated */
+			if (pid < 0)
+				pid = -pid;
+			if (pid > 1 && (kill((pid_t) pid, 0) == 0 || errno == EPERM))
+			{
+				in_use = true;
+				break;
+			}
+		}
+	}
+	list_free_deep(elemlist);
+	pfree(rawstring);
+	return in_use;
+}
+
+/*
  * find_free_port
- *		Probe TCP ports on the loopback interface starting just above the
- *		primary's own port and return the first one we can bind, or -1.
+ *		Return the first port, starting just above the primary's own, that is
+ *		free both over TCP on the loopback interface and for the Unix socket
+ *		in each of our socket directories, or -1.
  */
 static int
 find_free_port(void)
@@ -636,6 +722,14 @@ find_free_port(void)
 
 		free_port = (bind(sock, (struct sockaddr *) &addr, sizeof(addr)) == 0);
 		close(sock);
+
+		if (free_port && socket_port_in_use(port))
+		{
+			ereport(LOG,
+					(errmsg("dbblue create standby: port %d is free over TCP, but another server holds its Unix socket; trying the next port",
+							port)));
+			free_port = false;
+		}
 
 		if (free_port)
 			return port;
@@ -856,12 +950,42 @@ report_standby_port(const char *dir, int port)
 	char		tmppath[MAXPGPATH];
 	FILE	   *fp;
 	bool		ok;
+	bool		tcp = (ListenAddresses != NULL && ListenAddresses[0] != '\0');
+	char	   *socketdir = first_socket_directory();
 
-	ereport(LOG,
-			(errmsg("dbblue create standby: standby is running on port %d (data directory \"%s\")",
-					port, dir),
-			 errhint("For Odoo, set db_replica_host = localhost and db_replica_port = %d.",
-					 port)));
+	/*
+	 * The standby takes the same port number over TCP and for its Unix
+	 * socket, and the listen_addresses and socket directories of ours.  Name
+	 * whichever of the two it has: Odoo's replica should be reached the way
+	 * its db_host reaches us, as the standby shares our pg_hba.conf, and on
+	 * Debian a TCP connection there asks for the password a socket one does
+	 * not.
+	 */
+	if (tcp && socketdir)
+		ereport(LOG,
+				(errmsg("dbblue create standby: standby is running on port %d (data directory \"%s\")",
+						port, dir),
+				 errhint("For Odoo, set db_replica_port = %d, and db_replica_host the way db_host is set: localhost to connect over TCP, or \"%s\" over the Unix socket.",
+						 port, socketdir)));
+	else if (tcp)
+		ereport(LOG,
+				(errmsg("dbblue create standby: standby is running on port %d (data directory \"%s\")",
+						port, dir),
+				 errhint("For Odoo, set db_replica_host = localhost and db_replica_port = %d.",
+						 port)));
+	else if (socketdir)
+		ereport(LOG,
+				(errmsg("dbblue create standby: standby is running on port %d (data directory \"%s\")",
+						port, dir),
+				 errhint("For Odoo, set db_replica_host = \"%s\" and db_replica_port = %d.",
+						 socketdir, port)));
+	else
+		ereport(LOG,
+				(errmsg("dbblue create standby: standby is running on port %d (data directory \"%s\")",
+						port, dir)));
+
+	if (socketdir)
+		pfree(socketdir);
 
 	snprintf(path, sizeof(path), "%s/dbblue_standby.port", DataDir);
 	snprintf(tmppath, sizeof(tmppath), "%s.tmp", path);
@@ -1313,19 +1437,7 @@ run_shell(const char *cmd, const char *logfile, const char *what)
 static char *
 replication_host(void)
 {
-	char	   *host = NULL;
-
-	if (Unix_socket_directories != NULL && Unix_socket_directories[0] != '\0')
-	{
-		char	   *rawstring = pstrdup(Unix_socket_directories);
-		List	   *elemlist;
-
-		if (SplitDirectoriesString(rawstring, ',', &elemlist) &&
-			elemlist != NIL)
-			host = pstrdup((char *) linitial(elemlist));
-		list_free_deep(elemlist);
-		pfree(rawstring);
-	}
+	char	   *host = first_socket_directory();
 
 	return host ? host : pstrdup("localhost");
 }
