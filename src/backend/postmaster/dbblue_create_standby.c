@@ -90,6 +90,14 @@ char	   *dbblue_standby_user = NULL;
 #define DBBLUE_STANDBY_MAX_FAILURES		5
 
 /*
+ * How many lines of a failed command's output run_shell() quotes, how long
+ * each may be, and how much of the end of that output it reads to find them.
+ */
+#define DBBLUE_STANDBY_OUTPUT_LINES		5
+#define DBBLUE_STANDBY_OUTPUT_LINE_MAX	512
+#define DBBLUE_STANDBY_OUTPUT_SCAN		65536
+
+/*
  * pg_tde layout, as in src/include/tde/pg_tde.h.  Spelled out here rather
  * than included because that header drags in pg_tde's own definitions,
  * which the core backend does not otherwise need.
@@ -896,9 +904,165 @@ report_standby_port(const char *dir, int port)
 }
 
 /*
+ * file_size
+ *		Size of the file at path, or 0 if it does not exist.
+ */
+static off_t
+file_size(const char *path)
+{
+	struct stat st;
+
+	return (stat(path, &st) == 0) ? st.st_size : 0;
+}
+
+/*
+ * line_has_marker
+ *		Does line contain any of the given markers?
+ */
+static bool
+line_has_marker(const char *line, const char *const *markers, int nmarkers)
+{
+	for (int i = 0; i < nmarkers; i++)
+	{
+		if (strstr(line, markers[i]) != NULL)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * remember_line
+ *		Append line to ring, which holds the last DBBLUE_STANDBY_OUTPUT_LINES
+ *		lines given to it.
+ */
+static void
+remember_line(const char **ring, int *n, const char *line)
+{
+	if (*n == DBBLUE_STANDBY_OUTPUT_LINES)
+	{
+		memmove(ring, ring + 1, (DBBLUE_STANDBY_OUTPUT_LINES - 1) * sizeof(*ring));
+		ring[DBBLUE_STANDBY_OUTPUT_LINES - 1] = line;
+	}
+	else
+		ring[(*n)++] = line;
+}
+
+/*
+ * command_output_excerpt
+ *		Return the lines of logfile past offset start that say why a command
+ *		failed, palloc'd and joined by newlines, or NULL if there are none.
+ *
+ * Those are its last error lines -- "pg_basebackup: error: ..." from a client
+ * program, "FATAL:  ..." from the standby's own server log, which pg_ctl
+ * start sends to the same file -- each with any detail and hint lines that
+ * follow it.  Without any, they are its last lines.  The last lines alone
+ * would not do: pg_ctl start ends with "Examine the log output." after the
+ * standby's FATAL.  Only the end of a long output is read.
+ */
+static char *
+command_output_excerpt(const char *logfile, off_t start)
+{
+	static const char *const error_markers[] = {
+		"error:", "ERROR:", "FATAL:", "PANIC:",
+	};
+	static const char *const followup_markers[] = {
+		"detail:", "hint:", "DETAIL:", "HINT:",
+	};
+	const char *errors[DBBLUE_STANDBY_OUTPUT_LINES];
+	const char *last[DBBLUE_STANDBY_OUTPUT_LINES];
+	int			nerrors = 0;
+	int			nlast = 0;
+	bool		prev_error = false;
+	const char **pick;
+	int			npick;
+	int			fd;
+	struct stat st;
+	off_t		from;
+	ssize_t		nread;
+	char	   *buf;
+	char	   *line;
+	StringInfoData out;
+
+	fd = open(logfile, O_RDONLY | PG_BINARY, 0);
+	if (fd < 0)
+		return NULL;
+	if (fstat(fd, &st) != 0 || st.st_size <= start)
+	{
+		close(fd);
+		return NULL;
+	}
+	from = Max(start, st.st_size - DBBLUE_STANDBY_OUTPUT_SCAN);
+	buf = palloc(st.st_size - from + 1);
+	nread = pg_pread(fd, buf, st.st_size - from, from);
+	close(fd);
+	if (nread <= 0)
+	{
+		pfree(buf);
+		return NULL;
+	}
+	buf[nread] = '\0';
+
+	line = buf;
+	/* a scan that starts after the output does starts mid-line */
+	if (from > start)
+	{
+		char	   *nl = strchr(line, '\n');
+
+		line = nl ? nl + 1 : line + strlen(line);
+	}
+
+	while (*line)
+	{
+		char	   *nl = strchr(line, '\n');
+		char	   *next = nl ? nl + 1 : line + strlen(line);
+
+		if (nl)
+			*nl = '\0';
+
+		if (line_has_marker(line, error_markers, lengthof(error_markers)) ||
+			(prev_error &&
+			 line_has_marker(line, followup_markers, lengthof(followup_markers))))
+		{
+			remember_line(errors, &nerrors, line);
+			prev_error = true;
+		}
+		else
+			prev_error = false;
+
+		if (strspn(line, " \t\r") < strlen(line))
+			remember_line(last, &nlast, line);
+
+		line = next;
+	}
+
+	pick = nerrors > 0 ? errors : last;
+	npick = nerrors > 0 ? nerrors : nlast;
+	if (npick == 0)
+	{
+		pfree(buf);
+		return NULL;
+	}
+
+	initStringInfo(&out);
+	for (int i = 0; i < npick; i++)
+	{
+		if (i > 0)
+			appendStringInfoChar(&out, '\n');
+		appendBinaryStringInfo(&out, pick[i],
+							   Min(strlen(pick[i]), DBBLUE_STANDBY_OUTPUT_LINE_MAX));
+	}
+	pfree(buf);
+	return out.data;
+}
+
+/*
  * run_shell
  *		Run a command via system(), appending its output to logfile.
  *		Returns true on exit status 0.
+ *
+ * On failure, the warning quotes what the command said about it, so that
+ * the reason -- a role that does not exist, a pg_hba.conf that refuses it,
+ * a full disk -- shows in the server log, and not only in logfile.
  *
  * Once shutdown has been requested, nothing new is started, and false is
  * returned.  The postmaster cannot finish shutting down until we exit.  It
@@ -913,12 +1077,17 @@ run_shell(const char *cmd, const char *logfile, const char *what)
 	char	   *full;
 	char	   *qlog;
 	int			rc;
+	struct stat st;
+	off_t		logsize;
 
 	if (ShutdownRequestPending)
 		return false;
 
 	qlog = shell_quote(logfile);
 	full = psprintf("%s >> %s 2>&1", cmd, qlog);
+
+	/* the command's output is what it appends to logfile from here on */
+	logsize = file_size(logfile);
 
 	fflush(NULL);
 	pgstat_report_wait_start(WAIT_EVENT_DBBLUE_CREATE_STANDBY_MAIN);
@@ -938,11 +1107,32 @@ run_shell(const char *cmd, const char *logfile, const char *what)
 
 	if (rc != 0)
 	{
-		ereport(WARNING,
-				(errmsg("dbblue create standby: %s failed with status %d",
-						what, rc),
-				 errdetail("Command: %s", full),
-				 errhint("See \"%s\" for details.", logfile)));
+		char	   *reason = wait_result_to_str(rc);
+		char	   *output = command_output_excerpt(logfile, logsize);
+
+		if (output != NULL)
+			ereport(WARNING,
+					(errmsg("dbblue create standby: %s failed: %s",
+							what, reason),
+					 errdetail("%s\nCommand: %s", output, full),
+					 errhint("See \"%s\" for the full output.", logfile)));
+		else if (stat(logfile, &st) != 0)
+			ereport(WARNING,
+					(errmsg("dbblue create standby: %s failed: %s",
+							what, reason),
+					 errdetail("Command: %s", full),
+					 errhint("Its output could not be written to \"%s\". Check that the directory exists and that the server may write to it.",
+							 logfile)));
+		else
+			ereport(WARNING,
+					(errmsg("dbblue create standby: %s failed: %s",
+							what, reason),
+					 errdetail("Command: %s", full),
+					 errhint("See \"%s\" for details.", logfile)));
+
+		if (output)
+			pfree(output);
+		pfree(reason);
 		pfree(qlog);
 		pfree(full);
 		return false;
@@ -1299,6 +1489,7 @@ run_standby_tick(void)
 	bool		ok;
 	bool		encrypt_wal;
 	char	   *connopts;
+	off_t		logsize;
 
 	dir = resolve_standby_directory();
 	if (dir == NULL)
@@ -1510,10 +1701,32 @@ run_standby_tick(void)
 		pfree(qlog);
 	}
 
+	logsize = file_size(logfile);
 	ok = run_shell(cmd, logfile, "pg_ctl start");
 	pfree(cmd);
 	pfree(qbin);
 	pfree(qdir);
+
+	/*
+	 * pg_ctl start also succeeds when the server exits during startup while
+	 * its control file says it was shut down in recovery, taking that for a
+	 * stop at a recovery target.  But that is what a standby we stopped
+	 * cleanly says, whatever then kept it from starting: a configuration
+	 * error, or a port taken since we picked it.  So check it is up.
+	 */
+	if (ok && !standby_is_running(dir))
+	{
+		char	   *output = command_output_excerpt(logfile, logsize);
+
+		ereport(WARNING,
+				(errmsg("dbblue create standby: standby in \"%s\" exited during startup",
+						dir),
+				 output ? errdetail("%s", output) : 0,
+				 errhint("See \"%s\" for the full output.", logfile)));
+		if (output)
+			pfree(output);
+		ok = false;
+	}
 
 	if (ok)
 		report_standby_port(dir, port);
