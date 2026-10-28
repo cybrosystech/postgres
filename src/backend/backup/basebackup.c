@@ -235,6 +235,13 @@ static const struct exclude_list_item excludeFiles[] =
 	{"dbblue_standby.port", false},
 	{"dbblue_standby.port.tmp", false},
 
+	/*
+	 * The standby directory it last managed.  A copy has no standby there to
+	 * stop when it finds its own setting naming another.
+	 */
+	{"dbblue_standby.dir", false},
+	{"dbblue_standby.dir.tmp", false},
+
 	/* end of list */
 	{NULL, false}
 };

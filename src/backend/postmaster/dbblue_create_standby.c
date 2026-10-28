@@ -29,6 +29,10 @@
  * running when the primary shuts down — it remains usable for read-only
  * traffic and simply resumes streaming when the primary returns.
  *
+ * The directory last managed is remembered in <DataDir>/dbblue_standby.dir,
+ * so that when dbblue_standby_directory changes, the standby in the old one
+ * is stopped before the new one is built; see retire_previous_standby().
+ *
  * The standby must not spawn standbys of its own, neither while it is one
  * nor once promoted, so its copy of dbblue_create_standby is turned off.
  * The worker also never runs on a cluster that is itself in recovery, which
@@ -114,6 +118,13 @@ char	   *dbblue_standby_user = NULL;
  * back is capped by max_slot_wal_keep_size, which initdb's auto-tune sets.
  */
 #define DBBLUE_STANDBY_SLOT			"dbblue_standby"
+
+/*
+ * File in DataDir naming the standby directory last managed, so that a change
+ * of dbblue_standby_directory, across a restart too, still finds the standby
+ * left in the old one; see retire_previous_standby().
+ */
+#define DBBLUE_STANDBY_DIR_FILE		"dbblue_standby.dir"
 
 typedef enum
 {
@@ -939,6 +950,61 @@ write_standby_settings(const char *dir, int port)
 }
 
 /*
+ * write_data_dir_file
+ *		Make <DataDir>/name hold contents.  Reports a WARNING and returns
+ *		false on failure.
+ *
+ * Write a temporary file and rename it into place, so that a reader sees the
+ * old contents or the new, never an empty file.  fopen(path, "w") would empty
+ * it at once, and leave it empty if the write then failed.  syslogger.c
+ * writes current_logfiles the same way.
+ */
+static bool
+write_data_dir_file(const char *name, const char *contents)
+{
+	char		path[MAXPGPATH];
+	char		tmppath[MAXPGPATH];
+	FILE	   *fp;
+	bool		ok;
+
+	snprintf(path, sizeof(path), "%s/%s", DataDir, name);
+	snprintf(tmppath, sizeof(tmppath), "%s.tmp", path);
+
+	fp = fopen(tmppath, "w");
+	if (fp == NULL)
+	{
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("dbblue create standby: could not create \"%s\": %m",
+						tmppath)));
+		return false;
+	}
+	ok = (fputs(contents, fp) >= 0);
+	if (fclose(fp) != 0)
+		ok = false;
+	if (!ok)
+	{
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("dbblue create standby: could not write \"%s\": %m",
+						tmppath)));
+		unlink(tmppath);
+		return false;
+	}
+
+	if (rename(tmppath, path) != 0)
+	{
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("dbblue create standby: could not rename \"%s\" to \"%s\": %m",
+						tmppath, path)));
+		unlink(tmppath);
+		return false;
+	}
+	return true;
+}
+
+/*
  * report_standby_port
  *		Announce the standby's port in the log and persist it to
  *		<DataDir>/dbblue_standby.port for external tooling.
@@ -946,10 +1012,7 @@ write_standby_settings(const char *dir, int port)
 static void
 report_standby_port(const char *dir, int port)
 {
-	char		path[MAXPGPATH];
-	char		tmppath[MAXPGPATH];
-	FILE	   *fp;
-	bool		ok;
+	char		contents[16];
 	bool		tcp = (ListenAddresses != NULL && ListenAddresses[0] != '\0');
 	char	   *socketdir = first_socket_directory();
 
@@ -987,45 +1050,8 @@ report_standby_port(const char *dir, int port)
 	if (socketdir)
 		pfree(socketdir);
 
-	snprintf(path, sizeof(path), "%s/dbblue_standby.port", DataDir);
-	snprintf(tmppath, sizeof(tmppath), "%s.tmp", path);
-
-	/*
-	 * Write a temporary file and rename it into place, so that tooling reading
-	 * the file sees the old port or the new one, never an empty file.
-	 * fopen(path, "w") would empty it at once, and leave it empty if the
-	 * write then failed.  syslogger.c writes current_logfiles the same way.
-	 */
-	fp = fopen(tmppath, "w");
-	if (fp == NULL)
-	{
-		ereport(WARNING,
-				(errcode_for_file_access(),
-				 errmsg("dbblue create standby: could not create \"%s\": %m",
-						tmppath)));
-		return;
-	}
-	ok = (fprintf(fp, "%d\n", port) >= 0);
-	if (fclose(fp) != 0)
-		ok = false;
-	if (!ok)
-	{
-		ereport(WARNING,
-				(errcode_for_file_access(),
-				 errmsg("dbblue create standby: could not write \"%s\": %m",
-						tmppath)));
-		unlink(tmppath);
-		return;
-	}
-
-	if (rename(tmppath, path) != 0)
-	{
-		ereport(WARNING,
-				(errcode_for_file_access(),
-				 errmsg("dbblue create standby: could not rename \"%s\" to \"%s\": %m",
-						tmppath, path)));
-		unlink(tmppath);
-	}
+	snprintf(contents, sizeof(contents), "%d\n", port);
+	(void) write_data_dir_file("dbblue_standby.port", contents);
 }
 
 /*
@@ -1719,6 +1745,96 @@ stop_standby(const char *dir, const char *logfile)
 }
 
 /*
+ * previous_standby_directory
+ *		The standby directory <DataDir>/dbblue_standby.dir names, palloc'd,
+ *		or NULL if the file is missing or holds no absolute path.
+ */
+static char *
+previous_standby_directory(void)
+{
+	char		path[MAXPGPATH];
+	char		line[MAXPGPATH];
+	FILE	   *fp;
+
+	snprintf(path, sizeof(path), "%s/%s", DataDir, DBBLUE_STANDBY_DIR_FILE);
+	fp = fopen(path, "r");
+	if (fp == NULL)
+		return NULL;
+	if (fgets(line, sizeof(line), fp) == NULL)
+		line[0] = '\0';
+	fclose(fp);
+
+	line[strcspn(line, "\n")] = '\0';
+	return is_absolute_path(line) ? pstrdup(line) : NULL;
+}
+
+/*
+ * retire_previous_standby
+ *		If the standby directory last managed is not dir, stop the standby of
+ *		ours still running there, and remember dir from now on.  Returns false
+ *		if that standby could not be stopped, or dir not remembered.
+ *
+ * Nothing else would ever stop it: once dbblue_standby_directory changes,
+ * every tick looks at the new directory only.  Yet the old standby goes on
+ * streaming from our one replication slot, so drop_standby_slot() refuses to
+ * make way for the new one, which is then never built.  Or, if the old one
+ * was between connections when we looked -- as across a restart of ours --
+ * the new one is built, and the two take turns at the slot, whichever is left
+ * out serving ever staler reads.
+ *
+ * Its files are left in place: a setting changed by mistake must not cost a
+ * copy of the database.  Nor is a promoted or foreign cluster stopped; it
+ * does not stream from our slot, and is not ours to stop.
+ */
+static bool
+retire_previous_standby(const char *dir)
+{
+	char	   *olddir = previous_standby_directory();
+	char	   *contents;
+	bool		ok;
+
+	if (olddir != NULL && strcmp(olddir, dir) == 0)
+	{
+		pfree(olddir);
+		return true;
+	}
+
+	if (olddir != NULL)
+	{
+		uint64		their_sysid = 0;
+
+		/* the port it names is the old standby's */
+		forget_standby_port();
+
+		if (standby_has_data(olddir) && standby_is_running(olddir) &&
+			standby_identity(olddir, &their_sysid) == STANDBY_OURS)
+		{
+			char	   *oldlog = psprintf("%s.log", olddir);
+
+			ok = stop_standby(olddir, oldlog);
+			pfree(oldlog);
+			if (!ok)
+			{
+				pfree(olddir);
+				return false;
+			}
+
+			ereport(LOG,
+					(errmsg("dbblue create standby: stopped the standby in \"%s\", as dbblue_standby_directory now names \"%s\"",
+							olddir, dir),
+					 errhint("Its files have been left in place. Remove \"%s\" once it is no longer needed.",
+							 olddir)));
+		}
+		pfree(olddir);
+	}
+
+	contents = psprintf("%s\n", dir);
+	ok = write_data_dir_file(DBBLUE_STANDBY_DIR_FILE, contents);
+	pfree(contents);
+	return ok;
+}
+
+/*
  * vet_existing_standby
  *		Check that the cluster in dir is a standby we can keep using.
  *
@@ -1830,6 +1946,14 @@ run_standby_tick(void)
 	}
 
 	logfile = psprintf("%s.log", dir);
+
+	/* the standby of a directory we no longer use must not hold our slot */
+	if (!retire_previous_standby(dir))
+	{
+		pfree(logfile);
+		pfree(dir);
+		return false;
+	}
 
 	/*
 	 * A standby that exists is only fine if it is ours and can still stream.

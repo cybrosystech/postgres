@@ -186,9 +186,14 @@ static const struct exclude_list_item excludeFiles[] =
 	{"postmaster.pid", false},
 	{"postmaster.opts", false},
 
-	/* dbblue_create_standby's port file and its temporary, see basebackup.c */
+	/*
+	 * dbblue_create_standby's port and directory files and their temporaries,
+	 * see basebackup.c
+	 */
 	{"dbblue_standby.port", false},
 	{"dbblue_standby.port.tmp", false},
+	{"dbblue_standby.dir", false},
+	{"dbblue_standby.dir.tmp", false},
 
 	/* end of list */
 	{NULL, false}
