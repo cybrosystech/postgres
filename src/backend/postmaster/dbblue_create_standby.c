@@ -948,6 +948,46 @@ remember_line(const char **ring, int *n, const char *line)
 }
 
 /*
+ * ring_contains
+ *		Is this very line already in ring?
+ */
+static bool
+ring_contains(const char **ring, int n, const char *line)
+{
+	for (int i = 0; i < n; i++)
+	{
+		if (ring[i] == line)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * line_pid
+ *		The process ID a server log line names, as "[12345]" in the default
+ *		log_line_prefix, or 0 if it names none.
+ */
+static long
+line_pid(const char *line)
+{
+	const char *p = line;
+
+	while ((p = strchr(p, '[')) != NULL)
+	{
+		char	   *end;
+		long		pid;
+
+		p++;
+		if (!isdigit((unsigned char) *p))
+			continue;
+		pid = strtol(p, &end, 10);
+		if (*end == ']')
+			return pid;
+	}
+	return 0;
+}
+
+/*
  * command_output_excerpt
  *		Return the lines of logfile past offset start that say why a command
  *		failed, palloc'd and joined by newlines, or NULL if there are none.
@@ -958,6 +998,14 @@ remember_line(const char **ring, int *n, const char *line)
  * follow it.  Without any, they are its last lines.  The last lines alone
  * would not do: pg_ctl start ends with "Examine the log output." after the
  * standby's FATAL.  Only the end of a long output is read.
+ *
+ * A server that fails to start often logs the cause at a lower level first,
+ * and a FATAL that only sums it up last: each bad setting as "invalid value
+ * for parameter", then "configuration file ... contains errors"; "could not
+ * bind", then "could not create any TCP/IP sockets".  So a FATAL or PANIC
+ * comes with the lines just before it from the same process, as the "[pid]"
+ * of the default log_line_prefix tells.  Under a prefix without one, it
+ * comes alone.
  */
 static char *
 command_output_excerpt(const char *logfile, off_t start)
@@ -967,6 +1015,9 @@ command_output_excerpt(const char *logfile, off_t start)
 	};
 	static const char *const followup_markers[] = {
 		"detail:", "hint:", "DETAIL:", "HINT:",
+	};
+	static const char *const fatal_markers[] = {
+		"FATAL:", "PANIC:",
 	};
 	const char *errors[DBBLUE_STANDBY_OUTPUT_LINES];
 	const char *last[DBBLUE_STANDBY_OUTPUT_LINES];
@@ -1018,6 +1069,20 @@ command_output_excerpt(const char *logfile, off_t start)
 
 		if (nl)
 			*nl = '\0';
+
+		/* the cause this FATAL sums up, logged just before it */
+		if (line_has_marker(line, fatal_markers, lengthof(fatal_markers)))
+		{
+			long		pid = line_pid(line);
+			int			first = nlast;
+
+			while (pid != 0 && first > 0 &&
+				   line_pid(last[first - 1]) == pid &&
+				   !ring_contains(errors, nerrors, last[first - 1]))
+				first--;
+			for (int i = first; i < nlast; i++)
+				remember_line(errors, &nerrors, last[i]);
+		}
 
 		if (line_has_marker(line, error_markers, lengthof(error_markers)) ||
 			(prev_error &&
