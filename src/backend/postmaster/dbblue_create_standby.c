@@ -12,8 +12,8 @@
  *      physical replication slot "dbblue_standby" it streams through.
  *   2. A free TCP port is picked by probing PostPortNumber+1, +2, ...
  *      and written, along with the primary's unix_socket_directories,
- *      hot_standby_feedback = on and dbblue_create_standby = off, to the
- *      standby's postgresql.auto.conf.
+ *      hot_standby_feedback = on, dbblue_create_standby = off and a
+ *      log_filename of its own, to the standby's postgresql.auto.conf.
  *   3. The standby is started with pg_ctl on the primary's configuration
  *      files (which need not live in the copied data directory), and the
  *      chosen port is reported in the server log and written to
@@ -69,6 +69,7 @@
 #include "postmaster/interrupt.h"
 #include "port/pg_crc32c.h"
 #include "postmaster/postmaster.h"
+#include "postmaster/syslogger.h"
 #include "replication/slot.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
@@ -1026,6 +1027,44 @@ next_conf_line(const char *line)
 }
 
 /*
+ * append_conf_string
+ *		Append "name = 'value'" to a postgresql.auto.conf being written,
+ *		quoting value as the configuration file parser expects.
+ */
+static void
+append_conf_string(StringInfo buf, const char *name, const char *value)
+{
+	appendStringInfo(buf, "%s = '", name);
+	for (const char *s = value; *s; s++)
+	{
+		if (*s == '\'')
+			appendStringInfoChar(buf, '\'');
+		appendStringInfoChar(buf, *s);
+	}
+	appendStringInfoString(buf, "'\n");
+}
+
+/*
+ * standby_log_filename
+ *		The log_filename the standby is given, palloc'd; see
+ *		write_standby_settings().
+ */
+static char *
+standby_log_filename(void)
+{
+	const char *name = Log_filename ? Log_filename : "";
+	const char *base;
+
+	if (Log_directory == NULL || !is_absolute_path(Log_directory))
+		return pstrdup(name);
+
+	/* log_filename may name a subdirectory; prefix the file itself */
+	base = last_dir_separator(name);
+	base = base ? base + 1 : name;
+	return psprintf("%.*sstandby-%s", (int) (base - name), name, base);
+}
+
+/*
  * write_standby_settings
  *		Rewrite the standby's postgresql.auto.conf -- our own copy, which
  *		pg_basebackup -R then appended primary_conninfo and primary_slot_name
@@ -1050,6 +1089,15 @@ next_conf_line(const char *line)
  * build a standby of its own, and that one another after its own promotion.
  * Whether a promoted standby should get a replica is for the operator to
  * decide, with ALTER SYSTEM.
+ *
+ * log_filename is ours, but with "standby-" before its last component when
+ * our log_directory is an absolute path.  With the logging collector on, the
+ * standby, sharing our postgresql.conf, then writes into the same directory
+ * as we do, and the two would append to the same files, their lines mixed,
+ * and with log_truncate_on_rotation each might empty the file the other is
+ * writing.  A relative log_directory is inside each one's data directory,
+ * and needs no telling apart.  It is set either way, to the value we use now,
+ * so as not to keep one set for an earlier log_directory.
  *
  * Only the last primary_conninfo and primary_slot_name are kept, which are
  * the ones -R just appended.  Any earlier ones came with the copy -- we were
@@ -1077,7 +1125,7 @@ write_standby_settings(const char *dir, int port)
 	const char *line;
 	const char *last_conninfo = NULL;
 	const char *last_slot_name = NULL;
-	const char *s;
+	char	   *logname;
 
 	snprintf(path, sizeof(path), "%s/postgresql.auto.conf", dir);
 	snprintf(tmppath, sizeof(tmppath), "%s.tmp", path);
@@ -1129,7 +1177,8 @@ write_standby_settings(const char *dir, int port)
 		if (conf_line_sets(line, "port") ||
 			conf_line_sets(line, "unix_socket_directories") ||
 			conf_line_sets(line, "hot_standby_feedback") ||
-			conf_line_sets(line, "dbblue_create_standby"))
+			conf_line_sets(line, "dbblue_create_standby") ||
+			conf_line_sets(line, "log_filename"))
 			keep = false;
 		else if (conf_line_sets(line, "primary_conninfo"))
 			keep = (line == last_conninfo);
@@ -1147,16 +1196,14 @@ write_standby_settings(const char *dir, int port)
 		appendStringInfoChar(&buf, '\n');
 
 	appendStringInfo(&buf, "port = %d\n", port);
-	appendStringInfoString(&buf, "unix_socket_directories = '");
-	for (s = Unix_socket_directories ? Unix_socket_directories : ""; *s; s++)
-	{
-		if (*s == '\'')
-			appendStringInfoChar(&buf, '\'');
-		appendStringInfoChar(&buf, *s);
-	}
-	appendStringInfoString(&buf, "'\n");
+	append_conf_string(&buf, "unix_socket_directories",
+					   Unix_socket_directories ? Unix_socket_directories : "");
 	appendStringInfoString(&buf, "hot_standby_feedback = on\n");
 	appendStringInfoString(&buf, "dbblue_create_standby = off\n");
+
+	logname = standby_log_filename();
+	append_conf_string(&buf, "log_filename", logname);
+	pfree(logname);
 
 	fp = fopen(tmppath, "w");
 	if (fp == NULL)
@@ -1896,12 +1943,65 @@ drop_standby_slot(const char *logfile)
 }
 
 /*
+ * standby_log_path
+ *		The log of the standby in dir, which the commands we run for it write
+ *		to as well, palloc'd.
+ *
+ * If our stderr goes to a file, as pg_ctl -l sends it, the standby's goes
+ * next to it: "<our log>-standby.log", any ".log" of ours dropped first.  It
+ * then gets whatever keeps ours in check -- on Debian, the logrotate rule for
+ * the *.log files in /var/log/postgresql, where pg_ctlcluster starts us with
+ * -l.  Nothing rotates "<dir>.log", beside the standby's data directory, and
+ * there it grows until it fills the disk our data is on, the faster if the
+ * standby is stuck retrying its connection, or our postgresql.conf, which it
+ * shares, logs every statement.
+ *
+ * Otherwise it is "<dir>.log": when we log through the logging collector,
+ * whose pipe our stderr then is, to a terminal or the journal, when that
+ * file's directory is not ours to create files in, and off Linux, where
+ * /proc does not name our stderr.  A file renamed or removed since we opened
+ * it is not followed, as a new one in its place would be written next to.
+ */
+static char *
+standby_log_path(const char *dir)
+{
+	char		target[MAXPGPATH];
+	char		logdir[MAXPGPATH];
+	ssize_t		len;
+	struct stat ours;
+	struct stat named;
+
+	len = readlink("/proc/self/fd/2", target, sizeof(target) - 1);
+	if (len > 0 && len < MAXPGPATH - 32)
+	{
+		target[len] = '\0';
+		strlcpy(logdir, target, sizeof(logdir));
+		get_parent_directory(logdir);
+
+		if (is_absolute_path(target) &&
+			fstat(STDERR_FILENO, &ours) == 0 && S_ISREG(ours.st_mode) &&
+			stat(target, &named) == 0 &&
+			named.st_dev == ours.st_dev && named.st_ino == ours.st_ino &&
+			access(logdir, W_OK | X_OK) == 0)
+		{
+			size_t		baselen = strlen(target);
+
+			if (baselen > 4 && strcmp(target + baselen - 4, ".log") == 0)
+				baselen -= 4;
+			return psprintf("%.*s-standby.log", (int) baselen, target);
+		}
+	}
+
+	return psprintf("%s.log", dir);
+}
+
+/*
  * standby_parent_usable
  *		Check that the parent directory of the standby directory dir exists
  *		and that we may write to it, and say why not if not.
  *
- * The standby is built there, and the log of every command we run, which
- * the shell opens before the command starts, is "<dir>.log" next to it.
+ * The standby is built there, and its log, logfile, may be next to it; see
+ * standby_log_path().  The shell opens that log before every command we run.
  * Without this check, a parent we cannot write to shows up as whichever of
  * pg_receivewal, pg_basebackup or pg_ctl happens to run first failing.
  *
@@ -1914,13 +2014,16 @@ drop_standby_slot(const char *logfile)
  * would otherwise do, but only when WAL is encrypted.
  */
 static bool
-standby_parent_usable(const char *dir)
+standby_parent_usable(const char *dir, const char *logfile)
 {
 	char		parent[MAXPGPATH];
+	char		logdir[MAXPGPATH];
 	struct stat st;
 
 	strlcpy(parent, dir, sizeof(parent));
 	get_parent_directory(parent);
+	strlcpy(logdir, logfile, sizeof(logdir));
+	get_parent_directory(logdir);
 
 	if (stat(parent, &st) != 0)
 	{
@@ -1951,8 +2054,9 @@ standby_parent_usable(const char *dir)
 				(errcode_for_file_access(),
 				 errmsg("dbblue create standby: cannot use standby directory \"%s\": the server cannot write to its parent directory \"%s\": %m",
 						dir, parent),
-				 errhint("The standby's log file, \"%s.log\", is written there as well.",
-						 dir)));
+				 strcmp(logdir, parent) == 0 ?
+				 errhint("The standby's log file, \"%s\", is written there as well.",
+						 logfile) : 0));
 		return false;
 	}
 
@@ -2053,7 +2157,7 @@ retire_previous_standby(const char *dir)
 		if (standby_has_data(olddir) && standby_is_running(olddir) &&
 			standby_identity(olddir, &their_sysid) == STANDBY_OURS)
 		{
-			char	   *oldlog = psprintf("%s.log", olddir);
+			char	   *oldlog = standby_log_path(olddir);
 
 			ok = stop_standby(olddir, oldlog);
 			pfree(oldlog);
@@ -2211,7 +2315,7 @@ run_standby_tick(void)
 		return false;
 	}
 
-	logfile = psprintf("%s.log", dir);
+	logfile = standby_log_path(dir);
 
 	/* the standby of a directory we no longer use must not hold our slot */
 	if (!retire_previous_standby(dir))
@@ -2245,7 +2349,7 @@ run_standby_tick(void)
 	}
 
 	/* Building or starting it, from here on, needs its parent directory. */
-	if (!standby_parent_usable(dir))
+	if (!standby_parent_usable(dir, logfile))
 	{
 		pfree(logfile);
 		pfree(dir);
