@@ -917,12 +917,13 @@
   boot_val => 'false',
 },
 
-{ name => 'dbblue_create_standby', type => 'bool', context => 'PGC_SIGHUP', group => 'REPLICATION_PRIMARY',
+{ name => 'dbblue_create_standby', type => 'enum', context => 'PGC_SIGHUP', group => 'REPLICATION_PRIMARY',
   short_desc => 'Automatically creates and runs a local streaming-replication standby.',
-  long_desc => 'When enabled, a background worker provisions a standby of this cluster with pg_basebackup (if dbblue_standby_directory does not contain one yet), starts it on the first free port above this server\'s port, and keeps it running. The chosen port is reported in the server log and in the dbblue_standby.port file in the data directory, ready for Odoo\'s db_replica_port setting.',
+  long_desc => 'When on, a background worker provisions a standby of this cluster with pg_basebackup (if dbblue_standby_directory does not contain one yet), starts it on the first free port above this server\'s port, and keeps it running. The chosen port is reported in the server log and in the dbblue_standby.port file in the data directory, ready for Odoo\'s db_replica_port setting. When paused, the standby is stopped but its replication slot and files are kept, so that turning this on again resumes streaming where it left off, as long as max_slot_wal_keep_size has not been exceeded meanwhile. When off, the standby is stopped and its replication slot dropped, so that it no longer holds back WAL; its files are left in place, and turning this on again builds the standby anew.',
   flags => 'GUC_NOT_IN_SAMPLE',
   variable => 'dbblue_create_standby',
-  boot_val => 'false',
+  boot_val => 'DBBLUE_STANDBY_OFF',
+  options => 'dbblue_create_standby_options',
 },
 
 { name => 'dbblue_default_builtin_locale', type => 'bool', context => 'PGC_USERSET', group => 'CLIENT_CONN_LOCALE',

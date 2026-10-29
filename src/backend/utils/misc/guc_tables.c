@@ -289,6 +289,23 @@ static const struct config_enum_entry dbblue_wait_sampling_profile_queries_optio
 	{NULL, 0, false}
 };
 
+/*
+ * Although only "on", "off" and "paused" are documented, we accept all the
+ * likely variants of "on" and "off", as the setting used to be a boolean.
+ */
+static const struct config_enum_entry dbblue_create_standby_options[] = {
+	{"on", DBBLUE_STANDBY_ON, false},
+	{"off", DBBLUE_STANDBY_OFF, false},
+	{"paused", DBBLUE_STANDBY_PAUSED, false},
+	{"true", DBBLUE_STANDBY_ON, true},
+	{"false", DBBLUE_STANDBY_OFF, true},
+	{"yes", DBBLUE_STANDBY_ON, true},
+	{"no", DBBLUE_STANDBY_OFF, true},
+	{"1", DBBLUE_STANDBY_ON, true},
+	{"0", DBBLUE_STANDBY_OFF, true},
+	{NULL, 0, false}
+};
+
 static const struct config_enum_entry stats_fetch_consistency[] = {
 	{"none", PGSTAT_FETCH_CONSISTENCY_NONE, false},
 	{"cache", PGSTAT_FETCH_CONSISTENCY_CACHE, false},

@@ -23,12 +23,18 @@
  *
  * The worker then babysits the standby: every tick it checks the standby
  * postmaster is still alive and restarts it if not.  It also checks the
- * standby is still usable: if our replication slot has been invalidated,
- * the standby can never catch up and is rebuilt; if the directory holds a
+ * standby is still usable: if our replication slot has been invalidated or
+ * is gone, the standby can never catch up and is rebuilt; if the directory holds a
  * promoted copy of us or a different cluster altogether, it is left alone,
  * and neither started nor reported.  The standby is left
  * running when the primary shuts down — it remains usable for read-only
  * traffic and simply resumes streaming when the primary returns.
+ *
+ * Set to paused, the worker stops the standby but keeps its slot, so that it
+ * resumes streaming when turned on again; set to off, it also drops the
+ * slot, which would otherwise hold back WAL for a standby not coming back,
+ * and the standby is rebuilt if turned on again.  Its files are left in
+ * place either way; see set_standby_aside().
  *
  * The directory last managed is remembered in <DataDir>/dbblue_standby.dir,
  * so that when dbblue_standby_directory changes, the standby in the old one
@@ -88,7 +94,7 @@
 #include "utils/wait_event.h"
 
 /* GUC-backed variables (real values come from guc_parameters.dat). */
-bool		dbblue_create_standby = false;
+int			dbblue_create_standby = DBBLUE_STANDBY_OFF;
 char	   *dbblue_standby_directory = NULL;
 char	   *dbblue_standby_user = NULL;
 
@@ -103,6 +109,13 @@ char	   *dbblue_standby_user = NULL;
 
 /* How often to look again for disk space to build the standby in. */
 #define DBBLUE_STANDBY_SPACE_RECHECK_MS	60000L
+
+/*
+ * How long drop_standby_slot() waits for our slot to be released by the
+ * walsender of a standby just stopped, and how often it looks.
+ */
+#define DBBLUE_STANDBY_SLOT_RELEASE_MS	5000L
+#define DBBLUE_STANDBY_SLOT_POLL_MS		100L
 
 /*
  * How many lines of a failed command's output run_shell() quotes, how long
@@ -166,6 +179,12 @@ static bool slot_wal_limit_warned = false;
  */
 static TimestampTz space_recheck_at = 0;
 static bool space_short_warned = false;
+
+/*
+ * The dbblue_create_standby value last acted on, -1 for none yet; paused
+ * and off are acted on once, see set_standby_aside().
+ */
+static int	standby_mode_applied = -1;
 
 /*
  * standby_directory_path
@@ -1895,16 +1914,19 @@ standby_slot_state(void)
  *		Drop our replication slot if it exists.  Returns true if, afterwards,
  *		there is no such slot.
  *
- * This is only called when we are about to build a standby from scratch, or
- * have just failed to, so an existing slot belongs to a standby that is gone:
+ * This is called when we are about to build a standby from scratch, or have
+ * just failed to, so an existing slot belongs to a standby that is gone:
  * its folder was removed, or an earlier attempt failed after pg_basebackup -C
  * had created the slot.  Left in place it would hold back WAL for nobody,
  * and it would make the next pg_basebackup -C fail with "already exists".
+ * It is also called once our standby has been stopped for
+ * dbblue_create_standby = off; see set_standby_aside().
  *
  * A slot something is still streaming from is not ours to drop -- most
  * likely a standby still running although its folder was deleted under it,
  * or another standby configured with the same slot name.  Refuse, and let
- * the operator sort it out.
+ * the operator sort it out.  The walsender of a standby we have just stopped
+ * may not have noticed yet, so it is given a few seconds to let go first.
  */
 static bool
 drop_standby_slot(const char *logfile)
@@ -1914,6 +1936,7 @@ drop_standby_slot(const char *logfile)
 	char	   *connopts;
 	char	   *cmd;
 	bool		ok;
+	long		waited = 0;
 
 	/*
 	 * run_shell() would not run pg_receivewal anyway, and the slot can wait:
@@ -1921,6 +1944,13 @@ drop_standby_slot(const char *logfile)
 	 */
 	if (ShutdownRequestPending)
 		return false;
+
+	while (standby_slot_state() == STANDBY_SLOT_ACTIVE &&
+		   waited < DBBLUE_STANDBY_SLOT_RELEASE_MS && !ShutdownRequestPending)
+	{
+		pg_usleep(DBBLUE_STANDBY_SLOT_POLL_MS * 1000L);
+		waited += DBBLUE_STANDBY_SLOT_POLL_MS;
+	}
 
 	switch (standby_slot_state())
 	{
@@ -1939,7 +1969,7 @@ drop_standby_slot(const char *logfile)
 	}
 
 	ereport(LOG,
-			(errmsg("dbblue create standby: dropping stale replication slot \"%s\"",
+			(errmsg("dbblue create standby: dropping replication slot \"%s\"",
 					DBBLUE_STANDBY_SLOT)));
 
 	resolve_bin_path("pg_receivewal", binpath, sizeof(binpath));
@@ -2205,11 +2235,14 @@ retire_previous_standby(const char *dir)
  * for the operator, after saying why.
  *
  * Only a standby of ours is ever stopped or deleted here, and only once our
- * replication slot has been invalidated: it fell more than
- * max_slot_wal_keep_size behind, the WAL it needs is gone, and it would
- * otherwise sit there forever -- alive, so never restarted, serving ever
- * staler reads.  Everything it holds is also here, so nothing is lost by
- * building it again.
+ * replication slot has been invalidated or is gone.  Invalidated, it fell
+ * more than max_slot_wal_keep_size behind, the WAL it needs is gone, and it
+ * would otherwise sit there forever -- alive, so never restarted, serving
+ * ever staler reads.  Gone, it was dropped by dbblue_create_standby = off,
+ * by hand, or with the rest of a data directory restored from a backup, and
+ * the standby, whose primary_slot_name still names it, can never connect;
+ * nor is there anything left to keep the WAL it would need to catch up.
+ * Everything it holds is also here, so nothing is lost by building it again.
  *
  * A directory that is not our standby is not ours to delete, whatever it
  * holds: a different cluster may be the last copy of a primary that is gone,
@@ -2270,21 +2303,34 @@ vet_existing_standby(const char *dir, const char *logfile)
 			return false;
 	}
 
-	if (standby_slot_state() != STANDBY_SLOT_INVALIDATED)
-		return true;
-
-	forget_standby_port();
-	ereport(WARNING,
-			(errmsg("dbblue create standby: replication slot \"%s\" has been invalidated, rebuilding the standby in \"%s\"",
-					DBBLUE_STANDBY_SLOT, dir),
-			 errdetail("The standby fell more than max_slot_wal_keep_size behind, and the WAL it still needed has been removed.")));
+	switch (standby_slot_state())
+	{
+		case STANDBY_SLOT_IDLE:
+		case STANDBY_SLOT_ACTIVE:
+			return true;
+		case STANDBY_SLOT_INVALIDATED:
+			forget_standby_port();
+			ereport(WARNING,
+					(errmsg("dbblue create standby: replication slot \"%s\" has been invalidated, rebuilding the standby in \"%s\"",
+							DBBLUE_STANDBY_SLOT, dir),
+					 errdetail("The standby fell more than max_slot_wal_keep_size behind, and the WAL it still needed has been removed.")));
+			break;
+		case STANDBY_SLOT_ABSENT:
+			forget_standby_port();
+			ereport(LOG,
+					(errmsg("dbblue create standby: replication slot \"%s\" does not exist, rebuilding the standby in \"%s\"",
+							DBBLUE_STANDBY_SLOT, dir),
+					 errdetail("The standby streams through that slot, and cannot connect without it.")));
+			break;
+	}
 
 	if (!stop_standby(dir, logfile))
 		return false;
 
 	/*
 	 * Removing a whole standby takes a while, and the rebuild cannot start
-	 * before the next startup anyway; it finds the slot still invalidated.
+	 * before the next startup anyway; it finds the slot still invalidated,
+	 * or still missing.
 	 */
 	if (ShutdownRequestPending)
 		return false;
@@ -2466,6 +2512,76 @@ standby_has_room(const char *dir)
 	pfree(s_avail);
 	pfree(s_reserve);
 	return false;
+}
+
+/*
+ * set_standby_aside
+ *		Act on dbblue_create_standby = paused, or off if drop_slot: stop our
+ *		standby, stop reporting its port, and if off, drop our replication
+ *		slot.  Returns false if any of that failed.
+ *
+ * Paused, the slot is kept, holding WAL from where the standby stopped, so
+ * that turned on again it resumes streaming from there -- unless it was paused
+ * for longer than max_slot_wal_keep_size lasts, and the slot invalidated, in
+ * which case vet_existing_standby() rebuilds it.  Off, the slot would hold
+ * back WAL, and through hot_standby_feedback VACUUM, for a standby that is
+ * not coming back, so it goes; turned on again, the standby is then rebuilt.
+ *
+ * Its files are left in place either way: a setting changed by mistake must
+ * not cost a copy of the database, and whoever turns the standby off for good
+ * may want to look at it, or promote it, first.
+ *
+ * Only the directory dbblue_standby.dir names, the one we last ran a standby
+ * in, is looked at: off is the default, and a standby someone else set up in
+ * "<DataDir>_standby" is not ours to stop.  Nor is a promoted or foreign
+ * cluster stopped, as in retire_previous_standby().
+ *
+ * This is done once, when the setting changes to paused or off, or the
+ * worker starts with it so; a standby the operator then starts by hand is
+ * left alone.
+ */
+static bool
+set_standby_aside(bool drop_slot)
+{
+	char	   *dir = previous_standby_directory();
+	char	   *logdir;
+	char	   *logfile;
+	uint64		their_sysid = 0;
+	bool		stopped = false;
+	bool		ok = true;
+
+	/* the commands we run log to the standby's log, wherever it is */
+	logdir = dir ? pstrdup(dir) :
+		standby_directory_path(dbblue_standby_directory);
+	logfile = standby_log_path(logdir);
+
+	/* tooling must stop sending it reads before it goes away */
+	forget_standby_port();
+
+	if (dir != NULL && standby_has_data(dir) && standby_is_running(dir) &&
+		standby_identity(dir, &their_sysid) == STANDBY_OURS)
+	{
+		ok = stop_standby(dir, logfile);
+		stopped = ok;
+	}
+
+	if (stopped)
+		ereport(LOG,
+				(errmsg("dbblue create standby: stopped the standby in \"%s\", as dbblue_create_standby is %s",
+						dir, drop_slot ? "off" : "paused"),
+				 drop_slot ?
+				 errhint("Its files have been left in place. Remove \"%s\" once it is no longer needed; turning dbblue_create_standby on again builds the standby anew.",
+						 dir) :
+				 errhint("Turning dbblue_create_standby on again starts it, and it resumes streaming where it left off.")));
+
+	if (ok && drop_slot)
+		ok = drop_standby_slot(logfile);
+
+	if (dir)
+		pfree(dir);
+	pfree(logdir);
+	pfree(logfile);
+	return ok;
 }
 
 /*
@@ -2964,7 +3080,7 @@ DbblueCreateStandbyMain(Datum main_arg)
 
 	ereport(LOG,
 			(errmsg("dbblue create standby worker started (dbblue_create_standby=%s)",
-					dbblue_create_standby ? "on" : "off")));
+					GetConfigOption("dbblue_create_standby", false, false))));
 
 	while (!ShutdownRequestPending)
 	{
@@ -2986,16 +3102,35 @@ DbblueCreateStandbyMain(Datum main_arg)
 		/*
 		 * Never act while in recovery: a standby must not spawn standbys of
 		 * its own just because it inherited dbblue_create_standby=on from
-		 * the primary's configuration.
+		 * the primary's configuration.  Paused and off are acted on once
+		 * each time they are set; see set_standby_aside().
 		 */
-		if (dbblue_create_standby && !RecoveryInProgress())
+		if (!RecoveryInProgress())
 		{
-			/* even once we have given up, as the slot then holds back WAL */
-			warn_unlimited_slot_wal();
+			bool		on = (dbblue_create_standby == DBBLUE_STANDBY_ON);
 
-			if (consecutive_failures < DBBLUE_STANDBY_MAX_FAILURES)
+			/* even once we have given up, as the slot then holds back WAL */
+			if (dbblue_create_standby != DBBLUE_STANDBY_OFF)
+				warn_unlimited_slot_wal();
+
+			if (consecutive_failures < DBBLUE_STANDBY_MAX_FAILURES &&
+				(on || dbblue_create_standby != standby_mode_applied))
 			{
-				if (run_standby_tick())
+				bool		ok;
+
+				if (on)
+				{
+					standby_mode_applied = DBBLUE_STANDBY_ON;
+					ok = run_standby_tick();
+				}
+				else
+				{
+					ok = set_standby_aside(dbblue_create_standby == DBBLUE_STANDBY_OFF);
+					if (ok)
+						standby_mode_applied = dbblue_create_standby;
+				}
+
+				if (ok)
 					consecutive_failures = 0;
 				else
 				{
