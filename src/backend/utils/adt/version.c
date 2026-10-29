@@ -20,8 +20,15 @@
 Datum
 pgsql_version(PG_FUNCTION_ARGS)
 {
-	/* Modified to return DBblue version string */
-	const char *version_str =
-		"DBblue 19beta2 on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0, 64-bit";
+	/*
+	 * DBblue: report PG_VERSION_STR with "PostgreSQL" replaced by "DBblue",
+	 * so the version, platform and compiler always match the build.
+	 */
+	const char *pgname = "PostgreSQL";
+	const char *version_str = PG_VERSION_STR;
+
+	if (strncmp(version_str, pgname, strlen(pgname)) == 0)
+		version_str = psprintf("DBblue%s", version_str + strlen(pgname));
+
 	PG_RETURN_TEXT_P(cstring_to_text(version_str));
 }
