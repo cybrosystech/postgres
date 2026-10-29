@@ -365,9 +365,10 @@ gtsvector_consistent(PG_FUNCTION_ARGS)
 static int32
 unionkey(BITVECP sbase, SignTSVector *add, int siglen)
 {
+	int32		i;
+
 	if (ISSIGNKEY(add))
 	{
-		int32		i;
 		BITVECP		sadd = GETSIGN(add);
 
 		if (ISALLTRUE(add))
@@ -382,7 +383,7 @@ unionkey(BITVECP sbase, SignTSVector *add, int siglen)
 	{
 		int32	   *ptr = GETARR(add);
 
-		for (uint32 i = 0; i < ARRNELEM(add); i++)
+		for (i = 0; i < ARRNELEM(add); i++)
 			HASH(sbase, ptr[i], siglen);
 	}
 	return 0;

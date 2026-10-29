@@ -436,6 +436,7 @@ statext_dependencies_build(StatsBuildData *data)
 bytea *
 statext_dependencies_serialize(MVDependencies *dependencies)
 {
+	int			i;
 	bytea	   *output;
 	char	   *tmp;
 	Size		len;
@@ -444,7 +445,7 @@ statext_dependencies_serialize(MVDependencies *dependencies)
 	len = VARHDRSZ + SizeOfHeader;
 
 	/* and also include space for the actual attribute numbers and degrees */
-	for (uint32 i = 0; i < dependencies->ndeps; i++)
+	for (i = 0; i < dependencies->ndeps; i++)
 		len += SizeOfItem(dependencies->deps[i]->nattributes);
 
 	output = (bytea *) palloc0(len);
@@ -461,7 +462,7 @@ statext_dependencies_serialize(MVDependencies *dependencies)
 	tmp += sizeof(uint32);
 
 	/* store number of attributes and attribute numbers for each dependency */
-	for (uint32 i = 0; i < dependencies->ndeps; i++)
+	for (i = 0; i < dependencies->ndeps; i++)
 	{
 		MVDependency *d = dependencies->deps[i];
 
@@ -490,6 +491,7 @@ statext_dependencies_serialize(MVDependencies *dependencies)
 MVDependencies *
 statext_dependencies_deserialize(bytea *data)
 {
+	int			i;
 	Size		min_expected_size;
 	MVDependencies *dependencies;
 	char	   *tmp;
@@ -537,7 +539,7 @@ statext_dependencies_deserialize(bytea *data)
 	dependencies = repalloc(dependencies, offsetof(MVDependencies, deps)
 							+ (dependencies->ndeps * sizeof(MVDependency *)));
 
-	for (uint32 i = 0; i < dependencies->ndeps; i++)
+	for (i = 0; i < dependencies->ndeps; i++)
 	{
 		double		degree;
 		AttrNumber	k;
@@ -583,7 +585,7 @@ statext_dependencies_deserialize(bytea *data)
 void
 statext_dependencies_free(MVDependencies *dependencies)
 {
-	for (uint32 i = 0; i < dependencies->ndeps; i++)
+	for (int i = 0; i < dependencies->ndeps; i++)
 		pfree(dependencies->deps[i]);
 	pfree(dependencies);
 }
@@ -608,7 +610,7 @@ statext_dependencies_validate(const MVDependencies *dependencies,
 	int			attnum_expr_lowbound = 0 - numexprs;
 
 	/* Scan through each dependency entry */
-	for (uint32 i = 0; i < dependencies->ndeps; i++)
+	for (int i = 0; i < dependencies->ndeps; i++)
 	{
 		const MVDependency *dep = dependencies->deps[i];
 
@@ -911,6 +913,8 @@ static MVDependency *
 find_strongest_dependency(MVDependencies **dependencies, int ndependencies,
 						  Bitmapset *attnums)
 {
+	int			i,
+				j;
 	MVDependency *strongest = NULL;
 
 	/* number of attnums in clauses */
@@ -921,9 +925,9 @@ find_strongest_dependency(MVDependencies **dependencies, int ndependencies,
 	 * fully-matched dependencies. We do the cheap checks first, before
 	 * matching it against the attnums.
 	 */
-	for (int i = 0; i < ndependencies; i++)
+	for (i = 0; i < ndependencies; i++)
 	{
-		for (uint32 j = 0; j < dependencies[i]->ndeps; j++)
+		for (j = 0; j < dependencies[i]->ndeps; j++)
 		{
 			MVDependency *dependency = dependencies[i]->deps[j];
 
@@ -1365,6 +1369,7 @@ dependencies_clauselist_selectivity(PlannerInfo *root,
 	int			total_ndeps;
 	MVDependency **dependencies;
 	int			ndependencies;
+	int			i;
 	AttrNumber	attnum_offset;
 	RangeTblEntry *rte = planner_rt_fetch(rel->relid, root);
 
@@ -1434,7 +1439,7 @@ dependencies_clauselist_selectivity(PlannerInfo *root,
 				Assert(expr != NULL);
 
 				/* If the expression is duplicate, use the same attnum. */
-				for (int i = 0; i < unique_exprs_cnt; i++)
+				for (i = 0; i < unique_exprs_cnt; i++)
 				{
 					if (equal(unique_exprs[i], expr))
 					{
@@ -1477,7 +1482,7 @@ dependencies_clauselist_selectivity(PlannerInfo *root,
 	 * Now that we know how many expressions there are, we can offset the
 	 * values just enough to build the bitmapset.
 	 */
-	for (int i = 0; i < list_length(clauses); i++)
+	for (i = 0; i < list_length(clauses); i++)
 	{
 		AttrNumber	attnum;
 
@@ -1582,7 +1587,7 @@ dependencies_clauselist_selectivity(PlannerInfo *root,
 
 		/* count matching expressions */
 		nexprs = 0;
-		for (int i = 0; i < unique_exprs_cnt; i++)
+		for (i = 0; i < unique_exprs_cnt; i++)
 		{
 			ListCell   *lc;
 
@@ -1633,14 +1638,15 @@ dependencies_clauselist_selectivity(PlannerInfo *root,
 		 */
 		if (unique_exprs_cnt > 0 || stat->exprs != NIL)
 		{
-			uint32		ndeps = 0;
+			int			ndeps = 0;
 
-			for (uint32 i = 0; i < deps->ndeps; i++)
+			for (i = 0; i < deps->ndeps; i++)
 			{
 				bool		skip = false;
 				MVDependency *dep = deps->deps[i];
+				int			j;
 
-				for (int j = 0; j < dep->nattributes; j++)
+				for (j = 0; j < dep->nattributes; j++)
 				{
 					int			idx;
 					Node	   *expr;
@@ -1791,7 +1797,7 @@ dependencies_clauselist_selectivity(PlannerInfo *root,
 										   list_attnums, estimatedclauses);
 
 	/* free deserialized functional dependencies (and then the array) */
-	for (int i = 0; i < nfunc_dependencies; i++)
+	for (i = 0; i < nfunc_dependencies; i++)
 		pfree(func_dependencies[i]);
 
 	pfree(dependencies);

@@ -194,7 +194,8 @@ static void mdunlinkfork(RelFileLocatorBackend rlocator, ForkNumber forknum,
 static MdfdVec *mdopenfork(MdSMgrRelation reln, ForkNumber forknum, int behavior);
 static void register_dirty_segment(MdSMgrRelation reln, ForkNumber forknum,
 								   MdfdVec *seg);
-static void register_unlink_tombstone(RelFileLocatorBackend rlocator);
+static void register_unlink_segment(RelFileLocatorBackend rlocator, ForkNumber forknum,
+									BlockNumber segno);
 static void register_forget_request(RelFileLocatorBackend rlocator, ForkNumber forknum,
 									BlockNumber segno);
 static void _fdvec_resize(MdSMgrRelation reln,
@@ -468,7 +469,7 @@ mdunlinkfork(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 
 		/* Register request to unlink first segment later */
 		save_errno = errno;
-		register_unlink_tombstone(rlocator);
+		register_unlink_segment(rlocator, forknum, 0 /* first seg */ );
 		errno = save_errno;
 	}
 
@@ -1622,18 +1623,15 @@ register_dirty_segment(MdSMgrRelation reln, ForkNumber forknum, MdfdVec *seg)
 }
 
 /*
- * register_unlink_tombstone() -- Schedule a tombstone file to be deleted
- *
- * A tombstone file is an empty first segment of a relation that has already
- * been dropped (see mdunlink()).  This function schedules it to be deleted
- * after the next checkpoint.
+ * register_unlink_segment() -- Schedule a file to be deleted after next checkpoint
  */
 static void
-register_unlink_tombstone(RelFileLocatorBackend rlocator)
+register_unlink_segment(RelFileLocatorBackend rlocator, ForkNumber forknum,
+						BlockNumber segno)
 {
 	FileTag		tag;
 
-	INIT_MD_FILETAG(tag, rlocator.locator, MAIN_FORKNUM, 0);
+	INIT_MD_FILETAG(tag, rlocator.locator, forknum, segno);
 
 	/* Should never be used with temp relations */
 	Assert(!RelFileLocatorBackendIsTemp(rlocator));
@@ -2025,9 +2023,6 @@ int
 mdunlinkfiletag(const FileTag *ftag, char *path)
 {
 	RelPathStr	p;
-
-	/* We only unlink tombstone files through this mechanism */
-	Assert(ftag->forknum == MAIN_FORKNUM && ftag->segno == 0);
 
 	/* Compute the path. */
 	p = relpathperm(ftag->rlocator, MAIN_FORKNUM);

@@ -840,12 +840,12 @@ StoreQueryTuple(const PGresult *result)
 
 			if (!SetVariable(pset.vars, varname, value))
 			{
-				pfree(varname);
+				free(varname);
 				success = false;
 				break;
 			}
 
-			pfree(varname);
+			free(varname);
 		}
 	}
 

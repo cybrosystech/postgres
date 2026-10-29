@@ -535,9 +535,10 @@ gtrgm_distance(PG_FUNCTION_ARGS)
 static int32
 unionkey(BITVECP sbase, TRGM *add, int siglen)
 {
+	int32		i;
+
 	if (ISSIGNKEY(add))
 	{
-		int32		i;
 		BITVECP		sadd = GETSIGN(add);
 
 		if (ISALLTRUE(add))
@@ -551,7 +552,7 @@ unionkey(BITVECP sbase, TRGM *add, int siglen)
 		trgm	   *ptr = GETARR(add);
 		int32		tmp = 0;
 
-		for (unsigned i = 0; i < ARRNELEM(add); i++)
+		for (i = 0; i < ARRNELEM(add); i++)
 		{
 			CPTRGM(&tmp, ptr + i);
 			HASH(sbase, tmp, siglen);

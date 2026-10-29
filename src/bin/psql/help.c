@@ -725,7 +725,7 @@ helpSQL(const char *topic, unsigned short int pager)
 							_(QL_HELP[i].help),
 							buffer.data,
 							url);
-					pfree(url);
+					free(url);
 					termPQExpBuffer(&buffer);
 
 					/* If we have an exact match, exit.  Fixes \h SELECT */

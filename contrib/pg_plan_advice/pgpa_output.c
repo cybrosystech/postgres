@@ -95,7 +95,7 @@ pgpa_output_advice(StringInfo buf, pgpa_plan_walker_context *walker,
 	 * portion of the query didn't make it into the final plan.
 	 */
 	context.rid_strings = palloc0_array(const char *, rtable_length);
-	for (Index i = 0; i < rtable_length; ++i)
+	for (int i = 0; i < rtable_length; ++i)
 		if (rt_identifiers[i].alias_name != NULL)
 			context.rid_strings[i] = pgpa_identifier_string(&rt_identifiers[i]);
 
@@ -173,7 +173,7 @@ pgpa_output_unrolled_join(pgpa_output_context *context,
 {
 	pgpa_output_join_member(context, &join->outer);
 
-	for (unsigned k = 0; k < join->ninner; ++k)
+	for (int k = 0; k < join->ninner; ++k)
 	{
 		pgpa_join_member *member = &join->inner[k];
 

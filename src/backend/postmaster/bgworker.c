@@ -1416,7 +1416,9 @@ LookupBackgroundWorkerFunction(const char *libraryname, const char *funcname)
 	 */
 	if (strcmp(libraryname, "postgres") == 0)
 	{
-		for (size_t i = 0; i < lengthof(InternalBGWorkers); i++)
+		int			i;
+
+		for (i = 0; i < lengthof(InternalBGWorkers); i++)
 		{
 			if (strcmp(InternalBGWorkers[i].fn_name, funcname) == 0)
 				return InternalBGWorkers[i].fn_addr;

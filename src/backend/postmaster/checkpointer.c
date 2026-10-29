@@ -47,7 +47,6 @@
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "pgstat.h"
-#include "port/atomics.h"
 #include "postmaster/auxprocess.h"
 #include "postmaster/bgwriter.h"
 #include "postmaster/interrupt.h"
@@ -358,6 +357,12 @@ CheckpointerMain(const void *startup_data, size_t startup_data_len)
 	 * this here ensures no race conditions from other concurrent updaters.
 	 */
 	UpdateSharedMemoryConfig();
+
+	/*
+	 * Advertise our proc number that backends can use to wake us up while
+	 * we're sleeping.
+	 */
+	ProcGlobal->checkpointerProc = MyProcNumber;
 
 	/*
 	 * Loop until we've been asked to write the shutdown checkpoint or
@@ -1114,7 +1119,8 @@ RequestCheckpoint(int flags)
 #define MAX_SIGNAL_TRIES 600	/* max wait 60.0 sec */
 	for (ntries = 0;; ntries++)
 	{
-		ProcNumber	checkpointerProc = pg_atomic_read_u32(&ProcGlobal->checkpointerProc);
+		volatile PROC_HDR *procglobal = ProcGlobal;
+		ProcNumber	checkpointerProc = procglobal->checkpointerProc;
 
 		if (checkpointerProc == INVALID_PROC_NUMBER)
 		{
@@ -1255,7 +1261,8 @@ ForwardSyncRequest(const FileTag *ftag, SyncRequestType type)
 	/* ... but not till after we release the lock */
 	if (too_full)
 	{
-		ProcNumber	checkpointerProc = pg_atomic_read_u32(&ProcGlobal->checkpointerProc);
+		volatile PROC_HDR *procglobal = ProcGlobal;
+		ProcNumber	checkpointerProc = procglobal->checkpointerProc;
 
 		if (checkpointerProc != INVALID_PROC_NUMBER)
 			SetLatch(&GetPGProcByNumber(checkpointerProc)->procLatch);
@@ -1535,7 +1542,8 @@ FirstCallSinceLastCheckpoint(void)
 void
 WakeupCheckpointer(void)
 {
-	ProcNumber	checkpointerProc = pg_atomic_read_u32(&ProcGlobal->checkpointerProc);
+	volatile PROC_HDR *procglobal = ProcGlobal;
+	ProcNumber	checkpointerProc = procglobal->checkpointerProc;
 
 	if (checkpointerProc != INVALID_PROC_NUMBER)
 		SetLatch(&GetPGProcByNumber(checkpointerProc)->procLatch);

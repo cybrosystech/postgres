@@ -1,7 +1,5 @@
 /*
  * contrib/btree_gist/btree_numeric.c
- *
- * Support for numeric data type.
  */
 #include "postgres.h"
 
@@ -75,15 +73,11 @@ gbt_numeric_cmp(const void *a, const void *b, Oid collation, FmgrInfo *flinfo)
 }
 
 
-/*
- * We could conceivably support internal-key truncation here, but it would
- * require custom truncation code, and most values wouldn't be long enough
- * to make it worthwhile.
- */
 static const gbtree_vinfo tinfo =
 {
 	gbt_t_numeric,
-	false,						/* no truncation permitted */
+	0,
+	false,
 	gbt_numeric_gt,
 	gbt_numeric_ge,
 	gbt_numeric_eq,

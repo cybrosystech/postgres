@@ -1,7 +1,5 @@
 /*
  * contrib/btree_gist/btree_bytea.c
- *
- * Support for bytea data type.
  */
 #include "postgres.h"
 
@@ -73,7 +71,8 @@ gbt_byteacmp(const void *a, const void *b, Oid collation, FmgrInfo *flinfo)
 static const gbtree_vinfo tinfo =
 {
 	gbt_t_bytea,
-	true,						/* internal keys can be truncated */
+	0,
+	true,
 	gbt_byteagt,
 	gbt_byteage,
 	gbt_byteaeq,

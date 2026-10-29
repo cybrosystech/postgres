@@ -372,7 +372,7 @@ downcase_ident_libc_sb(char *dst, size_t dstsize, const char *src,
 					   size_t srclen, pg_locale_t locale)
 {
 	locale_t	loc = locale->lt;
-	size_t		i;
+	int			i;
 
 	for (i = 0; i < srclen && i < dstsize; i++)
 	{

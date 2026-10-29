@@ -1426,7 +1426,7 @@ sendDir(bbsink *sink, const char *path, int basepathlen, bool sizeonly,
 		if (strcmp(path, "./pg_tblspc") == 0 && S_ISLNK(statbuf.st_mode))
 		{
 			char		linkpath[MAXPGPATH];
-			ssize_t		rllen;
+			int			rllen;
 
 			rllen = readlink(pathbuf, linkpath, sizeof(linkpath));
 			if (rllen < 0)

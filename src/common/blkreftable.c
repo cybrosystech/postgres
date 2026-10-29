@@ -173,8 +173,8 @@ typedef struct BlockRefTableBuffer
 	io_callback_fn io_callback;
 	void	   *io_callback_arg;
 	char		data[BUFSIZE];
-	size_t		used;
-	size_t		cursor;
+	int			used;
+	int			cursor;
 	pg_crc32c	crc;
 } BlockRefTableBuffer;
 
@@ -223,9 +223,9 @@ struct BlockRefTableWriter
 static int	BlockRefTableComparator(const void *a, const void *b);
 static void BlockRefTableFlush(BlockRefTableBuffer *buffer);
 static void BlockRefTableRead(BlockRefTableReader *reader, void *data,
-							  size_t length);
+							  int length);
 static void BlockRefTableWrite(BlockRefTableBuffer *buffer, void *data,
-							   size_t length);
+							   int length);
 static void BlockRefTableFileTerminate(BlockRefTableBuffer *buffer);
 
 /*
@@ -1228,7 +1228,7 @@ BlockRefTableFlush(BlockRefTableBuffer *buffer)
  * buffered but not yet actually returned).
  */
 static void
-BlockRefTableRead(BlockRefTableReader *reader, void *data, size_t length)
+BlockRefTableRead(BlockRefTableReader *reader, void *data, int length)
 {
 	BlockRefTableBuffer *buffer = &reader->buffer;
 
@@ -1241,7 +1241,7 @@ BlockRefTableRead(BlockRefTableReader *reader, void *data, size_t length)
 			 * If any buffered data is available, use that to satisfy as much
 			 * of the request as possible.
 			 */
-			size_t		bytes_to_copy = Min(length, buffer->used - buffer->cursor);
+			int			bytes_to_copy = Min(length, buffer->used - buffer->cursor);
 
 			memcpy(data, &buffer->data[buffer->cursor], bytes_to_copy);
 			COMP_CRC32C(buffer->crc, &buffer->data[buffer->cursor],
@@ -1256,7 +1256,7 @@ BlockRefTableRead(BlockRefTableReader *reader, void *data, size_t length)
 			 * If the request length is long, read directly into caller's
 			 * buffer.
 			 */
-			size_t		bytes_read;
+			int			bytes_read;
 
 			bytes_read = buffer->io_callback(buffer->io_callback_arg,
 											 data, length);
@@ -1293,7 +1293,7 @@ BlockRefTableRead(BlockRefTableReader *reader, void *data, size_t length)
  * and update the running CRC calculation for that data.
  */
 static void
-BlockRefTableWrite(BlockRefTableBuffer *buffer, void *data, size_t length)
+BlockRefTableWrite(BlockRefTableBuffer *buffer, void *data, int length)
 {
 	/* Update running CRC calculation. */
 	COMP_CRC32C(buffer->crc, data, length);

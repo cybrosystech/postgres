@@ -75,7 +75,7 @@ directBoolConsistentFn(GinScanKey key)
 										  PointerGetDatum(key->entryRes),
 										  UInt16GetDatum(key->strategy),
 										  key->query,
-										  Int32GetDatum(key->nuserentries),
+										  UInt32GetDatum(key->nuserentries),
 										  PointerGetDatum(key->extra_data),
 										  PointerGetDatum(&key->recheckCurItem),
 										  PointerGetDatum(key->queryValues),
@@ -93,7 +93,7 @@ directTriConsistentFn(GinScanKey key)
 													 PointerGetDatum(key->entryRes),
 													 UInt16GetDatum(key->strategy),
 													 key->query,
-													 Int32GetDatum(key->nuserentries),
+													 UInt32GetDatum(key->nuserentries),
 													 PointerGetDatum(key->extra_data),
 													 PointerGetDatum(key->queryValues),
 													 PointerGetDatum(key->queryCategories)));
@@ -114,7 +114,7 @@ shimBoolConsistentFn(GinScanKey key)
 													   PointerGetDatum(key->entryRes),
 													   UInt16GetDatum(key->strategy),
 													   key->query,
-													   Int32GetDatum(key->nuserentries),
+													   UInt32GetDatum(key->nuserentries),
 													   PointerGetDatum(key->extra_data),
 													   PointerGetDatum(key->queryValues),
 													   PointerGetDatum(key->queryCategories)));
@@ -148,7 +148,8 @@ static GinTernaryValue
 shimTriConsistentFn(GinScanKey key)
 {
 	int			nmaybe;
-	uint32		maybeEntries[MAX_MAYBE_ENTRIES];
+	int			maybeEntries[MAX_MAYBE_ENTRIES];
+	int			i;
 	bool		boolResult;
 	bool		recheck;
 	GinTernaryValue curResult;
@@ -159,7 +160,7 @@ shimTriConsistentFn(GinScanKey key)
 	 * test all combinations, so give up and return MAYBE.
 	 */
 	nmaybe = 0;
-	for (uint32 i = 0; i < key->nentries; i++)
+	for (i = 0; i < key->nentries; i++)
 	{
 		if (key->entryRes[i] == GIN_MAYBE)
 		{
@@ -177,15 +178,13 @@ shimTriConsistentFn(GinScanKey key)
 		return directBoolConsistentFn(key);
 
 	/* First call consistent function with all the maybe-inputs set FALSE */
-	for (int i = 0; i < nmaybe; i++)
+	for (i = 0; i < nmaybe; i++)
 		key->entryRes[maybeEntries[i]] = GIN_FALSE;
 	curResult = directBoolConsistentFn(key);
 	recheck = key->recheckCurItem;
 
 	for (;;)
 	{
-		int			i;
-
 		/* Twiddle the entries for next combination. */
 		for (i = 0; i < nmaybe; i++)
 		{
@@ -215,7 +214,7 @@ shimTriConsistentFn(GinScanKey key)
 		curResult = GIN_MAYBE;
 
 	/* We must restore the original state of the entryRes array */
-	for (int i = 0; i < nmaybe; i++)
+	for (i = 0; i < nmaybe; i++)
 		key->entryRes[maybeEntries[i]] = GIN_MAYBE;
 
 	return curResult;

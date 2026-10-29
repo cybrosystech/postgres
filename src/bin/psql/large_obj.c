@@ -210,12 +210,12 @@ do_lo_import(const char *filename_arg, const char *comment_arg)
 
 		if (!(res = PSQLexec(cmdbuf)))
 		{
-			pg_free(cmdbuf);
+			free(cmdbuf);
 			return fail_lo_xact("\\lo_import", own_transaction);
 		}
 
 		PQclear(res);
-		pg_free(cmdbuf);
+		free(cmdbuf);
 	}
 
 	if (!finish_lo_xact("\\lo_import", own_transaction))

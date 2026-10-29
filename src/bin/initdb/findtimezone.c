@@ -96,10 +96,23 @@ pg_load_tz(const char *name)
 		return NULL;			/* not going to fit */
 
 	/*
-	 * Let the IANA tzdb code interpret the time zone name.
+	 * "GMT" is always sent to tzparse(); see comments for pg_tzset().
 	 */
-	if (!pg_tzload(name, NULL, &tz.state))
-		return NULL;			/* unknown timezone */
+	if (strcmp(name, "GMT") == 0)
+	{
+		if (!tzparse(name, &tz.state, true))
+		{
+			/* This really, really should not happen ... */
+			return NULL;
+		}
+	}
+	else if (tzload(name, NULL, &tz.state, true) != 0)
+	{
+		if (name[0] == ':' || !tzparse(name, &tz.state, false))
+		{
+			return NULL;		/* unknown timezone */
+		}
+	}
 
 	strcpy(tz.TZname, name);
 
@@ -533,7 +546,7 @@ check_system_link_file(const char *linkname, struct tztry *tt,
 {
 #ifdef HAVE_READLINK
 	char		link_target[MAXPGPATH];
-	ssize_t		len;
+	int			len;
 	const char *cur_name;
 
 	/*

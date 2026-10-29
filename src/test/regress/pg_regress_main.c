@@ -82,7 +82,7 @@ psql_start_test(const char *testname,
 
 	appnameenv = psprintf("pg_regress/%s", testname);
 	setenv("PGAPPNAME", appnameenv, 1);
-	pfree(appnameenv);
+	free(appnameenv);
 
 	pid = spawn_process(psql_cmd.data);
 

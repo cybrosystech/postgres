@@ -383,7 +383,7 @@ check_testspec(TestSpec *testspec)
 		}
 	}
 
-	pg_free(allsteps);
+	free(allsteps);
 }
 
 /*
@@ -437,9 +437,9 @@ run_all_permutations(TestSpec *testspec)
 
 	run_all_permutations_recurse(testspec, piles, 0, stepptrs);
 
-	pg_free(steps);
-	pg_free(stepptrs);
-	pg_free(piles);
+	free(steps);
+	free(stepptrs);
+	free(piles);
 }
 
 static void
@@ -742,7 +742,7 @@ run_permutation(TestSpec *testspec, int nsteps, PermutationStep **steps)
 		PQclear(res);
 	}
 
-	pg_free(waiting);
+	free(waiting);
 }
 
 /*

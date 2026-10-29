@@ -530,7 +530,7 @@ llvm_copy_attributes(LLVMValueRef v_from, LLVMValueRef v_to)
 	/* and each function parameter's attribute */
 	param_count = LLVMCountParams(v_from);
 
-	for (uint32 paramidx = 1; paramidx <= param_count; paramidx++)
+	for (int paramidx = 1; paramidx <= param_count; paramidx++)
 		llvm_copy_attributes_at_index(v_from, v_to, paramidx);
 }
 
@@ -1138,7 +1138,7 @@ llvm_resolve_symbols(LLVMOrcDefinitionGeneratorRef GeneratorObj, void *Ctx,
 	LLVMErrorRef error;
 	LLVMOrcMaterializationUnitRef mu;
 
-	for (size_t i = 0; i < LookupSetSize; i++)
+	for (int i = 0; i < LookupSetSize; i++)
 	{
 		const char *name = LLVMOrcSymbolStringPoolEntryStr(LookupSet[i].Name);
 

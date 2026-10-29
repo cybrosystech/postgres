@@ -23,11 +23,11 @@
 #include "miscadmin.h"
 #include "nodes/pg_list.h"
 #include "nodes/value.h"
+#include "storage/condition_variable.h"
 #include "storage/dsm_registry.h"
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
-#include "storage/spin.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/injection_point.h"
@@ -40,10 +40,6 @@ PG_MODULE_MAGIC;
 /* Maximum number of waits usable in injection points at once */
 #define INJ_MAX_WAIT	8
 #define INJ_NAME_MAXLEN	64
-
-/* Thresholds of waits */
-#define INJ_WAIT_INITIAL_US		10	/* 10us */
-#define INJ_WAIT_MAX_US			100000	/* 100ms */
 
 /*
  * List of injection points stored in TopMemoryContext attached
@@ -63,10 +59,13 @@ typedef struct InjectionPointSharedState
 	slock_t		lock;
 
 	/* Counters advancing when injection_points_wakeup() is called */
-	pg_atomic_uint32 wait_counts[INJ_MAX_WAIT];
+	uint32		wait_counts[INJ_MAX_WAIT];
 
 	/* Names of injection points attached to wait counters */
 	char		name[INJ_MAX_WAIT][INJ_NAME_MAXLEN];
+
+	/* Condition variable used for waits and wakeups */
+	ConditionVariable wait_point;
 } InjectionPointSharedState;
 
 /* Pointer to shared-memory state. */
@@ -103,9 +102,9 @@ injection_point_init_state(void *ptr, void *arg)
 	InjectionPointSharedState *state = (InjectionPointSharedState *) ptr;
 
 	SpinLockInit(&state->lock);
+	memset(state->wait_counts, 0, sizeof(state->wait_counts));
 	memset(state->name, 0, sizeof(state->name));
-	for (int i = 0; i < INJ_MAX_WAIT; i++)
-		pg_atomic_init_u32(&state->wait_counts[i], 0);
+	ConditionVariableInit(&state->wait_point);
 }
 
 static void
@@ -223,7 +222,7 @@ injection_notice(const char *name, const void *private_data, void *arg)
 		elog(NOTICE, "notice triggered for injection point %s", name);
 }
 
-/* Wait until injection_points_wakeup() is called */
+/* Wait on a condition variable, awaken by injection_points_wakeup() */
 void
 injection_wait(const char *name, const void *private_data, void *arg)
 {
@@ -231,7 +230,6 @@ injection_wait(const char *name, const void *private_data, void *arg)
 	int			index = -1;
 	uint32		injection_wait_event = 0;
 	const InjectionPointCondition *condition = private_data;
-	int			delay_us = 0;
 
 	if (inj_state == NULL)
 		injection_init_shmem();
@@ -256,33 +254,31 @@ injection_wait(const char *name, const void *private_data, void *arg)
 		{
 			index = i;
 			strlcpy(inj_state->name[i], name, INJ_NAME_MAXLEN);
-			old_wait_counts = pg_atomic_read_u32(&inj_state->wait_counts[i]);
+			old_wait_counts = inj_state->wait_counts[i];
 			break;
 		}
 	}
 	SpinLockRelease(&inj_state->lock);
 
 	if (index < 0)
-		elog(ERROR, "could not find free slot for wait of injection point %s",
+		elog(ERROR, "could not find free slot for wait of injection point %s ",
 			 name);
 
-	/*
-	 * Wait until the counter is bumped by injection_points_wakeup().
-	 *
-	 * This loop starts with a short delay for responsiveness, enlarged to
-	 * ease the CPU workload in slower environments.
-	 */
-	delay_us = INJ_WAIT_INITIAL_US;
-
-	pgstat_report_wait_start(injection_wait_event);
-	while (pg_atomic_read_u32(&inj_state->wait_counts[index]) == old_wait_counts)
+	/* And sleep.. */
+	ConditionVariablePrepareToSleep(&inj_state->wait_point);
+	for (;;)
 	{
-		CHECK_FOR_INTERRUPTS();
-		pg_usleep(delay_us);
-		if (delay_us < INJ_WAIT_MAX_US)
-			delay_us = Min(delay_us * 2, INJ_WAIT_MAX_US);
+		uint32		new_wait_counts;
+
+		SpinLockAcquire(&inj_state->lock);
+		new_wait_counts = inj_state->wait_counts[index];
+		SpinLockRelease(&inj_state->lock);
+
+		if (old_wait_counts != new_wait_counts)
+			break;
+		ConditionVariableSleep(&inj_state->wait_point, injection_wait_event);
 	}
-	pgstat_report_wait_end();
+	ConditionVariableCancelSleep();
 
 	/* Remove this injection point from the waiters. */
 	injection_wait_cleanup(0, Int32GetDatum(index));
@@ -445,7 +441,7 @@ injection_points_wakeup(PG_FUNCTION_ARGS)
 	if (inj_state == NULL)
 		injection_init_shmem();
 
-	/* Find the injection point then bump its wait counter */
+	/* First bump the wait counter for the injection point to wake up */
 	SpinLockAcquire(&inj_state->lock);
 	for (int i = 0; i < INJ_MAX_WAIT; i++)
 	{
@@ -460,9 +456,11 @@ injection_points_wakeup(PG_FUNCTION_ARGS)
 		SpinLockRelease(&inj_state->lock);
 		elog(ERROR, "could not find injection point %s to wake up", name);
 	}
+	inj_state->wait_counts[index]++;
 	SpinLockRelease(&inj_state->lock);
 
-	pg_atomic_fetch_add_u32(&inj_state->wait_counts[index], 1);
+	/* And broadcast the change to the waiters */
+	ConditionVariableBroadcast(&inj_state->wait_point);
 	PG_RETURN_VOID();
 }
 

@@ -176,11 +176,6 @@ _pglstat64(const char *name, struct stat *buf)
 				ret = -1;
 			}
 		}
-		else if (size >= sizeof(next))
-		{
-			errno = ENAMETOOLONG;
-			ret = -1;
-		}
 		else
 		{
 			/* It's a junction point, so report it as a symlink. */
@@ -239,7 +234,7 @@ _pgstat64(const char *name, struct stat *buf)
 			}
 			return -1;
 		}
-		else if (size >= sizeof(next))
+		if (size >= sizeof(next))
 		{
 			errno = ENAMETOOLONG;
 			return -1;

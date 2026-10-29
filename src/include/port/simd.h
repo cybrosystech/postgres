@@ -548,6 +548,10 @@ vector8_pack_16(const Vector8 v1, const Vector8 v2)
 
 /*
  * Unsigned shift left of each 32-bit element in the vector by "i" bits.
+ *
+ * XXX AArch64 requires an integer literal, so we have to list all expected
+ * values of "i" from all callers in a switch statement.  If you add a new
+ * caller, be sure your expected values of "i" are handled.
  */
 #ifndef USE_NO_SIMD
 static inline Vector8
@@ -556,13 +560,24 @@ vector8_shift_left(const Vector8 v1, int i)
 #ifdef USE_SSE2
 	return _mm_slli_epi32(v1, i);
 #elif defined(USE_NEON)
-	return (Vector8) vshlq_u32((Vector32) v1, vdupq_n_s32(i));
+	switch (i)
+	{
+		case 4:
+			return (Vector8) vshlq_n_u32((Vector32) v1, 4);
+		default:
+			Assert(false);
+			return vector8_broadcast(0);
+	}
 #endif
 }
 #endif							/* ! USE_NO_SIMD */
 
 /*
  * Unsigned shift right of each 32-bit element in the vector by "i" bits.
+ *
+ * XXX AArch64 requires an integer literal, so we have to list all expected
+ * values of "i" from all callers in a switch statement.  If you add a new
+ * caller, be sure your expected values of "i" are handled.
  */
 #ifndef USE_NO_SIMD
 static inline Vector8
@@ -571,8 +586,16 @@ vector8_shift_right(const Vector8 v1, int i)
 #ifdef USE_SSE2
 	return _mm_srli_epi32(v1, i);
 #elif defined(USE_NEON)
-	/* negative shift count means right shift */
-	return (Vector8) vshlq_u32((Vector32) v1, vdupq_n_s32(-i));
+	switch (i)
+	{
+		case 4:
+			return (Vector8) vshrq_n_u32((Vector32) v1, 4);
+		case 8:
+			return (Vector8) vshrq_n_u32((Vector32) v1, 8);
+		default:
+			Assert(false);
+			return vector8_broadcast(0);
+	}
 #endif
 }
 #endif							/* ! USE_NO_SIMD */

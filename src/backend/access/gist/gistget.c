@@ -409,12 +409,10 @@ gistScanPage(IndexScanDesc scan, GISTSearchItem *pageItem,
 		MemoryContextReset(so->pageDataCxt);
 
 	/*
-	 * Save the current page's block number for a possible gistkillitems()
-	 * call later.  We also save its LSN, so that we know whether it is safe
-	 * to apply the LP_DEAD hints to the page later.  This allows us to drop
-	 * the pin for MVCC scans, which allows vacuum to avoid blocking.
+	 * We save the LSN of the page as we read it, so that we know whether it
+	 * is safe to apply LP_DEAD hints to the page later. This allows us to
+	 * drop the pin for MVCC scans, which allows vacuum to avoid blocking.
 	 */
-	so->curBlkno = pageItem->blkno;
 	so->curPageLSN = BufferGetLSNAtomic(buffer);
 
 	/*
@@ -731,6 +729,9 @@ gistgettuple(IndexScanDesc scan, ScanDirection dir)
 					return false;
 
 				CHECK_FOR_INTERRUPTS();
+
+				/* save current item BlockNumber for next gistkillitems() call */
+				so->curBlkno = item->blkno;
 
 				/*
 				 * While scanning a leaf page, ItemPointers of matching heap

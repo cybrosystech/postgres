@@ -3110,7 +3110,11 @@ transformIndexStmt(Oid relid, IndexStmt *stmt, const char *queryString)
 
 		if (ielem->expr)
 		{
-			/* Do parse transformation of the expression */
+			/* Extract preliminary index col name before transforming expr */
+			if (ielem->indexcolname == NULL)
+				ielem->indexcolname = FigureIndexColname(ielem->expr);
+
+			/* Now do parse transformation of the expression */
 			ielem->expr = transformExpr(pstate, ielem->expr,
 										EXPR_KIND_INDEX_EXPRESSION);
 

@@ -268,6 +268,7 @@ ginNewScanKey(IndexScanDesc scan)
 {
 	ScanKey		scankey = scan->keyData;
 	GinScanOpaque so = (GinScanOpaque) scan->opaque;
+	int			i;
 	int			numExcludeOnly;
 	bool		hasNullQuery = false;
 	bool		attrHasNormalScan[INDEX_MAX_KEYS] = {false};
@@ -293,7 +294,7 @@ ginNewScanKey(IndexScanDesc scan)
 
 	so->isVoidRes = false;
 
-	for (int i = 0; i < scan->numberOfKeys; i++)
+	for (i = 0; i < scan->numberOfKeys; i++)
 	{
 		ScanKey		skey = &scankey[i];
 		Datum	   *queryValues;
@@ -392,7 +393,7 @@ ginNewScanKey(IndexScanDesc scan)
 	 * and be set to normal (excludeOnly = false).
 	 */
 	numExcludeOnly = 0;
-	for (uint32 i = 0; i < so->nkeys; i++)
+	for (i = 0; i < so->nkeys; i++)
 	{
 		GinScanKey	key = &so->keys[i];
 
@@ -426,7 +427,7 @@ ginNewScanKey(IndexScanDesc scan)
 		/* Re-order the keys ... */
 		iNormalKey = 0;
 		iExcludeOnly = so->nkeys - numExcludeOnly;
-		for (uint32 i = 0; i < so->nkeys; i++)
+		for (i = 0; i < so->nkeys; i++)
 		{
 			GinScanKey	key = &so->keys[i];
 

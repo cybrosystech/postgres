@@ -56,10 +56,6 @@ CREATE FUNCTION test_bms_difference(text, text)
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C;
 
-CREATE FUNCTION test_bms_offset_members(text, integer)
-RETURNS text
-AS 'MODULE_PATHNAME' LANGUAGE C;
-
 CREATE FUNCTION test_bms_is_empty(text)
 RETURNS boolean
 AS 'MODULE_PATHNAME' LANGUAGE C;
@@ -138,10 +134,6 @@ AS 'MODULE_PATHNAME' LANGUAGE C;
 
 -- Test utility functions
 CREATE FUNCTION test_random_operations(bigint, integer, integer, integer)
-RETURNS integer
-AS 'MODULE_PATHNAME' LANGUAGE C;
-
-CREATE FUNCTION test_random_offset_operations(bigint, integer, integer, integer)
 RETURNS integer
 AS 'MODULE_PATHNAME' LANGUAGE C;
 

@@ -785,11 +785,17 @@ dropRoles(PGconn *conn)
 	int			i_rolname;
 	int			i;
 
-	printfPQExpBuffer(buf,
-					  "SELECT rolname "
-					  "FROM %s "
-					  "WHERE rolname !~ '^pg_' "
-					  "ORDER BY 1", role_catalog);
+	if (server_version >= 90600)
+		printfPQExpBuffer(buf,
+						  "SELECT rolname "
+						  "FROM %s "
+						  "WHERE rolname !~ '^pg_' "
+						  "ORDER BY 1", role_catalog);
+	else
+		printfPQExpBuffer(buf,
+						  "SELECT rolname "
+						  "FROM %s "
+						  "ORDER BY 1", role_catalog);
 
 	res = executeQuery(conn, buf->data);
 
@@ -843,16 +849,38 @@ dumpRoles(PGconn *conn)
 	 * Notes: rolconfig is dumped later, and pg_authid must be used for
 	 * extracting rolcomment regardless of role_catalog.
 	 */
-	printfPQExpBuffer(buf,
-					  "SELECT oid, rolname, rolsuper, rolinherit, "
-					  "rolcreaterole, rolcreatedb, "
-					  "rolcanlogin, rolconnlimit, rolpassword, "
-					  "rolvaliduntil, rolreplication, rolbypassrls, "
-					  "pg_catalog.shobj_description(oid, 'pg_authid') as rolcomment, "
-					  "rolname = current_user AS is_current_user "
-					  "FROM %s "
-					  "WHERE rolname !~ '^pg_' "
-					  "ORDER BY 2", role_catalog);
+	if (server_version >= 90600)
+		printfPQExpBuffer(buf,
+						  "SELECT oid, rolname, rolsuper, rolinherit, "
+						  "rolcreaterole, rolcreatedb, "
+						  "rolcanlogin, rolconnlimit, rolpassword, "
+						  "rolvaliduntil, rolreplication, rolbypassrls, "
+						  "pg_catalog.shobj_description(oid, 'pg_authid') as rolcomment, "
+						  "rolname = current_user AS is_current_user "
+						  "FROM %s "
+						  "WHERE rolname !~ '^pg_' "
+						  "ORDER BY 2", role_catalog);
+	else if (server_version >= 90500)
+		printfPQExpBuffer(buf,
+						  "SELECT oid, rolname, rolsuper, rolinherit, "
+						  "rolcreaterole, rolcreatedb, "
+						  "rolcanlogin, rolconnlimit, rolpassword, "
+						  "rolvaliduntil, rolreplication, rolbypassrls, "
+						  "pg_catalog.shobj_description(oid, 'pg_authid') as rolcomment, "
+						  "rolname = current_user AS is_current_user "
+						  "FROM %s "
+						  "ORDER BY 2", role_catalog);
+	else
+		printfPQExpBuffer(buf,
+						  "SELECT oid, rolname, rolsuper, rolinherit, "
+						  "rolcreaterole, rolcreatedb, "
+						  "rolcanlogin, rolconnlimit, rolpassword, "
+						  "rolvaliduntil, rolreplication, "
+						  "false as rolbypassrls, "
+						  "pg_catalog.shobj_description(oid, 'pg_authid') as rolcomment, "
+						  "rolname = current_user AS is_current_user "
+						  "FROM %s "
+						  "ORDER BY 2", role_catalog);
 
 	res = executeQuery(conn, buf->data);
 
@@ -1308,7 +1336,7 @@ dumpRoleGUCPrivs(PGconn *conn)
 
 		fprintf(OPF, "%s", buf->data);
 
-		pg_free(fparname);
+		free(fparname);
 		destroyPQExpBuffer(buf);
 	}
 
@@ -1447,7 +1475,7 @@ dumpTablespaces(PGconn *conn)
 
 		fprintf(OPF, "%s", buf->data);
 
-		pg_free(fspcname);
+		free(fspcname);
 		destroyPQExpBuffer(buf);
 	}
 

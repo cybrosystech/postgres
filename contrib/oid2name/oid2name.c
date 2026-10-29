@@ -427,7 +427,7 @@ sql_exec(PGconn *conn, const char *todo, bool quiet)
 		memset(pad, '-', l);
 		pad[l] = '\0';
 		fprintf(stdout, "%s\n", pad);
-		pg_free(pad);
+		free(pad);
 	}
 
 	/* for each row, dump the information */
@@ -440,7 +440,7 @@ sql_exec(PGconn *conn, const char *todo, bool quiet)
 
 	/* cleanup */
 	PQclear(res);
-	pg_free(length);
+	free(length);
 
 	return 0;
 }
@@ -562,7 +562,7 @@ sql_exec_searchtables(PGconn *conn, struct options *opts)
 					opts->extended ? addfields : "",
 					qualifiers);
 
-	pg_free(qualifiers);
+	free(qualifiers);
 
 	sql_exec(conn, todo, opts->quiet);
 }

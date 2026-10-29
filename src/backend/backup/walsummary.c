@@ -269,11 +269,11 @@ IsWalSummaryFilename(char *filename)
 /*
  * Data read callback for use with CreateBlockRefTableReader.
  */
-size_t
-ReadWalSummary(void *wal_summary_io, void *data, size_t length)
+int
+ReadWalSummary(void *wal_summary_io, void *data, int length)
 {
 	WalSummaryIO *io = wal_summary_io;
-	ssize_t		nbytes;
+	int			nbytes;
 
 	nbytes = FileRead(io->file, data, length, io->filepos,
 					  WAIT_EVENT_WAL_SUMMARY_READ);
@@ -290,11 +290,11 @@ ReadWalSummary(void *wal_summary_io, void *data, size_t length)
 /*
  * Data write callback for use with WriteBlockRefTable.
  */
-size_t
-WriteWalSummary(void *wal_summary_io, void *data, size_t length)
+int
+WriteWalSummary(void *wal_summary_io, void *data, int length)
 {
 	WalSummaryIO *io = wal_summary_io;
-	ssize_t		nbytes;
+	int			nbytes;
 
 	nbytes = FileWrite(io->file, data, length, io->filepos,
 					   WAIT_EVENT_WAL_SUMMARY_WRITE);
@@ -306,9 +306,9 @@ WriteWalSummary(void *wal_summary_io, void *data, size_t length)
 	if (nbytes != length)
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("could not write file \"%s\": wrote only %zd of %zu bytes at offset %lld",
+				 errmsg("could not write file \"%s\": wrote only %d of %d bytes at offset %u",
 						FilePathName(io->file), nbytes,
-						length, (long long) io->filepos),
+						length, (unsigned) io->filepos),
 				 errhint("Check free disk space.")));
 
 	io->filepos += nbytes;

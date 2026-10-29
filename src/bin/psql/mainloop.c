@@ -210,7 +210,7 @@ MainLoop(FILE *source)
 		if (pset.lineno == 1 && !pset.cur_cmd_interactive &&
 			strncmp(line, "PGDMP", 5) == 0)
 		{
-			pg_free(line);
+			free(line);
 			puts(_("The input is a PostgreSQL custom-format dump.\n"
 				   "Use the pg_restore command-line client to restore this dump to a database.\n"));
 			fflush(stdout);
@@ -221,7 +221,7 @@ MainLoop(FILE *source)
 		/* no further processing of empty lines, unless within a literal */
 		if (line[0] == '\0' && !psql_scan_in_quote(scan_state))
 		{
-			pg_free(line);
+			free(line);
 			continue;
 		}
 
@@ -304,7 +304,7 @@ MainLoop(FILE *source)
 							 "       \\? for help with psql commands\n"
 							 "       \\g or terminate with semicolon to execute query\n"
 							 "       \\q to quit\n"));
-					pg_free(line);
+					free(line);
 					fflush(stdout);
 					continue;
 				}
@@ -334,7 +334,7 @@ MainLoop(FILE *source)
 				else
 				{
 					/* exit app */
-					pg_free(line);
+					free(line);
 					fflush(stdout);
 					successResult = EXIT_SUCCESS;
 					break;
@@ -536,7 +536,7 @@ MainLoop(FILE *source)
 						appendPQExpBufferChar(query_buf, '\n');
 					/* rescan query_buf as new input */
 					psql_scan_finish(scan_state);
-					pg_free(line);
+					free(line);
 					line = pg_strdup(query_buf->data);
 					resetPQExpBuffer(query_buf);
 					/* reset parsing state since we are rescanning whole line */
@@ -574,7 +574,7 @@ MainLoop(FILE *source)
 		}
 
 		psql_scan_finish(scan_state);
-		pg_free(line);
+		free(line);
 
 		if (slashCmdStatus == PSQL_CMD_TERMINATE)
 		{

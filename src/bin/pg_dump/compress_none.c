@@ -53,7 +53,7 @@ ReadDataFromArchiveNone(ArchiveHandle *AH, CompressorState *cs)
 		ahwrite(buf, 1, cnt, AH);
 	}
 
-	pg_free(buf);
+	free(buf);
 }
 
 

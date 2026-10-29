@@ -1988,6 +1988,7 @@ void
 NISortAffixes(IspellDict *Conf)
 {
 	AFFIX	   *Affix;
+	size_t		i;
 	CMPDAffix  *ptr;
 	int			firstsuffix = Conf->naffixes;
 
@@ -2000,7 +2001,7 @@ NISortAffixes(IspellDict *Conf)
 	Conf->CompoundAffix = ptr = palloc_array(CMPDAffix, Conf->naffixes);
 	ptr->affix = NULL;
 
-	for (int i = 0; i < Conf->naffixes; i++)
+	for (i = 0; i < Conf->naffixes; i++)
 	{
 		Affix = &(((AFFIX *) Conf->Affix)[i]);
 		if (Affix->type == FF_SUFFIX && i < firstsuffix)

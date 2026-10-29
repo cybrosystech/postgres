@@ -26,7 +26,6 @@ OBJS = \
 	pgstat_database.o \
 	pgstat_function.o \
 	pgstat_io.o \
-	pgstat_kind.o \
 	pgstat_lock.o \
 	pgstat_relation.o \
 	pgstat_replslot.o \

@@ -1215,7 +1215,7 @@ fill_allowed_sasl_mechs(PGconn *conn)
 	StaticAssertDecl(lengthof(conn->allowed_sasl_mechs) == SASL_MECHANISM_COUNT,
 					 "conn->allowed_sasl_mechs[] is not sufficiently large for holding all supported SASL mechanisms");
 
-	for (size_t i = 0; i < SASL_MECHANISM_COUNT; i++)
+	for (int i = 0; i < SASL_MECHANISM_COUNT; i++)
 		conn->allowed_sasl_mechs[i] = supported_sasl_mechs[i];
 }
 
@@ -1225,7 +1225,7 @@ fill_allowed_sasl_mechs(PGconn *conn)
 static inline void
 clear_allowed_sasl_mechs(PGconn *conn)
 {
-	for (size_t i = 0; i < lengthof(conn->allowed_sasl_mechs); i++)
+	for (int i = 0; i < lengthof(conn->allowed_sasl_mechs); i++)
 		conn->allowed_sasl_mechs[i] = NULL;
 }
 
@@ -1236,7 +1236,7 @@ clear_allowed_sasl_mechs(PGconn *conn)
 static inline int
 index_of_allowed_sasl_mech(PGconn *conn, const pg_fe_sasl_mech *mech)
 {
-	for (size_t i = 0; i < lengthof(conn->allowed_sasl_mechs); i++)
+	for (int i = 0; i < lengthof(conn->allowed_sasl_mechs); i++)
 	{
 		if (conn->allowed_sasl_mechs[i] == mech)
 			return i;
@@ -1256,6 +1256,8 @@ index_of_allowed_sasl_mech(PGconn *conn, const pg_fe_sasl_mech *mech)
 bool
 pqConnectOptions2(PGconn *conn)
 {
+	int			i;
+
 	/*
 	 * Allocate memory for details about each host to which we might possibly
 	 * try to connect.  For that, count the number of elements in the hostaddr
@@ -1279,7 +1281,6 @@ pqConnectOptions2(PGconn *conn)
 	 */
 	if (conn->pghostaddr != NULL && conn->pghostaddr[0] != '\0')
 	{
-		int			i;
 		char	   *s = conn->pghostaddr;
 		bool		more = true;
 
@@ -1301,7 +1302,6 @@ pqConnectOptions2(PGconn *conn)
 
 	if (conn->pghost != NULL && conn->pghost[0] != '\0')
 	{
-		int			i;
 		char	   *s = conn->pghost;
 		bool		more = true;
 
@@ -1326,7 +1326,7 @@ pqConnectOptions2(PGconn *conn)
 	 * Now, for each host slot, identify the type of address spec, and fill in
 	 * the default address if nothing was given.
 	 */
-	for (int i = 0; i < conn->nconnhost; i++)
+	for (i = 0; i < conn->nconnhost; i++)
 	{
 		pg_conn_host *ch = &conn->connhost[i];
 
@@ -1370,7 +1370,6 @@ pqConnectOptions2(PGconn *conn)
 	 */
 	if (conn->pgport != NULL && conn->pgport[0] != '\0')
 	{
-		int			i;
 		char	   *s = conn->pgport;
 		bool		more = true;
 
@@ -1454,7 +1453,7 @@ pqConnectOptions2(PGconn *conn)
 
 		if (conn->pgpassfile != NULL && conn->pgpassfile[0] != '\0')
 		{
-			for (int i = 0; i < conn->nconnhost; i++)
+			for (i = 0; i < conn->nconnhost; i++)
 			{
 				/*
 				 * Try to get a password for this host from file.  We use host
@@ -1640,8 +1639,6 @@ pqConnectOptions2(PGconn *conn)
 
 				if (negated)
 				{
-					int			i;
-
 					/* Remove the existing mechanism from the list. */
 					i = index_of_allowed_sasl_mech(conn, mech);
 					if (i < 0)
@@ -1651,8 +1648,6 @@ pqConnectOptions2(PGconn *conn)
 				}
 				else
 				{
-					int			i;
-
 					/*
 					 * Find a space to put the new mechanism (after making
 					 * sure it's not already there).
@@ -1726,7 +1721,7 @@ pqConnectOptions2(PGconn *conn)
 				| (1 << AUTH_REQ_SASL_CONT)
 				| (1 << AUTH_REQ_SASL_FIN);
 
-			for (size_t i = 0; i < lengthof(conn->allowed_sasl_mechs); i++)
+			for (i = 0; i < lengthof(conn->allowed_sasl_mechs); i++)
 			{
 				if (conn->allowed_sasl_mechs[i])
 				{
@@ -2118,7 +2113,7 @@ pqConnectOptions2(PGconn *conn)
 		 * last integer last).  The swap step can be optimized by combining it
 		 * with the insertion.
 		 */
-		for (int i = 1; i < conn->nconnhost; i++)
+		for (i = 1; i < conn->nconnhost; i++)
 		{
 			int			j = pg_prng_uint64_range(&conn->prng_state, 0, i);
 			pg_conn_host temp = conn->connhost[j];
@@ -5522,10 +5517,10 @@ ldapServiceLookup(const char *purl, PQconninfoOption *options,
 	int			port = LDAP_DEF_PORT,
 				scope,
 				rc,
+				size,
 				state,
 				oldstate,
 				i;
-	size_t		size;
 #ifndef WIN32
 	int			msgid;
 #endif

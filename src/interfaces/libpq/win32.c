@@ -277,10 +277,11 @@ const char *
 winsock_strerror(int err, char *strerrbuf, size_t buflen)
 {
 	unsigned long flags;
-	int			offs;
+	int			offs,
+				i;
 	int			success = LookupWSErrorMessage(err, strerrbuf);
 
-	for (size_t i = 0; !success && i < DLLS_SIZE; i++)
+	for (i = 0; !success && i < DLLS_SIZE; i++)
 	{
 
 		if (!dlls[i].loaded)

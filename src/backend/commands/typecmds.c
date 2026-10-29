@@ -1803,6 +1803,7 @@ makeRangeConstructors(const char *name, Oid namespace,
 	Oid			constructorArgTypes[3];
 	ObjectAddress myself,
 				referenced;
+	int			i;
 
 	constructorArgTypes[0] = subtype;
 	constructorArgTypes[1] = subtype;
@@ -1812,7 +1813,7 @@ makeRangeConstructors(const char *name, Oid namespace,
 	referenced.objectId = rangeOid;
 	referenced.objectSubId = 0;
 
-	for (size_t i = 0; i < lengthof(prosrc); i++)
+	for (i = 0; i < lengthof(prosrc); i++)
 	{
 		oidvector  *constructorArgTypesVector;
 

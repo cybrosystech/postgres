@@ -58,7 +58,7 @@ typedef enum TimeoutType
 typedef struct
 {
 	TimeoutId	id;				/* timeout to set */
-	TimeoutType type;
+	TimeoutType type;			/* TMPARAM_AFTER or TMPARAM_AT */
 	int			delay_ms;		/* only used for TMPARAM_AFTER/EVERY */
 	TimestampTz fin_time;		/* only used for TMPARAM_AT */
 } EnableTimeoutParams;

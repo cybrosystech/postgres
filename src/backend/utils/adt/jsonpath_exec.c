@@ -240,14 +240,6 @@ typedef struct JsonTablePlanState
 
 	/* Parent plan, if this is a nested plan */
 	struct JsonTablePlanState *parent;
-
-	/* Join type */
-	bool		cross;
-	bool		outerJoin;
-	/* Planning control fields */
-	bool		advanceNested;
-	bool		advanceRight;
-	bool		reset;
 } JsonTablePlanState;
 
 /* Random number to identify JsonTableExecContext for sanity checking */
@@ -396,13 +388,13 @@ static JsonTablePlanState *JsonTableInitPlan(JsonTableExecContext *cxt,
 											 MemoryContext mcxt);
 static void JsonTableSetDocument(TableFuncScanState *state, Datum value);
 static void JsonTableResetRowPattern(JsonTablePlanState *planstate, Datum item);
-static void JsonTableRescan(JsonTablePlanState *planstate);
 static bool JsonTableFetchRow(TableFuncScanState *state);
 static Datum JsonTableGetValue(TableFuncScanState *state, int colnum,
 							   Oid typid, int32 typmod, bool *isnull);
 static void JsonTableDestroyOpaque(TableFuncScanState *state);
 static bool JsonTablePlanScanNextRow(JsonTablePlanState *planstate);
 static void JsonTableResetNestedPlan(JsonTablePlanState *planstate);
+static bool JsonTablePlanJoinNextRow(JsonTablePlanState *planstate);
 static bool JsonTablePlanNextRow(JsonTablePlanState *planstate);
 
 const TableFuncRoutine JsonbTableRoutine =
@@ -2527,6 +2519,7 @@ executeDateTimeMethod(JsonPathExecContext *cxt, JsonPathItem *jsp,
 
 		/* cache for format texts */
 		static text *fmt_txt[lengthof(fmt_str)] = {0};
+		int			i;
 
 		/*
 		 * Check for optional precision for methods other than .datetime() and
@@ -2553,7 +2546,7 @@ executeDateTimeMethod(JsonPathExecContext *cxt, JsonPathItem *jsp,
 		}
 
 		/* loop until datetime format fits */
-		for (size_t i = 0; i < lengthof(fmt_str); i++)
+		for (i = 0; i < lengthof(fmt_str); i++)
 		{
 			ErrorSaveContext escontext = {T_ErrorSaveContext};
 
@@ -4521,7 +4514,6 @@ JsonTableInitPlan(JsonTableExecContext *cxt, JsonTablePlan *plan,
 		JsonTablePathScan *scan = (JsonTablePathScan *) plan;
 		int			i;
 
-		planstate->outerJoin = scan->outerJoin;
 		planstate->path = DatumGetJsonPathP(scan->path->value->constvalue);
 		planstate->args = args;
 		planstate->mcxt = AllocSetContextCreate(mcxt, "JsonTableExecContext",
@@ -4540,8 +4532,6 @@ JsonTableInitPlan(JsonTableExecContext *cxt, JsonTablePlan *plan,
 	else if (IsA(plan, JsonTableSiblingJoin))
 	{
 		JsonTableSiblingJoin *join = (JsonTableSiblingJoin *) plan;
-
-		planstate->cross = join->cross;
 
 		planstate->left = JsonTableInitPlan(cxt, join->lplan, parentstate,
 											args, mcxt);
@@ -4597,7 +4587,11 @@ JsonTableResetRowPattern(JsonTablePlanState *planstate, Datum item)
 		JsonValueListClear(&planstate->found);
 	}
 
-	JsonTableRescan(planstate);
+	/* Reset plan iterator to the beginning of the item list */
+	JsonValueListInitIterator(&planstate->found, &planstate->iter);
+	planstate->current.value = PointerGetDatum(NULL);
+	planstate->current.isnull = true;
+	planstate->ordinal = 0;
 }
 
 /*
@@ -4608,93 +4602,16 @@ JsonTableResetRowPattern(JsonTablePlanState *planstate, Datum item)
 static bool
 JsonTablePlanNextRow(JsonTablePlanState *planstate)
 {
-	if (IsA(planstate->plan, JsonTableSiblingJoin))
-	{
-		if (planstate->advanceRight)
-		{
-			/* fetch next inner row */
-			if (JsonTablePlanNextRow(planstate->right))
-				return true;
-
-			/* inner rows are exhausted */
-			if (planstate->cross)
-				planstate->advanceRight = false;	/* next outer row */
-			else
-				return false;	/* end of scan */
-		}
-
-		while (!planstate->advanceRight)
-		{
-			/* fetch next outer row */
-			bool		more = JsonTablePlanNextRow(planstate->left);
-
-			if (planstate->cross)
-			{
-				if (!more)
-					return false;	/* end of scan */
-
-				JsonTableRescan(planstate->right);
-
-				if (!JsonTablePlanNextRow(planstate->right))
-					continue;	/* next outer row */
-
-				planstate->advanceRight = true; /* next inner row */
-			}
-			else if (!more)
-			{
-				if (!JsonTablePlanNextRow(planstate->right))
-					return false;	/* end of scan */
-
-				planstate->advanceRight = true; /* next inner row */
-			}
-
-			break;
-		}
-	}
+	if (IsA(planstate->plan, JsonTablePathScan))
+		return JsonTablePlanScanNextRow(planstate);
+	else if (IsA(planstate->plan, JsonTableSiblingJoin))
+		return JsonTablePlanJoinNextRow(planstate);
 	else
-	{
-		/* reset context item if requested */
-		if (planstate->reset)
-		{
-			JsonTablePlanState *parent = planstate->parent;
+		elog(ERROR, "invalid JsonTablePlan %d", (int) planstate->plan->type);
 
-			Assert(parent != NULL && !parent->current.isnull);
-			JsonTableResetRowPattern(planstate, parent->current.value);
-			planstate->reset = false;
-		}
-
-		if (planstate->advanceNested)
-		{
-			/* fetch next nested row */
-			planstate->advanceNested = JsonTablePlanNextRow(planstate->nested);
-			if (planstate->advanceNested)
-				return true;
-		}
-
-		for (;;)
-		{
-			if (!JsonTablePlanScanNextRow(planstate))
-				return false;
-
-			if (planstate->nested == NULL)
-				break;
-
-			JsonTableResetNestedPlan(planstate->nested);
-			planstate->advanceNested = JsonTablePlanNextRow(planstate->nested);
-
-			if (!planstate->advanceNested && !planstate->outerJoin)
-				continue;
-
-			/*
-			 * We have a row to return: either the nested plan produced one,
-			 * or this is an outer join and we emit the parent row with the
-			 * nested columns set to NULL.
-			 */
-			break;
-		}
-	}
-
-	return true;
+	Assert(false);
+	/* Appease compiler */
+	return false;
 }
 
 /*
@@ -4780,25 +4697,45 @@ JsonTableResetNestedPlan(JsonTablePlanState *planstate)
 	{
 		JsonTablePlanState *parent = planstate->parent;
 
-		planstate->reset = true;
-		planstate->advanceNested = false;
-
-		if (planstate->nested)
-			JsonTableResetNestedPlan(planstate->nested);
+		if (!parent->current.isnull)
+			JsonTableResetRowPattern(planstate, parent->current.value);
 
 		/*
 		 * If this plan itself has a child nested plan, it will be reset when
 		 * the caller calls JsonTablePlanNextRow() on this plan.
 		 */
-		if (!parent->current.isnull)
-			JsonTableResetRowPattern(planstate, parent->current.value);
 	}
 	else if (IsA(planstate->plan, JsonTableSiblingJoin))
 	{
 		JsonTableResetNestedPlan(planstate->left);
 		JsonTableResetNestedPlan(planstate->right);
-		planstate->advanceRight = false;
 	}
+}
+
+/*
+ * Fetch the next row from a JsonTableSiblingJoin.
+ *
+ * This is essentially a UNION between the rows from left and right siblings.
+ */
+static bool
+JsonTablePlanJoinNextRow(JsonTablePlanState *planstate)
+{
+
+	/* Fetch row from left sibling. */
+	if (!JsonTablePlanNextRow(planstate->left))
+	{
+		/*
+		 * Left sibling ran out of rows, so start fetching from the right
+		 * sibling.
+		 */
+		if (!JsonTablePlanNextRow(planstate->right))
+		{
+			/* Right sibling ran out of rows too, so there are no more rows. */
+			return false;
+		}
+	}
+
+	return true;
 }
 
 /*
@@ -4864,27 +4801,4 @@ JsonTableGetValue(TableFuncScanState *state, int colnum,
 	}
 
 	return result;
-}
-
-/* Recursively reset planstate and its child nodes */
-static void
-JsonTableRescan(JsonTablePlanState *planstate)
-{
-	if (IsA(planstate->plan, JsonTablePathScan))
-	{
-		/* Reset plan iterator to the beginning of the item list */
-		JsonValueListInitIterator(&planstate->found, &planstate->iter);
-		planstate->current.value = PointerGetDatum(NULL);
-		planstate->current.isnull = true;
-		planstate->ordinal = 0;
-
-		if (planstate->nested)
-			JsonTableRescan(planstate->nested);
-	}
-	else if (IsA(planstate->plan, JsonTableSiblingJoin))
-	{
-		JsonTableRescan(planstate->left);
-		JsonTableRescan(planstate->right);
-		planstate->advanceRight = false;
-	}
 }

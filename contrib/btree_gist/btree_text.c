@@ -1,7 +1,5 @@
 /*
  * contrib/btree_gist/btree_text.c
- *
- * Support for text and bpchar types.
  */
 #include "postgres.h"
 
@@ -80,16 +78,11 @@ gbt_textcmp(const void *a, const void *b, Oid collation, FmgrInfo *flinfo)
 												 PointerGetDatum(b)));
 }
 
-/*
- * Originally this module permitted truncation of internal keys, but that
- * tends to result in wrong comparison answers if the collation is any
- * more complicated than C.  The prefix-match hack used for simpler types
- * can't fix it, either.
- */
-static const gbtree_vinfo tinfo =
+static gbtree_vinfo tinfo =
 {
 	gbt_t_text,
-	false,						/* no truncation permitted */
+	0,
+	false,
 	gbt_textgt,
 	gbt_textge,
 	gbt_texteq,
@@ -155,10 +148,11 @@ gbt_bpcharcmp(const void *a, const void *b, Oid collation, FmgrInfo *flinfo)
 												 PointerGetDatum(b)));
 }
 
-static const gbtree_vinfo bptinfo =
+static gbtree_vinfo bptinfo =
 {
 	gbt_t_bpchar,
-	false,						/* as above, no truncation permitted */
+	0,
+	false,
 	gbt_bpchargt,
 	gbt_bpcharge,
 	gbt_bpchareq,
@@ -177,6 +171,11 @@ Datum
 gbt_text_compress(PG_FUNCTION_ARGS)
 {
 	GISTENTRY  *entry = (GISTENTRY *) PG_GETARG_POINTER(0);
+
+	if (tinfo.eml == 0)
+	{
+		tinfo.eml = pg_database_encoding_max_length();
+	}
 
 	PG_RETURN_POINTER(gbt_var_compress(entry, &tinfo));
 }
@@ -205,6 +204,11 @@ gbt_text_consistent(PG_FUNCTION_ARGS)
 	/* All cases served by this function are exact */
 	*recheck = false;
 
+	if (tinfo.eml == 0)
+	{
+		tinfo.eml = pg_database_encoding_max_length();
+	}
+
 	retval = gbt_var_consistent(&r, query, strategy, PG_GET_COLLATION(),
 								GIST_LEAF(entry), &tinfo, fcinfo->flinfo);
 
@@ -227,6 +231,11 @@ gbt_bpchar_consistent(PG_FUNCTION_ARGS)
 
 	/* All cases served by this function are exact */
 	*recheck = false;
+
+	if (bptinfo.eml == 0)
+	{
+		bptinfo.eml = pg_database_encoding_max_length();
+	}
 
 	retval = gbt_var_consistent(&r, query, strategy, PG_GET_COLLATION(),
 								GIST_LEAF(entry), &bptinfo, fcinfo->flinfo);

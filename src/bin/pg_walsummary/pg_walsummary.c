@@ -41,8 +41,8 @@ static void dump_one_relation(ws_options *opt, RelFileLocator *rlocator,
 							  BlockRefTableReader *reader);
 static void help(const char *progname);
 static int	compare_block_numbers(const void *a, const void *b);
-static size_t walsummary_read_callback(void *callback_arg, void *data,
-									   size_t length);
+static int	walsummary_read_callback(void *callback_arg, void *data,
+									 int length);
 static void walsummary_error_callback(void *callback_arg, char *fmt, ...) pg_attribute_printf(2, 3);
 
 /*
@@ -241,11 +241,11 @@ walsummary_error_callback(void *callback_arg, char *fmt, ...)
 /*
  * Read callback.
  */
-size_t
-walsummary_read_callback(void *callback_arg, void *data, size_t length)
+int
+walsummary_read_callback(void *callback_arg, void *data, int length)
 {
 	ws_file_info *ws = callback_arg;
-	ssize_t		rc;
+	int			rc;
 
 	if ((rc = read(ws->fd, data, length)) < 0)
 		pg_fatal("could not read file \"%s\": %m", ws->filename);

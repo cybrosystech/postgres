@@ -203,15 +203,15 @@ GetConnection(void)
 	{
 		pg_log_error("%s", PQerrorMessage(tmpconn));
 		PQfinish(tmpconn);
-		pg_free(values);
-		pg_free(keywords);
+		free(values);
+		free(keywords);
 		PQconninfoFree(conn_opts);
 		return NULL;
 	}
 
 	/* Connection ok! */
-	pg_free(values);
-	pg_free(keywords);
+	free(values);
+	free(keywords);
 	PQconninfoFree(conn_opts);
 
 	/*

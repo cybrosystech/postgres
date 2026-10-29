@@ -312,7 +312,7 @@ typedef struct
 	uint32		count[FAST_PATH_STRONG_LOCK_HASH_PARTITIONS];
 } FastPathStrongRelationLockData;
 
-static FastPathStrongRelationLockData *FastPathStrongRelationLocks;
+static volatile FastPathStrongRelationLockData *FastPathStrongRelationLocks;
 
 static void LockManagerShmemRequest(void *arg);
 static void LockManagerShmemInit(void *arg);
@@ -3122,6 +3122,7 @@ GetLockConflicts(const LOCKTAG *locktag, LOCKMODE lockmode, int *countp)
 	 */
 	if (ConflictsWithRelationFastPath(locktag, lockmode))
 	{
+		int			i;
 		Oid			relid = locktag->locktag_field2;
 		VirtualTransactionId vxid;
 
@@ -3138,7 +3139,7 @@ GetLockConflicts(const LOCKTAG *locktag, LOCKMODE lockmode, int *countp)
 		 * time we return the value and the time the caller does something
 		 * with it.
 		 */
-		for (uint32 i = 0; i < ProcGlobal->allProcCount; i++)
+		for (i = 0; i < ProcGlobal->allProcCount; i++)
 		{
 			PGPROC	   *proc = GetPGProcByNumber(i);
 			uint32		j;
@@ -3779,6 +3780,7 @@ GetLockStatusData(void)
 	HASH_SEQ_STATUS seqstat;
 	int			els;
 	int			el;
+	int			i;
 
 	data = palloc_object(LockData);
 
@@ -3799,7 +3801,7 @@ GetLockStatusData(void)
 	 * lockGroupLeader field without holding all lock partition locks, and
 	 * it's not worth that.)
 	 */
-	for (uint32 i = 0; i < ProcGlobal->allProcCount; ++i)
+	for (i = 0; i < ProcGlobal->allProcCount; ++i)
 	{
 		PGPROC	   *proc = GetPGProcByNumber(i);
 
@@ -3898,7 +3900,7 @@ GetLockStatusData(void)
 	 *
 	 * Must grab LWLocks in partition-number order to avoid LWLock deadlock.
 	 */
-	for (int i = 0; i < NUM_LOCK_PARTITIONS; i++)
+	for (i = 0; i < NUM_LOCK_PARTITIONS; i++)
 		LWLockAcquire(LockHashPartitionLockByIndex(i), LW_SHARED);
 
 	/* Now we can safely count the number of proclocks */
@@ -3942,7 +3944,7 @@ GetLockStatusData(void)
 	 * until it can get all the locks it needs. (2) This avoids O(N^2)
 	 * behavior inside LWLockRelease.
 	 */
-	for (int i = NUM_LOCK_PARTITIONS; --i >= 0;)
+	for (i = NUM_LOCK_PARTITIONS; --i >= 0;)
 		LWLockRelease(LockHashPartitionLockByIndex(i));
 
 	Assert(el == data->nelements);

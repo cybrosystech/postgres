@@ -176,13 +176,15 @@ static const struct
 void
 _dosmaperr(unsigned long e)
 {
+	int			i;
+
 	if (e == 0)
 	{
 		errno = 0;
 		return;
 	}
 
-	for (size_t i = 0; i < lengthof(doserrors); i++)
+	for (i = 0; i < lengthof(doserrors); i++)
 	{
 		if (doserrors[i].winerr == e)
 		{

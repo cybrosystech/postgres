@@ -2672,7 +2672,8 @@ XLogSetAsyncXactLSN(XLogRecPtr asyncXactLSN)
 
 	if (wakeup)
 	{
-		ProcNumber	walwriterProc = pg_atomic_read_u32(&ProcGlobal->walwriterProc);
+		volatile PROC_HDR *procglobal = ProcGlobal;
+		ProcNumber	walwriterProc = procglobal->walwriterProc;
 
 		if (walwriterProc != INVALID_PROC_NUMBER)
 			SetLatch(&GetPGProcByNumber(walwriterProc)->procLatch);
@@ -9671,7 +9672,7 @@ do_pg_backup_start(const char *backupidstr, bool fast, List **tablespaces,
 			if (de_type == PGFILETYPE_LNK)
 			{
 				StringInfoData escapedpath;
-				ssize_t		rllen;
+				int			rllen;
 
 				rllen = readlink(fullpath, linkpath, sizeof(linkpath));
 				if (rllen < 0)

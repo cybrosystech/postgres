@@ -262,57 +262,39 @@ gbt_num_bin_union(Datum *u, GBT_NUMKEY *e, const gbtree_ninfo *tinfo, FmgrInfo *
 bool
 gbt_num_consistent(const GBT_NUMKEY_R *key,
 				   const void *query,
-				   StrategyNumber strategy,
+				   const StrategyNumber *strategy,
 				   bool is_leaf,
 				   const gbtree_ninfo *tinfo,
 				   FmgrInfo *flinfo)
 {
 	bool		retval;
 
-	/*
-	 * On leaf pages we directly apply the check "key->lower OP query"; we
-	 * need not consider key->upper since it will be equal to key->lower.
-	 *
-	 * On internal pages we mostly need to check "is lower bound below query?"
-	 * and/or "is upper bound above query?", where we must allow equality in
-	 * both cases.
-	 */
-#define lower_is_below_query() \
-	tinfo->f_le(key->lower, query, flinfo)
-#define upper_is_above_query() \
-	tinfo->f_ge(key->upper, query, flinfo)
-
-	switch (strategy)
+	switch (*strategy)
 	{
 		case BTLessEqualStrategyNumber:
-			if (is_leaf)
-				retval = tinfo->f_le(key->lower, query, flinfo);
-			else
-				retval = lower_is_below_query();
+			retval = tinfo->f_ge(query, key->lower, flinfo);
 			break;
 		case BTLessStrategyNumber:
 			if (is_leaf)
-				retval = tinfo->f_lt(key->lower, query, flinfo);
+				retval = tinfo->f_gt(query, key->lower, flinfo);
 			else
-				retval = lower_is_below_query();
+				retval = tinfo->f_ge(query, key->lower, flinfo);
 			break;
 		case BTEqualStrategyNumber:
 			if (is_leaf)
-				retval = tinfo->f_eq(key->lower, query, flinfo);
+				retval = tinfo->f_eq(query, key->lower, flinfo);
 			else
-				retval = lower_is_below_query() && upper_is_above_query();
+				retval = (tinfo->f_le(key->lower, query, flinfo) &&
+						  tinfo->f_le(query, key->upper, flinfo));
 			break;
 		case BTGreaterStrategyNumber:
 			if (is_leaf)
-				retval = tinfo->f_gt(key->lower, query, flinfo);
+				retval = tinfo->f_lt(query, key->upper, flinfo);
 			else
-				retval = upper_is_above_query();
+				retval = tinfo->f_le(query, key->upper, flinfo);
 			break;
 		case BTGreaterEqualStrategyNumber:
-			if (is_leaf)
-				retval = tinfo->f_ge(key->lower, query, flinfo);
-			else
-				retval = upper_is_above_query();
+			retval = tinfo->f_le(query, key->upper, flinfo);
 			break;
 		case BtreeGistNotEqualStrategyNumber:
 			if (is_leaf)
@@ -332,9 +314,6 @@ gbt_num_consistent(const GBT_NUMKEY_R *key,
 		default:
 			retval = false;
 	}
-
-#undef lower_is_below_query
-#undef upper_is_above_query
 
 	return retval;
 }

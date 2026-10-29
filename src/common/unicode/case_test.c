@@ -115,7 +115,6 @@ icu_test_full(char *str)
 	char		icu_fold[BUFSZ];
 	UErrorCode	status;
 	size_t		len = strlen(str);
-	size_t		consumed;
 
 	/* full case mapping doesn't use posix semantics */
 	struct WordBoundaryState wbstate = {
@@ -127,10 +126,10 @@ icu_test_full(char *str)
 		.prev_alnum = false,
 	};
 
-	unicode_strlower(lower, BUFSZ, str, len, &consumed, true);
-	unicode_strtitle(title, BUFSZ, str, len, &consumed, true, initcap_wbnext, &wbstate);
-	unicode_strupper(upper, BUFSZ, str, len, &consumed, true);
-	unicode_strfold(fold, BUFSZ, str, len, &consumed, true);
+	unicode_strlower(lower, BUFSZ, str, len, true);
+	unicode_strtitle(title, BUFSZ, str, len, true, initcap_wbnext, &wbstate);
+	unicode_strupper(upper, BUFSZ, str, len, true);
+	unicode_strfold(fold, BUFSZ, str, len, true);
 	status = U_ZERO_ERROR;
 	ucasemap_utf8ToLower(casemap, icu_lower, BUFSZ, str, len, &status);
 	status = U_ZERO_ERROR;
@@ -261,16 +260,13 @@ static size_t
 tfunc_lower(char *dst, size_t dstsize, const char *src,
 			size_t srclen)
 {
-	size_t		consumed;
-
-	return unicode_strlower(dst, dstsize, src, srclen, &consumed, true);
+	return unicode_strlower(dst, dstsize, src, srclen, true);
 }
 
 static size_t
 tfunc_title(char *dst, size_t dstsize, const char *src,
 			size_t srclen)
 {
-	size_t		consumed;
 	struct WordBoundaryState wbstate = {
 		.str = src,
 		.len = srclen,
@@ -279,26 +275,22 @@ tfunc_title(char *dst, size_t dstsize, const char *src,
 		.prev_alnum = false,
 	};
 
-	return unicode_strtitle(dst, dstsize, src, srclen, &consumed, true,
-							initcap_wbnext, &wbstate);
+	return unicode_strtitle(dst, dstsize, src, srclen, true, initcap_wbnext,
+							&wbstate);
 }
 
 static size_t
 tfunc_upper(char *dst, size_t dstsize, const char *src,
 			size_t srclen)
 {
-	size_t		consumed;
-
-	return unicode_strupper(dst, dstsize, src, srclen, &consumed, true);
+	return unicode_strupper(dst, dstsize, src, srclen, true);
 }
 
 static size_t
 tfunc_fold(char *dst, size_t dstsize, const char *src,
 		   size_t srclen)
 {
-	size_t		consumed;
-
-	return unicode_strfold(dst, dstsize, src, srclen, &consumed, true);
+	return unicode_strfold(dst, dstsize, src, srclen, true);
 }
 
 static void

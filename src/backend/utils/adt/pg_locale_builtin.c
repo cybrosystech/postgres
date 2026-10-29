@@ -98,16 +98,8 @@ static size_t
 strlower_builtin(char *dest, size_t destsize, const char *src, size_t srclen,
 				 pg_locale_t locale)
 {
-	size_t		consumed;
-	size_t		result;
-
-	result = unicode_strlower(dest, destsize, src, srclen, &consumed,
-							  locale->builtin.casemap_full);
-	if (consumed < srclen)
-		report_invalid_encoding(GetDatabaseEncoding(), src + consumed,
-								srclen - consumed);
-
-	return result;
+	return unicode_strlower(dest, destsize, src, srclen,
+							locale->builtin.casemap_full);
 }
 
 static size_t
@@ -122,50 +114,26 @@ strtitle_builtin(char *dest, size_t destsize, const char *src, size_t srclen,
 		.init = false,
 		.prev_alnum = false,
 	};
-	size_t		consumed;
-	size_t		result;
 
-	result = unicode_strtitle(dest, destsize, src, srclen, &consumed,
-							  locale->builtin.casemap_full,
-							  initcap_wbnext, &wbstate);
-
-	if (consumed < srclen)
-		report_invalid_encoding(GetDatabaseEncoding(), src + consumed,
-								srclen - consumed);
-
-	return result;
+	return unicode_strtitle(dest, destsize, src, srclen,
+							locale->builtin.casemap_full,
+							initcap_wbnext, &wbstate);
 }
 
 static size_t
 strupper_builtin(char *dest, size_t destsize, const char *src, size_t srclen,
 				 pg_locale_t locale)
 {
-	size_t		consumed;
-	size_t		result;
-
-	result = unicode_strupper(dest, destsize, src, srclen, &consumed,
-							  locale->builtin.casemap_full);
-	if (consumed < srclen)
-		report_invalid_encoding(GetDatabaseEncoding(), src + consumed,
-								srclen - consumed);
-
-	return result;
+	return unicode_strupper(dest, destsize, src, srclen,
+							locale->builtin.casemap_full);
 }
 
 static size_t
 strfold_builtin(char *dest, size_t destsize, const char *src, size_t srclen,
 				pg_locale_t locale)
 {
-	size_t		consumed;
-	size_t		result;
-
-	result = unicode_strfold(dest, destsize, src, srclen, &consumed,
-							 locale->builtin.casemap_full);
-	if (consumed < srclen)
-		report_invalid_encoding(GetDatabaseEncoding(), src + consumed,
-								srclen - consumed);
-
-	return result;
+	return unicode_strfold(dest, destsize, src, srclen,
+						   locale->builtin.casemap_full);
 }
 
 static bool

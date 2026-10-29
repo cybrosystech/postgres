@@ -1121,6 +1121,7 @@ ExportSnapshot(Snapshot snapshot)
 	int			addTopXid;
 	StringInfoData buf;
 	FILE	   *f;
+	int			i;
 	MemoryContext oldcxt;
 	char		path[MAXPGPATH];
 	char		pathtmp[MAXPGPATH];
@@ -1217,7 +1218,7 @@ ExportSnapshot(Snapshot snapshot)
 	addTopXid = (TransactionIdIsValid(topXid) &&
 				 TransactionIdPrecedes(topXid, snapshot->xmax)) ? 1 : 0;
 	appendStringInfo(&buf, "xcnt:%d\n", snapshot->xcnt + addTopXid);
-	for (uint32 i = 0; i < snapshot->xcnt; i++)
+	for (i = 0; i < snapshot->xcnt; i++)
 		appendStringInfo(&buf, "xip:%u\n", snapshot->xip[i]);
 	if (addTopXid)
 		appendStringInfo(&buf, "xip:%u\n", topXid);
@@ -1233,9 +1234,9 @@ ExportSnapshot(Snapshot snapshot)
 	{
 		appendStringInfoString(&buf, "sof:0\n");
 		appendStringInfo(&buf, "sxcnt:%d\n", snapshot->subxcnt + nchildren);
-		for (int32 i = 0; i < snapshot->subxcnt; i++)
+		for (i = 0; i < snapshot->subxcnt; i++)
 			appendStringInfo(&buf, "sxp:%u\n", snapshot->subxip[i]);
-		for (int32 i = 0; i < nchildren; i++)
+		for (i = 0; i < nchildren; i++)
 			appendStringInfo(&buf, "sxp:%u\n", children[i]);
 	}
 	appendStringInfo(&buf, "rec:%u\n", snapshot->takenDuringRecovery);

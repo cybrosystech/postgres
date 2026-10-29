@@ -119,9 +119,10 @@ gtsquery_same(PG_FUNCTION_ARGS)
 static int
 sizebitvec(TSQuerySign sign)
 {
-	int			size = 0;
+	int			size = 0,
+				i;
 
-	for (size_t i = 0; i < TSQS_SIGLEN; i++)
+	for (i = 0; i < TSQS_SIGLEN; i++)
 		size += 0x01 & (sign >> i);
 
 	return size;

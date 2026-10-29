@@ -52,7 +52,7 @@ test_shm_mq_main(Datum main_arg)
 	shm_toc    *toc;
 	shm_mq_handle *inqh;
 	shm_mq_handle *outqh;
-	test_shm_mq_header *hdr;
+	volatile test_shm_mq_header *hdr;
 	int			myworkernumber;
 	PGPROC	   *registrant;
 

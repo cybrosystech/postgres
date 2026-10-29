@@ -3162,7 +3162,7 @@ sendCommand(CState *st, Command *command)
 
 		pg_log_debug("client %d sending %s", st->id, sql);
 		r = PQsendQuery(st->con, sql);
-		pg_free(sql);
+		free(sql);
 	}
 	else if (querymode == QUERY_EXTENDED)
 	{
@@ -3355,7 +3355,7 @@ readCommandResponse(CState *st, MetaCommand meta, char *varprefix)
 						}
 
 						if (*varprefix != '\0')
-							pfree(varname);
+							pg_free(varname);
 					}
 				}
 				/* otherwise the result is simply thrown away by PQclear below */
@@ -4938,13 +4938,14 @@ initCreateTables(PGconn *con)
 			1
 		}
 	};
+	int			i;
 	PQExpBufferData query;
 
 	fprintf(stderr, "creating tables...\n");
 
 	initPQExpBuffer(&query);
 
-	for (size_t i = 0; i < lengthof(DDLs); i++)
+	for (i = 0; i < lengthof(DDLs); i++)
 	{
 		const struct ddlinfo *ddl = &DDLs[i];
 
@@ -5245,12 +5246,13 @@ initCreatePKeys(PGconn *con)
 		"alter table pgbench_tellers add primary key (tid)",
 		"alter table pgbench_accounts add primary key (aid)"
 	};
+	int			i;
 	PQExpBufferData query;
 
 	fprintf(stderr, "creating primary keys...\n");
 	initPQExpBuffer(&query);
 
-	for (size_t i = 0; i < lengthof(DDLINDEXes); i++)
+	for (i = 0; i < lengthof(DDLINDEXes); i++)
 	{
 		resetPQExpBuffer(&query);
 		appendPQExpBufferStr(&query, DDLINDEXes[i]);
@@ -5284,9 +5286,10 @@ initCreateFKeys(PGconn *con)
 		"alter table pgbench_history add constraint pgbench_history_tid_fkey foreign key (tid) references pgbench_tellers",
 		"alter table pgbench_history add constraint pgbench_history_aid_fkey foreign key (aid) references pgbench_accounts"
 	};
+	int			i;
 
 	fprintf(stderr, "creating foreign keys...\n");
-	for (size_t i = 0; i < lengthof(DDLKEYs); i++)
+	for (i = 0; i < lengthof(DDLKEYs); i++)
 	{
 		executeStatement(con, DDLKEYs[i]);
 	}
@@ -6202,8 +6205,10 @@ process_builtin(const BuiltinScript *bi, int weight)
 static void
 listAvailableScripts(void)
 {
+	int			i;
+
 	fprintf(stderr, "Available builtin scripts:\n");
-	for (size_t i = 0; i < lengthof(builtin_script); i++)
+	for (i = 0; i < lengthof(builtin_script); i++)
 		fprintf(stderr, "  %13s: %s\n", builtin_script[i].name, builtin_script[i].desc);
 	fprintf(stderr, "\n");
 }
@@ -6212,11 +6217,12 @@ listAvailableScripts(void)
 static const BuiltinScript *
 findBuiltin(const char *name)
 {
-	int			found = 0,
+	int			i,
+				found = 0,
 				len = strlen(name);
 	const BuiltinScript *result = NULL;
 
-	for (size_t i = 0; i < lengthof(builtin_script); i++)
+	for (i = 0; i < lengthof(builtin_script); i++)
 	{
 		if (strncmp(builtin_script[i].name, name, len) == 0)
 		{

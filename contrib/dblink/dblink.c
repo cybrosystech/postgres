@@ -3151,8 +3151,9 @@ applyRemoteGucs(PGconn *conn)
 	};
 
 	int			nestlevel = -1;
+	int			i;
 
-	for (size_t i = 0; i < lengthof(GUCsAffectingIO); i++)
+	for (i = 0; i < lengthof(GUCsAffectingIO); i++)
 	{
 		const char *gucName = GUCsAffectingIO[i];
 		const char *remoteVal = PQparameterStatus(conn, gucName);

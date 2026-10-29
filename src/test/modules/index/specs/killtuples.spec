@@ -96,8 +96,7 @@ permutation
   measure access flush result
   drop_table drop_ext_btree_gist
 
-# Test gist, but with fewer rows (tests for an old bug where
-# gistkillitems didn't remove items on the root page)
+# Test gist, but with fewer rows - shows that killitems doesn't work anymore!
 permutation
   create_table fill_10 create_ext_btree_gist create_gist flush
   disable_seq disable_bitmap

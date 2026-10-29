@@ -68,7 +68,7 @@ static int	_SPI_execute_plan(SPIPlanPtr plan, const SPIExecuteOptions *options,
 							  Snapshot snapshot, Snapshot crosscheck_snapshot,
 							  bool fire_triggers);
 
-static ParamListInfo _SPI_convert_params(int nargs, const Oid *argtypes,
+static ParamListInfo _SPI_convert_params(int nargs, Oid *argtypes,
 										 const Datum *Values, const char *Nulls);
 
 static int	_SPI_pquery(QueryDesc *queryDesc, bool fire_triggers, uint64 tcount);
@@ -811,7 +811,7 @@ SPI_execute_snapshot(SPIPlanPtr plan,
  */
 int
 SPI_execute_with_args(const char *src,
-					  int nargs, const Oid *argtypes,
+					  int nargs, Oid *argtypes,
 					  const Datum *Values, const char *Nulls,
 					  bool read_only, long tcount)
 {
@@ -858,13 +858,13 @@ SPI_execute_with_args(const char *src,
 }
 
 SPIPlanPtr
-SPI_prepare(const char *src, int nargs, const Oid *argtypes)
+SPI_prepare(const char *src, int nargs, Oid *argtypes)
 {
 	return SPI_prepare_cursor(src, nargs, argtypes, 0);
 }
 
 SPIPlanPtr
-SPI_prepare_cursor(const char *src, int nargs, const Oid *argtypes,
+SPI_prepare_cursor(const char *src, int nargs, Oid *argtypes,
 				   int cursorOptions)
 {
 	_SPI_plan	plan;
@@ -2846,7 +2846,7 @@ fail:
  * Convert arrays of query parameters to form wanted by planner and executor
  */
 static ParamListInfo
-_SPI_convert_params(int nargs, const Oid *argtypes,
+_SPI_convert_params(int nargs, Oid *argtypes,
 					const Datum *Values, const char *Nulls)
 {
 	ParamListInfo paramLI;
@@ -3170,11 +3170,8 @@ _SPI_make_plan_non_temp(SPIPlanPtr plan)
 	newplan->nargs = plan->nargs;
 	if (plan->nargs > 0)
 	{
-		Oid		   *newplan_argtypes;
-
-		newplan_argtypes = palloc_array(Oid, plan->nargs);
-		memcpy(newplan_argtypes, plan->argtypes, plan->nargs * sizeof(Oid));
-		newplan->argtypes = newplan_argtypes;
+		newplan->argtypes = palloc_array(Oid, plan->nargs);
+		memcpy(newplan->argtypes, plan->argtypes, plan->nargs * sizeof(Oid));
 	}
 	else
 		newplan->argtypes = NULL;
@@ -3238,11 +3235,8 @@ _SPI_save_plan(SPIPlanPtr plan)
 	newplan->nargs = plan->nargs;
 	if (plan->nargs > 0)
 	{
-		Oid		   *newplan_argtypes;
-
-		newplan_argtypes = palloc_array(Oid, plan->nargs);
-		memcpy(newplan_argtypes, plan->argtypes, plan->nargs * sizeof(Oid));
-		newplan->argtypes = newplan_argtypes;
+		newplan->argtypes = palloc_array(Oid, plan->nargs);
+		memcpy(newplan->argtypes, plan->argtypes, plan->nargs * sizeof(Oid));
 	}
 	else
 		newplan->argtypes = NULL;

@@ -296,7 +296,7 @@ CleanupProcSignalState(int status, Datum arg)
 int
 SendProcSignal(pid_t pid, ProcSignalReason reason, ProcNumber procNumber)
 {
-	ProcSignalSlot *slot;
+	volatile ProcSignalSlot *slot;
 
 	if (procNumber != INVALID_PROC_NUMBER)
 	{
@@ -381,7 +381,7 @@ EmitProcSignalBarrier(ProcSignalBarrierType type)
 	 */
 	for (int i = 0; i < NumProcSignalSlots; i++)
 	{
-		ProcSignalSlot *slot = &ProcSignal->psh_slot[i];
+		volatile ProcSignalSlot *slot = &ProcSignal->psh_slot[i];
 
 		pg_atomic_fetch_or_u32(&slot->pss_barrierCheckMask, flagbit);
 	}
@@ -407,7 +407,7 @@ EmitProcSignalBarrier(ProcSignalBarrierType type)
 	 */
 	for (int i = NumProcSignalSlots - 1; i >= 0; i--)
 	{
-		ProcSignalSlot *slot = &ProcSignal->psh_slot[i];
+		volatile ProcSignalSlot *slot = &ProcSignal->psh_slot[i];
 		pid_t		pid = pg_atomic_read_u32(&slot->pss_pid);
 
 		if (pid != 0)
@@ -671,7 +671,7 @@ ResetProcSignalBarrierBits(uint32 flags)
 static bool
 CheckProcSignal(ProcSignalReason reason)
 {
-	ProcSignalSlot *slot = MyProcSignalSlot;
+	volatile ProcSignalSlot *slot = MyProcSignalSlot;
 
 	if (slot != NULL)
 	{

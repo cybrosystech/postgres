@@ -135,13 +135,13 @@ select count(*) from
   ( select unique1 from tenk1 intersect select fivethous from tenk1 ) ss;
 
 -- this query will prefer a sorted setop unless we force it.
-set enable_groupagg to off;
+set enable_indexscan to off;
 
 explain (costs off)
 select unique1 from tenk1 except select unique2 from tenk1 where unique2 != 10;
 select unique1 from tenk1 except select unique2 from tenk1 where unique2 != 10;
 
-reset enable_groupagg;
+reset enable_indexscan;
 
 -- the hashed implementation is sensitive to child plans' tuple slot types
 explain (costs off)
@@ -321,14 +321,14 @@ select except select;
 
 -- check hashed implementation
 set enable_hashagg = true;
-set enable_groupagg = false;
+set enable_sort = false;
 
-explain (costs off)
-select from generate_series(1,5) union select from generate_series(1,3);
+-- We've no way to check hashed UNION as the empty pathkeys in the Append are
+-- fine to make use of Unique, which is cheaper than HashAggregate and we've
+-- no means to disable Unique.
 explain (costs off)
 select from generate_series(1,5) intersect select from generate_series(1,3);
 
-select from generate_series(1,5) union select from generate_series(1,3);
 select from generate_series(1,5) union all select from generate_series(1,3);
 select from generate_series(1,5) intersect select from generate_series(1,3);
 select from generate_series(1,5) intersect all select from generate_series(1,3);
@@ -337,7 +337,7 @@ select from generate_series(1,5) except all select from generate_series(1,3);
 
 -- check sorted implementation
 set enable_hashagg = false;
-set enable_groupagg = true;
+set enable_sort = true;
 
 explain (costs off)
 select from generate_series(1,5) union select from generate_series(1,3);
@@ -363,7 +363,7 @@ with cte as not materialized (select s from generate_series(1,5) s)
 select from cte union select from cte;
 
 reset enable_hashagg;
-reset enable_groupagg;
+reset enable_sort;
 
 --
 -- Check handling of a case with unknown constants.  We don't guarantee
@@ -668,9 +668,3 @@ on true limit 1;
 -- Test handling of Vars with varno 0 in estimate_array_length
 explain (verbose, costs off)
 select null::int[] union all select null::int[] union all select null::bigint[];
-
--- Estimate a UNION's output rows as the sum of its children's distinct-group
--- estimates, not the total input size.  Ensure we get an index nested loop
-explain (costs off)
-select * from tenk1 t
-join (select ten from tenk1 union select ten from onek) s on s.ten = t.unique1;

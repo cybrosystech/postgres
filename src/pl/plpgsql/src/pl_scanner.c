@@ -417,7 +417,9 @@ plpgsql_push_back_token(int token, YYSTYPE *yylvalp, YYLTYPE *yyllocp, yyscan_t 
 bool
 plpgsql_token_is_unreserved_keyword(int token)
 {
-	for (size_t i = 0; i < lengthof(UnreservedPLKeywordTokens); i++)
+	int			i;
+
+	for (i = 0; i < lengthof(UnreservedPLKeywordTokens); i++)
 	{
 		if (UnreservedPLKeywordTokens[i] == token)
 			return true;
