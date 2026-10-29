@@ -74,6 +74,7 @@
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/injection_point.h"
+#include "utils/lsyscache.h"
 #include "utils/pg_audit.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
