@@ -2525,6 +2525,7 @@ set_join_references(PlannerInfo *root, Join *join, int rtoffset)
 											    outer_itlist,
 											    OUTER_VAR,
 											    rtoffset,
+											    NRM_EQUAL,
 											    NUM_EXEC_QUAL((Plan *) join));
 
 		/*
@@ -2538,6 +2539,7 @@ set_join_references(PlannerInfo *root, Join *join, int rtoffset)
 													 inner_itlist,
 													 INNER_VAR,
 													 rtoffset,
+													 NRM_EQUAL,
 													 NUM_EXEC_QUAL((Plan *) join));
 
 		/*

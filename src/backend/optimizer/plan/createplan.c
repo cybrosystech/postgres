@@ -240,9 +240,7 @@ static HashJoin *make_hashjoin(List *tlist,
 							   List *hashoperators, List *hashcollations,
 							   List *hashkeys,
 							   Plan *lefttree, Plan *righttree,
-							   JoinType jointype,
-							   Relids ojrelids,
-							   bool inner_unique);
+							   JoinType jointype, bool inner_unique);
 static HashGroupJoin *make_hashgroupjoin(List *tlist,
 										 List *joinclauses, List *otherclauses,
 										 List *hashclauses,

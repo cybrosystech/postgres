@@ -995,8 +995,7 @@ DefineIndex(ParseState *pstate,
 		indexRelationName = ChooseIndexName(RelationGetRelationName(rel),
 											namespaceId,
 											global ?
-											ChooseIndexColumnNames(rel,
-																   list_concat_copy(stmt->indexParams,
+											ChooseIndexColumnNames(list_concat_copy(stmt->indexParams,
 																					stmt->indexIncludingParams)) :
 											indexColNames,
 											stmt->excludeOpNames,
