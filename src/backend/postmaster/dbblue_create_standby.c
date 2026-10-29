@@ -9,7 +9,8 @@
  *   1. If the standby data directory (dbblue_standby_directory, default
  *      "<DataDir>_standby") does not exist yet, it is created with
  *      pg_basebackup -R against the local primary, together with the
- *      physical replication slot "dbblue_standby" it streams through.
+ *      physical replication slot "dbblue_standby" it streams through --
+ *      once there is room for it on disk; see standby_has_room().
  *   2. A free TCP port is picked by probing PostPortNumber+1, +2, ...
  *      and written, along with the primary's unix_socket_directories,
  *      hot_standby_feedback = on, dbblue_create_standby = off and a
@@ -53,6 +54,7 @@
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
 
 #include "access/xact.h"
@@ -60,6 +62,7 @@
 #include "access/xlog_internal.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_control.h"
+#include "common/file_utils.h"
 #include "lib/stringinfo.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
@@ -80,6 +83,7 @@
 #include "utils/guc_hooks.h"
 #include "utils/pidfile.h"
 #include "utils/syscache.h"
+#include "utils/timestamp.h"
 #include "utils/varlena.h"
 #include "utils/wait_event.h"
 
@@ -96,6 +100,9 @@ char	   *dbblue_standby_user = NULL;
 
 /* Stop retrying after this many consecutive failures (reset on SIGHUP). */
 #define DBBLUE_STANDBY_MAX_FAILURES		5
+
+/* How often to look again for disk space to build the standby in. */
+#define DBBLUE_STANDBY_SPACE_RECHECK_MS	60000L
 
 /*
  * How many lines of a failed command's output run_shell() quotes, how long
@@ -152,6 +159,13 @@ static int	consecutive_failures = 0;
 
 /* Whether warn_unlimited_slot_wal() has spoken since the last reload. */
 static bool slot_wal_limit_warned = false;
+
+/*
+ * While there is no room on disk for the standby, when standby_has_room()
+ * looks again, and whether it has said so.  Both are cleared on reload.
+ */
+static TimestampTz space_recheck_at = 0;
+static bool space_short_warned = false;
 
 /*
  * standby_directory_path
@@ -2289,9 +2303,176 @@ vet_existing_standby(const char *dir, const char *logfile)
 }
 
 /*
+ * add_directory_size
+ *		Add to *size the bytes in the files under path that pg_basebackup
+ *		copies; top says whether path is our data directory itself.
+ *
+ * pg_wal is left out: -X stream sends only the WAL written from the start
+ * of the copy on, which standby_has_room() allows for separately.  So are
+ * temporary files and replication slots, which pg_basebackup skips too.
+ * Symbolic links are not followed, so tablespaces are not counted.  A file
+ * that vanishes while we look, as temporary ones do, is simply not counted.
+ */
+static void
+add_directory_size(const char *path, bool top, uint64 *size)
+{
+	DIR		   *d;
+	struct dirent *de;
+
+	d = opendir(path);
+	if (d == NULL)
+		return;
+
+	while ((de = readdir(d)) != NULL)
+	{
+		char		sub[MAXPGPATH];
+		struct stat st;
+
+		if (strcmp(de->d_name, ".") == 0 ||
+			strcmp(de->d_name, "..") == 0 ||
+			strncmp(de->d_name, PG_TEMP_FILE_PREFIX,
+					strlen(PG_TEMP_FILE_PREFIX)) == 0)
+			continue;
+		if (top &&
+			(strcmp(de->d_name, XLOGDIR) == 0 ||
+			 strcmp(de->d_name, PG_REPLSLOT_DIR) == 0))
+			continue;
+
+		snprintf(sub, sizeof(sub), "%s/%s", path, de->d_name);
+		if (lstat(sub, &st) != 0)
+			continue;
+		if (S_ISDIR(st.st_mode))
+			add_directory_size(sub, false, size);
+		else if (S_ISREG(st.st_mode))
+			*size += st.st_size;
+	}
+	closedir(d);
+}
+
+/*
+ * pretty_size
+ *		bytes as "<n> MB", or "<n.n> GB" from a gigabyte up, palloc'd.
+ */
+static char *
+pretty_size(uint64 bytes)
+{
+	if (bytes >= (uint64) 1024 * 1024 * 1024)
+		return psprintf("%.1f GB", bytes / (1024.0 * 1024.0 * 1024.0));
+	return psprintf("%" PRIu64 " MB", bytes / (1024 * 1024));
+}
+
+/*
+ * standby_has_room
+ *		Check that the filesystem the standby directory dir is to be built on
+ *		has room for a copy of this cluster.  Returns false, having warned
+ *		about it, if not.
+ *
+ * Without the check, pg_basebackup copies until the disk is full.  When that
+ * disk holds our pg_wal too, as with the default "<DataDir>_standby" it
+ * does, our next WAL write fails and we PANIC; the failed copy is removed,
+ * we come back, and so does this worker, its count of failures back at zero,
+ * to start the same copy again 10 seconds later.
+ *
+ * The copy needs our data directory, as add_directory_size() counts it, and
+ * max_wal_size more for the WAL streamed during the copy and kept by the
+ * standby after it.  If the standby shares a filesystem with our data or our
+ * pg_wal, a tenth of that filesystem, or twice max_wal_size if more, must be
+ * left free besides: a copy that only just fits would leave us no room to
+ * grow, and the slot may hold back WAL up to max_slot_wal_keep_size, twice
+ * max_wal_size as initdb's auto-tune sets it.
+ *
+ * Counting our data directory means reading all of it, so while there is no
+ * room this is done only once a minute, and the warning given only once,
+ * until there is room or the configuration is reloaded.  If the free space
+ * cannot be found out at all, the copy goes ahead, as it did before.
+ */
+static bool
+standby_has_room(const char *dir)
+{
+	char		target[MAXPGPATH];
+	char		waldir[MAXPGPATH];
+	struct stat st;
+	struct stat ours;
+	struct statvfs fs;
+	TimestampTz now;
+	uint64		copy_size = 0;
+	uint64		wal_size;
+	uint64		needed;
+	uint64		reserve = 0;
+	uint64		avail;
+	bool		shared;
+	char	   *s_copy;
+	char	   *s_avail;
+	char	   *s_reserve;
+
+	now = GetCurrentTimestamp();
+	if (now < space_recheck_at)
+		return false;
+
+	/* the directory itself if it exists, empty; else the parent it goes in */
+	strlcpy(target, dir, sizeof(target));
+	if (stat(target, &st) != 0)
+		get_parent_directory(target);
+
+	if (stat(target, &st) != 0 || statvfs(target, &fs) != 0)
+	{
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("dbblue create standby: could not determine the free disk space in \"%s\": %m",
+						target),
+				 errdetail("The standby is built without checking that it fits.")));
+		return true;
+	}
+
+	snprintf(waldir, sizeof(waldir), "%s/%s", DataDir, XLOGDIR);
+	shared = (stat(DataDir, &ours) == 0 && ours.st_dev == st.st_dev) ||
+		(stat(waldir, &ours) == 0 && ours.st_dev == st.st_dev);
+
+	add_directory_size(DataDir, true, &copy_size);
+	wal_size = (uint64) max_wal_size_mb * 1024 * 1024;
+	needed = copy_size + wal_size;
+	if (shared)
+	{
+		reserve = Max((uint64) fs.f_blocks * fs.f_frsize / 10, 2 * wal_size);
+		needed += reserve;
+	}
+	avail = (uint64) fs.f_bavail * fs.f_frsize;
+
+	if (avail >= needed)
+	{
+		space_short_warned = false;
+		return true;
+	}
+
+	space_recheck_at = TimestampTzPlusMilliseconds(now,
+												   DBBLUE_STANDBY_SPACE_RECHECK_MS);
+	if (space_short_warned)
+		return false;
+	space_short_warned = true;
+
+	s_copy = pretty_size(copy_size + wal_size);
+	s_avail = pretty_size(avail);
+	s_reserve = pretty_size(reserve);
+	ereport(WARNING,
+			(errmsg("dbblue create standby: not enough free disk space to build the standby in \"%s\"",
+					dir),
+			 shared ?
+			 errdetail("The copy needs about %s, and %s is free there.  This server's data is on the same filesystem, so %s more is kept free for it.",
+					   s_copy, s_avail, s_reserve) :
+			 errdetail("The copy needs about %s, and %s is free there.",
+					   s_copy, s_avail),
+			 errhint("Free up disk space, or point dbblue_standby_directory to a directory on another filesystem.  The check is repeated every minute.")));
+	pfree(s_copy);
+	pfree(s_avail);
+	pfree(s_reserve);
+	return false;
+}
+
+/*
  * run_standby_tick
  *		Create the standby if needed and make sure it is running.
- *		Returns true if the standby is (now) up, false on failure.
+ *		Returns false on failure, true if the standby is (now) up or waits
+ *		for room on disk to be built, which is not one.
  */
 static bool
 run_standby_tick(void)
@@ -2419,6 +2600,14 @@ run_standby_tick(void)
 		 * once we have recycled it.  -E re-encrypts that WAL with a fresh
 		 * key and writes a matching wal_keys, but needs pg_tde seeded first.
 		 */
+		/* a copy that fills the disk would take us down; see there */
+		if (!standby_has_room(dir))
+		{
+			pfree(logfile);
+			pfree(dir);
+			return true;
+		}
+
 		/*
 		 * A fresh standby gets a fresh slot.  Any slot of that name left
 		 * behind belongs to a standby that no longer exists; see
@@ -2789,6 +2978,9 @@ DbblueCreateStandbyMain(Datum main_arg)
 			consecutive_failures = 0;
 			/* and repeat the warning if the limit is still missing */
 			slot_wal_limit_warned = false;
+			/* and look for disk space for the standby again at once */
+			space_recheck_at = 0;
+			space_short_warned = false;
 		}
 
 		/*
