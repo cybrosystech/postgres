@@ -2075,7 +2075,7 @@ Included in publications:
        <link linkend="guc-track-commit-timestamp"><varname>track_commit_timestamp</varname></link>
        and <link linkend="sql-createsubscription-params-with-retain-dead-tuples"><literal>retain_dead_tuples</literal></link>
        are enabled. Note that if a tuple cannot be found due to the table being
-       truncated, only a <literal>update_missing</literal> conflict will
+       truncated, only an <literal>update_missing</literal> conflict will
        arise. Additionally, if the tuple was deleted by the same origin, an
        <literal>update_missing</literal> conflict will arise.
       </para>
@@ -2560,6 +2560,15 @@ CONTEXT:  processing remote data for replication origin "pg_16395" during "INSER
   </para>
 
   <para>
+   The name of the output plugin used by the replication connection must be
+   included in the server's <xref linkend="guc-output-plugin-libraries"/>. (For
+   subscriptions, the plugin name that is used is <literal>pgoutput</literal>.)
+   Superusers may modify the trusted list per-connection, by including
+   <literal>options=-coutput_plugin_libraries=...</literal> in the connection
+   string.
+  </para>
+
+  <para>
    In order to be able to copy the initial table data or synchronize
    sequences, the role used for the replication connection must have the
    <literal>SELECT</literal> privilege on a published table or sequence (or be
@@ -2800,7 +2809,9 @@ CONTEXT:  processing remote data for replication origin "pg_16395" during "INSER
     <listitem>
      <para>
       The output plugins referenced by the slots in the old cluster must be
-      installed in the new PostgreSQL executable directory.
+      installed in the new PostgreSQL executable directory. They must also be
+      included in the new cluster's <xref linkend="guc-output-plugin-libraries"/>;
+      see that parameter's documentation for safety information.
      </para>
     </listitem>
     <listitem>

@@ -68,20 +68,6 @@ CREATE POLICY upd_pol ON rls_test_tgt FOR UPDATE
   WITH CHECK (rls_test_policy_fn('UPDATE CHECK on rls_test_tgt', rls_test_tgt));
 CREATE POLICY del_pol ON rls_test_tgt FOR DELETE
   USING (rls_test_policy_fn('DELETE USING on rls_test_tgt', rls_test_tgt));
--- setup temporal target table (for FOR PORTION OF operations)
-CREATE TABLE rls_test_fpo_tgt (a int, b text, valid_at int4range);
-ALTER TABLE rls_test_fpo_tgt ENABLE ROW LEVEL SECURITY;
-GRANT SELECT, UPDATE, DELETE ON rls_test_fpo_tgt TO public;
-INSERT INTO rls_test_fpo_tgt VALUES (1, 'fpo a', '[1,10)');
-CREATE POLICY sel_pol ON rls_test_fpo_tgt FOR SELECT
-  USING (rls_test_policy_fn('SELECT USING on rls_test_fpo_tgt', rls_test_fpo_tgt));
-CREATE POLICY ins_pol ON rls_test_fpo_tgt FOR INSERT
-  WITH CHECK (rls_test_policy_fn('INSERT CHECK on rls_test_fpo_tgt', rls_test_fpo_tgt));
-CREATE POLICY upd_pol ON rls_test_fpo_tgt FOR UPDATE
-  USING (rls_test_policy_fn('UPDATE USING on rls_test_fpo_tgt', rls_test_fpo_tgt))
-  WITH CHECK (rls_test_policy_fn('UPDATE CHECK on rls_test_fpo_tgt', rls_test_fpo_tgt));
-CREATE POLICY del_pol ON rls_test_fpo_tgt FOR DELETE
-  USING (rls_test_policy_fn('DELETE USING on rls_test_fpo_tgt', rls_test_fpo_tgt));
 -- test policies applied to regress_rls_bob
 SET SESSION AUTHORIZATION regress_rls_bob;
 -- SELECT, COPY ... TO, and TABLE should only apply SELECT USING policy clause
@@ -169,19 +155,6 @@ NOTICE:  SELECT USING on rls_test_tgt.(1,"tgt d","TGT D")
  1 | tgt d | TGT D
 (1 row)
 
--- UPDATE ... FOR PORTION OF should also apply SELECT USING policy clauses to
--- the old and new rows, and INSERT CHECK policy clauses to leftover rows.
-BEGIN;
-UPDATE rls_test_fpo_tgt
-  FOR PORTION OF valid_at FROM 3 TO 7
-  SET b = 'fpo b';
-NOTICE:  UPDATE USING on rls_test_fpo_tgt.(1,"fpo a","[1,10)")
-NOTICE:  SELECT USING on rls_test_fpo_tgt.(1,"fpo a","[1,10)")
-NOTICE:  UPDATE CHECK on rls_test_fpo_tgt.(1,"fpo b","[3,7)")
-NOTICE:  SELECT USING on rls_test_fpo_tgt.(1,"fpo b","[3,7)")
-NOTICE:  INSERT CHECK on rls_test_fpo_tgt.(1,"fpo a","[1,3)")
-NOTICE:  INSERT CHECK on rls_test_fpo_tgt.(1,"fpo a","[7,10)")
-ROLLBACK;
 -- DELETE without WHERE or RETURNING should only apply DELETE USING policy clause
 BEGIN; DELETE FROM rls_test_tgt; ROLLBACK;
 NOTICE:  DELETE USING on rls_test_tgt.(1,"tgt d","TGT D")
@@ -197,16 +170,6 @@ NOTICE:  SELECT USING on rls_test_tgt.(1,"tgt d","TGT D")
  1 | tgt d | TGT D
 (1 row)
 
--- DELETE ... FOR PORTION OF should also apply SELECT USING policy clauses to
--- the old row, and INSERT CHECK policy clauses to leftover rows.
-BEGIN;
-DELETE FROM rls_test_fpo_tgt
-  FOR PORTION OF valid_at FROM 3 TO 7;
-NOTICE:  DELETE USING on rls_test_fpo_tgt.(1,"fpo a","[1,10)")
-NOTICE:  SELECT USING on rls_test_fpo_tgt.(1,"fpo a","[1,10)")
-NOTICE:  INSERT CHECK on rls_test_fpo_tgt.(1,"fpo a","[1,3)")
-NOTICE:  INSERT CHECK on rls_test_fpo_tgt.(1,"fpo a","[7,10)")
-ROLLBACK;
 -- INSERT ... ON CONFLICT DO NOTHING with an arbiter clause should apply
 -- INSERT CHECK and SELECT USING policy clauses (to new value, whether it
 -- conflicts or not)
@@ -369,7 +332,7 @@ NOTICE:  DELETE USING on rls_test_tgt.(1,"tgt c","TGT C")
 
 -- Tidy up
 RESET SESSION AUTHORIZATION;
-DROP TABLE rls_test_src, rls_test_tgt, rls_test_fpo_tgt;
+DROP TABLE rls_test_src, rls_test_tgt;
 DROP FUNCTION rls_test_tgt_set_c;
 DROP FUNCTION rls_test_policy_fn;
 -- BASIC Row-Level Security Scenario
@@ -534,6 +497,17 @@ NOTICE:  f_leak => awesome science fiction
    6 |  22 |      1 | regress_rls_carol | great science fiction
    8 |  44 |      1 | regress_rls_carol | great manga
    9 |  22 |      1 | regress_rls_dave  | awesome science fiction
+(4 rows)
+
+-- a rel with RLS quals can still be removed by outer-join removal
+EXPLAIN (COSTS OFF)
+SELECT c.cid FROM category c LEFT JOIN document d ON c.cid = d.did;
+                     QUERY PLAN                     
+----------------------------------------------------
+ Seq Scan on category c
+   InitPlan expr_1
+     ->  Index Scan using uaccount_pkey on uaccount
+           Index Cond: (pguser = CURRENT_USER)
 (4 rows)
 
 -- viewpoint from regress_rls_carol
@@ -4895,7 +4869,7 @@ DROP USER regress_rls_dob_role2;
 -- Bug #15708: view + table with RLS should check policies as view owner
 CREATE TABLE ref_tbl (a int);
 INSERT INTO ref_tbl VALUES (1);
-CREATE TABLE rls_tbl (a int);
+CREATE TABLE rls_tbl (a int PRIMARY KEY);
 INSERT INTO rls_tbl VALUES (10);
 ALTER TABLE rls_tbl ENABLE ROW LEVEL SECURITY;
 CREATE POLICY p1 ON rls_tbl USING (EXISTS (SELECT 1 FROM ref_tbl));
@@ -4915,6 +4889,51 @@ SELECT * FROM rls_view; -- OK
  10
 (1 row)
 
+EXPLAIN (COSTS OFF) -- check that RLS enforcement is actually happening
+SELECT * FROM rls_view;
+             QUERY PLAN             
+------------------------------------
+ Seq Scan on rls_tbl
+   Filter: (InitPlan exists_1).col1
+   InitPlan exists_1
+     ->  Seq Scan on ref_tbl
+(4 rows)
+
+-- Use the same view+table to test interaction of SJE with RLS
+SET enable_self_join_elimination = on;
+-- We can do SJE here, although presently an unused InitPlan survives
+EXPLAIN (COSTS OFF)
+SELECT * FROM rls_view r1, rls_view r2 WHERE r1.a = r2.a;
+              QUERY PLAN               
+---------------------------------------
+ Seq Scan on rls_tbl
+   Filter: (InitPlan exists_2).col1
+   InitPlan exists_1
+     ->  Seq Scan on ref_tbl
+   InitPlan exists_2
+     ->  Seq Scan on ref_tbl ref_tbl_1
+(6 rows)
+
+SET SESSION AUTHORIZATION regress_rls_bob;
+-- No SJE here, because the two rls_tbl RTEs have different checkAsUser values
+EXPLAIN (COSTS OFF)
+SELECT * FROM rls_tbl r1, rls_view r2 WHERE r1.a = r2.a;
+                   QUERY PLAN                   
+------------------------------------------------
+ Hash Join
+   Hash Cond: (r1.a = rls_tbl.a)
+   InitPlan exists_1
+     ->  Seq Scan on ref_tbl
+   InitPlan exists_2
+     ->  Seq Scan on ref_tbl ref_tbl_1
+   ->  Seq Scan on rls_tbl r1
+         Filter: (InitPlan exists_1).col1
+   ->  Hash
+         ->  Seq Scan on rls_tbl
+               Filter: (InitPlan exists_2).col1
+(11 rows)
+
+RESET enable_self_join_elimination;
 RESET SESSION AUTHORIZATION;
 DROP VIEW rls_view;
 DROP TABLE rls_tbl;

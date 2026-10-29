@@ -24,7 +24,6 @@ SUBDIRS = \
 		  test_bitmapset \
 		  test_bloomfilter \
 		  test_cloexec \
-		  test_checksums \
 		  test_copy_callbacks \
 		  test_custom_rmgrs \
 		  test_custom_stats \
@@ -56,15 +55,16 @@ SUBDIRS = \
 		  test_shm_mq \
 		  test_slru \
 		  test_tidstore \
+		  test_wait_lsn \
 		  unsafe_tests \
 		  worker_spi \
 		  xid_wraparound
 
 
 ifeq ($(enable_injection_points),yes)
-SUBDIRS += injection_points gin nbtree typcache
+SUBDIRS += injection_points gin hash nbtree typcache
 else
-ALWAYS_SUBDIRS += injection_points gin nbtree typcache
+ALWAYS_SUBDIRS += injection_points gin hash nbtree typcache
 endif
 
 ifeq ($(with_ssl),openssl)

@@ -866,16 +866,6 @@ set_rel_consider_parallel(PlannerInfo *root, RelOptInfo *rel,
 		case RTE_RESULT:
 			/* RESULT RTEs, in themselves, are no problem. */
 			break;
-
-		case RTE_GRAPH_TABLE:
-
-			/*
-			 * Shouldn't happen since these are replaced by subquery RTEs when
-			 * rewriting queries.
-			 */
-			Assert(false);
-			return;
-
 		case RTE_GROUP:
 			/* Shouldn't happen; we're only considering baserels here. */
 			Assert(false);
@@ -1212,13 +1202,22 @@ set_append_rel_size(PlannerInfo *root, RelOptInfo *rel,
 		 * for the child.  This saves some effort while processing the child
 		 * rel, and it also avoids an implementation restriction in
 		 * adjust_appendrel_attrs (it can't apply nullingrels to a non-Var).
+		 *
+		 * clause_relids does not reflect references to this rel that appear
+		 * within PlaceHolderVars, but those are lateral references, so we
+		 * also skip quals that use any rel laterally referencing this rel.
+		 * This is safe since such quals are useless for the child: enforcing
+		 * one at a scan of this rel would require the scan to be
+		 * parameterized by a rel that laterally references this rel, which is
+		 * impossible since that rel needs this rel's output first.
 		 */
 		childrinfos = NIL;
 		foreach(lc, rel->joininfo)
 		{
 			RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
 
-			if (!bms_overlap(rinfo->clause_relids, rel->nulling_relids))
+			if (!bms_overlap(rinfo->clause_relids, rel->nulling_relids) &&
+				!bms_overlap(rinfo->clause_relids, rel->lateral_referencers))
 				childrinfos = lappend(childrinfos,
 									  adjust_appendrel_attrs(root,
 															 (Node *) rinfo,
@@ -1425,10 +1424,15 @@ set_append_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 		 * If set_append_rel_size() decided the parent appendrel was
 		 * parallel-unsafe at some point after visiting this child rel, we
 		 * need to propagate the unsafety marking down to the child, so that
-		 * we don't generate useless partial paths for it.
+		 * we don't generate useless partial paths for it.  Also, zap any
+		 * partial paths that already exist from places such as
+		 * set_subquery_pathlist().
 		 */
 		if (!rel->consider_parallel)
+		{
+			childrel->partial_pathlist = NIL;
 			childrel->consider_parallel = false;
+		}
 
 		/*
 		 * Compute the child's access paths.
@@ -3631,6 +3635,10 @@ generate_grouped_paths(PlannerInfo *root, RelOptInfo *grouped_rel,
 		group_pathkeys =
 			make_pathkeys_for_sortclauses(root, agg_info->group_clauses,
 										  top_group_tlist);
+
+		/* The ECs just made for extra grouping keys lack child members */
+		if (IS_OTHER_REL(rel))
+			add_child_rel_pathkey_equivalences(root, rel, group_pathkeys);
 	}
 
 	/*
@@ -3982,7 +3990,8 @@ make_rel_from_joinlist(PlannerInfo *root, List *joinlist)
 		 * using a plugin, GEQO, or the regular join search code.
 		 *
 		 * We put the initial_rels list into a PlannerInfo field because
-		 * has_legal_joinclause() needs to look at it (ugly :-().
+		 * has_legal_joinclause() and join_is_legal() need to look at it (ugly
+		 * :-().
 		 */
 		root->initial_rels = initial_rels;
 

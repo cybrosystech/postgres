@@ -644,40 +644,6 @@ extract_bound_params(Query *query, Oid *param_types, int num_params)
  *		plansource construction
  * ---------------------------------------------------------------- */
 
-/*
- * Does the query (or any subquery/CTE) use a GRAPH_TABLE clause?  Our
- * parameterization walk relies on expression_tree_mutator(), which does not
- * handle SQL/PGQ graph-pattern node types and would elog(ERROR) on them.  Such
- * queries must therefore be declined rather than parameterized.  We only scan
- * range tables (GRAPH_TABLE is always a table source), avoiding any walk over
- * the graph-pattern expression nodes themselves.
- */
-static bool
-query_has_graph_table(Query *query)
-{
-	ListCell   *lc;
-
-	foreach(lc, query->rtable)
-	{
-		RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
-
-		if (rte->rtekind == RTE_GRAPH_TABLE)
-			return true;
-		if (rte->rtekind == RTE_SUBQUERY && rte->subquery != NULL &&
-			query_has_graph_table(rte->subquery))
-			return true;
-	}
-	foreach(lc, query->cteList)
-	{
-		CommonTableExpr *cte = lfirst_node(CommonTableExpr, lc);
-
-		if (cte->ctequery != NULL && IsA(cte->ctequery, Query) &&
-			query_has_graph_table((Query *) cte->ctequery))
-			return true;
-	}
-	return false;
-}
-
 static bool
 query_is_cacheable(Query *query)
 {
@@ -694,9 +660,6 @@ query_is_cacheable(Query *query)
 		default:
 			return false;
 	}
-	/* SQL/PGQ GRAPH_TABLE nodes aren't handled by our parameterization walk. */
-	if (query_has_graph_table(query))
-		return false;
 	return true;
 }
 

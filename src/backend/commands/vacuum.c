@@ -2439,6 +2439,14 @@ vacuum_delay_point(bool is_analyze)
 {
 	double		msec = 0;
 
+	/*
+	 * If we're holding locks or holding interrupts for some other reason,
+	 * don't sleep, because we don't want to hold locks any longer than
+	 * necessary.
+	 */
+	if (!INTERRUPTS_CAN_BE_PROCESSED())
+		return;
+
 	/* Always check for interrupts */
 	CHECK_FOR_INTERRUPTS();
 
@@ -2576,6 +2584,9 @@ vacuum_delay_point(bool is_analyze)
 		 * besides "check after napping".
 		 */
 		AutoVacuumUpdateCostLimit();
+
+		if (AmAutoVacuumWorkerProcess())
+			parallel_vacuum_propagate_shared_delay_params();
 
 		/* Might have gotten an interrupt while sleeping */
 		CHECK_FOR_INTERRUPTS();

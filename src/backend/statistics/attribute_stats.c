@@ -221,13 +221,15 @@ attribute_statistics_update_internal(Oid reloid,
 
 	Oid			atttypid = InvalidOid;
 	int32		atttypmod;
-	char		atttyptype;
+	TypeCacheEntry *basetypcache;
 	Oid			atttypcoll = InvalidOid;
 	Oid			eq_opr = InvalidOid;
 	Oid			lt_opr = InvalidOid;
 
 	Oid			elemtypid = InvalidOid;
 	Oid			elem_eq_opr = InvalidOid;
+
+	Oid			bounds_typid = InvalidOid;
 
 	FmgrInfo	array_in_fn;
 
@@ -249,8 +251,8 @@ attribute_statistics_update_internal(Oid reloid,
 	bool		result = true;
 
 	/*
-	 * Check argument sanity. If some arguments are unusable, emit a WARNING
-	 * and set the corresponding argument to NULL in fcinfo.
+	 * Check argument sanity.  If some arguments are unusable, emit a WARNING
+	 * and skip the corresponding statistics kind, reporting back a failure.
 	 */
 
 	if (!stats_check_arg_array(fcinfo, attarginfo, MOST_COMMON_FREQS_ARG))
@@ -296,14 +298,13 @@ attribute_statistics_update_internal(Oid reloid,
 	/* derive information from attribute */
 	statatt_get_type(reloid, attnum,
 					 &atttypid, &atttypmod,
-					 &atttyptype, &atttypcoll,
+					 &basetypcache, &atttypcoll,
 					 &eq_opr, &lt_opr);
 
 	/* if needed, derive element type */
 	if (do_mcelem || do_dechist)
 	{
-		if (!statatt_get_elem_type(atttypid, atttyptype,
-								   &elemtypid, &elem_eq_opr))
+		if (!statatt_get_elem_type(basetypcache, &elemtypid, &elem_eq_opr))
 		{
 			ereport(WARNING,
 					(errmsg("could not determine element type of column \"%s\"", attname),
@@ -334,7 +335,7 @@ attribute_statistics_update_internal(Oid reloid,
 
 	/* only range types can have range stats */
 	if ((do_range_length_histogram || do_bounds_histogram) &&
-		!(atttyptype == TYPTYPE_RANGE || atttyptype == TYPTYPE_MULTIRANGE))
+		!statatt_get_range_type(basetypcache, &bounds_typid))
 	{
 		ereport(WARNING,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -499,10 +500,12 @@ attribute_statistics_update_internal(Oid reloid,
 		bool		converted = false;
 		Datum		stavalues;
 
+		Assert(OidIsValid(bounds_typid));
+
 		stavalues = statatt_build_stavalues("range_bounds_histogram",
 											&array_in_fn,
 											PG_GETARG_DATUM(RANGE_BOUNDS_HISTOGRAM_ARG),
-											atttypid, atttypmod,
+											bounds_typid, atttypmod,
 											&converted);
 
 		if (converted)

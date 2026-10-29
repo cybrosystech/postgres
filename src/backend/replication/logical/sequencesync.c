@@ -60,6 +60,7 @@
 #include "postmaster/interrupt.h"
 #include "replication/logicalworker.h"
 #include "replication/worker_internal.h"
+#include "storage/lmgr.h"
 #include "storage/lwlock.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
@@ -80,7 +81,8 @@ typedef enum CopySeqResult
 	COPYSEQ_MISMATCH,
 	COPYSEQ_SUBSCRIBER_INSUFFICIENT_PERM,
 	COPYSEQ_PUBLISHER_INSUFFICIENT_PERM,
-	COPYSEQ_SKIPPED
+	COPYSEQ_SKIPPED,
+	COPYSEQ_NOT_SUBSCRIBED
 } CopySeqResult;
 
 static List *seqinfos = NIL;
@@ -159,6 +161,22 @@ get_sequences_string(List *seqindexes, StringInfo buf)
 
 		appendStringInfo(buf, "\"%s.%s\"", seqinfo->nspname, seqinfo->seqname);
 	}
+}
+
+/*
+ * Error callback to give more context info about the sequence being
+ * synchronized.
+ */
+static void
+sequence_sync_error_callback(void *arg)
+{
+	LogicalRepSequenceInfo *seqinfo = *(LogicalRepSequenceInfo **) arg;
+
+	if (seqinfo == NULL)
+		return;
+
+	errcontext("synchronizing sequence \"%s.%s\" for subscription \"%s\"",
+			   seqinfo->nspname, seqinfo->seqname, MySubscription->name);
 }
 
 /*
@@ -285,6 +303,23 @@ get_and_validate_seq_info(TupleTableSlot *slot, Relation *sequence_rel,
 	*seqidx = DatumGetInt32(slot_getattr(slot, ++col, &isnull));
 	Assert(!isnull);
 
+	/*
+	 * The publisher only echoes back an index that we put in the VALUES list,
+	 * so this should always identify an entry of seqinfos. Check it anyway
+	 * before using it as a list subscript, since list_nth() does not
+	 * bounds-check on non-assert builds and we would then write the remote
+	 * sequence state through a pointer fetched from beyond the list.
+	 *
+	 * This only keeps the subscript inside the list. An index that is wrong
+	 * but still in range is not detected, and cannot be; the sequence it
+	 * points at then receives another sequence's data. That is the same kind
+	 * of damage as the publisher reporting a wrong value in any other column,
+	 * and is likewise beyond what we can check.
+	 */
+	if (*seqidx < 0 || *seqidx >= list_length(seqinfos))
+		elog(ERROR, "invalid sequence index %d received from the publisher",
+			 *seqidx);
+
 	/* Identify the corresponding local sequence for the given index. */
 	*seqinfo = seqinfo_local =
 		(LogicalRepSequenceInfo *) list_nth(seqinfos, *seqidx);
@@ -403,6 +438,29 @@ copy_sequence(LogicalRepSequenceInfo *seqinfo, Oid seqowner)
 	AclResult	aclresult;
 	bool		run_as_owner = MySubscription->runasowner;
 	Oid			seqoid = seqinfo->localrelid;
+	Relation	rel;
+
+	/*
+	 * Take the subscription object lock before checking whether this sequence
+	 * is still part of the subscription. The lock is held until the end of
+	 * the transaction, so the check and the state update below are protected
+	 * from a concurrent ALTER SUBSCRIPTION ... REFRESH PUBLICATION.
+	 *
+	 * AlterSubscription() takes this lock in AccessExclusiveLock mode while
+	 * removing pg_subscription_rel rows, so the row cannot be removed between
+	 * the check and the state update.
+	 */
+	LockSharedObject(SubscriptionRelationId, MySubscription->oid, 0,
+					 AccessShareLock);
+
+	/*
+	 * The sequence may no longer be part of the subscription, in which case
+	 * there is nothing to synchronize and the caller just skips it.
+	 */
+	if (!SearchSysCacheExists2(SUBSCRIPTIONRELMAP,
+							   ObjectIdGetDatum(seqoid),
+							   ObjectIdGetDatum(MySubscription->oid)))
+		return COPYSEQ_NOT_SUBSCRIBED;
 
 	/*
 	 * If the user did not opt to run as the owner of the subscription
@@ -434,12 +492,18 @@ copy_sequence(LogicalRepSequenceInfo *seqinfo, Oid seqowner)
 	if (!run_as_owner)
 		RestoreUserContext(&ucxt);
 
+	rel = table_open(SubscriptionRelRelationId, RowExclusiveLock);
+
 	/*
 	 * Record the remote sequence's LSN in pg_subscription_rel and mark the
-	 * sequence as READY.
+	 * sequence as READY. Both locks it needs are held already, the object
+	 * lock from further up and the relation lock just taken, so say so rather
+	 * than have it take and release them again.
 	 */
 	UpdateSubscriptionRelState(MySubscription->oid, seqoid, SUBREL_STATE_READY,
-							   seqinfo->page_lsn, false);
+							   seqinfo->page_lsn, true);
+
+	table_close(rel, NoLock);
 
 	return COPYSEQ_SUCCESS;
 }
@@ -481,7 +545,7 @@ copy_sequences(WalReceiverConn *conn)
 
 	while (cur_batch_base_index < n_seqinfos)
 	{
-		Oid			seqRow[REMOTE_SEQ_COL_COUNT] = {INT8OID, BOOLOID, INT8OID,
+		Oid			seqRow[REMOTE_SEQ_COL_COUNT] = {INT4OID, BOOLOID, INT8OID,
 		BOOLOID, LSNOID, OIDOID, INT8OID, INT8OID, INT8OID, INT8OID, BOOLOID};
 		int			batch_size = 0;
 		int			batch_succeeded_count = 0;
@@ -573,9 +637,10 @@ copy_sequences(WalReceiverConn *conn)
 		while (tuplestore_gettupleslot(res->tuplestore, true, false, slot))
 		{
 			CopySeqResult sync_status;
-			LogicalRepSequenceInfo *seqinfo;
+			LogicalRepSequenceInfo *seqinfo = NULL;
 			Relation	sequence_rel = NULL;
 			int			seqidx;
+			ErrorContextCallback errcallback;
 
 			CHECK_FOR_INTERRUPTS();
 
@@ -585,11 +650,24 @@ copy_sequences(WalReceiverConn *conn)
 				ProcessConfigFile(PGC_SIGHUP);
 			}
 
+			/*
+			 * Set up callback to identify the sequence in error messages.
+			 * seqinfo will be filled once get_and_validate_seq_info()
+			 * resolves the sequence index.
+			 */
+			errcallback.callback = sequence_sync_error_callback;
+			errcallback.arg = &seqinfo;
+			errcallback.previous = error_context_stack;
+			error_context_stack = &errcallback;
+
 			sync_status = get_and_validate_seq_info(slot, &sequence_rel,
 													&seqinfo, &seqidx);
 			if (sync_status == COPYSEQ_SUCCESS)
 				sync_status = copy_sequence(seqinfo,
 											sequence_rel->rd_rel->relowner);
+
+			/* Pop the error context stack */
+			error_context_stack = errcallback.previous;
 
 			switch (sync_status)
 			{
@@ -654,6 +732,19 @@ copy_sequences(WalReceiverConn *conn)
 									   seqinfo->seqname));
 						batch_skipped_count++;
 					}
+					break;
+				case COPYSEQ_NOT_SUBSCRIBED:
+
+					/*
+					 * A concurrent refresh removed this sequence from the
+					 * subscription. Skipping it is the only sensible action,
+					 * and it must not be treated as an error.
+					 */
+					ereport(LOG,
+							errmsg("skip synchronization of sequence \"%s.%s\" because it is no longer part of subscription \"%s\"",
+								   seqinfo->nspname, seqinfo->seqname,
+								   MySubscription->name));
+					batch_skipped_count++;
 					break;
 			}
 
@@ -755,7 +846,7 @@ LogicalRepSyncSequences(void)
 		/*
 		 * Lock the sequence so its identity (namespace and name) cannot
 		 * change under us via a concurrent DROP, RENAME or SET SCHEMA. The
-		 * lock is released immediately rathen than at the transaction end.
+		 * lock is released immediately rather than at the transaction end.
 		 * The later synchronization does not depend on this captured identity
 		 * remaining valid, as it re-opens the sequence and tolerates
 		 * concurrent changes. Releasing early also avoids holding one lock
@@ -815,7 +906,7 @@ LogicalRepSyncSequences(void)
 	 * Establish the connection to the publisher for sequence synchronization.
 	 */
 	LogRepWorkerWalRcvConn =
-		walrcv_connect(MySubscription->conninfo, true, true,
+		walrcv_connect(MySubscriptionConninfo, true, true,
 					   must_use_password,
 					   app_name.data, &err);
 	if (LogRepWorkerWalRcvConn == NULL)

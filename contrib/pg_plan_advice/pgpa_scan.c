@@ -83,6 +83,9 @@ pgpa_build_scan(pgpa_plan_walker_context *walker, Plan *plan,
 		else
 			strategy = PGPA_SCAN_ORDINARY;
 
+		/* Be sure to account for pulled-up scans, as for a live Append. */
+		child_append_relid_sets = elided_node->child_append_relid_sets;
+
 		/* Join RTIs can be present, but advice never refers to them. */
 		relids = pgpa_filter_out_join_relids(relids, walker->pstmt->rtable);
 	}
@@ -200,8 +203,13 @@ pgpa_build_scan(pgpa_plan_walker_context *walker, Plan *plan,
 		child_nonjoin_relids =
 			pgpa_filter_out_join_relids(child_relids,
 										walker->pstmt->rtable);
-		(void) pgpa_make_scan(walker, plan, strategy,
-							  child_nonjoin_relids);
+		if (unique_nonjoin_rtekind(child_nonjoin_relids, walker->pstmt->rtable)
+			== RTE_RELATION)
+			(void) pgpa_make_scan(walker, plan, PGPA_SCAN_PARTITIONWISE,
+								  child_nonjoin_relids);
+		else
+			(void) pgpa_make_scan(walker, plan, PGPA_SCAN_ORDINARY,
+								  child_nonjoin_relids);
 	}
 
 	/*
@@ -221,13 +229,8 @@ pgpa_build_scan(pgpa_plan_walker_context *walker, Plan *plan,
 	 *
 	 * Add nothing if we're beneath a Gather or Gather Merge node, since
 	 * NO_GATHER advice is clearly inappropriate in that situation.
-	 *
-	 * Add nothing if this is an Append or MergeAppend node, whether or not
-	 * elided. We'll emit NO_GATHER() for the underlying scan, which is good
-	 * enough.
 	 */
-	if (!beneath_any_gather && nodetype != T_Append &&
-		nodetype != T_MergeAppend)
+	if (!beneath_any_gather)
 		walker->no_gather_scans =
 			bms_add_members(walker->no_gather_scans, relids);
 

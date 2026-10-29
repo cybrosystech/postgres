@@ -18,7 +18,6 @@ OBJS = \
 	bgworker.o \
 	bgwriter.o \
 	checkpointer.o \
-	datachecksum_state.o \
 	dbblue_create_standby.o \
 	dbblue_index_advisor.o \
 	dbblue_repack_launcher.o \

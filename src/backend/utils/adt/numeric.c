@@ -5015,7 +5015,15 @@ numeric_combine(PG_FUNCTION_ARGS)
 	state2 = PG_ARGISNULL(1) ? NULL : (NumericAggState *) PG_GETARG_POINTER(1);
 
 	if (state2 == NULL)
+	{
+		/*
+		 * NULL state2 is easy, just return state1, which we know is already
+		 * in the agg_context
+		 */
+		if (state1 == NULL)
+			PG_RETURN_NULL();
 		PG_RETURN_POINTER(state1);
+	}
 
 	/* manually copy all fields from state2 to state1 */
 	if (state1 == NULL)
@@ -5107,7 +5115,15 @@ numeric_avg_combine(PG_FUNCTION_ARGS)
 	state2 = PG_ARGISNULL(1) ? NULL : (NumericAggState *) PG_GETARG_POINTER(1);
 
 	if (state2 == NULL)
+	{
+		/*
+		 * NULL state2 is easy, just return state1, which we know is already
+		 * in the agg_context
+		 */
+		if (state1 == NULL)
+			PG_RETURN_NULL();
 		PG_RETURN_POINTER(state1);
+	}
 
 	/* manually copy all fields from state2 to state1 */
 	if (state1 == NULL)
@@ -5352,7 +5368,7 @@ numeric_deserialize(PG_FUNCTION_ARGS)
 	initReadOnlyStringInfo(&buf, VARDATA_ANY(sstate),
 						   VARSIZE_ANY_EXHDR(sstate));
 
-	result = makeNumericAggStateCurrentContext(false);
+	result = makeNumericAggStateCurrentContext(true);
 
 	/* N */
 	result->N = pq_getmsgint64(&buf);
@@ -5571,7 +5587,15 @@ numeric_poly_combine(PG_FUNCTION_ARGS)
 	state2 = PG_ARGISNULL(1) ? NULL : (Int128AggState *) PG_GETARG_POINTER(1);
 
 	if (state2 == NULL)
+	{
+		/*
+		 * NULL state2 is easy, just return state1, which we know is already
+		 * in the agg_context
+		 */
+		if (state1 == NULL)
+			PG_RETURN_NULL();
 		PG_RETURN_POINTER(state1);
+	}
 
 	/* manually copy all fields from state2 to state1 */
 	if (state1 == NULL)
@@ -5677,7 +5701,7 @@ numeric_poly_deserialize(PG_FUNCTION_ARGS)
 	initReadOnlyStringInfo(&buf, VARDATA_ANY(sstate),
 						   VARSIZE_ANY_EXHDR(sstate));
 
-	result = makeInt128AggStateCurrentContext(false);
+	result = makeInt128AggStateCurrentContext(true);
 
 	/* N */
 	result->N = pq_getmsgint64(&buf);
@@ -5732,7 +5756,15 @@ int8_avg_combine(PG_FUNCTION_ARGS)
 	state2 = PG_ARGISNULL(1) ? NULL : (Int128AggState *) PG_GETARG_POINTER(1);
 
 	if (state2 == NULL)
+	{
+		/*
+		 * NULL state2 is easy, just return state1, which we know is already
+		 * in the agg_context
+		 */
+		if (state1 == NULL)
+			PG_RETURN_NULL();
 		PG_RETURN_POINTER(state1);
+	}
 
 	/* manually copy all fields from state2 to state1 */
 	if (state1 == NULL)

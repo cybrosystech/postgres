@@ -230,10 +230,32 @@ analyze_rel(Oid relid, RangeVar *relation,
 
 		fdwroutine = GetFdwRoutineForRelation(onerel, false);
 
-		if (fdwroutine->ImportForeignStatistics != NULL &&
-			fdwroutine->ImportForeignStatistics(onerel, va_cols, elevel))
-			stats_imported = true;
-		else
+		if (fdwroutine->ImportForeignStatistics != NULL)
+		{
+			Oid			save_userid;
+			int			save_sec_context;
+			int			save_nestlevel;
+
+			/*
+			 * Switch to the table owner's userid, as in the sampling path.
+			 * Also lock down security-restricted operations and arrange to
+			 * make GUC variable changes local to this command.
+			 */
+			GetUserIdAndSecContext(&save_userid, &save_sec_context);
+			SetUserIdAndSecContext(onerel->rd_rel->relowner,
+								   save_sec_context | SECURITY_RESTRICTED_OPERATION);
+			save_nestlevel = NewGUCNestLevel();
+			RestrictSearchPath();
+
+			stats_imported = fdwroutine->ImportForeignStatistics(onerel,
+																 va_cols,
+																 elevel);
+
+			AtEOXact_GUC(false, save_nestlevel);
+			SetUserIdAndSecContext(save_userid, save_sec_context);
+		}
+
+		if (!stats_imported)
 		{
 			bool		ok = false;
 
@@ -245,7 +267,7 @@ analyze_rel(Oid relid, RangeVar *relation,
 			if (!ok)
 			{
 				ereport(WARNING,
-						errmsg("skipping \"%s\" -- cannot analyze this foreign table.",
+						errmsg("skipping \"%s\" --- cannot analyze this foreign table",
 							   RelationGetRelationName(onerel)));
 				relation_close(onerel, ShareUpdateExclusiveLock);
 				goto out;
@@ -734,6 +756,7 @@ do_analyze_rel(Relation onerel, const VacuumParams *params,
 			ivinfo.index = Irel[ind];
 			ivinfo.heaprel = onerel;
 			ivinfo.analyze_only = true;
+			ivinfo.is_autovacuum = AmAutoVacuumWorkerProcess();
 			ivinfo.estimated_count = true;
 			ivinfo.message_level = elevel;
 			ivinfo.num_heap_tuples = onerel->rd_rel->reltuples;
@@ -1179,6 +1202,11 @@ examine_attribute(Relation onerel, int attnum, Node *index_expr)
 	return stats;
 }
 
+/*
+ * Determine whether the column is analyzable.
+ *
+ * If the column is analyzable, return its attstattarget value, if asked to.
+ */
 bool
 attribute_is_analyzable(Relation onerel, int attnum, Form_pg_attribute attr,
 						int *p_attstattarget)
@@ -1383,8 +1411,6 @@ acquire_sample_rows(Relation onerel, int elevel,
 	/* Outer loop over blocks to sample */
 	while (table_scan_analyze_next_block(scan, stream))
 	{
-		vacuum_delay_point(true);
-
 		while (table_scan_analyze_next_tuple(scan, &liverows, &deadrows, slot))
 		{
 			/*
@@ -1432,6 +1458,7 @@ acquire_sample_rows(Relation onerel, int elevel,
 
 		pgstat_progress_update_param(PROGRESS_ANALYZE_BLOCKS_DONE,
 									 ++blksdone);
+		vacuum_delay_point(true);
 	}
 
 	read_stream_end(stream);

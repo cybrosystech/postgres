@@ -21,6 +21,7 @@
 #include "access/table.h"
 #include "access/tableam.h"
 #include "access/tupconvert.h"
+#include "access/xlog.h"
 #include "catalog/pg_inherits.h"
 #include "commands/copyapi.h"
 #include "commands/progress.h"
@@ -395,22 +396,38 @@ CopyToJsonOneRow(CopyToState cstate, TupleTableSlot *slot)
 	else
 	{
 		/*
-		 * Full table or query without column list.  For queries, the slot's
-		 * TupleDesc may carry RECORDOID, which is not registered in the type
-		 * cache and would cause composite_to_json's lookup_rowtype_tupdesc
-		 * call to fail.  Build a HeapTuple stamped with the blessed
-		 * descriptor so the type can be looked up correctly.
+		 * Full table or query without column list.  For a query, the slot's
+		 * descriptor is either an unregistered RECORD type, which
+		 * composite_to_json's lookup_rowtype_tupdesc() cannot look up, or,
+		 * when the top plan node does not project, the row type of a scanned
+		 * table, whose column names need not match the query's.  Either way,
+		 * the datum must be stamped with the query's blessed descriptor.
+		 *
+		 * A virtual slot has no physical tuple, so form one directly.
+		 * Otherwise copy the slot's tuple and stamp the copy with the query's
+		 * descriptor.  That is safe because the tuple's physical layout
+		 * matches the query's result descriptor: a scan returns its scan
+		 * tuple unprojected only if tlist_matches_tupdesc() holds, which
+		 * rules out dropped columns and columns with missing values.
 		 */
-		if (!cstate->rel && slot->tts_tupleDescriptor->tdtypeid == RECORDOID)
-		{
-			HeapTuple	tup = heap_form_tuple(cstate->tupDesc,
-											  slot->tts_values,
-											  slot->tts_isnull);
-
-			rowdata = HeapTupleGetDatum(tup);
-		}
-		else
+		if (cstate->rel)
 			rowdata = ExecFetchSlotHeapTupleDatum(slot);
+		else if (TTS_IS_VIRTUAL(slot))
+			rowdata = HeapTupleGetDatum(heap_form_tuple(cstate->tupDesc,
+														slot->tts_values,
+														slot->tts_isnull));
+		else
+		{
+			HeapTuple	tup;
+			bool		shouldFree;
+
+			Assert(slot->tts_tupleDescriptor->natts == cstate->tupDesc->natts);
+
+			tup = ExecFetchSlotHeapTuple(slot, false, &shouldFree);
+			rowdata = heap_copy_tuple_as_datum(tup, cstate->tupDesc);
+			if (shouldFree)
+				heap_freetuple(tup);
+		}
 	}
 
 	composite_to_json(rowdata, cstate->json_buf, false);
@@ -861,6 +878,19 @@ BeginCopyTo(ParseState *pstate,
 							errhint("Try the COPY (SELECT ...) TO variant."));
 				}
 
+				/* Unlogged partitions are inaccessible during recovery. */
+				if (RecoveryInProgress() &&
+					get_rel_persistence(child) == RELPERSISTENCE_UNLOGGED)
+				{
+					char	   *relation_name = get_rel_name(child);
+
+					ereport(ERROR,
+							errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("cannot access temporary or unlogged relations during recovery"),
+							errdetail("Partition \"%s\" is an unlogged table in partitioned table \"%s\".",
+									  relation_name, RelationGetRelationName(rel)));
+				}
+
 				/* Exclude tables with no data */
 				if (RELKIND_HAS_PARTITIONS(relkind))
 					children = foreach_delete_current(children, child);
@@ -873,6 +903,11 @@ BeginCopyTo(ParseState *pstate,
 							RelationGetRelationName(rel))));
 	}
 
+	/* Temporary and unlogged relations are inaccessible during recovery. */
+	if (rel != NULL && !RelationIsPermanent(rel) && RecoveryInProgress())
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot access temporary or unlogged relations during recovery")));
 
 	/* Allocate workspace and zero all fields */
 	cstate = palloc0_object(CopyToStateData);

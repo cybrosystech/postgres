@@ -6,7 +6,6 @@ backend_sources += files(
   'bgworker.c',
   'bgwriter.c',
   'checkpointer.c',
-  'datachecksum_state.c',
   'dbblue_create_standby.c',
   'dbblue_index_advisor.c',
   'dbblue_repack_launcher.c',

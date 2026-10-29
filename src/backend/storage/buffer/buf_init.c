@@ -24,17 +24,14 @@
 BufferDescPadded *BufferDescriptors;
 char	   *BufferBlocks;
 ConditionVariableMinimallyPadded *BufferIOCVArray;
-WritebackContext BackendWritebackContext;
 CkptSortItem *CkptBufferIds;
 
 static void BufferManagerShmemRequest(void *arg);
 static void BufferManagerShmemInit(void *arg);
-static void BufferManagerShmemAttach(void *arg);
 
 const ShmemCallbacks BufferManagerShmemCallbacks = {
 	.request_fn = BufferManagerShmemRequest,
 	.init_fn = BufferManagerShmemInit,
-	.attach_fn = BufferManagerShmemAttach,
 };
 
 /*
@@ -141,16 +138,4 @@ BufferManagerShmemInit(void *arg)
 		/* Odoo pinner: start out unpinned. */
 		pg_atomic_init_u32(&buf->soft_pin_tier, SOFT_PIN_TIER_NONE);
 	}
-
-	/* Initialize per-backend file flush context */
-	WritebackContextInit(&BackendWritebackContext,
-						 &backend_flush_after);
-}
-
-static void
-BufferManagerShmemAttach(void *arg)
-{
-	/* Initialize per-backend file flush context */
-	WritebackContextInit(&BackendWritebackContext,
-						 &backend_flush_after);
 }

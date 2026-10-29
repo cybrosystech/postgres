@@ -124,6 +124,11 @@ static struct hosts
 	 * matches the supplied hostname in the SNI extension.
 	 */
 	HostsLine  *default_host;
+
+	/*
+	 * Whether the configuration was loaded with ssl_sni enabled.
+	 */
+	bool		sni_enabled;
 }		   *SSL_hosts;
 
 static bool dummy_ssl_passwd_cb_called = false;
@@ -160,6 +165,7 @@ be_tls_init(bool isServerStart)
 	int			ssl_ver_min = -1;
 	int			ssl_ver_max = -1;
 	host_cache_hash *host_cache = NULL;
+	int			nloaded = 0;
 
 	/*
 	 * Since we don't know which host we're using until the ClientHello is
@@ -175,6 +181,7 @@ be_tls_init(bool isServerStart)
 
 	/* Allocate a tentative replacement for SSL_hosts. */
 	new_hosts = palloc0_object(struct hosts);
+	new_hosts->sni_enabled = ssl_sni;
 
 	/*
 	 * Register a reset callback for the memory context which is responsible
@@ -228,7 +235,7 @@ be_tls_init(bool isServerStart)
 		{
 			ereport(isServerStart ? FATAL : LOG,
 					errcode(ERRCODE_CONFIG_FILE_ERROR),
-					errmsg("could not load \"%s\": %s", HostsFileName,
+					errmsg("could not load file \"%s\": %s", HostsFileName,
 						   err_msg ? err_msg : "unknown error"));
 			goto error;
 		}
@@ -248,9 +255,6 @@ be_tls_init(bool isServerStart)
 		foreach(line, pg_hosts)
 		{
 			HostsLine  *host = lfirst(line);
-
-			if (!init_host_context(host, isServerStart))
-				goto error;
 
 			/*
 			 * The hostname in the config will be set to NULL for the default
@@ -321,7 +325,25 @@ be_tls_init(bool isServerStart)
 				 */
 				new_hosts->sni = lappend(new_hosts->sni, host);
 			}
+
+			/*
+			 * Create the SSL context only once the entry has been accepted
+			 * and added to new_hosts, as the cleanup callback can only free
+			 * contexts of entries it can reach from there.
+			 *
+			 * An EXEC_BACKEND child has no previous configuration to fall
+			 * back on, so rather than leaving the backend without SSL for all
+			 * hosts we keep a failed entry without a context.  Connections
+			 * selecting it will fail the handshake.
+			 */
+			if (init_host_context(host, isServerStart))
+				nloaded++;
+			else if (!IsUnderPostmaster)
+				goto error;
 		}
+
+		if (nloaded == 0)
+			goto error;
 	}
 
 	/*
@@ -338,10 +360,14 @@ be_tls_init(bool isServerStart)
 			Assert(ssl_sni == false);
 #endif
 
-		pgconf->ssl_cert = ssl_cert_file;
-		pgconf->ssl_key = ssl_key_file;
-		pgconf->ssl_ca = ssl_ca_file;
-		pgconf->ssl_passphrase_cmd = ssl_passphrase_command;
+		/*
+		 * Copy the configuration from the GUC variables since they aren't
+		 * guaranteed to survive a failed reload.
+		 */
+		pgconf->ssl_cert = pstrdup(ssl_cert_file);
+		pgconf->ssl_key = pstrdup(ssl_key_file);
+		pgconf->ssl_ca = pstrdup(ssl_ca_file);
+		pgconf->ssl_passphrase_cmd = pstrdup(ssl_passphrase_command);
 		pgconf->ssl_passphrase_reload = ssl_passphrase_command_supports_reload;
 
 		if (!init_host_context(pgconf, isServerStart))
@@ -364,7 +390,7 @@ be_tls_init(bool isServerStart)
 				errcode(ERRCODE_CONFIG_FILE_ERROR),
 				errmsg("no SSL configurations loaded"),
 		/*- translator: The two %s contain filenames */
-				errhint("If ssl_sni is enabled then add configuration to \"%s\", else \"%s\"",
+				errhint("If ssl_sni is enabled then add configuration to file \"%s\", else file \"%s\".",
 						HostsFileName, "postgresql.conf"));
 		goto error;
 	}
@@ -568,14 +594,30 @@ be_tls_init(bool isServerStart)
 
 	return 0;
 
+error:
+
 	/*
 	 * Clean up by releasing working SSL contexts as well as allocations
 	 * performed during parsing.  Since all our allocations are done in a
 	 * local memory context all we need to do is delete it.
 	 */
-error:
 	if (context)
 		SSL_CTX_free(context);
+
+	/*
+	 * If the initialization failed, and the ssl_sni setting was changed, we
+	 * issue a WARNING to indicate that the ssl_sni setting won't match the
+	 * SSL configuration in use.
+	 */
+	if (SSL_context && SSL_hosts && SSL_hosts->sni_enabled != ssl_sni)
+	{
+		ereport(WARNING,
+				errcode(ERRCODE_CONFIG_FILE_ERROR),
+				SSL_hosts->sni_enabled ?
+				errmsg("SSL configuration not reloaded, SNI remains on") :
+				errmsg("SSL configuration not reloaded, SNI remains off"),
+				errdetail("The SSL configuration failed to reload; the previous configuration and SNI state will remain active."));
+	}
 
 	MemoryContextSwitchTo(oldcxt);
 	MemoryContextDelete(host_memcxt);
@@ -826,6 +868,13 @@ be_tls_destroy(void)
 		SSL_CTX_free(SSL_context);
 	SSL_context = NULL;
 	ssl_loaded_verify_locations = false;
+
+	if (SSL_hosts_memcxt)
+	{
+		MemoryContextDelete(SSL_hosts_memcxt);
+		SSL_hosts_memcxt = NULL;
+		SSL_hosts = NULL;
+	}
 }
 
 int
@@ -1922,9 +1971,11 @@ sni_clienthello_cb(SSL *ssl, int *al, void *arg)
 				len;
 	HostsLine  *install_config = NULL;
 
-	if (!ssl_sni)
+	if (!SSL_hosts->sni_enabled)
 	{
+		/* A configuration loaded without SNI must have a default host */
 		install_config = SSL_hosts->default_host;
+		Assert(install_config != NULL);
 		goto found;
 	}
 
@@ -2046,6 +2097,17 @@ sni_clienthello_cb(SSL *ssl, int *al, void *arg)
 	}
 
 found:
+	if (install_config->ssl_ctx == NULL)
+	{
+		*al = SSL_AD_INTERNAL_ERROR;
+		ereport(COMMERROR,
+				errcode(ERRCODE_CONFIG_FILE_ERROR),
+				errmsg("SSL configuration for host could not be loaded, terminating connection"),
+				errcontext("line %d of configuration file \"%s\"",
+						   install_config->linenumber, install_config->sourcefile));
+		return SSL_CLIENT_HELLO_ERROR;
+	}
+
 	if (!ssl_update_ssl(ssl, install_config))
 	{
 		*al = SSL_AD_INTERNAL_ERROR;

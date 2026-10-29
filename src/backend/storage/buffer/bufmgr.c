@@ -372,6 +372,8 @@ static int	PrivateRefCountEntryLast = -1;
 
 static uint32 MaxProportionalPins;
 
+static WritebackContext BackendWritebackContext;
+
 static void ReservePrivateRefCountEntry(void);
 static PrivateRefCountEntry *NewPrivateRefCountEntry(Buffer buffer);
 static PrivateRefCountEntry *GetPrivateRefCountEntry(Buffer buffer, bool do_move);
@@ -1933,8 +1935,9 @@ WaitReadBuffers(ReadBuffersOperation *operation)
 				needed_wait = true;
 
 				/*
-				 * The IO operation itself was already counted earlier, in
-				 * AsyncReadBuffers(), this just accounts for the wait time.
+				 * This just accounts for the wait time. The IO operation
+				 * itself was already counted earlier in AsyncReadBuffers() --
+				 * either by us or by another backend if this is a foreign IO.
 				 */
 				pgstat_count_io_op_time(io_object, io_context, IOOP_READ,
 										io_start, 0, 0);
@@ -2122,8 +2125,7 @@ AsyncReadBuffers(ReadBuffersOperation *operation, int *nblocks_progress)
 	 * A secondary benefit is that this would allow us to measure the time in
 	 * pgaio_io_acquire() without causing undue timer overhead in the common,
 	 * non-blocking, case.  However, currently the pgstats infrastructure
-	 * doesn't really allow that, as it a) asserts that an operation can't
-	 * have time without operations b) doesn't have an API to report
+	 * doesn't really allow that because it doesn't have an API to report
 	 * "accumulated" time.
 	 */
 	ioh = pgaio_io_acquire_nb(CurrentResourceOwner, &operation->io_return);
@@ -4369,6 +4371,10 @@ InitBufferManagerAccess(void)
 	memset(&PrivateRefCountArrayKeys, 0, sizeof(PrivateRefCountArrayKeys));
 
 	PrivateRefCountHash = refcount_create(CurrentMemoryContext, 100, NULL);
+
+	/* Initialize per-backend file flush context */
+	WritebackContextInit(&BackendWritebackContext,
+						 &backend_flush_after);
 
 	/*
 	 * AtProcExit_Buffers needs LWLock access, and thereby has to be called at
@@ -8803,7 +8809,7 @@ buffer_readv_complete_one(PgAioTargetData *td, uint8 buf_off, Buffer buffer,
 			buffer_readv_encode_error(&result_one, is_temp,
 									  *zeroed_buffer,
 									  *ignored_checksum,
-									  *buffer_invalid,
+									  *buffer_invalid ? 1 : 0,
 									  *zeroed_buffer ? 1 : 0,
 									  *failed_checksum ? 1 : 0,
 									  buf_off, buf_off, buf_off);

@@ -130,7 +130,7 @@ pg_control_checkpoint(PG_FUNCTION_ARGS)
 	values[9] = TransactionIdGetDatum(ControlFile->checkPointCopy.nextMulti);
 	nulls[9] = false;
 
-	values[10] = TransactionIdGetDatum(ControlFile->checkPointCopy.nextMultiOffset);
+	values[10] = Int64GetDatum(ControlFile->checkPointCopy.nextMultiOffset);
 	nulls[10] = false;
 
 	values[11] = TransactionIdGetDatum(ControlFile->checkPointCopy.oldestXid);
@@ -254,7 +254,7 @@ pg_control_init(PG_FUNCTION_ARGS)
 	values[9] = BoolGetDatum(ControlFile->float8ByVal);
 	nulls[9] = false;
 
-	values[10] = Int32GetDatum(ControlFile->data_checksum_version);
+	values[10] = Int32GetDatum(ControlFile->data_checksum_version_init);
 	nulls[10] = false;
 
 	values[11] = BoolGetDatum(ControlFile->default_char_signedness);

@@ -408,10 +408,6 @@ pg_tde_ddl_command_start_capture(PG_FUNCTION_ARGS)
 
 				if (cmd->subtype == AT_SetAccessMethod)
 					setAccessMethod = cmd;
-#if PG_VERSION_NUM >= 190000
-				else if (cmd->subtype == AT_SplitPartition || cmd->subtype == AT_MergePartitions)
-					create_partition = true;
-#endif
 			}
 
 			rel = relation_open(relid, NoLock);

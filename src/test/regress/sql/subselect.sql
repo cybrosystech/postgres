@@ -540,6 +540,18 @@ from
   join
   int4_tbl i4 on dummy = i4.f1;
 
+-- Likewise, but with the sublink inserted into a whole-row reference.
+
+select 1 from ((select (select 1) as x) ss1 cross join int4_tbl i4) j
+  where (select 1 where j is null) is null;
+
+select 1 from ((select (select 1) as x) ss1 cross join int4_tbl i4) j
+  where (1, 1) in (select (j is null)::int, count(*) from int4_tbl);
+
+select 1 from ((select (select 1) as x) ss1 cross join int4_tbl i4) j
+  where exists (select 1 from int4_tbl
+                tablesample system ((j is null)::int * 100));
+
 --
 -- Test case for subselect within UPDATE of INSERT...ON CONFLICT DO UPDATE
 --
@@ -1040,6 +1052,17 @@ WHERE a = ROW(1.0)::t_rec;
 
 SELECT * FROM (SELECT DISTINCT ON (a) id, a FROM pdt ORDER BY a, id) s
 WHERE a = ROW(1.0)::t_rec;
+
+-- Simple CASE: the arg is compared by each WHEN, so the same rules apply.
+-- The relabeled arg is compared by oid's "=", not the grouping eqop.
+EXPLAIN (COSTS OFF)
+SELECT * FROM (SELECT DISTINCT id FROM pdt) s
+WHERE (CASE id::oid WHEN 1 THEN 1 ELSE 0 END) = 1;
+
+-- Positive: compatible opfamily, safe to push past the grouping
+EXPLAIN (COSTS OFF)
+SELECT * FROM (SELECT DISTINCT id FROM pdt) s
+WHERE (CASE id WHEN 1 THEN 1 ELSE 0 END) = 1;
 
 -- Set operations: any operation other than UNION ALL groups rows by equality,
 -- so the same opfamily-mismatch rules apply.
@@ -1750,5 +1773,20 @@ WHERE id NOT IN (SELECT id FROM notnull_notvalid_tab);
 -- NOT IN with NULL on inner side should return no rows
 SELECT * FROM not_null_tab
 WHERE id NOT IN (SELECT id FROM notnull_notvalid_tab);
+
+-- No ANTI JOIN: the sub-select's output is an upper-level Var, so the
+-- sub-select's own quals tell us nothing about its nullability
+INSERT INTO null_tab VALUES (1, NULL);
+INSERT INTO not_null_tab VALUES (2, 2);
+
+EXPLAIN (COSTS OFF)
+SELECT * FROM null_tab t1
+WHERE COALESCE(t1.id, -1) NOT IN
+    (SELECT t1.val FROM not_null_tab t2 WHERE t2.val IS NOT NULL);
+
+-- NOT IN with NULL on inner side should return no rows
+SELECT * FROM null_tab t1
+WHERE COALESCE(t1.id, -1) NOT IN
+    (SELECT t1.val FROM not_null_tab t2 WHERE t2.val IS NOT NULL);
 
 ROLLBACK;

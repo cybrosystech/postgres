@@ -915,7 +915,11 @@ heapgettup_advance_block(HeapScanDesc scan, BlockNumber block, ScanDirection dir
 		/* check if the limit imposed by heap_setscanlimits() is met */
 		if (scan->rs_numblocks != InvalidBlockNumber)
 		{
-			if (--scan->rs_numblocks == 0)
+			BlockNumber endblock;
+
+			endblock = (scan->rs_startblock + scan->rs_numblocks) %
+				scan->rs_nblocks;
+			if (block == endblock)
 				return InvalidBlockNumber;
 		}
 
@@ -923,16 +927,14 @@ heapgettup_advance_block(HeapScanDesc scan, BlockNumber block, ScanDirection dir
 	}
 	else
 	{
-		/* we're done if the last block is the start position */
+		/*
+		 * We're done if the last block is the start position.  No need to
+		 * check if rs_numblocks was set by heap_setscanlimits() as that only
+		 * changes the end block.  The start block is the same with or without
+		 * scan limits.
+		 */
 		if (block == scan->rs_startblock)
 			return InvalidBlockNumber;
-
-		/* check if the limit imposed by heap_setscanlimits() is met */
-		if (scan->rs_numblocks != InvalidBlockNumber)
-		{
-			if (--scan->rs_numblocks == 0)
-				return InvalidBlockNumber;
-		}
 
 		/* wrap to the end of the heap when the last page was page 0 */
 		if (block == 0)
@@ -2488,19 +2490,19 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 		{
 			PageSetAllVisible(page);
 			PageClearPrunable(page);
-			visibilitymap_set(BufferGetBlockNumber(buffer),
-							  vmbuffer,
-							  VISIBILITYMAP_ALL_VISIBLE |
-							  VISIBILITYMAP_ALL_FROZEN,
-							  relation->rd_locator);
+			(void) visibilitymap_set(BufferGetBlockNumber(buffer),
+									 vmbuffer,
+									 VISIBILITYMAP_ALL_VISIBLE |
+									 VISIBILITYMAP_ALL_FROZEN,
+									 relation->rd_locator);
 		}
 
 		/*
 		 * Set pd_prune_xid. See heap_insert() for more on why we do this when
-		 * inserting tuples. This only makes sense if we aren't already
-		 * setting the page frozen in the VM and we're not in bootstrap mode.
+		 * inserting tuples. This only makes sense if the tuples aren't frozen
+		 * and we're not in bootstrap mode.
 		 */
-		if (!all_frozen_set && TransactionIdIsNormal(xid))
+		if (TransactionIdIsNormal(xid) && !(options & HEAP_INSERT_FROZEN))
 			PageSetPrunable(page, xid);
 
 		MarkBufferDirty(buffer);
@@ -3569,7 +3571,7 @@ simple_heap_delete(Relation relation, const ItemPointerData *tid)
  */
 TM_Result
 heap_update(Relation relation, const ItemPointerData *otid, HeapTuple newtup,
-			CommandId cid, uint32 options pg_attribute_unused(), Snapshot crosscheck, bool wait,
+			CommandId cid, uint32 options, Snapshot crosscheck, bool wait,
 			TM_FailureData *tmfd, LockTupleMode *lockmode,
 			TU_UpdateIndexes *update_indexes)
 {
@@ -3923,14 +3925,25 @@ l2:
 			else
 				update_xact = InvalidTransactionId;
 
-			/*
-			 * There was no UPDATE in the MultiXact; or it aborted. No
-			 * TransactionIdIsInProgress() call needed here, since we called
-			 * MultiXactIdWait() above.
-			 */
-			if (!TransactionIdIsValid(update_xact) ||
-				TransactionIdDidAbort(update_xact))
+			if (!TransactionIdIsValid(update_xact))
+			{
+				/* no UPDATE in the MultiXact */
 				can_continue = true;
+			}
+			else
+			{
+				/*
+				 * There was another UPDATE.  Did it abort?
+				 *
+				 * Note: We check !TransactionIdDidCommit() instead of
+				 * TransactionIdDidAbort(), to treat crashed transactions as
+				 * aborted.  No TransactionIdIsInProgress() call is needed
+				 * here, because the MultiXactIdWait() call above already
+				 * waited for it to finish.
+				 */
+				if (!TransactionIdDidCommit(update_xact))
+					can_continue = true;
+			}
 		}
 		else if (TransactionIdIsCurrentTransactionId(xwait))
 		{
@@ -4265,8 +4278,12 @@ l2:
 		 */
 		if (need_toast)
 		{
-			/* Note we always use WAL and FSM during updates */
-			heaptup = heap_toast_insert_or_update(relation, newtup, &oldtup, 0);
+			/*
+			 * If logical decoding is not needed, suppress it for the TOAST
+			 * tuples too. We never skip the FSM here.
+			 */
+			heaptup = heap_toast_insert_or_update(relation, newtup, &oldtup,
+												  walLogical ? 0 : HEAP_INSERT_NO_LOGICAL);
 			newtupsize = MAXALIGN(heaptup->t_len);
 		}
 		else
@@ -8160,8 +8177,9 @@ DoesMultiXactIdConflict(MultiXactId multi, uint16 infomask,
 
 			if (ISUPDATE_from_mxstatus(members[i].status))
 			{
-				/* ignore aborted updaters */
-				if (TransactionIdDidAbort(memxid))
+				/* ignore aborted (or crashed) updaters */
+				if (!TransactionIdIsInProgress(memxid) &&
+					!TransactionIdDidCommit(memxid))
 					continue;
 			}
 			else

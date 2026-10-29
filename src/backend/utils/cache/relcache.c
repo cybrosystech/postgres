@@ -2139,16 +2139,6 @@ RelationIdGetRelation(Oid relationId)
 	return rd;
 }
 
-/*
- * Returns a schema-qualified name of the relation.
- */
-char *
-RelationGetQualifiedRelationName(Relation rel)
-{
-	return get_qualified_objname(RelationGetNamespace(rel),
-								 RelationGetRelationName(rel));
-}
-
 /* ----------------------------------------------------------------
  *				cache invalidation support routines
  * ----------------------------------------------------------------
@@ -2328,14 +2318,15 @@ RelationReloadIndexInfo(Relation relation)
 	RelationInitPhysicalAddr(relation);
 
 	/*
-	 * For a non-system index, there are fields of the pg_index row that are
-	 * allowed to change, so re-read that row and update the relcache entry.
-	 * Most of the info derived from pg_index (such as support function lookup
-	 * info) cannot change, and indeed the whole point of this routine is to
-	 * update the relcache entry without clobbering that data; so wholesale
+	 * For a non-catalog index (this includes the TOAST index of a user
+	 * table), there are fields of the pg_index row that are allowed to
+	 * change, so re-read that row and update the relcache entry.  Most of the
+	 * info derived from pg_index (such as support function lookup info)
+	 * cannot change, and indeed the whole point of this routine is to update
+	 * the relcache entry without clobbering that data; so wholesale
 	 * replacement is not appropriate.
 	 */
-	if (!IsSystemRelation(relation))
+	if (!IsCatalogRelation(relation))
 	{
 		HeapTuple	tuple;
 		Form_pg_index index;
@@ -5079,6 +5070,13 @@ RelationGetPrimaryKeyIndex(Relation relation, bool deferrable_ok)
 /*
  * RelationGetReplicaIndex -- get OID of the relation's replica identity index
  *
+ * If replica identity is DEFAULT, then return the OID of the primary key, if
+ * it's not deferrable; if replica identity is INDEX, return the OID of the
+ * index with indisreplident, if one exists.
+ *
+ * Note that a working PK is not returned if identity is INDEX!  This is
+ * surprising if the replica identity index is dropped.  FIXME someday.
+ *
  * Returns InvalidOid if there is no such index.
  */
 Oid
@@ -5976,12 +5974,20 @@ RelationBuildPublicationDesc(Relation relation, PublicationDesc *pubdesc)
 	schemaid = RelationGetNamespace(relation);
 	puboids = list_concat_unique_oid(puboids, GetSchemaPublications(schemaid));
 
+	/*
+	 * A partition whose concurrent detach has been committed but not
+	 * finalized reports no ancestors, even though relispartition is still
+	 * set. Treat such a partition as a standalone table, as after the detach
+	 * is finalized.
+	 */
 	if (relation->rd_rel->relispartition)
+		ancestors = get_partition_ancestors(relid);
+
+	if (ancestors)
 	{
 		Oid			last_ancestor_relid;
 
 		/* Add publications that the ancestors are in too. */
-		ancestors = get_partition_ancestors(relid);
 		last_ancestor_relid = llast_oid(ancestors);
 
 		foreach(lc, ancestors)

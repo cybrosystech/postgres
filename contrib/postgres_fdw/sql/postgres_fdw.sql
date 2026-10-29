@@ -54,20 +54,12 @@ CREATE TABLE "S 1"."T 4" (
 	c3 text,
 	CONSTRAINT t4_pkey PRIMARY KEY (c1)
 );
-CREATE TABLE "S 1"."T 5" (
-	c1 int4range NOT NULL,
-	c2 int NOT NULL,
-	c3 text,
-	c4 daterange NOT NULL,
-	CONSTRAINT t5_pkey PRIMARY KEY (c1, c4 WITHOUT OVERLAPS)
-);
 
 -- Disable autovacuum for these tables to avoid unexpected effects of that
 ALTER TABLE "S 1"."T 1" SET (autovacuum_enabled = 'false');
 ALTER TABLE "S 1"."T 2" SET (autovacuum_enabled = 'false');
 ALTER TABLE "S 1"."T 3" SET (autovacuum_enabled = 'false');
 ALTER TABLE "S 1"."T 4" SET (autovacuum_enabled = 'false');
-ALTER TABLE "S 1"."T 5" SET (autovacuum_enabled = 'false');
 
 INSERT INTO "S 1"."T 1"
 	SELECT id,
@@ -95,18 +87,11 @@ INSERT INTO "S 1"."T 4"
 	       'AAA' || to_char(id, 'FM000')
 	FROM generate_series(1, 100) id;
 DELETE FROM "S 1"."T 4" WHERE c1 % 3 != 0;	-- delete for outer join tests
-INSERT INTO "S 1"."T 5"
-	SELECT int4range(id, id + 1),
-	       id + 1,
-	       'AAA' || to_char(id, 'FM000'),
-        '[2000-01-01,2020-01-01)'
-	FROM generate_series(1, 100) id;
 
 ANALYZE "S 1"."T 1";
 ANALYZE "S 1"."T 2";
 ANALYZE "S 1"."T 3";
 ANALYZE "S 1"."T 4";
-ANALYZE "S 1"."T 5";
 
 -- ===================================================================
 -- create foreign tables
@@ -160,14 +145,6 @@ CREATE FOREIGN TABLE ft7 (
 	c2 int NOT NULL,
 	c3 text
 ) SERVER loopback3 OPTIONS (schema_name 'S 1', table_name 'T 4');
-
-CREATE FOREIGN TABLE ft8 (
-	c1 int4range NOT NULL,
-	c2 int NOT NULL,
-	c3 text,
-	c4 daterange NOT NULL
-) SERVER loopback OPTIONS (schema_name 'S 1', table_name 'T 5');
-
 
 -- ===================================================================
 -- tests for validator
@@ -1189,6 +1166,11 @@ explain (verbose, costs off)
 select sum(q.a), count(q.b) from ft4 left join (select 13, avg(ft1.c1), sum(ft2.c1) from ft1 right join ft2 on (ft1.c1 = ft2.c1)) q(a, b, c) on (ft4.c1 <= q.b);
 select sum(q.a), count(q.b) from ft4 left join (select 13, avg(ft1.c1), sum(ft2.c1) from ft1 right join ft2 on (ft1.c1 = ft2.c1)) q(a, b, c) on (ft4.c1 <= q.b);
 
+-- Eager aggregation: a partially grouped rel must not be joined remotely
+explain (verbose, costs off)
+select t1.c2, sum(t2.c1) from ft1 t1 inner join ft2 t2 on (t1.c2 = t2.c2) where t1.c1 < 20 group by t1.c2 order by 1;
+select t1.c2, sum(t2.c1) from ft1 t1 inner join ft2 t2 on (t1.c2 = t2.c2) where t1.c1 < 20 group by t1.c2 order by 1;
+
 
 -- Not supported cases
 -- Grouping sets
@@ -1610,41 +1592,6 @@ UPDATE ft2 SET c3 = 'bar' WHERE c1 = 1200 RETURNING tableoid::regclass;
 EXPLAIN (verbose, costs off)
 DELETE FROM ft2 WHERE c1 = 1200 RETURNING tableoid::regclass;                       -- can be pushed down
 DELETE FROM ft2 WHERE c1 = 1200 RETURNING tableoid::regclass;
-
--- Test UPDATE FOR PORTION OF
-UPDATE ft8 FOR PORTION OF c4 FROM '2005-01-01' TO '2006-01-01'
-  SET c2 = c2 + 1
-  WHERE c1 = '[1,2)'; -- error
-SELECT * FROM ft8 WHERE c1 = '[1,2)' ORDER BY c1, c4;
-
--- Test DELETE FOR PORTION OF
-DELETE FROM ft8 FOR PORTION OF c4 FROM '2005-01-01' TO '2006-01-01'
-  WHERE c1 = '[2,3)'; -- error
-SELECT * FROM ft8 WHERE c1 = '[2,3)' ORDER BY c1, c4;
-
--- FOR PORTION OF fails if a child partition is a foreign table, even if the
--- root is not. But a child partition that is pruned doesn't cause an error.
-CREATE TABLE fpo_part_parent (
-  c1 int4range NOT NULL,
-  c2 int NOT NULL,
-  c3 text,
-  c4 daterange NOT NULL
-) PARTITION BY LIST (c2);
-CREATE TABLE fpo_part_local PARTITION OF fpo_part_parent FOR VALUES IN (1);
-INSERT INTO fpo_part_local VALUES ('[1,2)', 1, 'one', '[2024-01-01,2024-12-31)');
-CREATE FOREIGN TABLE fpo_part_foreign
-  PARTITION OF fpo_part_parent FOR VALUES IN (6)
-  SERVER loopback OPTIONS (schema_name 'S 1', table_name 'T 5');
-DELETE FROM fpo_part_parent
-  FOR PORTION OF c4 FROM '2001-01-01' TO '2001-02-01' WHERE c2 = 6; -- error
-UPDATE fpo_part_parent
-  FOR PORTION OF c4 FROM '2001-01-01' TO '2001-02-01' SET c3 = 'x' WHERE c2 = 6; -- error
-UPDATE fpo_part_parent
-  FOR PORTION OF c4 FROM '2024-06-01' TO '2024-07-01' SET c3 = 'edited' WHERE c2 = 1; -- okay
-DELETE FROM fpo_part_parent
-  FOR PORTION OF c4 FROM '2024-06-01' TO '2024-06-15' WHERE c2 = 1; -- okay
-SELECT c1, c2, c3, c4 FROM fpo_part_local ORDER BY c4;
-DROP TABLE fpo_part_parent;
 
 -- Test UPDATE/DELETE with RETURNING on a three-table join
 INSERT INTO ft2 (c1,c2,c3)
@@ -4090,6 +4037,16 @@ INSERT INTO result_tbl SELECT * FROM async_pt WHERE b === 505;
 SELECT * FROM result_tbl ORDER BY a;
 DELETE FROM result_tbl;
 
+-- Test ExecAppendAsyncReset code path that drains outstanding async requests
+-- (case where subplans are re-scanned with parameter changes)
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT o.x FROM (VALUES (2505), (3505)) o(x), LATERAL (SELECT a FROM async_pt WHERE a = o.x OR a = 1505 LIMIT 1) s ORDER BY o.x;
+SELECT o.x FROM (VALUES (2505), (3505)) o(x), LATERAL (SELECT a FROM async_pt WHERE a = o.x OR a = 1505 LIMIT 1) s ORDER BY o.x;
+
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT o.x FROM (VALUES (2505), (3505)) o(x), LATERAL (SELECT a FROM async_pt WHERE a = o.x OR (a = 1505 AND o.x = 2505) LIMIT 1) s ORDER BY o.x;
+SELECT o.x FROM (VALUES (2505), (3505)) o(x), LATERAL (SELECT a FROM async_pt WHERE a = o.x OR (a = 1505 AND o.x = 2505) LIMIT 1) s ORDER BY o.x;
+
 -- Test COPY TO when foreign table is partition
 COPY async_pt TO stdout; --error
 
@@ -4329,8 +4286,8 @@ DROP TABLE base_tbl2;
 DROP TABLE result_tbl;
 DROP TABLE join_tbl;
 
--- Test that an asynchronous fetch is processed before restarting the scan in
--- ReScanForeignScan
+-- Test ExecAppendAsyncReset code path that drains outstanding async requests
+-- (case where subplans are re-scanned without parameter changes)
 CREATE TABLE base_tbl (a int, b int);
 INSERT INTO base_tbl VALUES (1, 11), (2, 22), (3, 33);
 CREATE FOREIGN TABLE foreign_tbl (b int)
@@ -4425,6 +4382,8 @@ DROP VIEW my_application_name;
 -- test read-only and/or deferrable transactions
 -- ===================================================================
 CREATE TABLE loct (f1 int, f2 text);
+INSERT INTO loct VALUES (1, 'foo'), (2, 'bar');
+
 CREATE FUNCTION locf() RETURNS SETOF loct LANGUAGE SQL AS
   'UPDATE public.loct SET f2 = f2 || f2 RETURNING *';
 CREATE VIEW locv AS SELECT t.* FROM locf() t;
@@ -4432,7 +4391,6 @@ CREATE FOREIGN TABLE remt (f1 int, f2 text)
   SERVER loopback OPTIONS (table_name 'locv');
 CREATE FOREIGN TABLE remt2 (f1 int, f2 text)
   SERVER loopback2 OPTIONS (table_name 'locv');
-INSERT INTO loct VALUES (1, 'foo'), (2, 'bar');
 
 START TRANSACTION READ ONLY;
 SAVEPOINT s;
@@ -4478,9 +4436,31 @@ SET transaction_read_only = on;
 SELECT * FROM remt2;  -- should fail
 ROLLBACK;
 
+-- Clean up
 DROP FOREIGN TABLE remt;
+DROP FOREIGN TABLE remt2;
+DROP VIEW locv;
+DROP FUNCTION locf();
+
 CREATE FOREIGN TABLE remt (f1 int, f2 text)
   SERVER loopback OPTIONS (table_name 'loct');
+
+CREATE FUNCTION defer_trig_func() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.f2 IS NOT NULL THEN
+    UPDATE public.loct SET f2 = f2 || f2 WHERE f1 = NEW.f1;
+  END IF;
+  RETURN NULL;
+END;
+$$;
+CREATE CONSTRAINT TRIGGER defer_trig AFTER INSERT ON loct
+  DEFERRABLE INITIALLY DEFERRED
+  FOR EACH ROW EXECUTE PROCEDURE defer_trig_func();
+
+START TRANSACTION;
+INSERT INTO remt VALUES (3, 'baz');
+SET TRANSACTION READ ONLY;
+COMMIT;
 
 START TRANSACTION ISOLATION LEVEL SERIALIZABLE READ ONLY;
 SELECT * FROM remt;
@@ -4496,9 +4476,8 @@ COMMIT;
 
 -- Clean up
 DROP FOREIGN TABLE remt;
-DROP FOREIGN TABLE remt2;
-DROP VIEW locv;
-DROP FUNCTION locf();
+DROP TRIGGER defer_trig ON loct;
+DROP FUNCTION defer_trig_func;
 DROP TABLE loct;
 
 -- ===================================================================
@@ -4616,7 +4595,7 @@ CREATE TABLE simport_table (c1 int, c2 text);
 CREATE FOREIGN TABLE simport_ftable (c1 int, c2 text, cx int)
        SERVER loopback OPTIONS (table_name 'simport_table');
 ALTER FOREIGN TABLE simport_ftable ALTER COLUMN cx OPTIONS (ADD column_name 'c1');
-ALTER FOREIGN TABLE simport_ftable OPTIONS (ADD restore_stats 'true');
+ALTER FOREIGN TABLE simport_ftable OPTIONS (ADD import_stats 'true');
 
 ANALYZE simport_ftable;                   -- should fail
 
@@ -4672,15 +4651,30 @@ ANALYZE simport_ftable (c1, c1);          -- should fail
 CREATE VIEW simport_view AS SELECT * FROM simport_table;
 CREATE FOREIGN TABLE simport_fview (c1 int, c2 text)
        SERVER loopback OPTIONS (table_name 'simport_view');
-ALTER FOREIGN TABLE simport_fview OPTIONS (ADD restore_stats 'true');
+ALTER FOREIGN TABLE simport_fview OPTIONS (ADD import_stats 'true');
 
 ANALYZE simport_fview;                    -- should fail
+
+CREATE TABLE simport_pt (c1 int not null, c2 text) PARTITION BY LIST (c1);
+CREATE TABLE simport_p1 PARTITION OF simport_pt FOR VALUES IN (1);
+CREATE TABLE simport_p2 PARTITION OF simport_pt FOR VALUES IN (2);
+CREATE FOREIGN TABLE simport_fpt (c1 int not null, c2 text)
+       SERVER loopback OPTIONS (table_name 'simport_pt');
+INSERT INTO simport_pt VALUES (1, 'foo'), (1, 'foo'), (2, 'bar'), (2, 'bar');
+
+-- Check that we have relpages = 0 for simport_fpt regardless of the method
+ANALYZE simport_fpt;
+SELECT relpages FROM pg_class WHERE oid = 'public.simport_fpt'::regclass;
+ALTER FOREIGN TABLE simport_fpt OPTIONS (ADD import_stats 'true');
+ANALYZE simport_pt;
+ANALYZE VERBOSE simport_fpt;              -- should work
+SELECT relpages FROM pg_class WHERE oid = 'public.simport_fpt'::regclass;
 
 -- This tests build_remattrmap()'s deparsing of column names that include
 -- single quotes or backslashes
 CREATE TABLE dtest_table ("col'quote" int, "col\backslash" int);
 CREATE FOREIGN TABLE dtest_ftable ("col'quote" int, "col\backslash" int)
-       SERVER loopback OPTIONS (table_name 'dtest_table', restore_stats 'true');
+       SERVER loopback OPTIONS (table_name 'dtest_table', import_stats 'true');
 
 INSERT INTO dtest_table SELECT g, g FROM generate_series(1, 10) g;
 ANALYZE dtest_table;
@@ -4720,6 +4714,8 @@ DROP FOREIGN TABLE simport_ftable;
 DROP FOREIGN TABLE simport_fview;
 DROP VIEW simport_view;
 DROP TABLE simport_table;
+DROP FOREIGN TABLE simport_fpt;
+DROP TABLE simport_pt;
 DROP FOREIGN TABLE dtest_ftable;
 DROP TABLE dtest_table;
 

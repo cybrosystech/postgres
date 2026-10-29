@@ -54,12 +54,10 @@ repack_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt,
 	RepackDecodingState *dstate;
 
 	if (!AmRepackWorker())
-		ereport(ERROR,
-				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				errmsg("unsupported use of logical decoding plugin \"%s\"",
-					   "pgrepack"),
-				errdetail("This plugin can only be used by %s.",
-						  "REPACK (CONCURRENTLY)"));
+	{
+		/* StartupDecodingContext() should have caught this case already */
+		elog(FATAL, "unexpected pgrepack startup outside of repack worker");
+	}
 
 	/* Initial setup of our private state */
 	Assert(CurrentMemoryContext == ctx->context);
@@ -183,7 +181,7 @@ repack_process_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 
 /*
  * Write the given tuple, with the given change kind, to the repack spill
- * file.  Later, the repack decoding worker can read these and replay
+ * file.  Later, the repack steering process can read these and replay
  * the operations on the new copy of the table.
  *
  * For each change affecting the table being repacked, we store enough

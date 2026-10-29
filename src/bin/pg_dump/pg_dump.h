@@ -429,7 +429,7 @@ typedef struct _indxInfo
 	int			indnconkeyattrs;	/* leading key attributes that belong to the
 								 * constraint (fewer than indnkeyattrs for a
 								 * DBblue global partition index) */
-	Oid		   *indkeys;		/* In spite of the name 'indkeys' this field
+	int		   *indkeys;		/* In spite of the name 'indkeys' this field
 								 * contains both key and nonkey attributes */
 	bool		indisclustered;
 	bool		indisreplident;
@@ -785,7 +785,8 @@ extern SubscriptionInfo *findSubscriptionByOid(Oid oid);
 extern void recordExtensionMembership(CatalogId catId, ExtensionInfo *ext);
 extern ExtensionInfo *findOwningExtension(CatalogId catalogId);
 
-extern void parseOidArray(const char *str, Oid *array, int arraysize);
+extern Oid *parseOidArray(const char *str, int arraysize);
+extern int *parseIntArray(const char *str, int arraysize);
 
 extern void sortDumpableObjects(DumpableObject **objs, int numObjs,
 								DumpId preBoundaryId, DumpId postBoundaryId);

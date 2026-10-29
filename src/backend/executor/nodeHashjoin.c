@@ -195,10 +195,12 @@
 
 static TupleTableSlot *ExecHashJoinOuterGetTuple(PlanState *outerNode,
 												 HashJoinState *hjstate,
-												 uint32 *hashvalue);
+												 uint32 *hashvalue,
+												 bool *is_null);
 static TupleTableSlot *ExecParallelHashJoinOuterGetTuple(PlanState *outerNode,
 														 HashJoinState *hjstate,
-														 uint32 *hashvalue);
+														 uint32 *hashvalue,
+														 bool *is_null);
 static bool ExecHashJoinNewBatch(HashJoinState *hjstate);
 static bool ExecParallelHashJoinNewBatch(HashJoinState *hjstate);
 static void ExecParallelHashJoinPartitionOuter(HashJoinState *hjstate);
@@ -229,6 +231,7 @@ ExecHashJoinImpl(PlanState *pstate, bool parallel)
 	HashJoinTable hashtable;
 	TupleTableSlot *outerTupleSlot;
 	uint32		hashvalue;
+	bool		is_null;
 	int			batchno;
 	ParallelHashJoinState *parallel_state;
 
@@ -436,10 +439,13 @@ ExecHashJoinImpl(PlanState *pstate, bool parallel)
 				if (parallel)
 					outerTupleSlot =
 						ExecParallelHashJoinOuterGetTuple(outerNode, node,
-														  &hashvalue);
+														  &hashvalue,
+														  &is_null);
 				else
 					outerTupleSlot =
-						ExecHashJoinOuterGetTuple(outerNode, node, &hashvalue);
+						ExecHashJoinOuterGetTuple(outerNode, node,
+												  &hashvalue,
+												  &is_null);
 
 				if (TupIsNull(outerTupleSlot))
 				{
@@ -484,6 +490,16 @@ ExecHashJoinImpl(PlanState *pstate, bool parallel)
 
 				econtext->ecxt_outertuple = outerTupleSlot;
 				node->hj_MatchedOuter = false;
+
+				/*
+				 * If the tuple can't match anything, skip all the tedium and
+				 * go directly to emitting it in null-extended form.
+				 */
+				if (is_null)
+				{
+					node->hj_JoinState = HJ_FILL_OUTER_TUPLE;
+					continue;
+				}
 
 				/*
 				 * Find the corresponding bucket for this tuple in the main
@@ -1100,12 +1116,15 @@ ExecEndHashJoin(HashJoinState *node)
  * Returns a null slot if no more outer tuples (within the current batch).
  *
  * On success, the tuple's hash value is stored at *hashvalue --- this is
- * either originally computed, or re-read from the temp file.
+ * either originally computed, or re-read from the temp file.  Also, we
+ * set *is_null to true if the tuple cannot have any matches due to
+ * containing a null join key (in which case the hashvalue is meaningless).
  */
 static TupleTableSlot *
 ExecHashJoinOuterGetTuple(PlanState *outerNode,
 						  HashJoinState *hjstate,
-						  uint32 *hashvalue)
+						  uint32 *hashvalue,
+						  bool *is_null)
 {
 	HashJoinTable hashtable = hjstate->hj_HashTable;
 	int			curbatch = hashtable->curbatch;
@@ -1125,8 +1144,6 @@ ExecHashJoinOuterGetTuple(PlanState *outerNode,
 
 		while (!TupIsNull(slot))
 		{
-			bool		isnull;
-
 			/*
 			 * We have to compute the tuple's hash value.
 			 */
@@ -1138,9 +1155,9 @@ ExecHashJoinOuterGetTuple(PlanState *outerNode,
 
 			*hashvalue = DatumGetUInt32(ExecEvalExprSwitchContext(hjstate->hj_OuterHash,
 																  econtext,
-																  &isnull));
+																  is_null));
 
-			if (!isnull)
+			if (!*is_null)
 			{
 				/* normal case with a non-null join key */
 				/* remember outer relation is not empty for possible rescan */
@@ -1150,10 +1167,8 @@ ExecHashJoinOuterGetTuple(PlanState *outerNode,
 			}
 			else if (hjstate->hj_KeepNullTuples)
 			{
-				/* null join key, but we must save tuple to be emitted later */
-				if (hjstate->hj_NullOuterTupleStore == NULL)
-					hjstate->hj_NullOuterTupleStore = ExecHashBuildNullTupleStore(hashtable);
-				tuplestore_puttupleslot(hjstate->hj_NullOuterTupleStore, slot);
+				/* null join key, but we must return tuple to be emitted */
+				return slot;
 			}
 
 			/*
@@ -1179,7 +1194,10 @@ ExecHashJoinOuterGetTuple(PlanState *outerNode,
 										 hashvalue,
 										 hjstate->hj_OuterTupleSlot);
 		if (!TupIsNull(slot))
+		{
+			*is_null = false;	/* else it'd not be in the batch file */
 			return slot;
+		}
 	}
 
 	/* End of this batch */
@@ -1192,7 +1210,8 @@ ExecHashJoinOuterGetTuple(PlanState *outerNode,
 static TupleTableSlot *
 ExecParallelHashJoinOuterGetTuple(PlanState *outerNode,
 								  HashJoinState *hjstate,
-								  uint32 *hashvalue)
+								  uint32 *hashvalue,
+								  bool *is_null)
 {
 	HashJoinTable hashtable = hjstate->hj_HashTable;
 	int			curbatch = hashtable->curbatch;
@@ -1209,8 +1228,6 @@ ExecParallelHashJoinOuterGetTuple(PlanState *outerNode,
 
 		while (!TupIsNull(slot))
 		{
-			bool		isnull;
-
 			ExprContext *econtext = hjstate->js.ps.ps_ExprContext;
 
 			econtext->ecxt_outertuple = slot;
@@ -1219,19 +1236,17 @@ ExecParallelHashJoinOuterGetTuple(PlanState *outerNode,
 
 			*hashvalue = DatumGetUInt32(ExecEvalExprSwitchContext(hjstate->hj_OuterHash,
 																  econtext,
-																  &isnull));
+																  is_null));
 
-			if (!isnull)
+			if (!*is_null)
 			{
 				/* normal case with a non-null join key */
 				return slot;
 			}
 			else if (hjstate->hj_KeepNullTuples)
 			{
-				/* null join key, but we must save tuple to be emitted later */
-				if (hjstate->hj_NullOuterTupleStore == NULL)
-					hjstate->hj_NullOuterTupleStore = ExecHashBuildNullTupleStore(hashtable);
-				tuplestore_puttupleslot(hjstate->hj_NullOuterTupleStore, slot);
+				/* null join key, but we must return tuple to be emitted */
+				return slot;
 			}
 
 			/*
@@ -1252,6 +1267,7 @@ ExecParallelHashJoinOuterGetTuple(PlanState *outerNode,
 			ExecForceStoreMinimalTuple(tuple,
 									   hjstate->hj_OuterTupleSlot,
 									   false);
+			*is_null = false;	/* else it'd not be in the batch file */
 			slot = hjstate->hj_OuterTupleSlot;
 			return slot;
 		}
