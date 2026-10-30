@@ -218,6 +218,25 @@ standby_directory_path(const char *dir)
 }
 
 /*
+ * path_shell_unsafe_char
+ *		The first character of path that pg_ctl's shell would act on, or NUL
+ *		if there is none.
+ *
+ * pg_ctl starts postgres through /bin/sh, with the data directory and the
+ * log file in double quotes (see start_postmaster() in pg_ctl.c).  There the
+ * shell still expands $ and `, and \ and " end or escape the quoting, so a
+ * path holding "$(cmd)" runs cmd.  shell_quote() cannot help: pg_ctl gets
+ * the path after our own shell has removed those quotes.
+ */
+static char
+path_shell_unsafe_char(const char *path)
+{
+	const char *p = strpbrk(path, "$`\"\\");
+
+	return p ? *p : '\0';
+}
+
+/*
  * resolve_standby_directory
  *		Return a palloc'd absolute path for the standby data directory.
  */
@@ -236,6 +255,20 @@ resolve_standby_directory(void)
 				(errmsg("dbblue create standby: directory path is too long (exceeds %d bytes)",
 						MAXPGPATH - 32),
 				 errdetail("Path: %s", result)));
+		pfree(result);
+		return NULL;
+	}
+
+	/*
+	 * check_dbblue_standby_directory() refuses this, but the default
+	 * "<DataDir>_standby" never goes through it.
+	 */
+	if (path_shell_unsafe_char(result) != '\0')
+	{
+		ereport(WARNING,
+				(errmsg("dbblue create standby: directory \"%s\" contains the character '%c', which pg_ctl's shell would interpret",
+						result, path_shell_unsafe_char(result)),
+				 errhint("Point dbblue_standby_directory to a path without $, `, \" or \\.")));
 		pfree(result);
 		return NULL;
 	}
@@ -2614,6 +2647,17 @@ run_standby_tick(void)
 
 	logfile = standby_log_path(dir);
 
+	/* pg_ctl -l puts it in double quotes too; it may follow our own log */
+	if (path_shell_unsafe_char(logfile) != '\0')
+	{
+		ereport(WARNING,
+				(errmsg("dbblue create standby: log file \"%s\" contains the character '%c', which pg_ctl's shell would interpret",
+						logfile, path_shell_unsafe_char(logfile))));
+		pfree(logfile);
+		pfree(dir);
+		return false;
+	}
+
 	/* the standby of a directory we no longer use must not hold our slot */
 	if (!retire_previous_standby(dir))
 	{
@@ -2844,6 +2888,14 @@ run_standby_tick(void)
 
 		cmd = psprintf("%s -D %s -l %s -o %s -w -t 60 start",
 					   qbin, qdir, qlog, qopts);
+
+		// for(int i=0; i<strlen(cmd);i++)
+		// {
+		// 	if (cmd[i]=='$')
+		// 	{
+
+		// 	};
+		// };
 		pfree(qopts);
 		pfree(opts);
 		pfree(qlog);
@@ -2914,6 +2966,10 @@ run_standby_tick(void)
  * run_standby_tick() repeats the checks that matter at the time it builds.
  * An empty value, "<DataDir>_standby", is created by pg_basebackup and need
  * not exist.
+ *
+ * A path holding a character pg_ctl's shell would interpret is refused from
+ * every source, the configuration file included: no directory, missing or
+ * not, makes such a value right, and it would run commands as the server.
  */
 bool
 check_dbblue_standby_directory(char **newval, void **extra, GucSource source)
@@ -2922,12 +2978,22 @@ check_dbblue_standby_directory(char **newval, void **extra, GucSource source)
 	struct stat st;
 	bool		empty;
 	bool		ok = false;
+	char		unsafe;
 
 	if (*newval == NULL || (*newval)[0] == '\0')
 		return true;
 
 	/* canonicalize_path never enlarges the string, so modify it in place */
 	canonicalize_path(*newval);
+
+	unsafe = path_shell_unsafe_char(*newval);
+	if (unsafe != '\0')
+	{
+		GUC_check_errdetail("Path \"%s\" contains the character '%c', which pg_ctl's shell would interpret.",
+							*newval, unsafe);
+		GUC_check_errhint("Use a path without $, `, \" or \\.");
+		return false;
+	}
 
 	if (!IsTransactionState())
 		return true;
