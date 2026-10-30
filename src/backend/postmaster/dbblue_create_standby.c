@@ -69,6 +69,7 @@
 #include "access/xlog_internal.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_control.h"
+#include "common/file_perm.h"
 #include "common/file_utils.h"
 #include "lib/stringinfo.h"
 #include "libpq/pqsignal.h"
@@ -378,6 +379,95 @@ standby_dir_is_empty(const char *dir, bool *empty)
 	}
 	closedir(d);
 	return true;
+}
+
+/*
+ * standby_build_marker_path
+ *		"<dir>.building", palloc'd; see mark_standby_build().
+ */
+static char *
+standby_build_marker_path(const char *dir)
+{
+	return psprintf("%s.building", dir);
+}
+
+/*
+ * mark_standby_build
+ *		Record, durably, that a build into dir is under way.  Reports a
+ *		WARNING and returns false if that cannot be done.
+ *
+ * pg_basebackup -C makes our slot before it copies a single file, and a
+ * copy that fails is cleared away after, files and slot; see
+ * run_standby_tick().  But a crash or a SIGKILL -- of the server, of this
+ * worker, or of pg_basebackup -- runs no cleanup.  The next tick would then
+ * find a directory holding part of a cluster, which it must not take for
+ * ours without being told, and refuse it for good, while the slot held back
+ * WAL for a standby that never comes.  The marker tells it.
+ *
+ * It goes next to the directory, as the standby's log may, and not into our
+ * data directory, which pg_basebackup would copy into the standby.
+ */
+static bool
+mark_standby_build(const char *dir)
+{
+	char	   *path = standby_build_marker_path(dir);
+	char		parent[MAXPGPATH];
+	int			fd;
+	bool		ok;
+
+	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY,
+			  pg_file_create_mode);
+	if (fd < 0 || close(fd) != 0)
+	{
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("dbblue create standby: could not create \"%s\": %m",
+						path)));
+		pfree(path);
+		return false;
+	}
+
+	/* it must outlive a crash that the partial copy outlives */
+	strlcpy(parent, dir, sizeof(parent));
+	get_parent_directory(parent);
+	ok = (fsync_fname_ext(path, false, false, WARNING) == 0 &&
+		  fsync_fname_ext(parent, true, false, WARNING) == 0);
+
+	pfree(path);
+	return ok;
+}
+
+/*
+ * unmark_standby_build
+ *		Remove the marker of mark_standby_build(), once the build it marks
+ *		has finished or been cleared away.  Reports a WARNING and returns
+ *		false if that cannot be done.
+ */
+static bool
+unmark_standby_build(const char *dir)
+{
+	char	   *path = standby_build_marker_path(dir);
+	bool		ok;
+
+	ok = (durable_unlink(path, WARNING) == 0);
+	pfree(path);
+	return ok;
+}
+
+/*
+ * standby_build_interrupted
+ *		Did a build into dir begin, and never finish nor get cleared away?
+ */
+static bool
+standby_build_interrupted(const char *dir)
+{
+	char	   *path = standby_build_marker_path(dir);
+	struct stat st;
+	bool		result;
+
+	result = (stat(path, &st) == 0);
+	pfree(path);
+	return result;
 }
 
 /*
@@ -2677,6 +2767,50 @@ run_standby_tick(void)
 	}
 
 	/*
+	 * A build that a crash or kill cut short has left a partial copy, which
+	 * would be refused below as not ours, or as unreadable once it holds
+	 * PG_VERSION, for good.  Clear it away; the build then drops the slot
+	 * that pg_basebackup -C made.  A slot still in use is that pg_basebackup
+	 * still copying, which our crash did not take down: let it finish failing.
+	 */
+	if (standby_build_interrupted(dir))
+	{
+		struct stat st;
+
+		if (standby_slot_state() == STANDBY_SLOT_ACTIVE)
+		{
+			ereport(LOG,
+					(errmsg("dbblue create standby: waiting for replication slot \"%s\" to be released before clearing the interrupted build in \"%s\"",
+							DBBLUE_STANDBY_SLOT, dir)));
+			pfree(logfile);
+			pfree(dir);
+			return true;
+		}
+
+		ereport(LOG,
+				(errmsg("dbblue create standby: clearing \"%s\", left behind by a build that was interrupted",
+						dir)));
+
+		/* the directory itself may be the operator's, with its permissions */
+		if (stat(dir, &st) == 0 && !rmtree(dir, false))
+		{
+			ereport(WARNING,
+					(errmsg("dbblue create standby: could not remove the contents of \"%s\"",
+							dir)));
+			pfree(logfile);
+			pfree(dir);
+			return false;
+		}
+
+		if (!unmark_standby_build(dir))
+		{
+			pfree(logfile);
+			pfree(dir);
+			return false;
+		}
+	}
+
+	/*
 	 * A standby that exists is only fine if it is ours and can still stream.
 	 * Vetting it may also clear it out for a rebuild, below.
 	 */
@@ -2790,10 +2924,19 @@ run_standby_tick(void)
 			return false;
 		}
 
+		/* from here until it is complete, what dir holds is ours */
+		if (!mark_standby_build(dir))
+		{
+			pfree(logfile);
+			pfree(dir);
+			return false;
+		}
+
 		encrypt_wal = primary_uses_wal_encryption();
 		if (encrypt_wal && !seed_standby_tde_dir(dir))
 		{
-			rmtree(dir, false);
+			if (rmtree(dir, false))
+				(void) unmark_standby_build(dir);
 			pfree(logfile);
 			pfree(dir);
 			return false;
@@ -2838,10 +2981,11 @@ run_standby_tick(void)
 			 * pg_basebackup removes what it wrote, but a crash or kill can
 			 * leave a partial copy, and the seeded pg_tde must not survive
 			 * either way.  The directory was empty, or held only our seed,
-			 * when we started, so clearing its contents loses nothing.
+			 * when we started, so clearing its contents loses nothing.  Any
+			 * left over keep the marker, for the next tick to clear.
 			 */
-			if (stat(dir, &st) == 0)
-				rmtree(dir, false);
+			if (stat(dir, &st) != 0 || rmtree(dir, false))
+				(void) unmark_standby_build(dir);
 
 			/*
 			 * -C creates the slot before the copy starts, so a failure after
@@ -2849,6 +2993,13 @@ run_standby_tick(void)
 			 * does not exist.
 			 */
 			(void) drop_standby_slot(logfile);
+			pfree(logfile);
+			pfree(dir);
+			return false;
+		}
+
+		if (!unmark_standby_build(dir))
+		{
 			pfree(logfile);
 			pfree(dir);
 			return false;
