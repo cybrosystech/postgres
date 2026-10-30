@@ -13,8 +13,9 @@
  *      once there is room for it on disk; see standby_has_room().
  *   2. A free TCP port is picked by probing PostPortNumber+1, +2, ...
  *      and written, along with the primary's unix_socket_directories,
- *      hot_standby_feedback = on, dbblue_create_standby = off and a
- *      log_filename of its own, to the standby's postgresql.auto.conf.
+ *      hot_standby_feedback = on, dbblue_create_standby = off, an empty
+ *      dbblue_standby_directory and a log_filename of its own, to the
+ *      standby's postgresql.auto.conf.
  *   3. The standby is started with pg_ctl on the primary's configuration
  *      files (which need not live in the copied data directory), and the
  *      chosen port is reported in the server log and written to
@@ -1156,6 +1157,13 @@ standby_log_filename(void)
  * Whether a promoted standby should get a replica is for the operator to
  * decide, with ALTER SYSTEM.
  *
+ * dbblue_standby_directory is reset.  The copied value, when set, names the
+ * directory the standby was built in: its own data directory.  A parallel
+ * worker restores it inside a transaction, where
+ * check_dbblue_standby_directory() refuses exactly that, so every parallel
+ * query on the standby would fail.  Reset, it names "<its DataDir>_standby",
+ * a sibling, which is also what a promoted standby should build into.
+ *
  * log_filename is ours, but with "standby-" before its last component when
  * our log_directory is an absolute path.  With the logging collector on, the
  * standby, sharing our postgresql.conf, then writes into the same directory
@@ -1244,6 +1252,7 @@ write_standby_settings(const char *dir, int port)
 			conf_line_sets(line, "unix_socket_directories") ||
 			conf_line_sets(line, "hot_standby_feedback") ||
 			conf_line_sets(line, "dbblue_create_standby") ||
+			conf_line_sets(line, "dbblue_standby_directory") ||
 			conf_line_sets(line, "log_filename"))
 			keep = false;
 		else if (conf_line_sets(line, "primary_conninfo"))
@@ -1266,6 +1275,7 @@ write_standby_settings(const char *dir, int port)
 					   Unix_socket_directories ? Unix_socket_directories : "");
 	appendStringInfoString(&buf, "hot_standby_feedback = on\n");
 	appendStringInfoString(&buf, "dbblue_create_standby = off\n");
+	appendStringInfoString(&buf, "dbblue_standby_directory = ''\n");
 
 	logname = standby_log_filename();
 	append_conf_string(&buf, "log_filename", logname);
