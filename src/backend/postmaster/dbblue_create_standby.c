@@ -14,7 +14,8 @@
  *   2. A free TCP port is picked by probing PostPortNumber+1, +2, ...
  *      and written, along with the primary's unix_socket_directories,
  *      hot_standby_feedback = on, dbblue_create_standby = off, an empty
- *      dbblue_standby_directory and a log_filename of its own, to the
+ *      dbblue_standby_directory, a log_filename of its own and half of the
+ *      primary's shared_buffers, work_mem and effective_cache_size, to the
  *      standby's postgresql.auto.conf.
  *   3. The standby is started with pg_ctl on the primary's configuration
  *      files (which need not live in the copied data directory), and the
@@ -75,6 +76,7 @@
 #include "lib/stringinfo.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
+#include "optimizer/optimizer.h"
 #include "pgstat.h"
 #include "postmaster/bgworker.h"
 #include "postmaster/dbblue_create_standby.h"
@@ -1320,6 +1322,18 @@ standby_log_filename(void)
 }
 
 /*
+ * standby_memory_kb
+ *		The standby's value, in kB, of a memory setting that is primary_kb for
+ *		us: half of ours, but not below stock_kb, PostgreSQL's default, unless
+ *		ours is lower still; see write_standby_settings().
+ */
+static int64
+standby_memory_kb(int64 primary_kb, int64 stock_kb)
+{
+	return Max(primary_kb / 2, Min(primary_kb, stock_kb));
+}
+
+/*
  * write_standby_settings
  *		Rewrite the standby's postgresql.auto.conf -- our own copy, which
  *		pg_basebackup -R then appended primary_conninfo and primary_slot_name
@@ -1360,6 +1374,22 @@ standby_log_filename(void)
  * writing.  A relative log_directory is inside each one's data directory,
  * and needs no telling apart.  It is set either way, to the value we use now,
  * so as not to keep one set for an earlier log_directory.
+ *
+ * shared_buffers, work_mem and effective_cache_size are half of ours, but
+ * not below PostgreSQL's defaults unless ours are lower still.  Ours were
+ * sized, by auto-tune or by hand, for one server on the whole machine, and
+ * the standby got them with our postgresql.conf: the pair would ask for
+ * twice that, on an auto-tuned host half of RAM in shared buffers alone
+ * before any query's memory, and risk the OOM killer once Odoo's reports
+ * run on both.  Half still lets those reports sort and hash in memory, and
+ * unlike max_connections and the rest below, no memory setting has to be as
+ * high as ours for a standby to start.  They follow ours as they are when
+ * the standby starts; set on the standby with ALTER SYSTEM, they are
+ * overwritten at its next start, as port is.  maintenance_work_mem is left
+ * alone, as VACUUM and index builds do not run on a standby, and so is
+ * huge_pages: an operator who set it to on, with vm.nr_hugepages sized for
+ * us alone, has to make room for the standby too.  Promoted, the standby
+ * keeps these halves until they are changed with ALTER SYSTEM.
  *
  * Only the last primary_conninfo and primary_slot_name are kept, which are
  * the ones -R just appended.  Any earlier ones came with the copy -- we were
@@ -1441,7 +1471,10 @@ write_standby_settings(const char *dir, int port)
 			conf_line_sets(line, "hot_standby_feedback") ||
 			conf_line_sets(line, "dbblue_create_standby") ||
 			conf_line_sets(line, "dbblue_standby_directory") ||
-			conf_line_sets(line, "log_filename"))
+			conf_line_sets(line, "log_filename") ||
+			conf_line_sets(line, "shared_buffers") ||
+			conf_line_sets(line, "work_mem") ||
+			conf_line_sets(line, "effective_cache_size"))
 			keep = false;
 		else if (conf_line_sets(line, "primary_conninfo"))
 			keep = (line == last_conninfo);
@@ -1468,6 +1501,15 @@ write_standby_settings(const char *dir, int port)
 	logname = standby_log_filename();
 	append_conf_string(&buf, "log_filename", logname);
 	pfree(logname);
+
+	appendStringInfo(&buf, "shared_buffers = " INT64_FORMAT "kB\n",
+					 standby_memory_kb((int64) NBuffers * (BLCKSZ / 1024),
+									   128 * 1024));
+	appendStringInfo(&buf, "work_mem = " INT64_FORMAT "kB\n",
+					 standby_memory_kb(work_mem, 4 * 1024));
+	appendStringInfo(&buf, "effective_cache_size = " INT64_FORMAT "kB\n",
+					 standby_memory_kb((int64) effective_cache_size * (BLCKSZ / 1024),
+									   4 * 1024 * 1024));
 
 	fp = fopen(tmppath, "w");
 	if (fp == NULL)
