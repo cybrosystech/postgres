@@ -605,16 +605,13 @@ conninfo_value(const char *conninfo, const char *keyword)
 }
 
 /*
- * standby_primary_conninfo
- *		The primary_conninfo of the standby in dir, as its postgresql.auto.conf
- *		sets it, palloc'd, or NULL if that file does not set it or cannot be
- *		read.
- *
- * pg_basebackup -R writes it there, and the standby's postgresql.conf, which
- * is ours (see standby_server_opts()), does not set it.
+ * standby_conf_value
+ *		The value the postgresql.auto.conf of the standby in dir gives name,
+ *		the last one if it gives several, palloc'd, or NULL if that file does
+ *		not set it or cannot be read.
  */
 static char *
-standby_primary_conninfo(const char *dir)
+standby_conf_value(const char *dir, const char *name)
 {
 	char		path[MAXPGPATH];
 	FILE	   *fp;
@@ -633,7 +630,7 @@ standby_primary_conninfo(const char *dir)
 		for (ConfigVariable *item = head; item != NULL; item = item->next)
 		{
 			if (item->name == NULL || item->ignore ||
-				pg_strcasecmp(item->name, "primary_conninfo") != 0)
+				pg_strcasecmp(item->name, name) != 0)
 				continue;
 			if (result)
 				pfree(result);
@@ -644,6 +641,44 @@ standby_primary_conninfo(const char *dir)
 	FreeConfigVariables(head);
 	FreeFile(fp);
 	return result;
+}
+
+/*
+ * standby_primary_conninfo
+ *		The primary_conninfo of the standby in dir, as its postgresql.auto.conf
+ *		sets it, palloc'd, or NULL if that file does not set it or cannot be
+ *		read.
+ *
+ * pg_basebackup -R writes it there, and the standby's postgresql.conf, which
+ * is ours (see standby_server_opts()), does not set it.
+ */
+static char *
+standby_primary_conninfo(const char *dir)
+{
+	return standby_conf_value(dir, "primary_conninfo");
+}
+
+/*
+ * standby_previous_port
+ *		The port the standby in dir was last started on, as
+ *		write_standby_settings() left it in its postgresql.auto.conf, or -1.
+ */
+static int
+standby_previous_port(const char *dir)
+{
+	char	   *value = standby_conf_value(dir, "port");
+	int			port = -1;
+
+	if (value != NULL)
+	{
+		char	   *end;
+		long		v = strtol(value, &end, 10);
+
+		if (end != value && *end == '\0' && v > 0 && v <= 65535)
+			port = (int) v;
+		pfree(value);
+	}
+	return port;
 }
 
 /*
@@ -1126,24 +1161,75 @@ socket_port_in_use(int port)
 }
 
 /*
+ * port_is_free
+ *		Is port free both over TCP on the loopback interface and for the Unix
+ *		socket in each of our socket directories?
+ *
+ * The probe sets SO_REUSEADDR, as the postmaster does on its own sockets.
+ * Without it, the connections a standby closed as it stopped hold its port
+ * in TIME_WAIT for a minute, the port looks taken although the standby could
+ * bind it, and a standby restarted within that minute -- by the next tick,
+ * that is -- moves to another port, where Odoo's db_replica_port no longer
+ * finds it.  A port that something listens on is refused all the same.
+ */
+static bool
+port_is_free(int port)
+{
+	int			sock;
+	int			one = 1;
+	struct sockaddr_in addr;
+	bool		free_port;
+
+	sock = socket(AF_INET, SOCK_STREAM, 0);
+	if (sock < 0)
+	{
+		ereport(DEBUG2,
+				(errmsg("dbblue create standby: socket creation failed for port %d: %m",
+						port)));
+		return false;
+	}
+	(void) setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (char *) &one,
+					  sizeof(one));
+
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	addr.sin_port = htons((uint16) port);
+
+	free_port = (bind(sock, (struct sockaddr *) &addr, sizeof(addr)) == 0);
+	close(sock);
+
+	if (free_port && socket_port_in_use(port))
+	{
+		ereport(LOG,
+				(errmsg("dbblue create standby: port %d is free over TCP, but another server holds its Unix socket; trying another port",
+						port)));
+		free_port = false;
+	}
+
+	return free_port;
+}
+
+/*
  * find_free_port
- *		Return the first port, starting just above the primary's own, that is
- *		free both over TCP on the loopback interface and for the Unix socket
- *		in each of our socket directories, or -1.
+ *		Return preferred if it is one of ours to use and free, or else the
+ *		first free port starting just above the primary's own, or -1.  See
+ *		port_is_free().
  */
 static int
-find_free_port(void)
+find_free_port(int preferred)
 {
 	int			port;
+
+	if (preferred > PostPortNumber &&
+		preferred <= PostPortNumber + DBBLUE_STANDBY_PORT_ATTEMPTS &&
+		preferred <= 65535 && port_is_free(preferred))
+		return preferred;
 
 	for (port = PostPortNumber + 1;
 		 port <= PostPortNumber + DBBLUE_STANDBY_PORT_ATTEMPTS;
 		 port++)
 	{
-		int			sock;
-		struct sockaddr_in addr;
-		bool		free_port;
-
 		/*
 		 * Validate port is within valid TCP port range (1-65535).
 		 * Prevents integer overflow when casting to uint16.
@@ -1156,32 +1242,7 @@ find_free_port(void)
 			return -1;
 		}
 
-		sock = socket(AF_INET, SOCK_STREAM, 0);
-		if (sock < 0)
-		{
-			ereport(DEBUG2,
-					(errmsg("dbblue create standby: socket creation failed for port %d: %m",
-							port)));
-			continue;	/* Try next port */
-		}
-
-		memset(&addr, 0, sizeof(addr));
-		addr.sin_family = AF_INET;
-		addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-		addr.sin_port = htons((uint16) port);
-
-		free_port = (bind(sock, (struct sockaddr *) &addr, sizeof(addr)) == 0);
-		close(sock);
-
-		if (free_port && socket_port_in_use(port))
-		{
-			ereport(LOG,
-					(errmsg("dbblue create standby: port %d is free over TCP, but another server holds its Unix socket; trying the next port",
-							port)));
-			free_port = false;
-		}
-
-		if (free_port)
+		if (port != preferred && port_is_free(port))
 			return port;
 	}
 
@@ -3073,8 +3134,13 @@ run_standby_tick(void)
 	 * Something may still take it before the standby binds it.  No probe
 	 * can rule that out, as the port is free until somebody binds it; the
 	 * standby then fails to start, and the next tick picks another port.
+	 *
+	 * The port it was last started on comes first, so that it keeps it
+	 * across restarts: Odoo's db_replica_port is usually set once, by hand.
+	 * A fresh copy still carries our own postgresql.auto.conf, whose port,
+	 * if it sets one, is ours and is passed over.
 	 */
-	port = find_free_port();
+	port = find_free_port(standby_previous_port(dir));
 	if (port < 0)
 	{
 		ereport(WARNING,
