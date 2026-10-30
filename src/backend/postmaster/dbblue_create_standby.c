@@ -981,9 +981,17 @@ seed_standby_tde_dir(const char *dir)
 
 /*
  * standby_is_running
- *		True if dir/postmaster.pid names a live process.  Same heuristic
- *		pg_ctl status uses; a stale pidfile whose PID was recycled can give
- *		a false positive, which only delays a restart by one tick.
+ *		True if dir/postmaster.pid names a live process running in dir.
+ *
+ * A standby that died hard -- power loss, SIGKILL, the OOM killer -- leaves
+ * its postmaster.pid behind, and after a reboot its PID may belong to another
+ * process of ours: the primary itself, one of its backends, or another
+ * cluster's postmaster.  A live PID alone would then pass for the standby,
+ * which would never be restarted, and stop_standby() would have pg_ctl send
+ * its shutdown signal to that process.  So on Linux the process must also be
+ * working in dir, as a postmaster is in its data directory from before it
+ * writes postmaster.pid.  Elsewhere a live PID is all we check, as pg_ctl
+ * status does.
  */
 static bool
 standby_is_running(const char *dir)
@@ -1000,7 +1008,35 @@ standby_is_running(const char *dir)
 		pid = 0;
 	fclose(fp);
 
-	return (pid > 1 && kill((pid_t) pid, 0) == 0);
+	if (pid <= 1 || kill((pid_t) pid, 0) != 0)
+		return false;
+
+#ifdef __linux__
+	{
+		char		proc[64];
+		char		cwd[MAXPGPATH];
+		char	   *real;
+		ssize_t		len;
+		bool		same;
+
+		snprintf(proc, sizeof(proc), "/proc/%ld/cwd", pid);
+		len = readlink(proc, cwd, sizeof(cwd) - 1);
+		if (len < 0)
+			return false;
+		cwd[len] = '\0';
+
+		/* /proc shows the path with symbolic links resolved */
+		real = realpath(dir, NULL);
+		if (real == NULL)
+			return false;
+		same = (strcmp(cwd, real) == 0);
+		free(real);
+		if (!same)
+			return false;
+	}
+#endif
+
+	return true;
 }
 
 /*
@@ -3061,6 +3097,35 @@ run_standby_tick(void)
 	 * there is none to report: tooling must not be sent to the old one.
 	 */
 	forget_standby_port();
+
+	/*
+	 * A standby that died hard has left its postmaster.pid, and if its PID
+	 * now belongs to another process, the standby refuses to start: "lock
+	 * file already exists".  standby_is_running() has just told it is not
+	 * the standby's, so remove it.
+	 */
+	{
+		char		pidfile[MAXPGPATH];
+		struct stat pst;
+
+		snprintf(pidfile, sizeof(pidfile), "%s/postmaster.pid", dir);
+		if (stat(pidfile, &pst) == 0 && !standby_is_running(dir))
+		{
+			ereport(LOG,
+					(errmsg("dbblue create standby: removing stale \"%s\", left by a standby that did not shut down cleanly",
+							pidfile)));
+			if (unlink(pidfile) != 0)
+			{
+				ereport(WARNING,
+						(errcode_for_file_access(),
+						 errmsg("dbblue create standby: could not remove \"%s\": %m",
+								pidfile)));
+				pfree(logfile);
+				pfree(dir);
+				return false;
+			}
+		}
+	}
 
 	resolve_bin_path("pg_ctl", binpath, sizeof(binpath));
 	qbin = shell_quote(binpath);
