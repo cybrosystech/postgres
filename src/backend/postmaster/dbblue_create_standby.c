@@ -2896,6 +2896,29 @@ run_standby_tick(void)
 		}
 
 		/*
+		 * The slot the build makes keeps every WAL file the standby has not
+		 * received.  Without a limit, a standby that stops streaming keeps
+		 * them until our disk is full and we stop, and the slot is never
+		 * invalidated, so vet_existing_standby() never rebuilds it either.
+		 * initdb's auto-tune sets one; a cluster made without it, or before
+		 * it did, gets none.  So none is built without a limit.  A standby
+		 * built already is left running: it is what keeps the slot drained.
+		 */
+		if (max_slot_wal_keep_size_mb < 0)
+		{
+			ereport(WARNING,
+					(errmsg("dbblue create standby: not building a standby in \"%s\", as max_slot_wal_keep_size is -1",
+							dir),
+					 errdetail("Replication slot \"%s\" would then retain WAL without limit whenever the standby stops streaming, until the disk is full and this server stops.",
+							   DBBLUE_STANDBY_SLOT),
+					 errhint("Set a limit, such as twice max_wal_size: ALTER SYSTEM SET max_slot_wal_keep_size = '%" PRId64 "MB'; SELECT pg_reload_conf();",
+							 (int64) max_wal_size_mb * 2)));
+			pfree(logfile);
+			pfree(dir);
+			return false;
+		}
+
+		/*
 		 * With pg_tde WAL encryption on, the walsender hands pg_basebackup
 		 * plaintext WAL while the copied pg_tde/wal_keys says that range is
 		 * encrypted.  Without -E the standby's own WAL from the copy window
@@ -3275,9 +3298,10 @@ check_dbblue_standby_user(char **newval, void **extra, GucSource source)
  * initdb's auto-tune sets a limit, but a cluster made without it, or before
  * it did so, has PostgreSQL's default of -1.  A standby that stops streaming
  * then holds back WAL until the disk fills and the primary stops, and as the
- * slot is never invalidated, vet_existing_standby() never rebuilds it.  It is
- * only a warning: some run without a limit on purpose, watching disk space
- * by other means.
+ * slot is never invalidated, vet_existing_standby() never rebuilds it.  No
+ * standby is built without a limit (see run_standby_tick()); one built
+ * before the limit was lifted gets only this warning, as stopping it would
+ * not drain the slot.
  */
 static void
 warn_unlimited_slot_wal(void)
