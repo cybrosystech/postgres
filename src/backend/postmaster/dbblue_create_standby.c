@@ -64,6 +64,7 @@
 #include <sys/statvfs.h>
 #include <unistd.h>
 
+#include "access/parallel.h"
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
@@ -3216,6 +3217,12 @@ run_standby_tick(void)
  * An empty value, "<DataDir>_standby", is created by pg_basebackup and need
  * not exist.
  *
+ * Nor is it checked in a parallel worker, which restores the leader's value
+ * inside a transaction.  The leader already holds that value, and the
+ * directory may have changed since it was accepted -- removed to have the
+ * standby rebuilt, or half-filled by a build under way -- and the worker,
+ * and with it the leader's query, would then fail.
+ *
  * A path holding a character pg_ctl's shell would interpret is refused from
  * every source, the configuration file included: no directory, missing or
  * not, makes such a value right, and it would run commands as the server.
@@ -3244,7 +3251,7 @@ check_dbblue_standby_directory(char **newval, void **extra, GucSource source)
 		return false;
 	}
 
-	if (!IsTransactionState())
+	if (!IsTransactionState() || InitializingParallelWorker)
 		return true;
 
 	dir = standby_directory_path(*newval);
@@ -3305,6 +3312,10 @@ check_dbblue_standby_directory(char **newval, void **extra, GucSource source)
  * read from the configuration file is taken on faith, and a bad one shows up
  * as a pg_basebackup failure.  So does a pg_hba.conf that lets the role in
  * only with a password, which no check short of connecting can tell.
+ *
+ * A parallel worker restoring the leader's value is not checked either: the
+ * role may have been dropped or lost LOGIN since the value was accepted, and
+ * every parallel query would then fail.
  */
 bool
 check_dbblue_standby_user(char **newval, void **extra, GucSource source)
@@ -3324,7 +3335,8 @@ check_dbblue_standby_user(char **newval, void **extra, GucSource source)
 		return false;
 	}
 
-	if (!IsTransactionState() || !OidIsValid(MyDatabaseId))
+	if (!IsTransactionState() || !OidIsValid(MyDatabaseId) ||
+		InitializingParallelWorker)
 		return true;
 
 	roletup = SearchSysCache1(AUTHNAME, CStringGetDatum(*newval));
