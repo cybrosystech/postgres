@@ -28,9 +28,9 @@
  * standby is still usable: if our replication slot has been invalidated or
  * is gone, the standby can never catch up and is rebuilt; if the directory holds a
  * promoted copy of us or a different cluster altogether, it is left alone,
- * and neither started nor reported.  The standby is left
- * running when the primary shuts down — it remains usable for read-only
- * traffic and simply resumes streaming when the primary returns.
+ * and neither started nor reported.  The standby is shut down along with the
+ * primary, cleanly, and started again when the primary returns; see
+ * stop_standby_at_shutdown().
  *
  * Set to paused, the worker stops the standby but keeps its slot, so that it
  * resumes streaming when turned on again; set to off, it also drops the
@@ -121,6 +121,14 @@ char	   *dbblue_standby_user = NULL;
  */
 #define DBBLUE_STANDBY_SLOT_RELEASE_MS	5000L
 #define DBBLUE_STANDBY_SLOT_POLL_MS		100L
+
+/*
+ * How long stop_standby_at_shutdown() waits for the standby to finish its
+ * shutdown restartpoint, as pg_ctl stop does by default, and how often it
+ * looks.
+ */
+#define DBBLUE_STANDBY_STOP_WAIT_MS		60000L
+#define DBBLUE_STANDBY_STOP_POLL_MS		100L
 
 /*
  * How many lines of a failed command's output run_shell() quotes, how long
@@ -3504,6 +3512,99 @@ warn_unlimited_slot_wal(void)
 }
 
 /*
+ * stop_standby_at_shutdown
+ *		Shut our standby down, cleanly, as this server shuts down.
+ *
+ * We start the standby, so under systemd it runs in our unit's control group,
+ * and whatever systemd does to what is left there when we stop, it does to
+ * the standby: dbblue@.service (KillMode=mixed) SIGKILLs it once our
+ * postmaster has exited, so that it goes through crash recovery at its next
+ * start; Debian's postgresql@.service sends it SIGTERM, a smart shutdown that
+ * waits for every read-only session of Odoo's to end, and holds up the stop
+ * of our unit as long.  Without systemd, nothing stopped it at all.  So the
+ * standby is stopped here, the same way every time, with a fast shutdown as
+ * pg_ctl -m fast would request, before our postmaster can exit; and the next
+ * startup's tick starts it again.
+ *
+ * pg_ctl itself cannot be run, as run_shell() starts nothing once shutdown
+ * has been requested.  standby_is_running() has vouched for the PID in the
+ * standby's postmaster.pid, so we signal that process ourselves, and wait for
+ * the file to go, as pg_ctl does.  Only a standby we run with
+ * dbblue_create_standby on is stopped: one we set aside, or that is not ours,
+ * is left as it is.  An immediate shutdown or a crash of ours does not come
+ * here, and leaves the standby to systemd.
+ */
+static void
+stop_standby_at_shutdown(void)
+{
+	char	   *dir;
+	char		path[MAXPGPATH];
+	FILE	   *fp;
+	long		pid = 0;
+	uint64		their_sysid = 0;
+	long		waited = 0;
+
+	if (standby_mode_applied != DBBLUE_STANDBY_ON)
+		return;
+
+	/* the directory we last ran a standby in; see retire_previous_standby() */
+	dir = previous_standby_directory();
+	if (dir == NULL)
+		return;
+
+	if (!standby_has_data(dir) || !standby_is_running(dir) ||
+		standby_identity(dir, &their_sysid) != STANDBY_OURS)
+	{
+		pfree(dir);
+		return;
+	}
+
+	snprintf(path, sizeof(path), "%s/postmaster.pid", dir);
+	fp = fopen(path, "r");
+	if (fp != NULL)
+	{
+		if (fscanf(fp, "%ld", &pid) != 1)
+			pid = 0;
+		fclose(fp);
+	}
+	if (pid <= 1)
+	{
+		pfree(dir);
+		return;
+	}
+
+	/* tooling must stop sending it reads before it goes away */
+	forget_standby_port();
+
+	ereport(LOG,
+			(errmsg("dbblue create standby: shutting down the standby in \"%s\" along with this server",
+					dir)));
+
+	if (kill((pid_t) pid, SIGINT) != 0)
+	{
+		ereport(WARNING,
+				(errmsg("dbblue create standby: could not send the shutdown signal to the standby (PID %ld): %m",
+						pid)));
+		pfree(dir);
+		return;
+	}
+
+	while (standby_is_running(dir) && waited < DBBLUE_STANDBY_STOP_WAIT_MS)
+	{
+		pg_usleep(DBBLUE_STANDBY_STOP_POLL_MS * 1000L);
+		waited += DBBLUE_STANDBY_STOP_POLL_MS;
+	}
+
+	if (standby_is_running(dir))
+		ereport(WARNING,
+				(errmsg("dbblue create standby: the standby in \"%s\" did not shut down within %ld seconds",
+						dir, DBBLUE_STANDBY_STOP_WAIT_MS / 1000),
+				 errhint("It goes on shutting down, but a service manager may kill it once this server has stopped.")));
+
+	pfree(dir);
+}
+
+/*
  * DbblueCreateStandbyMain
  *		Entry point for the dbblue create standby background worker.
  */
@@ -3589,6 +3690,8 @@ DbblueCreateStandbyMain(Datum main_arg)
 		if (rc & WL_POSTMASTER_DEATH)
 			proc_exit(1);
 	}
+
+	stop_standby_at_shutdown();
 
 	ereport(LOG, (errmsg("dbblue create standby worker shutting down")));
 	proc_exit(0);
