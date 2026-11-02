@@ -14,9 +14,12 @@
  *   2. A free TCP port is picked by probing PostPortNumber+1, +2, ...
  *      and written, along with the primary's unix_socket_directories,
  *      hot_standby_feedback = on, dbblue_create_standby = off, an empty
- *      dbblue_standby_directory, a log_filename of its own and half of the
- *      primary's shared_buffers, work_mem and effective_cache_size, to the
- *      standby's postgresql.auto.conf.
+ *      dbblue_standby_directory, a log_filename of its own, half of the
+ *      primary's shared_buffers, work_mem and effective_cache_size, and the
+ *      settings a hot standby must have at least as high as its primary
+ *      (max_connections and four more), to the standby's
+ *      postgresql.auto.conf.  A running standby that has fallen short of
+ *      those is restarted with them; see standby_limits_behind().
  *   3. The standby is started with pg_ctl on the primary's configuration
  *      files (which need not live in the copied data directory), and the
  *      chosen port is reported in the server log and written to
@@ -66,6 +69,7 @@
 #include <unistd.h>
 
 #include "access/parallel.h"
+#include "access/twophase.h"
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
@@ -85,9 +89,11 @@
 #include "postmaster/postmaster.h"
 #include "postmaster/syslogger.h"
 #include "replication/slot.h"
+#include "replication/walsender.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
+#include "storage/lock.h"
 #include "utils/builtins.h"
 #include "utils/conffiles.h"
 #include "utils/guc.h"
@@ -482,19 +488,18 @@ standby_build_interrupted(const char *dir)
 }
 
 /*
- * read_system_identifier
- *		Read the system identifier from dir's pg_control.  Reports a WARNING
- *		and returns false if that cannot be done.
+ * read_control_file
+ *		Read dir's pg_control into *control.  Reports a WARNING and returns
+ *		false if that cannot be done.
  *
  * get_controlfile() would do, but raises an ERROR on any problem, which
  * would cost us the worker rather than one tick.  Like its frontend flavor,
  * retry on a bad CRC: the standby may be rewriting the file as we read it.
  */
 static bool
-read_system_identifier(const char *dir, uint64 *sysid)
+read_control_file(const char *dir, ControlFileData *control)
 {
 	char		path[MAXPGPATH];
-	ControlFileData control;
 	pg_crc32c	crc;
 
 	snprintf(path, sizeof(path), "%s/%s", dir, XLOG_CONTROL_FILE);
@@ -513,9 +518,9 @@ read_system_identifier(const char *dir, uint64 *sysid)
 							path)));
 			return false;
 		}
-		nread = read(fd, &control, sizeof(control));
+		nread = read(fd, control, sizeof(*control));
 		close(fd);
-		if (nread != sizeof(control))
+		if (nread != sizeof(*control))
 		{
 			ereport(WARNING,
 					(errmsg("dbblue create standby: could not read \"%s\"",
@@ -524,13 +529,10 @@ read_system_identifier(const char *dir, uint64 *sysid)
 		}
 
 		INIT_CRC32C(crc);
-		COMP_CRC32C(crc, &control, offsetof(ControlFileData, crc));
+		COMP_CRC32C(crc, control, offsetof(ControlFileData, crc));
 		FIN_CRC32C(crc);
-		if (EQ_CRC32C(crc, control.crc))
-		{
-			*sysid = control.system_identifier;
+		if (EQ_CRC32C(crc, control->crc))
 			return true;
-		}
 
 		pg_usleep(10000L);
 	}
@@ -539,6 +541,22 @@ read_system_identifier(const char *dir, uint64 *sysid)
 			(errmsg("dbblue create standby: \"%s\" has an invalid checksum",
 					path)));
 	return false;
+}
+
+/*
+ * read_system_identifier
+ *		Read the system identifier from dir's pg_control.  Reports a WARNING
+ *		and returns false if that cannot be done.
+ */
+static bool
+read_system_identifier(const char *dir, uint64 *sysid)
+{
+	ControlFileData control;
+
+	if (!read_control_file(dir, &control))
+		return false;
+	*sysid = control.system_identifier;
+	return true;
 }
 
 /*
@@ -1342,6 +1360,144 @@ standby_memory_kb(int64 primary_kb, int64 stock_kb)
 }
 
 /*
+ * The settings a hot standby must have at least as high as the primary whose
+ * WAL it replays.  Lower, it pauses replay at the first WAL that records the
+ * primary's values, and once restarted refuses to start at all; see
+ * CheckRequiredParameterValues().  standby_limit_values() fills an array in
+ * this order.
+ */
+static const char *const standby_limit_names[] = {
+	"max_connections",
+	"max_worker_processes",
+	"max_wal_senders",
+	"max_prepared_transactions",
+	"max_locks_per_transaction",
+};
+
+#define NUM_STANDBY_LIMITS	lengthof(standby_limit_names)
+
+/*
+ * conf_line_sets_limit
+ *		Does this postgresql.auto.conf line assign one of standby_limit_names?
+ */
+static bool
+conf_line_sets_limit(const char *line)
+{
+	for (int i = 0; i < NUM_STANDBY_LIMITS; i++)
+	{
+		if (conf_line_sets(line, standby_limit_names[i]))
+			return true;
+	}
+	return false;
+}
+
+/*
+ * standby_limit_values
+ *		Fill values, in the order of standby_limit_names, with what the
+ *		standby in dir must run with.
+ *
+ * That is the larger of our own live value, which is what we record in WAL
+ * for it to replay, and the value its pg_control holds, which is ours as of
+ * the WAL it has replayed so far.  Ours alone would do but after we have
+ * lowered a setting: the standby may still have WAL from before to replay,
+ * and must start with what we had then.  If its pg_control cannot be read,
+ * ours are used, after a WARNING.
+ */
+static void
+standby_limit_values(const char *dir, int *values)
+{
+	ControlFileData control;
+
+	values[0] = MaxConnections;
+	values[1] = max_worker_processes;
+	values[2] = max_wal_senders;
+	values[3] = max_prepared_xacts;
+	values[4] = max_locks_per_xact;
+
+	if (read_control_file(dir, &control))
+	{
+		values[0] = Max(values[0], control.MaxConnections);
+		values[1] = Max(values[1], control.max_worker_processes);
+		values[2] = Max(values[2], control.max_wal_senders);
+		values[3] = Max(values[3], control.max_prepared_xacts);
+		values[4] = Max(values[4], control.max_locks_per_xact);
+	}
+}
+
+/*
+ * standby_limit_setting
+ *		The value the postgresql.auto.conf of the standby in dir gives the
+ *		setting name, or -1 if it gives none, or none that is a number.
+ */
+static long
+standby_limit_setting(const char *dir, const char *name)
+{
+	char	   *value = standby_conf_value(dir, name);
+	long		result = -1;
+
+	if (value != NULL)
+	{
+		char	   *end;
+		long		v = strtol(value, &end, 10);
+
+		if (end != value && *end == '\0' && v >= 0)
+			result = v;
+		pfree(value);
+	}
+	return result;
+}
+
+/*
+ * standby_limits_behind
+ *		Does the running standby in dir run with less than it needs of one of
+ *		standby_limit_names?  If so, say so: run_standby_tick() then restarts
+ *		it, and write_standby_settings() gives it what it needs.
+ *
+ * A standby is normally started after us, as stop_standby_at_shutdown()
+ * stops it along with us, and so gets our values as they are now.  But one
+ * that kept running -- through a crash or an immediate shutdown of ours, a
+ * crash of this worker, or the upgrade that brought this check -- still has
+ * those it was started with.  If we have since come back with higher ones,
+ * it pauses replay at the first WAL we write, and serves ever staler reads
+ * with no error; restarted later for any reason, it refuses to start at all.
+ *
+ * What it runs with is what write_standby_settings() put in its
+ * postgresql.auto.conf before it started.  A standby started before this
+ * worker set these there has none of them, and what it runs with cannot be
+ * told; it is restarted once, to take them over.
+ */
+static bool
+standby_limits_behind(const char *dir)
+{
+	int			needed[NUM_STANDBY_LIMITS];
+
+	standby_limit_values(dir, needed);
+
+	for (int i = 0; i < NUM_STANDBY_LIMITS; i++)
+	{
+		long		running = standby_limit_setting(dir, standby_limit_names[i]);
+
+		if (running < 0)
+		{
+			ereport(LOG,
+					(errmsg("dbblue create standby: restarting the standby in \"%s\" to set its %s, which must be at least %d",
+							dir, standby_limit_names[i], needed[i]),
+					 errdetail("A hot standby must have this setting at least as high as the primary whose WAL it replays.")));
+			return true;
+		}
+		if (running < needed[i])
+		{
+			ereport(WARNING,
+					(errmsg("dbblue create standby: restarting the standby in \"%s\", which runs with %s = %ld but needs %d",
+							dir, standby_limit_names[i], running, needed[i]),
+					 errdetail("This server now runs with a higher value. Until the standby has it too, it cannot replay this server's WAL.")));
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
  * write_standby_settings
  *		Rewrite the standby's postgresql.auto.conf -- our own copy, which
  *		pg_basebackup -R then appended primary_conninfo and primary_slot_name
@@ -1399,6 +1555,15 @@ standby_memory_kb(int64 primary_kb, int64 stock_kb)
  * us alone, has to make room for the standby too.  Promoted, the standby
  * keeps these halves until they are changed with ALTER SYSTEM.
  *
+ * max_connections, max_worker_processes, max_wal_senders,
+ * max_prepared_transactions and max_locks_per_transaction are set to what
+ * standby_limit_values() works out, at least ours.  A hot standby with less
+ * pauses replay at the first WAL of ours that records more, and refuses to
+ * start at all once restarted.  Sharing our postgresql.conf does not keep them
+ * in step: the copy of our postgresql.auto.conf the standby was built with
+ * holds them as they were then, and overrides it, and an ALTER SYSTEM of ours
+ * since never reaches the standby.  A value raised here is reported.
+ *
  * Only the last primary_conninfo and primary_slot_name are kept, which are
  * the ones -R just appended.  Any earlier ones came with the copy -- we were
  * a standby once ourselves, and promoted -- and point at our old primary.
@@ -1406,8 +1571,7 @@ standby_memory_kb(int64 primary_kb, int64 stock_kb)
  * pile up one more pair with every link of a chain of promotions.
  *
  * Everything else is kept.  The standby needs settings such as
- * pg_tde.wal_encrypt and default_table_access_method to stay encrypted, and
- * max_connections and friends at least as high as ours to start at all.
+ * pg_tde.wal_encrypt and default_table_access_method to stay encrypted.
  *
  * This runs before every start, not just after the build, so it drops
  * earlier assignments of what it sets instead of adding to them.
@@ -1426,9 +1590,15 @@ write_standby_settings(const char *dir, int port)
 	const char *last_conninfo = NULL;
 	const char *last_slot_name = NULL;
 	char	   *logname;
+	int			limits[NUM_STANDBY_LIMITS];
+	long		previous[NUM_STANDBY_LIMITS];
 
 	snprintf(path, sizeof(path), "%s/postgresql.auto.conf", dir);
 	snprintf(tmppath, sizeof(tmppath), "%s.tmp", path);
+
+	standby_limit_values(dir, limits);
+	for (int i = 0; i < NUM_STANDBY_LIMITS; i++)
+		previous[i] = standby_limit_setting(dir, standby_limit_names[i]);
 
 	initStringInfo(&old);
 	initStringInfo(&buf);
@@ -1482,7 +1652,8 @@ write_standby_settings(const char *dir, int port)
 			conf_line_sets(line, "log_filename") ||
 			conf_line_sets(line, "shared_buffers") ||
 			conf_line_sets(line, "work_mem") ||
-			conf_line_sets(line, "effective_cache_size"))
+			conf_line_sets(line, "effective_cache_size") ||
+			conf_line_sets_limit(line))
 			keep = false;
 		else if (conf_line_sets(line, "primary_conninfo"))
 			keep = (line == last_conninfo);
@@ -1518,6 +1689,8 @@ write_standby_settings(const char *dir, int port)
 	appendStringInfo(&buf, "effective_cache_size = " INT64_FORMAT "kB\n",
 					 standby_memory_kb((int64) effective_cache_size * (BLCKSZ / 1024),
 									   4 * 1024 * 1024));
+	for (int i = 0; i < NUM_STANDBY_LIMITS; i++)
+		appendStringInfo(&buf, "%s = %d\n", standby_limit_names[i], limits[i]);
 
 	fp = fopen(tmppath, "w");
 	if (fp == NULL)
@@ -1550,6 +1723,14 @@ write_standby_settings(const char *dir, int port)
 						tmppath, path)));
 		unlink(tmppath);
 		return false;
+	}
+
+	for (int i = 0; i < NUM_STANDBY_LIMITS; i++)
+	{
+		if (previous[i] >= 0 && previous[i] < limits[i])
+			ereport(LOG,
+					(errmsg("dbblue create standby: raising the standby's %s from %ld to %d, to match this server",
+							standby_limit_names[i], previous[i], limits[i])));
 	}
 	return true;
 }
@@ -2111,10 +2292,12 @@ replication_conn_opts(void)
  * configuration files only where initdb leaves them, inside it.  Debian's
  * pg_createcluster moves them to /etc/postgresql/<version>/<cluster>, and
  * a standby started on the bare copy fails for want of postgresql.conf.  So
- * the standby is pointed at our own files, which also keeps the settings it
- * must match, such as max_connections, in step with ours.  What it sets
- * differently, port and the like, is in its postgresql.auto.conf, which
- * overrides postgresql.conf; see write_standby_settings().
+ * the standby is pointed at our own files.  What it sets differently, port
+ * and the like, is in its postgresql.auto.conf, which overrides
+ * postgresql.conf; see write_standby_settings().  That includes the settings
+ * it must have at least as high as ours, such as max_connections: our files
+ * alone do not keep those in step, as an ALTER SYSTEM of ours lands in our
+ * postgresql.auto.conf, not in its own.
  *
  * Such a postgresql.conf names our data directory in data_directory, and our
  * PID file in external_pid_file.  Both are overridden here, as options on the
@@ -2971,14 +3154,26 @@ run_standby_tick(void)
 
 	/*
 	 * Nothing to do while the standby postmaster is alive, but to make sure
-	 * its port is reported.
+	 * its port is reported -- unless it runs with less than it needs of a
+	 * setting it must have at least as high as ours.  It is then stopped, and
+	 * started again below with what it needs; see standby_limits_behind().
 	 */
 	if (standby_is_running(dir))
 	{
-		sync_standby_port(dir);
-		pfree(logfile);
-		pfree(dir);
-		return true;
+		if (!standby_limits_behind(dir))
+		{
+			sync_standby_port(dir);
+			pfree(logfile);
+			pfree(dir);
+			return true;
+		}
+
+		if (!stop_standby(dir, logfile))
+		{
+			pfree(logfile);
+			pfree(dir);
+			return false;
+		}
 	}
 
 	/* Building or starting it, from here on, needs its parent directory. */
