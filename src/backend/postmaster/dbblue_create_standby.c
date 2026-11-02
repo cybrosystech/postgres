@@ -10,7 +10,8 @@
  *      "<DataDir>_standby") does not exist yet, it is created with
  *      pg_basebackup -R against the local primary, together with the
  *      physical replication slot "dbblue_standby" it streams through --
- *      once there is room for it on disk; see standby_has_room().
+ *      once there is room for it on disk; see standby_has_room().  A
+ *      cluster with tablespaces gets none; see standby_copyable().
  *   2. A free TCP port is picked by probing PostPortNumber+1, +2, ...
  *      and written, along with the primary's unix_socket_directories,
  *      hot_standby_feedback = on, dbblue_create_standby = off, an empty
@@ -198,6 +199,9 @@ static bool slot_wal_limit_warned = false;
  */
 static TimestampTz space_recheck_at = 0;
 static bool space_short_warned = false;
+
+/* Whether standby_copyable() has spoken since the last reload. */
+static bool tablespace_warned = false;
 
 /*
  * The dbblue_create_standby value last acted on, -1 for none yet; paused
@@ -2979,6 +2983,60 @@ standby_has_room(const char *dir)
 }
 
 /*
+ * standby_copyable
+ *		Check that pg_basebackup can copy this cluster to a standby on this
+ *		host at all.  Returns false, having warned about it, if not.
+ *
+ * It cannot if we have a tablespace.  In plain format, pg_basebackup writes
+ * each one to the directory it has here, unless told otherwise with -T, and
+ * on the same host that is our own: it finds it not empty and gives up.  Not
+ * before -c fast has forced a checkpoint on us, though, and the failure would
+ * be retried until we give up too, a checkpoint each time, with a hint to fix
+ * what cannot be fixed.  So we say why once, until the tablespaces are gone or
+ * the configuration is reloaded, and build the standby once they are gone.
+ * If pg_tblspc cannot be read, the copy goes ahead, as it did before.
+ */
+static bool
+standby_copyable(void)
+{
+	char		path[MAXPGPATH];
+	DIR		   *d;
+	struct dirent *de;
+	bool		none = true;
+
+	snprintf(path, sizeof(path), "%s/%s", DataDir, PG_TBLSPC_DIR);
+	d = opendir(path);
+	if (d == NULL)
+		return true;
+
+	while ((de = readdir(d)) != NULL)
+	{
+		if (strcmp(de->d_name, ".") != 0 && strcmp(de->d_name, "..") != 0)
+		{
+			none = false;
+			break;
+		}
+	}
+	closedir(d);
+
+	if (none)
+	{
+		tablespace_warned = false;
+		return true;
+	}
+
+	if (!tablespace_warned)
+	{
+		ereport(WARNING,
+				(errmsg("dbblue create standby: cannot build a standby of this server, as it has tablespaces"),
+				 errdetail("pg_basebackup would write each tablespace to the directory it has on this server, which is in use by this server."),
+				 errhint("Move what those tablespaces hold to pg_default and drop them, or set up the standby by hand.")));
+		tablespace_warned = true;
+	}
+	return false;
+}
+
+/*
  * set_standby_aside
  *		Act on dbblue_create_standby = paused, or off if drop_slot: stop our
  *		standby, stop reporting its port, and if off, drop our replication
@@ -3270,6 +3328,14 @@ run_standby_tick(void)
 		 * once we have recycled it.  -E re-encrypts that WAL with a fresh
 		 * key and writes a matching wal_keys, but needs pg_tde seeded first.
 		 */
+		/* a copy that cannot succeed would force checkpoints; see there */
+		if (!standby_copyable())
+		{
+			pfree(logfile);
+			pfree(dir);
+			return true;
+		}
+
 		/* a copy that fills the disk would take us down; see there */
 		if (!standby_has_room(dir))
 		{
@@ -3829,6 +3895,8 @@ DbblueCreateStandbyMain(Datum main_arg)
 			/* and look for disk space for the standby again at once */
 			space_recheck_at = 0;
 			space_short_warned = false;
+			/* and say again why a cluster with tablespaces gets none */
+			tablespace_warned = false;
 		}
 
 		/*
