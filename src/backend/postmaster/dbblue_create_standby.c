@@ -40,7 +40,9 @@
  * stop_standby_at_shutdown().
  *
  * Set to paused, the worker stops the standby but keeps its slot, so that it
- * resumes streaming when turned on again; set to off, it also drops the
+ * resumes streaming when turned on again -- keeping the WAL, but not the
+ * xmin the standby fed it, which would stop VACUUM from removing any row
+ * since; see release_idle_slot_xmin().  Set to off, it also drops the
  * slot, which would otherwise hold back WAL for a standby not coming back,
  * and the standby is rebuilt if turned on again.  Its files are left in
  * place either way; see set_standby_aside().
@@ -232,6 +234,14 @@ static bool tablespace_warned = false;
 static XLogRecPtr standby_last_apply = InvalidXLogRecPtr;
 static XLogRecPtr standby_last_flush = InvalidXLogRecPtr;
 static TimestampTz standby_stalled_since = 0;
+
+/*
+ * Whether the standby run_standby_tick() last saw running is fenced, and
+ * since when our slot has had no standby streaming from it, or 0; see
+ * release_idle_slot_xmin().
+ */
+static bool standby_running_fenced = false;
+static TimestampTz slot_idle_since = 0;
 
 /*
  * The dbblue_create_standby value last acted on, -1 for none yet; paused
@@ -2415,6 +2425,109 @@ standby_slot_state(void)
 }
 
 /*
+ * clear_standby_slot_xmin
+ *		Make our replication slot stop holding back VACUUM, keeping the WAL it
+ *		holds.  If only_idle, only while no standby streams from it.  Returns
+ *		true if it held something back until now.
+ *
+ * With hot_standby_feedback, the standby has the walsender put the oldest
+ * xmin its queries need into the slot, and VACUUM leaves every row newer
+ * than that.  Only feedback from the standby changes it again: a standby
+ * that is stopped, cannot connect, or runs fenced, without hot standby,
+ * sends none, and the slot keeps the last xmin it was given until it is
+ * invalidated, after max_slot_wal_keep_size of WAL.  On a quiet Odoo
+ * database that may be weeks, with no dead row removed meanwhile.  No SQL
+ * function clears it, so it is cleared here as the walsender would on
+ * feedback without an xmin.  restart_lsn is left alone, so the standby can
+ * resume streaming where it stopped; its first feedback then sets the xmin
+ * again.
+ *
+ * ReplicationSlotAcquire() would raise an ERROR, and cost us the worker, if
+ * the standby took the slot at the same time.  Holding the control lock
+ * exclusively keeps it from doing so instead.  The slot is marked dirty, so
+ * the next checkpoint saves it; after a crash before that, it is cleared
+ * again at the next tick.
+ */
+static bool
+clear_standby_slot_xmin(bool only_idle)
+{
+	ReplicationSlot *slot;
+	bool		cleared = false;
+
+	LWLockAcquire(ReplicationSlotControlLock, LW_EXCLUSIVE);
+	slot = SearchNamedReplicationSlot(DBBLUE_STANDBY_SLOT, false);
+	if (slot != NULL)
+	{
+		SpinLockAcquire(&slot->mutex);
+		if ((!only_idle || slot->active_proc == INVALID_PROC_NUMBER) &&
+			(TransactionIdIsValid(slot->data.xmin) ||
+			 TransactionIdIsValid(slot->data.catalog_xmin)))
+		{
+			slot->data.xmin = InvalidTransactionId;
+			slot->effective_xmin = InvalidTransactionId;
+			slot->data.catalog_xmin = InvalidTransactionId;
+			slot->effective_catalog_xmin = InvalidTransactionId;
+			slot->just_dirtied = true;
+			slot->dirty = true;
+			cleared = true;
+		}
+		SpinLockRelease(&slot->mutex);
+	}
+	LWLockRelease(ReplicationSlotControlLock);
+
+	if (cleared)
+		ReplicationSlotsComputeRequiredXmin(false);
+	return cleared;
+}
+
+/*
+ * release_idle_slot_xmin
+ *		Once no standby has fed our slot an xmin for DBBLUE_STANDBY_STALL_MS,
+ *		have it stop holding back VACUUM; see clear_standby_slot_xmin().
+ *
+ * That is when the slot has had no standby streaming from it for that long:
+ * dbblue_create_standby paused, the standby stopped or failing to start, or
+ * unable to connect.  Or at once when the standby is fenced, as it then
+ * sends no feedback at all.  Either way no query on it can need those rows
+ * any more: one not connected for that long has been fenced as well, see
+ * standby_fence_changes(), and refuses queries.
+ *
+ * Called every tick while dbblue_create_standby is on or paused, whether or
+ * not the standby itself is looked after, so also once paused or given up.
+ */
+static void
+release_idle_slot_xmin(void)
+{
+	StandbySlotState state = standby_slot_state();
+	TimestampTz now = GetCurrentTimestamp();
+
+	if (state != STANDBY_SLOT_IDLE)
+		slot_idle_since = 0;
+
+	if (state == STANDBY_SLOT_ACTIVE && standby_running_fenced)
+	{
+		if (clear_standby_slot_xmin(false))
+			ereport(LOG,
+					(errmsg("dbblue create standby: replication slot \"%s\" no longer holds back VACUUM on this server, as its standby refuses connections",
+							DBBLUE_STANDBY_SLOT)));
+		return;
+	}
+
+	if (state != STANDBY_SLOT_IDLE)
+		return;
+
+	if (slot_idle_since == 0)
+		slot_idle_since = now;
+	if (TimestampDifferenceExceeds(slot_idle_since, now,
+								   DBBLUE_STANDBY_STALL_MS) &&
+		clear_standby_slot_xmin(true))
+		ereport(LOG,
+				(errmsg("dbblue create standby: replication slot \"%s\" no longer holds back VACUUM on this server, as no standby has streamed from it for %ld seconds",
+						DBBLUE_STANDBY_SLOT, DBBLUE_STANDBY_STALL_MS / 1000),
+				 errdetail("It still keeps the WAL the standby needs to resume streaming.")));
+}
+
+/*
  * standby_apply_lsn
  *		Set *apply to how far the standby streaming from our slot has
  *		replayed, as it last told the walsender serving it: invalid until its
@@ -2912,7 +3025,9 @@ retire_previous_standby(const char *dir)
  * A directory that is not our standby is not ours to delete, whatever it
  * holds: a different cluster may be the last copy of a primary that is gone,
  * and a promoted one is somebody's primary now.  We neither start nor report
- * either, which would send read-only traffic to the wrong server.
+ * either, which would send read-only traffic to the wrong server.  Our slot
+ * is dropped once our standby has been promoted, though: nothing will stream
+ * from it again, and it would hold back WAL until max_slot_wal_keep_size.
  */
 static bool
 vet_existing_standby(const char *dir, const char *logfile)
@@ -2931,6 +3046,8 @@ vet_existing_standby(const char *dir, const char *logfile)
 					 errdetail("It has been promoted, and is now a primary in its own right; this server may be the old primary of that failover."),
 					 errhint("If this server is to stay the primary, remove \"%s\" to have a new standby built. Otherwise turn dbblue_create_standby off here, and make this server a standby of the new primary.",
 							 dir)));
+			/* a primary never streams from us; the slot would only hold back */
+			(void) drop_standby_slot(logfile);
 			return false;
 		case STANDBY_FOREIGN:
 			forget_standby_port();
@@ -3276,6 +3393,7 @@ set_standby_aside(bool drop_slot)
 
 	/* tooling must stop sending it reads before it goes away */
 	forget_standby_port();
+	standby_running_fenced = false;
 
 	if (dir != NULL && standby_has_data(dir) && standby_is_running(dir) &&
 		standby_identity(dir, &their_sysid) == STANDBY_OURS)
@@ -3423,6 +3541,7 @@ run_standby_tick(void)
 
 		if (!refence && !standby_limits_behind(dir))
 		{
+			standby_running_fenced = fenced;
 			if (!fenced)
 				sync_standby_port(dir);
 			pfree(logfile);
@@ -3780,6 +3899,9 @@ run_standby_tick(void)
 		ereport(LOG,
 				(errmsg("dbblue create standby: standby in \"%s\" is still starting; its port will be reported once it accepts connections",
 						dir)));
+
+	if (ok)
+		standby_running_fenced = fenced;
 
 	if (ok && fenced)
 		ereport(LOG,
@@ -4162,6 +4284,10 @@ DbblueCreateStandbyMain(Datum main_arg)
 								 errhint("Fix the underlying problem, then reload the configuration (SELECT pg_reload_conf()) to retry.")));
 				}
 			}
+
+			/* even once paused or given up, as the slot then holds back VACUUM */
+			if (dbblue_create_standby != DBBLUE_STANDBY_OFF)
+				release_idle_slot_xmin();
 		}
 
 		rc = WaitLatch(MyLatch,
