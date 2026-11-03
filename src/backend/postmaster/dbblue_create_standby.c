@@ -3557,6 +3557,8 @@ retire_previous_standby(const char *dir)
  * the standby, whose primary_slot_name still names it, can never connect;
  * nor is there anything left to keep the WAL it would need to catch up.
  * Everything it holds is also here, so nothing is lost by building it again.
+ * Unless it cannot be built again, as max_slot_wal_keep_size is -1: it is
+ * then only stopped, and kept until a limit is set.
  *
  * A directory that is not our standby is not ours to delete, whatever it
  * holds: a different cluster may be the last copy of a primary that is gone,
@@ -3571,6 +3573,7 @@ static bool
 vet_existing_standby(const char *dir, const char *logfile)
 {
 	uint64		their_sysid = 0;
+	StandbySlotState slot_state;
 
 	switch (standby_identity(dir, &their_sysid))
 	{
@@ -3641,20 +3644,49 @@ vet_existing_standby(const char *dir, const char *logfile)
 			return false;
 	}
 
-	switch (standby_slot_state())
+	slot_state = standby_slot_state();
+	if (slot_state == STANDBY_SLOT_IDLE || slot_state == STANDBY_SLOT_ACTIVE)
+		return true;
+
+	/* it cannot stream from us any more, so none is to read from it */
+	forget_standby_port();
+
+	/*
+	 * Nor could a new one be built while slots may hold back WAL without
+	 * limit; see run_standby_tick().  Deleted now, the standby would be gone
+	 * with none to take its place.  Its files are kept until a limit is set,
+	 * and it is stopped meanwhile: it no longer receives anything, and would
+	 * serve ever staler reads.
+	 */
+	if (max_slot_wal_keep_size_mb < 0)
+	{
+		ereport(WARNING,
+				(errmsg("dbblue create standby: not rebuilding the standby in \"%s\", as max_slot_wal_keep_size is -1",
+						dir),
+				 slot_state == STANDBY_SLOT_INVALIDATED ?
+				 errdetail("Replication slot \"%s\" has been invalidated, so the standby can no longer stream. It is stopped, and its files are kept until a limit is set.",
+						   DBBLUE_STANDBY_SLOT) :
+				 errdetail("Replication slot \"%s\" does not exist, so the standby can no longer stream. It is stopped, and its files are kept until a limit is set.",
+						   DBBLUE_STANDBY_SLOT),
+				 errhint("Set a limit, such as twice max_wal_size: ALTER SYSTEM SET max_slot_wal_keep_size = '%" PRId64 "MB'; SELECT pg_reload_conf();",
+						 (int64) max_wal_size_mb * 2)));
+		(void) stop_standby(dir, logfile);
+		return false;
+	}
+
+	switch (slot_state)
 	{
 		case STANDBY_SLOT_IDLE:
 		case STANDBY_SLOT_ACTIVE:
-			return true;
+			/* returned above */
+			break;
 		case STANDBY_SLOT_INVALIDATED:
-			forget_standby_port();
 			ereport(WARNING,
 					(errmsg("dbblue create standby: replication slot \"%s\" has been invalidated, rebuilding the standby in \"%s\"",
 							DBBLUE_STANDBY_SLOT, dir),
 					 errdetail("The standby fell more than max_slot_wal_keep_size behind, and the WAL it still needed has been removed.")));
 			break;
 		case STANDBY_SLOT_ABSENT:
-			forget_standby_port();
 			ereport(LOG,
 					(errmsg("dbblue create standby: replication slot \"%s\" does not exist, rebuilding the standby in \"%s\"",
 							DBBLUE_STANDBY_SLOT, dir),
@@ -4194,6 +4226,8 @@ run_standby_tick(void)
 		 * initdb's auto-tune sets one; a cluster made without it, or before
 		 * it did, gets none.  So none is built without a limit.  A standby
 		 * built already is left running: it is what keeps the slot drained.
+		 * One that can no longer stream, its slot gone or invalidated, is
+		 * not deleted either; see vet_existing_standby().
 		 */
 		if (max_slot_wal_keep_size_mb < 0)
 		{
