@@ -4,7 +4,9 @@
  *	  dbblue Create Standby background worker.
  *
  * When dbblue_create_standby is on, this worker provisions and starts a
- * streaming-replication standby of the running cluster on the same host:
+ * streaming-replication standby of the running cluster on the same host
+ * (a build that is turned off, paused or pointed elsewhere while it copies
+ * is stopped at once; see run_command()):
  *
  *   1. If the standby data directory (dbblue_standby_directory, default
  *      "<DataDir>_standby") does not exist yet, it is created with
@@ -73,6 +75,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "access/parallel.h"
@@ -129,6 +132,13 @@ char	   *dbblue_standby_user = NULL;
 
 /* How often to look again for disk space to build the standby in. */
 #define DBBLUE_STANDBY_SPACE_RECHECK_MS	60000L
+
+/*
+ * How often run_command() looks whether its command has exited, and how long
+ * it waits for one it has asked to stop before killing it outright.
+ */
+#define DBBLUE_STANDBY_COMMAND_POLL_MS	100L
+#define DBBLUE_STANDBY_COMMAND_KILL_MS	5000L
 
 /*
  * How long the running standby may go without streaming or replaying our WAL
@@ -203,6 +213,15 @@ typedef enum
 	STANDBY_UNREADABLE,			/* cannot tell; pg_control unreadable */
 } StandbyIdentity;
 
+/* How a command we ran ended; see run_command(). */
+typedef enum
+{
+	COMMAND_OK,
+	COMMAND_FAILED,				/* exited non-zero, or could not be run */
+	COMMAND_INTERRUPTED,		/* stopped for our shutdown */
+	COMMAND_CANCELLED,			/* stopped as no longer wanted */
+} CommandResult;
+
 /* How the running standby keeps up with us; see standby_replication(). */
 typedef enum
 {
@@ -247,6 +266,12 @@ static TimestampTz slot_idle_since = 0;
 
 /* Whether we have reloaded our configuration, but not the standby's yet. */
 static bool standby_reload_pending = false;
+
+/*
+ * The process group of the command run_command() waits for, or 0, for
+ * signal handlers and exit callbacks to pass our end on to; see there.
+ */
+static volatile pid_t command_pgid = 0;
 
 /*
  * The dbblue_create_standby value last acted on, -1 for none yet; paused
@@ -2278,32 +2303,129 @@ command_output_excerpt(const char *logfile, off_t start)
 }
 
 /*
- * run_shell
- *		Run a command via system(), appending its output to logfile.
- *		Returns true on exit status 0.
+ * apply_config_reload
+ *		Reload our configuration, and start afresh what depends on it.
+ *
+ * Done in the main loop, and by run_command() during a build, which must
+ * know at once whether the standby it copies is still wanted.
+ */
+static void
+apply_config_reload(void)
+{
+	ConfigReloadPending = false;
+	ProcessConfigFile(PGC_SIGHUP);
+	/* give a hand-fixed setup a fresh set of attempts */
+	consecutive_failures = 0;
+	/* and repeat the warning if the limit is still missing */
+	slot_wal_limit_warned = false;
+	/* and look for disk space for the standby again at once */
+	space_recheck_at = 0;
+	space_short_warned = false;
+	/* and say again why a cluster with tablespaces gets none */
+	tablespace_warned = false;
+	/* and have the standby, which shares our files, reload too */
+	standby_reload_pending = true;
+}
+
+/*
+ * standby_build_wanted
+ *		Is a standby still to be built in dir, as the configuration now says?
+ */
+static bool
+standby_build_wanted(const char *dir)
+{
+	char	   *now;
+	bool		same;
+
+	if (dbblue_create_standby != DBBLUE_STANDBY_ON || RecoveryInProgress())
+		return false;
+
+	/* one that cannot be used any more says why itself */
+	now = resolve_standby_directory();
+	if (now == NULL)
+		return false;
+	same = (strcmp(now, dir) == 0);
+	pfree(now);
+	return same;
+}
+
+/*
+ * standby_command_quickdie
+ *		SIGQUIT handler: take the command we wait for down with us.
+ *
+ * The postmaster sends SIGQUIT to our process group, which the command is not
+ * in; see run_command().  Only async-signal-safe calls, as in
+ * SignalHandlerForCrashExit(), whose _exit(2) this keeps.
+ */
+static void
+standby_command_quickdie(SIGNAL_ARGS)
+{
+	if (command_pgid > 0)
+		(void) kill(-command_pgid, SIGQUIT);
+	_exit(2);
+}
+
+/*
+ * standby_command_atexit
+ *		before_shmem_exit callback: do not leave the command we wait for
+ *		running when we exit some other way, an ERROR for one.
+ */
+static void
+standby_command_atexit(int code, Datum arg)
+{
+	if (command_pgid > 0)
+		(void) kill(-command_pgid, SIGTERM);
+	command_pgid = 0;
+}
+
+/*
+ * run_command
+ *		Run a command through the shell, appending its output to logfile, and
+ *		wait for it.  If build_dir is given, it builds the standby there, and
+ *		is stopped once a reload no longer wants one built there.
  *
  * On failure, the warning quotes what the command said about it, so that
  * the reason -- a role that does not exist, a pg_hba.conf that refuses it,
  * a full disk -- shows in the server log, and not only in logfile.
  *
- * Once shutdown has been requested, nothing new is started, and false is
- * returned.  The postmaster cannot finish shutting down until we exit.  It
- * signals our whole process group, so a command already running when the
- * shutdown begins is killed along with us; but one started after that is
- * never signalled, and would run to completion, a whole base backup perhaps,
- * with the shutdown waiting on it.
+ * system() would block us until the command is done: a base backup of a
+ * large Odoo database takes hours, through which a reload turning
+ * dbblue_create_standby off or paused, or pointing dbblue_standby_directory
+ * elsewhere, would only be seen once the copy was complete -- and the
+ * standby then started anyway.  It also ignores SIGQUIT in us meanwhile, so
+ * that a crash of the postmaster went unnoticed until we were killed.  So the
+ * command is forked off, and we wait on our latch instead, waking to look
+ * whether it has exited, and for reloads and shutdown.
+ *
+ * It runs in a process group of its own, so that whatever it starts can be
+ * signalled with it: pg_basebackup stops the child that streams its WAL only
+ * from an atexit handler, which a signal does not run.  The postmaster's
+ * signals to our process group no longer reach it, so we pass them on: our
+ * shutdown as SIGTERM, here; a crash as SIGQUIT, in
+ * standby_command_quickdie(); our own exit, in standby_command_atexit().  A
+ * command asked to stop that is still there after
+ * DBBLUE_STANDBY_COMMAND_KILL_MS is killed.  pg_ctl start puts the standby
+ * in a session of its own, so it is not stopped with pg_ctl.
+ *
+ * Once shutdown has been requested, nothing new is started.  The postmaster
+ * cannot finish shutting down until we exit, and would wait for the command.
  */
-static bool
-run_shell(const char *cmd, const char *logfile, const char *what)
+static CommandResult
+run_command(const char *cmd, const char *logfile, const char *what,
+			const char *build_dir)
 {
 	char	   *full;
 	char	   *qlog;
-	int			rc;
+	int			rc = 0;
 	struct stat st;
 	off_t		logsize;
+	pid_t		pid;
+	CommandResult stopped = COMMAND_OK;
+	TimestampTz kill_at = 0;
+	bool		killed = false;
 
 	if (ShutdownRequestPending)
-		return false;
+		return COMMAND_INTERRUPTED;
 
 	qlog = shell_quote(logfile);
 	full = psprintf("%s >> %s 2>&1", cmd, qlog);
@@ -2312,19 +2434,128 @@ run_shell(const char *cmd, const char *logfile, const char *what)
 	logsize = file_size(logfile);
 
 	fflush(NULL);
+	pid = fork();
+	if (pid < 0)
+	{
+		ereport(WARNING,
+				(errmsg("dbblue create standby: could not fork to run %s: %m",
+						what)));
+		pfree(qlog);
+		pfree(full);
+		return COMMAND_FAILED;
+	}
+	if (pid == 0)
+	{
+		const int	sigs[] = {SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGPIPE,
+		SIGALRM, SIGUSR1, SIGUSR2, SIGCHLD, SIGFPE};
+		sigset_t	none;
+
+		(void) setpgid(0, 0);
+
+		/* what we ignore or block is not the command's to inherit */
+		for (int i = 0; i < lengthof(sigs); i++)
+			(void) signal(sigs[i], SIG_DFL);
+		sigemptyset(&none);
+		(void) sigprocmask(SIG_SETMASK, &none, NULL);
+
+		execl("/bin/sh", "sh", "-c", full, (char *) NULL);
+		_exit(127);
+	}
+
+	/* also here, so that it is in place before we may signal the group */
+	(void) setpgid(pid, pid);
+	command_pgid = pid;
+
 	pgstat_report_wait_start(WAIT_EVENT_DBBLUE_CREATE_STANDBY_MAIN);
-	rc = system(full);
+	for (;;)
+	{
+		pid_t		w = waitpid(pid, &rc, WNOHANG);
+		int			wrc;
+
+		if (w == pid)
+			break;
+		if (w < 0 && errno != EINTR)
+		{
+			rc = -1;
+			break;
+		}
+
+		if (stopped == COMMAND_OK)
+		{
+			if (ShutdownRequestPending)
+				stopped = COMMAND_INTERRUPTED;
+			else if (build_dir != NULL && ConfigReloadPending)
+			{
+				apply_config_reload();
+				if (!standby_build_wanted(build_dir))
+				{
+					stopped = COMMAND_CANCELLED;
+					if (dbblue_create_standby != DBBLUE_STANDBY_ON)
+						ereport(LOG,
+								(errmsg("dbblue create standby: stopping %s, as dbblue_create_standby is now %s",
+										what,
+										GetConfigOption("dbblue_create_standby", false, false))));
+					else
+						ereport(LOG,
+								(errmsg("dbblue create standby: stopping %s, as dbblue_standby_directory no longer names \"%s\"",
+										what, build_dir)));
+				}
+			}
+
+			if (stopped != COMMAND_OK)
+			{
+				(void) kill(-pid, SIGTERM);
+				kill_at = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+													  DBBLUE_STANDBY_COMMAND_KILL_MS);
+			}
+		}
+		else if (!killed && GetCurrentTimestamp() >= kill_at)
+		{
+			(void) kill(-pid, SIGKILL);
+			killed = true;
+		}
+
+		wrc = WaitLatch(MyLatch,
+						WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
+						DBBLUE_STANDBY_COMMAND_POLL_MS,
+						WAIT_EVENT_DBBLUE_CREATE_STANDBY_MAIN);
+		ResetLatch(MyLatch);
+
+		/* standby_command_atexit() stops the command */
+		if (wrc & WL_POSTMASTER_DEATH)
+			proc_exit(1);
+	}
 	pgstat_report_wait_end();
 
-	/* killed by the shutdown signal, which is no failure worth a warning */
-	if (rc != 0 && ShutdownRequestPending)
+	/* whatever it started and left behind goes with it */
+	if (stopped != COMMAND_OK)
+		(void) kill(-pid, SIGKILL);
+	command_pgid = 0;
+
+	/*
+	 * We may have reset the latch a shutdown or reload request set, which
+	 * the main loop has yet to act on: without it, it would sleep a whole
+	 * DBBLUE_STANDBY_NAPTIME_MS first, and the postmaster wait with it.
+	 */
+	if (ShutdownRequestPending || ConfigReloadPending)
+		SetLatch(MyLatch);
+
+	if (stopped == COMMAND_CANCELLED)
+	{
+		pfree(qlog);
+		pfree(full);
+		return COMMAND_CANCELLED;
+	}
+
+	/* stopped for the shutdown, which is no failure worth a warning */
+	if (rc != 0 && (stopped == COMMAND_INTERRUPTED || ShutdownRequestPending))
 	{
 		ereport(LOG,
 				(errmsg("dbblue create standby: %s interrupted by shutdown",
 						what)));
 		pfree(qlog);
 		pfree(full);
-		return false;
+		return COMMAND_INTERRUPTED;
 	}
 
 	if (rc != 0)
@@ -2357,12 +2588,23 @@ run_shell(const char *cmd, const char *logfile, const char *what)
 		pfree(reason);
 		pfree(qlog);
 		pfree(full);
-		return false;
+		return COMMAND_FAILED;
 	}
 
 	pfree(qlog);
 	pfree(full);
-	return true;
+	return COMMAND_OK;
+}
+
+/*
+ * run_shell
+ *		run_command() for a command no reload stops.  Returns true on exit
+ *		status 0.
+ */
+static bool
+run_shell(const char *cmd, const char *logfile, const char *what)
+{
+	return run_command(cmd, logfile, what, NULL) == COMMAND_OK;
 }
 
 /*
@@ -3538,6 +3780,7 @@ run_standby_tick(void)
 	char	   *cmd;
 	int			port;
 	bool		ok;
+	CommandResult built;
 	bool		encrypt_wal;
 	bool		fenced;
 	char	   *connopts;
@@ -3834,12 +4077,13 @@ run_standby_tick(void)
 				(errmsg("dbblue create standby: creating standby in \"%s\" from primary on port %d",
 						dir, PostPortNumber)));
 
-		ok = run_shell(cmd, logfile, "pg_basebackup");
+		/* turned off or paused, or pointed elsewhere, it is stopped; see there */
+		built = run_command(cmd, logfile, "pg_basebackup", dir);
 		pfree(cmd);
 		pfree(qbin);
 		pfree(qdir);
 
-		if (!ok)
+		if (built != COMMAND_OK)
 		{
 			/*
 			 * pg_basebackup removes what it wrote, but a crash or kill can
@@ -3859,7 +4103,9 @@ run_standby_tick(void)
 			(void) drop_standby_slot(logfile);
 			pfree(logfile);
 			pfree(dir);
-			return false;
+
+			/* a build no longer wanted is no failure to count */
+			return built == COMMAND_CANCELLED;
 		}
 
 		if (!unmark_standby_build(dir))
@@ -4337,6 +4583,9 @@ DbblueCreateStandbyMain(Datum main_arg)
 {
 	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
+	/* the commands we run are not in our process group; see run_command() */
+	pqsignal(SIGQUIT, standby_command_quickdie);
+	before_shmem_exit(standby_command_atexit, (Datum) 0);
 	BackgroundWorkerUnblockSignals();
 
 	ereport(LOG,
@@ -4348,21 +4597,7 @@ DbblueCreateStandbyMain(Datum main_arg)
 		int			rc;
 
 		if (ConfigReloadPending)
-		{
-			ConfigReloadPending = false;
-			ProcessConfigFile(PGC_SIGHUP);
-			/* give a hand-fixed setup a fresh set of attempts */
-			consecutive_failures = 0;
-			/* and repeat the warning if the limit is still missing */
-			slot_wal_limit_warned = false;
-			/* and look for disk space for the standby again at once */
-			space_recheck_at = 0;
-			space_short_warned = false;
-			/* and say again why a cluster with tablespaces gets none */
-			tablespace_warned = false;
-			/* and have the standby, which shares our files, reload too */
-			standby_reload_pending = true;
-		}
+			apply_config_reload();
 
 		/*
 		 * Never act while in recovery: a standby must not spawn standbys of
