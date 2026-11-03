@@ -127,6 +127,11 @@ char	   *dbblue_standby_user = NULL;
 /* How many ports above PostPortNumber to probe before giving up. */
 #define DBBLUE_STANDBY_PORT_ATTEMPTS	10
 
+/* Where Debian's postgresql-common keeps each cluster's configuration. */
+#ifndef DBBLUE_DEBIAN_CONF_DIR
+#define DBBLUE_DEBIAN_CONF_DIR	"/etc/postgresql"
+#endif
+
 /* Stop retrying after this many consecutive failures (reset on SIGHUP). */
 #define DBBLUE_STANDBY_MAX_FAILURES		5
 
@@ -707,26 +712,24 @@ conninfo_value(const char *conninfo, const char *keyword)
 }
 
 /*
- * standby_conf_value
- *		The value the postgresql.auto.conf of the standby in dir gives name,
- *		the last one if it gives several, palloc'd, or NULL if that file does
- *		not set it or cannot be read.
+ * conf_file_value
+ *		The value the configuration file at path, with the files it includes,
+ *		gives name, the last one if it gives several, palloc'd, or NULL if it
+ *		does not set it or cannot be read.
  */
 static char *
-standby_conf_value(const char *dir, const char *name)
+conf_file_value(const char *path, const char *name)
 {
-	char		path[MAXPGPATH];
 	FILE	   *fp;
 	ConfigVariable *head = NULL;
 	ConfigVariable *tail = NULL;
 	char	   *result = NULL;
 
-	snprintf(path, sizeof(path), "%s/%s", dir, PG_AUTOCONF_FILENAME);
 	fp = AllocateFile(path, "r");
 	if (fp == NULL)
 		return NULL;
 
-	/* a file the standby cannot parse either is for pg_ctl start to report */
+	/* a file its server cannot parse either is for that server to report */
 	if (ParseConfigFp(fp, path, CONF_FILE_START_DEPTH, DEBUG1, &head, &tail))
 	{
 		for (ConfigVariable *item = head; item != NULL; item = item->next)
@@ -746,6 +749,21 @@ standby_conf_value(const char *dir, const char *name)
 }
 
 /*
+ * standby_conf_value
+ *		The value the postgresql.auto.conf of the standby in dir gives name,
+ *		the last one if it gives several, palloc'd, or NULL if that file does
+ *		not set it or cannot be read.
+ */
+static char *
+standby_conf_value(const char *dir, const char *name)
+{
+	char		path[MAXPGPATH];
+
+	snprintf(path, sizeof(path), "%s/%s", dir, PG_AUTOCONF_FILENAME);
+	return conf_file_value(path, name);
+}
+
+/*
  * standby_primary_conninfo
  *		The primary_conninfo of the standby in dir, as its postgresql.auto.conf
  *		sets it, palloc'd, or NULL if that file does not set it or cannot be
@@ -761,14 +779,13 @@ standby_primary_conninfo(const char *dir)
 }
 
 /*
- * standby_previous_port
- *		The port the standby in dir was last started on, as
- *		write_standby_settings() left it in its postgresql.auto.conf, or -1.
+ * conf_port_number
+ *		The port number a configuration file gives as value, which is pfree'd,
+ *		or -1 if value is NULL or not a port number.
  */
 static int
-standby_previous_port(const char *dir)
+conf_port_number(char *value)
 {
-	char	   *value = standby_conf_value(dir, "port");
 	int			port = -1;
 
 	if (value != NULL)
@@ -781,6 +798,17 @@ standby_previous_port(const char *dir)
 		pfree(value);
 	}
 	return port;
+}
+
+/*
+ * standby_previous_port
+ *		The port the standby in dir was last started on, as
+ *		write_standby_settings() left it in its postgresql.auto.conf, or -1.
+ */
+static int
+standby_previous_port(const char *dir)
+{
+	return conf_port_number(standby_conf_value(dir, "port"));
 }
 
 /*
@@ -1329,19 +1357,193 @@ port_is_free(int port)
 }
 
 /*
+ * claim_configured_port
+ *		Mark in claimed[] the port another cluster is configured to listen on,
+ *		if find_free_port() could choose it: the port its autoconf sets, or
+ *		else its conf, or the default port if a file is readable but sets
+ *		none.  Either path may be NULL.
+ */
+static void
+claim_configured_port(const char *conf, const char *autoconf, bool *claimed)
+{
+	int			port = -1;
+	bool		readable = false;
+
+	if (autoconf != NULL && access(autoconf, R_OK) == 0)
+	{
+		readable = true;
+		port = conf_port_number(conf_file_value(autoconf, "port"));
+	}
+	if (port < 0 && conf != NULL && access(conf, R_OK) == 0)
+	{
+		readable = true;
+		port = conf_port_number(conf_file_value(conf, "port"));
+	}
+	if (!readable)
+		return;
+	if (port < 0)
+		port = DEF_PGPORT;
+
+	if (port > PostPortNumber &&
+		port <= PostPortNumber + DBBLUE_STANDBY_PORT_ATTEMPTS)
+	{
+		if (!claimed[port - PostPortNumber - 1])
+			ereport(DEBUG1,
+					(errmsg("dbblue create standby: port %d is configured for the cluster at \"%s\"; not using it",
+							port, conf != NULL ? conf : autoconf)));
+		claimed[port - PostPortNumber - 1] = true;
+	}
+}
+
+/*
+ * sibling_is_our_standby
+ *		Is the cluster in dir, beside our data directory, a standby of ours?
+ *
+ * standby_identity() tells, but warns of a pg_control it cannot read, as
+ * that of another major version: look first at what is cheap and silent.
+ */
+static bool
+sibling_is_our_standby(const char *dir)
+{
+	char		path[MAXPGPATH];
+	char		version[32] = "";
+	FILE	   *fp;
+	char	   *slot;
+	bool		our_slot;
+	uint64		sysid;
+
+	snprintf(path, sizeof(path), "%s/PG_VERSION", dir);
+	fp = AllocateFile(path, "r");
+	if (fp == NULL)
+		return false;
+	if (fgets(version, sizeof(version), fp) == NULL)
+		version[0] = '\0';
+	FreeFile(fp);
+	version[strcspn(version, "\r\n")] = '\0';
+	if (strcmp(version, PG_MAJORVERSION) != 0)
+		return false;
+
+	slot = standby_conf_value(dir, "primary_slot_name");
+	our_slot = (slot != NULL && strcmp(slot, DBBLUE_STANDBY_SLOT) == 0);
+	if (slot)
+		pfree(slot);
+	if (!our_slot)
+		return false;
+
+	return standby_identity(dir, &sysid) == STANDBY_OURS;
+}
+
+/*
+ * collect_configured_ports
+ *		Mark in claimed[], one entry for each port find_free_port() probes,
+ *		the ports other clusters on this host are configured for.
+ *
+ * A cluster that is stopped holds neither its TCP port nor its Unix socket,
+ * and port_is_free() alone hands its port to the standby, which then keeps
+ * it from starting.  Nor do Debian's pg_createcluster and pg_upgradecluster
+ * look at live sockets: they give a new cluster the first port no
+ * configuration under /etc/postgresql sets, which may be the standby's.
+ * Look at both places such clusters are found:
+ *
+ *	- Debian's <DBBLUE_DEBIAN_CONF_DIR>/<version>/<cluster>/postgresql.conf,
+ *	  the include_dir conf.d beside it included;
+ *	- the data directories beside ours, by their postgresql.conf and
+ *	  postgresql.auto.conf, which is where the standby itself is kept by
+ *	  default, and where copies of us usually live.  A standby of ours is
+ *	  passed over: its port is the standby's own, or one we are free to give
+ *	  the standby now.
+ *
+ * Clusters kept elsewhere are seen only while they run, by port_is_free().
+ */
+static void
+collect_configured_ports(bool *claimed)
+{
+	const char *root = DBBLUE_DEBIAN_CONF_DIR;
+	char	   *parent;
+	DIR		   *vdir;
+	DIR		   *pdir;
+	struct dirent *ve;
+	struct dirent *pe;
+	char		path[MAXPGPATH];
+
+	memset(claimed, 0, sizeof(bool) * DBBLUE_STANDBY_PORT_ATTEMPTS);
+
+	vdir = AllocateDir(root);
+	while ((ve = ReadDirExtended(vdir, root, DEBUG1)) != NULL)
+	{
+		char		verdir[MAXPGPATH];
+		DIR		   *cdir;
+		struct dirent *ce;
+
+		if (ve->d_name[0] == '.')
+			continue;
+		snprintf(verdir, sizeof(verdir), "%s/%s", root, ve->d_name);
+		cdir = AllocateDir(verdir);
+		while ((ce = ReadDirExtended(cdir, verdir, DEBUG1)) != NULL)
+		{
+			if (ce->d_name[0] == '.')
+				continue;
+			snprintf(path, sizeof(path), "%s/%s/postgresql.conf",
+					 verdir, ce->d_name);
+			claim_configured_port(path, NULL, claimed);
+		}
+		if (cdir)
+			FreeDir(cdir);
+	}
+	if (vdir)
+		FreeDir(vdir);
+
+	parent = pstrdup(DataDir);
+	get_parent_directory(parent);
+	pdir = AllocateDir(parent);
+	while ((pe = ReadDirExtended(pdir, parent, DEBUG1)) != NULL)
+	{
+		char		sib[MAXPGPATH];
+		char		autoconf[MAXPGPATH];
+		struct stat st;
+
+		if (pe->d_name[0] == '.')
+			continue;
+		snprintf(sib, sizeof(sib), "%s/%s", parent, pe->d_name);
+		if (strcmp(sib, DataDir) == 0)
+			continue;
+		snprintf(path, sizeof(path), "%s/PG_VERSION", sib);
+		if (stat(path, &st) != 0 || !S_ISREG(st.st_mode))
+			continue;
+		if (sibling_is_our_standby(sib))
+			continue;
+
+		snprintf(path, sizeof(path), "%s/postgresql.conf", sib);
+		snprintf(autoconf, sizeof(autoconf), "%s/%s",
+				 sib, PG_AUTOCONF_FILENAME);
+		claim_configured_port(path, autoconf, claimed);
+	}
+	if (pdir)
+		FreeDir(pdir);
+	pfree(parent);
+}
+
+/*
  * find_free_port
  *		Return preferred if it is one of ours to use and free, or else the
- *		first free port starting just above the primary's own, or -1.  See
+ *		first free port starting just above the primary's own, or -1.  A port
+ *		another cluster is configured for is never one of ours, even while
+ *		that cluster is stopped; see collect_configured_ports() and
  *		port_is_free().
  */
 static int
 find_free_port(int preferred)
 {
 	int			port;
+	bool		claimed[DBBLUE_STANDBY_PORT_ATTEMPTS];
+
+	collect_configured_ports(claimed);
 
 	if (preferred > PostPortNumber &&
 		preferred <= PostPortNumber + DBBLUE_STANDBY_PORT_ATTEMPTS &&
-		preferred <= 65535 && port_is_free(preferred))
+		preferred <= 65535 &&
+		!claimed[preferred - PostPortNumber - 1] &&
+		port_is_free(preferred))
 		return preferred;
 
 	for (port = PostPortNumber + 1;
@@ -1360,7 +1562,8 @@ find_free_port(int preferred)
 			return -1;
 		}
 
-		if (port != preferred && port_is_free(port))
+		if (port != preferred && !claimed[port - PostPortNumber - 1] &&
+			port_is_free(port))
 			return port;
 	}
 
@@ -3779,6 +3982,7 @@ run_standby_tick(void)
 	char	   *qdir;
 	char	   *cmd;
 	int			port;
+	int			previous_port;
 	bool		ok;
 	CommandResult built;
 	bool		encrypt_wal;
@@ -4129,17 +4333,28 @@ run_standby_tick(void)
 	 * A fresh copy still carries our own postgresql.auto.conf, whose port,
 	 * if it sets one, is ours and is passed over.
 	 */
-	port = find_free_port(standby_previous_port(dir));
+	previous_port = standby_previous_port(dir);
+	port = find_free_port(previous_port);
 	if (port < 0)
 	{
 		ereport(WARNING,
 				(errmsg("dbblue create standby: no free port found in range %d..%d",
 						PostPortNumber + 1,
-						PostPortNumber + DBBLUE_STANDBY_PORT_ATTEMPTS)));
+						PostPortNumber + DBBLUE_STANDBY_PORT_ATTEMPTS),
+				 errdetail("Ports another cluster on this host is configured for are not used, even while that cluster is stopped.")));
 		pfree(logfile);
 		pfree(dir);
 		return false;
 	}
+
+	/* a fresh copy's port is ours, never the standby's: see above */
+	if (port != previous_port &&
+		previous_port > PostPortNumber &&
+		previous_port <= PostPortNumber + DBBLUE_STANDBY_PORT_ATTEMPTS)
+		ereport(WARNING,
+				(errmsg("dbblue create standby: standby moves from port %d to port %d, as port %d is taken or configured for another cluster",
+						previous_port, port, previous_port),
+				 errhint("Set Odoo's db_replica_port to %d.", port)));
 
 	if (!write_standby_settings(dir, port, fenced))
 	{
