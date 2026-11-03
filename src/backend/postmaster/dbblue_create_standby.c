@@ -31,7 +31,8 @@
  * postmaster is still alive and restarts it if not.  One that has stopped
  * streaming or replaying our WAL is restarted refusing connections, so that
  * Odoo reads from us instead of stale data, until it has caught up; see
- * standby_fence_changes().  It also checks the
+ * standby_fence_changes().  When we reload our configuration, which the
+ * standby shares, it is reloaded too; see reload_standby().  It also checks the
  * standby is still usable: if our replication slot has been invalidated or
  * is gone, the standby can never catch up and is rebuilt; if the directory holds a
  * promoted copy of us or a different cluster altogether, it is left alone,
@@ -243,6 +244,9 @@ static TimestampTz standby_stalled_since = 0;
  */
 static bool standby_running_fenced = false;
 static TimestampTz slot_idle_since = 0;
+
+/* Whether we have reloaded our configuration, but not the standby's yet. */
+static bool standby_reload_pending = false;
 
 /*
  * The dbblue_create_standby value last acted on, -1 for none yet; paused
@@ -1638,7 +1642,8 @@ standby_limits_behind(const char *dir)
  * Everything else is kept.  The standby needs settings such as
  * pg_tde.wal_encrypt and default_table_access_method to stay encrypted.
  *
- * This runs before every start, not just after the build, so it drops
+ * This runs before every start, not just after the build, and again when
+ * the standby reloads along with us (see reload_standby()), so it drops
  * earlier assignments of what it sets instead of adding to them.
  */
 static bool
@@ -1995,6 +2000,64 @@ sync_standby_port(const char *dir)
 
 	if (reported_standby_port() != port)
 		report_standby_port(dir, port);
+}
+
+/*
+ * reload_standby
+ *		Have the running standby in dir reload its configuration, as we have
+ *		just reloaded ours.  Returns false if that could not be done yet.
+ *
+ * It runs on our postgresql.conf and pg_hba.conf (see standby_server_opts()),
+ * but only the postmaster it belongs to is signalled by pg_reload_conf().
+ * Without this, what an operator changes there and reloads applies to the
+ * standby only at its next restart: a pg_hba.conf rule shutting a role out
+ * would still let it read everything from the standby.  What we set for it
+ * from our own values, such as half our work_mem, is written again first.
+ * Settings that need a restart keep their value until the next one, as they
+ * do for us; shared_buffers, halved, is among them.
+ *
+ * Called only once the standby is known to need no restart: rewriting its
+ * postgresql.auto.conf first would hide from standby_limits_behind() that
+ * it runs with less than it needs.  ALTER SYSTEM on us is not passed on, as
+ * the standby reads the postgresql.auto.conf in its own data directory.
+ */
+static bool
+reload_standby(const char *dir, bool fenced)
+{
+	char		path[MAXPGPATH];
+	FILE	   *fp;
+	long		pid = 0;
+	int			port = 0;
+	bool		ready = false;
+
+	if (!standby_pidfile_port(dir, &port, &ready))
+		return false;
+
+	snprintf(path, sizeof(path), "%s/postmaster.pid", dir);
+	fp = fopen(path, "r");
+	if (fp == NULL)
+		return false;
+	if (fscanf(fp, "%ld", &pid) != 1)
+		pid = 0;
+	fclose(fp);
+	if (pid <= 1)
+		return false;
+
+	if (!write_standby_settings(dir, port, fenced))
+		return false;
+
+	if (kill((pid_t) pid, SIGHUP) != 0)
+	{
+		ereport(WARNING,
+				(errmsg("dbblue create standby: could not signal the standby in \"%s\" to reload its configuration: %m",
+						dir)));
+		return false;
+	}
+
+	ereport(LOG,
+			(errmsg("dbblue create standby: reloading the configuration of the standby in \"%s\" along with this server's",
+					dir)));
+	return true;
 }
 
 /*
@@ -3579,6 +3642,8 @@ run_standby_tick(void)
 		if (!refence && !standby_limits_behind(dir))
 		{
 			standby_running_fenced = fenced;
+			if (standby_reload_pending && reload_standby(dir, fenced))
+				standby_reload_pending = false;
 			if (!fenced)
 				sync_standby_port(dir);
 			pfree(logfile);
@@ -3836,6 +3901,9 @@ run_standby_tick(void)
 		pfree(dir);
 		return false;
 	}
+
+	/* starting, it reads all its configuration anew */
+	standby_reload_pending = false;
 
 	/* what standby_replication() saw was of the standby before this start */
 	standby_last_apply = InvalidXLogRecPtr;
@@ -4292,6 +4360,8 @@ DbblueCreateStandbyMain(Datum main_arg)
 			space_short_warned = false;
 			/* and say again why a cluster with tablespaces gets none */
 			tablespace_warned = false;
+			/* and have the standby, which shares our files, reload too */
+			standby_reload_pending = true;
 		}
 
 		/*
