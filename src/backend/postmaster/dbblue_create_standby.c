@@ -198,6 +198,7 @@ typedef enum
 	STANDBY_PROMOTED,			/* a copy of this cluster, since promoted */
 	STANDBY_FOREIGN,			/* a different cluster altogether */
 	STANDBY_OTHER_PRIMARY,		/* a standby of another copy of this cluster */
+	STANDBY_NOT_BUILT,			/* a standby of ours we did not build */
 	STANDBY_UNREADABLE,			/* cannot tell; pg_control unreadable */
 } StandbyIdentity;
 
@@ -887,6 +888,13 @@ standby_follows_us(const char *dir, char **their_host, char **their_port)
  * which shares our system identifier; see standby_follows_us().  None can
  * stream from us, and none is ours to start, report, or delete.
  *
+ * Nor is a standby of ours that streams without our slot, or through another
+ * one: somebody built it by hand, as every standby we build streams through
+ * DBBLUE_STANDBY_SLOT, and may have set it up as we never would -- delayed
+ * with recovery_min_apply_delay, say, to undo a mistake on us.  Taken for
+ * ours, it would be deleted and built anew as soon as our slot was found
+ * missing, which it always is.
+ *
  * On STANDBY_FOREIGN, *their_sysid is set to the identifier found.
  */
 static StandbyIdentity
@@ -894,6 +902,8 @@ standby_identity(const char *dir, uint64 *their_sysid)
 {
 	char		path[MAXPGPATH];
 	struct stat st;
+	char	   *slot;
+	bool		our_slot;
 
 	if (!read_system_identifier(dir, their_sysid))
 		return STANDBY_UNREADABLE;
@@ -906,6 +916,13 @@ standby_identity(const char *dir, uint64 *their_sysid)
 
 	if (!standby_follows_us(dir, NULL, NULL))
 		return STANDBY_OTHER_PRIMARY;
+
+	slot = standby_conf_value(dir, "primary_slot_name");
+	our_slot = (slot != NULL && strcmp(slot, DBBLUE_STANDBY_SLOT) == 0);
+	if (slot)
+		pfree(slot);
+	if (!our_slot)
+		return STANDBY_NOT_BUILT;
 
 	return STANDBY_OURS;
 }
@@ -3024,8 +3041,10 @@ retire_previous_standby(const char *dir)
  *
  * A directory that is not our standby is not ours to delete, whatever it
  * holds: a different cluster may be the last copy of a primary that is gone,
- * and a promoted one is somebody's primary now.  We neither start nor report
- * either, which would send read-only traffic to the wrong server.  Our slot
+ * a promoted one is somebody's primary now, and one streaming from us but not
+ * through our slot is a standby somebody set up by hand.  We neither start
+ * nor report any of them, which would send read-only traffic to the wrong
+ * server, or to one we do not look after.  Our slot
  * is dropped once our standby has been promoted, though: nothing will stream
  * from it again, and it would hold back WAL until max_slot_wal_keep_size.
  */
@@ -3078,6 +3097,24 @@ vet_existing_standby(const char *dir, const char *logfile)
 					pfree(their_host);
 				if (their_port)
 					pfree(their_port);
+			}
+			return false;
+		case STANDBY_NOT_BUILT:
+			{
+				char	   *their_slot = standby_conf_value(dir, "primary_slot_name");
+
+				forget_standby_port();
+				ereport(WARNING,
+						(errmsg("dbblue create standby: \"%s\" holds a standby of this server that dbblue_create_standby did not build, and is left alone",
+								dir),
+						 (their_slot && their_slot[0]) ?
+						 errdetail("It streams through replication slot \"%s\", while a standby built here streams through \"%s\".",
+								   their_slot, DBBLUE_STANDBY_SLOT) :
+						 errdetail("It streams without a replication slot, while a standby built here streams through \"%s\".",
+								   DBBLUE_STANDBY_SLOT),
+						 errhint("Point dbblue_standby_directory to an empty directory to have a standby built there, or turn dbblue_create_standby off.")));
+				if (their_slot)
+					pfree(their_slot);
 			}
 			return false;
 		case STANDBY_UNREADABLE:
@@ -3925,8 +3962,10 @@ run_standby_tick(void)
  *
  * When the value is set with ALTER SYSTEM, it must also not be our data
  * directory or lie inside it, and the directory must already exist, belong
- * to us, and be empty or hold a cluster.  That is only checked inside a
- * transaction.  The configuration file is read outside one, at startup and
+ * to us, and be empty or hold a cluster that streams through our slot, as
+ * every standby we build does: a standby somebody built by hand is not ours
+ * to delete and build anew, as we would once we found our slot missing.
+ * That is only checked inside a transaction.  The configuration file is read outside one, at startup and
  * on every reload, and no server must refuse to start over this setting:
  * the standby's directory may be missing because the operator removed it to
  * have the standby rebuilt, as the hints in vet_existing_standby() suggest,
@@ -4005,14 +4044,28 @@ check_dbblue_standby_directory(char **newval, void **extra, GucSource source)
 	else if (access(dir, R_OK | W_OK | X_OK) != 0)
 		GUC_check_errdetail("The server cannot write to directory \"%s\": %m.", dir);
 	else if (standby_has_data(dir))
-		ok = true;
+	{
+		/* one that does not use our slot is not ours to take over; see standby_identity() */
+		char	   *slot = standby_conf_value(dir, "primary_slot_name");
+
+		if (slot != NULL && strcmp(slot, DBBLUE_STANDBY_SLOT) == 0)
+			ok = true;
+		else
+		{
+			GUC_check_errdetail("Directory \"%s\" holds a PostgreSQL cluster that does not stream through replication slot \"%s\", so dbblue_create_standby did not build it.",
+								dir, DBBLUE_STANDBY_SLOT);
+			GUC_check_errhint("Use an empty directory, or the data directory of a standby dbblue_create_standby built.");
+		}
+		if (slot)
+			pfree(slot);
+	}
 	else if (!standby_dir_is_empty(dir, &empty))
 		GUC_check_errdetail("Could not read directory \"%s\": %m.", dir);
 	else if (!empty)
 	{
 		GUC_check_errdetail("Directory \"%s\" is not empty, and does not hold a PostgreSQL cluster.",
 							dir);
-		GUC_check_errhint("Use an empty directory, or the data directory of an existing standby of this server.");
+		GUC_check_errhint("Use an empty directory, or the data directory of a standby dbblue_create_standby built.");
 	}
 	else
 		ok = true;
