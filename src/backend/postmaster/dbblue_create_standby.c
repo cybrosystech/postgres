@@ -28,7 +28,10 @@
  *      generator setting db_replica_port) can pick it up.
  *
  * The worker then babysits the standby: every tick it checks the standby
- * postmaster is still alive and restarts it if not.  It also checks the
+ * postmaster is still alive and restarts it if not.  One that has stopped
+ * streaming or replaying our WAL is restarted refusing connections, so that
+ * Odoo reads from us instead of stale data, until it has caught up; see
+ * standby_fence_changes().  It also checks the
  * standby is still usable: if our replication slot has been invalidated or
  * is gone, the standby can never catch up and is rebuilt; if the directory holds a
  * promoted copy of us or a different cluster altogether, it is left alone,
@@ -91,10 +94,12 @@
 #include "postmaster/syslogger.h"
 #include "replication/slot.h"
 #include "replication/walsender.h"
+#include "replication/walsender_private.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/lock.h"
+#include "storage/proc.h"
 #include "utils/builtins.h"
 #include "utils/conffiles.h"
 #include "utils/guc.h"
@@ -121,6 +126,12 @@ char	   *dbblue_standby_user = NULL;
 
 /* How often to look again for disk space to build the standby in. */
 #define DBBLUE_STANDBY_SPACE_RECHECK_MS	60000L
+
+/*
+ * How long the running standby may go without streaming or replaying our WAL
+ * before standby_must_fence() has it refuse connections.
+ */
+#define DBBLUE_STANDBY_STALL_MS		60000L
 
 /*
  * How long drop_standby_slot() waits for our slot to be released by the
@@ -188,6 +199,15 @@ typedef enum
 	STANDBY_UNREADABLE,			/* cannot tell; pg_control unreadable */
 } StandbyIdentity;
 
+/* How the running standby keeps up with us; see standby_replication(). */
+typedef enum
+{
+	STANDBY_REPL_CAUGHT_UP,		/* has replayed what we had a tick ago */
+	STANDBY_REPL_BEHIND,		/* behind, but replaying, or cannot tell yet */
+	STANDBY_REPL_STALLED,		/* streaming, but not replaying */
+	STANDBY_REPL_DISCONNECTED,	/* not streaming at all */
+} StandbyReplication;
+
 static int	consecutive_failures = 0;
 
 /* Whether warn_unlimited_slot_wal() has spoken since the last reload. */
@@ -202,6 +222,16 @@ static bool space_short_warned = false;
 
 /* Whether standby_copyable() has spoken since the last reload. */
 static bool tablespace_warned = false;
+
+/*
+ * What standby_replication() saw at the last tick: how far the standby had
+ * replayed, and how far we had flushed.  Invalid until it has looked once
+ * since the standby was started.  And since when the standby has neither
+ * streamed nor replayed, or 0.
+ */
+static XLogRecPtr standby_last_apply = InvalidXLogRecPtr;
+static XLogRecPtr standby_last_flush = InvalidXLogRecPtr;
+static TimestampTz standby_stalled_since = 0;
 
 /*
  * The dbblue_create_standby value last acted on, -1 for none yet; paused
@@ -1568,6 +1598,10 @@ standby_limits_behind(const char *dir)
  * holds them as they were then, and overrides it, and an ALTER SYSTEM of ours
  * since never reaches the standby.  A value raised here is reported.
  *
+ * hot_standby is set off if fenced, and otherwise left to our postgresql.conf;
+ * see standby_fence_changes().  Kept here, the fence lasts across restarts of
+ * the standby, of ours, and of this worker, until it is lifted.
+ *
  * Only the last primary_conninfo and primary_slot_name are kept, which are
  * the ones -R just appended.  Any earlier ones came with the copy -- we were
  * a standby once ourselves, and promoted -- and point at our old primary.
@@ -1581,7 +1615,7 @@ standby_limits_behind(const char *dir)
  * earlier assignments of what it sets instead of adding to them.
  */
 static bool
-write_standby_settings(const char *dir, int port)
+write_standby_settings(const char *dir, int port, bool fenced)
 {
 	char		path[MAXPGPATH];
 	char		tmppath[MAXPGPATH];
@@ -1651,6 +1685,7 @@ write_standby_settings(const char *dir, int port)
 		if (conf_line_sets(line, "port") ||
 			conf_line_sets(line, "unix_socket_directories") ||
 			conf_line_sets(line, "hot_standby_feedback") ||
+			conf_line_sets(line, "hot_standby") ||
 			conf_line_sets(line, "dbblue_create_standby") ||
 			conf_line_sets(line, "dbblue_standby_directory") ||
 			conf_line_sets(line, "log_filename") ||
@@ -1678,6 +1713,8 @@ write_standby_settings(const char *dir, int port)
 	append_conf_string(&buf, "unix_socket_directories",
 					   Unix_socket_directories ? Unix_socket_directories : "");
 	appendStringInfoString(&buf, "hot_standby_feedback = on\n");
+	if (fenced)
+		appendStringInfoString(&buf, "hot_standby = off\n");
 	appendStringInfoString(&buf, "dbblue_create_standby = off\n");
 	appendStringInfoString(&buf, "dbblue_standby_directory = ''\n");
 
@@ -2375,6 +2412,166 @@ standby_slot_state(void)
 	LWLockRelease(ReplicationSlotControlLock);
 
 	return state;
+}
+
+/*
+ * standby_apply_lsn
+ *		Set *apply to how far the standby streaming from our slot has
+ *		replayed, as it last told the walsender serving it: invalid until its
+ *		first reply.  Returns false if no walsender holds our slot.
+ *
+ * The walsender is found by the PID of the process holding the slot, so that
+ * other standbys, or pg_receivewal, are not taken for ours.
+ */
+static bool
+standby_apply_lsn(XLogRecPtr *apply)
+{
+	ReplicationSlot *slot;
+	ProcNumber	holder = INVALID_PROC_NUMBER;
+	pid_t		pid;
+
+	LWLockAcquire(ReplicationSlotControlLock, LW_SHARED);
+	slot = SearchNamedReplicationSlot(DBBLUE_STANDBY_SLOT, false);
+	if (slot != NULL)
+	{
+		SpinLockAcquire(&slot->mutex);
+		holder = slot->active_proc;
+		SpinLockRelease(&slot->mutex);
+	}
+	LWLockRelease(ReplicationSlotControlLock);
+
+	if (holder == INVALID_PROC_NUMBER)
+		return false;
+	pid = GetPGProcByNumber(holder)->pid;
+
+	for (int i = 0; i < max_wal_senders; i++)
+	{
+		WalSnd	   *walsnd = &WalSndCtl->walsnds[i];
+		bool		ours;
+
+		SpinLockAcquire(&walsnd->mutex);
+		ours = (pid != 0 && walsnd->pid == pid);
+		if (ours)
+			*apply = walsnd->apply;
+		SpinLockRelease(&walsnd->mutex);
+		if (ours)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * standby_replication
+ *		How the running standby has kept up with us since the last tick.
+ *
+ * It has caught up once it has replayed what we had flushed a tick ago:
+ * comparing with what we have flushed now would rarely find it there while
+ * we write.  It is stalled if it streams from our slot but has not replayed
+ * any further, while it is still short of that.  A standby replays as it
+ * receives and reports where it is at least every wal_receiver_status_interval,
+ * so a stall lasting a few ticks is real: replay paused, by hand or for a
+ * setting lower than ours, or held up by a query.  Disconnected, it cannot
+ * stream at all: pg_hba.conf, authentication, or a socket directory changed.
+ */
+static StandbyReplication
+standby_replication(void)
+{
+	XLogRecPtr	apply = InvalidXLogRecPtr;
+	XLogRecPtr	last_apply = standby_last_apply;
+	XLogRecPtr	last_flush = standby_last_flush;
+	bool		streaming = standby_apply_lsn(&apply);
+
+	standby_last_apply = apply;
+	standby_last_flush = GetFlushRecPtr(NULL);
+
+	if (!streaming)
+		return STANDBY_REPL_DISCONNECTED;
+	if (XLogRecPtrIsInvalid(last_flush))
+		return STANDBY_REPL_BEHIND;
+	if (XLogRecPtrIsValid(apply) && apply >= last_flush)
+		return STANDBY_REPL_CAUGHT_UP;
+	if (apply != last_apply)
+		return STANDBY_REPL_BEHIND;
+	return STANDBY_REPL_STALLED;
+}
+
+/*
+ * standby_fenced
+ *		Is the standby in dir set, in its postgresql.auto.conf, to refuse
+ *		connections?  See standby_fence_changes().
+ */
+static bool
+standby_fenced(const char *dir)
+{
+	char	   *value = standby_conf_value(dir, "hot_standby");
+	bool		on = true;
+
+	if (value != NULL)
+	{
+		(void) parse_bool(value, &on);
+		pfree(value);
+	}
+	return !on;
+}
+
+/*
+ * standby_fence_changes
+ *		Must the running standby in dir, fenced or not, be restarted the other
+ *		way?  If so, say why.
+ *
+ * Odoo sends its read-only cursors to the standby while it accepts them, and
+ * a standby that no longer streams or replays our WAL still does: it answers
+ * every query with data as it was when it fell behind, and nothing tells.
+ * Once it has been so for DBBLUE_STANDBY_STALL_MS, it is fenced: restarted
+ * with hot_standby off, which still streams and replays but refuses every
+ * connection.  Odoo, failing to connect, falls back to us for its read-only
+ * cursors, and tries the replica again later; tooling is no longer pointed at
+ * it either, as its port is not reported while it is fenced.
+ *
+ * The restart alone may be the cure, as a paused replay does not survive it.
+ * Once it has caught up, it is restarted without the fence.  A standby that
+ * cannot connect stays fenced until whatever keeps it out is fixed.
+ */
+static bool
+standby_fence_changes(const char *dir, bool fenced)
+{
+	StandbyReplication repl = standby_replication();
+	TimestampTz now = GetCurrentTimestamp();
+
+	if (repl == STANDBY_REPL_CAUGHT_UP || repl == STANDBY_REPL_BEHIND)
+	{
+		standby_stalled_since = 0;
+		if (!fenced || repl != STANDBY_REPL_CAUGHT_UP)
+			return false;
+
+		ereport(LOG,
+				(errmsg("dbblue create standby: the standby in \"%s\" has caught up with this server, restarting it to accept connections again",
+						dir)));
+		return true;
+	}
+
+	if (standby_stalled_since == 0)
+		standby_stalled_since = now;
+	if (fenced ||
+		!TimestampDifferenceExceeds(standby_stalled_since, now,
+									DBBLUE_STANDBY_STALL_MS))
+		return false;
+
+	if (repl == STANDBY_REPL_DISCONNECTED)
+		ereport(WARNING,
+				(errmsg("dbblue create standby: the standby in \"%s\" has not streamed from this server for %ld seconds, restarting it to refuse connections until it has caught up",
+						dir, DBBLUE_STANDBY_STALL_MS / 1000),
+				 errdetail("Until then, its data is falling behind, and Odoo reads from this server instead."),
+				 errhint("See the standby's log for why it cannot connect; a change to pg_hba.conf or to the role it connects as is the usual cause.")));
+	else
+		ereport(WARNING,
+				(errmsg("dbblue create standby: the standby in \"%s\" has not replayed past %X/%08X for %ld seconds, restarting it to refuse connections until it has caught up",
+						dir, LSN_FORMAT_ARGS(standby_last_apply),
+						DBBLUE_STANDBY_STALL_MS / 1000),
+				 errdetail("This server has flushed up to %X/%08X. Until the standby has caught up, its data is falling behind, and Odoo reads from this server instead.",
+						   LSN_FORMAT_ARGS(standby_last_flush)),
+				 errhint("Replay may have been paused with pg_wal_replay_pause(), or held up by a query on the standby; see the standby's log.")));
+	return true;
 }
 
 /*
@@ -3124,6 +3321,7 @@ run_standby_tick(void)
 	int			port;
 	bool		ok;
 	bool		encrypt_wal;
+	bool		fenced;
 	char	   *connopts;
 	off_t		logsize;
 
@@ -3210,20 +3408,33 @@ run_standby_tick(void)
 		return false;
 	}
 
+	/* a fenced standby is started fenced again; see standby_fence_changes() */
+	fenced = standby_fenced(dir);
+
 	/*
 	 * Nothing to do while the standby postmaster is alive, but to make sure
-	 * its port is reported -- unless it runs with less than it needs of a
-	 * setting it must have at least as high as ours.  It is then stopped, and
-	 * started again below with what it needs; see standby_limits_behind().
+	 * its port is reported, unless it is fenced -- or to restart it, fenced
+	 * or not as it now must be, or with what it needs of a setting it must
+	 * have at least as high as ours; see standby_limits_behind().
 	 */
 	if (standby_is_running(dir))
 	{
-		if (!standby_limits_behind(dir))
+		bool		refence = standby_fence_changes(dir, fenced);
+
+		if (!refence && !standby_limits_behind(dir))
 		{
-			sync_standby_port(dir);
+			if (!fenced)
+				sync_standby_port(dir);
 			pfree(logfile);
 			pfree(dir);
 			return true;
+		}
+
+		if (refence)
+		{
+			fenced = !fenced;
+			/* tooling must not be sent to it while it restarts fenced */
+			forget_standby_port();
 		}
 
 		if (!stop_standby(dir, logfile))
@@ -3463,12 +3674,17 @@ run_standby_tick(void)
 		return false;
 	}
 
-	if (!write_standby_settings(dir, port))
+	if (!write_standby_settings(dir, port, fenced))
 	{
 		pfree(logfile);
 		pfree(dir);
 		return false;
 	}
+
+	/* what standby_replication() saw was of the standby before this start */
+	standby_last_apply = InvalidXLogRecPtr;
+	standby_last_flush = InvalidXLogRecPtr;
+	standby_stalled_since = 0;
 
 	/*
 	 * The port may differ from the last start's, and until the standby is up
@@ -3565,7 +3781,11 @@ run_standby_tick(void)
 				(errmsg("dbblue create standby: standby in \"%s\" is still starting; its port will be reported once it accepts connections",
 						dir)));
 
-	if (ok)
+	if (ok && fenced)
+		ereport(LOG,
+				(errmsg("dbblue create standby: standby is running on port %d (data directory \"%s\"), refusing connections until it has caught up with this server",
+						port, dir)));
+	else if (ok)
 		report_standby_port(dir, port);
 
 	pfree(logfile);
