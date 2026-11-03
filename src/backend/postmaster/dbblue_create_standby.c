@@ -132,8 +132,14 @@ char	   *dbblue_standby_user = NULL;
 #define DBBLUE_DEBIAN_CONF_DIR	"/etc/postgresql"
 #endif
 
-/* Stop retrying after this many consecutive failures (reset on SIGHUP). */
-#define DBBLUE_STANDBY_MAX_FAILURES		5
+/*
+ * Retry a failure on the next tick this many times in a row, then ever less
+ * often: after DBBLUE_STANDBY_BACKOFF_MIN_MS, doubled with each further
+ * failure up to DBBLUE_STANDBY_BACKOFF_MAX_MS.  See failure_retry_delay().
+ */
+#define DBBLUE_STANDBY_QUICK_RETRIES	5
+#define DBBLUE_STANDBY_BACKOFF_MIN_MS	60000L
+#define DBBLUE_STANDBY_BACKOFF_MAX_MS	3600000L
 
 /* How often to look again for disk space to build the standby in. */
 #define DBBLUE_STANDBY_SPACE_RECHECK_MS	60000L
@@ -237,6 +243,9 @@ typedef enum
 } StandbyReplication;
 
 static int	consecutive_failures = 0;
+
+/* No attempt before this, after a failure; 0 for at once. */
+static TimestampTz retry_at = 0;
 
 /* Whether warn_unlimited_slot_wal() has spoken since the last reload. */
 static bool slot_wal_limit_warned = false;
@@ -2517,8 +2526,9 @@ apply_config_reload(void)
 {
 	ConfigReloadPending = false;
 	ProcessConfigFile(PGC_SIGHUP);
-	/* give a hand-fixed setup a fresh set of attempts */
+	/* give a hand-fixed setup a fresh set of attempts, starting now */
 	consecutive_failures = 0;
+	retry_at = 0;
 	/* and repeat the warning if the limit is still missing */
 	slot_wal_limit_warned = false;
 	/* and look for disk space for the standby again at once */
@@ -3018,7 +3028,8 @@ clear_standby_slot_xmin(bool only_idle)
  * standby_fence_changes(), and refuses queries.
  *
  * Called every tick while dbblue_create_standby is on or paused, whether or
- * not the standby itself is looked after, so also once paused or given up.
+ * not the standby itself is looked after, so also once paused, or while
+ * waiting to retry a failure.
  */
 static void
 release_idle_slot_xmin(void)
@@ -3850,7 +3861,7 @@ standby_has_room(const char *dir)
  * each one to the directory it has here, unless told otherwise with -T, and
  * on the same host that is our own: it finds it not empty and gives up.  Not
  * before -c fast has forced a checkpoint on us, though, and the failure would
- * be retried until we give up too, a checkpoint each time, with a hint to fix
+ * be retried for as long as we run, a checkpoint each time, with a hint to fix
  * what cannot be fixed.  So we say why once, until the tablespaces are gone or
  * the configuration is reloaded, and build the standby once they are gone.
  * If pg_tblspc cannot be read, the copy goes ahead, as it did before.
@@ -4790,6 +4801,34 @@ stop_standby_at_shutdown(void)
 }
 
 /*
+ * failure_retry_delay
+ *		How long to wait, in milliseconds, before trying again after failures
+ *		failures in a row.
+ *
+ * A failure is first retried on the next tick: most clear up by then, as a
+ * port taken for a moment.  One that keeps coming back is retried less and
+ * less often, but never given up on: the standby of a primary left alone at
+ * night, which died while, say, its disk was full, comes back once the disk
+ * has room again, instead of staying down until somebody reloads.  At most
+ * once an hour, a problem that lasts -- a bad directory, a pg_basebackup
+ * that always fails -- costs one attempt and one warning.
+ */
+static long
+failure_retry_delay(int failures)
+{
+	long		delay = DBBLUE_STANDBY_BACKOFF_MIN_MS;
+
+	if (failures < DBBLUE_STANDBY_QUICK_RETRIES)
+		return DBBLUE_STANDBY_NAPTIME_MS;
+
+	for (int i = DBBLUE_STANDBY_QUICK_RETRIES;
+		 i < failures && delay < DBBLUE_STANDBY_BACKOFF_MAX_MS;
+		 i++)
+		delay *= 2;
+	return Min(delay, DBBLUE_STANDBY_BACKOFF_MAX_MS);
+}
+
+/*
  * DbblueCreateStandbyMain
  *		Entry point for the dbblue create standby background worker.
  */
@@ -4824,14 +4863,22 @@ DbblueCreateStandbyMain(Datum main_arg)
 		{
 			bool		on = (dbblue_create_standby == DBBLUE_STANDBY_ON);
 
-			/* even once we have given up, as the slot then holds back WAL */
+			/* even while waiting to retry, as the slot then holds back WAL */
 			if (dbblue_create_standby != DBBLUE_STANDBY_OFF)
 				warn_unlimited_slot_wal();
 
-			if (consecutive_failures < DBBLUE_STANDBY_MAX_FAILURES &&
-				(on || dbblue_create_standby != standby_mode_applied))
+			/*
+			 * After a failure, wait as long as failure_retry_delay() says,
+			 * counted from when the attempt started, so that the next tick
+			 * after the naptime finds it over.  Not merely until the next
+			 * tick: our latch is set as we start, and the first wait ends at
+			 * once, which would spend the second attempt within a second.
+			 */
+			if ((on || dbblue_create_standby != standby_mode_applied) &&
+				GetCurrentTimestamp() >= retry_at)
 			{
 				bool		ok;
+				TimestampTz started = GetCurrentTimestamp();
 
 				if (on)
 				{
@@ -4846,19 +4893,28 @@ DbblueCreateStandbyMain(Datum main_arg)
 				}
 
 				if (ok)
+				{
 					consecutive_failures = 0;
+					retry_at = 0;
+				}
 				else
 				{
-					consecutive_failures++;
-					if (consecutive_failures == DBBLUE_STANDBY_MAX_FAILURES)
+					long		delay;
+
+					if (consecutive_failures < INT_MAX)
+						consecutive_failures++;
+					delay = failure_retry_delay(consecutive_failures);
+					retry_at = TimestampTzPlusMilliseconds(started, delay);
+					if (consecutive_failures >= DBBLUE_STANDBY_QUICK_RETRIES)
 						ereport(WARNING,
-								(errmsg("dbblue create standby: giving up after %d consecutive failures",
-										consecutive_failures),
-								 errhint("Fix the underlying problem, then reload the configuration (SELECT pg_reload_conf()) to retry.")));
+								(errmsg("dbblue create standby: %d consecutive failures; retrying in %ld min",
+										consecutive_failures,
+										delay / 60000L),
+								 errhint("Fix the underlying problem; reloading the configuration (SELECT pg_reload_conf()) retries at once.")));
 				}
 			}
 
-			/* even once paused or given up, as the slot then holds back VACUUM */
+			/* even once paused or waiting to retry, as the slot holds back VACUUM */
 			if (dbblue_create_standby != DBBLUE_STANDBY_OFF)
 				release_idle_slot_xmin();
 		}
