@@ -467,7 +467,7 @@ error:
 		connection_warnings(true);
 		if (!pset.quiet)
 			printf(_("Type \"help\" for help.\n"));
-			printf(_("Welcome to Dbblue database - made by Cybrosys Technologies\n"));
+			printf(_("Welcome to Dbblue database - made by Cybrosys Technologies\n\n"));
 
 		initializeInput(options.no_readline ? 0 : 1);
 		successResult = MainLoop(stdin);
