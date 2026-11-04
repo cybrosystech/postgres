@@ -1,0 +1,5 @@
+# cobalt extension
+comment = 'cobalt access method - bitmap-posting trigram index for LIKE/ILIKE'
+default_version = '1.0'
+module_pathname = '$libdir/cobalt'
+relocatable = true
