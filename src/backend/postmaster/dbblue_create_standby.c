@@ -1866,9 +1866,13 @@ standby_limits_behind(const char *dir)
  * holds them as they were then, and overrides it, and an ALTER SYSTEM of ours
  * since never reaches the standby.  A value raised here is reported.
  *
- * hot_standby is set off if fenced, and otherwise left to our postgresql.conf;
- * see standby_fence_changes().  Kept here, the fence lasts across restarts of
- * the standby, of ours, and of this worker, until it is lifted.
+ * hot_standby is set off if fenced, and on otherwise; see
+ * standby_fence_changes().  Kept here, the fence lasts across restarts of the
+ * standby, of ours, and of this worker, until it is lifted.  On is set too,
+ * not left to our postgresql.conf: hot_standby does nothing on a primary, so
+ * an off there goes unnoticed -- left from when we were a standby ourselves,
+ * say -- and would have the standby refuse every connection while it is
+ * reported as running, and stay so once the fence is lifted.
  *
  * Only the last primary_conninfo and primary_slot_name are kept, which are
  * the ones -R just appended.  Any earlier ones came with the copy -- we were
@@ -1982,8 +1986,7 @@ write_standby_settings(const char *dir, int port, bool fenced)
 	append_conf_string(&buf, "unix_socket_directories",
 					   Unix_socket_directories ? Unix_socket_directories : "");
 	appendStringInfoString(&buf, "hot_standby_feedback = on\n");
-	if (fenced)
-		appendStringInfoString(&buf, "hot_standby = off\n");
+	appendStringInfo(&buf, "hot_standby = %s\n", fenced ? "off" : "on");
 	appendStringInfoString(&buf, "dbblue_create_standby = off\n");
 	appendStringInfoString(&buf, "dbblue_standby_directory = ''\n");
 
