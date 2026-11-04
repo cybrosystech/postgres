@@ -327,6 +327,68 @@ standby_directory_path(const char *dir)
 }
 
 /*
+ * real_path_of
+ *		path with its symbolic links resolved, palloc'd.  A path that does not
+ *		exist yet, such as the default standby directory before its first
+ *		build, is resolved through its parent; failing that, path is returned
+ *		as it is.
+ */
+static char *
+real_path_of(const char *path)
+{
+	char	   *real = realpath(path, NULL);
+	char	   *result;
+
+	if (real == NULL && errno == ENOENT)
+	{
+		char		parent[MAXPGPATH];
+		const char *last = last_dir_separator(path);
+
+		strlcpy(parent, path, sizeof(parent));
+		get_parent_directory(parent);
+		if (last != NULL && parent[0] != '\0' &&
+			(real = realpath(parent, NULL)) != NULL)
+		{
+			result = psprintf("%s/%s", real, last + 1);
+			free(real);
+			return result;
+		}
+	}
+
+	if (real == NULL)
+		return pstrdup(path);
+	result = pstrdup(real);
+	free(real);
+	return result;
+}
+
+/*
+ * path_inside_data_dir
+ *		Is dir our data directory, or inside it?
+ *
+ * By its path, and also by where its symbolic links lead: a directory
+ * elsewhere that is, or sits under, a link into our data directory is inside
+ * it all the same, and every base backup would copy the standby into itself.
+ */
+static bool
+path_inside_data_dir(const char *dir)
+{
+	char	   *real_data;
+	char	   *real_dir;
+	bool		inside;
+
+	if (path_is_prefix_of_path(DataDir, dir))
+		return true;
+
+	real_data = real_path_of(DataDir);
+	real_dir = real_path_of(dir);
+	inside = path_is_prefix_of_path(real_data, real_dir);
+	pfree(real_data);
+	pfree(real_dir);
+	return inside;
+}
+
+/*
  * path_shell_unsafe_char
  *		The first character of path that pg_ctl's shell would act on, or NUL
  *		if there is none.
@@ -386,7 +448,7 @@ resolve_standby_directory(void)
 	 * check_dbblue_standby_directory() refuses this for ALTER SYSTEM, but
 	 * not for a value read from the configuration file.
 	 */
-	if (path_is_prefix_of_path(DataDir, result))
+	if (path_inside_data_dir(result))
 	{
 		ereport(WARNING,
 				(errmsg("dbblue create standby: directory \"%s\" is the data directory of this server or lies inside it",
@@ -2136,12 +2198,14 @@ write_standby_settings(const char *dir, int port, bool fenced)
 	}
 	pfree(buf.data);
 
-	if (rename(tmppath, path) != 0)
+	/*
+	 * Durably: a rename alone may not survive a power loss, and leave the
+	 * file empty or as it was -- the standby's postgresql.auto.conf without
+	 * its primary_conninfo or its fence, say.  durable_rename() reports why
+	 * it failed.
+	 */
+	if (durable_rename(tmppath, path, WARNING) != 0)
 	{
-		ereport(WARNING,
-				(errcode_for_file_access(),
-				 errmsg("dbblue create standby: could not rename \"%s\" to \"%s\": %m",
-						tmppath, path)));
 		unlink(tmppath);
 		return false;
 	}
@@ -2199,12 +2263,14 @@ write_data_dir_file(const char *name, const char *contents)
 		return false;
 	}
 
-	if (rename(tmppath, path) != 0)
+	/*
+	 * Durably: a rename alone may not survive a power loss, and leave the
+	 * file empty or as it was -- the standby's postgresql.auto.conf without
+	 * its primary_conninfo or its fence, say.  durable_rename() reports why
+	 * it failed.
+	 */
+	if (durable_rename(tmppath, path, WARNING) != 0)
 	{
-		ereport(WARNING,
-				(errcode_for_file_access(),
-				 errmsg("dbblue create standby: could not rename \"%s\" to \"%s\": %m",
-						tmppath, path)));
 		unlink(tmppath);
 		return false;
 	}
@@ -4416,15 +4482,6 @@ run_standby_tick(void)
 			return false;
 		}
 
-		/*
-		 * With pg_tde WAL encryption on, the walsender hands pg_basebackup
-		 * plaintext WAL while the copied pg_tde/wal_keys says that range is
-		 * encrypted.  Without -E the standby's own WAL from the copy window
-		 * would therefore be plaintext on disk and unreadable to it, and it
-		 * could only start by re-fetching that WAL from us -- impossible
-		 * once we have recycled it.  -E re-encrypts that WAL with a fresh
-		 * key and writes a matching wal_keys, but needs pg_tde seeded first.
-		 */
 		/* a copy that cannot succeed would force checkpoints; see there */
 		if (!standby_copyable())
 		{
@@ -4461,6 +4518,15 @@ run_standby_tick(void)
 			return false;
 		}
 
+		/*
+		 * With pg_tde WAL encryption on, the walsender hands pg_basebackup
+		 * plaintext WAL while the copied pg_tde/wal_keys says that range is
+		 * encrypted.  Without -E the standby's own WAL from the copy window
+		 * would therefore be plaintext on disk and unreadable to it, and it
+		 * could only start by re-fetching that WAL from us -- impossible
+		 * once we have recycled it.  -E re-encrypts that WAL with a fresh
+		 * key and writes a matching wal_keys, but needs pg_tde seeded first.
+		 */
 		encrypt_wal = primary_uses_wal_encryption();
 		if (encrypt_wal && !seed_standby_tde_dir(dir))
 		{
@@ -4646,13 +4712,6 @@ run_standby_tick(void)
 		cmd = psprintf("%s -D %s -l %s -o %s -w -t 60 start",
 					   qbin, qdir, qlog, qopts);
 
-		// for(int i=0; i<strlen(cmd);i++)
-		// {
-		// 	if (cmd[i]=='$')
-		// 	{
-
-		// 	};
-		// };
 		pfree(qopts);
 		pfree(opts);
 		pfree(qlog);
@@ -4775,7 +4834,7 @@ check_dbblue_standby_directory(char **newval, void **extra, GucSource source)
 	if (strlen(dir) >= MAXPGPATH - 32)
 		GUC_check_errdetail("Path \"%s\" is too long (maximum %d bytes).",
 							dir, MAXPGPATH - 33);
-	else if (path_is_prefix_of_path(DataDir, dir))
+	else if (path_inside_data_dir(dir))
 	{
 		GUC_check_errdetail("Path \"%s\" is the data directory of this server or lies inside it.",
 							dir);
