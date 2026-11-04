@@ -4464,8 +4464,19 @@ run_standby_tick(void)
 			 * either way.  The directory was empty, or held only our seed,
 			 * when we started, so clearing its contents loses nothing.  Any
 			 * left over keep the marker, for the next tick to clear.
+			 *
+			 * Not while we shut down, though: a partial copy may be most of
+			 * our size, and the postmaster waits for us to exit before it
+			 * can finish -- past systemd's stop timeout, say, which then
+			 * kills it.  The marker stays, and the next start clears the
+			 * copy as an interrupted build, as vet_existing_standby() and
+			 * drop_standby_slot() leave their own work to it.
 			 */
-			if (stat(dir, &st) != 0 || rmtree(dir, false))
+			if (ShutdownRequestPending)
+				ereport(LOG,
+						(errmsg("dbblue create standby: leaving the partial copy in \"%s\" for the next start to clear, as this server is shutting down",
+								dir)));
+			else if (stat(dir, &st) != 0 || rmtree(dir, false))
 				(void) unmark_standby_build(dir);
 
 			/*
