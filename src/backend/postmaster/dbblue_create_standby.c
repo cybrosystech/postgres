@@ -3603,7 +3603,18 @@ vet_existing_standby(const char *dir, const char *logfile)
 			{
 				char	   *their_host = NULL;
 				char	   *their_port = NULL;
+				char	   *our_host = replication_host();
 
+				/*
+				 * Our own standby after our port or socket directory changed
+				 * looks just the same as a copy's, and is not taken for ours
+				 * without proof: a copy of our data directory carries every
+				 * mark of ours.  But it needs no rebuild, only to be pointed
+				 * at us again, so say how, with the address a standby built
+				 * now would get.  The slot still holds what it needs to
+				 * catch up.  A reload makes us look again at once, rather
+				 * than after the wait failure_retry_delay() may have reached.
+				 */
 				forget_standby_port();
 				(void) standby_follows_us(dir, &their_host, &their_port);
 				ereport(WARNING,
@@ -3613,8 +3624,10 @@ vet_existing_standby(const char *dir, const char *logfile)
 								   their_port ? their_port : "?",
 								   their_host ? their_host : "?",
 								   PostPortNumber),
-						 errhint("This server is most likely a copy of that one: point dbblue_standby_directory elsewhere, or turn dbblue_create_standby off here. If instead this server's port or socket directory has changed, remove \"%s\" to have a new standby built.",
-								 dir)));
+						 errhint("This server is most likely a copy of that one: point dbblue_standby_directory elsewhere, or turn dbblue_create_standby off here. If instead this server's port or socket directory has changed, keep the standby by setting port=%d and host=%s in primary_conninfo in \"%s/%s\", then reload the configuration (SELECT pg_reload_conf()); or remove \"%s\" to have a new standby built.",
+								 PostPortNumber, our_host,
+								 dir, PG_AUTOCONF_FILENAME, dir)));
+				pfree(our_host);
 				if (their_host)
 					pfree(their_host);
 				if (their_port)
