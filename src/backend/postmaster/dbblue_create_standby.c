@@ -3042,6 +3042,30 @@ standby_server_opts(const char *dir)
 }
 
 /*
+ * standby_slot_invalidation
+ *		Why our replication slot was invalidated, or RS_INVAL_NONE if it is
+ *		still valid or does not exist.
+ */
+static ReplicationSlotInvalidationCause
+standby_slot_invalidation(void)
+{
+	ReplicationSlot *slot;
+	ReplicationSlotInvalidationCause cause = RS_INVAL_NONE;
+
+	LWLockAcquire(ReplicationSlotControlLock, LW_SHARED);
+	slot = SearchNamedReplicationSlot(DBBLUE_STANDBY_SLOT, false);
+	if (slot != NULL)
+	{
+		SpinLockAcquire(&slot->mutex);
+		cause = slot->data.invalidated;
+		SpinLockRelease(&slot->mutex);
+	}
+	LWLockRelease(ReplicationSlotControlLock);
+
+	return cause;
+}
+
+/*
  * standby_slot_state
  *		Does our replication slot exist, is it still usable, and is a process
  *		streaming from it?
@@ -3661,7 +3685,8 @@ retire_previous_standby(const char *dir)
  *
  * Only a standby of ours is ever stopped or deleted here, and only once our
  * replication slot has been invalidated or is gone.  Invalidated, it fell
- * more than max_slot_wal_keep_size behind, the WAL it needs is gone, and it
+ * more than max_slot_wal_keep_size behind, or its slot went unused for
+ * longer than idle_replication_slot_timeout; the WAL it needs is gone, and it
  * would otherwise sit there forever -- alive, so never restarted, serving
  * ever staler reads.  Gone, it was dropped by dbblue_create_standby = off,
  * by hand, or with the rest of a data directory restored from a backup, and
@@ -3805,10 +3830,34 @@ vet_existing_standby(const char *dir, const char *logfile)
 			/* returned above */
 			break;
 		case STANDBY_SLOT_INVALIDATED:
-			ereport(WARNING,
-					(errmsg("dbblue create standby: replication slot \"%s\" has been invalidated, rebuilding the standby in \"%s\"",
-							DBBLUE_STANDBY_SLOT, dir),
-					 errdetail("The standby fell more than max_slot_wal_keep_size behind, and the WAL it still needed has been removed.")));
+			{
+				/*
+				 * Say why, as the cure differs: a standby that fell behind
+				 * needs a larger max_slot_wal_keep_size, while one whose slot
+				 * went unused -- paused, or stopped -- needs a longer
+				 * idle_replication_slot_timeout, or none, and raising the
+				 * former would only have the same happen again.
+				 */
+				ReplicationSlotInvalidationCause cause = standby_slot_invalidation();
+
+				if (cause == RS_INVAL_IDLE_TIMEOUT)
+					ereport(WARNING,
+							(errmsg("dbblue create standby: replication slot \"%s\" has been invalidated, rebuilding the standby in \"%s\"",
+									DBBLUE_STANDBY_SLOT, dir),
+							 errdetail("The slot went unused for longer than idle_replication_slot_timeout, as it does while the standby is paused or stopped, and the WAL the standby still needed has been removed."),
+							 errhint("To keep the standby across such pauses, raise idle_replication_slot_timeout, or set it to 0.")));
+				else if (cause == RS_INVAL_WAL_REMOVED)
+					ereport(WARNING,
+							(errmsg("dbblue create standby: replication slot \"%s\" has been invalidated, rebuilding the standby in \"%s\"",
+									DBBLUE_STANDBY_SLOT, dir),
+							 errdetail("The standby fell more than max_slot_wal_keep_size behind, and the WAL it still needed has been removed.")));
+				else
+					ereport(WARNING,
+							(errmsg("dbblue create standby: replication slot \"%s\" has been invalidated, rebuilding the standby in \"%s\"",
+									DBBLUE_STANDBY_SLOT, dir),
+							 errdetail("The slot was invalidated because of \"%s\".",
+									   GetSlotInvalidationCauseName(cause))));
+			}
 			break;
 		case STANDBY_SLOT_ABSENT:
 			ereport(LOG,
