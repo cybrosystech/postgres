@@ -70,6 +70,7 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <sys/socket.h>
@@ -87,6 +88,7 @@
 #include "catalog/pg_control.h"
 #include "common/file_perm.h"
 #include "common/file_utils.h"
+#include "common/ip.h"
 #include "lib/stringinfo.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
@@ -1316,9 +1318,101 @@ socket_port_in_use(int port)
 }
 
 /*
+ * listen_port_taken
+ *		Does something already listen on port at one of the addresses in our
+ *		listen_addresses, which the standby is given too?  If so, set *where
+ *		to that entry, palloc'd.
+ *
+ * The loopback probe in port_is_free() sees only 127.0.0.1.  With
+ * listen_addresses naming another address, a daemon holding the port there
+ * goes unseen, and the standby fails to start on it: "could not create any
+ * TCP/IP sockets".  As that port is then the one it was last given, the next
+ * tick would prefer it again, and so on for good.  So the addresses are
+ * resolved and bound as the postmaster does (see ListenServerPort()),
+ * with SO_REUSEADDR, and IPV6_V6ONLY for IPv6.  Only a port in use counts:
+ * an address that is not on this host, or a name that does not resolve, is
+ * no reason to move to another port, as the standby would fail on any.
+ */
+static bool
+listen_port_taken(int port, char **where)
+{
+	char	   *rawstring;
+	List	   *elemlist;
+	ListCell   *lc;
+	char		service[16];
+	bool		taken = false;
+
+	if (ListenAddresses == NULL || ListenAddresses[0] == '\0')
+		return false;
+
+	snprintf(service, sizeof(service), "%d", port);
+	rawstring = pstrdup(ListenAddresses);
+	if (!SplitGUCList(rawstring, ',', &elemlist))
+	{
+		pfree(rawstring);
+		return false;
+	}
+
+	foreach(lc, elemlist)
+	{
+		char	   *host = (char *) lfirst(lc);
+		struct addrinfo hints;
+		struct addrinfo *addrs = NULL;
+
+		memset(&hints, 0, sizeof(hints));
+		hints.ai_family = AF_UNSPEC;
+		hints.ai_flags = AI_PASSIVE;
+		hints.ai_socktype = SOCK_STREAM;
+
+		if (pg_getaddrinfo_all(strcmp(host, "*") == 0 ? NULL : host,
+							   service, &hints, &addrs) != 0 || addrs == NULL)
+		{
+			if (addrs)
+				pg_freeaddrinfo_all(hints.ai_family, addrs);
+			continue;
+		}
+
+		for (struct addrinfo *ai = addrs; ai != NULL && !taken; ai = ai->ai_next)
+		{
+			int			sock;
+			int			one = 1;
+
+			if (ai->ai_family != AF_INET && ai->ai_family != AF_INET6)
+				continue;
+			sock = socket(ai->ai_family, SOCK_STREAM, 0);
+			if (sock < 0)
+				continue;
+			(void) setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (char *) &one,
+							  sizeof(one));
+#ifdef IPV6_V6ONLY
+			if (ai->ai_family == AF_INET6)
+				(void) setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY,
+								  (char *) &one, sizeof(one));
+#endif
+			if (bind(sock, ai->ai_addr, ai->ai_addrlen) != 0 &&
+				errno == EADDRINUSE)
+				taken = true;
+			close(sock);
+		}
+		pg_freeaddrinfo_all(hints.ai_family, addrs);
+
+		if (taken)
+		{
+			*where = pstrdup(host);
+			break;
+		}
+	}
+
+	list_free(elemlist);
+	pfree(rawstring);
+	return taken;
+}
+
+/*
  * port_is_free
- *		Is port free both over TCP on the loopback interface and for the Unix
- *		socket in each of our socket directories?
+ *		Is port free both over TCP on the loopback interface and at each of
+ *		our listen_addresses, and for the Unix socket in each of our socket
+ *		directories?
  *
  * The probe sets SO_REUSEADDR, as the postmaster does on its own sockets.
  * Without it, the connections a standby closed as it stopped hold its port
@@ -1353,6 +1447,20 @@ port_is_free(int port)
 
 	free_port = (bind(sock, (struct sockaddr *) &addr, sizeof(addr)) == 0);
 	close(sock);
+
+	if (free_port)
+	{
+		char	   *where = NULL;
+
+		if (listen_port_taken(port, &where))
+		{
+			ereport(LOG,
+					(errmsg("dbblue create standby: port %d is free on 127.0.0.1, but taken at listen address \"%s\"; trying another port",
+							port, where)));
+			pfree(where);
+			free_port = false;
+		}
+	}
 
 	if (free_port && socket_port_in_use(port))
 	{
