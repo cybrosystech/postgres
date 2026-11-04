@@ -8,7 +8,7 @@
 
 project('postgresql',
   ['c'],
-  version: '19beta2',
+  version: '19rc1',
   license: 'PostgreSQL',
 
   # We want < 0.62 for python 3.6 compatibility on old platforms.
@@ -2200,6 +2200,12 @@ common_functional_flags = [
   # Disable optimizations that assume no overflow; needed for gcc 4.3+
   '-fwrapv',
   '-fexcess-precision=standard',
+  # Without -fpch-deps gcc emits dependencies that are insufficient for ccache
+  # to trigger a rebuild when the precompiled header changes. We could make
+  # this depend on using gcc and precompiled headers being enabled, but that's
+  # probably not worth it.  See also
+  # https://github.com/ccache/ccache/issues/1686
+  '-fpch-deps',
 ]
 
 cflags += cc.get_supported_arguments(common_functional_flags)
@@ -3865,13 +3871,30 @@ meson_install_args = meson_args + ['install'] + {
 # setup tests should be run first,
 # so define priority for these
 setup_tests_priority = 100
+
+# Depend on a single stamp custom_target rather than on installed_targets
+# directly.  On Windows, meson adds the build directory of every target in a
+# test's 'depends:' to the test's PATH, and with NLS enabled installed_targets
+# includes hundreds of per-locale .mo targets, pushing PATH past the Windows
+# length limit.  A custom_target's own dependencies are not walked for this
+# purpose, so the stamp adds at most one entry, while still forcing
+# installed_targets to be built first.  This indirection can be removed once
+# we mandate a meson version with the upstream fix
+# (https://github.com/mesonbuild/meson/pull/16039, expected in 1.13).
+installed_targets_stamp = custom_target('installed-targets-stamp',
+  output: 'installed-targets-stamp',
+  command: [python, '-c', 'pass'],
+  depends: installed_targets,
+  build_always_stale: true,
+)
+
 test('tmp_install',
     meson_bin, args: meson_install_args ,
     env: {'DESTDIR':test_install_destdir},
     priority: setup_tests_priority,
     timeout: 300,
     is_parallel: false,
-    depends: installed_targets,
+    depends: installed_targets_stamp,
     suite: ['setup'])
 
 test('install_test_files',

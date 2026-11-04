@@ -657,12 +657,15 @@ sub init
 	# disabled, use a previously initdb'd cluster as a template by copying it.
 	# For a lot of tests, that's substantially cheaper. It does not seem
 	# worth figuring out whether extra parameters affect compatibility, so
-	# initdb is forced if any are defined.
+	# initdb is forced if any are defined.  The template was created by the
+	# installation under test, so it can't be used for a node using a
+	# different installation.
 	#
 	# There's very similar code in pg_regress.c, but we can't easily
 	# deduplicate it until we require perl at build time.
 	if (   $params{force_initdb}
 		or defined $params{extra}
+		or defined $self->{_install_path}
 		or !defined $ENV{INITDB_TEMPLATE})
 	{
 		note("initializing database system by running initdb");
@@ -2796,8 +2799,10 @@ sub poll_query_until
 
 	# Give up. Print the output from the last attempt, hopefully that's useful
 	# for debugging.
+	my $msg_query = $query;
+	$msg_query = '(connection attempt only)' unless defined $query;
 	diag qq(poll_query_until timed out executing this query:
-$query
+$msg_query
 expecting this output:
 $expected
 last actual query output:
@@ -3988,42 +3993,6 @@ sub advance_wal
 			SELECT pg_switch_wal();
 			});
 	}
-}
-
-=item $node->checksum_enable_offline()
-
-Enable data page checksums in an offline cluster with B<pg_checksums>. The
-caller is responsible for ensuring that the cluster is in the right state for
-this operation.
-
-=cut
-
-sub checksum_enable_offline
-{
-	my ($self) = @_;
-
-	print "# Enabling checksums in \"$self->data_dir\"\n";
-	PostgreSQL::Test::Utils::system_or_bail('pg_checksums', '-D',
-		$self->data_dir, '-e');
-	return;
-}
-
-=item $node->checksum_disable_offline()
-
-Disable data page checksums in an offline cluster with B<pg_checksums>. The
-caller is responsible for ensuring that the cluster is in the right state for
-this operation.
-
-=cut
-
-sub checksum_disable_offline
-{
-	my ($self) = @_;
-
-	print "# Disabling checksums in \"$self->data_dir\"\n";
-	PostgreSQL::Test::Utils::system_or_bail('pg_checksums', '-D',
-		$self->data_dir, '-d');
-	return;
 }
 
 =pod

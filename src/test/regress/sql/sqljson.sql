@@ -152,6 +152,17 @@ SELECT JSON_OBJECT(1: 1, '2': NULL, '1': 1 ABSENT ON NULL WITH UNIQUE RETURNING 
 SELECT JSON_OBJECT(1: 1, '2': NULL, '1': 1 ABSENT ON NULL WITHOUT UNIQUE RETURNING jsonb);
 SELECT JSON_OBJECT(1: 1, '2': NULL, '3': 1, 4: NULL, '5': 'a' ABSENT ON NULL WITH UNIQUE RETURNING jsonb);
 
+-- the RETURNING coercion must not pick up the test value of an enclosing CASE
+SELECT CASE 'x' WHEN JSON_OBJECT('a': 'b' RETURNING text) THEN 1 ELSE 0 END;
+
+-- the RETURNING coercion must not prevent inlining of a SQL function
+CREATE FUNCTION json_object_inline_test(text) RETURNS text
+LANGUAGE sql IMMUTABLE AS $$ SELECT $1 || '!' $$;
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT json_object_inline_test(JSON_OBJECT('a': 'b' RETURNING text));
+SELECT json_object_inline_test(JSON_OBJECT('a': 'b' RETURNING text));
+DROP FUNCTION json_object_inline_test(text);
+
 -- BUG: https://postgr.es/m/CADXhmgTJtJZK9A3Na_ry%2BXrq-ghjcejBRhcRMzWZvbd__QdgJA%40mail.gmail.com
 -- datum_to_jsonb_internal() didn't catch keys that are casts instead of a simple scalar
 CREATE TYPE mood AS ENUM ('happy', 'sad', 'neutral');
@@ -438,6 +449,14 @@ SELECT JSON_ARRAY(SELECT i FROM (VALUES (1), (2), (NULL), (4)) foo(i) RETURNING 
 
 CREATE VIEW json_array_subquery_view AS
 SELECT JSON_ARRAY(SELECT i FROM (VALUES (1), (2), (NULL), (4)) foo(i) RETURNING text);
+
+\sv json_array_subquery_view
+
+DROP VIEW json_array_subquery_view;
+
+-- JSON_ARRAY(subquery) with an input FORMAT clause
+CREATE VIEW json_array_subquery_view AS
+SELECT JSON_ARRAY(SELECT '{"a": 1}'::text FORMAT JSON);
 
 \sv json_array_subquery_view
 

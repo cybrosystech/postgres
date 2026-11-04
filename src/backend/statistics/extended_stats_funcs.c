@@ -234,7 +234,7 @@ expand_stxkind(HeapTuple tup, StakindFlags *enabled)
 								   Anum_pg_statistic_ext_stxkind);
 	arr = DatumGetArrayTypeP(datum);
 	if (ARR_NDIM(arr) != 1 || ARR_HASNULL(arr) || ARR_ELEMTYPE(arr) != CHAROID)
-		elog(ERROR, "stxkind is not a one-dimension char array");
+		elog(ERROR, "stxkind is not a one-dimensional char array");
 
 	kinds = (char *) ARR_DATA_PTR(arr);
 
@@ -945,8 +945,8 @@ check_all_expr_argnames_valid(JsonbContainer *cont, AttrNumber exprnum)
 		Assert(jitok == WJB_KEY);
 		Assert(jkey.type == jbvString);
 
-		/* A value must follow the key */
-		jitok = JsonbIteratorNext(&jbit, &jval, false);
+		/* A value must follow the key.  Skip nested containers. */
+		jitok = JsonbIteratorNext(&jbit, &jval, true);
 		Assert(jitok == WJB_VALUE);
 
 		/*
@@ -960,14 +960,10 @@ check_all_expr_argnames_valid(JsonbContainer *cont, AttrNumber exprnum)
 
 		if (!key_in_expr_argnames(&jkey))
 		{
-			char	   *bad_element_name = jbv_string_get_cstr(&jkey);
-
 			ereport(WARNING,
 					errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					errmsg("could not import element in expression %d: invalid key name",
 						   exprnum));
-
-			pfree(bad_element_name);
 			all_keys_valid = false;
 		}
 	}
@@ -1115,7 +1111,7 @@ import_pg_statistic(Relation pgsd, JsonbContainer *cont,
 					bool *pg_statistic_ok)
 {
 	const char *argname = extarginfo[EXPRESSIONS_ARG].argname;
-	TypeCacheEntry *typcache;
+	TypeCacheEntry *basetypcache;
 	Datum		values[Natts_pg_statistic];
 	bool		nulls[Natts_pg_statistic];
 	bool		replaces[Natts_pg_statistic];
@@ -1123,6 +1119,7 @@ import_pg_statistic(Relation pgsd, JsonbContainer *cont,
 	Datum		pgstdat = (Datum) 0;
 	Oid			elemtypid = InvalidOid;
 	Oid			elemeqopr = InvalidOid;
+	Oid			rtypid = InvalidOid;
 	bool		found[NUM_ATTRIBUTE_STATS_ELEMS] = {0};
 	JsonbValue	val[NUM_ATTRIBUTE_STATS_ELEMS] = {0};
 
@@ -1221,7 +1218,13 @@ import_pg_statistic(Relation pgsd, JsonbContainer *cont,
 	}
 
 	/* This finds the right operators even if atttypid is a domain */
-	typcache = lookup_type_cache(typid, TYPECACHE_LT_OPR | TYPECACHE_EQ_OPR);
+	basetypcache = lookup_type_cache(typid, TYPECACHE_LT_OPR |
+									 TYPECACHE_EQ_OPR |
+									 TYPECACHE_DOMAIN_BASE_INFO);
+	if (OidIsValid(basetypcache->domainBaseType))
+		basetypcache = lookup_type_cache(basetypcache->domainBaseType,
+										 TYPECACHE_LT_OPR |
+										 TYPECACHE_EQ_OPR);
 
 	statatt_init_empty_tuple(InvalidOid, InvalidAttrNumber, false,
 							 values, nulls, replaces);
@@ -1230,7 +1233,7 @@ import_pg_statistic(Relation pgsd, JsonbContainer *cont,
 	 * Special case: collation for tsvector is DEFAULT_COLLATION_OID. See
 	 * compute_tsvector_stats().
 	 */
-	if (typid == TSVECTOROID)
+	if (basetypcache->type_id == TSVECTOROID)
 		typcoll = DEFAULT_COLLATION_OID;
 
 	/*
@@ -1240,8 +1243,7 @@ import_pg_statistic(Relation pgsd, JsonbContainer *cont,
 	 */
 	if (found[MOST_COMMON_ELEMS_ELEM] || found[ELEM_COUNT_HISTOGRAM_ELEM])
 	{
-		if (!statatt_get_elem_type(typid, typcache->typtype,
-								   &elemtypid, &elemeqopr))
+		if (!statatt_get_elem_type(basetypcache, &elemtypid, &elemeqopr))
 		{
 			ereport(WARNING,
 					errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -1259,8 +1261,7 @@ import_pg_statistic(Relation pgsd, JsonbContainer *cont,
 		found[RANGE_EMPTY_FRAC_ELEM] ||
 		found[RANGE_BOUNDS_HISTOGRAM_ELEM])
 	{
-		if (typcache->typtype != TYPTYPE_RANGE &&
-			typcache->typtype != TYPTYPE_MULTIRANGE)
+		if (!statatt_get_range_type(basetypcache, &rtypid))
 		{
 			ereport(WARNING,
 					errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -1364,7 +1365,7 @@ import_pg_statistic(Relation pgsd, JsonbContainer *cont,
 
 			statatt_set_slot(values, nulls, replaces,
 							 STATISTIC_KIND_MCV,
-							 typcache->eq_opr, typcoll,
+							 basetypcache->eq_opr, typcoll,
 							 stanumbers, false, stavalues, false);
 		}
 		else
@@ -1386,7 +1387,7 @@ import_pg_statistic(Relation pgsd, JsonbContainer *cont,
 		if (val_ok)
 			statatt_set_slot(values, nulls, replaces,
 							 STATISTIC_KIND_HISTOGRAM,
-							 typcache->lt_opr, typcoll,
+							 basetypcache->lt_opr, typcoll,
 							 0, true, stavalues, false);
 		else
 			goto pg_statistic_error;
@@ -1405,7 +1406,7 @@ import_pg_statistic(Relation pgsd, JsonbContainer *cont,
 
 			statatt_set_slot(values, nulls, replaces,
 							 STATISTIC_KIND_CORRELATION,
-							 typcache->lt_opr, typcoll,
+							 basetypcache->lt_opr, typcoll,
 							 stanumbers, false, 0, true);
 		}
 		else
@@ -1476,14 +1477,8 @@ import_pg_statistic(Relation pgsd, JsonbContainer *cont,
 		Datum		stavalues;
 		bool		val_ok = false;
 		char	   *s;
-		Oid			rtypid = typid;
 
-		/*
-		 * If it's a multirange, step down to the range type, as is done by
-		 * multirange_typanalyze().
-		 */
-		if (type_is_multirange(typid))
-			rtypid = get_multirange_range(typid);
+		Assert(OidIsValid(rtypid));
 
 		s = jbv_string_get_cstr(&val[RANGE_BOUNDS_HISTOGRAM_ELEM]);
 

@@ -149,6 +149,18 @@ SELECT corr(g, 0.09), regr_r2(g, 0.09), regr_slope(g, 0.09), regr_intercept(g, 0
 SELECT corr(1.3 + g * 1e-16, 1.3 + g * 1e-16)
   FROM generate_series(1, 3) g;
 
+-- verify that we handle Inf/NaN the same regardless of position
+with data(x) as (values (1::float8),(2::float8),(3::float8))
+select covar_pop(x, 0::float8) from data;
+with data(x) as (values ('Inf'::float8),(2::float8),(3::float8))
+select covar_pop(x, 0::float8) from data;
+with data(x) as (values (1::float8),('Inf'::float8),(3::float8))
+select covar_pop(x, 0::float8) from data;
+with data(x) as (values ('NaN'::float8),(2::float8),(3::float8))
+select covar_pop(x, 0::float8) from data;
+with data(x) as (values (1::float8),('NaN'::float8),(3::float8))
+select covar_pop(x, 0::float8) from data;
+
 -- check some cases that formerly suffered from internal overflow/underflow
 SELECT corr(1e-100 + g * 1e-105, 1e-100 + g * 1e-105),
        regr_r2(1e-100 + g * 1e-105, 1e-100 + g * 1e-105)
@@ -639,60 +651,6 @@ select a, count(*) from t_having group by a having a = row(1.0)::avg_rec;
 
 drop table t_having;
 drop type avg_rec;
-
---
--- Test GROUP BY ALL
---
--- We don't care about the data here, just the proper transformation of the
--- GROUP BY clause, so test some queries and verify the EXPLAIN plans.
---
-
-CREATE TEMP TABLE t1 (
-  a int,
-  b int,
-  c int
-);
-
--- basic example
-EXPLAIN (COSTS OFF) SELECT b, COUNT(*) FROM t1 GROUP BY ALL;
-
--- multiple columns, non-consecutive order
-EXPLAIN (COSTS OFF) SELECT a, SUM(b), b FROM t1 GROUP BY ALL;
-
--- multi columns, no aggregate
-EXPLAIN (COSTS OFF) SELECT a + b FROM t1 GROUP BY ALL;
-
--- check we detect a non-top-level aggregate
-EXPLAIN (COSTS OFF) SELECT a, SUM(b) + 4 FROM t1 GROUP BY ALL;
-
--- including grouped column is okay
-EXPLAIN (COSTS OFF) SELECT a, SUM(b) + a FROM t1 GROUP BY ALL;
-
--- including non-grouped column, not so much
-EXPLAIN (COSTS OFF) SELECT a, SUM(b) + c FROM t1 GROUP BY ALL;
-
--- all aggregates, should reduce to GROUP BY ()
-EXPLAIN (COSTS OFF) SELECT COUNT(a), SUM(b) FROM t1 GROUP BY ALL;
-
--- likewise with empty target list
-EXPLAIN (COSTS OFF) SELECT FROM t1 GROUP BY ALL;
-
--- window functions are not to be included in GROUP BY, either
-EXPLAIN (COSTS OFF) SELECT a, COUNT(a) OVER (PARTITION BY a) FROM t1 GROUP BY ALL;
-
--- all cols
-EXPLAIN (COSTS OFF) SELECT *, count(*) FROM t1 GROUP BY ALL;
-
--- group by all with grouping element(s) (equivalent to GROUP BY's
--- default behavior, explicit antithesis to GROUP BY DISTINCT)
-EXPLAIN (COSTS OFF) SELECT a, count(*) FROM t1 GROUP BY ALL a;
-
--- verify deparsing of GROUP BY ALL
-CREATE TEMP VIEW v1 AS SELECT b, COUNT(*) FROM t1 GROUP BY ALL;
-SELECT pg_get_viewdef('v1'::regclass);
-
-DROP VIEW v1;
-DROP TABLE t1;
 
 --
 -- Test GROUP BY matching of join columns that are type-coerced due to USING

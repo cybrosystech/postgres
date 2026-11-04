@@ -284,9 +284,6 @@ exprType(const Node *expr)
 		case T_PlaceHolderVar:
 			type = exprType((Node *) ((const PlaceHolderVar *) expr)->phexpr);
 			break;
-		case T_GraphPropertyRef:
-			type = ((const GraphPropertyRef *) expr)->typeId;
-			break;
 		default:
 			elog(ERROR, "unrecognized node type: %d", (int) nodeTag(expr));
 			type = InvalidOid;	/* keep compiler quiet */
@@ -539,8 +536,6 @@ exprTypmod(const Node *expr)
 			return exprTypmod((Node *) ((const ReturningExpr *) expr)->retexpr);
 		case T_PlaceHolderVar:
 			return exprTypmod((Node *) ((const PlaceHolderVar *) expr)->phexpr);
-		case T_GraphPropertyRef:
-			return ((const GraphPropertyRef *) expr)->typmod;
 		default:
 			break;
 	}
@@ -1070,9 +1065,6 @@ exprCollation(const Node *expr)
 			break;
 		case T_PlaceHolderVar:
 			coll = exprCollation((Node *) ((const PlaceHolderVar *) expr)->phexpr);
-			break;
-		case T_GraphPropertyRef:
-			coll = ((const GraphPropertyRef *) expr)->collation;
 			break;
 		default:
 			elog(ERROR, "unrecognized node type: %d", (int) nodeTag(expr));
@@ -2146,8 +2138,6 @@ expression_tree_walker_impl(Node *node,
 		case T_RangeTblRef:
 		case T_SortGroupClause:
 		case T_CTESearchClause:
-		case T_GraphLabelRef:
-		case T_GraphPropertyRef:
 		case T_MergeSupportFunc:
 			/* primitive node types with no expression subnodes */
 			break;
@@ -2591,24 +2581,6 @@ expression_tree_walker_impl(Node *node,
 					return true;
 			}
 			break;
-		case T_ForPortionOfExpr:
-			{
-				ForPortionOfExpr *forPortionOf = (ForPortionOfExpr *) node;
-
-				if (WALK(forPortionOf->rangeVar))
-					return true;
-				if (WALK(forPortionOf->targetFrom))
-					return true;
-				if (WALK(forPortionOf->targetTo))
-					return true;
-				if (WALK(forPortionOf->targetRange))
-					return true;
-				if (WALK(forPortionOf->overlapsExpr))
-					return true;
-				if (WALK(forPortionOf->rangeTargetList))
-					return true;
-			}
-			break;
 		case T_PartitionPruneStepOp:
 			{
 				PartitionPruneStepOp *opstep = (PartitionPruneStepOp *) node;
@@ -2706,28 +2678,6 @@ expression_tree_walker_impl(Node *node,
 					return true;
 			}
 			break;
-		case T_GraphElementPattern:
-			{
-				GraphElementPattern *gep = (GraphElementPattern *) node;
-
-				if (WALK(gep->labelexpr))
-					return true;
-				if (WALK(gep->subexpr))
-					return true;
-				if (WALK(gep->whereClause))
-					return true;
-			}
-			break;
-		case T_GraphPattern:
-			{
-				GraphPattern *gp = (GraphPattern *) node;
-
-				if (LIST_WALK(gp->path_pattern_list))
-					return true;
-				if (WALK(gp->whereClause))
-					return true;
-			}
-			break;
 		default:
 			elog(ERROR, "unrecognized node type: %d",
 				 (int) nodeTag(node));
@@ -2778,8 +2728,6 @@ query_tree_walker_impl(Query *query,
 	if (WALK(query->mergeActionList))
 		return true;
 	if (WALK(query->mergeJoinCondition))
-		return true;
-	if (WALK(query->forPortionOf))
 		return true;
 	if (WALK(query->returningList))
 		return true;
@@ -2921,12 +2869,6 @@ range_table_entry_walker_impl(RangeTblEntry *rte,
 			break;
 		case RTE_VALUES:
 			if (WALK(rte->values_lists))
-				return true;
-			break;
-		case RTE_GRAPH_TABLE:
-			if (WALK(rte->graph_pattern))
-				return true;
-			if (WALK(rte->graph_table_columns))
 				return true;
 			break;
 		case RTE_CTE:
@@ -3075,8 +3017,6 @@ expression_tree_mutator_impl(Node *node,
 		case T_RangeTblRef:
 		case T_SortGroupClause:
 		case T_CTESearchClause:
-		case T_GraphLabelRef:
-		case T_GraphPropertyRef:
 		case T_MergeSupportFunc:
 			return copyObject(node);
 		case T_WithCheckOption:
@@ -3683,22 +3623,6 @@ expression_tree_mutator_impl(Node *node,
 				return (Node *) newnode;
 			}
 			break;
-		case T_ForPortionOfExpr:
-			{
-				ForPortionOfExpr *fpo = (ForPortionOfExpr *) node;
-				ForPortionOfExpr *newnode;
-
-				FLATCOPY(newnode, fpo, ForPortionOfExpr);
-				MUTATE(newnode->rangeVar, fpo->rangeVar, Var *);
-				MUTATE(newnode->targetFrom, fpo->targetFrom, Node *);
-				MUTATE(newnode->targetTo, fpo->targetTo, Node *);
-				MUTATE(newnode->targetRange, fpo->targetRange, Node *);
-				MUTATE(newnode->overlapsExpr, fpo->overlapsExpr, Node *);
-				MUTATE(newnode->rangeTargetList, fpo->rangeTargetList, List *);
-
-				return (Node *) newnode;
-			}
-			break;
 		case T_PartitionPruneStepOp:
 			{
 				PartitionPruneStepOp *opstep = (PartitionPruneStepOp *) node;
@@ -3830,30 +3754,6 @@ expression_tree_mutator_impl(Node *node,
 				return (Node *) newnode;
 			}
 			break;
-		case T_GraphElementPattern:
-			{
-				GraphElementPattern *gep = (GraphElementPattern *) node;
-				GraphElementPattern *newnode;
-
-				FLATCOPY(newnode, gep, GraphElementPattern);
-				MUTATE(newnode->labelexpr, gep->labelexpr, Node *);
-				MUTATE(newnode->subexpr, gep->subexpr, List *);
-				MUTATE(newnode->whereClause, gep->whereClause, Node *);
-				newnode->quantifier = list_copy(gep->quantifier);
-				return (Node *) newnode;
-			}
-			break;
-		case T_GraphPattern:
-			{
-				GraphPattern *gp = (GraphPattern *) node;
-				GraphPattern *newnode;
-
-				FLATCOPY(newnode, gp, GraphPattern);
-				MUTATE(newnode->path_pattern_list, gp->path_pattern_list, List *);
-				MUTATE(newnode->whereClause, gp->whereClause, Node *);
-				return (Node *) newnode;
-			}
-			break;
 		default:
 			elog(ERROR, "unrecognized node type: %d",
 				 (int) nodeTag(node));
@@ -3904,7 +3804,6 @@ query_tree_mutator_impl(Query *query,
 	MUTATE(query->onConflict, query->onConflict, OnConflictExpr *);
 	MUTATE(query->mergeActionList, query->mergeActionList, List *);
 	MUTATE(query->mergeJoinCondition, query->mergeJoinCondition, Node *);
-	MUTATE(query->forPortionOf, query->forPortionOf, ForPortionOfExpr *);
 	MUTATE(query->returningList, query->returningList, List *);
 	MUTATE(query->jointree, query->jointree, FromExpr *);
 	MUTATE(query->setOperations, query->setOperations, Node *);
@@ -4023,10 +3922,6 @@ range_table_mutator_impl(List *rtable,
 				break;
 			case RTE_VALUES:
 				MUTATE(newrte->values_lists, rte->values_lists, List *);
-				break;
-			case RTE_GRAPH_TABLE:
-				MUTATE(newrte->graph_pattern, rte->graph_pattern, GraphPattern *);
-				MUTATE(newrte->graph_table_columns, rte->graph_table_columns, List *);
 				break;
 			case RTE_CTE:
 			case RTE_NAMEDTUPLESTORE:
@@ -4662,18 +4557,6 @@ raw_expression_tree_walker_impl(Node *node,
 					return true;
 			}
 			break;
-		case T_RangeGraphTable:
-			{
-				RangeGraphTable *rgt = (RangeGraphTable *) node;
-
-				if (WALK(rgt->graph_pattern))
-					return true;
-				if (WALK(rgt->columns))
-					return true;
-				if (WALK(rgt->alias))
-					return true;
-			}
-			break;
 		case T_TypeName:
 			{
 				TypeName   *tn = (TypeName *) node;
@@ -4829,28 +4712,6 @@ raw_expression_tree_walker_impl(Node *node,
 				if (WALK(jaqc->output))
 					return true;
 				if (WALK(jaqc->query))
-					return true;
-			}
-			break;
-		case T_GraphElementPattern:
-			{
-				GraphElementPattern *gep = (GraphElementPattern *) node;
-
-				if (WALK(gep->labelexpr))
-					return true;
-				if (WALK(gep->subexpr))
-					return true;
-				if (WALK(gep->whereClause))
-					return true;
-			}
-			break;
-		case T_GraphPattern:
-			{
-				GraphPattern *gp = (GraphPattern *) node;
-
-				if (WALK(gp->path_pattern_list))
-					return true;
-				if (WALK(gp->whereClause))
 					return true;
 			}
 			break;

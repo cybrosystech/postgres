@@ -1843,8 +1843,8 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 				 * ignoring NULL input values.  We've nothing more to do after
 				 * finding a NULL.
 				 */
-				*op->resnull = true;
-				*op->resvalue = (Datum) 0;
+				state->resnull = true;
+				state->resvalue = (Datum) 0;
 				EEO_JUMP(op->d.hashdatum.jumpdone);
 			}
 
@@ -1891,8 +1891,8 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 				 * ignoring NULL input values.  We've nothing more to do after
 				 * finding a NULL.
 				 */
-				*op->resnull = true;
-				*op->resvalue = (Datum) 0;
+				state->resnull = true;
+				state->resvalue = (Datum) 0;
 				EEO_JUMP(op->d.hashdatum.jumpdone);
 			}
 			else
@@ -5187,6 +5187,20 @@ ExecEvalJsonCoercion(ExprState *state, ExprEvalStep *op,
 					 ExprContext *econtext)
 {
 	ErrorSaveContext *escontext = op->d.jsonexpr_coercion.escontext;
+
+	/*
+	 * If an error was saved while evaluating the ON ERROR or ON EMPTY DEFAULT
+	 * expression whose result we are to coerce, that result is going to be
+	 * discarded when the following COERCION_FINISH step throws the error.
+	 * Don't coerce it; doing so might throw a hard error or overwrite the
+	 * saved error.
+	 */
+	if (SOFT_ERROR_OCCURRED(escontext))
+	{
+		*op->resnull = true;
+		*op->resvalue = (Datum) 0;
+		return;
+	}
 
 	/*
 	 * Prepare to call json_populate_type() to coerce the boolean result of

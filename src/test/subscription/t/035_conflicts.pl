@@ -377,6 +377,155 @@ like(
 	'update target row was deleted in tab');
 
 ###############################################################################
+# Ensure that a deferrable primary key is not used to match deleted tuples in
+# a sequential table scan. Such a key cannot serve as a replica identity, so
+# the whole tuple must be compared, and a deleted row that only shares the key
+# value must not be reported as update_deleted.
+###############################################################################
+
+# Create the table and publish it from node B only, so that local changes on
+# node A are not sent back. Skip the initial copy, so that node A never has
+# the row from node B.
+$node_B->safe_psql(
+	'postgres', "
+	CREATE TABLE tab_defer (a int, b int);
+	ALTER TABLE tab_defer REPLICA IDENTITY FULL;
+	INSERT INTO tab_defer VALUES (1, 1);");
+$node_A->safe_psql('postgres', "CREATE TABLE tab_defer (a int, b int)");
+$node_B->safe_psql('postgres',
+	"ALTER PUBLICATION tap_pub_B ADD TABLE tab_defer");
+$node_A->safe_psql('postgres',
+	"ALTER SUBSCRIPTION $subname_AB REFRESH PUBLICATION WITH (copy_data = false)"
+);
+$node_A->wait_for_subscription_sync($node_B, $subname_AB);
+
+# Disable the logical replication from node B to node A
+$node_A->safe_psql('postgres', "ALTER SUBSCRIPTION $subname_AB DISABLE");
+
+# Wait for the apply worker to stop
+$node_A->poll_query_until('postgres',
+	"SELECT count(*) = 0 FROM pg_stat_activity WHERE backend_type = 'logical replication apply worker'"
+);
+
+# The primary key is created after the conflict detection slot's xmin, so it
+# cannot be used to find deleted tuples and a sequential scan is used instead.
+# Then delete a local row that has the same key but a different value.
+$node_A->safe_psql(
+	'postgres', "
+	ALTER TABLE tab_defer ADD PRIMARY KEY (a) DEFERRABLE;
+	INSERT INTO tab_defer VALUES (1, 10);
+	DELETE FROM tab_defer WHERE a = 1;");
+
+$node_B->safe_psql('postgres', "UPDATE tab_defer SET b = 2 WHERE a = 1;");
+
+$log_location = -s $node_A->logfile;
+
+$node_A->safe_psql('postgres', "ALTER SUBSCRIPTION $subname_AB ENABLE;");
+$node_B->wait_for_catchup($subname_AB);
+
+$logfile = slurp_file($node_A->logfile(), $log_location);
+like(
+	$logfile,
+	qr/conflict detected on relation "public.tab_defer": conflict=update_missing.*
+.*DETAIL:.* Could not find the row to be updated: remote row \(1, 2\), replica identity full \(1, 1\)/,
+	'deleted row matching only the deferrable primary key is not reported as update_deleted'
+);
+
+# Clean up
+$node_B->safe_psql('postgres',
+	"ALTER PUBLICATION tap_pub_B DROP TABLE tab_defer");
+$node_A->safe_psql('postgres',
+	"ALTER SUBSCRIPTION $subname_AB REFRESH PUBLICATION");
+$node_A->safe_psql('postgres', "DROP TABLE tab_defer");
+$node_B->safe_psql('postgres', "DROP TABLE tab_defer");
+
+###############################################################################
+# Check that the search for a deleted tuple rechecks a candidate found through
+# a lossy replica identity index (a GiST index on a multirange, which stores
+# only the bounding range), instead of blaming the transaction that deleted an
+# unrelated row.
+#
+# The publisher updates a row that never existed on the subscriber, while the
+# subscriber locally deleted a different row whose multirange key shares the
+# same bounding range. Without a recheck, the deleted row would be accepted
+# as the update target and the conflict would be misreported as update_deleted
+# instead of update_missing.
+###############################################################################
+
+# Publisher table holding the row that will be updated.
+$node_B->safe_psql(
+	'postgres', "
+	CREATE TABLE tab_mr (id int4multirange, valid_at daterange, v int);
+	ALTER TABLE tab_mr REPLICA IDENTITY FULL;
+	INSERT INTO tab_mr VALUES ('{[1,5)}', '[2000-01-01,2010-01-01)', 1);
+	ALTER PUBLICATION tap_pub_B ADD TABLE tab_mr;
+");
+
+# Subscriber table with the lossy replica identity index. The index is
+# created before the conflict detection slot's xmin is pinned below, so that
+# it can be used to find deleted tuples.
+$node_A->safe_psql('postgres',
+	"CREATE TABLE tab_mr (id int4multirange, valid_at daterange, v int, PRIMARY KEY (id, valid_at WITHOUT OVERLAPS))"
+);
+
+$node_A->safe_psql('postgres',
+	"ALTER SUBSCRIPTION $subname_AB REFRESH PUBLICATION WITH (copy_data = false)"
+);
+$node_A->wait_for_subscription_sync($node_B, $subname_AB);
+
+# Pin the conflict detection slot's xmin: hold an open transaction with an
+# assigned transaction ID so that oldest_nonremovable_xid cannot advance past
+# it. This keeps the row deleted below retained and recently dead, making the
+# test independent of timing.
+my $holder = $node_A->background_psql('postgres');
+$holder->query_safe('BEGIN');
+my $pinned_xid = $holder->query_safe('SELECT txid_current()');
+
+ok( $node_A->poll_query_until(
+		'postgres',
+		"SELECT xmin = $pinned_xid FROM pg_replication_slots WHERE slot_name = 'pg_conflict_detection'"
+	),
+	"conflict detection slot xmin pinned at $pinned_xid");
+
+# Insert and locally delete the row: a different multirange with the
+# same bounding range as the publisher's key.
+$node_A->safe_psql(
+	'postgres', "
+	INSERT INTO tab_mr VALUES ('{[1,2),[3,5)}', '[2000-01-01,2010-01-01)', 9);
+	DELETE FROM tab_mr WHERE id = '{[1,2),[3,5)}';
+");
+
+$log_location = -s $node_A->logfile;
+
+# The publisher updates its row; the old key sent is '{[1,5)}'.
+$node_B->safe_psql('postgres',
+	"UPDATE tab_mr SET v = 2 WHERE id = '{[1,5)}'");
+
+$node_B->wait_for_catchup($subname_AB);
+
+$logfile = slurp_file($node_A->logfile(), $log_location);
+
+# The decoy row must not be mistaken for the update target.
+like(
+	$logfile,
+	qr/conflict detected on relation "public.tab_mr": conflict=update_missing.*
+.*DETAIL:.* Could not find the row to be updated: remote row \(\Q{[1,5)}\E, \Q[2000-01-01,2010-01-01)\E, 2\), replica identity \(id, valid_at\)=\(\Q{[1,5)}\E, \Q[2000-01-01,2010-01-01)\E\)/,
+	'update target reported as missing');
+
+ok( $logfile !~ /conflict detected on relation "public.tab_mr": conflict=update_deleted/,
+	'deleted row sharing the bounding range is not reported as update_deleted');
+
+# Clean up
+$holder->query_safe('COMMIT');
+ok($holder->quit, 'release the pinned transaction');
+$node_B->safe_psql('postgres',
+	"ALTER PUBLICATION tap_pub_B DROP TABLE tab_mr");
+$node_A->safe_psql('postgres',
+	"ALTER SUBSCRIPTION $subname_AB REFRESH PUBLICATION");
+$node_A->safe_psql('postgres', "DROP TABLE tab_mr");
+$node_B->safe_psql('postgres', "DROP TABLE tab_mr");
+
+###############################################################################
 # Check that the xmin value of the conflict detection slot can be advanced when
 # the subscription has no tables.
 ###############################################################################
@@ -648,6 +797,73 @@ $result = $node_A->safe_psql('postgres',
 	"SELECT subretentionactive FROM pg_subscription WHERE subname='$subname_AB';"
 );
 is($result, qq(t), 'retention is active');
+
+###############################################################################
+# Check that the conflict detection slot's xmin is re-initialized when a
+# database newly appears among the databases with retain_dead_tuples
+# subscriptions.
+#
+# The slot's xmin is advanced according to the per-database horizons of the
+# databases seen so far. Without re-initialization, a worker started in a
+# newly retaining database whose oldest active transaction ID is older would
+# be seeded with a value newer than its database's horizon.
+###############################################################################
+
+# Create a second database on node B, with the same table.
+$node_B->safe_psql('postgres', "CREATE DATABASE dbb");
+$node_B->safe_psql('dbb', "CREATE TABLE tab (a int PRIMARY KEY, b int)");
+
+# Hold a transaction with an assigned transaction ID open in dbb, pinning its
+# oldest active transaction ID.
+my $dbb_session = $node_B->background_psql('dbb');
+$dbb_session->query_safe(q{
+	BEGIN;
+	SELECT txid_current();
+});
+
+# Push the transaction ID counter clearly past the pinned transaction ID and
+# wait for the slot's xmin to advance past it. Only the apply worker in the
+# postgres database drives the slot's xmin here, and postgres has no old
+# transaction running.
+$next_xid = $node_B->safe_psql('postgres', "SELECT txid_current() + 1");
+ok( $node_B->poll_query_until(
+		'postgres',
+		"SELECT xmin::text::bigint >= $next_xid FROM pg_replication_slots WHERE slot_name = 'pg_conflict_detection'"
+	),
+	"slot xmin advanced past the transaction ID pinned in dbb");
+
+# Create the second retention subscription in dbb. The launcher must
+# re-initialize the slot's xmin before launching dbb's apply worker.
+my $subname_BA2 = 'tap_sub_b_a2';
+$node_B->safe_psql('dbb',
+	"CREATE SUBSCRIPTION $subname_BA2
+	 CONNECTION '$node_A_connstr application_name=$subname_BA2'
+	 PUBLICATION tap_pub_A
+	 WITH (retain_dead_tuples = true, origin = none)");
+$node_B->wait_for_subscription_sync($node_A, $subname_BA2, 'dbb');
+
+# The slot's xmin must regress to the horizon pinned in dbb.
+ok( $node_B->poll_query_until(
+		'postgres',
+		"SELECT xmin::text::bigint < $next_xid FROM pg_replication_slots WHERE slot_name = 'pg_conflict_detection'"
+	),
+	"slot xmin regressed to the horizon pinned in dbb");
+
+# Once the pinned transaction commits, the xmin must be able to advance
+# again.
+$dbb_session->query_safe("COMMIT;");
+ok($dbb_session->quit, 'close pinned session');
+
+$next_xid = $node_B->safe_psql('postgres', "SELECT txid_current() + 1");
+ok( $node_B->poll_query_until(
+		'postgres',
+		"SELECT xmin::text::bigint >= $next_xid FROM pg_replication_slots WHERE slot_name = 'pg_conflict_detection'"
+	),
+	"slot xmin advances again after the pinned transaction commits");
+
+# Clean up the second database.
+$node_B->safe_psql('dbb', "DROP SUBSCRIPTION $subname_BA2");
+$node_B->safe_psql('postgres', "DROP DATABASE dbb");
 
 ###############################################################################
 # Check that the replication slot pg_conflict_detection is dropped after

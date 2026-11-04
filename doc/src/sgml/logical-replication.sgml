@@ -1803,6 +1803,13 @@ Included in publications:
    configuration.
   </para>
 
+  <note>
+   <para>
+    Sequence synchronization requires the publisher to be running
+    <productname>PostgreSQL</productname> 19 or later.
+   </para>
+  </note>
+
   <sect2 id="sequence-definition-mismatches">
    <title>Sequence Definition Mismatches</title>
    <para>
@@ -2068,7 +2075,7 @@ Included in publications:
        <link linkend="guc-track-commit-timestamp"><varname>track_commit_timestamp</varname></link>
        and <link linkend="sql-createsubscription-params-with-retain-dead-tuples"><literal>retain_dead_tuples</literal></link>
        are enabled. Note that if a tuple cannot be found due to the table being
-       truncated, only a <literal>update_missing</literal> conflict will
+       truncated, only an <literal>update_missing</literal> conflict will
        arise. Additionally, if the tuple was deleted by the same origin, an
        <literal>update_missing</literal> conflict will arise.
       </para>
@@ -2353,7 +2360,16 @@ CONTEXT:  processing remote data for replication origin "pg_16395" during "INSER
      <command>ALTER SUBSCRIPTION ... REFRESH SEQUENCES</command></link>
      or by copying the current data from the publisher (perhaps using
      <command>pg_dump</command>) or by determining a sufficiently high value
-     from the tables themselves.
+     from the tables themselves.  Note that
+     <link linkend="sql-altersubscription-params-refresh-sequences">
+     <command>ALTER SUBSCRIPTION ... REFRESH SEQUENCES</command></link> only
+     re-synchronizes sequences that are already known to the subscription
+     (see <xref linkend="logical-replication-sequences"/>); in particular, it
+     requires the publisher to be running <productname>PostgreSQL</productname>
+     19 or later. Before relying on it to prepare for a switchover or
+     failover, confirm that the publisher's version supports sequence
+     replication and that the sequences of interest are already known to the
+     subscription.
     </para>
    </listitem>
 
@@ -2541,6 +2557,15 @@ CONTEXT:  processing remote data for replication origin "pg_16395" during "INSER
    that setting will cause replication to halt rather than execute the policy.
    Access for the role must be configured in <filename>pg_hba.conf</filename>
    and it must have the <literal>LOGIN</literal> attribute.
+  </para>
+
+  <para>
+   The name of the output plugin used by the replication connection must be
+   included in the server's <xref linkend="guc-output-plugin-libraries"/>. (For
+   subscriptions, the plugin name that is used is <literal>pgoutput</literal>.)
+   Superusers may modify the trusted list per-connection, by including
+   <literal>options=-coutput_plugin_libraries=...</literal> in the connection
+   string.
   </para>
 
   <para>
@@ -2784,7 +2809,9 @@ CONTEXT:  processing remote data for replication origin "pg_16395" during "INSER
     <listitem>
      <para>
       The output plugins referenced by the slots in the old cluster must be
-      installed in the new PostgreSQL executable directory.
+      installed in the new PostgreSQL executable directory. They must also be
+      included in the new cluster's <xref linkend="guc-output-plugin-libraries"/>;
+      see that parameter's documentation for safety information.
      </para>
     </listitem>
     <listitem>

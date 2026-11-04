@@ -488,10 +488,52 @@ SELECT JSON_QUERY(jsonb 'null', '$Xyz' PASSING 1 AS Xyz);
 SELECT JSON_QUERY(jsonb 'null', '$Xyz' PASSING 1 AS "Xyz");
 SELECT JSON_QUERY(jsonb 'null', '$"Xyz"' PASSING 1 AS "Xyz");
 
+-- Test PASSING and toasted values
+CREATE TABLE test_passing_toast (t text);
+ALTER TABLE test_passing_toast ALTER COLUMN t SET STORAGE EXTENDED;
+INSERT INTO test_passing_toast(t)
+  SELECT repeat(string_agg(to_char(g.i, 'FM0000'), ''), 50)
+  FROM generate_series(1, 500) g(i);
+ALTER TABLE test_passing_toast ALTER COLUMN t SET STORAGE EXTERNAL;
+INSERT INTO test_passing_toast(t)
+  SELECT repeat(string_agg(to_char(g.i, 'FM0000'), ''), 50)
+  FROM generate_series(1, 500) g(i);
+SELECT count(*) AS toasted_chunks
+  FROM test_passing_toast WHERE pg_column_toast_chunk_id(t) IS NOT NULL;
+SELECT JSON_VALUE(jsonb 'null', '$a' PASSING t AS a) = t AS ok
+  FROM test_passing_toast;
+DROP TABLE test_passing_toast;
+
 -- Test ON ERROR / EMPTY value validity for the function; all fail.
 SELECT JSON_EXISTS(jsonb '1', '$' DEFAULT 1 ON ERROR);
 SELECT JSON_VALUE(jsonb '1', '$' EMPTY ON ERROR);
 SELECT JSON_QUERY(jsonb '1', '$' TRUE ON ERROR);
+
+-- soft errors raised by the ON ERROR or ON EMPTY DEFAULT expression must always
+-- be rethrown
+SELECT JSON_VALUE('"a"', '$' RETURNING sqljsonb_int_not_null DEFAULT NULL ON ERROR);
+SELECT JSON_VALUE('"a"', '$' RETURNING int DEFAULT (NULL::sqljsonb_int_not_null + 0) ON ERROR);
+SELECT JSON_QUERY('"a"', '$' RETURNING int DEFAULT (NULL::sqljsonb_int_not_null + 0) ON ERROR);
+SELECT JSON_VALUE('"a"', '$' RETURNING int DEFAULT (('a' || (random() * 0)::int)::int + 0) ON ERROR);
+SELECT JSON_QUERY('"a"', '$' RETURNING int DEFAULT (('a' || (random() * 0)::int)::int + 0) ON ERROR);
+-- error. should report that the DEFAULT expression cannot be coerced to the
+-- RETURNING type, not a NOT NULL violation
+SELECT JSON_VALUE(jsonb '{"a": 1}', '$' RETURNING sqljsonb_int_not_null DEFAULT concat('y') ON ERROR);
+
+-- domain constraints must not be checked once a soft error has already occurred
+CREATE DOMAIN queryfuncs_int AS int CHECK (1 / coalesce(VALUE, 0) = 0);
+SELECT JSON_VALUE(jsonb '"x"', '$' RETURNING int DEFAULT 11 ON ERROR);
+SELECT JSON_QUERY(jsonb '["x"]', '$' RETURNING int[] DEFAULT '{11}' ON ERROR);
+SELECT JSON_VALUE(jsonb '"x"', '$' RETURNING queryfuncs_int DEFAULT 11 ON ERROR);
+SELECT JSON_QUERY(jsonb '["x"]', '$' RETURNING queryfuncs_int[] DEFAULT '{11}' ON ERROR);
+
+CREATE TYPE compcoalesce AS (a int, b queryfuncs_int);
+SELECT JSON_QUERY(jsonb '{"a": "x"}', '$' RETURNING compcoalesce);
+SELECT JSON_QUERY(jsonb '{"a": 1, "b": 11}', '$' RETURNING compcoalesce);
+SELECT JSON_QUERY(jsonb '{"a": 1, "b": "B"}', '$' RETURNING compcoalesce);
+SELECT JSON_QUERY(jsonb '{"a": 1, "b": 0}', '$' RETURNING compcoalesce); -- error
+DROP TYPE compcoalesce;
+DROP DOMAIN queryfuncs_int;
 
 -- Test implicit coercion to a domain over fixed-length type specified in
 -- RETURNING

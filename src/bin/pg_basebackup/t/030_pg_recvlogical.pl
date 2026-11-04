@@ -84,6 +84,41 @@ $node->command_ok(
 	],
 	'slot dropped');
 
+# Check that pgoutput rejects options that require a parameter when passed
+# without a value.
+$node->safe_psql('postgres',
+	"SELECT pg_create_logical_replication_slot('pgoutput_slot', 'pgoutput')");
+
+$node->command_fails_like(
+	[
+		'pg_recvlogical',
+		'--slot' => 'pgoutput_slot',
+		'--dbname' => $node->connstr('postgres'),
+		'--start',
+		'--option' => 'proto_version',
+		'--no-loop',
+		'--file' => '-',
+	],
+	qr/proto_version requires a parameter/,
+	'pgoutput proto_version option without a value');
+
+$node->command_fails_like(
+	[
+		'pg_recvlogical',
+		'--slot' => 'pgoutput_slot',
+		'--dbname' => $node->connstr('postgres'),
+		'--start',
+		'--option' => 'proto_version=1',
+		'--option' => 'publication_names',
+		'--no-loop',
+		'--file' => '-',
+	],
+	qr/publication_names requires a parameter/,
+	'pgoutput publication_names option without a value');
+
+$node->safe_psql('postgres',
+	"SELECT pg_drop_replication_slot('pgoutput_slot')");
+
 #test with two-phase option enabled
 $node->command_ok(
 	[
@@ -198,6 +233,8 @@ my $recv = IPC::Run::start(
 # Wait for pg_recvlogical to receive and write the first INSERT
 my $first_ins = wait_for_file($outfile, qr/INSERT/);
 
+my $log_offset = -s $node->logfile;
+
 # Terminate the walsender to force pg_recvlogical to reconnect
 my $backend_pid = $node->safe_psql('postgres',
 	"SELECT active_pid FROM pg_replication_slots WHERE slot_name = 'reconnect_test'"
@@ -205,9 +242,8 @@ my $backend_pid = $node->safe_psql('postgres',
 $node->safe_psql('postgres', "SELECT pg_terminate_backend($backend_pid)");
 
 # Wait for pg_recvlogical to reconnect
-$node->poll_query_until('postgres',
-	"SELECT active_pid IS NOT NULL AND active_pid != $backend_pid FROM pg_replication_slots WHERE slot_name = 'reconnect_test'"
-) or die "Timed out while waiting for pg_recvlogical to reconnect";
+$node->wait_for_log(qr/acquired logical replication slot \"reconnect_test\"/,
+	$log_offset);
 
 # Insert the second record for this test
 $node->safe_psql('postgres', 'INSERT INTO test_table VALUES (2)');
