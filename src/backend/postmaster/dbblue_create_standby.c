@@ -4983,6 +4983,19 @@ DbblueCreateStandbyRegister(void)
 {
 	BackgroundWorker bgw;
 
+	/*
+	 * Don't run during pg_upgrade, which starts the server in binary upgrade
+	 * mode, on a temporary port, while it restores the schema; the data
+	 * files are moved in only after.  A standby built then would be a copy
+	 * of a cluster still missing every table's data, streaming from a port
+	 * the upgraded server never listens on again: once it is started for
+	 * real, it is taken for another server's standby and left alone, and
+	 * the slot made for it holds back WAL.  The first normal start builds
+	 * the standby instead.
+	 */
+	if (IsBinaryUpgrade)
+		return;
+
 	memset(&bgw, 0, sizeof(bgw));
 	bgw.bgw_flags = BGWORKER_SHMEM_ACCESS;
 	bgw.bgw_start_time = BgWorkerStart_RecoveryFinished;
