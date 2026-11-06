@@ -302,6 +302,13 @@ static int	standby_lagging_ticks = 0;
 static bool standby_running_fenced = false;
 static TimestampTz slot_idle_since = 0;
 
+/*
+ * The fence the running standby was to be restarted with, 1 or 0, while
+ * that restart is still to be made: its stop failed, pg_ctl giving up after
+ * 60 seconds, say.  -1 when none is pending.  See run_standby_tick().
+ */
+static int	standby_fence_pending = -1;
+
 /* Whether we have reloaded our configuration, but not the standby's yet. */
 static bool standby_reload_pending = false;
 
@@ -597,17 +604,33 @@ standby_build_marker_path(const char *dir)
  *
  * It goes next to the directory, as the standby's log may, and not into our
  * data directory, which pg_basebackup would copy into the standby.
+ *
+ * It holds our data directory: another server sharing an absolute
+ * dbblue_standby_directory with us -- a copy of us, with our system
+ * identifier and our settings -- must not take our build for its own
+ * interrupted one and clear it, nor we its; see standby_build_marker_owner().
  */
 static bool
 mark_standby_build(const char *dir)
 {
 	char	   *path = standby_build_marker_path(dir);
+	char	   *contents = psprintf("%s\n", DataDir);
 	char		parent[MAXPGPATH];
 	int			fd;
 	bool		ok;
 
 	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY,
 			  pg_file_create_mode);
+	if (fd >= 0 &&
+		write(fd, contents, strlen(contents)) != (ssize_t) strlen(contents))
+	{
+		int			save_errno = errno ? errno : ENOSPC;
+
+		close(fd);
+		errno = save_errno;
+		fd = -1;
+	}
+	pfree(contents);
 	if (fd < 0 || close(fd) != 0)
 	{
 		ereport(WARNING,
@@ -646,18 +669,44 @@ unmark_standby_build(const char *dir)
 }
 
 /*
+ * standby_build_marker_owner
+ *		The data directory of the server whose build into dir the marker
+ *		records, palloc'd, or NULL if there is no marker.  A marker left by an
+ *		earlier version of this worker records none, and gives "".
+ */
+static char *
+standby_build_marker_owner(const char *dir)
+{
+	char	   *path = standby_build_marker_path(dir);
+	char		owner[MAXPGPATH] = "";
+	FILE	   *fp;
+
+	fp = AllocateFile(path, "r");
+	pfree(path);
+	if (fp == NULL)
+		return NULL;
+	if (fgets(owner, sizeof(owner), fp) == NULL)
+		owner[0] = '\0';
+	FreeFile(fp);
+	owner[strcspn(owner, "\r\n")] = '\0';
+	return pstrdup(owner);
+}
+
+/*
  * standby_build_interrupted
- *		Did a build into dir begin, and never finish nor get cleared away?
+ *		Did a build of ours into dir begin, and never finish nor get cleared
+ *		away?  A marker of another server's is not ours to act on.
  */
 static bool
 standby_build_interrupted(const char *dir)
 {
-	char	   *path = standby_build_marker_path(dir);
-	struct stat st;
+	char	   *owner = standby_build_marker_owner(dir);
 	bool		result;
 
-	result = (stat(path, &st) == 0);
-	pfree(path);
+	if (owner == NULL)
+		return false;
+	result = (owner[0] == '\0' || strcmp(owner, DataDir) == 0);
+	pfree(owner);
 	return result;
 }
 
@@ -1257,6 +1306,84 @@ seed_standby_tde_dir(const char *dir)
 }
 
 /*
+ * What dir/postmaster.pid tells of the process it names; see
+ * standby_pid_state().
+ */
+typedef enum StandbyPidState
+{
+	STANDBY_PID_NONE,			/* no postmaster.pid */
+	STANDBY_PID_RUNNING,		/* a live process working in dir */
+	STANDBY_PID_GONE,			/* its process is gone */
+	STANDBY_PID_OTHER,			/* its PID is now another process's */
+	STANDBY_PID_UNKNOWN,		/* cannot tell */
+} StandbyPidState;
+
+/*
+ * standby_pid_state
+ *		What is the process dir/postmaster.pid names?
+ *
+ * Only RUNNING is the standby, and only GONE and OTHER are sure it is not:
+ * an error reading the file, signalling the process, or looking at its
+ * working directory tells nothing either way, and gives UNKNOWN.
+ */
+static StandbyPidState
+standby_pid_state(const char *dir)
+{
+	char		path[MAXPGPATH];
+	FILE	   *fp;
+	long		pid = 0;
+
+	snprintf(path, sizeof(path), "%s/postmaster.pid", dir);
+	fp = fopen(path, "r");
+	if (fp == NULL)
+		return (errno == ENOENT) ? STANDBY_PID_NONE : STANDBY_PID_UNKNOWN;
+	if (fscanf(fp, "%ld", &pid) != 1)
+		pid = 0;
+	fclose(fp);
+
+	/* a file a crash cut short names no process */
+	if (pid <= 1)
+		return STANDBY_PID_GONE;
+	if (kill((pid_t) pid, 0) != 0)
+	{
+		if (errno == ESRCH)
+			return STANDBY_PID_GONE;
+		/* another user's process cannot be our standby */
+		if (errno == EPERM)
+			return STANDBY_PID_OTHER;
+		return STANDBY_PID_UNKNOWN;
+	}
+
+#ifdef __linux__
+	{
+		char		proc[64];
+		char		cwd[MAXPGPATH];
+		char	   *real;
+		ssize_t		len;
+		bool		same;
+
+		snprintf(proc, sizeof(proc), "/proc/%ld/cwd", pid);
+		len = readlink(proc, cwd, sizeof(cwd) - 1);
+		if (len < 0)
+			return (errno == ENOENT || errno == ESRCH) ?
+				STANDBY_PID_GONE : STANDBY_PID_UNKNOWN;
+		cwd[len] = '\0';
+
+		/* /proc shows the path with symbolic links resolved */
+		real = realpath(dir, NULL);
+		if (real == NULL)
+			return STANDBY_PID_UNKNOWN;
+		same = (strcmp(cwd, real) == 0);
+		free(real);
+		if (!same)
+			return STANDBY_PID_OTHER;
+	}
+#endif
+
+	return STANDBY_PID_RUNNING;
+}
+
+/*
  * standby_is_running
  *		True if dir/postmaster.pid names a live process running in dir.
  *
@@ -1273,47 +1400,7 @@ seed_standby_tde_dir(const char *dir)
 static bool
 standby_is_running(const char *dir)
 {
-	char		path[MAXPGPATH];
-	FILE	   *fp;
-	long		pid = 0;
-
-	snprintf(path, sizeof(path), "%s/postmaster.pid", dir);
-	fp = fopen(path, "r");
-	if (fp == NULL)
-		return false;
-	if (fscanf(fp, "%ld", &pid) != 1)
-		pid = 0;
-	fclose(fp);
-
-	if (pid <= 1 || kill((pid_t) pid, 0) != 0)
-		return false;
-
-#ifdef __linux__
-	{
-		char		proc[64];
-		char		cwd[MAXPGPATH];
-		char	   *real;
-		ssize_t		len;
-		bool		same;
-
-		snprintf(proc, sizeof(proc), "/proc/%ld/cwd", pid);
-		len = readlink(proc, cwd, sizeof(cwd) - 1);
-		if (len < 0)
-			return false;
-		cwd[len] = '\0';
-
-		/* /proc shows the path with symbolic links resolved */
-		real = realpath(dir, NULL);
-		if (real == NULL)
-			return false;
-		same = (strcmp(cwd, real) == 0);
-		free(real);
-		if (!same)
-			return false;
-	}
-#endif
-
-	return true;
+	return standby_pid_state(dir) == STANDBY_PID_RUNNING;
 }
 
 /*
@@ -1807,6 +1894,10 @@ next_conf_line(const char *line)
  * append_conf_string
  *		Append "name = 'value'" to a postgresql.auto.conf being written,
  *		quoting value as the configuration file parser expects.
+ *
+ * Both ' and \ are doubled, as ALTER SYSTEM does: the parser reads
+ * backslash escapes inside a quoted value, so a lone \ would reach the
+ * standby altered, or swallow the character after it.
  */
 static void
 append_conf_string(StringInfo buf, const char *name, const char *value)
@@ -1814,8 +1905,8 @@ append_conf_string(StringInfo buf, const char *name, const char *value)
 	appendStringInfo(buf, "%s = '", name);
 	for (const char *s = value; *s; s++)
 	{
-		if (*s == '\'')
-			appendStringInfoChar(buf, '\'');
+		if (*s == '\'' || *s == '\\')
+			appendStringInfoChar(buf, *s);
 		appendStringInfoChar(buf, *s);
 	}
 	appendStringInfoString(buf, "'\n");
@@ -4320,6 +4411,7 @@ set_standby_aside(bool drop_slot)
 	/* tooling must stop sending it reads before it goes away */
 	forget_standby_port();
 	standby_running_fenced = false;
+	standby_fence_pending = -1;
 
 	if (dir != NULL && standby_has_data(dir) && standby_is_running(dir) &&
 		standby_identity(dir, &their_sysid) == STANDBY_OURS)
@@ -4406,6 +4498,31 @@ run_standby_tick(void)
 	 * that pg_basebackup -C made.  A slot still in use is that pg_basebackup
 	 * still copying, which our crash did not take down: let it finish failing.
 	 */
+	/*
+	 * Another server is building into dir, or left a build there: a copy of
+	 * us sharing an absolute dbblue_standby_directory.  Its copy is not ours
+	 * to clear, nor dir ours to build into.
+	 */
+	{
+		char	   *owner = standby_build_marker_owner(dir);
+
+		if (owner != NULL && owner[0] != '\0' && strcmp(owner, DataDir) != 0)
+		{
+			forget_standby_port();
+			ereport(WARNING,
+					(errmsg("dbblue create standby: \"%s\" is being built, or was left half built, by the server with data directory \"%s\", and is left alone",
+							dir, owner),
+					 errhint("Point dbblue_standby_directory elsewhere. If that server builds there no more, remove the contents of \"%s\" and \"%s.building\".",
+							 dir, dir)));
+			pfree(owner);
+			pfree(logfile);
+			pfree(dir);
+			return false;
+		}
+		if (owner != NULL)
+			pfree(owner);
+	}
+
 	if (standby_build_interrupted(dir))
 	{
 		struct stat st;
@@ -4485,6 +4602,17 @@ run_standby_tick(void)
 			/* tooling must not be sent to it while it restarts fenced */
 			forget_standby_port();
 		}
+
+		/*
+		 * The new fence is written only once the standby has stopped, as
+		 * the one running still has the old one.  A stop that fails, as when
+		 * pg_ctl gives up after 60 seconds while the standby goes on
+		 * stopping, would lose it: the next start would read the old one
+		 * back, and serve stale reads for another stall's worth before the
+		 * fence came again.  So it is kept here until a start writes it.
+		 */
+		if (refence)
+			standby_fence_pending = fenced ? 1 : 0;
 
 		if (!stop_standby(dir, logfile))
 		{
@@ -4750,6 +4878,10 @@ run_standby_tick(void)
 						previous_port, port, previous_port),
 				 errhint("Set Odoo's db_replica_port to %d.", port)));
 
+	/* a fence change whose restart was cut short; see above */
+	if (standby_fence_pending >= 0)
+		fenced = (standby_fence_pending == 1);
+
 	/*
 	 * A standby has as much to catch up on as we have written while it was
 	 * down: after a pause, a crash or a reboot, possibly gigabytes, all of
@@ -4780,6 +4912,18 @@ run_standby_tick(void)
 		return false;
 	}
 
+	/*
+	 * Whatever standby comes up from here on, it comes up fenced or not as
+	 * just written, even if pg_ctl gives up waiting for it: a standby
+	 * replaying a large backlog may take longer than that to open.  Set the
+	 * flag release_idle_slot_xmin() goes by now, not only once pg_ctl has
+	 * succeeded, lest it go on clearing the xmin of a standby that serves
+	 * queries, or keep that of one that refuses them.  Should nothing come
+	 * up, the slot is not active, and the flag is not looked at.
+	 */
+	standby_running_fenced = fenced;
+	standby_fence_pending = -1;
+
 	/* starting, it reads all its configuration anew */
 	standby_reload_pending = false;
 
@@ -4798,15 +4942,28 @@ run_standby_tick(void)
 	/*
 	 * A standby that died hard has left its postmaster.pid, and if its PID
 	 * now belongs to another process, the standby refuses to start: "lock
-	 * file already exists".  standby_is_running() has just told it is not
-	 * the standby's, so remove it.
+	 * file already exists".  Remove it, but only when its process is
+	 * surely gone or someone else's: when that cannot be told, the standby
+	 * may be running still, and a second postmaster on its directory, on
+	 * another port, would get past its shared-memory interlock.
 	 */
 	{
 		char		pidfile[MAXPGPATH];
-		struct stat pst;
+		StandbyPidState pid_state = standby_pid_state(dir);
 
 		snprintf(pidfile, sizeof(pidfile), "%s/postmaster.pid", dir);
-		if (stat(pidfile, &pst) == 0 && !standby_is_running(dir))
+		if (pid_state == STANDBY_PID_UNKNOWN)
+		{
+			ereport(WARNING,
+					(errmsg("dbblue create standby: cannot tell whether the process \"%s\" names is the standby, so the standby is not started",
+							pidfile),
+					 errhint("If no standby runs in \"%s\", remove \"%s\".",
+							 dir, pidfile)));
+			pfree(logfile);
+			pfree(dir);
+			return false;
+		}
+		if (pid_state == STANDBY_PID_GONE || pid_state == STANDBY_PID_OTHER)
 		{
 			ereport(LOG,
 					(errmsg("dbblue create standby: removing stale \"%s\", left by a standby that did not shut down cleanly",
@@ -4876,9 +5033,6 @@ run_standby_tick(void)
 		ereport(LOG,
 				(errmsg("dbblue create standby: standby in \"%s\" is still starting; its port will be reported once it accepts connections",
 						dir)));
-
-	if (ok)
-		standby_running_fenced = fenced;
 
 	if (ok && fenced)
 		ereport(LOG,
