@@ -102,6 +102,7 @@
 #include "postmaster/postmaster.h"
 #include "postmaster/syslogger.h"
 #include "replication/slot.h"
+#include "replication/syncrep.h"
 #include "replication/walsender.h"
 #include "replication/walsender_private.h"
 #include "storage/fd.h"
@@ -209,6 +210,13 @@ int			dbblue_standby_max_lag = 64;
 #define DBBLUE_STANDBY_SLOT			"dbblue_standby"
 
 /*
+ * The name the standby streams as, its cluster_name, which its walreceiver
+ * sends as application_name: what pg_stat_replication shows for it, and
+ * what synchronous_standby_names would have to name.
+ */
+#define DBBLUE_STANDBY_NAME			"dbblue_standby"
+
+/*
  * File in DataDir naming the standby directory last managed, so that a change
  * of dbblue_standby_directory, across a restart too, still finds the standby
  * left in the old one; see retire_previous_standby().
@@ -260,6 +268,9 @@ static TimestampTz retry_at = 0;
 
 /* Whether warn_unlimited_slot_wal() has spoken since the last reload. */
 static bool slot_wal_limit_warned = false;
+
+/* Whether warn_synchronous_standby() has spoken since the last reload. */
+static bool sync_standby_warned = false;
 
 /*
  * While there is no room on disk for the standby, when standby_has_room()
@@ -2055,6 +2066,13 @@ standby_limits_behind(const char *dir)
  * say -- and would have the standby refuse every connection while it is
  * reported as running, and stay so once the fence is lifted.
  *
+ * cluster_name is set to DBBLUE_STANDBY_NAME.  Its walreceiver streams under
+ * that name, rather than as "walreceiver" or under our own cluster_name,
+ * which the standby otherwise shares with us through our postgresql.conf:
+ * pg_stat_replication then tells it apart from any other standby, and so
+ * do its processes in ps.  See warn_synchronous_standby() for why the name
+ * matters.  It takes effect at the standby's next start.
+ *
  * Only the last primary_conninfo and primary_slot_name are kept, which are
  * the ones -R just appended.  Any earlier ones came with the copy -- we were
  * a standby once ourselves, and promoted -- and point at our old primary.
@@ -2140,6 +2158,7 @@ write_standby_settings(const char *dir, int port, bool fenced)
 			conf_line_sets(line, "unix_socket_directories") ||
 			conf_line_sets(line, "hot_standby_feedback") ||
 			conf_line_sets(line, "hot_standby") ||
+			conf_line_sets(line, "cluster_name") ||
 			conf_line_sets(line, "dbblue_create_standby") ||
 			conf_line_sets(line, "dbblue_standby_directory") ||
 			conf_line_sets(line, "log_filename") ||
@@ -2168,6 +2187,7 @@ write_standby_settings(const char *dir, int port, bool fenced)
 					   Unix_socket_directories ? Unix_socket_directories : "");
 	appendStringInfoString(&buf, "hot_standby_feedback = on\n");
 	appendStringInfo(&buf, "hot_standby = %s\n", fenced ? "off" : "on");
+	appendStringInfoString(&buf, "cluster_name = '" DBBLUE_STANDBY_NAME "'\n");
 	appendStringInfoString(&buf, "dbblue_create_standby = off\n");
 	appendStringInfoString(&buf, "dbblue_standby_directory = ''\n");
 
@@ -2719,6 +2739,7 @@ apply_config_reload(void)
 	retry_at = 0;
 	/* and repeat the warning if the limit is still missing */
 	slot_wal_limit_warned = false;
+	sync_standby_warned = false;
 	/* and look for disk space for the standby again at once */
 	space_recheck_at = 0;
 	space_short_warned = false;
@@ -5059,6 +5080,56 @@ check_dbblue_standby_user(char **newval, void **extra, GucSource source)
 }
 
 /*
+ * warn_synchronous_standby
+ *		Warn, once per configuration load, if synchronous_standby_names would
+ *		make our standby a synchronous standby.
+ *
+ * It names standbys by the application_name they stream as, and "*" names
+ * every one, ours included, which streams as DBBLUE_STANDBY_NAME -- or, if
+ * started before that was set, under our cluster_name or as "walreceiver",
+ * which "*" matches all the same.  With nothing else streaming, every commit
+ * of ours then waits for it, and waits for good while it is down: paused,
+ * being rebuilt, restarted with a fence, or crashed.  With other standbys
+ * streaming, it may be picked over them, and our commits then wait only for
+ * a copy on this same host, which protects against nothing a synchronous
+ * standby is for.  Nothing can be done about it here, as no setting leaves
+ * out one standby: "*" is the operator's to replace with the names meant.
+ */
+static void
+warn_synchronous_standby(void)
+{
+	const char *name;
+	bool		matches = false;
+
+	if (sync_standby_warned || SyncRepConfig == NULL ||
+		SyncRepStandbyNames == NULL || SyncRepStandbyNames[0] == '\0')
+		return;
+
+	name = SyncRepConfig->member_names;
+	for (int i = 0; i < SyncRepConfig->nmembers; i++)
+	{
+		/* as SyncRepGetStandbyPriority() matches them */
+		if (strcmp(name, "*") == 0 ||
+			pg_strcasecmp(name, DBBLUE_STANDBY_NAME) == 0)
+		{
+			matches = true;
+			break;
+		}
+		name += strlen(name) + 1;
+	}
+	sync_standby_warned = true;
+	if (!matches)
+		return;
+
+	ereport(WARNING,
+			(errmsg("dbblue create standby: synchronous_standby_names \"%s\" makes the standby of dbblue_create_standby a synchronous standby",
+					SyncRepStandbyNames),
+			 errdetail("Commits on this server then wait for it, for as long as it is paused, rebuilt or restarted; and as it runs on this same host, waiting for it protects nothing."),
+			 errhint("List the synchronous standbys by name in synchronous_standby_names instead of \"*\", leaving out \"%s\".",
+					 DBBLUE_STANDBY_NAME)));
+}
+
+/*
  * warn_unlimited_slot_wal
  *		Warn, once per configuration load, if max_slot_wal_keep_size leaves
  *		our replication slot free to retain WAL without limit.
@@ -5244,7 +5315,10 @@ DbblueCreateStandbyMain(Datum main_arg)
 
 			/* even while waiting to retry, as the slot then holds back WAL */
 			if (dbblue_create_standby != DBBLUE_STANDBY_OFF)
+			{
 				warn_unlimited_slot_wal();
+				warn_synchronous_standby();
+			}
 
 			/*
 			 * After a failure, wait as long as failure_retry_delay() says,
