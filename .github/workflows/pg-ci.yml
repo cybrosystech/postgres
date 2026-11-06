@@ -40,14 +40,6 @@ env:
   # concurrent jobs and retrying older runs have a chance of working.
   CLONE_DEPTH: 500
 
-  # At the moment all jobs use 4vcore runners, and none seems to benefit from
-  # increasing concurrency further.
-  BUILD_JOBS: 4
-
-  # It's possible that some jobs benefit from an increased test concurrency,
-  # but a default of 4 is a safe bet. Individual jobs can override.
-  TEST_JOBS: 4
-
   CCACHE_MAXSIZE: "250M"
   CCACHE_DIR: ${{ github.workspace }}/ccache_dir
 
@@ -94,7 +86,7 @@ env:
     -Dzlib=enabled
     -Dzstd=enabled
 
-  # Shared between the Linux autoconf job and the CompilerWarnings jobs
+  # Used by the Linux autoconf job
   LINUX_CONFIGURE_FEATURES: >-
     --with-gssapi
     --with-icu
@@ -215,10 +207,18 @@ jobs:
       - &nix_sysinfo_step
         name: sysinfo
         run: |
-          id
-          uname -a
+          echo "Number of cores: " $(nproc || sysctl hw.physicalcpu hw.logicalcpu)
+
+          echo "id: $(id)"
+          echo "uname: $(uname -a)"
+
+          echo ::group::ulimit
           ulimit -a -H && ulimit -a -S
+          echo ::endgroup::
+
+          echo ::group::env
           env
+          echo ::endgroup::
 
       - name: Parse ci-os-only
         id: os
@@ -352,7 +352,7 @@ jobs:
       - name: Build
         shell: *su_postgres_shell
         run: &ninja_build_cmd |
-          ninja -C build -j${{env.BUILD_JOBS}} ${{env.MBUILD_TARGET}}
+          ninja -C build ${{env.MBUILD_TARGET}}
           ninja -C build -t missingdeps
 
       # Decide if it's worth uploading a new version of the ccache cache. If
@@ -405,7 +405,7 @@ jobs:
           meson test ${{env.MTEST_ARGS}} --suite setup --logbase setup || exit 1
           echo ::endgroup::
 
-          meson test ${{env.MTEST_ARGS}} --num-processes ${{env.TEST_JOBS}} --no-suite setup ${{env.MTEST_TARGET}}
+          meson test ${{env.MTEST_ARGS}} --no-suite setup ${{env.MTEST_TARGET}}
 
       - &linux_collect_cores_step
         name: Core backtraces
@@ -511,7 +511,7 @@ jobs:
       - name: Build
         shell: *su_postgres_shell
         run: |
-          make -s -j${BUILD_JOBS} world-bin
+          make -s -j$(nproc) world-bin
 
       - *ccache_decide_save_step
       - *ccache_save_step
@@ -519,7 +519,7 @@ jobs:
       - name: Test world
         shell: *su_postgres_shell
         run: |
-          make -s ${CHECK} ${CHECKFLAGS} -j${TEST_JOBS}
+          make -s ${CHECK} ${CHECKFLAGS} -j$(nproc)
 
       - *linux_collect_cores_step
       - *upload_logs_step
@@ -611,7 +611,7 @@ jobs:
           build/tmp_install/usr/local/pgsql/bin/pg_ctl -c -o '-c fsync=off' -D build/runningcheck -l build/testrun/runningcheck.log start
 
           # Run the tests supporting running against an already running
-          meson test ${{env.MTEST_ARGS}} --num-processes ${{env.TEST_JOBS}} --setup running
+          meson test ${{env.MTEST_ARGS}} --setup running
 
           build/tmp_install/usr/local/pgsql/bin/pg_ctl -D build/runningcheck stop
 
@@ -893,9 +893,18 @@ jobs:
 
       - name: Sysinfo
         run: |
+          echo Number of logical processors: %NUMBER_OF_PROCESSORS%
+
+          echo codepage:
           chcp
+
+          echo ::group::systeminfo
           systeminfo
+          echo ::endgroup::
+
+          echo ::group::env
           set
+          echo ::endgroup::
 
       # The TAP tests build an initdb template under build/tmp_install and
       # then `robocopy` it into per-test data directories. Robocopy with the
@@ -1151,10 +1160,6 @@ jobs:
   # with various combinations of cassert/dtrace flags. Trace probes have
   # a history of getting accidentally broken; the matrix is there to
   # catch that.
-  #
-  # The autoconf cache files (gcc.cache / clang.cache) are intentionally
-  # reused across the matrix entries that share a compiler, so we don't
-  # pay for full feature detection on every entry.
   compiler-warnings:
     name: CompilerWarnings
     needs: [setup, sanity-check]
@@ -1170,7 +1175,19 @@ jobs:
       # Use larger ccache cache as this job compiles with multiple
       # compilers / flag combinations.
       CCACHE_MAXSIZE: "1G"
-      DEFAULT_BUILD: world-bin
+      CCACHE_SLOPPINESS: pch_defines,time_macros
+      CCACHE_DEPEND: 1
+
+      # Enable everything else in LINUX_CONFIGURE_FEATURES but not in
+      # MESON_COMMON_FEATURES.
+      MESON_FEATURES: >-
+        -Dgssapi=enabled
+        -Dlibcurl=enabled
+        -Dllvm=enabled
+        -Dpam=enabled
+        -Dselinux=enabled
+        -Dsystemd=enabled
+        -Duuid=ossp
 
     steps:
       - *nix_sysinfo_step
@@ -1178,33 +1195,30 @@ jobs:
       - *ccache_restore_default_step
       - *ccache_restore_branch_step
 
-      - name: Setup workspace
-        run: |
-          echo "COPT=-Werror" > src/Makefile.custom
-
       # gcc, cassert off, dtrace on
       - name: gcc warnings + (dtrace)
         if: ${{ !cancelled() }}
         env:
-          CONF: ${{env.LINUX_CONFIGURE_FEATURES}} --cache gcc.cache --enable-dtrace
+          CONF: ${{env.MESON_COMMON_FEATURES}} ${{env.MESON_FEATURES}} -Ddtrace=enabled
           CC: ccache gcc
           CXX: ccache g++
-          CLANG: ccache clang
         run: &compiler_warnings_cmd |
           echo "::group::configure"
-          ./configure \
+          rm -rf build
+          meson setup \
+            -Dwerror=true \
+            -Ddebug=false \
             ${{env.CONF}} \
-            CLANG="ccache clang"
+            build
           echo "::endgroup::"
 
-          make -s -j${{env.BUILD_JOBS}} clean
-          make -s -j${{env.BUILD_JOBS}} ${{env.DEFAULT_BUILD}}
+          ninja -C build --quiet ${{env.MBUILD_TARGET}}
 
       # gcc, cassert on, dtrace off
       - name: gcc warnings + (cassert)
         if: ${{ !cancelled() }}
         env:
-          CONF: ${{env.LINUX_CONFIGURE_FEATURES}} --cache gcc.cache --enable-cassert
+          CONF: ${{env.MESON_COMMON_FEATURES}} ${{env.MESON_FEATURES}} -Dcassert=true
           CC: ccache gcc
           CXX: ccache g++
         run: *compiler_warnings_cmd
@@ -1213,7 +1227,7 @@ jobs:
       - name: clang warnings
         if: ${{ !cancelled() }}
         env:
-          CONF: ${{env.LINUX_CONFIGURE_FEATURES}} --cache clang.cache
+          CONF: ${{env.MESON_COMMON_FEATURES}} ${{env.MESON_FEATURES}}
           CC: ccache clang
           CXX: ccache clang++
         run: *compiler_warnings_cmd
@@ -1222,7 +1236,7 @@ jobs:
       - name: clang warnings + (cassert + dtrace)
         if: ${{ !cancelled() }}
         env:
-          CONF: ${{env.LINUX_CONFIGURE_FEATURES}} --cache clang.cache --enable-cassert --enable-dtrace
+          CONF: ${{env.MESON_COMMON_FEATURES}} ${{env.MESON_FEATURES}} -Dcassert=true -Ddtrace=enabled
           CC: ccache clang
           CXX: ccache clang++
         run: *compiler_warnings_cmd
@@ -1230,9 +1244,13 @@ jobs:
       - name: mingw warnings (cross compilation)
         if: ${{ !cancelled() }}
         env:
-          CONF: --host=x86_64-w64-mingw32ucrt --enable-cassert --without-icu
-          CC: ccache x86_64-w64-mingw32ucrt-gcc
-          CXX: ccache x86_64-w64-mingw32ucrt-g++
+          CONF: >-
+            --cross-file src/tools/ci/mingw-cross-file.txt
+            -Db_pch=true
+            -Dcassert=true
+            -Dauto_features=disabled
+            -Dzlib=enabled
+          MBUILD_TARGET: all
         run: *compiler_warnings_cmd
 
       ###
@@ -1242,34 +1260,38 @@ jobs:
       - name: Build documentation
         if: ${{ !cancelled() }}
         env:
-          CONF: --cache gcc.cache
+          CONF: -Dauto_features=disabled -Ddocs=enabled
           CC: ccache gcc
           CXX: ccache g++
-          DEFAULT_BUILD: -C doc
+          MBUILD_TARGET: docs
         run: *compiler_warnings_cmd
 
       ###
       # Verify headerscheck / cpluspluscheck succeed
       #
-      # - Run both in same script to increase parallelism, use -k to get
-      #   result of both
+      # - Run both in the same ninja invocation to increase parallelism, use
+      #   -k 0 to get the result of both
       # - Use -fmax-errors, as particularly cpluspluscheck can be very verbose
       ###
       - name: headerscheck + cpluspluscheck
         if: ${{ !cancelled() }}
+        env:
+          CONF: ${{env.MESON_COMMON_FEATURES}} ${{env.MESON_FEATURES}}
+          CC: ccache gcc
+          CXX: ccache g++
+          EXTRAFLAGS: -fmax-errors=10
         run: |
           echo "::group::configure"
-          ./configure \
-            ${{env.LINUX_CONFIGURE_FEATURES}} \
-            --cache gcc.cache \
-            --quiet \
-            CC="ccache gcc" CXX="ccache g++" CLANG="ccache clang"
+          rm -rf build
+          meson setup \
+            -Dwerror=true \
+            -Ddebug=false \
+            ${{env.CONF}} \
+            build
           echo "::endgroup::"
 
-          make -s -j${{env.BUILD_JOBS}} clean
-          make -s -j${{env.BUILD_JOBS}} -k ${{env.CHECKFLAGS}} \
-            headerscheck cpluspluscheck \
-            EXTRAFLAGS='-fmax-errors=10'
+          ninja -C build --quiet -k 0 \
+            headerscheck cpluspluscheck
 
       - *ccache_decide_save_step
       - *ccache_save_step
