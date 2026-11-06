@@ -69,6 +69,7 @@
 #include "common/file_perm.h"
 #include "miscadmin.h"
 #include "postmaster/bgwriter.h"
+#include "postmaster/dbblue_create_standby.h"
 #include "storage/fd.h"
 #include "storage/lmgr.h"
 #include "storage/lwlock.h"
@@ -77,6 +78,7 @@
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
+#include "utils/guc.h"
 #include "utils/guc_hooks.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -262,6 +264,25 @@ CreateTableSpace(CreateTableSpaceStmt *stmt)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 				 errmsg("tablespace location must be an absolute path")));
+
+	/*
+	 * dbblue_create_standby runs a standby on this same host, and it replays
+	 * CREATE TABLESPACE with this very location: the two servers would then
+	 * share one directory, and the standby would write its own, older pages
+	 * over ours there, corrupting them.  Refuse while it is on, and while it
+	 * is paused, as a paused standby is kept, and replays this on resuming.
+	 * With it off, the standby is gone, and none is built again while we
+	 * have a tablespace.  An in-place tablespace lives inside each server's
+	 * own data directory, and is not shared.
+	 */
+	if (dbblue_create_standby != DBBLUE_STANDBY_OFF && !in_place)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot create a tablespace while dbblue_create_standby is \"%s\"",
+						GetConfigOption("dbblue_create_standby", false, false)),
+				 errdetail("The standby of dbblue_create_standby runs on this same host, and would use the same directory \"%s\" as this server, overwriting this server's files.",
+						   location),
+				 errhint("Set dbblue_create_standby to off first, then create the tablespace.")));
 
 	/*
 	 * Check that location isn't too long. Remember that we're going to append

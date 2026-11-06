@@ -23,6 +23,9 @@
 #   * with max_slot_wal_keep_size = -1, a standby whose slot is gone is kept,
 #     not deleted with no rebuild to follow, and rebuilt once a limit is set
 #     (M6);
+#   * CREATE TABLESPACE is refused while the feature is on or paused, as the
+#     standby on this host would share the tablespace's directory and write
+#     over the primary's files, and allowed once it is off (R1);
 #   * a promoted standby is no longer taken for ours, and its slot is dropped
 #     (H4).
 #
@@ -324,6 +327,35 @@ $sb = wait_for_standby('after a limit is set again');
 $rows = $node->safe_psql('postgres', 'SELECT count(*) FROM t');
 ok($sb->poll_query_until('postgres', 'SELECT count(*) FROM t', $rows),
 	'once a limit is set, the standby is rebuilt');
+
+# ---------------------------------------------------------------------------
+# Tablespaces: the standby on this host would replay CREATE TABLESPACE with
+# the same location and write over the primary's files, so it is refused
+# while the feature is on or paused, and allowed once it is off.
+# ---------------------------------------------------------------------------
+my $tbsdir = $node->basedir . '/tbs';
+mkdir $tbsdir or die "could not create $tbsdir: $!";
+
+my ($tbs_ret, $tbs_out, $tbs_err) = $node->psql('postgres',
+	"CREATE TABLESPACE tbs LOCATION '$tbsdir'");
+ok( $tbs_ret != 0
+	  && $tbs_err =~ /cannot create a tablespace while dbblue_create_standby is "on"/,
+	'CREATE TABLESPACE is refused while dbblue_create_standby is on');
+
+alter_system('SET dbblue_create_standby = paused');
+($tbs_ret, $tbs_out, $tbs_err) = $node->psql('postgres',
+	"CREATE TABLESPACE tbs LOCATION '$tbsdir'");
+ok( $tbs_ret != 0
+	  && $tbs_err =~ /cannot create a tablespace while dbblue_create_standby is "paused"/,
+	'CREATE TABLESPACE is refused while dbblue_create_standby is paused');
+
+alter_system('SET dbblue_create_standby = off');
+$node->safe_psql('postgres', "CREATE TABLESPACE tbs LOCATION '$tbsdir'");
+pass('CREATE TABLESPACE is allowed once dbblue_create_standby is off');
+$node->safe_psql('postgres', 'DROP TABLESPACE tbs');
+
+alter_system('SET dbblue_create_standby = on');
+$sb = wait_for_standby('after the tablespace test');
 
 # ---------------------------------------------------------------------------
 # H4: a promoted standby is no longer ours, and its slot is dropped.
