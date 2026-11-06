@@ -88,7 +88,7 @@ you change [dbblue_create_standby.c](../src/backend/postmaster/dbblue_create_sta
 | [src/backend/utils/misc/guc_tables.c](../src/backend/utils/misc/guc_tables.c) | `dbblue_create_standby_options[]`: `on`/`off`/`paused`, plus hidden boolean spellings (`true`, `yes`, `1`…) because the setting used to be a boolean. |
 | [src/include/utils/guc_hooks.h](../src/include/utils/guc_hooks.h) | Declares `check_dbblue_standby_directory()` and `check_dbblue_standby_user()`. |
 | [src/backend/utils/activity/wait_event_names.txt](../src/backend/utils/activity/wait_event_names.txt) | Wait event `DBBLUE_CREATE_STANDBY_MAIN`. |
-| [src/backend/backup/basebackup.c](../src/backend/backup/basebackup.c) | Excludes `dbblue_standby.port`, `dbblue_standby.dir` and their `.tmp` files from every base backup. |
+| [src/backend/backup/basebackup.c](../src/backend/backup/basebackup.c) | Excludes `dbblue_standby.port`, `dbblue_standby.dir`, `dbblue_standby.slot` and their `.tmp` files from every base backup. |
 | [src/bin/pg_rewind/filemap.c](../src/bin/pg_rewind/filemap.c) | The same exclusions for `pg_rewind`. |
 | [src/bin/initdb/auto_tune.c](../src/bin/initdb/auto_tune.c) | Sets `max_slot_wal_keep_size = 2 × max_wal_size`. The worker refuses to build without such a limit. |
 | [src/test/modules/dbblue_standby/](../src/test/modules/dbblue_standby/) | TAP test `t/001_auto_standby.pl`. |
@@ -257,13 +257,15 @@ run_standby_tick()
 │
 ├─ 1. dir = resolve_standby_directory()          too long / shell chars / inside DataDir → false
 ├─ 2. logfile = standby_log_path(dir)            shell chars → false
+│     adopt_legacy_slot_owner()                  older version: record the slot's directory (§10)
 ├─ 3. retire_previous_standby(dir)               stop the standby in the OLD directory (§13)
 ├─ 4. build marker "<dir>.building" owned by another DataDir?  → warn, false
 ├─ 5. standby_build_interrupted(dir)?            our own crashed build:
 │        slot ACTIVE → wait (true)
 │        else rmtree(dir contents), unmark → continue
 ├─ 6. has PG_VERSION && !vet_existing_standby()  not ours / promoted / unusable → false
-│        (vet may also wipe dir for a rebuild → continue)
+│        (vet may also wipe dir for a rebuild → continue: slot invalidated,
+│         absent, or made for another directory)
 ├─ 7. fenced = standby_fenced(dir)               hot_standby = off in its auto.conf?
 │
 ├─ 8. RUNNING?  standby_is_running(dir)
@@ -280,6 +282,7 @@ run_standby_tick()
 │      ├─ standby_copyable()  (no tablespaces)   else true (wait)
 │      ├─ standby_has_room()                     else true (wait)
 │      ├─ drop_standby_slot()                    left-over slot
+│      ├─ record_standby_slot_owner(dir)         write dbblue_standby.slot
 │      ├─ mark_standby_build()                   write "<dir>.building"
 │      ├─ seed_standby_tde_dir() if WAL encrypted
 │      ├─ run_command("pg_basebackup … -C -S dbblue_standby -R -w [-E]", build_dir=dir)
@@ -335,14 +338,17 @@ If `statvfs()` fails, the build goes ahead (old behaviour).
    standby that no longer exists. Left there it would hold WAL, and
    `pg_basebackup -C` would fail with "already exists". An **active** slot is not
    dropped (someone else streams from it): warn and fail.
-2. **`mark_standby_build()`** — writes `<dir>.building` containing the primary's
+2. **`record_standby_slot_owner(dir)`**: writes `dir` to `<DataDir>/dbblue_standby.slot`.
+   From now on any slot named `dbblue_standby` is `dir`'s, so a standby left in another
+   directory is rebuilt rather than started if the setting points back at it (§10).
+3. **`mark_standby_build()`** — writes `<dir>.building` containing the primary's
    `DataDir`, and fsyncs it and its parent. From now on, until the marker is removed,
    whatever is in `dir` is "ours, and maybe half-built".
-3. **`seed_standby_tde_dir()`** — only if `<DataDir>/pg_tde/wal_keys` exists (WAL
+4. **`seed_standby_tde_dir()`** — only if `<DataDir>/pg_tde/wal_keys` exists (WAL
    encryption is on). Copies `pg_tde/wal_keys` and `pg_tde/1664_providers` into
    `<dir>/pg_tde`, so that `pg_basebackup -E` can find the server key before the copy
    starts.
-4. **`pg_basebackup`** through `run_command()` with `build_dir = dir`:
+5. **`pg_basebackup`** through `run_command()` with `build_dir = dir`:
 
    ```
    pg_basebackup -h <first socket dir | localhost> -p <PostPortNumber> [-U <dbblue_standby_user>]
@@ -362,8 +368,8 @@ If `statvfs()` fails, the build goes ahead (old behaviour).
    `local replication … peer` rule in `pg_hba.conf` lets the OS user in without a
    password. `-R` copies the same host into `primary_conninfo`, so the standby streams
    over the socket too.
-5. On **success**: `unmark_standby_build()`, then continue to start (§7).
-6. On **failure**:
+6. On **success**: `unmark_standby_build()`, then continue to start (§7).
+7. On **failure**:
    - while shutting down: leave the partial copy and the marker; the next start clears
      it (step 5 of the tick). Deleting gigabytes now would hold up the shutdown.
    - otherwise: `rmtree(dir, false)` (contents only — the directory may be the
@@ -678,13 +684,47 @@ For `OURS`, the slot decides:
 
 | Slot | Action |
 |---|---|
-| `IDLE` or `ACTIVE` | fine → `true` |
-| `INVALIDATED` or `ABSENT`, and `max_slot_wal_keep_size = -1` | forget port, **stop** the standby, keep its files (no rebuild is possible) → `false` |
+| `IDLE` or `ACTIVE`, made for this directory (or owner unknown) | fine → `true` |
+| `ACTIVE`, made for **another** directory | forget port, warn: the standby there still streams through it → `false` |
+| `IDLE`, made for **another** directory | treated as `REPLACED` (below) |
+| `INVALIDATED`, `ABSENT` or `REPLACED`, and `max_slot_wal_keep_size = -1` | forget port, **stop** the standby, keep its files (no rebuild is possible) → `false` |
 | `INVALIDATED` | warn with the reason (`RS_INVAL_IDLE_TIMEOUT` → raise `idle_replication_slot_timeout`; `RS_INVAL_WAL_REMOVED` → fell behind `max_slot_wal_keep_size`), stop, `rmtree` contents → `true` (rebuild) |
 | `ABSENT` | log, stop, `rmtree` contents → `true` (rebuild) |
+| `REPLACED` | warn `was made for the standby in …, not for this one`, stop, `rmtree` contents → `true` (rebuild) |
 
 During shutdown it stops before `rmtree`; the next start finds the same slot state and
 finishes the job.
+
+### Which standby the slot belongs to — `dbblue_standby.slot`
+
+The slot is known only by its **name**. A build in another directory drops it and makes a
+new one with the same name. So "a slot named `dbblue_standby` exists" does not mean
+"this standby's slot exists". `<DataDir>/dbblue_standby.slot` records which directory the
+current slot was made for:
+
+- **Written** by `record_standby_slot_owner(dir)` in the build path, right after
+  `drop_standby_slot()` and before `pg_basebackup -C`. From that moment, any slot of that
+  name is `dir`'s, whether the build then succeeds or not.
+- **Read** by `standby_slot_owner()` in `vet_existing_standby()`. If it names another
+  directory, the standby here lost its slot when that other standby was built. The WAL
+  it needs has not been kept since, so it is gone after a checkpoint or two. The slot
+  state becomes `STANDBY_SLOT_REPLACED`, which only `vet_existing_standby()` uses
+  (`standby_slot_state()` never returns it).
+- **Missing** (a cluster upgraded from an older version): `adopt_legacy_slot_owner()`
+  runs at the start of each tick, **before** `retire_previous_standby()` rewrites
+  `dbblue_standby.dir`. If a slot exists, it records the directory `dbblue_standby.dir`
+  names, which is where the older version built the slot. If that guess is wrong (the
+  directory was changed but no build followed), a standby that could have resumed is
+  rebuilt. That costs a copy but never serves stale data. With neither file, the owner
+  stays unknown and the slot is taken for ours, as before.
+
+**Why it matters (the bug it fixes):** before this file, pointing
+`dbblue_standby_directory` back at a standby set aside for one built elsewhere
+accepted the old standby, because a slot of that name existed. The start-time backlog
+was measured from the slot, that is from the **other** standby's position, so the old
+standby started **open** and served Odoo its old data. It could not stream, because its
+WAL was gone, so after 60 s the stall fence closed it. It then stayed fenced for good,
+never rebuilt, while the slot held WAL back.
 
 ---
 
@@ -779,6 +819,12 @@ because those modes act only once.
 **Why:** otherwise the old standby keeps streaming from the one slot. Then
 `drop_standby_slot()` refuses to drop it, and the new standby is never built. Or both
 take turns on the slot and one always serves stale data.
+
+**Pointing back at the old directory** rebuilds the standby there, if a standby was built
+in the new directory meanwhile: that build dropped the old standby's slot. See
+[Which standby the slot belongs to](#which-standby-the-slot-belongs-to--dbblue_standbyslot).
+If no build happened in between (for example, it waited for disk space), the slot is
+still the old standby's, and it simply resumes.
 
 During a build, `run_command()` notices the change on reload
 (`standby_build_wanted()`) and cancels `pg_basebackup` at once.
@@ -935,6 +981,7 @@ directory in `dbblue_standby.dir`, the build marker).
 | `<dir>.pid` | the standby | — | only if the primary sets `external_pid_file` |
 | `<DataDir>/dbblue_standby.port` | `report_standby_port()` | Odoo tooling, `reported_standby_port()` | exists **only** while the standby runs open; `.tmp` + `durable_rename()` |
 | `<DataDir>/dbblue_standby.dir` | `retire_previous_standby()` | `previous_standby_directory()` | absolute path of the managed directory |
+| `<DataDir>/dbblue_standby.slot` | `record_standby_slot_owner()`, `adopt_legacy_slot_owner()` | `standby_slot_owner()` | absolute path of the directory the slot was made for (§10) |
 | `<primary log>-standby.log` or `<dir>.log` | `run_command()` (`>>`), `pg_ctl -l` | humans, `command_output_excerpt()` | chosen by `standby_log_path()` |
 
 **`standby_log_path()`:** if the primary's stderr (`/proc/self/fd/2`) is a regular file
@@ -942,7 +989,7 @@ whose directory we can write to (as with `pg_ctl -l` or Debian's `pg_ctlcluster`
 standby log goes next to it as `<log without .log>-standby.log`, so the same logrotate
 rule covers it. Otherwise it is `<dir>.log`, which nothing rotates.
 
-**Excluded from copies:** `dbblue_standby.port`, `dbblue_standby.dir` and their `.tmp`
+**Excluded from copies:** `dbblue_standby.port`, `dbblue_standby.dir`, `dbblue_standby.slot` and their `.tmp`
 files are in the exclude lists of `basebackup.c` and `pg_rewind/filemap.c`. A copy of
 this server must not inherit them: they would name a standby the copy does not have.
 
@@ -1014,6 +1061,7 @@ All at the top of `dbblue_create_standby.c`.
 | `DBBLUE_STANDBY_SLOT` | `"dbblue_standby"` | slot name |
 | `DBBLUE_STANDBY_NAME` | `"dbblue_standby"` | `cluster_name` / `application_name` |
 | `DBBLUE_STANDBY_DIR_FILE` | `"dbblue_standby.dir"` | directory memory file |
+| `DBBLUE_STANDBY_SLOT_FILE` | `"dbblue_standby.slot"` | which directory the slot was made for |
 | `DBBLUE_DEBIAN_CONF_DIR` | `"/etc/postgresql"` | claimed-port scan (overridable at compile time) |
 
 ---
@@ -1079,6 +1127,7 @@ install, because this fork's default `shared_preload_libraries` names them.
 | H3, H4 | a standby whose replay is paused is fenced (port file gone, refuses connections, slot xmin cleared), then let back in |
 | L8 | an `idle_replication_slot_timeout` invalidation is reported as such, and the standby rebuilt |
 | M6 | with `max_slot_wal_keep_size = -1`, a standby whose slot is gone is kept, then rebuilt once a limit is set |
+| Slot owner | pointed back at a directory whose standby was set aside for one built in another, that standby is rebuilt, never started on its old data or left fenced |
 | H4 | a promoted standby is no longer treated as ours, and its slot is dropped |
 
 ### What it does not cover (test by hand)
@@ -1185,6 +1234,7 @@ text. The most common ones:
 | `holds a different database cluster` | `vet_existing_standby()` (`FOREIGN`) |
 | `is a standby of another server` | `vet_existing_standby()` (`OTHER_PRIMARY`) |
 | `did not build, and is left alone` | `vet_existing_standby()` (`NOT_BUILT`) |
+| `was made for the standby in …, not for this one, rebuilding` / `which still streams through it` | `vet_existing_standby()` (slot owner, §10) |
 | `is being built, or was left half built, by the server with data directory` | `run_standby_tick()` (marker owner) |
 | `clearing … left behind by a build that was interrupted` | `run_standby_tick()` |
 | `leaving the partial copy` | `run_standby_tick()` (build failed during shutdown) |

@@ -54,6 +54,11 @@
  * The directory last managed is remembered in <DataDir>/dbblue_standby.dir,
  * so that when dbblue_standby_directory changes, the standby in the old one
  * is stopped before the new one is built; see retire_previous_standby().
+ * The directory our replication slot was made for is remembered in
+ * <DataDir>/dbblue_standby.slot, so that a standby left in an old directory,
+ * whose slot a build elsewhere has dropped and made anew, is rebuilt rather
+ * than started on data it can never bring up to date; see
+ * vet_existing_standby().
  *
  * The standby must not spawn standbys of its own, neither while it is one
  * nor once promoted, so its copy of dbblue_create_standby is turned off.
@@ -223,6 +228,15 @@ int			dbblue_standby_max_lag = 64;
  */
 #define DBBLUE_STANDBY_DIR_FILE		"dbblue_standby.dir"
 
+/*
+ * File in DataDir naming the standby directory our replication slot was made
+ * for.  The slot is known by its name alone, and a build elsewhere drops it
+ * and makes it anew under the same name; this tells a standby whose slot it
+ * still is from one whose slot has gone that way.  See
+ * vet_existing_standby().
+ */
+#define DBBLUE_STANDBY_SLOT_FILE	"dbblue_standby.slot"
+
 typedef enum
 {
 	STANDBY_SLOT_ABSENT,
@@ -230,6 +244,9 @@ typedef enum
 	STANDBY_SLOT_ACTIVE,
 	STANDBY_SLOT_INVALIDATED,	/* WAL it needed is gone; see
 								 * vet_existing_standby() */
+	STANDBY_SLOT_REPLACED,		/* made anew for a standby in another
+								 * directory; only vet_existing_standby()
+								 * tells, standby_slot_state() never does */
 } StandbySlotState;
 
 /* What an existing standby directory holds; see standby_identity(). */
@@ -415,6 +432,29 @@ path_inside_data_dir(const char *dir)
 	pfree(real_data);
 	pfree(real_dir);
 	return inside;
+}
+
+/*
+ * same_directory
+ *		Are a and b the same directory, by their paths or by where their
+ *		symbolic links lead?
+ */
+static bool
+same_directory(const char *a, const char *b)
+{
+	char	   *real_a;
+	char	   *real_b;
+	bool		same;
+
+	if (strcmp(a, b) == 0)
+		return true;
+
+	real_a = real_path_of(a);
+	real_b = real_path_of(b);
+	same = (strcmp(real_a, real_b) == 0);
+	pfree(real_a);
+	pfree(real_b);
+	return same;
 }
 
 /*
@@ -3670,6 +3710,7 @@ drop_standby_slot(const char *logfile)
 			return false;
 		case STANDBY_SLOT_IDLE:
 		case STANDBY_SLOT_INVALIDATED:
+		case STANDBY_SLOT_REPLACED:
 			break;
 	}
 
@@ -3842,18 +3883,18 @@ stop_standby(const char *dir, const char *logfile)
 }
 
 /*
- * previous_standby_directory
- *		The standby directory <DataDir>/dbblue_standby.dir names, palloc'd,
- *		or NULL if the file is missing or holds no absolute path.
+ * data_dir_file_path
+ *		The absolute path the file <DataDir>/name holds, palloc'd, or NULL if
+ *		the file is missing or holds no absolute path.
  */
 static char *
-previous_standby_directory(void)
+data_dir_file_path(const char *name)
 {
 	char		path[MAXPGPATH];
 	char		line[MAXPGPATH];
 	FILE	   *fp;
 
-	snprintf(path, sizeof(path), "%s/%s", DataDir, DBBLUE_STANDBY_DIR_FILE);
+	snprintf(path, sizeof(path), "%s/%s", DataDir, name);
 	fp = fopen(path, "r");
 	if (fp == NULL)
 		return NULL;
@@ -3863,6 +3904,83 @@ previous_standby_directory(void)
 
 	line[strcspn(line, "\n")] = '\0';
 	return is_absolute_path(line) ? pstrdup(line) : NULL;
+}
+
+/*
+ * previous_standby_directory
+ *		The standby directory <DataDir>/dbblue_standby.dir names, palloc'd,
+ *		or NULL if the file is missing or holds no absolute path.
+ */
+static char *
+previous_standby_directory(void)
+{
+	return data_dir_file_path(DBBLUE_STANDBY_DIR_FILE);
+}
+
+/*
+ * standby_slot_owner
+ *		The standby directory our replication slot was made for, as
+ *		<DataDir>/dbblue_standby.slot names it, palloc'd, or NULL if that is
+ *		not known.
+ */
+static char *
+standby_slot_owner(void)
+{
+	return data_dir_file_path(DBBLUE_STANDBY_SLOT_FILE);
+}
+
+/*
+ * record_standby_slot_owner
+ *		Remember that our replication slot is, from now on, the one made for
+ *		the standby in dir.  Reports a WARNING and returns false on failure.
+ *
+ * Called just before the build in dir makes the slot: from the moment the
+ * slot of the standby before has been dropped, any slot of that name is
+ * dir's, whether the build then succeeds or not.
+ */
+static bool
+record_standby_slot_owner(const char *dir)
+{
+	char	   *contents = psprintf("%s\n", dir);
+	bool		ok = write_data_dir_file(DBBLUE_STANDBY_SLOT_FILE, contents);
+
+	pfree(contents);
+	return ok;
+}
+
+/*
+ * adopt_legacy_slot_owner
+ *		Record which directory our replication slot was made for, if it was
+ *		made by a version of this worker that did not record it.
+ *
+ * Such a version made the slot in a build into the directory it then
+ * managed, and wrote that directory to dbblue_standby.dir first, as
+ * retire_previous_standby() still does.  So, read before this tick's
+ * retire_previous_standby() rewrites it, dbblue_standby.dir names the
+ * slot's directory -- or, if a change of dbblue_standby_directory was never
+ * followed by a build, one the slot was not made for.  That error rebuilds a
+ * standby that could have resumed, which costs a copy but serves no stale
+ * data.  Without either file, nothing is known, and nothing recorded.
+ */
+static void
+adopt_legacy_slot_owner(void)
+{
+	char	   *owner = standby_slot_owner();
+	char	   *last;
+
+	if (owner != NULL)
+	{
+		pfree(owner);
+		return;
+	}
+	if (standby_slot_state() == STANDBY_SLOT_ABSENT)
+		return;
+
+	last = previous_standby_directory();
+	if (last == NULL)
+		return;
+	(void) record_standby_slot_owner(last);
+	pfree(last);
 }
 
 /*
@@ -3952,6 +4070,20 @@ retire_previous_standby(const char *dir)
  * Unless it cannot be built again, as max_slot_wal_keep_size is -1: it is
  * then only stopped, and kept until a limit is set.
  *
+ * A slot of our slot's name may also be there, but made for a standby in
+ * another directory, as dbblue_standby.slot tells: dbblue_standby_directory
+ * pointed elsewhere, a standby was built there, and the setting has since
+ * been pointed back here.  That build dropped the slot this standby streamed
+ * through, and the WAL it still needs went unkept from then on, so it is
+ * gone for good after a checkpoint or two.  Taken for ours, as the name
+ * alone would have it, the standby would be started accepting connections --
+ * the backlog that decides otherwise is measured from the slot, that is from
+ * the other standby -- and serve Odoo its old data until it was fenced for
+ * not streaming, and stay fenced from then on, never rebuilt, while the slot
+ * held back WAL.  It is rebuilt as if its slot were gone, which it is.  Not
+ * when the slot is in use, though: then a standby in the other directory
+ * still runs, and is left to the operator.
+ *
  * A directory that is not our standby is not ours to delete, whatever it
  * holds: a different cluster may be the last copy of a primary that is gone,
  * a promoted one is somebody's primary now, and one streaming from us but not
@@ -3966,6 +4098,7 @@ vet_existing_standby(const char *dir, const char *logfile)
 {
 	uint64		their_sysid = 0;
 	StandbySlotState slot_state;
+	char	   *slot_owner = NULL;
 
 	switch (standby_identity(dir, &their_sysid))
 	{
@@ -4051,7 +4184,30 @@ vet_existing_standby(const char *dir, const char *logfile)
 
 	slot_state = standby_slot_state();
 	if (slot_state == STANDBY_SLOT_IDLE || slot_state == STANDBY_SLOT_ACTIVE)
-		return true;
+	{
+		/* unknown, as from an earlier version, is taken for ours */
+		slot_owner = standby_slot_owner();
+		if (slot_owner == NULL || same_directory(slot_owner, dir))
+		{
+			if (slot_owner)
+				pfree(slot_owner);
+			return true;
+		}
+
+		if (slot_state == STANDBY_SLOT_ACTIVE)
+		{
+			forget_standby_port();
+			ereport(WARNING,
+					(errmsg("dbblue create standby: replication slot \"%s\" was made for the standby in \"%s\", which still streams through it, not for the standby in \"%s\"",
+							DBBLUE_STANDBY_SLOT, slot_owner, dir),
+					 errhint("Stop the standby in \"%s\". The standby in \"%s\" is then built anew, as it can no longer catch up.",
+							 slot_owner, dir)));
+			pfree(slot_owner);
+			return false;
+		}
+
+		slot_state = STANDBY_SLOT_REPLACED;
+	}
 
 	/* it cannot stream from us any more, so none is to read from it */
 	forget_standby_port();
@@ -4071,10 +4227,15 @@ vet_existing_standby(const char *dir, const char *logfile)
 				 slot_state == STANDBY_SLOT_INVALIDATED ?
 				 errdetail("Replication slot \"%s\" has been invalidated, so the standby can no longer stream. It is stopped, and its files are kept until a limit is set.",
 						   DBBLUE_STANDBY_SLOT) :
+				 slot_state == STANDBY_SLOT_REPLACED ?
+				 errdetail("Replication slot \"%s\" was made for the standby in \"%s\", so this standby can no longer stream. It is stopped, and its files are kept until a limit is set.",
+						   DBBLUE_STANDBY_SLOT, slot_owner) :
 				 errdetail("Replication slot \"%s\" does not exist, so the standby can no longer stream. It is stopped, and its files are kept until a limit is set.",
 						   DBBLUE_STANDBY_SLOT),
 				 errhint("Set a limit, such as twice max_wal_size: ALTER SYSTEM SET max_slot_wal_keep_size = '%" PRId64 "MB'; SELECT pg_reload_conf();",
 						 (int64) max_wal_size_mb * 2)));
+		if (slot_owner)
+			pfree(slot_owner);
 		(void) stop_standby(dir, logfile);
 		return false;
 	}
@@ -4084,6 +4245,13 @@ vet_existing_standby(const char *dir, const char *logfile)
 		case STANDBY_SLOT_IDLE:
 		case STANDBY_SLOT_ACTIVE:
 			/* returned above */
+			break;
+		case STANDBY_SLOT_REPLACED:
+			ereport(WARNING,
+					(errmsg("dbblue create standby: replication slot \"%s\" was made for the standby in \"%s\", not for this one, rebuilding the standby in \"%s\"",
+							DBBLUE_STANDBY_SLOT, slot_owner, dir),
+					 errdetail("The slot this standby streamed through was dropped when the standby in \"%s\" was built, and the WAL it still needs has not been kept for it since. Started, it could never catch up, and would serve its old data meanwhile.",
+							   slot_owner)));
 			break;
 		case STANDBY_SLOT_INVALIDATED:
 			{
@@ -4122,6 +4290,8 @@ vet_existing_standby(const char *dir, const char *logfile)
 					 errdetail("The standby streams through that slot, and cannot connect without it.")));
 			break;
 	}
+	if (slot_owner)
+		pfree(slot_owner);
 
 	if (!stop_standby(dir, logfile))
 		return false;
@@ -4483,6 +4653,9 @@ run_standby_tick(void)
 		return false;
 	}
 
+	/* before retire_previous_standby() rewrites what it goes by */
+	adopt_legacy_slot_owner();
+
 	/* the standby of a directory we no longer use must not hold our slot */
 	if (!retire_previous_standby(dir))
 	{
@@ -4731,6 +4904,18 @@ run_standby_tick(void)
 		 * drop_standby_slot().
 		 */
 		if (!drop_standby_slot(logfile))
+		{
+			pfree(logfile);
+			pfree(dir);
+			return false;
+		}
+
+		/*
+		 * From here on, a slot of that name is the one made for dir, so a
+		 * standby left in another directory is no longer taken for one it
+		 * can stream through; see vet_existing_standby().
+		 */
+		if (!record_standby_slot_owner(dir))
 		{
 			pfree(logfile);
 			pfree(dir);

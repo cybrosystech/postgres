@@ -245,6 +245,13 @@ static const struct exclude_list_item excludeFiles[] =
 	{"dbblue_standby.dir", false},
 	{"dbblue_standby.dir.tmp", false},
 
+	/*
+	 * The standby directory its replication slot was made for.  A copy has
+	 * no such slot.
+	 */
+	{"dbblue_standby.slot", false},
+	{"dbblue_standby.slot.tmp", false},
+
 	/* end of list */
 	{NULL, false}
 };

@@ -23,6 +23,10 @@
 #   * with max_slot_wal_keep_size = -1, a standby whose slot is gone is kept,
 #     not deleted with no rebuild to follow, and rebuilt once a limit is set
 #     (M6);
+#   * pointed back at a directory whose standby was set aside for one built
+#     in another, the standby there is rebuilt, not started on its old data
+#     and left fenced for good, as the slot it streamed through was made anew
+#     for the other one;
 #   * CREATE TABLESPACE is refused while the feature is on or paused, as the
 #     standby on this host would share the tablespace's directory and write
 #     over the primary's files, and allowed once it is off (R1);
@@ -50,6 +54,7 @@ $node->init(allows_streaming => 1);
 
 my $pgdata = $node->data_dir;
 my $sbdir = "${pgdata}_standby";
+my $sbdir_b = $node->basedir . '/standby_b';
 my $portfile = "$pgdata/dbblue_standby.port";
 my $port = $node->port;
 
@@ -60,8 +65,11 @@ END
 {
 	local $?;
 	eval { $node->stop('immediate') if defined $node; };
-	system('pg_ctl', '-D', $sbdir, '-m', 'immediate', 'stop')
-	  if defined $sbdir && -f "$sbdir/postmaster.pid";
+	foreach my $dir ($sbdir, $sbdir_b)
+	{
+		system('pg_ctl', '-D', $dir, '-m', 'immediate', 'stop')
+		  if defined $dir && -f "$dir/postmaster.pid";
+	}
 }
 
 # A stopped cluster beside ours, configured for the port just above ours.
@@ -327,6 +335,58 @@ $sb = wait_for_standby('after a limit is set again');
 $rows = $node->safe_psql('postgres', 'SELECT count(*) FROM t');
 ok($sb->poll_query_until('postgres', 'SELECT count(*) FROM t', $rows),
 	'once a limit is set, the standby is rebuilt');
+
+# ---------------------------------------------------------------------------
+# A standby set aside for one built in another directory is rebuilt, not
+# started on its old data, once dbblue_standby_directory points back at it:
+# the build in the other directory dropped the slot it streamed through, and
+# made one of the same name, for itself.
+# ---------------------------------------------------------------------------
+mkdir $sbdir_b or die "could not create $sbdir_b: $!";
+chmod 0700, $sbdir_b;
+
+alter_system("SET dbblue_standby_directory = '$sbdir_b'");
+wait_until('the standby is running in the second directory',
+	sub { -f "$sbdir_b/standby.signal" && -f "$sbdir_b/postmaster.pid" });
+ok(!-f "$sbdir/postmaster.pid",
+	'the standby in the first directory is stopped');
+like(
+	slurp_file("$pgdata/dbblue_standby.slot"),
+	qr/standby_b$/m,
+	'the slot is recorded as made for the second directory');
+$sb = wait_for_standby('in the second directory');
+
+# Rows the set-aside standby never received.
+$node->safe_psql('postgres',
+	'INSERT INTO t SELECT generate_series(1001, 1100)');
+$rows = $node->safe_psql('postgres', 'SELECT count(*) FROM t');
+ok($sb->poll_query_until('postgres', 'SELECT count(*) FROM t', $rows),
+	'the standby in the second directory replicates');
+
+$offset = -s $node->logfile;
+alter_system('RESET dbblue_standby_directory');
+$node->wait_for_log(
+	qr/replication slot "dbblue_standby" was made for the standby in ".*standby_b", not for this one, rebuilding the standby in/,
+	$offset);
+pass('pointed back at, the set-aside standby is rebuilt');
+wait_until('the standby in the second directory has stopped',
+	sub { !-f "$sbdir_b/postmaster.pid" });
+
+$sb = wait_for_standby('back in the first directory');
+ok($sb->poll_query_until('postgres', 'SELECT count(*) FROM t', $rows),
+	'the rebuilt standby has the rows written while it was set aside');
+
+my $log = substr(slurp_file($node->logfile), $offset);
+my $rebuilt_at = index($log, 'not for this one, rebuilding the standby');
+my $reported_at = index($log, 'standby is running on port');
+ok($rebuilt_at >= 0 && $reported_at > $rebuilt_at,
+	'the set-aside standby is not started on its old data before the rebuild');
+ok(!$node->log_contains(qr/has not streamed from this server/, $offset),
+	'and is never left fenced for not streaming');
+like(
+	slurp_file("$pgdata/dbblue_standby.slot"),
+	qr/_standby$/m,
+	'the slot is recorded as made for the first directory again');
 
 # ---------------------------------------------------------------------------
 # Tablespaces: the standby on this host would replay CREATE TABLESPACE with

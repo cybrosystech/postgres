@@ -207,6 +207,7 @@ WAL.
 | Primary crashes or immediate stop | Standby keeps running; picked up again when the primary starts |
 | Standby far behind, or replay stopped | Fenced until caught up (see above) |
 | Slot invalidated, or dropped | Standby rebuilt; the log says why (`wal_removed` vs `idle_replication_slot_timeout`) |
+| `dbblue_standby_directory` pointed back at a directory whose standby was set aside for one built elsewhere | That standby is rebuilt, never started on its old data: the build elsewhere dropped the slot it streamed through |
 | A start or build keeps failing | Retried 5 times 10 s apart, then after 1, 2, 4 … minutes, up to once an hour; `SELECT pg_reload_conf()` retries at once |
 | Primary stopped during a build | The partial copy is cleared at the next start, not during the shutdown |
 | Primary settings raised (`max_connections` and the like) | The standby's are raised to match, and it is restarted if needed |
@@ -254,7 +255,7 @@ important ones:
 |---|---|
 | `restarting it to refuse connections` / `starting it to refuse connections` | Fenced: Odoo reads from the primary meanwhile |
 | `consecutive failures; retrying in` | Something keeps failing; the message before it says what |
-| `has been invalidated, rebuilding` / `does not exist, rebuilding` | Full rebuild under way |
+| `has been invalidated, rebuilding` / `does not exist, rebuilding` / `not for this one, rebuilding` | Full rebuild under way |
 | `not enough free disk space` / `cannot build a standby of this server` / `not building a standby` | No standby until you act (disk, tablespaces, `max_slot_wal_keep_size = -1`) |
 | `standby moves from port` | Update Odoo's `db_replica_port` |
 | `makes the standby of dbblue_create_standby a synchronous standby` | Fix `synchronous_standby_names` |
@@ -338,6 +339,7 @@ deletes data it cannot prove is its own.
 | `<data directory>_standby.building` | Marker while a build is in progress |
 | `<data directory>/dbblue_standby.port` | The standby's port, present while it accepts connections |
 | `<data directory>/dbblue_standby.dir` | Which directory holds the current standby |
+| `<data directory>/dbblue_standby.slot` | Which directory the `dbblue_standby` slot was made for |
 | `<primary log>-standby.log`, or `<data directory>_standby.log` | Output of `pg_basebackup`/`pg_ctl`, and the standby's log when it does not use the logging collector. The second location is not rotated. |
 | `standby-<log_filename>` in an absolute `log_directory` | The standby's server log, with the logging collector on |
 
