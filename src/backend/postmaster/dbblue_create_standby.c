@@ -5179,6 +5179,12 @@ warn_unlimited_slot_wal(void)
  * dbblue_create_standby on is stopped: one we set aside, or that is not ours,
  * is left as it is.  An immediate shutdown or a crash of ours does not come
  * here, and leaves the standby to systemd.
+ *
+ * Nor can we tell our postmaster's SIGTERM from one sent to us alone, by an
+ * operator with kill(1), say, as pg_terminate_backend() cannot reach a
+ * worker without a database connection.  Either way the standby is stopped,
+ * which is never wrong; see DbblueCreateStandbyMain() for how the worker
+ * comes back after the latter.
  */
 static void
 stop_standby_at_shutdown(void)
@@ -5223,8 +5229,9 @@ stop_standby_at_shutdown(void)
 	forget_standby_port();
 
 	ereport(LOG,
-			(errmsg("dbblue create standby: shutting down the standby in \"%s\" along with this server",
-					dir)));
+			(errmsg("dbblue create standby: shutting down the standby in \"%s\", as this worker is stopping",
+					dir),
+			 errdetail("Either this server is shutting down, or this worker alone was sent SIGTERM, in which case it is started again within a minute, and the standby with it.")));
 
 	if (kill((pid_t) pid, SIGINT) != 0)
 	{
@@ -5384,8 +5391,17 @@ DbblueCreateStandbyMain(Datum main_arg)
 
 	stop_standby_at_shutdown();
 
+	/*
+	 * Exit with 1, not 0: the postmaster unregisters a worker that exits with
+	 * 0 for good.  After a SIGTERM sent to us alone, that would leave the
+	 * standby stopped and nothing releasing our slot's hold on VACUUM until
+	 * the server restarts; with 1, we are started again after
+	 * bgw_restart_time, and start the standby again.  When the server shuts
+	 * down, it starts no worker anew, whatever the exit code; see
+	 * bgworker_should_start_now().
+	 */
 	ereport(LOG, (errmsg("dbblue create standby worker shutting down")));
-	proc_exit(0);
+	proc_exit(1);
 }
 
 /*

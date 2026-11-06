@@ -205,7 +205,7 @@ is(standby_pid(), $pid, 'the standby reloaded without being restarted');
 my $sbport = $sb->port;
 $node->stop;
 ok(!-f "$sbdir/postmaster.pid", 'standby stopped along with the primary');
-ok($node->log_contains(qr/shutting down the standby in .* along with this server/),
+ok($node->log_contains(qr/shutting down the standby in .*, as this worker is stopping/),
 	'the worker shut the standby down cleanly');
 
 $node->start;
