@@ -257,7 +257,8 @@ Not a query-speed feature, so not in the table above: with
 server** for Odoo's `db_replica_port`, so list views and reports read from the replica
 instead of the primary. It is off by default, and it is not high availability.
 Sizing, Odoo setup, monitoring and troubleshooting: see
-[AUTO_STANDBY.md](AUTO_STANDBY.md).
+[AUTO_STANDBY.md](AUTO_STANDBY.md). How it works inside, for developers:
+[AUTO_STANDBY_INTERNALS.md](AUTO_STANDBY_INTERNALS.md).
 
 ---
 

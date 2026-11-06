@@ -20,6 +20,9 @@ SELECT pg_reload_conf();
 >   For real HA, run a replica on **another** machine.
 > - It is **off by default**, and changes nothing until you turn it on.
 
+Developers changing the feature: see [AUTO_STANDBY_INTERNALS.md](AUTO_STANDBY_INTERNALS.md)
+for how the worker works inside.
+
 ---
 
 ## Quick reference
@@ -116,7 +119,7 @@ Odoo retries the replica about 20 minutes after a failed connection.
 | `max_slot_wal_keep_size` | **not** `-1` (auto-tune sets 2× `max_wal_size`) | Without a limit, a stopped standby could fill the disk with WAL. The worker refuses to build one. |
 | `pg_hba.conf` | a `replication` entry that needs no typed password: `local replication all peer` or `trust`, or a password from a `.pgpass` file | The worker connects over the first Unix socket directory, or `localhost`, with `pg_basebackup -w` |
 | `synchronous_standby_names` | empty (the default), or a list of **names** — never `'*'` | `'*'` makes this standby synchronous, and commits hang while it is down (see Troubleshooting) |
-| Tablespaces | **none** | A copy on the same host cannot place them; the worker refuses and says so |
+| Tablespaces | **none** | On the same host the standby would use the primary's own tablespace directories and overwrite its files. The worker will not build a standby while a tablespace exists, and `CREATE TABLESPACE` is refused while the feature is `on` or `paused` |
 
 **Security.** The standby listens on the primary's `listen_addresses`, on a port up to
 ten above the primary's. With `listen_addresses = '*'`, make sure your firewall covers
@@ -298,6 +301,12 @@ primary.
 standby holds back VACUUM on the primary for as long as it runs, just as it would on
 the primary. In return, VACUUM on the primary does not cancel queries on the standby;
 locks taken on the primary, such as `DROP TABLE` or `TRUNCATE`, still can.
+
+**"cannot create a tablespace while dbblue_create_standby is …"**
+A standby on the same host would share the new tablespace's directory with the primary
+and overwrite its files, so `CREATE TABLESPACE` is refused while the feature is `on` or
+`paused`. If you need the tablespace, set `dbblue_create_standby = off` first. The
+standby is then not rebuilt for as long as a tablespace exists.
 
 **Restarting the worker.** It has no database connection, so `pg_terminate_backend()`
 cannot reach it. Use `kill <pid>` (SIGTERM). The standby stops, and both come back
