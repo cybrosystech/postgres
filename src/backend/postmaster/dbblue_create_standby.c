@@ -31,9 +31,10 @@
  *
  * The worker then babysits the standby: every tick it checks the standby
  * postmaster is still alive and restarts it if not.  One that has stopped
- * streaming or replaying our WAL is restarted refusing connections, so that
- * Odoo reads from us instead of stale data, until it has caught up; see
- * standby_fence_changes().  When we reload our configuration, which the
+ * streaming or replaying our WAL, or is more than dbblue_standby_max_lag
+ * behind us, is restarted refusing connections, so that Odoo reads from us
+ * instead of stale data, until it has caught up; one that has that much to
+ * catch up on when it starts is started so.  See standby_fence_changes().  When we reload our configuration, which the
  * standby shares, it is reloaded too; see reload_standby().  It also checks the
  * standby is still usable: if our replication slot has been invalidated or
  * is gone, the standby can never catch up and is rebuilt; if the directory holds a
@@ -122,6 +123,7 @@
 int			dbblue_create_standby = DBBLUE_STANDBY_OFF;
 char	   *dbblue_standby_directory = NULL;
 char	   *dbblue_standby_user = NULL;
+int			dbblue_standby_max_lag = 64;
 
 /* How often the worker wakes up to check on the standby. */
 #define DBBLUE_STANDBY_NAPTIME_MS	10000L
@@ -158,6 +160,13 @@ char	   *dbblue_standby_user = NULL;
  * before standby_must_fence() has it refuse connections.
  */
 #define DBBLUE_STANDBY_STALL_MS		60000L
+
+/*
+ * How many checks in a row a running standby must be more than
+ * dbblue_standby_max_lag behind before it is fenced, so that a moment's
+ * spike does not restart it.
+ */
+#define DBBLUE_STANDBY_LAG_TICKS	2
 
 /*
  * How long drop_standby_slot() waits for our slot to be released by the
@@ -271,6 +280,8 @@ static bool tablespace_warned = false;
 static XLogRecPtr standby_last_apply = InvalidXLogRecPtr;
 static XLogRecPtr standby_last_flush = InvalidXLogRecPtr;
 static TimestampTz standby_stalled_since = 0;
+/* Checks in a row the running standby was more than dbblue_standby_max_lag behind. */
+static int	standby_lagging_ticks = 0;
 
 /*
  * Whether the standby run_standby_tick() last saw running is fenced, and
@@ -3108,6 +3119,42 @@ standby_server_opts(const char *dir)
 }
 
 /*
+ * standby_slot_backlog
+ *		Set *backlog to how many bytes of WAL we have flushed that our slot's
+ *		standby has not yet received.  Returns false if that cannot be told:
+ *		the slot is missing or reserves no WAL.
+ *
+ * A physical slot's restart_lsn is where its standby last reported having
+ * flushed what it received, and it stays there while the standby is down:
+ * the WAL written meanwhile is what the standby must catch up on when it
+ * starts again.
+ */
+static bool
+standby_slot_backlog(uint64 *backlog)
+{
+	ReplicationSlot *slot;
+	XLogRecPtr	restart_lsn = InvalidXLogRecPtr;
+	XLogRecPtr	flush;
+
+	LWLockAcquire(ReplicationSlotControlLock, LW_SHARED);
+	slot = SearchNamedReplicationSlot(DBBLUE_STANDBY_SLOT, false);
+	if (slot != NULL)
+	{
+		SpinLockAcquire(&slot->mutex);
+		restart_lsn = slot->data.restart_lsn;
+		SpinLockRelease(&slot->mutex);
+	}
+	LWLockRelease(ReplicationSlotControlLock);
+
+	if (XLogRecPtrIsInvalid(restart_lsn))
+		return false;
+
+	flush = GetFlushRecPtr(NULL);
+	*backlog = (flush > restart_lsn) ? flush - restart_lsn : 0;
+	return true;
+}
+
+/*
  * standby_slot_invalidation
  *		Why our replication slot was invalidated, or RS_INVAL_NONE if it is
  *		still valid or does not exist.
@@ -3378,6 +3425,14 @@ standby_fenced(const char *dir)
  * cursors, and tries the replica again later; tooling is no longer pointed at
  * it either, as its port is not reported while it is fenced.
  *
+ * A standby that still replays, but is far behind, serves data just as stale
+ * for as long as it takes to catch up: after a pause, a crash, or while its
+ * replay cannot keep up with our writes.  Once it has been more than
+ * dbblue_standby_max_lag behind at DBBLUE_STANDBY_LAG_TICKS checks in a row,
+ * it is fenced too.  Only a standby that has not caught up is measured: one
+ * that has replayed what we had a tick ago is at most a tick behind, however
+ * much we have written since.
+ *
  * The restart alone may be the cure, as a paused replay does not survive it.
  * Once it has caught up, it is restarted without the fence.  A standby that
  * cannot connect stays fenced until whatever keeps it out is fixed.
@@ -3391,6 +3446,29 @@ standby_fence_changes(const char *dir, bool fenced)
 	if (repl == STANDBY_REPL_CAUGHT_UP || repl == STANDBY_REPL_BEHIND)
 	{
 		standby_stalled_since = 0;
+
+		if (!fenced && repl == STANDBY_REPL_BEHIND &&
+			dbblue_standby_max_lag > 0 &&
+			XLogRecPtrIsValid(standby_last_apply) &&
+			standby_last_flush > standby_last_apply &&
+			standby_last_flush - standby_last_apply >
+			(uint64) dbblue_standby_max_lag * 1024 * 1024)
+		{
+			if (++standby_lagging_ticks < DBBLUE_STANDBY_LAG_TICKS)
+				return false;
+			standby_lagging_ticks = 0;
+			ereport(WARNING,
+					(errmsg("dbblue create standby: the standby in \"%s\" is %" PRIu64 " MB behind this server, more than dbblue_standby_max_lag, restarting it to refuse connections until it has caught up",
+							dir,
+							(standby_last_flush - standby_last_apply) / (1024 * 1024)),
+					 errdetail("It has replayed up to %X/%08X, this server has flushed up to %X/%08X. Until it has caught up, Odoo reads from this server instead.",
+							   LSN_FORMAT_ARGS(standby_last_apply),
+							   LSN_FORMAT_ARGS(standby_last_flush)),
+					 errhint("Its replay cannot keep up with this server's writes, which it shares the host's disk and CPU with.")));
+			return true;
+		}
+		standby_lagging_ticks = 0;
+
 		if (!fenced || repl != STANDBY_REPL_CAUGHT_UP)
 			return false;
 
@@ -4651,6 +4729,29 @@ run_standby_tick(void)
 						previous_port, port, previous_port),
 				 errhint("Set Odoo's db_replica_port to %d.", port)));
 
+	/*
+	 * A standby has as much to catch up on as we have written while it was
+	 * down: after a pause, a crash or a reboot, possibly gigabytes, all of
+	 * it replayed while it already accepts connections.  Started with more
+	 * than dbblue_standby_max_lag to catch up on, it is started fenced, and
+	 * let in once it has caught up; see standby_fence_changes().  A standby
+	 * stopped along with us, or just built, has next to nothing to catch up
+	 * on, and starts as it was.
+	 */
+	if (!fenced && dbblue_standby_max_lag > 0)
+	{
+		uint64		backlog;
+
+		if (standby_slot_backlog(&backlog) &&
+			backlog > (uint64) dbblue_standby_max_lag * 1024 * 1024)
+		{
+			fenced = true;
+			ereport(LOG,
+					(errmsg("dbblue create standby: the standby in \"%s\" has %" PRIu64 " MB of this server's WAL to catch up on, more than dbblue_standby_max_lag, starting it to refuse connections until it has caught up",
+							dir, backlog / (1024 * 1024))));
+		}
+	}
+
 	if (!write_standby_settings(dir, port, fenced))
 	{
 		pfree(logfile);
@@ -4665,6 +4766,7 @@ run_standby_tick(void)
 	standby_last_apply = InvalidXLogRecPtr;
 	standby_last_flush = InvalidXLogRecPtr;
 	standby_stalled_since = 0;
+	standby_lagging_ticks = 0;
 
 	/*
 	 * The port may differ from the last start's, and until the standby is up

@@ -27,6 +27,7 @@ typedef enum DbblueCreateStandbyMode
 extern PGDLLIMPORT int dbblue_create_standby;
 extern PGDLLIMPORT char *dbblue_standby_directory;
 extern PGDLLIMPORT char *dbblue_standby_user;
+extern PGDLLIMPORT int dbblue_standby_max_lag;
 
 extern void DbblueCreateStandbyRegister(void);
 extern PGDLLEXPORT void DbblueCreateStandbyMain(Datum main_arg);

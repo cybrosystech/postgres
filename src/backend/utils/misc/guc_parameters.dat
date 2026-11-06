@@ -1108,6 +1108,16 @@
   check_hook => 'check_dbblue_standby_directory',
 },
 
+{ name => 'dbblue_standby_max_lag', type => 'int', context => 'PGC_SIGHUP', group => 'REPLICATION_PRIMARY',
+  short_desc => 'Sets how far the standby of dbblue_create_standby may be behind this server and still accept connections.',
+  long_desc => 'Odoo reads from the standby while it accepts connections. A standby that has more than this much WAL left to replay -- after a pause, a crash, or while replay cannot keep up with this server -- is started, or restarted, refusing connections, so that Odoo reads from this server instead, and is let back in once it has caught up. 0 lets a standby that is behind accept connections all the same; one that has stopped replaying is refused regardless.',
+  flags => 'GUC_UNIT_MB',
+  variable => 'dbblue_standby_max_lag',
+  boot_val => '64',
+  min => '0',
+  max => 'MAX_KILOBYTES',
+},
+
 { name => 'dbblue_standby_user', type => 'string', context => 'PGC_SIGHUP', group => 'REPLICATION_PRIMARY',
   short_desc => 'Role pg_basebackup connects as when dbblue_create_standby provisions the standby.',
   long_desc => 'The role must have REPLICATION privilege and a matching pg_hba.conf replication entry that does not require an interactive password (trust, a password from a passfile, or peer). The standby connects over this server\'s first Unix socket directory, or else localhost. Peer authentication only accepts a role named like the operating-system user the server runs as, unless a pg_ident.conf map allows otherwise. An empty value (the default) connects as that operating-system user, which works with initdb\'s default pg_hba.conf. Set this to e.g. "replicator" if you use a dedicated replication role. ALTER SYSTEM refuses a role that does not exist, cannot log in, or has neither REPLICATION nor SUPERUSER.',
