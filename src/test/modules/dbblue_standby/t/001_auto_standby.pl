@@ -20,6 +20,8 @@
 #     reported -- and let back in once it has caught up (H3, H4);
 #   * a standby whose replay has stopped is fenced as soon as it is more than
 #     dbblue_standby_max_lag behind, not only by the 60-second stall timer;
+#   * so is a standby that cannot stream from us at all, measured by what our
+#     slot says it has received;
 #   * a slot invalidated by idle_replication_slot_timeout is reported as such,
 #     not blamed on max_slot_wal_keep_size, and the standby rebuilt (L8);
 #   * with max_slot_wal_keep_size = -1, a standby whose slot is gone is kept,
@@ -301,6 +303,58 @@ alter_system('RESET dbblue_standby_max_lag');
 $sb = wait_for_standby('after the lag fence of a stalled standby is lifted');
 is($sb->safe_psql('postgres', 'SELECT count(*) FROM lag_test'),
 	'50000', 'once let back in, the standby has the rows it fell behind on');
+$node->safe_psql('postgres', 'DROP TABLE lag_test');
+
+# ---------------------------------------------------------------------------
+# A standby that cannot stream from us at all is fenced as soon as it is
+# more than dbblue_standby_max_lag behind what our slot says it has received,
+# not only once it has not streamed for 60 seconds.
+# ---------------------------------------------------------------------------
+my $hba = $node->data_dir . '/pg_hba.conf';
+my $hba_orig = slurp_file($hba);
+
+alter_system("SET dbblue_standby_max_lag = '1MB'");
+
+# Shut its replication connection out: the standby connects over the socket.
+open my $hba_fh, '>', $hba or die "could not write $hba: $!";
+print $hba_fh "local replication all reject\n" . $hba_orig;
+close $hba_fh;
+$node->reload;
+
+$offset = -s $node->logfile;
+my $cut_at = time;
+$node->safe_psql('postgres',
+	"SELECT pg_terminate_backend(pid) FROM pg_stat_replication WHERE application_name = 'dbblue_standby'"
+);
+$node->poll_query_until('postgres',
+	"SELECT count(*) = 0 FROM pg_stat_replication WHERE application_name = 'dbblue_standby'"
+) or die "timed out waiting for the standby to be disconnected";
+
+$node->safe_psql('postgres',
+	"CREATE TABLE lag_test AS SELECT g, repeat('x', 100) AS pad FROM generate_series(1, 50000) g"
+);
+$node->wait_for_log(
+	qr/does not stream from this server, and is at least \d+ MB behind it, more than dbblue_standby_max_lag, restarting it to refuse connections/,
+	$offset);
+my $cut_fenced_after = time - $cut_at;
+cmp_ok($cut_fenced_after, '<', 55,
+	"a disconnected standby over dbblue_standby_max_lag is fenced at once ($cut_fenced_after s), not after the 60 s stall timer"
+);
+ok(!$node->log_contains(qr/has not streamed from this server for/, $offset),
+	'it was fenced for its lag, not by the stall timer');
+
+# Let it in again: it streams, catches up, and is let back in.
+open $hba_fh, '>', $hba or die "could not write $hba: $!";
+print $hba_fh $hba_orig;
+close $hba_fh;
+$node->reload;
+$node->wait_for_log(
+	qr/has caught up with this server, restarting it to accept connections again/,
+	$offset);
+alter_system('RESET dbblue_standby_max_lag');
+$sb = wait_for_standby('after a disconnected standby is let in again');
+is($sb->safe_psql('postgres', 'SELECT count(*) FROM lag_test'),
+	'50000', 'let in again, the standby has the rows written while it was shut out');
 $node->safe_psql('postgres', 'DROP TABLE lag_test');
 
 # ---------------------------------------------------------------------------

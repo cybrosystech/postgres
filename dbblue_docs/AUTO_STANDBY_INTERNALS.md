@@ -581,11 +581,16 @@ primary keeps writing, so the current flush is almost never reached.
 ### 9.2 Deciding — `standby_fence_changes(dir, fenced)`
 
 ```
-LAG CHECK, first, for BEHIND and STALLED alike:
-    if (!fenced && (BEHIND || STALLED) && max_lag > 0 && flush - apply > max_lag MB):
+LAG CHECK, first, for BEHIND, STALLED and DISCONNECTED:
+    lag = flush - apply                    (BEHIND, STALLED: apply from the walsender)
+    lag = flush - slot restart_lsn         (DISCONNECTED: what it received, the most
+                                            it can have replayed)
+    if (!fenced && max_lag > 0 && lag > max_lag MB):
         if (++lagging_ticks >= 2)                 // 2 checks in a row: no one-tick spike
             WARNING "... MB behind ..., restarting it to refuse connections"
-                    (hint: "Its replay has stopped" when STALLED)
+                    (hint: "Its replay has stopped" when STALLED;
+                     "does not stream from this server, and is at least … MB behind it"
+                     when DISCONNECTED)
             return true                           // → fence
     else
         lagging_ticks = 0
@@ -607,9 +612,16 @@ STALLED or DISCONNECTED:
 The lag check runs for a **stalled** standby too. A stopped replay falls behind at the
 full rate of the primary's writes. A lock conflict that `max_standby_streaming_delay`
 (30 s by default) cuts short never reaches the 60 s timer, so before this, such a
-standby served data far more than `max_lag` behind and was never fenced. The 60 s
-timer still covers a standby that has stopped but is **not** far behind (a quiet
-database), and a disconnected one, whose replay position is not known.
+standby served data far more than `max_lag` behind and was never fenced.
+
+A **disconnected** standby has no walsender, so its replay position is unknown. But the
+slot's `restart_lsn` (`standby_slot_restart_lsn()`) still holds what it last received,
+and it cannot have replayed past that, so `flush − restart_lsn` is the **smallest** its
+lag can be. When even that is over `max_lag`, it is fenced. A standby that reconnects
+before the second check is measured normally again and is not fenced for a short break.
+
+The 60 s timer still covers a standby that has stopped or disconnected but is **not**
+far behind (a quiet database).
 
 ### 9.3 The fence state machine
 
@@ -1137,6 +1149,7 @@ install, because this fork's default `shared_preload_libraries` names them.
 | H1 | the standby stops with the primary and keeps its port |
 | H3, H4 | a standby whose replay is paused is fenced (port file gone, refuses connections, slot xmin cleared), then let back in |
 | Stalled lag | a standby whose replay is paused and that falls more than `dbblue_standby_max_lag` behind is fenced for its lag within a couple of ticks, not by the 60 s stall timer |
+| Disconnected lag | a standby shut out by `pg_hba.conf` that falls more than `dbblue_standby_max_lag` behind its slot's `restart_lsn` is fenced within a couple of ticks; let in again, it catches up and is unfenced |
 | L8 | an `idle_replication_slot_timeout` invalidation is reported as such, and the standby rebuilt |
 | M6 | with `max_slot_wal_keep_size = -1`, a standby whose slot is gone is kept, then rebuilt once a limit is set |
 | Slot owner | pointed back at a directory whose standby was set aside for one built in another, that standby is rebuilt, never started on its old data or left fenced |

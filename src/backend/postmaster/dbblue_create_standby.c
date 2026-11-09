@@ -3271,6 +3271,35 @@ standby_server_opts(const char *dir)
 }
 
 /*
+ * standby_slot_restart_lsn
+ *		Our replication slot's restart_lsn, or InvalidXLogRecPtr if the slot is
+ *		missing or reserves no WAL.
+ *
+ * For a physical slot, that is how far its standby last told us it had
+ * received and flushed our WAL, and it stays there while the standby does
+ * not stream: the most it can have replayed since, short of fetching WAL
+ * from an archive.
+ */
+static XLogRecPtr
+standby_slot_restart_lsn(void)
+{
+	ReplicationSlot *slot;
+	XLogRecPtr	restart_lsn = InvalidXLogRecPtr;
+
+	LWLockAcquire(ReplicationSlotControlLock, LW_SHARED);
+	slot = SearchNamedReplicationSlot(DBBLUE_STANDBY_SLOT, false);
+	if (slot != NULL)
+	{
+		SpinLockAcquire(&slot->mutex);
+		restart_lsn = slot->data.restart_lsn;
+		SpinLockRelease(&slot->mutex);
+	}
+	LWLockRelease(ReplicationSlotControlLock);
+
+	return restart_lsn;
+}
+
+/*
  * standby_slot_backlog
  *		Set *backlog to how many bytes of WAL we have flushed that our slot's
  *		standby has not yet received.  Returns false if that cannot be told:
@@ -3284,19 +3313,8 @@ standby_server_opts(const char *dir)
 static bool
 standby_slot_backlog(uint64 *backlog)
 {
-	ReplicationSlot *slot;
-	XLogRecPtr	restart_lsn = InvalidXLogRecPtr;
+	XLogRecPtr	restart_lsn = standby_slot_restart_lsn();
 	XLogRecPtr	flush;
-
-	LWLockAcquire(ReplicationSlotControlLock, LW_SHARED);
-	slot = SearchNamedReplicationSlot(DBBLUE_STANDBY_SLOT, false);
-	if (slot != NULL)
-	{
-		SpinLockAcquire(&slot->mutex);
-		restart_lsn = slot->data.restart_lsn;
-		SpinLockRelease(&slot->mutex);
-	}
-	LWLockRelease(ReplicationSlotControlLock);
 
 	if (XLogRecPtrIsInvalid(restart_lsn))
 		return false;
@@ -3591,8 +3609,18 @@ standby_fenced(const char *dir)
  * max_standby_streaming_delay of 30 seconds does, would otherwise never be
  * fenced at all.  Only a standby that has not caught up is measured: one
  * that has replayed what we had a tick ago is at most a tick behind, however
- * much we have written since.  Nor is one we cannot hear from, as how far it
- * has replayed is then not known.
+ * much we have written since.
+ *
+ * A standby that does not stream from us at all -- shut out by pg_hba.conf,
+ * or by a change to the role it connects as -- has no walsender to tell how
+ * far it has replayed, but still serves its data, which falls behind at the
+ * full rate of our writes.  Our slot keeps how far it had received, which is
+ * the most it can have replayed since: so it is at least that far behind, and
+ * once that is more than dbblue_standby_max_lag at
+ * DBBLUE_STANDBY_LAG_TICKS checks in a row, it is fenced as well, without
+ * waiting out DBBLUE_STANDBY_STALL_MS.  One that connects again in the
+ * meantime is measured as any other, and is not fenced for a moment's
+ * break.
  *
  * The restart alone may be the cure, as a paused replay does not survive it,
  * nor does the query a replay waits on.  Once it has caught up, it is
@@ -3604,28 +3632,51 @@ standby_fence_changes(const char *dir, bool fenced)
 {
 	StandbyReplication repl = standby_replication();
 	TimestampTz now = GetCurrentTimestamp();
+	XLogRecPtr	received = InvalidXLogRecPtr;
+	bool		lagging = false;
 
-	if (!fenced &&
-		(repl == STANDBY_REPL_BEHIND || repl == STANDBY_REPL_STALLED) &&
-		dbblue_standby_max_lag > 0 &&
-		XLogRecPtrIsValid(standby_last_apply) &&
-		standby_last_flush > standby_last_apply &&
-		standby_last_flush - standby_last_apply >
-		(uint64) dbblue_standby_max_lag * 1024 * 1024)
+	if (!fenced && dbblue_standby_max_lag > 0)
+	{
+		uint64		max_lag = (uint64) dbblue_standby_max_lag * 1024 * 1024;
+
+		if (repl == STANDBY_REPL_BEHIND || repl == STANDBY_REPL_STALLED)
+			lagging = (XLogRecPtrIsValid(standby_last_apply) &&
+					   standby_last_flush > standby_last_apply &&
+					   standby_last_flush - standby_last_apply > max_lag);
+		else if (repl == STANDBY_REPL_DISCONNECTED)
+		{
+			/* how far it has replayed is not known; see above */
+			received = standby_slot_restart_lsn();
+			lagging = (XLogRecPtrIsValid(received) &&
+					   standby_last_flush > received &&
+					   standby_last_flush - received > max_lag);
+		}
+	}
+
+	if (lagging)
 	{
 		if (++standby_lagging_ticks >= DBBLUE_STANDBY_LAG_TICKS)
 		{
 			standby_lagging_ticks = 0;
-			ereport(WARNING,
-					(errmsg("dbblue create standby: the standby in \"%s\" is %" PRIu64 " MB behind this server, more than dbblue_standby_max_lag, restarting it to refuse connections until it has caught up",
-							dir,
-							(standby_last_flush - standby_last_apply) / (1024 * 1024)),
-					 errdetail("It has replayed up to %X/%08X, this server has flushed up to %X/%08X. Until it has caught up, Odoo reads from this server instead.",
-							   LSN_FORMAT_ARGS(standby_last_apply),
-							   LSN_FORMAT_ARGS(standby_last_flush)),
-					 repl == STANDBY_REPL_STALLED ?
-					 errhint("Its replay has stopped: it may wait on a query on the standby that conflicts with this server's changes (see max_standby_streaming_delay), or have been paused with pg_wal_replay_pause(); see the standby's log.") :
-					 errhint("Its replay cannot keep up with this server's writes, which it shares the host's disk and CPU with.")));
+			if (repl == STANDBY_REPL_DISCONNECTED)
+				ereport(WARNING,
+						(errmsg("dbblue create standby: the standby in \"%s\" does not stream from this server, and is at least %" PRIu64 " MB behind it, more than dbblue_standby_max_lag, restarting it to refuse connections until it has caught up",
+								dir, (standby_last_flush - received) / (1024 * 1024)),
+						 errdetail("It has received up to %X/%08X, this server has flushed up to %X/%08X. Until it has caught up, Odoo reads from this server instead.",
+								   LSN_FORMAT_ARGS(received),
+								   LSN_FORMAT_ARGS(standby_last_flush)),
+						 errhint("See the standby's log for why it cannot connect; a change to pg_hba.conf or to the role it connects as is the usual cause.")));
+			else
+				ereport(WARNING,
+						(errmsg("dbblue create standby: the standby in \"%s\" is %" PRIu64 " MB behind this server, more than dbblue_standby_max_lag, restarting it to refuse connections until it has caught up",
+								dir,
+								(standby_last_flush - standby_last_apply) / (1024 * 1024)),
+						 errdetail("It has replayed up to %X/%08X, this server has flushed up to %X/%08X. Until it has caught up, Odoo reads from this server instead.",
+								   LSN_FORMAT_ARGS(standby_last_apply),
+								   LSN_FORMAT_ARGS(standby_last_flush)),
+						 repl == STANDBY_REPL_STALLED ?
+						 errhint("Its replay has stopped: it may wait on a query on the standby that conflicts with this server's changes (see max_standby_streaming_delay), or have been paused with pg_wal_replay_pause(); see the standby's log.") :
+						 errhint("Its replay cannot keep up with this server's writes, which it shares the host's disk and CPU with.")));
 			return true;
 		}
 	}
