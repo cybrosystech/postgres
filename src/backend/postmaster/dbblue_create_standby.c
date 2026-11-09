@@ -1396,6 +1396,15 @@ standby_pid_state(const char *dir)
 		pid = 0;
 	fclose(fp);
 
+	/*
+	 * A standalone backend writes its PID negated (see
+	 * CreateLockFile()), and is alive all the same: taken for gone, its
+	 * postmaster.pid would be removed under it and a postmaster started
+	 * on its directory.  As in socket_port_in_use().
+	 */
+	if (pid < 0)
+		pid = -pid;
+
 	/* a file a crash cut short names no process */
 	if (pid <= 1)
 		return STANDBY_PID_GONE;
