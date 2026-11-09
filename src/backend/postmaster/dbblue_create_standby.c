@@ -605,9 +605,13 @@ standby_has_data(const char *dir)
  *		would refuse to write over.  Returns false, with errno set, if dir
  *		cannot be read.
  *
- * A lone pg_tde directory counts as empty: it is our own seed from an
- * attempt that died before pg_basebackup could clean up, and
- * seed_standby_tde_dir() replaces it.
+ * Anything at all makes it not empty, a lone pg_tde too.  That used to count
+ * as empty, as our own seed from a build that died before pg_basebackup
+ * could clean up -- but without proof, so that an operator's pg_tde, or a
+ * symbolic link to one, was taken for ours and cleared, keys and all.  Our
+ * own is proven by the build marker now, written before the seed, and
+ * cleared with the rest of an interrupted build before this is asked; see
+ * standby_build_interrupted().
  */
 static bool
 standby_dir_is_empty(const char *dir, bool *empty)
@@ -623,8 +627,7 @@ standby_dir_is_empty(const char *dir, bool *empty)
 	while ((de = readdir(d)) != NULL)
 	{
 		if (strcmp(de->d_name, ".") != 0 &&
-			strcmp(de->d_name, "..") != 0 &&
-			strcmp(de->d_name, DBBLUE_TDE_DIR) != 0)
+			strcmp(de->d_name, "..") != 0)
 		{
 			*empty = false;
 			break;
@@ -1297,7 +1300,12 @@ copy_tde_file(const char *from, const char *to)
  * seeded here, and pg_basebackup skips the server's wal_keys under -E and
  * writes its own, so it does not matter if a key file changes while we copy.
  *
- * A pg_tde directory left behind by an earlier failed attempt is replaced.
+ * A pg_tde directory left behind by an earlier failed attempt is replaced,
+ * though dir is empty by now: one in it was cleared as part of an
+ * interrupted build, and a directory holding anything else is refused before
+ * this is reached; see standby_dir_is_empty().  Should one be there all the
+ * same, only a real directory is removed, never what a symbolic link named
+ * pg_tde leads to.
  */
 static bool
 seed_standby_tde_dir(const char *dir)
@@ -1333,12 +1341,24 @@ seed_standby_tde_dir(const char *dir)
 	}
 
 	snprintf(tdedir, sizeof(tdedir), "%s/%s", dir, DBBLUE_TDE_DIR);
-	if (stat(tdedir, &st) == 0 && !rmtree(tdedir, true))
+	/* lstat, as rmtree() would empty whatever a link leads to */
+	if (lstat(tdedir, &st) == 0)
 	{
-		ereport(WARNING,
-				(errmsg("dbblue create standby: could not remove stale \"%s\"",
-						tdedir)));
-		return false;
+		if (!S_ISDIR(st.st_mode))
+		{
+			ereport(WARNING,
+					(errmsg("dbblue create standby: \"%s\" is not a directory, and is left alone",
+							tdedir),
+					 errhint("Remove it, or point dbblue_standby_directory to an empty directory.")));
+			return false;
+		}
+		if (!rmtree(tdedir, true))
+		{
+			ereport(WARNING,
+					(errmsg("dbblue create standby: could not remove stale \"%s\"",
+							tdedir)));
+			return false;
+		}
 	}
 	if (mkdir(tdedir, S_IRWXU) != 0)
 	{

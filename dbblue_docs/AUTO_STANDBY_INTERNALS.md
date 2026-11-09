@@ -351,7 +351,7 @@ Reached when the standby directory holds no `PG_VERSION`.
 | Check | Function | On failure |
 |---|---|---|
 | Parent of `dir` exists and is writable | `standby_parent_usable()` | `false`. A missing parent is **never created**: a typo must not grow a full copy of the database somewhere. |
-| `dir`, if it exists, is empty (a lone `pg_tde/` counts as empty — our own seed) | `standby_dir_is_empty()` | `false`, "exists but is not a PostgreSQL cluster". |
+| `dir`, if it exists, is empty. Anything counts, a lone `pg_tde` too: the worker's own `pg_tde` seed from a crashed build is already cleared by the interrupted-build step (the marker proves it is ours); anyone else's, or a symlink, is never taken for it. | `standby_dir_is_empty()` | `false`, "exists but is not a PostgreSQL cluster". |
 | `dir` has no group-write/other access | `chmod(dir, 0700)` | `false`. `pg_basebackup` keeps the mode, and postgres refuses to start in a group/world-accessible data dir. |
 | `max_slot_wal_keep_size` is not `-1` | — | `false`. Without a limit the slot could fill the disk and stop the primary. |
 | No tablespaces in `pg_tblspc` | `standby_copyable()` | `true` (wait), warns once. On the same host, `pg_basebackup` would write each tablespace to the primary's own directory. |
