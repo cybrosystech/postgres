@@ -4021,7 +4021,16 @@ standby_parent_usable(const char *dir, const char *logfile)
 
 /*
  * stop_standby
- *		Stop the standby postmaster in dir, if it is running.
+ *		Stop the standby postmaster in dir, if it is running.  Returns true
+ *		once no standby runs there.
+ *
+ * One whose postmaster.pid cannot be told about -- the file unreadable, or
+ * the /proc entry of the process it names refused us -- may well be running
+ * still, and is not reported stopped: vet_existing_standby() removes the
+ * standby's files once this says it has stopped, and would remove them
+ * under a live postmaster, whose processes would then write into the copy
+ * built there next.  The start path treats it so too; see
+ * run_standby_tick().
  */
 static bool
 stop_standby(const char *dir, const char *logfile)
@@ -4032,8 +4041,23 @@ stop_standby(const char *dir, const char *logfile)
 	char	   *cmd;
 	bool		ok;
 
-	if (!standby_is_running(dir))
-		return true;
+	switch (standby_pid_state(dir))
+	{
+		case STANDBY_PID_NONE:
+		case STANDBY_PID_GONE:
+		case STANDBY_PID_OTHER:
+			/* surely not running */
+			return true;
+		case STANDBY_PID_UNKNOWN:
+			ereport(WARNING,
+					(errmsg("dbblue create standby: cannot tell whether the standby in \"%s\" is running, so it is left as it is",
+							dir),
+					 errhint("Check that the server can read \"%s/postmaster.pid\" and the /proc entry of the process it names.",
+							 dir)));
+			return false;
+		case STANDBY_PID_RUNNING:
+			break;
+	}
 
 	resolve_bin_path("pg_ctl", binpath, sizeof(binpath));
 	qbin = shell_quote(binpath);

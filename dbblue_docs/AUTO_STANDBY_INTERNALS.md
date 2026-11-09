@@ -789,6 +789,14 @@ For `OURS`, the slot decides:
 During shutdown it stops before `rmtree`; the next start finds the same slot state and
 finishes the job.
 
+`rmtree` runs only once `stop_standby()` has returned `true`, which means the standby
+**surely** isn't running: no `postmaster.pid`, its process gone, or its PID now another
+process's. If the worker **can't tell** (`standby_pid_state()` returns `UNKNOWN`: the
+file is unreadable, or `/proc/<pid>/cwd` is refused), `stop_standby()` warns
+*"cannot tell whether the standby in … is running, so it is left as it is"* and returns
+`false`. Nothing is deleted, and the rebuild waits until the worker can tell. Deleting
+under a live postmaster would let its processes write into the copy built there next.
+
 ### Which standby the slot belongs to — `dbblue_standby.slot`
 
 The slot is known only by its **name**. A build in another directory drops it and makes a
@@ -1351,6 +1359,7 @@ text. The most common ones:
 | `%s failed:` | `run_command()` |
 | `exited during startup` / `is still starting` | `run_standby_tick()` (after `pg_ctl start`) |
 | `removing stale` / `cannot tell whether the process` | `run_standby_tick()` (stale `postmaster.pid`) |
+| `cannot tell whether the standby in … is running, so it is left as it is` | `stop_standby()` |
 | `stopped the standby in …, as dbblue_create_standby is` | `set_standby_aside()` |
 | `stopped the standby in …, as dbblue_standby_directory now names` | `retire_previous_standby()` |
 | `shutting down the standby in …, as this worker is stopping` | `stop_standby_at_shutdown()` |
