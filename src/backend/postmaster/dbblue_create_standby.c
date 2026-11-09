@@ -2607,13 +2607,16 @@ sync_standby_port(const char *dir)
  * Settings that need a restart keep their value until the next one, as they
  * do for us; shared_buffers, halved, is among them.
  *
- * Called only once the standby is known to need no restart: rewriting its
- * postgresql.auto.conf first would hide from standby_limits_behind() that
- * it runs with less than it needs.  ALTER SYSTEM on us is not passed on, as
- * the standby reads the postgresql.auto.conf in its own data directory.
+ * Called with rewrite_settings only once the standby is known to need no
+ * restart: rewriting its postgresql.auto.conf first would hide from
+ * standby_limits_behind() that it runs with less than it needs.  Without
+ * it, as watch_running_standby() calls it, the standby only rereads our
+ * files, pg_hba.conf the one that matters.  ALTER SYSTEM on us is not passed
+ * on, as the standby reads the postgresql.auto.conf in its own data
+ * directory.
  */
 static bool
-reload_standby(const char *dir, bool fenced)
+reload_standby(const char *dir, bool fenced, bool rewrite_settings)
 {
 	char		path[MAXPGPATH];
 	FILE	   *fp;
@@ -2634,7 +2637,7 @@ reload_standby(const char *dir, bool fenced)
 	if (pid <= 1)
 		return false;
 
-	if (!write_standby_settings(dir, port, fenced))
+	if (rewrite_settings && !write_standby_settings(dir, port, fenced))
 		return false;
 
 	if (kill((pid_t) pid, SIGHUP) != 0)
@@ -4312,7 +4315,17 @@ vet_existing_standby(const char *dir, const char *logfile)
 			}
 			return false;
 		case STANDBY_UNREADABLE:
-			/* read_system_identifier() has said why */
+			/*
+			 * read_system_identifier() has said why.  Not known to be ours,
+			 * it is neither stopped nor watched; see
+			 * watch_running_standby().  So it is not reported either, and
+			 * whoever reads from it is told to look.
+			 */
+			forget_standby_port();
+			ereport(WARNING,
+					(errmsg("dbblue create standby: cannot tell whether \"%s\" holds a standby of this server, so it is no longer reported or watched",
+							dir),
+					 errhint("If a server runs there, Odoo may still read from it, with nothing to stop it falling behind: check it, and stop it if it is not needed.")));
 			return false;
 	}
 
@@ -4744,13 +4757,111 @@ set_standby_aside(bool drop_slot)
 }
 
 /*
+ * watch_running_standby
+ *		Look after the standby running in the directory last managed, when
+ *		run_standby_tick() has not done so this tick: it failed before it got
+ *		that far, or it waits to be retried after failures.
+ *
+ * The standby goes on serving Odoo's reads all the while, from the port set
+ * by hand in odoo.conf, whatever dbblue_standby.port says.  Failures that
+ * stop run_standby_tick() short -- a dbblue_standby_directory the
+ * configuration file sets to a path it cannot use, an old standby it cannot
+ * stop, a pg_control it cannot read -- may last as long as nobody fixes them,
+ * and the retries come at most once an hour.  Unwatched meanwhile, a standby
+ * whose replay stops or falls behind would serve ever staler data, with no
+ * dbblue_standby_max_lag to stop it.  So the checks of standby_fence_changes()
+ * go on every tick regardless, which read only shared memory and the
+ * standby's own files.
+ *
+ * Should it have to refuse connections, it cannot be restarted so, as that
+ * takes the start that may be what fails: it is stopped instead, which
+ * refuses them as well, and the fence is kept for run_standby_tick() to
+ * start it with once it gets that far again.  Nor is it let back in here:
+ * one fenced stays so until then.  Our reloads reach it, so that a
+ * pg_hba.conf rule shutting a role out applies to it too, and its port goes
+ * on being reported while it serves reads.
+ *
+ * Only a standby of ours, by standby_identity(), that streams through a slot
+ * made for its directory, is measured, and so stopped: another one's lag is
+ * not ours to measure through our slot.  None at all, or one not ours, is no
+ * longer reported.
+ */
+static void
+watch_running_standby(void)
+{
+	char	   *dir = previous_standby_directory();
+	char	   *owner;
+	char	   *logfile;
+	uint64		their_sysid = 0;
+	bool		ours;
+	bool		fenced;
+
+	if (dir == NULL)
+		return;
+
+	if (!standby_has_data(dir) || !standby_is_running(dir))
+	{
+		/* nothing serves reads there */
+		forget_standby_port();
+		pfree(dir);
+		return;
+	}
+
+	owner = standby_slot_owner();
+	ours = (standby_identity(dir, &their_sysid) == STANDBY_OURS &&
+			(owner == NULL || same_directory(owner, dir)));
+	if (owner)
+		pfree(owner);
+	if (!ours)
+	{
+		forget_standby_port();
+		pfree(dir);
+		return;
+	}
+
+	fenced = standby_fenced(dir);
+	standby_running_fenced = fenced;
+
+	/* a fence to lift is left to run_standby_tick(); see above */
+	if (!standby_fence_changes(dir, fenced) || fenced)
+	{
+		if (standby_reload_pending && reload_standby(dir, fenced, false))
+			standby_reload_pending = false;
+		if (!fenced)
+			sync_standby_port(dir);
+		pfree(dir);
+		return;
+	}
+
+	/* it must refuse connections: stop it, and start it fenced later */
+	forget_standby_port();
+	standby_fence_pending = 1;
+
+	logfile = standby_log_path(dir);
+	if (path_shell_unsafe_char(logfile) == '\0')
+	{
+		ereport(LOG,
+				(errmsg("dbblue create standby: stopping the standby in \"%s\" to refuse connections, as this worker cannot restart it refusing them while its checks fail",
+						dir),
+				 errdetail("It is started again, refusing connections until it has caught up, once the checks succeed; the warnings before say why they fail.")));
+		(void) stop_standby(dir, logfile);
+	}
+	pfree(logfile);
+	pfree(dir);
+}
+
+/*
  * run_standby_tick
  *		Create the standby if needed and make sure it is running.
  *		Returns false on failure, true if the standby is (now) up or waits
  *		for room on disk to be built, which is not one.
+ *
+ * Sets *watched once it has got as far as looking after the standby in the
+ * directory it uses, running or not; until then, a failure leaves a standby
+ * still running there to watch_running_standby().
  */
 static bool
-run_standby_tick(void)
+run_standby_tick(bool *watched)
 {
 	char	   *dir;
 	char	   *logfile;
@@ -4878,6 +4989,9 @@ run_standby_tick(void)
 		return false;
 	}
 
+	/* from here on, the standby in dir is looked after below */
+	*watched = true;
+
 	/* a fenced standby is started fenced again; see standby_fence_changes() */
 	fenced = standby_fenced(dir);
 
@@ -4894,7 +5008,7 @@ run_standby_tick(void)
 		if (!refence && !standby_limits_behind(dir))
 		{
 			standby_running_fenced = fenced;
-			if (standby_reload_pending && reload_standby(dir, fenced))
+			if (standby_reload_pending && reload_standby(dir, fenced, true))
 				standby_reload_pending = false;
 			if (!fenced)
 				sync_standby_port(dir);
@@ -4928,6 +5042,14 @@ run_standby_tick(void)
 			return false;
 		}
 	}
+
+	/*
+	 * Not running, or just stopped to be restarted: until a start succeeds,
+	 * no standby serves reads here.  Said now, as each step from here to the
+	 * start may fail, and leave the port named for as long as it does -- a
+	 * port another server may take meanwhile.
+	 */
+	forget_standby_port();
 
 	/* Building or starting it, from here on, needs its parent directory. */
 	if (!standby_parent_usable(dir, logfile))
@@ -5810,6 +5932,7 @@ DbblueCreateStandbyMain(Datum main_arg)
 		if (!RecoveryInProgress())
 		{
 			bool		on = (dbblue_create_standby == DBBLUE_STANDBY_ON);
+			bool		watched = false;
 
 			/* even while waiting to retry, as the slot then holds back WAL */
 			if (dbblue_create_standby != DBBLUE_STANDBY_OFF)
@@ -5834,7 +5957,7 @@ DbblueCreateStandbyMain(Datum main_arg)
 				if (on)
 				{
 					standby_mode_applied = DBBLUE_STANDBY_ON;
-					ok = run_standby_tick();
+					ok = run_standby_tick(&watched);
 				}
 				else
 				{
@@ -5864,6 +5987,14 @@ DbblueCreateStandbyMain(Datum main_arg)
 								 errhint("Fix the underlying problem; reloading the configuration (SELECT pg_reload_conf()) retries at once.")));
 				}
 			}
+
+			/*
+			 * The standby serves reads whether or not the tick above got as
+			 * far as watching it, or ran at all; see watch_running_standby().
+			 * Before release_idle_slot_xmin(), which goes by its fence.
+			 */
+			if (on && !watched && !ShutdownRequestPending)
+				watch_running_standby();
 
 			/* even once paused or waiting to retry, as the slot holds back VACUUM */
 			if (dbblue_create_standby != DBBLUE_STANDBY_OFF)

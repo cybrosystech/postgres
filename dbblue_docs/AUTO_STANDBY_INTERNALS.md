@@ -173,13 +173,17 @@ while (!ShutdownRequestPending)
             warn_synchronous_standby();        // synchronous_standby_names = '*'
         }
 
+        watched = false
         if ((mode == on || mode != standby_mode_applied) && now >= retry_at)
         {
-            if (mode == on)  ok = run_standby_tick();
+            if (mode == on)  ok = run_standby_tick(&watched);
             else             ok = set_standby_aside(drop_slot = (mode == off));
 
             ok ? reset failures : schedule retry with failure_retry_delay()
         }
+
+        if (mode == on && !watched)
+            watch_running_standby();           // the tick failed early, or was skipped
 
         if (mode != off)
             release_idle_slot_xmin();          // every tick, even while backing off
@@ -196,7 +200,7 @@ proc_exit(1);                                  // 1, not 0: see §14
 
 | Mode | Every tick | Only when the mode changed |
 |---|---|---|
-| `on` | `run_standby_tick()`, `release_idle_slot_xmin()`, two warnings | — |
+| `on` | `run_standby_tick()` (unless backing off), `watch_running_standby()` (when the tick didn't watch the standby), `release_idle_slot_xmin()`, two warnings | — |
 | `paused` | `release_idle_slot_xmin()`, two warnings | `set_standby_aside(false)` |
 | `off` | nothing | `set_standby_aside(true)` |
 
@@ -245,6 +249,34 @@ running, because waiting is the right thing to do and the reason was already log
 - an interrupted build whose slot is still **in use** (a `pg_basebackup` still copying);
 - a build **cancelled** by a reload (`COMMAND_CANCELLED`).
 
+### Watching the standby when the tick can't — `watch_running_standby()`
+
+A running standby serves Odoo's reads from the port in `odoo.conf`, whatever the worker
+does. So it must be watched **every tick**, even when `run_standby_tick()` fails before
+it gets to the watching part (step 8 in §5), or doesn't run at all while backing off
+(up to an hour between tries).
+
+`run_standby_tick(&watched)` sets `watched` once it has passed `vet_existing_standby()`.
+If it didn't, the main loop calls `watch_running_standby()`, which looks after the
+standby in the directory `dbblue_standby.dir` names:
+
+| Standby there | Action |
+|---|---|
+| none, or not running | remove the port file |
+| not provably ours (`standby_identity()`), or the slot was made for another directory | remove the port file; leave it alone |
+| ours, keeping up | pass on a pending reload (SIGHUP only, so `pg_hba.conf` changes reach it), keep the port file right |
+| ours, already fenced | leave it fenced; lifting a fence needs a restart, left to `run_standby_tick()` |
+| ours, must be fenced (`standby_fence_changes()`: lag, stall, disconnection) | remove the port file, set `standby_fence_pending = 1`, and **stop** it |
+
+It stops instead of restarting fenced, because a restart goes through the start path,
+which may be exactly what is failing. A stopped standby refuses connections too. Once
+`run_standby_tick()` succeeds again, it starts the standby fenced (from
+`standby_fence_pending`), and opens it once caught up.
+
+Example: `postgresql.conf` sets `dbblue_standby_directory` inside the data directory
+(only `ALTER SYSTEM` checks for that). Every tick fails at step 1, but the standby in
+the old directory keeps being watched, and is stopped if it falls behind.
+
 ---
 
 ## 5. One tick: `run_standby_tick()`
@@ -274,6 +306,10 @@ run_standby_tick()
 │     │      remember fence, reload_standby() if pending, sync_standby_port() → true   ◀── normal case
 │     └─ else: flip fence if needed, forget port, stop_standby() → fall through to START
 │
+│     (from step 7 on, *watched = true; before it, a failure leaves the running
+│      standby to watch_running_standby(), §4)
+│     forget_standby_port()                      not running: nothing to send reads to
+│                                                until a start succeeds
 ├─ 9. standby_parent_usable(dir)                 parent missing / not writable → false
 │
 ├─ 10. BUILD if no PG_VERSION   (§6)
@@ -1318,6 +1354,8 @@ text. The most common ones:
 | `stopped the standby in …, as dbblue_create_standby is` | `set_standby_aside()` |
 | `stopped the standby in …, as dbblue_standby_directory now names` | `retire_previous_standby()` |
 | `shutting down the standby in …, as this worker is stopping` | `stop_standby_at_shutdown()` |
+| `stopping the standby in … to refuse connections, as this worker cannot restart it` | `watch_running_standby()` |
+| `cannot tell whether … holds a standby of this server, so it is no longer reported or watched` | `vet_existing_standby()` (`UNREADABLE`) |
 | `consecutive failures; retrying in` | `DbblueCreateStandbyMain()` |
 | `dropping replication slot` / `is in use by another process` | `drop_standby_slot()` |
 | `cannot use standby directory` | `standby_parent_usable()` |

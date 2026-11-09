@@ -213,6 +213,7 @@ WAL.
 | Slot invalidated, or dropped | Standby rebuilt; the log says why (`wal_removed` vs `idle_replication_slot_timeout`) |
 | `dbblue_standby_directory` pointed back at a directory whose standby was set aside for one built elsewhere | That standby is rebuilt, never started on its old data: the build elsewhere dropped the slot it streamed through |
 | A start or build keeps failing | Retried 5 times 10 s apart, then after 1, 2, 4 … minutes, up to once an hour; `SELECT pg_reload_conf()` retries at once |
+| The worker's checks keep failing while a standby runs (a bad `dbblue_standby_directory` in `postgresql.conf`, say) | The running standby is still watched every 10 s; if it falls behind, it is stopped, and started again fenced once the checks succeed |
 | Primary stopped during a build | The partial copy is cleared at the next start, not during the shutdown |
 | Primary settings raised (`max_connections` and the like) | The standby's are raised to match, and it is restarted if needed |
 | The worker itself sent SIGTERM | Standby stopped; the worker comes back within a minute and starts it again |
