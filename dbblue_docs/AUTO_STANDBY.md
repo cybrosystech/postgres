@@ -81,7 +81,7 @@ The worker fences the standby when any of these happens:
 | Situation | Trigger |
 |---|---|
 | Starting with a backlog (after a pause, a crash or a reboot), including WAL it had received but not replayed when it stopped | More than `dbblue_standby_max_lag` of WAL to replay |
-| Running, but falling behind (heavy batch, slow disk), replay stopped (waiting on a conflicting query, paused), or not streaming at all (shut out by `pg_hba.conf`, say) | More than `dbblue_standby_max_lag` behind on 2 checks in a row |
+| Running, but falling behind (heavy batch, slow disk), replay stopped (waiting on a conflicting query, paused), or not streaming at all (shut out by `pg_hba.conf`, say) | More than `dbblue_standby_max_lag` behind for 10 seconds (30 seconds when not streaming) |
 | Replay stopped, or not streaming at all, even if not far behind | 60 seconds without progress |
 
 While fenced, the port file is removed and the slot no longer holds back VACUUM on the

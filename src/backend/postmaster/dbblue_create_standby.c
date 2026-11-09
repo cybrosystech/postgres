@@ -168,11 +168,23 @@ int			dbblue_standby_max_lag = 64;
 #define DBBLUE_STANDBY_STALL_MS		60000L
 
 /*
- * How many checks in a row a running standby must be more than
- * dbblue_standby_max_lag behind before it is fenced, so that a moment's
- * spike does not restart it.
+ * How long a running standby must stay more than dbblue_standby_max_lag
+ * behind before it is fenced, so that a moment's spike does not restart it.
+ * A time, not a number of checks: checks are DBBLUE_STANDBY_NAPTIME_MS apart
+ * only when nothing wakes us sooner, and our latch is set as we start and on
+ * every reload, so two checks may come milliseconds apart and see one spike
+ * twice.
+ *
+ * Longer for a standby that does not stream from us at all, as its lag is
+ * then measured from our slot's restart_lsn, which a restart of ours sets
+ * back to what the last checkpoint saved: a standby still well within
+ * dbblue_standby_max_lag looks far behind it until it has connected again,
+ * which its walreceiver retries every wal_retrieve_retry_interval, 5 seconds
+ * by default.  This gives it several tries, and still fences one that stays
+ * away well before DBBLUE_STANDBY_STALL_MS.
  */
-#define DBBLUE_STANDBY_LAG_TICKS	2
+#define DBBLUE_STANDBY_LAG_MS			10000L
+#define DBBLUE_STANDBY_UNSTREAMED_LAG_MS	30000L
 
 /*
  * How long drop_standby_slot() waits for our slot to be released by the
@@ -308,8 +320,11 @@ static bool tablespace_warned = false;
 static XLogRecPtr standby_last_apply = InvalidXLogRecPtr;
 static XLogRecPtr standby_last_flush = InvalidXLogRecPtr;
 static TimestampTz standby_stalled_since = 0;
-/* Checks in a row the running standby was more than dbblue_standby_max_lag behind. */
-static int	standby_lagging_ticks = 0;
+/*
+ * Since when the running standby has been more than dbblue_standby_max_lag
+ * behind, or 0; see standby_fence_changes().
+ */
+static TimestampTz standby_lagging_since = 0;
 
 /*
  * Whether the standby run_standby_tick() last saw running is fenced, and
@@ -3649,8 +3664,8 @@ standby_fenced(const char *dir)
  * the standby that conflicts with our changes, for up to
  * max_standby_streaming_delay, paused with pg_wal_replay_pause(), or held by
  * recovery_min_apply_delay.  Once it has been more than
- * dbblue_standby_max_lag behind at DBBLUE_STANDBY_LAG_TICKS checks in a row,
- * whether its replay moved meanwhile or not, it is fenced too.  A stopped
+ * dbblue_standby_max_lag behind for DBBLUE_STANDBY_LAG_MS, at every check
+ * meanwhile, whether its replay moved or not, it is fenced too.  A stopped
  * replay must be measured as well as a slow one: it falls behind fastest, at
  * the full rate of our writes, and a conflict that lasts less than
  * DBBLUE_STANDBY_STALL_MS, as one cut short by the default
@@ -3664,11 +3679,11 @@ standby_fenced(const char *dir)
  * far it has replayed, but still serves its data, which falls behind at the
  * full rate of our writes.  Our slot keeps how far it had received, which is
  * the most it can have replayed since: so it is at least that far behind, and
- * once that is more than dbblue_standby_max_lag at
- * DBBLUE_STANDBY_LAG_TICKS checks in a row, it is fenced as well, without
- * waiting out DBBLUE_STANDBY_STALL_MS.  One that connects again in the
- * meantime is measured as any other, and is not fenced for a moment's
- * break.
+ * once that has been more than dbblue_standby_max_lag for
+ * DBBLUE_STANDBY_UNSTREAMED_LAG_MS, it is fenced as well, without waiting
+ * out DBBLUE_STANDBY_STALL_MS.  One that connects again in the meantime is
+ * measured as any other, and is not fenced for a moment's break -- nor for
+ * the restart_lsn a restart of ours set back.
  *
  * The restart alone may be the cure, as a paused replay does not survive it,
  * nor does the query a replay waits on.  Once it has caught up, it is
@@ -3703,9 +3718,14 @@ standby_fence_changes(const char *dir, bool fenced)
 
 	if (lagging)
 	{
-		if (++standby_lagging_ticks >= DBBLUE_STANDBY_LAG_TICKS)
+		long		lag_ms = (repl == STANDBY_REPL_DISCONNECTED) ?
+			DBBLUE_STANDBY_UNSTREAMED_LAG_MS : DBBLUE_STANDBY_LAG_MS;
+
+		if (standby_lagging_since == 0)
+			standby_lagging_since = now;
+		if (TimestampDifferenceExceeds(standby_lagging_since, now, lag_ms))
 		{
-			standby_lagging_ticks = 0;
+			standby_lagging_since = 0;
 			if (repl == STANDBY_REPL_DISCONNECTED)
 				ereport(WARNING,
 						(errmsg("dbblue create standby: the standby in \"%s\" does not stream from this server, and is at least %" PRIu64 " MB behind it, more than dbblue_standby_max_lag, restarting it to refuse connections until it has caught up",
@@ -3729,7 +3749,7 @@ standby_fence_changes(const char *dir, bool fenced)
 		}
 	}
 	else
-		standby_lagging_ticks = 0;
+		standby_lagging_since = 0;
 
 	if (repl == STANDBY_REPL_CAUGHT_UP || repl == STANDBY_REPL_BEHIND)
 	{
@@ -5232,7 +5252,7 @@ run_standby_tick(void)
 	standby_last_apply = InvalidXLogRecPtr;
 	standby_last_flush = InvalidXLogRecPtr;
 	standby_stalled_since = 0;
-	standby_lagging_ticks = 0;
+	standby_lagging_since = 0;
 
 	/*
 	 * The port may differ from the last start's, and until the standby is up

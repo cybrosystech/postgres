@@ -495,7 +495,7 @@ Values are quoted with `append_conf_string()`, which doubles both `'` and `\`, a
 ### 7.4 Before `pg_ctl start`
 
 - Reset fence/lag tracking: `standby_last_apply`, `standby_last_flush`,
-  `standby_stalled_since`, `standby_lagging_ticks`.
+  `standby_stalled_since`, `standby_lagging_since`.
 - Set `standby_running_fenced = fenced`, clear `standby_fence_pending` and
   `standby_reload_pending` (a start reads all config anyway).
 - `forget_standby_port()` — nothing may be sent to the standby until it is up.
@@ -610,14 +610,15 @@ LAG CHECK, first, for BEHIND, STALLED and DISCONNECTED:
     lag = flush - slot restart_lsn         (DISCONNECTED: what it received, the most
                                             it can have replayed)
     if (!fenced && max_lag > 0 && lag > max_lag MB):
-        if (++lagging_ticks >= 2)                 // 2 checks in a row: no one-tick spike
+        lagging_since = lagging_since ?: now
+        if (now - lagging_since >= 10 s)          // 30 s when DISCONNECTED
             WARNING "... MB behind ..., restarting it to refuse connections"
                     (hint: "Its replay has stopped" when STALLED;
                      "does not stream from this server, and is at least … MB behind it"
                      when DISCONNECTED)
             return true                           // → fence
     else
-        lagging_ticks = 0
+        lagging_since = 0
 
 CAUGHT_UP or BEHIND:
     stalled_since = 0
@@ -642,7 +643,17 @@ A **disconnected** standby has no walsender, so its replay position is unknown. 
 slot's `restart_lsn` (`standby_slot_restart_lsn()`) still holds what it last received,
 and it cannot have replayed past that, so `flush − restart_lsn` is the **smallest** its
 lag can be. When even that is over `max_lag`, it is fenced. A standby that reconnects
-before the second check is measured normally again and is not fenced for a short break.
+in the meantime is measured normally again and is not fenced for a short break.
+
+**The lag must last, in real time.** The rule is "behind for 10 seconds", not "behind
+on 2 checks". Checks are 10 s apart only when nothing wakes the worker sooner, but its
+latch is set when it starts and on every reload, so two checks can come milliseconds
+apart and see one spike twice. So `standby_lagging_since` records when the lag was
+first seen, and the fence comes only once it has lasted `DBBLUE_STANDBY_LAG_MS` (10 s).
+For a disconnected standby it is `DBBLUE_STANDBY_UNSTREAMED_LAG_MS` (30 s): after a
+restart of the primary, the slot's `restart_lsn` falls back to what the last checkpoint
+saved, so a healthy standby looks far behind until it reconnects. Its walreceiver
+retries every 5 s, so 30 s gives it several tries.
 
 The 60 s timer still covers a standby that has stopped or disconnected but is **not**
 far behind (a quiet database).
@@ -650,7 +661,7 @@ far behind (a quiet database).
 ### 9.3 The fence state machine
 
 ```
-        lag > max_lag on 2 ticks in a row (replaying or stalled)
+        lag > max_lag for 10 s (30 s if not streaming)
                     or stalled / disconnected ≥ 60 s
    ┌──────────┐  ─────────────────────────────────────▶  ┌──────────┐
    │  OPEN    │                                          │  FENCED  │
@@ -1008,7 +1019,7 @@ directory in `dbblue_standby.dir`, the build marker).
 | `tablespace_warned` | tablespace warning given | reload, no tablespaces |
 | `standby_last_apply`, `standby_last_flush` | LSNs seen last tick | every start |
 | `standby_stalled_since` | when it stopped making progress, or 0 | progress, every start |
-| `standby_lagging_ticks` | ticks in a row over `max_lag` | not lagging, every start |
+| `standby_lagging_since` | since when it has been over `max_lag`, or 0 | not lagging, fence, every start |
 | `standby_running_fenced` | is the running standby fenced | each running tick, start, set aside |
 | `standby_fence_pending` | fence to apply on the next start after a failed stop (`-1` none) | start, set aside |
 | `slot_idle_since` | slot has had no streamer since | slot not idle |
@@ -1102,7 +1113,8 @@ All at the top of `dbblue_create_standby.c`.
 | `DBBLUE_STANDBY_COMMAND_POLL_MS` | 100 ms | `run_command()` poll |
 | `DBBLUE_STANDBY_COMMAND_KILL_MS` | 5 s | `SIGTERM` → `SIGKILL` |
 | `DBBLUE_STANDBY_STALL_MS` | 60 s | stall/disconnect fence; idle-slot xmin release |
-| `DBBLUE_STANDBY_LAG_TICKS` | 2 | ticks over `max_lag` before fencing |
+| `DBBLUE_STANDBY_LAG_MS` | 10 s | how long a standby must stay over `max_lag` before it is fenced |
+| `DBBLUE_STANDBY_UNSTREAMED_LAG_MS` | 30 s | the same for a standby that does not stream, measured from the slot |
 | `DBBLUE_STANDBY_SLOT_RELEASE_MS` | 5 s | wait for slot release before drop |
 | `DBBLUE_STANDBY_STOP_WAIT_MS` | 60 s | shutdown wait for the standby |
 | `DBBLUE_STANDBY_OUTPUT_LINES` / `_LINE_MAX` / `_SCAN` | 5 / 512 B / 64 KB | failure excerpt |
@@ -1176,6 +1188,13 @@ install, because this fork's default `shared_preload_libraries` names them.
 | Stalled lag | a standby whose replay is paused and that falls more than `dbblue_standby_max_lag` behind is fenced for its lag within a couple of ticks, not by the 60 s stall timer |
 | Disconnected lag | a standby shut out by `pg_hba.conf` that falls more than `dbblue_standby_max_lag` behind its slot's `restart_lsn` is fenced within a couple of ticks; let in again, it catches up and is unfenced |
 | Start backlog | a standby stopped with several MB received but not replayed (replay paused) is started fenced after a primary restart, then opened once caught up |
+| M3 | a build in progress is stopped within seconds when the mode turns `paused`; no partial copy, marker or slot is left, and it is not counted as a failure |
+| L7 | a build cut short by a primary shutdown leaves its partial copy and marker; the next start clears them and builds the standby anew |
+
+To have a build last long enough to cancel without a large database, the test starts
+the primary with `PGOPTIONS='-c post_auth_delay=30'`. The worker's commands inherit the
+postmaster's environment, so the walsender serving `pg_basebackup` waits 30 s after
+authentication.
 | L8 | an `idle_replication_slot_timeout` invalidation is reported as such, and the standby rebuilt |
 | M6 | with `max_slot_wal_keep_size = -1`, a standby whose slot is gone is kept, then rebuilt once a limit is set |
 | Slot owner | pointed back at a directory whose standby was set aside for one built in another, that standby is rebuilt, never started on its old data or left fenced |
@@ -1183,10 +1202,6 @@ install, because this fork's default `shared_preload_libraries` names them.
 
 ### What it does not cover (test by hand)
 
-- cancelling a build in progress (M3) — needs a database big enough that the copy takes
-  a while; set the mode to `paused` during the copy and look for `stopping pg_basebackup`;
-- leaving a partial copy on shutdown (L7) — stop the primary during a build, start it
-  again, look for `clearing … left behind by a build that was interrupted`;
 - the retry backoff (M5) — make the parent directory unwritable and watch the
   `consecutive failures` messages;
 - the `pg_upgrade` guard (L1);
