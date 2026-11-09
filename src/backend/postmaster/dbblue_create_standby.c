@@ -3577,17 +3577,27 @@ standby_fenced(const char *dir)
  * cursors, and tries the replica again later; tooling is no longer pointed at
  * it either, as its port is not reported while it is fenced.
  *
- * A standby that still replays, but is far behind, serves data just as stale
- * for as long as it takes to catch up: after a pause, a crash, or while its
- * replay cannot keep up with our writes.  Once it has been more than
+ * A standby that is far behind serves data just as stale for as long as it
+ * takes to catch up: after a pause, a crash, while its replay cannot keep up
+ * with our writes, or while its replay has stopped -- waiting on a query on
+ * the standby that conflicts with our changes, for up to
+ * max_standby_streaming_delay, paused with pg_wal_replay_pause(), or held by
+ * recovery_min_apply_delay.  Once it has been more than
  * dbblue_standby_max_lag behind at DBBLUE_STANDBY_LAG_TICKS checks in a row,
- * it is fenced too.  Only a standby that has not caught up is measured: one
+ * whether its replay moved meanwhile or not, it is fenced too.  A stopped
+ * replay must be measured as well as a slow one: it falls behind fastest, at
+ * the full rate of our writes, and a conflict that lasts less than
+ * DBBLUE_STANDBY_STALL_MS, as one cut short by the default
+ * max_standby_streaming_delay of 30 seconds does, would otherwise never be
+ * fenced at all.  Only a standby that has not caught up is measured: one
  * that has replayed what we had a tick ago is at most a tick behind, however
- * much we have written since.
+ * much we have written since.  Nor is one we cannot hear from, as how far it
+ * has replayed is then not known.
  *
- * The restart alone may be the cure, as a paused replay does not survive it.
- * Once it has caught up, it is restarted without the fence.  A standby that
- * cannot connect stays fenced until whatever keeps it out is fixed.
+ * The restart alone may be the cure, as a paused replay does not survive it,
+ * nor does the query a replay waits on.  Once it has caught up, it is
+ * restarted without the fence.  A standby that cannot connect stays fenced
+ * until whatever keeps it out is fixed.
  */
 static bool
 standby_fence_changes(const char *dir, bool fenced)
@@ -3595,19 +3605,16 @@ standby_fence_changes(const char *dir, bool fenced)
 	StandbyReplication repl = standby_replication();
 	TimestampTz now = GetCurrentTimestamp();
 
-	if (repl == STANDBY_REPL_CAUGHT_UP || repl == STANDBY_REPL_BEHIND)
+	if (!fenced &&
+		(repl == STANDBY_REPL_BEHIND || repl == STANDBY_REPL_STALLED) &&
+		dbblue_standby_max_lag > 0 &&
+		XLogRecPtrIsValid(standby_last_apply) &&
+		standby_last_flush > standby_last_apply &&
+		standby_last_flush - standby_last_apply >
+		(uint64) dbblue_standby_max_lag * 1024 * 1024)
 	{
-		standby_stalled_since = 0;
-
-		if (!fenced && repl == STANDBY_REPL_BEHIND &&
-			dbblue_standby_max_lag > 0 &&
-			XLogRecPtrIsValid(standby_last_apply) &&
-			standby_last_flush > standby_last_apply &&
-			standby_last_flush - standby_last_apply >
-			(uint64) dbblue_standby_max_lag * 1024 * 1024)
+		if (++standby_lagging_ticks >= DBBLUE_STANDBY_LAG_TICKS)
 		{
-			if (++standby_lagging_ticks < DBBLUE_STANDBY_LAG_TICKS)
-				return false;
 			standby_lagging_ticks = 0;
 			ereport(WARNING,
 					(errmsg("dbblue create standby: the standby in \"%s\" is %" PRIu64 " MB behind this server, more than dbblue_standby_max_lag, restarting it to refuse connections until it has caught up",
@@ -3616,10 +3623,18 @@ standby_fence_changes(const char *dir, bool fenced)
 					 errdetail("It has replayed up to %X/%08X, this server has flushed up to %X/%08X. Until it has caught up, Odoo reads from this server instead.",
 							   LSN_FORMAT_ARGS(standby_last_apply),
 							   LSN_FORMAT_ARGS(standby_last_flush)),
+					 repl == STANDBY_REPL_STALLED ?
+					 errhint("Its replay has stopped: it may wait on a query on the standby that conflicts with this server's changes (see max_standby_streaming_delay), or have been paused with pg_wal_replay_pause(); see the standby's log.") :
 					 errhint("Its replay cannot keep up with this server's writes, which it shares the host's disk and CPU with.")));
 			return true;
 		}
+	}
+	else
 		standby_lagging_ticks = 0;
+
+	if (repl == STANDBY_REPL_CAUGHT_UP || repl == STANDBY_REPL_BEHIND)
+	{
+		standby_stalled_since = 0;
 
 		if (!fenced || repl != STANDBY_REPL_CAUGHT_UP)
 			return false;

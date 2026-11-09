@@ -1110,7 +1110,7 @@
 
 { name => 'dbblue_standby_max_lag', type => 'int', context => 'PGC_SIGHUP', group => 'REPLICATION_PRIMARY',
   short_desc => 'Sets how far the standby of dbblue_create_standby may be behind this server and still accept connections.',
-  long_desc => 'Odoo reads from the standby while it accepts connections. A standby that has more than this much WAL left to replay -- after a pause, a crash, or while replay cannot keep up with this server -- is started, or restarted, refusing connections, so that Odoo reads from this server instead, and is let back in once it has caught up. 0 lets a standby that is behind accept connections all the same; one that has stopped replaying is refused regardless.',
+  long_desc => 'Odoo reads from the standby while it accepts connections. A standby that has more than this much WAL left to replay -- after a pause, a crash, while replay cannot keep up with this server, or while replay has stopped, waiting on a conflicting query or paused -- is started, or restarted, refusing connections, so that Odoo reads from this server instead, and is let back in once it has caught up. 0 lets a standby that is behind accept connections all the same; one that has stopped replaying is refused regardless.',
   flags => 'GUC_UNIT_MB',
   variable => 'dbblue_standby_max_lag',
   boot_val => '64',

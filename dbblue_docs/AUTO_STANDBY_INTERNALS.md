@@ -581,13 +581,17 @@ primary keeps writing, so the current flush is almost never reached.
 ### 9.2 Deciding — `standby_fence_changes(dir, fenced)`
 
 ```
+LAG CHECK, first, for BEHIND and STALLED alike:
+    if (!fenced && (BEHIND || STALLED) && max_lag > 0 && flush - apply > max_lag MB):
+        if (++lagging_ticks >= 2)                 // 2 checks in a row: no one-tick spike
+            WARNING "... MB behind ..., restarting it to refuse connections"
+                    (hint: "Its replay has stopped" when STALLED)
+            return true                           // → fence
+    else
+        lagging_ticks = 0
+
 CAUGHT_UP or BEHIND:
     stalled_since = 0
-    if (!fenced && BEHIND && max_lag > 0 && flush - apply > max_lag MB):
-        if (++lagging_ticks < 2) return false     // ignore a one-tick spike
-        WARNING "... MB behind ..., restarting it to refuse connections"
-        return true                               // → fence
-    lagging_ticks = 0
     if (fenced && CAUGHT_UP):
         LOG "has caught up ..., restarting it to accept connections again"
         return true                               // → unfence
@@ -600,10 +604,17 @@ STALLED or DISCONNECTED:
     return true                                   // → fence
 ```
 
+The lag check runs for a **stalled** standby too. A stopped replay falls behind at the
+full rate of the primary's writes. A lock conflict that `max_standby_streaming_delay`
+(30 s by default) cuts short never reaches the 60 s timer, so before this, such a
+standby served data far more than `max_lag` behind and was never fenced. The 60 s
+timer still covers a standby that has stopped but is **not** far behind (a quiet
+database), and a disconnected one, whose replay position is not known.
+
 ### 9.3 The fence state machine
 
 ```
-                    lag > max_lag on 2 ticks in a row
+        lag > max_lag on 2 ticks in a row (replaying or stalled)
                     or stalled / disconnected ≥ 60 s
    ┌──────────┐  ─────────────────────────────────────▶  ┌──────────┐
    │  OPEN    │                                          │  FENCED  │
@@ -1125,6 +1136,7 @@ install, because this fork's default `shared_preload_libraries` names them.
 | M2 | a primary reload reaches the standby without restarting it |
 | H1 | the standby stops with the primary and keeps its port |
 | H3, H4 | a standby whose replay is paused is fenced (port file gone, refuses connections, slot xmin cleared), then let back in |
+| Stalled lag | a standby whose replay is paused and that falls more than `dbblue_standby_max_lag` behind is fenced for its lag within a couple of ticks, not by the 60 s stall timer |
 | L8 | an `idle_replication_slot_timeout` invalidation is reported as such, and the standby rebuilt |
 | M6 | with `max_slot_wal_keep_size = -1`, a standby whose slot is gone is kept, then rebuilt once a limit is set |
 | Slot owner | pointed back at a directory whose standby was set aside for one built in another, that standby is rebuilt, never started on its old data or left fenced |

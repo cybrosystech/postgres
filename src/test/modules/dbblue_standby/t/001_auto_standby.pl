@@ -18,6 +18,8 @@
 #   * a standby that stops replaying is fenced -- restarted to refuse
 #     connections, its slot no longer holding back VACUUM, its port no longer
 #     reported -- and let back in once it has caught up (H3, H4);
+#   * a standby whose replay has stopped is fenced as soon as it is more than
+#     dbblue_standby_max_lag behind, not only by the 60-second stall timer;
 #   * a slot invalidated by idle_replication_slot_timeout is reported as such,
 #     not blamed on max_slot_wal_keep_size, and the standby rebuilt (L8);
 #   * with max_slot_wal_keep_size = -1, a standby whose slot is gone is kept,
@@ -265,6 +267,41 @@ $sb = wait_for_standby('after the fence is lifted');
 my $rows = $node->safe_psql('postgres', 'SELECT count(*) FROM t');
 ok($sb->poll_query_until('postgres', 'SELECT count(*) FROM t', $rows),
 	'once let back in, the standby has every row written meanwhile');
+
+# ---------------------------------------------------------------------------
+# A standby whose replay has stopped is fenced as soon as it is more than
+# dbblue_standby_max_lag behind, not only once it has not replayed for 60
+# seconds: a stopped replay falls behind at the full rate of our writes.
+# ---------------------------------------------------------------------------
+alter_system("SET dbblue_standby_max_lag = '1MB'");
+$offset = -s $node->logfile;
+my $paused_at = time;
+$sb->safe_psql('postgres', 'SELECT pg_wal_replay_pause()');
+
+# Several MB of WAL at once, far more than the 1MB allowed.
+$node->safe_psql('postgres',
+	"CREATE TABLE lag_test AS SELECT g, repeat('x', 100) AS pad FROM generate_series(1, 50000) g"
+);
+$node->wait_for_log(
+	qr/MB behind this server, more than dbblue_standby_max_lag, restarting it to refuse connections/,
+	$offset);
+my $fenced_after = time - $paused_at;
+cmp_ok($fenced_after, '<', 55,
+	"a stalled standby over dbblue_standby_max_lag is fenced at once ($fenced_after s), not after the 60 s stall timer"
+);
+ok($node->log_contains(qr/Its replay has stopped/, $offset),
+	'the fence says its replay has stopped');
+ok(!$node->log_contains(qr/has not replayed past/, $offset),
+	'it was fenced for its lag, not by the stall timer');
+
+$node->wait_for_log(
+	qr/has caught up with this server, restarting it to accept connections again/,
+	$offset);
+alter_system('RESET dbblue_standby_max_lag');
+$sb = wait_for_standby('after the lag fence of a stalled standby is lifted');
+is($sb->safe_psql('postgres', 'SELECT count(*) FROM lag_test'),
+	'50000', 'once let back in, the standby has the rows it fell behind on');
+$node->safe_psql('postgres', 'DROP TABLE lag_test');
 
 # ---------------------------------------------------------------------------
 # L8: an idle_replication_slot_timeout invalidation is reported as such.
