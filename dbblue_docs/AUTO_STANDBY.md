@@ -147,6 +147,10 @@ else, set `dbblue_standby_directory` first. The directory must:
 - already exist, owned by the server's operating-system user
 - be empty
 - lie outside the data directory, symbolic links included
+- sit in a directory that user can write to as well, because the build marker
+  (`<dir>.building`) and possibly the standby's log go next to it. For a disk mounted
+  at a root-owned `/mnt/disk2`, use `/mnt/disk2/pg/standby` with `/mnt/disk2/pg` owned
+  by the server's user, not `/mnt/disk2/standby`.
 
 ---
 

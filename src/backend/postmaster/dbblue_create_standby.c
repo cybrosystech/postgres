@@ -5380,6 +5380,12 @@ run_standby_tick(void)
  * to us, and be empty or hold a cluster that streams through our slot, as
  * every standby we build does: a standby somebody built by hand is not ours
  * to delete and build anew, as we would once we found our slot missing.
+ * The directory that holds it must be writable to us as well: the build
+ * marker "<dir>.building" goes there, and so may the standby's "<dir>.log"
+ * and "<dir>.pid".  Accepted without that, as a directory made for us inside
+ * a root-owned mount point would be, the worker could never build or start
+ * the standby, and would only say so in the log, at every attempt; see
+ * standby_parent_usable().
  * That is only checked inside a transaction.  The configuration file is read outside one, at startup and
  * on every reload, and no server must refuse to start over this setting:
  * the standby's directory may be missing because the operator removed it to
@@ -5404,6 +5410,7 @@ bool
 check_dbblue_standby_directory(char **newval, void **extra, GucSource source)
 {
 	char	   *dir;
+	char		parent[MAXPGPATH];
 	struct stat st;
 	bool		empty;
 	bool		ok = false;
@@ -5428,6 +5435,8 @@ check_dbblue_standby_directory(char **newval, void **extra, GucSource source)
 		return true;
 
 	dir = standby_directory_path(*newval);
+	strlcpy(parent, dir, sizeof(parent));
+	get_parent_directory(parent);
 
 	if (strlen(dir) >= MAXPGPATH - 32)
 		GUC_check_errdetail("Path \"%s\" is too long (maximum %d bytes).",
@@ -5458,6 +5467,13 @@ check_dbblue_standby_directory(char **newval, void **extra, GucSource source)
 	}
 	else if (access(dir, R_OK | W_OK | X_OK) != 0)
 		GUC_check_errdetail("The server cannot write to directory \"%s\": %m.", dir);
+	else if (access(parent, W_OK | X_OK) != 0)
+	{
+		GUC_check_errdetail("The server cannot write to directory \"%s\", which holds \"%s\": %m.",
+							parent, dir);
+		GUC_check_errhint("The standby's build marker, \"%s.building\", and possibly its log are written there. Use a directory one level deeper, inside a directory owned by the operating-system user the server runs as.",
+						  dir);
+	}
 	else if (standby_has_data(dir))
 	{
 		/* one that does not use our slot is not ours to take over; see standby_identity() */

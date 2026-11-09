@@ -1085,8 +1085,10 @@ at startup or reload is **not** checked strictly, because:
   the directory); refuse `$`, `` ` ``, `"`, `\`;
 - **in a transaction:** not too long; not inside `DataDir` (symlinks resolved, see
   `path_inside_data_dir()`); exists; is a directory; owned by the server's OS user;
-  writable; and either empty or a cluster whose `primary_slot_name` is
-  `dbblue_standby`.
+  writable; its **parent** writable too (the build marker `<dir>.building`, and maybe
+  `<dir>.log` and `<dir>.pid`, go there; the worker's own check for it is
+  `standby_parent_usable()`); and either empty or a cluster whose `primary_slot_name`
+  is `dbblue_standby`.
 
 `check_dbblue_standby_user()`:
 
