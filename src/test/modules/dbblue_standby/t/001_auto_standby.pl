@@ -22,6 +22,8 @@
 #     dbblue_standby_max_lag behind, not only by the 60-second stall timer;
 #   * so is a standby that cannot stream from us at all, measured by what our
 #     slot says it has received;
+#   * a standby stopped with much WAL received but not replayed is started
+#     fenced, its backlog counted from what it had replayed;
 #   * a slot invalidated by idle_replication_slot_timeout is reported as such,
 #     not blamed on max_slot_wal_keep_size, and the standby rebuilt (L8);
 #   * with max_slot_wal_keep_size = -1, a standby whose slot is gone is kept,
@@ -355,6 +357,50 @@ alter_system('RESET dbblue_standby_max_lag');
 $sb = wait_for_standby('after a disconnected standby is let in again');
 is($sb->safe_psql('postgres', 'SELECT count(*) FROM lag_test'),
 	'50000', 'let in again, the standby has the rows written while it was shut out');
+$node->safe_psql('postgres', 'DROP TABLE lag_test');
+
+# ---------------------------------------------------------------------------
+# A standby stopped while it had received much more than it had replayed is
+# started fenced: its backlog is counted from what it had replayed, not from
+# what our slot says it had received.  It replays that WAL from its own
+# pg_wal before it connects to us at all.
+# ---------------------------------------------------------------------------
+$sb->safe_psql('postgres', 'SELECT pg_wal_replay_pause()');
+$node->safe_psql('postgres',
+	"CREATE TABLE lag_test AS SELECT g, repeat('x', 100) AS pad FROM generate_series(1, 50000) g"
+);
+
+# Received, and flushed, but not replayed.
+$node->poll_query_until('postgres',
+	"SELECT pg_wal_lsn_diff(pg_current_wal_flush_lsn(), restart_lsn) < 1048576 FROM pg_replication_slots WHERE slot_name = 'dbblue_standby'"
+) or die "timed out waiting for the standby to receive the WAL";
+is( $sb->safe_psql(
+		'postgres',
+		'SELECT pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn()) > 4 * 1048576'
+	),
+	't',
+	'the standby has received several MB more than it has replayed');
+
+# Not reloaded: the running standby is not to be fenced for its lag first.
+$node->safe_psql('postgres', "ALTER SYSTEM SET dbblue_standby_max_lag = '1MB'");
+$node->stop;
+ok(!-f "$sbdir/postmaster.pid", 'the standby is stopped along with the primary');
+
+$offset = -s $node->logfile;
+$node->start;
+$node->wait_for_log(
+	qr/MB of this server's WAL to replay, more than dbblue_standby_max_lag, starting it to refuse connections/,
+	$offset);
+pass('a standby stopped with much WAL received but not replayed is started fenced');
+ok(!-f $portfile, 'and its port is not reported');
+
+$node->wait_for_log(
+	qr/has caught up with this server, restarting it to accept connections again/,
+	$offset);
+alter_system('RESET dbblue_standby_max_lag');
+$sb = wait_for_standby('after the standby started fenced has caught up');
+is($sb->safe_psql('postgres', 'SELECT count(*) FROM lag_test'),
+	'50000', 'once let in, the standby has replayed what it had received');
 $node->safe_psql('postgres', 'DROP TABLE lag_test');
 
 # ---------------------------------------------------------------------------

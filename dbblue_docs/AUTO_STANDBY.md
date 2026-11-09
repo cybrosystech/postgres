@@ -80,7 +80,7 @@ The worker fences the standby when any of these happens:
 
 | Situation | Trigger |
 |---|---|
-| Starting with a backlog (after a pause, a crash or a reboot) | More than `dbblue_standby_max_lag` of WAL to catch up on |
+| Starting with a backlog (after a pause, a crash or a reboot), including WAL it had received but not replayed when it stopped | More than `dbblue_standby_max_lag` of WAL to replay |
 | Running, but falling behind (heavy batch, slow disk), replay stopped (waiting on a conflicting query, paused), or not streaming at all (shut out by `pg_hba.conf`, say) | More than `dbblue_standby_max_lag` behind on 2 checks in a row |
 | Replay stopped, or not streaming at all, even if not far behind | 60 seconds without progress |
 

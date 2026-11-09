@@ -429,9 +429,33 @@ start then fails, and the next tick picks another port.
 if (standby_fence_pending >= 0)          // a fence change whose restart failed earlier
     fenced = standby_fence_pending;
 if (!fenced && dbblue_standby_max_lag > 0 &&
-    standby_slot_backlog() > dbblue_standby_max_lag MB)   // flush LSN - slot restart_lsn
-    fenced = true;                       // log "starting it to refuse connections"
+    standby_backlog(dir) > dbblue_standby_max_lag MB)
+    fenced = true;                       // log "... MB of this server's WAL to replay,
+                                         //      ... starting it to refuse connections"
 ```
+
+`standby_backlog()` counts **everything the standby must replay**, not only what it must
+still download:
+
+```
+backlog = our flush LSN − min(slot restart_lsn, standby_replayed_lsn(dir))
+                              (what it received)  (what it replayed)
+```
+
+- **Received** comes from the slot's `restart_lsn`.
+- **Replayed** comes from the standby's own `pg_control`:
+  `max(minRecoveryPoint, checkPoint)` (`standby_replayed_lsn()`). A clean shutdown
+  leaves `minRecoveryPoint` at the replay end; after a crash it is behind that, never
+  ahead. So it never makes the standby look further along than it is.
+- **A fresh copy** still has `backup_label`. Its `pg_control` is the primary's, copied
+  mid-backup, so only the slot is used.
+
+**Why both:** a standby stopped while its replay lagged (a conflict, a pause, a slow
+disk) holds WAL in its own `pg_wal` that it received but did not replay, possibly
+gigabytes. The slot says it has nothing left to receive. At start, it replays that local
+WAL **before it connects** (no walreceiver while reading `pg_wal`), so there is no
+walsender and the running checks of §9 cannot measure it. Counted from the slot alone,
+it started **open** and served Odoo that old data until it had replayed it all.
 
 So a standby coming back after a pause, a crash or a reboot with gigabytes to replay
 starts **closed**, and is opened once it has caught up (§9).
@@ -764,7 +788,8 @@ All reads take `ReplicationSlotControlLock` shared and the slot's spinlock:
 |---|---|
 | `standby_slot_state()` | `ABSENT` / `IDLE` / `ACTIVE` (`active_proc` set) / `INVALIDATED` |
 | `standby_slot_invalidation()` | `slot->data.invalidated` (the cause) |
-| `standby_slot_backlog()` | our flush LSN − `restart_lsn` (WAL the standby still must receive) |
+| `standby_slot_restart_lsn()` | the slot's `restart_lsn`: what its standby last reported received and flushed |
+| `standby_backlog(dir)` | our flush LSN − the smaller of `restart_lsn` and what the stopped standby replayed (§7.2) |
 | `standby_apply_lsn()` | the apply LSN from the walsender holding the slot |
 
 ### Dropping it — `drop_standby_slot()`
@@ -1150,6 +1175,7 @@ install, because this fork's default `shared_preload_libraries` names them.
 | H3, H4 | a standby whose replay is paused is fenced (port file gone, refuses connections, slot xmin cleared), then let back in |
 | Stalled lag | a standby whose replay is paused and that falls more than `dbblue_standby_max_lag` behind is fenced for its lag within a couple of ticks, not by the 60 s stall timer |
 | Disconnected lag | a standby shut out by `pg_hba.conf` that falls more than `dbblue_standby_max_lag` behind its slot's `restart_lsn` is fenced within a couple of ticks; let in again, it catches up and is unfenced |
+| Start backlog | a standby stopped with several MB received but not replayed (replay paused) is started fenced after a primary restart, then opened once caught up |
 | L8 | an `idle_replication_slot_timeout` invalidation is reported as such, and the standby rebuilt |
 | M6 | with `max_slot_wal_keep_size = -1`, a standby whose slot is gone is kept, then rebuilt once a limit is set |
 | Slot owner | pointed back at a directory whose standby was set aside for one built in another, that standby is rebuilt, never started on its old data or left fenced |

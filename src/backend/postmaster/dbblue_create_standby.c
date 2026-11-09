@@ -3300,27 +3300,75 @@ standby_slot_restart_lsn(void)
 }
 
 /*
- * standby_slot_backlog
- *		Set *backlog to how many bytes of WAL we have flushed that our slot's
- *		standby has not yet received.  Returns false if that cannot be told:
- *		the slot is missing or reserves no WAL.
+ * standby_replayed_lsn
+ *		How far the standby in dir, which is not running, had replayed our
+ *		WAL, at least, as its pg_control tells; InvalidXLogRecPtr if that
+ *		cannot be told.
  *
- * A physical slot's restart_lsn is where its standby last reported having
- * flushed what it received, and it stays there while the standby is down:
- * the WAL written meanwhile is what the standby must catch up on when it
- * starts again.
+ * A standby moves minRecoveryPoint forward as it replays, and a clean
+ * shutdown leaves it at the end of what was replayed; after a crash it may
+ * be short of that, but never past it.  The last restartpoint, checkPoint,
+ * is never past it either.  So the larger of the two is a point the standby
+ * has surely replayed to, and from where it must replay on.
+ *
+ * Not for a fresh copy, which still holds the backup_label pg_basebackup
+ * wrote: its pg_control is ours, as copied during the backup, and tells
+ * nothing of the WAL the copy holds.  It is renamed once the standby has
+ * started.
+ */
+static XLogRecPtr
+standby_replayed_lsn(const char *dir)
+{
+	ControlFileData control;
+	char		path[MAXPGPATH];
+	struct stat st;
+
+	snprintf(path, sizeof(path), "%s/%s", dir, BACKUP_LABEL_FILE);
+	if (stat(path, &st) == 0 || errno != ENOENT)
+		return InvalidXLogRecPtr;
+
+	if (!read_control_file(dir, &control))
+		return InvalidXLogRecPtr;
+
+	return Max(control.minRecoveryPoint, control.checkPoint);
+}
+
+/*
+ * standby_backlog
+ *		Set *backlog to how many bytes of our WAL the standby in dir, which is
+ *		not running, must replay before its data is as current as ours.
+ *		Returns false if that cannot be told: the slot is missing or reserves
+ *		no WAL.
+ *
+ * Part of that it must still receive from us: what we have flushed past our
+ * slot's restart_lsn, where its standby last reported having received and
+ * flushed our WAL.  That stays there while the standby is down, so the WAL
+ * written meanwhile counts.  The rest it has received already, and holds in
+ * its own pg_wal, but has not replayed yet: when it was stopped while its
+ * replay was held up, by a conflicting query or a pause, or could not keep up
+ * with our writes, possibly gigabytes.  A starting standby replays all that
+ * WAL from its pg_wal before it connects to us at all, while it already
+ * accepts connections; and as it then has no walsender, standby_fence_changes()
+ * cannot measure it, and the slot says it has nothing more to receive.  So
+ * the backlog is counted from how far it had replayed, when its pg_control
+ * tells, as standby_replayed_lsn() reads it, and from the slot otherwise.
  */
 static bool
-standby_slot_backlog(uint64 *backlog)
+standby_backlog(const char *dir, uint64 *backlog)
 {
-	XLogRecPtr	restart_lsn = standby_slot_restart_lsn();
+	XLogRecPtr	from = standby_slot_restart_lsn();
+	XLogRecPtr	replayed;
 	XLogRecPtr	flush;
 
-	if (XLogRecPtrIsInvalid(restart_lsn))
+	if (XLogRecPtrIsInvalid(from))
 		return false;
 
+	replayed = standby_replayed_lsn(dir);
+	if (XLogRecPtrIsValid(replayed) && replayed < from)
+		from = replayed;
+
 	flush = GetFlushRecPtr(NULL);
-	*backlog = (flush > restart_lsn) ? flush - restart_lsn : 0;
+	*backlog = (flush > from) ? flush - from : 0;
 	return true;
 }
 
@@ -5135,23 +5183,25 @@ run_standby_tick(void)
 
 	/*
 	 * A standby has as much to catch up on as we have written while it was
-	 * down: after a pause, a crash or a reboot, possibly gigabytes, all of
-	 * it replayed while it already accepts connections.  Started with more
-	 * than dbblue_standby_max_lag to catch up on, it is started fenced, and
-	 * let in once it has caught up; see standby_fence_changes().  A standby
-	 * stopped along with us, or just built, has next to nothing to catch up
-	 * on, and starts as it was.
+	 * down: after a pause, a crash or a reboot, possibly gigabytes; and, if
+	 * it was stopped while its replay lagged behind what it had received,
+	 * that WAL in its own pg_wal as well.  All of it is replayed while it
+	 * already accepts connections.  Started with more than
+	 * dbblue_standby_max_lag to replay, it is started fenced, and let in once
+	 * it has caught up; see standby_fence_changes().  A standby stopped
+	 * along with us while it kept up, or just built, has next to nothing to
+	 * replay, and starts as it was.  See standby_backlog().
 	 */
 	if (!fenced && dbblue_standby_max_lag > 0)
 	{
 		uint64		backlog;
 
-		if (standby_slot_backlog(&backlog) &&
+		if (standby_backlog(dir, &backlog) &&
 			backlog > (uint64) dbblue_standby_max_lag * 1024 * 1024)
 		{
 			fenced = true;
 			ereport(LOG,
-					(errmsg("dbblue create standby: the standby in \"%s\" has %" PRIu64 " MB of this server's WAL to catch up on, more than dbblue_standby_max_lag, starting it to refuse connections until it has caught up",
+					(errmsg("dbblue create standby: the standby in \"%s\" has %" PRIu64 " MB of this server's WAL to replay, more than dbblue_standby_max_lag, starting it to refuse connections until it has caught up",
 							dir, backlog / (1024 * 1024))));
 		}
 	}
