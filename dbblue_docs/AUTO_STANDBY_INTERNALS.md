@@ -452,7 +452,12 @@ set by hand.
      standby restart still counts as free);
    - `bind()` at every address in `listen_addresses` (`listen_port_taken()`);
    - no live process holds `<socket dir>/.s.PGSQL.<port>.lock`
-     (`socket_port_in_use()`).
+     (`socket_port_in_use()`). A lock is **stale** (the port free) when its PID is gone,
+     or when the file is ours but its PID now belongs to another user's process: the
+     server that wrote it ran as us, so that PID was reused. That's PostgreSQL's own
+     rule (`CreateLockFile()`), and the standby removes the stale lock itself as it
+     starts. A lock owned by **another** user whose process is theirs is their live
+     server's, so the port is in use.
 5. The preferred port wins if it is in range, unclaimed and free; else the first free one.
    If the port moved, log `"standby moves from port X to port Y"` with a hint for Odoo.
 

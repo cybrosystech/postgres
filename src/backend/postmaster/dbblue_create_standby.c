@@ -1530,6 +1530,16 @@ first_socket_directory(void)
  * on every retry, as the TCP probe alone keeps choosing the same port.  As
  * PostgreSQL itself does, a lock whose process is gone counts as stale, and
  * the port as free.
+ *
+ * So does one of ours whose PID now belongs to another user's process, as
+ * CreateLockFile() has it: the server that wrote it ran as us, and the
+ * system has given its PID to something else since.  Counted as in use, it
+ * moved the standby off a port it would have started on, the stale lock
+ * being removed by the standby itself -- and off the port odoo.conf names,
+ * for good.  We only read the file, though, and may read another user's
+ * too, where its mode lets our group: a lock of theirs whose process is
+ * theirs is their live server's.  Which of the two, the file's owner tells.
+ * Any other answer from kill() tells nothing, and counts as in use.
  */
 static bool
 socket_port_in_use(int port)
@@ -1551,6 +1561,8 @@ socket_port_in_use(int port)
 			char		path[MAXPGPATH];
 			FILE	   *fp;
 			long		pid = 0;
+			struct stat st;
+			bool		ours;
 
 			/* an abstract socket (Linux "@name") has no lock file */
 			if (dir[0] == '@')
@@ -1562,16 +1574,26 @@ socket_port_in_use(int port)
 				continue;
 			if (fscanf(fp, "%ld", &pid) != 1)
 				pid = 0;
+			/* not known to be ours, it is taken for another user's */
+			ours = (fstat(fileno(fp), &st) == 0 && st.st_uid == geteuid());
 			fclose(fp);
 
 			/* a standalone backend writes its PID negated */
 			if (pid < 0)
 				pid = -pid;
-			if (pid > 1 && (kill((pid_t) pid, 0) == 0 || errno == EPERM))
-			{
+			/* a file a crash cut short names no process */
+			if (pid <= 1)
+				continue;
+
+			if (kill((pid_t) pid, 0) == 0)
 				in_use = true;
+			else if (errno == EPERM)
+				in_use = !ours;
+			else if (errno != ESRCH)
+				in_use = true;
+
+			if (in_use)
 				break;
-			}
 		}
 	}
 	list_free_deep(elemlist);
