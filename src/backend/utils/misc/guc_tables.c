@@ -33,6 +33,7 @@
 #include "access/gin.h"
 #include "access/hio.h"
 #include "access/nbtree.h"
+#include "access/htup_details.h"
 #include "access/slru.h"
 #include "access/tableam.h"
 #include "access/toast_compression.h"
@@ -349,6 +350,13 @@ static const struct config_enum_entry backslash_quote_options[] = {
 	{"no", BACKSLASH_QUOTE_OFF, true},
 	{"1", BACKSLASH_QUOTE_ON, true},
 	{"0", BACKSLASH_QUOTE_OFF, true},
+	{NULL, 0, false}
+};
+
+static const struct config_enum_entry composite_type_mismatch_options[] = {
+	{"error", COMPOSITE_TYPE_MISMATCH_ERROR, false},
+	{"warn", COMPOSITE_TYPE_MISMATCH_WARN, false},
+	{"disabled", COMPOSITE_TYPE_MISMATCH_DISABLED, false},
 	{NULL, 0, false}
 };
 
