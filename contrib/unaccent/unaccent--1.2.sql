@@ -8,15 +8,23 @@
 -- Odoo makes unaccent(text) immutable itself for the same reason.  The price is
 -- that PostgreSQL cannot notice a change of the rules file: after changing the
 -- rules call unaccent_refresh() (below) to reload them and rebuild the indexes.
+--
+-- COST 100 (C default: 1) is deliberate, like to_tsvector/ts_headline in core.
+-- Once an IMMUTABLE SQL wrapper around unaccent() is inlined, the planner
+-- costs this C function directly; at cost 1 it treats unaccent() as nearly
+-- free and prefers filtering every row over the trigram indexes, which made
+-- small-table and broad-pattern searches up to 10x slower in testing.  100 is
+-- also what an un-inlined SQL wrapper is costed at.  Do not lower it without
+-- re-running the search benchmarks.
 CREATE FUNCTION unaccent(regdictionary, text)
 	RETURNS text
 	AS 'MODULE_PATHNAME', 'unaccent_dict'
-	LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+	LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE COST 100;
 
 CREATE FUNCTION unaccent(text)
 	RETURNS text
 	AS 'MODULE_PATHNAME', 'unaccent_dict'
-	LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+	LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE COST 100;
 
 CREATE FUNCTION unaccent_init(internal)
 	RETURNS internal

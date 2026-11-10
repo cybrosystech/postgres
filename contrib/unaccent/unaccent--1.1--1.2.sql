@@ -4,9 +4,9 @@
 \echo Use "ALTER EXTENSION unaccent UPDATE TO '1.2'" to load this file. \quit
 
 -- Dbblue: see unaccent--1.2.sql.  Existing indexes need no rebuild by this
--- change itself.
-ALTER FUNCTION unaccent(regdictionary, text) IMMUTABLE;
-ALTER FUNCTION unaccent(text) IMMUTABLE;
+-- change itself.  For COST 100 see unaccent--1.2.sql.
+ALTER FUNCTION unaccent(regdictionary, text) IMMUTABLE COST 100;
+ALTER FUNCTION unaccent(text) IMMUTABLE COST 100;
 
 -- unaccent_refresh: repair everything after the unaccent rules change.
 --
