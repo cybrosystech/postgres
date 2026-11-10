@@ -1207,6 +1207,11 @@ usually brings an old bug back.
 11. **Free what you allocate.** No memory context is reset between ticks.
 12. **Warn once, not every 10 s.** Use a `*_warned` flag that `apply_config_reload()`
     clears.
+13. **Compare directories with `same_directory()`, never `strcmp()`.** One directory can
+    have several spellings: through a symbolic link, or `/var/run/postgresql` and
+    `/run/postgresql` on Debian. Compared as text, the worker's own standby, socket
+    directory or build marker is taken for another one's: a needless restart, a standby
+    left unstarted, or a build never cleared.
 
 ---
 

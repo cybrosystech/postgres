@@ -763,7 +763,8 @@ standby_build_interrupted(const char *dir)
 
 	if (owner == NULL)
 		return false;
-	result = (owner[0] == '\0' || strcmp(owner, DataDir) == 0);
+	/* by where it leads: we may have been started through another path */
+	result = (owner[0] == '\0' || same_directory(owner, DataDir));
 	pfree(owner);
 	return result;
 }
@@ -1099,7 +1100,13 @@ standby_follows_us(const char *dir, char **their_host, char **their_port)
 		List	   *elemlist;
 		ListCell   *lc;
 
-		/* one of our socket directories, however written */
+		/*
+		 * One of our socket directories, however written: /var/run/postgresql
+		 * and /run/postgresql are one on Debian, and the standby keeps the
+		 * spelling it was built with while ours may change.  An abstract
+		 * socket, "@name", has no path to resolve, and same_directory()
+		 * compares it as written.
+		 */
 		if (host[0] != '@')
 			canonicalize_path(host);
 		follows = false;
@@ -1110,7 +1117,7 @@ standby_follows_us(const char *dir, char **their_host, char **their_port)
 			{
 				foreach(lc, elemlist)
 				{
-					if (strcmp((const char *) lfirst(lc), host) == 0)
+					if (same_directory((const char *) lfirst(lc), host))
 					{
 						follows = true;
 						break;
@@ -4205,7 +4212,12 @@ retire_previous_standby(const char *dir)
 	char	   *contents;
 	bool		ok;
 
-	if (olddir != NULL && strcmp(olddir, dir) == 0)
+	/*
+	 * The same directory spelled another way -- through a symbolic link, say
+	 * -- is no change: its standby is not stopped, nor named as one to
+	 * remove, which would be the one running.
+	 */
+	if (olddir != NULL && same_directory(olddir, dir))
 	{
 		pfree(olddir);
 		return true;
@@ -4984,7 +4996,7 @@ run_standby_tick(bool *watched)
 	{
 		char	   *owner = standby_build_marker_owner(dir);
 
-		if (owner != NULL && owner[0] != '\0' && strcmp(owner, DataDir) != 0)
+		if (owner != NULL && owner[0] != '\0' && !same_directory(owner, DataDir))
 		{
 			forget_standby_port();
 			ereport(WARNING,
