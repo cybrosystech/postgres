@@ -119,6 +119,7 @@
 #include "utils/conffiles.h"
 #include "utils/guc.h"
 #include "utils/guc_hooks.h"
+#include "utils/memutils.h"
 #include "utils/pidfile.h"
 #include "utils/syscache.h"
 #include "utils/timestamp.h"
@@ -919,18 +920,34 @@ conninfo_value(const char *conninfo, const char *keyword)
  *		The value the configuration file at path, with the files it includes,
  *		gives name, the last one if it gives several, palloc'd, or NULL if it
  *		does not set it or cannot be read.
+ *
+ * The parser does not free all it allocates -- for each include_dir, the
+ * list of the files found there, as every postgresql.conf of Debian's has
+ * one -- and PostgreSQL only ever runs it in a context it then deletes; see
+ * ProcessConfigFile().  So does this: run in our own long-lived one, as it
+ * is on every start of the standby for every cluster on this host, and on
+ * every tick for the standby's own postgresql.auto.conf, it would leak for
+ * as long as we run.
  */
 static char *
 conf_file_value(const char *path, const char *name)
 {
+	MemoryContext parse_cxt;
+	MemoryContext caller_cxt;
 	FILE	   *fp;
 	ConfigVariable *head = NULL;
 	ConfigVariable *tail = NULL;
-	char	   *result = NULL;
+	const char *found = NULL;
+	char	   *result;
 
 	fp = AllocateFile(path, "r");
 	if (fp == NULL)
 		return NULL;
+
+	parse_cxt = AllocSetContextCreate(CurrentMemoryContext,
+									  "dbblue create standby config file",
+									  ALLOCSET_SMALL_SIZES);
+	caller_cxt = MemoryContextSwitchTo(parse_cxt);
 
 	/* a file its server cannot parse either is for that server to report */
 	if (ParseConfigFp(fp, path, CONF_FILE_START_DEPTH, DEBUG1, &head, &tail))
@@ -940,13 +957,15 @@ conf_file_value(const char *path, const char *name)
 			if (item->name == NULL || item->ignore ||
 				pg_strcasecmp(item->name, name) != 0)
 				continue;
-			if (result)
-				pfree(result);
-			result = pstrdup(item->value);
+			found = item->value;
 		}
 	}
 
-	FreeConfigVariables(head);
+	/* the value is copied out before all the parser left is freed */
+	MemoryContextSwitchTo(caller_cxt);
+	result = found ? pstrdup(found) : NULL;
+	MemoryContextDelete(parse_cxt);
+
 	FreeFile(fp);
 	return result;
 }
