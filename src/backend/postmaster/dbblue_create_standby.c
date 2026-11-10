@@ -3384,8 +3384,8 @@ standby_replayed_lsn(const char *dir)
  * standby_backlog
  *		Set *backlog to how many bytes of our WAL the standby in dir, which is
  *		not running, must replay before its data is as current as ours.
- *		Returns false if that cannot be told: the slot is missing or reserves
- *		no WAL.
+ *		Returns false if that cannot be told: its pg_control does not tell,
+ *		and the slot is missing or reserves no WAL.
  *
  * Part of that it must still receive from us: what we have flushed past our
  * slot's restart_lsn, where its standby last reported having received and
@@ -3399,20 +3399,27 @@ standby_replayed_lsn(const char *dir)
  * cannot measure it, and the slot says it has nothing more to receive.  So
  * the backlog is counted from how far it had replayed, when its pg_control
  * tells, as standby_replayed_lsn() reads it, and from the slot otherwise.
+ *
+ * Not from whichever of the two is smaller: the slot can be the smaller only
+ * when it is stale.  A standby replays no further than it has received, but
+ * our slot's restart_lsn is saved to disk only at our checkpoints, and a
+ * crash of ours -- a power loss, which takes the standby on this same host
+ * down with us -- brings it back as of the last one, minutes behind.  The
+ * standby saves its pg_control as it goes.  Counted from the stale slot, a
+ * standby with next to nothing to replay would be started fenced, and Odoo
+ * kept off it for as long as it waits before trying the replica again.
  */
 static bool
 standby_backlog(const char *dir, uint64 *backlog)
 {
-	XLogRecPtr	from = standby_slot_restart_lsn();
-	XLogRecPtr	replayed;
+	XLogRecPtr	from = standby_replayed_lsn(dir);
 	XLogRecPtr	flush;
 
+	/* a fresh copy, or an unreadable pg_control: the slot is all there is */
+	if (XLogRecPtrIsInvalid(from))
+		from = standby_slot_restart_lsn();
 	if (XLogRecPtrIsInvalid(from))
 		return false;
-
-	replayed = standby_replayed_lsn(dir);
-	if (XLogRecPtrIsValid(replayed) && replayed < from)
-		from = replayed;
 
 	flush = GetFlushRecPtr(NULL);
 	*backlog = (flush > from) ? flush - from : 0;

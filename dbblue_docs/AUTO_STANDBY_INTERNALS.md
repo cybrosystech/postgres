@@ -474,24 +474,31 @@ if (!fenced && dbblue_standby_max_lag > 0 &&
 still download:
 
 ```
-backlog = our flush LSN − min(slot restart_lsn, standby_replayed_lsn(dir))
-                              (what it received)  (what it replayed)
+backlog = our flush LSN − standby_replayed_lsn(dir)    (what it replayed, from its pg_control)
+        = our flush LSN − slot restart_lsn             (only when pg_control can't tell)
 ```
 
-- **Received** comes from the slot's `restart_lsn`.
 - **Replayed** comes from the standby's own `pg_control`:
   `max(minRecoveryPoint, checkPoint)` (`standby_replayed_lsn()`). A clean shutdown
   leaves `minRecoveryPoint` at the replay end; after a crash it is behind that, never
   ahead. So it never makes the standby look further along than it is.
-- **A fresh copy** still has `backup_label`. Its `pg_control` is the primary's, copied
-  mid-backup, so only the slot is used.
+- **The slot's `restart_lsn`** (what it received) is the fallback: for **a fresh copy**,
+  which still has `backup_label` (its `pg_control` is the primary's, copied mid-backup),
+  or an unreadable `pg_control`.
 
-**Why both:** a standby stopped while its replay lagged (a conflict, a pause, a slow
-disk) holds WAL in its own `pg_wal` that it received but did not replay, possibly
-gigabytes. The slot says it has nothing left to receive. At start, it replays that local
-WAL **before it connects** (no walreceiver while reading `pg_wal`), so there is no
-walsender and the running checks of §9 cannot measure it. Counted from the slot alone,
-it started **open** and served Odoo that old data until it had replayed it all.
+**Why replayed, not received:** a standby stopped while its replay lagged (a conflict, a
+pause, a slow disk) holds WAL in its own `pg_wal` that it received but did not replay,
+possibly gigabytes. The slot says it has nothing left to receive. At start, it replays
+that local WAL **before it connects** (no walreceiver while reading `pg_wal`), so there is
+no walsender and the running checks of §9 cannot measure it. Counted from the slot, it
+started **open** and served Odoo that old data until it had replayed it all.
+
+**Why not the smaller of the two:** the slot can only be smaller when it is **stale**.
+The primary saves the slot to disk only at its checkpoints, so after a crash of the
+primary (a power loss, which takes the standby on the same host down too) the slot comes
+back minutes behind. The standby saves its `pg_control` as it goes. Taking the smaller
+value made a standby that had replayed everything start fenced after every such crash,
+which kept Odoo off the replica for about 20 minutes for nothing.
 
 So a standby coming back after a pause, a crash or a reboot with gigabytes to replay
 starts **closed**, and is opened once it has caught up (§9).
@@ -844,7 +851,7 @@ All reads take `ReplicationSlotControlLock` shared and the slot's spinlock:
 | `standby_slot_state()` | `ABSENT` / `IDLE` / `ACTIVE` (`active_proc` set) / `INVALIDATED` |
 | `standby_slot_invalidation()` | `slot->data.invalidated` (the cause) |
 | `standby_slot_restart_lsn()` | the slot's `restart_lsn`: what its standby last reported received and flushed |
-| `standby_backlog(dir)` | our flush LSN − the smaller of `restart_lsn` and what the stopped standby replayed (§7.2) |
+| `standby_backlog(dir)` | our flush LSN − what the stopped standby replayed, from its `pg_control`; the slot's `restart_lsn` only when that can't be told (§7.2) |
 | `standby_apply_lsn()` | the apply LSN from the walsender holding the slot |
 
 ### Dropping it — `drop_standby_slot()`
