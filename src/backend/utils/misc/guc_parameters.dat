@@ -829,7 +829,7 @@
 
 { name => 'dbblue_backup_database', type => 'string', context => 'PGC_POSTMASTER', group => 'WAL_ARCHIVING',
   short_desc => 'Database the dbblue backup launcher connects to.',
-  long_desc => 'The backup launcher background worker attaches to this database at server startup and keeps its history table (public.dbblue_backup_history) there. Changing this value requires a server restart.',
+  long_desc => 'The backup launcher background worker attaches to this database at server startup and keeps its history table (dbblue.dbblue_backup_history, in the dedicated dbblue schema) there. Changing this value requires a server restart.',
   flags => 'GUC_NOT_IN_SAMPLE',
   variable => 'dbblue_backup_database',
   boot_val => '"postgres"',

@@ -48,6 +48,7 @@
 
 #include "access/xact.h"
 #include "catalog/pg_authid.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_type.h"
 #include "executor/spi.h"
@@ -394,6 +395,19 @@ BackupLauncherMain(Datum main_arg)
 				 */
 				SetConfigOption("lock_timeout", "5s", PGC_SUSET, PGC_S_SESSION);
 
+				/*
+				 * Pin search_path.  Every query this worker runs executes as
+				 * the bootstrap superuser, so no function, operator or table
+				 * may ever be resolved from a user-writable schema such as
+				 * public (otherwise e.g. a public.unnest(text[]) would be a
+				 * better match than pg_catalog.unnest(anyarray) and run with
+				 * superuser rights).  PGC_S_SESSION also overrides any
+				 * ALTER DATABASE ... SET search_path, and is not reset by a
+				 * SIGHUP reload of postgresql.conf.
+				 */
+				SetConfigOption("search_path", "pg_catalog, pg_temp",
+								PGC_SUSET, PGC_S_SESSION);
+
 				launcher_connected = true;
 			}
 
@@ -494,14 +508,241 @@ resolve_environment(void)
 }
 
 /*
+ * get_schema_owner
+ *		Owner of schema nspname, or InvalidOid if there is no such schema.
+ *		Caller must be connected to SPI.
+ */
+static Oid
+get_schema_owner(const char *nspname)
+{
+	Oid			argtypes[1] = {TEXTOID};
+	Datum		values[1];
+	Datum		d;
+	bool		isnull;
+
+	values[0] = CStringGetTextDatum(nspname);
+
+	/* read_only = false: must see a schema this transaction just created */
+	if (SPI_execute_with_args("SELECT nspowner FROM pg_catalog.pg_namespace "
+							  "WHERE nspname = $1",
+							  1, argtypes, values, NULL, false, 0) != SPI_OK_SELECT ||
+		SPI_processed != 1)
+		return InvalidOid;
+
+	d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
+	return isnull ? InvalidOid : DatumGetObjectId(d);
+}
+
+/*
+ * lookup_relation
+ *		Find nspname.relname in pg_class.  Returns false if there is no such
+ *		relation; otherwise sets *relkind and *relowner and returns true.
+ *		Caller must be connected to SPI.
+ */
+static bool
+lookup_relation(const char *nspname, const char *relname,
+				char *relkind, Oid *relowner)
+{
+	Oid			argtypes[2] = {TEXTOID, TEXTOID};
+	Datum		values[2];
+	Datum		d;
+	bool		isnull;
+
+	values[0] = CStringGetTextDatum(nspname);
+	values[1] = CStringGetTextDatum(relname);
+
+	/* read_only = false: must see a table this transaction just created */
+	if (SPI_execute_with_args("SELECT c.relkind, c.relowner "
+							  "FROM pg_catalog.pg_class c "
+							  "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+							  "WHERE n.nspname = $1 AND c.relname = $2",
+							  2, argtypes, values, NULL, false, 0) != SPI_OK_SELECT ||
+		SPI_processed != 1)
+		return false;
+
+	d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
+	*relkind = isnull ? '\0' : DatumGetChar(d);
+	d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &isnull);
+	*relowner = isnull ? InvalidOid : DatumGetObjectId(d);
+	return true;
+}
+
+/*
+ * create_history_objects
+ *		The body of ensure_schema(); runs inside its transaction and SPI
+ *		connection.  Returns false, after a WARNING, if the history table
+ *		cannot be created or cannot be trusted.
+ */
+static bool
+create_history_objects(void)
+{
+	char		relkind;
+	Oid			relowner;
+
+	/*
+	 * The schema.  CREATE SCHEMA IF NOT EXISTS silently adopts a schema of
+	 * that name created earlier by any role with CREATE on the database (the
+	 * database owner, typically), and a schema's owner can drop -- and so
+	 * replace -- any table inside it.  So whoever owns it must be verified,
+	 * not assumed.  The dbblue audit log (pg_audit.c) creates this same
+	 * schema as the same bootstrap superuser, so sharing it is fine.
+	 */
+	if (SPI_execute("CREATE SCHEMA IF NOT EXISTS dbblue", false, 0) != SPI_OK_UTILITY)
+	{
+		ereport(WARNING,
+				(errmsg("dbblue backup launcher: failed to create schema \"dbblue\"")));
+		return false;
+	}
+
+	if (get_schema_owner("dbblue") != BOOTSTRAP_SUPERUSERID)
+	{
+		ereport(WARNING,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("dbblue backup launcher: schema \"dbblue\" in database \"%s\" is not owned by the bootstrap superuser, refusing to use it",
+						dbblue_backup_database),
+				 errdetail("The schema already existed, created by another role; that role could drop and replace the backup history table, which the launcher writes to as superuser."),
+				 errhint("Inspect the schema, then either drop it or make the bootstrap superuser its owner (ALTER SCHEMA dbblue OWNER TO %s).",
+						 quote_identifier(backup_role))));
+		return false;
+	}
+
+	/*
+	 * One-time migration from earlier versions, which kept the table in
+	 * public.  Moving it keeps the per-database cooldown and the retention
+	 * history, so existing dump files are still pruned.  Only a table we can
+	 * trust is moved: an ordinary table owned by the bootstrap superuser, and
+	 * only while nothing of that name is in dbblue yet.  Anything else under
+	 * that name in public is left alone and no longer used.  (Should the
+	 * table be swapped between this check and the ALTER, the ownership check
+	 * on dbblue.dbblue_backup_history below still refuses the result.)
+	 */
+	if (lookup_relation("public", "dbblue_backup_history", &relkind, &relowner))
+	{
+		char		new_relkind;
+		Oid			new_relowner;
+
+		if (lookup_relation("dbblue", "dbblue_backup_history",
+							&new_relkind, &new_relowner))
+		{
+			/* already migrated (or created fresh); public's copy is unused */
+		}
+		else if (relkind == RELKIND_RELATION && relowner == BOOTSTRAP_SUPERUSERID)
+		{
+			if (SPI_execute("ALTER TABLE public.dbblue_backup_history SET SCHEMA dbblue",
+							false, 0) != SPI_OK_UTILITY)
+			{
+				ereport(WARNING,
+						(errmsg("dbblue backup launcher: failed to move public.dbblue_backup_history to schema \"dbblue\"")));
+				return false;
+			}
+			ereport(LOG,
+					(errmsg("dbblue backup launcher: moved public.dbblue_backup_history to schema \"dbblue\"")));
+		}
+		else
+			ereport(WARNING,
+					(errmsg("dbblue backup launcher: ignoring public.dbblue_backup_history in database \"%s\", which is not an ordinary table owned by the bootstrap superuser",
+							dbblue_backup_database),
+					 errdetail("Its backup history was not carried over to dbblue.dbblue_backup_history, so dump files it lists will not be pruned automatically.")));
+	}
+
+	if (SPI_execute("CREATE TABLE IF NOT EXISTS dbblue.dbblue_backup_history ("
+					"  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"
+					"  database_name text NOT NULL,"
+					"  backup_started_at timestamptz NOT NULL,"
+					"  backup_finished_at timestamptz,"
+					"  status text NOT NULL,"
+					"  file_path text,"
+					"  file_size_bytes bigint,"
+					"  error_message text"
+					")",
+					false, 0) != SPI_OK_UTILITY)
+	{
+		ereport(WARNING,
+				(errmsg("dbblue backup launcher: failed to create table dbblue.dbblue_backup_history")));
+		return false;
+	}
+
+	/*
+	 * The table, too, must be our own ordinary table before anything is
+	 * indexed, granted or written: a view of the same name with an INSTEAD
+	 * OF trigger, or a table owned by another role carrying its own
+	 * triggers, would run that role's code as the superuser worker.
+	 */
+	if (!lookup_relation("dbblue", "dbblue_backup_history", &relkind, &relowner) ||
+		relkind != RELKIND_RELATION || relowner != BOOTSTRAP_SUPERUSERID)
+	{
+		ereport(WARNING,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("dbblue backup launcher: \"dbblue.dbblue_backup_history\" in database \"%s\" is not an ordinary table owned by the bootstrap superuser, refusing to use it",
+						dbblue_backup_database),
+				 errhint("Drop the conflicting object so the launcher can create its own table.")));
+		return false;
+	}
+
+	if (SPI_execute("CREATE INDEX IF NOT EXISTS dbblue_backup_history_db_status_idx "
+					"ON dbblue.dbblue_backup_history (database_name, status, backup_finished_at)",
+					false, 0) != SPI_OK_UTILITY)
+	{
+		ereport(WARNING,
+				(errmsg("dbblue backup launcher: failed to create index on dbblue.dbblue_backup_history")));
+		return false;
+	}
+
+	/*
+	 * Read-only to everyone, writable by no one but the owning worker.
+	 * Strip any privilege PUBLIC might already hold (defensive, in case the
+	 * table pre-existed), then grant back SELECT alone so a non-superuser
+	 * pg_dump can still include it.  INSERT/UPDATE/DELETE/TRUNCATE are not
+	 * granted; DROP is owner-only (and, the schema now being the bootstrap
+	 * superuser's, schema-owner-only too), so non-owners get read access and
+	 * nothing more.
+	 *
+	 * On the schema, PUBLIC gets USAGE and nothing else -- the same as the
+	 * audit log grants -- which a non-superuser pg_dump needs to reach the
+	 * table at all, while CREATE stays revoked so no other role can place
+	 * objects next to it.
+	 */
+	if (SPI_execute("REVOKE ALL ON dbblue.dbblue_backup_history FROM PUBLIC",
+					false, 0) != SPI_OK_UTILITY)
+		ereport(WARNING,
+				(errmsg("dbblue backup launcher: failed to revoke public privileges on dbblue.dbblue_backup_history")));
+
+	if (SPI_execute("GRANT SELECT ON dbblue.dbblue_backup_history TO PUBLIC",
+					false, 0) != SPI_OK_UTILITY)
+		ereport(WARNING,
+				(errmsg("dbblue backup launcher: failed to grant select on dbblue.dbblue_backup_history")));
+
+	if (SPI_execute("REVOKE ALL ON SCHEMA dbblue FROM PUBLIC",
+					false, 0) != SPI_OK_UTILITY ||
+		SPI_execute("GRANT USAGE ON SCHEMA dbblue TO PUBLIC",
+					false, 0) != SPI_OK_UTILITY)
+		ereport(WARNING,
+				(errmsg("dbblue backup launcher: failed to set privileges on schema \"dbblue\"")));
+
+	return true;
+}
+
+/*
  * ensure_schema
- *		Create dbblue_backup_history if it doesn't already exist.  Safe
- *		to retry on every wakeup until it succeeds.
+ *		Create dbblue.dbblue_backup_history if it doesn't already exist,
+ *		and verify that both it and its schema belong to the bootstrap
+ *		superuser.  Safe to retry on every wakeup until it succeeds.
+ *
+ * Every statement this worker runs against the history table executes as the
+ * bootstrap superuser, so the table must be one no other role controls.  It
+ * therefore lives in the dedicated "dbblue" schema rather than in public:
+ * since PostgreSQL 15 public is owned by the database owner, who could drop a
+ * superuser-owned table there and put their own, with their own triggers, in
+ * its place.
+ *
+ * A refusal is reported as a WARNING and a false return, not an ERROR, so
+ * the main loop naps dbblue_backup_naptime before trying again rather than
+ * re-entering at once through the error-recovery path.
  */
 static bool
 ensure_schema(void)
 {
-	bool		table_ok;
+	bool		ok;
 
 	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
@@ -510,55 +751,6 @@ ensure_schema(void)
 	pgstat_report_activity(STATE_RUNNING,
 						   "dbblue backup launcher: ensuring schema");
 
-	table_ok = (SPI_execute(
-							"CREATE TABLE IF NOT EXISTS public.dbblue_backup_history ("
-							"  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"
-							"  database_name text NOT NULL,"
-							"  backup_started_at timestamptz NOT NULL,"
-							"  backup_finished_at timestamptz,"
-							"  status text NOT NULL,"
-							"  file_path text,"
-							"  file_size_bytes bigint,"
-							"  error_message text"
-							")",
-							false, 0) == SPI_OK_UTILITY);
-
-	if (table_ok)
-	{
-		table_ok = (SPI_execute(
-								"CREATE INDEX IF NOT EXISTS dbblue_backup_history_db_status_idx "
-								"ON public.dbblue_backup_history (database_name, status, backup_finished_at)",
-								false, 0) == SPI_OK_UTILITY);
-		if (!table_ok)
-			ereport(WARNING,
-					(errmsg("dbblue backup launcher: failed to create index on dbblue_backup_history")));
-	}
-
-	if (table_ok)
-	{
-		/*
-		 * Read-only to everyone, writable by no one but the owning worker.
-		 * Strip any privilege PUBLIC might already hold (defensive, in case the
-		 * table pre-existed), then grant back SELECT alone so a non-superuser
-		 * pg_dump can still include it.  INSERT/UPDATE/DELETE/TRUNCATE are not
-		 * granted; DROP and TRUNCATE are owner-only in PostgreSQL and cannot be
-		 * granted to PUBLIC at all, so non-owners get read access and nothing
-		 * more.
-		 */
-		if (SPI_execute("REVOKE ALL ON public.dbblue_backup_history FROM PUBLIC",
-						false, 0) != SPI_OK_UTILITY)
-			ereport(WARNING,
-					(errmsg("dbblue backup launcher: failed to revoke public privileges on dbblue_backup_history")));
-
-		if (SPI_execute("GRANT SELECT ON public.dbblue_backup_history TO PUBLIC",
-						false, 0) != SPI_OK_UTILITY)
-			ereport(WARNING,
-					(errmsg("dbblue backup launcher: failed to grant select on dbblue_backup_history")));
-	}
-	else
-		ereport(WARNING,
-				(errmsg("dbblue backup launcher: failed to create table dbblue_backup_history")));
-
 	/*
 	 * While we have catalog access, cache the bootstrap superuser's name for
 	 * pg_dump's -U (see backup_role).  Done once; it never changes under us.
@@ -566,23 +758,29 @@ ensure_schema(void)
 	if (backup_role == NULL)
 	{
 		char	   *name = GetUserNameFromId(BOOTSTRAP_SUPERUSERID, false);
-		ereport(LOG, errmsg("name of the user taking backup : %s", name));
 
 		backup_role = MemoryContextStrdup(TopMemoryContext, name);
 		pfree(name);
 	}
 
+	ok = create_history_objects();
+
 	SPI_finish();
 	PopActiveSnapshot();
-	CommitTransactionCommand();
+
+	/* Keep nothing half-done from a refused or failed attempt. */
+	if (ok)
+		CommitTransactionCommand();
+	else
+		AbortCurrentTransaction();
 	pgstat_report_activity(STATE_IDLE, NULL);
 
-	if (table_ok)
+	if (ok)
 		ereport(LOG,
-				(errmsg("dbblue backup launcher: ready (public.dbblue_backup_history verified in database \"%s\")",
-						dbblue_backup_database)));
+				(errmsg("dbblue backup launcher: ready (dbblue.dbblue_backup_history verified in database \"%s\", backing up as role \"%s\")",
+						dbblue_backup_database, backup_role)));
 
-	return table_ok;
+	return ok;
 }
 
 /*
@@ -692,11 +890,11 @@ load_backup_candidates(List *specs)
 
 	ret = SPI_execute_with_args(
 							   "WITH wanted AS ("
-							   "  SELECT s AS dbname FROM unnest($1::text[]) AS s"
+							   "  SELECT s AS dbname FROM pg_catalog.unnest($1::text[]) AS s"
 							   ")"
 							   "SELECT w.dbname, d.oid, d.datallowconn, d.datistemplate,"
 							   "       (SELECT max(h.backup_finished_at)"
-							   "        FROM public.dbblue_backup_history h"
+							   "        FROM dbblue.dbblue_backup_history h"
 							   "        WHERE h.database_name = w.dbname"
 							   "          AND h.status = 'success') AS last_backup_at"
 							   " FROM wanted w"
@@ -1130,7 +1328,7 @@ record_backup_history(const char *dbname, TimestampTz started_at,
 					  int64 file_size_bytes, const char *error_message)
 {
 	static const char *sql =
-		"INSERT INTO public.dbblue_backup_history "
+		"INSERT INTO dbblue.dbblue_backup_history "
 		"(database_name, backup_started_at, backup_finished_at, status, "
 		" file_path, file_size_bytes, error_message) "
 		"VALUES ($1, $2, now(), $3, $4, $5, $6)";
@@ -1186,7 +1384,7 @@ static void
 enforce_retention(const char *dbname, const char *status)
 {
 	static const char *select_sql =
-		"SELECT id, file_path FROM public.dbblue_backup_history "
+		"SELECT id, file_path FROM dbblue.dbblue_backup_history "
 		"WHERE database_name = $1 AND status = $2 "
 		"ORDER BY backup_finished_at DESC "
 		"OFFSET $3";
@@ -1258,7 +1456,7 @@ enforce_retention(const char *dbname, const char *status)
 	if (n_to_delete > 0)
 	{
 		static const char *delete_sql =
-			"DELETE FROM public.dbblue_backup_history WHERE id = ANY($1::bigint[])";
+			"DELETE FROM dbblue.dbblue_backup_history WHERE id = ANY($1::bigint[])";
 		static const Oid delete_argtypes[1] = {INT8ARRAYOID};
 		Datum		delete_values[1];
 		ArrayType  *idarr;

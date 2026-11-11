@@ -7,6 +7,7 @@ tests += {
   'tap': {
     'tests': [
       't/001_auto_backup.pl',
+      't/002_history_table_ownership.pl',
     ],
   },
 }

@@ -1,14 +1,14 @@
-# Checking port 14708
-# Found port 14708
+# Checking port 26745
+# Found port 26745
 Name: auto_backup
-Version: 19beta2
-Data directory: /home/cybrosys/global_partition_index/postgres/src/test/modules/dbblue_backup/tmp_check/t_001_auto_backup_auto_backup_data/pgdata
-Backup directory: /home/cybrosys/global_partition_index/postgres/src/test/modules/dbblue_backup/tmp_check/t_001_auto_backup_auto_backup_data/backup
-Archive directory: /home/cybrosys/global_partition_index/postgres/src/test/modules/dbblue_backup/tmp_check/t_001_auto_backup_auto_backup_data/archives
-Connection string: port=14708 host=/tmp/T8VRwWN7ic
+Version: 19rc2
+Data directory: tmp_check/t_001_auto_backup_auto_backup_data/pgdata
+Backup directory: tmp_check/t_001_auto_backup_auto_backup_data/backup
+Archive directory: tmp_check/t_001_auto_backup_auto_backup_data/archives
+Connection string: port=26745 host=/tmp/TQR2DbpUhy
 Log file: log/001_auto_backup_auto_backup.log
-[11:07:38.299](0.016s) # initializing database system by running initdb
-# Running: initdb --no-sync --pgdata /home/cybrosys/global_partition_index/postgres/src/test/modules/dbblue_backup/tmp_check/t_001_auto_backup_auto_backup_data/pgdata --auth trust
+[10:47:09.352](0.013s) # initializing database system by running initdb
+# Running: initdb --no-sync --pgdata tmp_check/t_001_auto_backup_auto_backup_data/pgdata --auth trust
 The files belonging to this database system will be owned by user "cybrosys".
 This user must also own the server process.
 
@@ -25,7 +25,7 @@ The default text search configuration will be set to "english".
 
 Data page checksums are enabled.
 
-creating directory /home/cybrosys/global_partition_index/postgres/src/test/modules/dbblue_backup/tmp_check/t_001_auto_backup_auto_backup_data/pgdata ... ok
+creating directory tmp_check/t_001_auto_backup_auto_backup_data/pgdata ... ok
 creating subdirectories ... ok
 selecting dynamic shared memory implementation ... posix
 selecting default "max_connections" ... 100
@@ -35,14 +35,14 @@ auto-tune: detected 30843 MB RAM, 16 CPU(s), storage=ssd
 auto-tune: probing "shared_buffers" = 8GB ... ok
 creating configuration files ... ok
 running bootstrap script ... ok
-performing post-bootstrap initialization ... 2026-10-14 11:07:38.893 IST [102868] LOG:  registered custom resource manager "pg_tde" with ID 140
-2026-10-14 11:07:38.893 IST [102868] LOG:  tde_shmem_request: requested 17689136 bytes
-2026-10-14 11:07:39.016 IST [102868] LOG:  creating DSA area of size 262144
-2026-10-14 11:07:39.338 IST [102868] LOG:  Setting principal key [odoo_default_key : global_file_provider] for the database
-2026-10-14 11:07:39.338 IST [102868] STATEMENT:  SELECT public.pg_tde_set_server_key_using_global_key_provider('odoo_default_key', 'global_file_provider');
+performing post-bootstrap initialization ... 2026-11-11 10:47:09.903 IST [1501242] LOG:  registered custom resource manager "pg_tde" with ID 140
+2026-11-11 10:47:09.903 IST [1501242] LOG:  tde_shmem_request: requested 17689136 bytes
+2026-11-11 10:47:10.041 IST [1501242] LOG:  creating DSA area of size 262144
+2026-11-11 10:47:10.276 IST [1501242] LOG:  Setting principal key [odoo_default_key : global_file_provider] for the database
+2026-11-11 10:47:10.276 IST [1501242] STATEMENT:  SELECT public.pg_tde_set_server_key_using_global_key_provider('odoo_default_key', 'global_file_provider');
 	
-2026-10-14 11:07:39.338 IST [102868] LOG:  Setting principal key [odoo_default_key : global_file_provider] for the database
-2026-10-14 11:07:39.338 IST [102868] STATEMENT:  SELECT public.pg_tde_set_default_key_using_global_key_provider('odoo_default_key', 'global_file_provider');
+2026-11-11 10:47:10.276 IST [1501242] LOG:  Setting principal key [odoo_default_key : global_file_provider] for the database
+2026-11-11 10:47:10.276 IST [1501242] STATEMENT:  SELECT public.pg_tde_set_default_key_using_global_key_provider('odoo_default_key', 'global_file_provider');
 	
 ok
 
@@ -51,29 +51,38 @@ The data directory might become corrupt if the operating system crashes.
 
 Success. You can now start the database server using:
 
-    pg_ctl -D /home/cybrosys/global_partition_index/postgres/src/test/modules/dbblue_backup/tmp_check/t_001_auto_backup_auto_backup_data/pgdata -l logfile start
+    pg_ctl -D tmp_check/t_001_auto_backup_auto_backup_data/pgdata -l logfile start
 
-# Running: /home/cybrosys/global_partition_index/postgres/src/test/regress/pg_regress --config-auth /home/cybrosys/global_partition_index/postgres/src/test/modules/dbblue_backup/tmp_check/t_001_auto_backup_auto_backup_data/pgdata
+The pg_tde principal key is stored in
+    /home/cybrosys/staging_s_latest/postgres/src/test/modules/dbblue_backup/tmp_check/t_001_auto_backup_auto_backup_data/pgdata_tde_keys/keyring.per
+Back it up separately from the data: without it this cluster, and any
+standby or backup made from it, cannot be decrypted.
+
+# Running: /home/cybrosys/staging_s_latest/postgres/src/test/regress/pg_regress --config-auth tmp_check/t_001_auto_backup_auto_backup_data/pgdata
 ### Starting node "auto_backup"
-# Running: pg_ctl --wait --pgdata /home/cybrosys/global_partition_index/postgres/src/test/modules/dbblue_backup/tmp_check/t_001_auto_backup_auto_backup_data/pgdata --log log/001_auto_backup_auto_backup.log --options --cluster-name=auto_backup start
+# Running: pg_ctl --wait --pgdata tmp_check/t_001_auto_backup_auto_backup_data/pgdata --log log/001_auto_backup_auto_backup.log --options --cluster-name=auto_backup start
 waiting for server to start.... done
 server started
-# Postmaster PID for node "auto_backup" is 102875
+# Postmaster PID for node "auto_backup" is 1501293
 #### Begin standard error
 psql:<stdin>:1: WARNING:  database "bktest" will use the builtin "C.UTF-8" locale with UTF8 encoding
 DETAIL:  It is created from template0, so template1 and anything installed in it (extensions, schemas, seed data) are not copied.
 HINT:  Set dbblue_default_builtin_locale to off, or name a TEMPLATE, LOCALE or ENCODING explicitly, to get the standard behaviour.
 #### End standard error
-[11:07:50.963](12.664s) ok 1 - retention_count = 0 keeps the newest backup, not zero
-[11:07:50.963](0.000s) ok 2 - retention_count = 0 leaves exactly one dump file on disk
-[11:07:50.963](0.000s) ok 3 - the retained dump file is non-empty
-[11:07:50.974](0.011s) ok 4 - pg_dump is invoked with an explicit -U role
-[11:07:50.981](0.007s) ok 5 - pg_dump receives the database name after a "--" end-of-options marker
-[11:07:51.005](0.024s) ok 6 - a non-superuser can SELECT the backup history
-[11:07:51.018](0.013s) ok 7 - a non-superuser cannot INSERT into the backup history
-### Stopping node "auto_backup" using mode fast
-# Running: pg_ctl --pgdata /home/cybrosys/global_partition_index/postgres/src/test/modules/dbblue_backup/tmp_check/t_001_auto_backup_auto_backup_data/pgdata --mode fast stop
+[10:47:21.790](12.437s) ok 1 - retention_count = 0 keeps the newest backup, not zero
+[10:47:21.790](0.000s) not ok 2 - retention_count = 0 leaves exactly one dump file on disk
+[10:47:21.790](0.000s) 
+[10:47:21.790](0.000s) #   Failed test 'retention_count = 0 leaves exactly one dump file on disk'
+#   at t/001_auto_backup.pl line 64.
+[10:47:21.790](0.000s) #          got: '0'
+#     expected: '1'
+[10:47:21.791](0.000s) # die: Use of uninitialized value in -s at t/001_auto_backup.pl line 66.
+[10:47:21.791](0.000s) 1..2
+Use of uninitialized value in -s at t/001_auto_backup.pl line 66.
+# Postmaster PID for node "auto_backup" is 1501293
+### Stopping node "auto_backup" using mode immediate
+# Running: pg_ctl --pgdata tmp_check/t_001_auto_backup_auto_backup_data/pgdata --mode immediate stop
 waiting for server to shut down.... done
 server stopped
 # No postmaster PID for node "auto_backup"
-[11:07:51.223](0.205s) 1..7
+[10:47:21.895](0.104s) # Looks like your test exited with 2 just after 2.

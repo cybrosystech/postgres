@@ -48,7 +48,7 @@ $node->safe_psql('bktest',
 
 # Wait for the worker to take its first successful backup of bktest.
 my $success_count = qq{
-	SELECT count(*) FROM public.dbblue_backup_history
+	SELECT count(*) FROM dbblue.dbblue_backup_history
 	WHERE database_name = 'bktest' AND status = 'success'};
 
 $node->poll_query_until('postgres', $success_count, '1')
@@ -88,14 +88,14 @@ $node->safe_psql('postgres', 'CREATE ROLE dbblue_reader LOGIN');
 
 is( $node->safe_psql(
 		'postgres',
-		'SELECT 1 FROM public.dbblue_backup_history LIMIT 1',
+		'SELECT 1 FROM dbblue.dbblue_backup_history LIMIT 1',
 		extra_params => [ '-U', 'dbblue_reader' ]),
 	'1', 'a non-superuser can SELECT the backup history');
 
 my $err = '';
 my $rc = $node->psql(
 	'postgres',
-	"INSERT INTO public.dbblue_backup_history (database_name, backup_started_at, status) "
+	"INSERT INTO dbblue.dbblue_backup_history (database_name, backup_started_at, status) "
 	  . "VALUES ('x', now(), 'y')",
 	extra_params => [ '-U', 'dbblue_reader' ],
 	stderr => \$err,
