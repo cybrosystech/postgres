@@ -19,6 +19,8 @@ contrib_targets += unaccent
 install_data(
   'unaccent--1.0--1.1.sql',
   'unaccent--1.1.sql',
+  'unaccent--1.2.sql',
+  'unaccent--1.1--1.2.sql',
   'unaccent.control',
   kwargs: contrib_data_args,
 )
