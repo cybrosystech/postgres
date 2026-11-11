@@ -5,6 +5,7 @@
 #include "catalog/partition.h"
 #include "commands/trigger.h"   /* SessionReplicationRole */
 #include "catalog/pg_authid.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_type.h"
 #include "executor/executor.h"
 #include "executor/execdesc.h"
@@ -774,6 +775,74 @@ dbblue_audit_ensure_log_table(void)
    PG_END_TRY();
 }
 
+/*
+ * audit_verify_log_table_owner
+ *
+ * Refuse a dbblue schema or dbblue.dbblue_audit_log that the bootstrap
+ * superuser does not own.
+ *
+ * Every audit row is written (and every expired row deleted) as the bootstrap
+ * superuser, so the table must be one no other role controls.
+ * CREATE ... IF NOT EXISTS silently adopts whatever already has the name,
+ * though, and both can exist before the audit log first does: the database
+ * owner can CREATE SCHEMA dbblue in a new database ahead of the first audited
+ * write, and a dump restored by a non-superuser with --no-owner recreates the
+ * schema and table under that role.  A schema's owner may drop any table in
+ * it -- erasing the trail -- or put its own in its place, whose triggers,
+ * column defaults or CHECK expressions would then run as the superuser on
+ * every audited row.
+ *
+ * Raises ERROR, which dbblue_audit_ensure_log_table() turns into either a
+ * refused statement or a WARNING, per dbblue_audit_require_write.  Caller
+ * must hold an SPI connection.
+ */
+static void
+audit_verify_log_table_owner(void)
+{
+   int         spi_ret;
+   bool        isnull;
+   Datum       d;
+   Oid         nspowner;
+   Oid         relowner = InvalidOid;
+   char        relkind = '\0';
+
+   /* read_only = false: must see a schema/table this transaction created */
+   spi_ret = SPI_execute(
+       "SELECT n.nspowner, c.relkind, c.relowner"
+       "  FROM pg_catalog.pg_namespace n"
+       "  LEFT JOIN pg_catalog.pg_class c"
+       "         ON c.relnamespace = n.oid AND c.relname = 'dbblue_audit_log'"
+       " WHERE n.nspname = 'dbblue'",
+       false, 0);
+
+   if (spi_ret != SPI_OK_SELECT || SPI_processed != 1)
+       elog(ERROR, "could not look up schema \"dbblue\"");
+
+   d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
+   nspowner = isnull ? InvalidOid : DatumGetObjectId(d);
+
+   if (nspowner != BOOTSTRAP_SUPERUSERID)
+       ereport(ERROR,
+               (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+                errmsg("schema \"dbblue\" is owned by role \"%s\", not by the bootstrap superuser; refusing to keep the audit log in it",
+                       OidIsValid(nspowner) ?
+                       GetUserNameFromId(nspowner, true) : "?"),
+                errhint("Inspect the schema, then drop it or make the bootstrap superuser its owner.")));
+
+   d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &isnull);
+   if (!isnull)
+       relkind = DatumGetChar(d);
+   d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3, &isnull);
+   if (!isnull)
+       relowner = DatumGetObjectId(d);
+
+   if (relkind != RELKIND_RELATION || relowner != BOOTSTRAP_SUPERUSERID)
+       ereport(ERROR,
+               (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+                errmsg("\"dbblue.dbblue_audit_log\" is not an ordinary table owned by the bootstrap superuser; refusing to write the audit log to it"),
+                errhint("Drop the conflicting object so the audit log can be created.")));
+}
+
 static void
 dbblue_audit_ensure_log_table_guts(void)
 {
@@ -823,7 +892,21 @@ dbblue_audit_ensure_log_table_guts(void)
         */
        "   AND EXISTS (SELECT 1 FROM pg_class c, aclexplode(c.relacl) a"
        "                WHERE c.oid = to_regclass('dbblue.dbblue_audit_log')"
-       "                  AND a.grantee = 0 AND a.privilege_type = 'SELECT')",
+       "                  AND a.grantee = 0 AND a.privilege_type = 'SELECT')"
+       /*
+        * And that both schema and table are the bootstrap superuser's own
+        * (see audit_verify_log_table_owner()).  Existence and INSERT
+        * privilege prove nothing here: the elevated identity has privilege
+        * on every table, including one another role planted.  Anything
+        * else falls through to the slow path, which refuses it with the
+        * reason.
+        */
+       "   AND EXISTS (SELECT 1 FROM pg_class c"
+       "                 JOIN pg_namespace n ON n.oid = c.relnamespace"
+       "                WHERE c.oid = to_regclass('dbblue.dbblue_audit_log')"
+       "                  AND c.relkind = " CppAsString2(RELKIND_RELATION)
+       "                  AND c.relowner = " CppAsString2(BOOTSTRAP_SUPERUSERID)
+       "                  AND n.nspowner = " CppAsString2(BOOTSTRAP_SUPERUSERID) ")",
        true, 1);
 
    if (spi_ret == SPI_OK_SELECT && SPI_processed == 1)
@@ -835,6 +918,7 @@ dbblue_audit_ensure_log_table_guts(void)
        if (!isnull && DatumGetBool(d))
        {
            audit_table_checked = true;
+           audit_table_available = true;
            SPI_finish();
            return;
        }
@@ -887,6 +971,12 @@ dbblue_audit_ensure_log_table_guts(void)
        SPI_finish();
        return;
    }
+
+   /*
+    * Both IF NOT EXISTS above may have adopted objects another role created
+    * first.  Verify before altering, indexing, granting or writing anything.
+    */
+   audit_verify_log_table_owner();
 
    /*
     * A log table created by an older dbblue lacks the four columns above.
@@ -980,6 +1070,14 @@ dbblue_audit_ensure_log_table_guts(void)
         */
        CommandCounterIncrement();
        audit_table_checked = true;
+
+       /*
+        * A failure earlier in this session (see the PG_CATCH in
+        * dbblue_audit_ensure_log_table) cleared this, and only an aborted
+        * transaction would otherwise set it again; once the log is usable,
+        * this backend must resume auditing.
+        */
+       audit_table_available = true;
        elog(DEBUG1, "dbblue_audit: dbblue_audit_log table ensured");
    }
 
