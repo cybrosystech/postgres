@@ -54,6 +54,8 @@
 #include "access/htup_details.h"
 #include "access/tableam.h"
 #include "access/xact.h"
+#include "catalog/pg_authid.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_database.h"
 #include "executor/spi.h"
 #include "miscadmin.h"
@@ -99,7 +101,6 @@ static List *audit_prune_get_databases(void);
 static void audit_prune_one_database(const AuditPruneDatabase *db);
 static void audit_prune_wait_for_worker(BackgroundWorkerHandle *handle,
 										const AuditPruneDatabase *db);
-static bool audit_log_table_exists(void);
 static int64 audit_prune_once(void);
 
 /*
@@ -342,9 +343,17 @@ audit_prune_one_database(const AuditPruneDatabase *db)
 	pfree(handle);
 }
 
+/* What audit_log_table_state() found in this database. */
+typedef enum AuditLogTableState
+{
+	AUDIT_LOG_ABSENT,			/* no dbblue.dbblue_audit_log: nothing to sweep */
+	AUDIT_LOG_TRUSTED,			/* ours: safe to delete from as superuser */
+	AUDIT_LOG_FOREIGN,			/* exists, but some other role controls it */
+} AuditLogTableState;
+
 /*
- * audit_log_table_exists
- *		Does this database have an audit log to sweep at all?
+ * audit_log_table_state
+ *		Does this database have an audit log to sweep, and is it ours?
  *
  * dbblue.dbblue_audit_log is created lazily, by the first write to an audited
  * table, so a database that has never recorded anything does not have it.
@@ -352,37 +361,59 @@ audit_prune_one_database(const AuditPruneDatabase *db)
  * per cycle, which matters now that an empty dbblue_audit_database means
  * every database rather than none: most of them will never have been audited.
  *
- * Uses the same to_regclass() test as the write path's fast path in
- * pg_audit.c, so the two agree on what "the log exists" means.
+ * Existence alone is not enough to sweep, though.  This worker deletes as the
+ * bootstrap superuser, and until the audit code has created the dbblue schema
+ * itself, any role with CREATE on the database (its owner, typically) can
+ * create a dbblue schema and a dbblue_audit_log of its own -- with a DELETE
+ * trigger whose function would then run as the superuser on every sweep.  So,
+ * exactly as the write path does (audit_verify_log_table_owner() in
+ * pg_audit.c), the log is only trusted when the bootstrap superuser owns both
+ * the schema and an ordinary table.  Once it does, no other role can drop or
+ * replace the table between this check and the sweep: that takes ownership of
+ * the table or of the schema.
  */
-static bool
-audit_log_table_exists(void)
+static AuditLogTableState
+audit_log_table_state(void)
 {
-	bool		exists = false;
+	AuditLogTableState state = AUDIT_LOG_ABSENT;
 	int			ret;
 
 	StartTransactionCommand();
 	PushActiveSnapshot(GetTransactionSnapshot());
 	SPI_connect();
 
-	ret = SPI_execute("SELECT to_regclass('dbblue.dbblue_audit_log') IS NOT NULL",
+	ret = SPI_execute("SELECT n.nspowner, c.relkind, c.relowner"
+					  "  FROM pg_catalog.pg_namespace n"
+					  "  JOIN pg_catalog.pg_class c"
+					  "    ON c.relnamespace = n.oid AND c.relname = 'dbblue_audit_log'"
+					  " WHERE n.nspname = 'dbblue'",
 					  true, 1);
 
 	if (ret == SPI_OK_SELECT && SPI_processed == 1)
 	{
-		bool		isnull;
-		Datum		datum;
+		HeapTuple	tup = SPI_tuptable->vals[0];
+		TupleDesc	desc = SPI_tuptable->tupdesc;
+		bool		nsp_null,
+					kind_null,
+					owner_null;
+		Oid			nspowner = DatumGetObjectId(SPI_getbinval(tup, desc, 1, &nsp_null));
+		char		relkind = DatumGetChar(SPI_getbinval(tup, desc, 2, &kind_null));
+		Oid			relowner = DatumGetObjectId(SPI_getbinval(tup, desc, 3, &owner_null));
 
-		datum = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc,
-							  1, &isnull);
-		exists = !isnull && DatumGetBool(datum);
+		if (!nsp_null && !kind_null && !owner_null &&
+			nspowner == BOOTSTRAP_SUPERUSERID &&
+			relkind == RELKIND_RELATION &&
+			relowner == BOOTSTRAP_SUPERUSERID)
+			state = AUDIT_LOG_TRUSTED;
+		else
+			state = AUDIT_LOG_FOREIGN;
 	}
 
 	SPI_finish();
 	PopActiveSnapshot();
 	CommitTransactionCommand();
 
-	return exists;
+	return state;
 }
 
 /*
@@ -447,6 +478,19 @@ AuditPrunerMain(Datum main_arg)
 
 	BackgroundWorkerInitializeConnectionByOid(dboid, InvalidOid, 0);
 
+	/*
+	 * Pin search_path before running any SQL.  This worker runs as the
+	 * bootstrap superuser, so no function or operator may ever be resolved
+	 * from a user-writable schema: e.g. a public.make_interval(integer,
+	 * integer, numeric) would be a closer match for the sweep's call than
+	 * pg_catalog.make_interval(..., double precision) and run with superuser
+	 * rights.  PGC_S_SESSION also overrides an ALTER DATABASE ... SET
+	 * search_path, which the database owner could otherwise use to put
+	 * public ahead of pg_catalog.
+	 */
+	SetConfigOption("search_path", "pg_catalog, pg_temp",
+					PGC_SUSET, PGC_S_SESSION);
+
 	pruner_cxt = AllocSetContextCreate(TopMemoryContext,
 									   "dbblue audit pruner",
 									   ALLOCSET_DEFAULT_SIZES);
@@ -493,12 +537,27 @@ AuditPrunerMain(Datum main_arg)
 	if (ShutdownRequestPending)
 		proc_exit(0);
 
-	if (!audit_log_table_exists())
+	switch (audit_log_table_state())
 	{
-		ereport(DEBUG1,
-				(errmsg("dbblue audit pruner: database \"%s\" has no audit log, nothing to sweep",
-						dbname)));
-		proc_exit(0);
+		case AUDIT_LOG_ABSENT:
+			ereport(DEBUG1,
+					(errmsg("dbblue audit pruner: database \"%s\" has no audit log, nothing to sweep",
+							dbname)));
+			proc_exit(0);
+			break;
+
+		case AUDIT_LOG_FOREIGN:
+			ereport(WARNING,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("dbblue audit pruner: not sweeping database \"%s\": \"dbblue.dbblue_audit_log\" or its schema is not owned by the bootstrap superuser",
+							dbname),
+					 errdetail("Another role controls it, so deleting from it as superuser could run that role's code with superuser rights."),
+					 errhint("Inspect schema \"dbblue\" in that database; drop the conflicting objects, or make the bootstrap superuser their owner.")));
+			proc_exit(0);
+			break;
+
+		case AUDIT_LOG_TRUSTED:
+			break;
 	}
 
 	/*

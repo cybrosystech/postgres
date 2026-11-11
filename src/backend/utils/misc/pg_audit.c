@@ -565,9 +565,16 @@ dbblue_audit_prune_batch(void)
    snprintf(sql, sizeof(sql),
             "DELETE FROM dbblue.dbblue_audit_log WHERE id IN ("
             "  SELECT id FROM dbblue.dbblue_audit_log"
-            "   WHERE logged_at < now() - make_interval(months => %d,"
-            "                                           days => %d,"
-            "                                           secs => %.6f)"
+            /*
+             * Schema-qualified, with secs cast to its real type, so that no
+             * same-named function in a user-writable schema can be a closer
+             * match even where search_path is not pinned (the pruner worker
+             * pins it too).
+             */
+            "   WHERE logged_at < pg_catalog.now()"
+            "       - pg_catalog.make_interval(months => %d,"
+            "                                  days => %d,"
+            "                                  secs => %.6f::pg_catalog.float8)"
             "   ORDER BY id LIMIT %d)",
             audit_retention_iv.month, audit_retention_iv.day,
             (double) audit_retention_iv.time / USECS_PER_SEC,
