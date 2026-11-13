@@ -60,6 +60,7 @@
 #include "postmaster/dbblue_backup_launcher.h"
 #include "postmaster/interrupt.h"
 #include "postmaster/postmaster.h"
+#include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "utils/array.h"
@@ -94,6 +95,16 @@ int			dbblue_backup_timeout = 3600;
  * to tune.
  */
 #define DBBLUE_BACKUP_KILL_GRACE_S	30
+
+/*
+ * pg_dump writes to <dbname>_<time>.dump.partial, which is renamed to
+ * <dbname>_<time>.dump only once the dump is complete and on disk.  So a file
+ * ending in .dump is always a whole backup, and one ending in .dump.partial
+ * is a dump that never finished (the worker was killed mid-dump, e.g. by a
+ * crash-restart, before it could clean up); remove_partial_dumps() deletes
+ * those.  Retention only ever removes files ending in .dump.
+ */
+#define DBBLUE_BACKUP_PARTIAL_SUFFIX ".partial"
 
 /* pg_dump's own -V output, for find_other_exec()'s version check. */
 #define DBBLUE_BACKUP_PGDUMP_VERSIONSTR "pg_dump (PostgreSQL) " PG_VERSION "\n"
@@ -1180,18 +1191,77 @@ run_backup_command(const char *cmd)
 }
 
 /*
+ * remove_partial_dumps
+ *		Delete the <dbname>_*.dump.partial files left in dbdir by dumps that
+ *		never finished.
+ *
+ * A dump that fails while this worker is alive cleans up after itself; this
+ * catches the ones that could not, because the worker itself was killed
+ * mid-dump: an immediate shutdown, a crash-restart after any backend crashed,
+ * kill -9, the OOM killer, postmaster death, or power loss.  Such a file has
+ * no history row, so retention would never remove it.
+ *
+ * Called just before dbname is dumped again.  Only this worker writes these
+ * files, and it dumps one database at a time, so none of them can belong to
+ * a dump still in progress.
+ */
+static void
+remove_partial_dumps(const char *dbdir, const char *dbname)
+{
+	static const char suffix[] = ".dump" DBBLUE_BACKUP_PARTIAL_SUFFIX;
+	size_t		namelen = strlen(dbname);
+	size_t		suffixlen = strlen(suffix);
+	DIR		   *dir;
+	struct dirent *de;
+
+	dir = AllocateDir(dbdir);
+	while ((de = ReadDirExtended(dir, dbdir, WARNING)) != NULL)
+	{
+		size_t		len = strlen(de->d_name);
+		char		path[MAXPGPATH];
+
+		/* Only <dbname>_<something>.dump.partial, as backup_one_database names it */
+		if (len <= namelen + 1 + suffixlen ||
+			strncmp(de->d_name, dbname, namelen) != 0 ||
+			de->d_name[namelen] != '_' ||
+			strcmp(de->d_name + len - suffixlen, suffix) != 0)
+			continue;
+
+		if (snprintf(path, sizeof(path), "%s/%s", dbdir, de->d_name) >= MAXPGPATH)
+			continue;
+
+		if (unlink(path) == 0)
+			ereport(LOG,
+					(errmsg("dbblue backup launcher: removed \"%s\", left by a backup of database \"%s\" that did not finish",
+							path, dbname)));
+		else if (errno != ENOENT)
+			ereport(WARNING,
+					(errcode_for_file_access(),
+					 errmsg("dbblue backup launcher: could not remove unfinished backup \"%s\": %m",
+							path)));
+	}
+	FreeDir(dir);
+}
+
+/*
  * backup_one_database
  *		pg_dump (custom format) one database to its own subdirectory
  *		under dbblue_backup_directory, record the outcome in
  *		dbblue_backup_history, and prune old backups on success.  A
  *		failure here is caught and logged; it does not abort the rest of
  *		the cycle or the worker.
+ *
+ * The dump is written to <outfile>.partial and renamed to outfile only after
+ * pg_dump has exited successfully and the file has been fsync'd, so that a
+ * file ending in .dump is always a complete, durable backup, and a "success"
+ * row is never recorded for one that is not.
  */
 static bool
 backup_one_database(const char *dbname)
 {
 	char		dbdir[MAXPGPATH];
 	char		outfile[MAXPGPATH];
+	char		partfile[MAXPGPATH];
 	char		timebuf[32];
 	time_t		now_t;
 	struct tm	lt;
@@ -1231,7 +1301,21 @@ backup_one_database(const char *dbname)
 		return false;
 	}
 
-	snprintf(outfile, sizeof(outfile), "%s/%s_%s.dump", dbdir, dbname, timebuf);
+	remove_partial_dumps(dbdir, dbname);
+
+	if (snprintf(outfile, sizeof(outfile), "%s/%s_%s.dump",
+				 dbdir, dbname, timebuf) >= MAXPGPATH ||
+		snprintf(partfile, sizeof(partfile), "%s%s",
+				 outfile, DBBLUE_BACKUP_PARTIAL_SUFFIX) >= MAXPGPATH)
+	{
+		ereport(WARNING,
+				(errmsg("dbblue backup launcher: backup file path for database \"%s\" is too long, skipping",
+						dbname)));
+		record_backup_history(dbname, started_at, "failed", NULL, 0,
+							  "backup file path is too long");
+		enforce_retention(dbname, "failed");
+		return false;
+	}
 
 	initStringInfo(&cmd);
 
@@ -1263,7 +1347,7 @@ backup_one_database(const char *dbname)
 	}
 
 	appendStringInfo(&cmd, " -p %d -f ", PostPortNumber);
-	ok &= append_shell_quoted(&cmd, outfile);
+	ok &= append_shell_quoted(&cmd, partfile);
 	/*
 	 * End-of-options marker before the database name: shell-quoting stops the
 	 * shell from misreading it, but pg_dump's own getopt would still treat a
@@ -1300,34 +1384,65 @@ backup_one_database(const char *dbname)
 	{
 		struct stat statbuf;
 
-		if (stat(outfile, &statbuf) == 0 && statbuf.st_size > 0)
+		if (stat(partfile, &statbuf) != 0 || statbuf.st_size == 0)
 		{
-			record_backup_history(dbname, started_at, "success", outfile,
-								  (int64) statbuf.st_size, NULL);
-			ereport(LOG,
-					(errmsg("dbblue backup launcher: backed up database \"%s\" to \"%s\" (%lld bytes)",
-							dbname, outfile, (long long) statbuf.st_size)));
-			enforce_retention(dbname, "success");
-			return true;
+			ereport(WARNING,
+					(errmsg("dbblue backup launcher: pg_dump for \"%s\" exited successfully but \"%s\" is missing or empty",
+							dbname, partfile)));
+			unlink(partfile);
+			record_backup_history(dbname, started_at, "failed", NULL, 0,
+								  "pg_dump exited successfully but produced no output file");
+			enforce_retention(dbname, "failed");
+			return false;
 		}
 
-		ereport(WARNING,
-				(errmsg("dbblue backup launcher: pg_dump for \"%s\" exited successfully but \"%s\" is missing or empty",
-						dbname, outfile)));
-		record_backup_history(dbname, started_at, "failed", NULL, 0,
-							  "pg_dump exited successfully but produced no output file");
-		enforce_retention(dbname, "failed");
-		unlink(outfile);
-		return false;
+		/*
+		 * Give the dump its final name only once it is on disk, and make the
+		 * rename itself durable, before the "success" row is committed: else
+		 * a power loss could leave a recorded backup truncated, or still
+		 * named .partial (and so deleted by remove_partial_dumps()).
+		 * durable_rename() fsyncs the file, renames it, and fsyncs it and
+		 * dbdir; dbdir's own entry, new on a database's first backup, needs
+		 * the backup directory synced too.  WARNING, not data_sync_elevel():
+		 * a failed fsync of a dump calls for discarding that dump, not for
+		 * PANICking the server.
+		 */
+		if (durable_rename(partfile, outfile, WARNING) != 0 ||
+			fsync_fname_ext(dbblue_backup_directory, true, false, WARNING) != 0)
+		{
+			struct stat st;
+
+			/*
+			 * Still under its .partial name means the rename never happened,
+			 * and outfile, if it exists, is not this dump.
+			 */
+			if (lstat(partfile, &st) == 0)
+				unlink(partfile);
+			else
+				unlink(outfile);
+
+			record_backup_history(dbname, started_at, "failed", NULL, 0,
+								  "could not write the backup file to disk durably");
+			enforce_retention(dbname, "failed");
+			return false;
+		}
+
+		record_backup_history(dbname, started_at, "success", outfile,
+							  (int64) statbuf.st_size, NULL);
+		ereport(LOG,
+				(errmsg("dbblue backup launcher: backed up database \"%s\" to \"%s\" (%lld bytes)",
+						dbname, outfile, (long long) statbuf.st_size)));
+		enforce_retention(dbname, "success");
+		return true;
 	}
 
 	ereport(WARNING,
 			(errmsg("dbblue backup launcher: backing up database \"%s\" failed: %s",
 					dbname, wait_result_to_str(rc))));
+	unlink(partfile);
 	record_backup_history(dbname, started_at, "failed", NULL, 0,
 						  wait_result_to_str(rc));
 	enforce_retention(dbname, "failed");
-	unlink(outfile);
 	return false;
 }
 

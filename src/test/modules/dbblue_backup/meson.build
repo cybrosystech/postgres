@@ -8,6 +8,9 @@ tests += {
     'tests': [
       't/001_auto_backup.pl',
       't/002_history_table_ownership.pl',
+      't/003_retention_path_check.pl',
+      't/004_database_names.pl',
+      't/005_partial_dump_cleanup.pl',
     ],
   },
 }
