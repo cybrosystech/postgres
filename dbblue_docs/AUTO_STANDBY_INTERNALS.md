@@ -36,6 +36,7 @@ you change [dbblue_create_standby.c](../src/backend/postmaster/dbblue_create_sta
 21. [Testing](#21-testing)
 22. [How to make common changes](#22-how-to-make-common-changes)
 23. [From a log line to the code](#23-from-a-log-line-to-the-code)
+24. [Known, accepted limitations](#24-known-accepted-limitations)
 
 ---
 
@@ -1385,3 +1386,25 @@ text. The most common ones:
 | `consecutive failures; retrying in` | `DbblueCreateStandbyMain()` |
 | `dropping replication slot` / `is in use by another process` | `drop_standby_slot()` |
 | `cannot use standby directory` | `standby_parent_usable()` |
+
+---
+
+## 24. Known, accepted limitations
+
+A full review of the worker (November 2026) found these and **deliberately left them**:
+each is rare, and none can make Odoo read stale data or lose data. They are listed so
+that nobody spends time re-analysing them; fix one only if it shows up in practice. The
+operator-facing limitations (same host only, no tablespaces, and so on) are in
+[AUTO_STANDBY.md](AUTO_STANDBY.md).
+
+| What can happen | When | Worst outcome | Why it is left |
+|---|---|---|---|
+| A **promoted** old standby drops the current standby's slot. `vet_existing_standby()` drops the slot for a `PROMOTED` directory without checking `dbblue_standby.slot`. | Someone promotes an **old**, stopped standby directory by hand, then points `dbblue_standby_directory` at it. | Pointing back at the current standby **rebuilds** it (one full copy). | Needs two unusual manual steps; with one replica it practically never happens. |
+| A **pending fence** (`standby_fence_pending`) survives a directory change or a rebuild. | A fence restart's `pg_ctl stop` fails (gives up after 60 s), and the directory changes or the standby is rebuilt before the next start. | A fresh standby starts fenced, then one extra restart to open it. | Needs a failed stop followed by a change before the next start. |
+| **`off` drops a slot** named `dbblue_standby` even when the worker has no record (`dbblue_standby.dir`, `.slot`) of making it. | Someone created a slot with exactly that name by hand. | That slot is dropped. | The name is the worker's own; nobody else should use it. |
+| **Clearing an interrupted build** (`run_standby_tick()`, step 5) doesn't check for shutdown, and `rmtree()` can't be interrupted. | The server is stopped exactly while a large partial copy, left by an earlier interrupted build, is being deleted at start-up. | The stop waits until the delete ends (seconds, sometimes minutes); a service manager may kill the server, which then does crash recovery at its next start. | Rare timing; an interruptible delete would be ~40 lines for a harmless case. |
+| A **`SIGTERM` during `pg_ctl start`** can leave the standby running. | The standby's postmaster has not written `postmaster.pid` yet when the worker is told to stop, so `stop_standby_at_shutdown()` doesn't see it. | The standby keeps running after the primary has exited. | A window of milliseconds; tracking a start in progress would complicate shutdown handling. |
+| The **slot xmin recompute** in `clear_standby_slot_xmin()` runs after the control lock is released. | The walsender stores a new xmin in the same microseconds. | VACUUM may remove rows a standby query still needs: that query is cancelled, nothing is corrupted. | A microsecond window; fixing it means taking core's `ProcArrayLock` in a new order. |
+| A **`SIGQUIT` right after `fork()`** in `run_command()` is not passed to the new command. | The postmaster crashes in the microseconds between `fork()` and setting `command_pgid`. | `pg_basebackup` or `pg_ctl` keeps running unsupervised. | A microsecond window, only during a crash. |
+| `standby_apply_lsn()` reads the **walsender's PID outside the slot lock**. | That walsender exits and another reuses its slot at that moment. | One check reads another standby's replay position. | PostgreSQL's own views read it the same way; the next check is right. |
+| An **unreadable `postgresql.auto.conf`** on the standby reads as "limits not set". | `standby_limits_behind()` can't open the file (too many open files, say). | One unnecessary restart of the standby. | Needs a failure to open a small file; the restart is harmless. |

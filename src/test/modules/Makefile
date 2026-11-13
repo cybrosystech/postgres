@@ -7,6 +7,7 @@ include $(top_builddir)/src/Makefile.global
 SUBDIRS = \
 		  brin \
 		  commit_ts \
+		  dbblue_audit \
 		  dbblue_backup \
 		  dbblue_brin \
 		  dbblue_standby \

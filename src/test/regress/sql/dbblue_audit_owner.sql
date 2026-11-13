@@ -1,0 +1,73 @@
+--
+-- DBblue dedicated audit log: ownership of the dbblue schema and log table.
+--
+-- Audit rows are written (and expired ones deleted) as the bootstrap
+-- superuser, so the audit log must be one no other role controls.  The
+-- schema's owner could otherwise drop the table -- erasing the trail -- or
+-- plant its own, whose triggers would run as the superuser.  CREATE ... IF NOT
+-- EXISTS adopts whatever already has the name, so the audit code verifies
+-- that the bootstrap superuser owns both the schema and the table, and refuses
+-- them otherwise.
+--
+-- Self-contained: dao_ / regress_dao_ objects plus a dbblue schema that is
+-- dropped again.
+
+SET client_min_messages = warning;
+\set VERBOSITY terse
+DROP SCHEMA IF EXISTS dbblue CASCADE;
+
+CREATE ROLE regress_dao_owner;           -- an ordinary, unprivileged role
+CREATE TABLE dao_t (id int PRIMARY KEY, v int);
+
+-- A dbblue schema created by another role before the audit log exists, as a
+-- database owner could in a new database (or a --no-owner restore would).
+CREATE SCHEMA dbblue AUTHORIZATION regress_dao_owner;
+
+SET dbblue_audit_operations = 'all';
+SET dbblue_audit_tables = 'public.dao_t';
+
+-- dbblue_audit_require_write = on (the default): the change is refused, and
+-- no audit log is created in the foreign schema.
+\set VERBOSITY default
+INSERT INTO dao_t VALUES (1, 10);
+\set VERBOSITY terse
+SELECT to_regclass('dbblue.dbblue_audit_log') IS NULL AS no_log_table;
+
+-- dbblue_audit_require_write = off: the change goes through, unaudited, with a
+-- warning naming the reason.
+SET dbblue_audit_require_write = off;
+INSERT INTO dao_t VALUES (2, 20);
+RESET dbblue_audit_require_write;
+SELECT count(*) AS rows_in_dao_t FROM dao_t;
+
+-- Once the bootstrap superuser owns the schema, the same session resumes
+-- auditing (it must not stay disabled after the earlier failure).
+DO $$
+BEGIN
+  EXECUTE format('ALTER SCHEMA dbblue OWNER TO %I',
+                 (SELECT rolname FROM pg_authid WHERE oid = 10));
+END $$;
+INSERT INTO dao_t VALUES (3, 30);
+SELECT count(*) AS audit_rows FROM dbblue.dbblue_audit_log;
+SELECT pg_get_userbyid(relowner) = (SELECT rolname FROM pg_authid WHERE oid = 10)
+         AS log_owned_by_bootstrap
+  FROM pg_class WHERE oid = 'dbblue.dbblue_audit_log'::regclass;
+
+-- The log table itself handed to another role is refused too, by a new
+-- session's fast path as well as its full check.
+ALTER TABLE dbblue.dbblue_audit_log OWNER TO regress_dao_owner;
+\c -
+SET client_min_messages = warning;
+SET dbblue_audit_operations = 'all';
+SET dbblue_audit_tables = 'public.dao_t';
+\set VERBOSITY default
+INSERT INTO dao_t VALUES (4, 40);
+\set VERBOSITY terse
+SELECT count(*) AS rows_in_dao_t FROM dao_t;
+
+-- cleanup
+RESET dbblue_audit_tables;
+RESET dbblue_audit_operations;
+DROP SCHEMA dbblue CASCADE;
+DROP TABLE dao_t;
+DROP ROLE regress_dao_owner;
