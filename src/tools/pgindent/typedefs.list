@@ -2054,6 +2054,8 @@ PLyResultObject
 PLySRFState
 PLySavedArgs
 PLyScalarToOb
+PLyStaticsEntry
+PLyStaticsKey
 PLySubtransactionData
 PLySubtransactionObject
 PLyTransformToOb
