@@ -1370,6 +1370,93 @@ record_backup_history(const char *dbname, TimestampTz started_at,
 }
 
 /*
+ * path_has_parent_component
+ *		True if any '/'-separated component of path is exactly "..".
+ */
+static bool
+path_has_parent_component(const char *path)
+{
+	const char *p = path;
+
+	for (;;)
+	{
+		const char *end = strchr(p, '/');
+		size_t		len = end ? (size_t) (end - p) : strlen(p);
+
+		if (len == 2 && p[0] == '.' && p[1] == '.')
+			return true;
+		if (end == NULL)
+			return false;
+		p = end + 1;
+	}
+}
+
+/*
+ * get_prunable_backup_path
+ *		Decide whether file_path, read from a history row, names a dump this
+ *		launcher could itself have written for dbname, i.e. a file
+ *		<dbblue_backup_directory>/<dbname>/<dbname>_<suffix>.dump with no
+ *		further '/' in <suffix>.  If so, copy its canonical form into
+ *		result (MAXPGPATH bytes) and return true.
+ *
+ *		The history table is read-only to PUBLIC, but members of
+ *		pg_write_all_data bypass that ACL and can rewrite file_path, and
+ *		retention unlinks as the server's OS user.  Without this check any
+ *		such role could have the server delete any file it can reach --
+ *		pg_control, WAL, relation files, TDE keys.  A ".." component is
+ *		refused outright rather than collapsed: canonicalize_path() resolves
+ *		it lexically, which disagrees with the kernel when an earlier
+ *		component is a symlink.
+ */
+static bool
+get_prunable_backup_path(const char *dbname, const char *file_path,
+						 char *result)
+{
+	char		dbdir[MAXPGPATH];
+	size_t		dirlen;
+	size_t		namelen;
+	const char *rest;
+	const char *suffix;
+	size_t		suffixlen;
+
+	if (dbblue_backup_directory == NULL || dbblue_backup_directory[0] == '\0')
+		return false;
+
+	if (path_has_parent_component(file_path) ||
+		path_has_parent_component(dbblue_backup_directory) ||
+		path_has_parent_component(dbname))
+		return false;
+
+	if (snprintf(dbdir, MAXPGPATH, "%s/%s",
+				 dbblue_backup_directory, dbname) >= MAXPGPATH ||
+		strlcpy(result, file_path, MAXPGPATH) >= MAXPGPATH)
+		return false;
+
+	canonicalize_path(dbdir);
+	canonicalize_path(result);
+
+	/* Directly inside <backup directory>/<dbname>/ ... */
+	dirlen = strlen(dbdir);
+	if (strncmp(result, dbdir, dirlen) != 0 || result[dirlen] != '/')
+		return false;
+
+	/* ... named <dbname>_<suffix>.dump, as backup_one_database() names it. */
+	rest = result + dirlen + 1;
+	namelen = strlen(dbname);
+	if (strncmp(rest, dbname, namelen) != 0 || rest[namelen] != '_')
+		return false;
+
+	suffix = rest + namelen + 1;
+	suffixlen = strlen(suffix);
+	if (strchr(suffix, '/') != NULL ||
+		suffixlen <= strlen(".dump") ||
+		strcmp(suffix + suffixlen - strlen(".dump"), ".dump") != 0)
+		return false;
+
+	return true;
+}
+
+/*
  * enforce_retention
  *		Delete backups of dbname with the given status beyond
  *		dbblue_backup_retention_count, both the dump file (if any) and the
@@ -1443,11 +1530,29 @@ enforce_retention(const char *dbname, const char *status)
 			file_path_datum = SPI_getbinval(tuple, tupdesc, 2, &isnull);
 			file_path = isnull ? NULL : TextDatumGetCString(file_path_datum);
 
-			if (file_path != NULL && unlink(file_path) != 0 && errno != ENOENT)
-				ereport(WARNING,
-						(errcode_for_file_access(),
-						 errmsg("dbblue backup launcher: could not remove old backup \"%s\": %m",
-								file_path)));
+			if (file_path != NULL)
+			{
+				char		safe_path[MAXPGPATH];
+
+				/*
+				 * Only remove a file this launcher could have written.  The
+				 * row is pruned either way, so a refused path is reported
+				 * once rather than on every cycle.
+				 */
+				if (!get_prunable_backup_path(dbname, file_path, safe_path))
+					ereport(WARNING,
+							(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+							 errmsg("dbblue backup launcher: not removing \"%s\" named in backup history row %lld, which is not a backup file of database \"%s\"",
+									file_path, (long long) DatumGetInt64(id),
+									dbname),
+							 errdetail("Retention removes only files named \"%s/%s/%s_*.dump\". The row has been deleted; the file was left in place.",
+									   dbblue_backup_directory, dbname, dbname)));
+				else if (unlink(safe_path) != 0 && errno != ENOENT)
+					ereport(WARNING,
+							(errcode_for_file_access(),
+							 errmsg("dbblue backup launcher: could not remove old backup \"%s\": %m",
+									safe_path)));
+			}
 
 			ids_to_delete[n_to_delete++] = id;
 		}
