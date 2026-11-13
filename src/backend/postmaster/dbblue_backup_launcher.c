@@ -66,6 +66,7 @@
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
+#include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
@@ -165,11 +166,45 @@ static char *socket_dir = NULL;	/* NULL means "let libpq pick the default" */
  */
 static char *backup_role = NULL;
 
+/*
+ * Retry state of a database whose backups are failing.
+ *
+ * The cooldown (dbblue_backup_interval) runs from the last *successful*
+ * backup, so on its own a database whose backups keep failing would be
+ * retried every cycle -- for a dump that always runs into
+ * dbblue_backup_timeout, an hour-long pg_dump every naptime, around the clock,
+ * holding its snapshot (blocking VACUUM) and its table locks (blocking DDL),
+ * and delaying every database after it in the list; for a full disk, filling
+ * it again every naptime.  So after the N-th failure in a row, the next
+ * attempt waits dbblue_backup_naptime * 2^(N-1), capped at
+ * dbblue_backup_interval: a passing problem is still retried soon, a lasting
+ * one costs about one attempt per interval.
+ *
+ * Kept in worker memory, not derived from dbblue_backup_history: retention
+ * keeps as few as one "failed" row per database, which cannot count
+ * failures.  A success or a restart clears it.  A configuration reload ends
+ * the current wait -- reloading being what an administrator does after
+ * fixing the cause (e.g. pg_hba.conf), so the fix is tried at the next cycle,
+ * not up to an interval later -- but keeps the count, so that should that
+ * attempt fail too, the waits go on growing rather than start over.
+ */
+typedef struct BackupRetryState
+{
+	char		dbname[NAMEDATALEN];	/* hash key */
+	int			failures;		/* consecutive failed attempts */
+	TimestampTz last_failure_at;	/* when the latest one ended */
+} BackupRetryState;
+
+static HTAB *retry_state = NULL;	/* in TopMemoryContext */
+
 static bool ensure_schema(void);
 static bool resolve_environment(void);
 static List *parse_configured_databases(void);
 static List *load_backup_candidates(List *specs);
 static void run_backup_cycle(void);
+static void reload_configuration(void);
+static int64 retry_delay_secs(int failures);
+static void note_backup_result(const char *dbname, bool ok);
 static bool backup_one_database(const char *dbname);
 static void record_backup_history(const char *dbname, TimestampTz started_at,
 								  const char *status, const char *file_path,
@@ -401,10 +436,7 @@ BackupLauncherMain(Datum main_arg)
 			break;
 
 		if (ConfigReloadPending)
-		{
-			ConfigReloadPending = false;
-			ProcessConfigFile(PGC_SIGHUP);
-		}
+			reload_configuration();
 
 		if (dbblue_backup_enabled && !RecoveryInProgress())
 		{
@@ -1011,8 +1043,7 @@ run_backup_cycle(void)
 
 		if (ConfigReloadPending)
 		{
-			ConfigReloadPending = false;
-			ProcessConfigFile(PGC_SIGHUP);
+			reload_configuration();
 
 			/*
 			 * If the feature was just switched off, stop rather than start
@@ -1047,13 +1078,133 @@ run_backup_cycle(void)
 			(int64) dbblue_backup_interval * USECS_PER_SEC)
 			continue;
 
-		(void) backup_one_database(cand->dbname);
+		/* Failing lately?  Then wait out its retry delay (see BackupRetryState). */
+		if (retry_state != NULL)
+		{
+			BackupRetryState *rs = hash_search(retry_state, cand->dbname,
+											   HASH_FIND, NULL);
+
+			if (rs != NULL &&
+				now < rs->last_failure_at +
+				retry_delay_secs(rs->failures) * USECS_PER_SEC)
+			{
+				ereport(DEBUG1,
+						(errmsg_internal("dbblue backup launcher: database \"%s\" is waiting out its retry delay after %d failed attempts",
+										 cand->dbname, rs->failures)));
+				continue;
+			}
+		}
+
+		note_backup_result(cand->dbname, backup_one_database(cand->dbname));
 	}
 
 	/* Free this cycle's specs/candidates before the next one. */
 	MemoryContextSwitchTo(TopMemoryContext);
 	MemoryContextReset(launcher_cxt);
 	MemoryContextSwitchTo(launcher_cxt);
+}
+
+/*
+ * reload_configuration
+ *		Process a pending SIGHUP, and end every failing database's current
+ *		retry wait so that it is tried again at the next cycle (see
+ *		BackupRetryState).  The failure counts are kept.
+ */
+static void
+reload_configuration(void)
+{
+	ConfigReloadPending = false;
+	ProcessConfigFile(PGC_SIGHUP);
+
+	if (retry_state != NULL)
+	{
+		HASH_SEQ_STATUS status;
+		BackupRetryState *rs;
+		long		n = 0;
+
+		hash_seq_init(&status, retry_state);
+		while ((rs = hash_seq_search(&status)) != NULL)
+		{
+			rs->last_failure_at = 0;
+			n++;
+		}
+
+		if (n > 0)
+			ereport(LOG,
+					(errmsg_plural("dbblue backup launcher: configuration reloaded, retrying %ld failing database at the next cycle",
+								   "dbblue backup launcher: configuration reloaded, retrying %ld failing databases at the next cycle",
+								   n, n)));
+	}
+}
+
+/*
+ * retry_delay_secs
+ *		Seconds to wait after the failures-th consecutive failed backup of a
+ *		database: dbblue_backup_naptime doubled per failure after the first,
+ *		capped at dbblue_backup_interval.
+ */
+static int64
+retry_delay_secs(int failures)
+{
+	int64		delay;
+
+	/* naptime <= INT_MAX / 1000, so a shift of up to 30 cannot overflow */
+	delay = (int64) dbblue_backup_naptime << Min(Max(failures - 1, 0), 30);
+
+	return Min(delay, (int64) dbblue_backup_interval);
+}
+
+/*
+ * note_backup_result
+ *		Update dbname's retry state after a backup attempt.
+ */
+static void
+note_backup_result(const char *dbname, bool ok)
+{
+	BackupRetryState *rs;
+	bool		found;
+
+	if (ok)
+	{
+		if (retry_state == NULL)
+			return;
+
+		rs = hash_search(retry_state, dbname, HASH_FIND, NULL);
+		if (rs == NULL)
+			return;
+
+		ereport(LOG,
+				(errmsg_plural("dbblue backup launcher: backed up database \"%s\" after %d failed attempt",
+							   "dbblue backup launcher: backed up database \"%s\" after %d failed attempts",
+							   rs->failures, dbname, rs->failures)));
+		(void) hash_search(retry_state, dbname, HASH_REMOVE, NULL);
+		return;
+	}
+
+	if (retry_state == NULL)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = NAMEDATALEN;
+		ctl.entrysize = sizeof(BackupRetryState);
+		ctl.hcxt = TopMemoryContext;
+		retry_state = hash_create("dbblue backup retry state", 16, &ctl,
+								  HASH_ELEM | HASH_STRINGS | HASH_CONTEXT);
+	}
+
+	rs = hash_search(retry_state, dbname, HASH_ENTER, &found);
+	if (!found)
+		rs->failures = 0;
+	if (rs->failures < INT_MAX)
+		rs->failures++;
+	rs->last_failure_at = GetCurrentTimestamp();
+
+	ereport(LOG,
+			(errmsg_plural("dbblue backup launcher: backup of database \"%s\" has failed %d time in a row, next attempt in %lld s",
+						   "dbblue backup launcher: backup of database \"%s\" has failed %d times in a row, next attempt in %lld s",
+						   rs->failures, dbname, rs->failures,
+						   (long long) retry_delay_secs(rs->failures)),
+			 errhint("Once the cause is fixed, a configuration reload (SELECT pg_reload_conf()) retries it at the next cycle.")));
 }
 
 /*

@@ -11,6 +11,7 @@ tests += {
       't/003_retention_path_check.pl',
       't/004_database_names.pl',
       't/005_partial_dump_cleanup.pl',
+      't/006_failure_backoff.pl',
     ],
   },
 }

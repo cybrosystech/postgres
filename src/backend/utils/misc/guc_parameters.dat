@@ -863,7 +863,7 @@
 
 { name => 'dbblue_backup_interval', type => 'int', context => 'PGC_SIGHUP', group => 'WAL_ARCHIVING',
   short_desc => 'Minimum time between two successful backups of the same database.',
-  long_desc => 'A cooldown, tracked per database in dbblue_backup_history, that prevents the launcher from backing up the same database again too soon after a successful run.',
+  long_desc => 'A cooldown, tracked per database in dbblue_backup_history, that prevents the launcher from backing up the same database again too soon after a successful run. A failed backup is retried after dbblue_backup_naptime, and after each further failure in a row the wait doubles, up to this interval. A configuration reload ends the current wait, so that the database is tried again at the next wake-up; a successful backup or a server restart starts the doubling over.',
   flags => 'GUC_UNIT_S | GUC_NOT_IN_SAMPLE',
   variable => 'dbblue_backup_interval',
   boot_val => '86400',
