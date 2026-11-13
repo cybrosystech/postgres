@@ -837,7 +837,7 @@
 
 { name => 'dbblue_backup_databases', type => 'string', context => 'PGC_SIGHUP', group => 'WAL_ARCHIVING',
   short_desc => 'Comma-separated list of database names the dbblue backup launcher will back up.',
-  long_desc => 'A fixed, manually curated list, not an automatic cluster-wide scan: nothing is backed up unless its name appears here. Each entry must be an unquoted, plain database name.',
+  long_desc => 'A fixed, manually curated list, not an automatic cluster-wide scan: nothing is backed up unless its name appears here. Names are case-sensitive and matched exactly as written; double quotes are needed only around a name containing a comma or whitespace. A database named "." or "..", or whose name contains "/", cannot be listed.',
   flags => 'GUC_LIST_INPUT | GUC_NOT_IN_SAMPLE',
   variable => 'dbblue_backup_databases',
   boot_val => '""',

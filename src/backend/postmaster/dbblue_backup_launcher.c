@@ -223,11 +223,21 @@ dbblue_check_backup_enabled(bool *newval, void **extra, GucSource source)
  * dbblue_check_backup_databases
  *		GUC check hook for dbblue_backup_databases.
  *
- * Syntax only: each comma-separated item must be a single unquoted plain
- * database name.  Resolution against pg_database is deliberately deferred
- * to each cycle (parse_configured_databases/load_backup_candidates), since
- * a database can be created, dropped, or renamed between GUC-set-time and
- * backup-time.
+ * Syntax only: a comma-separated list of database names, matched
+ * case-sensitively and exactly as written; double quotes are needed only
+ * around a name containing a comma or whitespace.  Resolution against
+ * pg_database is deliberately deferred to each cycle
+ * (parse_configured_databases/load_backup_candidates), since a database can
+ * be created, dropped, or renamed between GUC-set-time and backup-time.
+ *
+ * Names are split with SplitGUCList(), not SplitIdentifierString(): the
+ * latter downcases unquoted names, so a database created as "MyCompany" (as
+ * Odoo does) would be looked up as "mycompany" and never be found.
+ *
+ * Each name becomes a path component of the backup directory and file
+ * (<dbblue_backup_directory>/<name>/<name>_<time>.dump), so the names that
+ * cannot be one -- empty, ".", "..", or containing '/' -- are refused.  Any
+ * other character, '.' included (Odoo allows it), is safe there.
  */
 bool
 dbblue_check_backup_databases(char **newval, void **extra, GucSource source)
@@ -242,7 +252,7 @@ dbblue_check_backup_databases(char **newval, void **extra, GucSource source)
 
 	rawstring = pstrdup(*newval);
 
-	if (!SplitIdentifierString(rawstring, ',', &elemlist))
+	if (!SplitGUCList(rawstring, ',', &elemlist))
 	{
 		GUC_check_errdetail("List syntax is invalid.");
 		pfree(rawstring);
@@ -254,9 +264,14 @@ dbblue_check_backup_databases(char **newval, void **extra, GucSource source)
 	{
 		char	   *item = (char *) lfirst(lc);
 
-		if (item[0] == '\0' || strchr(item, '.') != NULL)
+		if (item[0] == '\0' ||
+			strcmp(item, ".") == 0 ||
+			strcmp(item, "..") == 0 ||
+			strchr(item, '/') != NULL)
 		{
-			GUC_check_errdetail("\"%s\" is not a valid database name.", item);
+			GUC_check_errdetail("\"%s\" cannot be backed up, as its name cannot be used as a backup directory name.",
+								item);
+			GUC_check_errhint("A database named \".\" or \"..\", or whose name contains \"/\", cannot be listed.");
 			ok = false;
 			break;
 		}
@@ -785,8 +800,9 @@ ensure_schema(void)
 
 /*
  * parse_configured_databases
- *		Split dbblue_backup_databases into database names.  The returned
- *		list and its entries live in launcher_cxt.
+ *		Split dbblue_backup_databases into database names, the same way
+ *		dbblue_check_backup_databases() does (case kept as written).  The
+ *		returned list and its entries live in launcher_cxt.
  */
 static List *
 parse_configured_databases(void)
@@ -800,7 +816,7 @@ parse_configured_databases(void)
 		return NIL;
 
 	rawstring = pstrdup(dbblue_backup_databases);
-	if (!SplitIdentifierString(rawstring, ',', &elemlist))
+	if (!SplitGUCList(rawstring, ',', &elemlist))
 	{
 		pfree(rawstring);
 		list_free(elemlist);
