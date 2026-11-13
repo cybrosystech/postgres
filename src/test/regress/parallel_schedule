@@ -159,6 +159,12 @@ test: dbblue_audit_privesc
 # objects plus a dropped dbblue schema; run alone.
 test: dbblue_audit_grants
 
+# DBblue: a dbblue schema or audit log table not owned by the bootstrap
+# superuser (created first by another role, or handed to one) is refused.
+# Self-contained, dao_/regress_dao_ objects plus a dropped dbblue schema; run
+# alone.
+test: dbblue_audit_owner
+
 # DBblue: a cross-partition UPDATE (row movement) is recorded as a single
 # UPDATE with both images, not as a bare INSERT.  Self-contained, dac_ objects
 # plus a dropped dbblue schema; run alone.
