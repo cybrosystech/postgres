@@ -368,8 +368,9 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
       (<literal>lz4</literal> is available only if
       <option>--with-lz4</option> was used when building
       <productname>PostgreSQL</productname>.  <literal>zstd</literal>
-      requires either <option>--with-zstd</option> or a loaded module
-      supplying zstd support, and is rejected when
+      requires either <option>--with-zstd</option> or a module
+      supplying zstd support loaded through
+      <xref linkend="guc-shared-preload-libraries"/>, and is rejected when
       <xref linkend="guc-dbblue-allow-zstd"/> is off.)  In addition,
       <replaceable class="parameter">compression_method</replaceable>
       can be <literal>default</literal> to explicitly specify the default

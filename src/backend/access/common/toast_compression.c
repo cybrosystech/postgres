@@ -52,12 +52,21 @@ zstd_decompress_datum_hook_type zstd_decompress_datum_hook = NULL;
 			 errmsg("compression method %s not supported", method), \
 			 errdetail("This functionality requires the server to be built with %s support.", method)))
 
+/*
+ * Only shared_preload_libraries reaches every process.  Autovacuum workers,
+ * logical replication workers and other background workers never process
+ * session_preload_libraries, so a module loaded that way leaves them unable
+ * to read or write zstd values.
+ */
+#define ZSTD_COMPAT_HINT \
+	"Add zstd_toast_compat to shared_preload_libraries and restart the server, or rebuild the server with --with-zstd."
+
 #define NO_ZSTD_SUPPORT() \
 	ereport(ERROR, \
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED), \
 			 errmsg("compression method zstd is not available"), \
 			 errdetail("This server was not built with --with-zstd, and no module supplying zstd support is loaded."), \
-			 errhint("Load the zstd_toast_compat module (for example via session_preload_libraries), or rebuild the server with --with-zstd.")))
+			 errhint(ZSTD_COMPAT_HINT)))
 
 #define ZSTD_DISABLED() \
 	ereport(ERROR, \
@@ -111,11 +120,12 @@ toast_resolve_compression(Relation rel, char cmethod)
  * rather than letting the setting be accepted and then failing on the first
  * INSERT large enough to be toasted.
  *
- * Startup is exempt: libraries named in session_preload_libraries (and
- * friends) are loaded only once GUC processing is complete, so a value
- * arriving from postgresql.conf, a per-database/per-user setting, or the
- * connection request may well become valid moments later.  Rejecting it here
- * would break that ordering, so those sources are accepted and the check in
+ * Startup is exempt: libraries named in shared_preload_libraries are loaded
+ * only once GUC processing is complete, so a value arriving from
+ * postgresql.conf may well become valid moments later.  Rejecting it here
+ * would break that ordering, so those sources are accepted;
+ * toast_compression_check_preload() warns once the preload libraries have
+ * been loaded if the value is still unusable, and the check in
  * zstd_compress_datum() remains the backstop.  What we do catch is the
  * interactive cases -- SET, and ALTER SYSTEM SET run from a live backend --
  * where the module, if it were coming at all, would already be loaded.
@@ -149,11 +159,41 @@ check_default_toast_compression(int *newval, void **extra, GucSource source)
 		GUC_check_errcode(ERRCODE_FEATURE_NOT_SUPPORTED);
 		GUC_check_errmsg("compression method zstd is not available");
 		GUC_check_errdetail("This server was not built with --with-zstd, and no module supplying zstd support is loaded.");
-		GUC_check_errhint("Load the zstd_toast_compat module (for example via session_preload_libraries), or rebuild the server with --with-zstd.");
+		GUC_check_errhint(ZSTD_COMPAT_HINT);
 		return false;
 	}
 
 	return true;
+}
+
+/*
+ * Called by the postmaster right after shared_preload_libraries has been
+ * processed.
+ *
+ * check_default_toast_compression() has to accept zstd from postgresql.conf
+ * at startup, because the module that supplies it is loaded afterwards.
+ * Now that every preload library has had its chance to install the hooks,
+ * warn if zstd is the default and still nothing can compress with it: every
+ * process forked from here inherits that state, so every write of a large
+ * value to a column using the default would fail.
+ *
+ * Catalog contents (columns explicitly marked COMPRESSION zstd) cannot be
+ * checked here, since the postmaster has no database access; the module
+ * itself warns when it is loaded outside shared_preload_libraries.
+ */
+void
+toast_compression_check_preload(void)
+{
+#ifndef USE_ZSTD
+	if (default_toast_compression == TOAST_ZSTD_COMPRESSION &&
+		dbblue_allow_zstd &&
+		zstd_compress_datum_hook == NULL)
+		ereport(WARNING,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("\"default_toast_compression\" is set to zstd, but no module supplying zstd support is loaded"),
+				 errdetail("This server was not built with --with-zstd.  Every write of a large value to a column using the default compression method will fail."),
+				 errhint(ZSTD_COMPAT_HINT)));
+#endif
 }
 
 /*

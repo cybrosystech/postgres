@@ -12,7 +12,15 @@ RETURNS text
 AS 'MODULE_PATHNAME'
 LANGUAGE C STRICT;
 
--- Force the shared library to load now, in this session, so a DBA running
--- CREATE EXTENSION to unblock a specific case sees it take effect
--- immediately rather than only on the next new connection.
+-- Force the shared library to load now, so a DBA running CREATE EXTENSION
+-- to unblock a specific case sees it take effect immediately in this
+-- session.
+--
+-- This only affects the current session.  For zstd support in every
+-- process, add zstd_toast_compat to shared_preload_libraries and restart
+-- the server.  That is the only setting that reaches background processes:
+-- autovacuum and logical replication workers never load
+-- session_preload_libraries, so autoanalyze and subscriptions fail on zstd
+-- values if the module is loaded any other way.  The library warns when it
+-- is loaded outside shared_preload_libraries.
 SELECT zstd_toast_compat_enable();

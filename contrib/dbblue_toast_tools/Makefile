@@ -6,7 +6,7 @@ OBJS = \
 	dbblue_toast_tools.o
 
 EXTENSION = dbblue_toast_tools
-DATA = dbblue_toast_tools--1.0.sql
+DATA = dbblue_toast_tools--1.0.sql dbblue_toast_tools--1.0--1.1.sql
 PGFILEDESC = "dbblue_toast_tools - audit and normalize TOAST compression"
 
 ifdef USE_PGXS

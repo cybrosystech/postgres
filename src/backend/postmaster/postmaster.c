@@ -89,6 +89,7 @@
 #include <pthread.h>
 #endif
 
+#include "access/toast_compression.h"
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
 #include "access/xlogrecovery.h"
@@ -942,6 +943,12 @@ PostmasterMain(int argc, char *argv[])
 	 * process any libraries that should be preloaded at postmaster start
 	 */
 	process_shared_preload_libraries();
+
+	/*
+	 * Now that preload libraries could have installed zstd TOAST hooks, warn
+	 * if default_toast_compression names a method nothing can provide.
+	 */
+	toast_compression_check_preload();
 
 	/*
 	 * Initialize SSL library, if specified.

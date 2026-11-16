@@ -113,6 +113,7 @@ extern PGDLLIMPORT zstd_decompress_datum_hook_type zstd_decompress_datum_hook;
 /* other stuff */
 struct RelationData;
 extern char toast_resolve_compression(struct RelationData *rel, char cmethod);
+extern void toast_compression_check_preload(void);
 extern ToastCompressionId toast_get_compression_id(varlena *attr);
 extern char CompressionNameToMethod(const char *compression);
 extern const char *GetCompressionMethodName(char method);

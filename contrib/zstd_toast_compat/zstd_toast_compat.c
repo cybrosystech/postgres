@@ -24,10 +24,15 @@
  * path is used and these hooks are simply never consulted).
  *
  * The hooks are per-process function pointers, not catalog state, so they
- * only take effect in backends that actually load this library.  Add it to
- * shared_preload_libraries or session_preload_libraries so that every new
- * connection picks it up automatically; CREATE EXTENSION alone only loads
- * it into the session that runs the install script.
+ * only take effect in processes that actually load this library.  Add it to
+ * shared_preload_libraries: that is the only setting that reaches every
+ * process, because each one is forked from the postmaster after the library
+ * is loaded.  session_preload_libraries is not enough -- autovacuum workers,
+ * logical replication workers and other background workers never process
+ * it, so autoanalyze and subscriptions fail on zstd values.  CREATE
+ * EXTENSION alone only loads the library into the session that runs the
+ * install script.  _PG_init() warns when the library is loaded any way
+ * other than through shared_preload_libraries.
  *
  * IDENTIFICATION
  *	  contrib/zstd_toast_compat/zstd_toast_compat.c
@@ -38,8 +43,10 @@
 
 #include <zstd.h>
 
+#include "access/parallel.h"
 #include "access/toast_compression.h"
 #include "fmgr.h"
+#include "miscadmin.h"
 #include "utils/builtins.h"
 #include "varatt.h"
 
@@ -56,6 +63,11 @@ PG_MODULE_MAGIC_EXT(
  */
 #define ZSTD_TOAST_COMPRESS_LEVEL	3
 
+#ifndef USE_ZSTD
+/* true when _PG_init ran while processing shared_preload_libraries */
+static bool loaded_via_shared_preload = false;
+#endif
+
 static varlena *zstd_compat_compress_datum(const varlena *value);
 static varlena *zstd_compat_decompress_datum(const varlena *value);
 
@@ -71,6 +83,22 @@ _PG_init(void)
 #else
 	zstd_compress_datum_hook = zstd_compat_compress_datum;
 	zstd_decompress_datum_hook = zstd_compat_decompress_datum;
+
+	loaded_via_shared_preload = process_shared_preload_libraries_in_progress;
+
+	/*
+	 * Loaded by session_preload_libraries, LOAD, CREATE EXTENSION or a
+	 * function call: only this process gets the hooks.  Say so, since the
+	 * failures this causes show up later, in other processes (autovacuum,
+	 * logical replication workers, other sessions).  Parallel workers
+	 * reload whatever their leader had loaded, so the leader has already
+	 * been warned.
+	 */
+	if (!loaded_via_shared_preload && !IsParallelWorker())
+		ereport(WARNING,
+				(errmsg("zstd_toast_compat is not loaded via \"shared_preload_libraries\""),
+				 errdetail("zstd support is active only in this session.  Other sessions, autovacuum workers and logical replication workers cannot read or write zstd-compressed values."),
+				 errhint("Add zstd_toast_compat to \"shared_preload_libraries\" and restart the server.")));
 #endif
 }
 
@@ -173,9 +201,16 @@ zstd_toast_compat_status(PG_FUNCTION_ARGS)
 #else
 	if (zstd_compress_datum_hook == zstd_compat_compress_datum &&
 		zstd_decompress_datum_hook == zstd_compat_decompress_datum)
-		PG_RETURN_TEXT_P(cstring_to_text("active in this session (read/write)"));
+	{
+		if (loaded_via_shared_preload)
+			PG_RETURN_TEXT_P(cstring_to_text("active in all processes (read/write, loaded via shared_preload_libraries)"));
+		else
+			PG_RETURN_TEXT_P(cstring_to_text("active in this session only -- add zstd_toast_compat to "
+											 "shared_preload_libraries and restart, otherwise other sessions, "
+											 "autovacuum and logical replication workers cannot read or write zstd values"));
+	}
 	else
 		PG_RETURN_TEXT_P(cstring_to_text("NOT active in this session -- add zstd_toast_compat to "
-										 "shared_preload_libraries or session_preload_libraries"));
+										 "shared_preload_libraries and restart"));
 #endif
 }

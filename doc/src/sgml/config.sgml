@@ -10514,10 +10514,19 @@ COPY postgres_log FROM '/full/path/to/logfile.csv' WITH csv;
 
        <para>
         <literal>zstd</literal> requires either a server compiled with
-        <option>--with-zstd</option> or a loaded module that supplies zstd
+        <option>--with-zstd</option> or a module that supplies zstd
         support, such as
-        <filename>contrib/zstd_toast_compat</filename>; otherwise setting
-        this parameter to <literal>zstd</literal> is rejected.  It is also
+        <filename>contrib/zstd_toast_compat</filename>, loaded through
+        <xref linkend="guc-shared-preload-libraries"/>; otherwise setting
+        this parameter to <literal>zstd</literal> is rejected, and if it is
+        set in <filename>postgresql.conf</filename> a warning is logged at
+        server start.  Load the module through
+        <varname>shared_preload_libraries</varname> only:
+        autovacuum workers, logical replication workers and other background
+        workers never load <xref linkend="guc-session-preload-libraries"/>,
+        so with any other method they cannot read or write
+        <literal>zstd</literal> values, and automatic analyze and
+        subscriptions fail on such tables.  It is also
         rejected outright when <xref linkend="guc-dbblue-allow-zstd"/> is
         off.  Note that data compressed with <literal>zstd</literal> cannot
         be read by a server that lacks zstd support, which matters when a
