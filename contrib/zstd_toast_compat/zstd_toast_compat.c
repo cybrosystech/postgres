@@ -172,6 +172,12 @@ zstd_compat_decompress_datum(const varlena *value)
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg_internal("compressed zstd data is corrupt: %s",
 								 ZSTD_getErrorName(decompressed))));
+	if (decompressed != (size_t) rawsize)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg_internal("compressed zstd data is corrupt"),
+				 errdetail_internal("Decompressed %zu bytes, expected %d.",
+									decompressed, rawsize)));
 
 	SET_VARSIZE(result, rawsize + VARHDRSZ);
 

@@ -253,7 +253,9 @@ CREATE TYPE dbblue_toast_candidate AS (
 -- Rewrite every zstd value to another compression method.
 --
 -- Order of work:
---   1. tables (as in 1.0);
+--   1. tables: ALTER COLUMN TYPE, or UPDATE where ALTER COLUMN TYPE is
+--      refused (dependent views, policies, triggers, generated columns,
+--      partition keys, inherited columns, typed tables);
 --   2. materialized views, each only once every relation it reads from is
 --      clean -- REFRESH copies compressed values verbatim, so refreshing
 --      earlier would just copy the zstd data again;
@@ -262,12 +264,23 @@ CREATE TYPE dbblue_toast_candidate AS (
 --      the indexes on the columns it rewrites.  A dry run lists indexes as
 --      they are now, so it may list some that step 1 would rebuild anyway.
 --
+-- Each statement runs in its own subtransaction: a relation that fails is
+-- reported with method 'failed: <error>' and a WARNING, matviews reading it
+-- are skipped, and everything else is still normalized.  All of it still
+-- commits together at the end, so locks are held until the call returns.
+--
 CREATE OR REPLACE FUNCTION dbblue_toast_normalize(target text DEFAULT 'pglz',
                                                   dry_run boolean DEFAULT true,
                                                   relation regclass DEFAULT NULL)
 RETURNS TABLE (schemaname text, tablename text, columnname text,
                method text, command text)
 LANGUAGE plpgsql
+/*
+ * With row security on, an UPDATE on a table whose policies apply to us
+ * would silently skip the rows we cannot see and leave them zstd.  Off, it
+ * fails instead, and that failure is reported for that table.
+ */
+SET row_security = off
 AS $$
 DECLARE
     cands      dbblue_toast_candidate[];
@@ -287,6 +300,14 @@ DECLARE
     mvname     text;
     populated  boolean;
     has_dep    boolean;
+    inherited  boolean;
+    generated  boolean;
+    src_col    text;
+    gen_expr   text;
+    tgt_kind   "char";
+    upd_stmt   text;
+    errmsg     text;
+    failed     oid[] := '{}';
     ix         record;
 BEGIN
     IF target NOT IN ('pglz', 'lz4') THEN
@@ -314,21 +335,30 @@ BEGIN
      * every partition under it.  Hence the DISTINCT: without it a tree with
      * N partitions would be rewritten N times.
      */
+    /*
+     * Within a table, generated columns go last: rewriting the columns they
+     * are computed from recomputes them, which usually leaves nothing to do.
+     */
     cands := ARRAY(
-        SELECT DISTINCT ON (s.tgt, s.columnname)
-               ROW(s.tgt, s.columnname, s.coltype, s.relkind, s.attcompression,
-                   n.nspname::text, r.relname::text)::dbblue_toast_candidate
-          FROM (SELECT c.columnname, c.coltype, c.attcompression, c.relkind,
-                       CASE WHEN c.relispartition
-                            THEN pg_catalog.pg_partition_root(c.reloid)::oid
-                            ELSE c.reloid END AS tgt
-                  FROM dbblue_toastable_columns c
-                 WHERE (c.schemaname, c.tablename, c.columnname) IN
-                       (SELECT k.schemaname, k.tablename, k.columnname
-                          FROM dbblue_toast_check(relation) k)) s
-          JOIN pg_catalog.pg_class r ON r.oid = s.tgt
-          JOIN pg_catalog.pg_namespace n ON n.oid = r.relnamespace
-         ORDER BY s.tgt, s.columnname);
+        SELECT d.cand
+          FROM (SELECT DISTINCT ON (s.tgt, s.columnname)
+                       s.tgt, s.columnname,
+                       ROW(s.tgt, s.columnname, s.coltype, s.relkind, s.attcompression,
+                           n.nspname::text, r.relname::text)::dbblue_toast_candidate AS cand
+                  FROM (SELECT c.columnname, c.coltype, c.attcompression, c.relkind,
+                               CASE WHEN c.relispartition
+                                    THEN pg_catalog.pg_partition_root(c.reloid)::oid
+                                    ELSE c.reloid END AS tgt
+                          FROM dbblue_toastable_columns c
+                         WHERE (c.schemaname, c.tablename, c.columnname) IN
+                               (SELECT k.schemaname, k.tablename, k.columnname
+                                  FROM dbblue_toast_check(relation) k)) s
+                  JOIN pg_catalog.pg_class r ON r.oid = s.tgt
+                  JOIN pg_catalog.pg_namespace n ON n.oid = r.relnamespace
+                 ORDER BY s.tgt, s.columnname) d
+          LEFT JOIN pg_catalog.pg_attribute a
+                 ON a.attrelid = d.tgt AND a.attname = d.columnname
+         ORDER BY d.tgt, coalesce(a.attgenerated, '') <> '', d.columnname);
 
     table_tgts := ARRAY(SELECT DISTINCT u.tgt FROM unnest(cands) u WHERE u.relkind <> 'm');
     pending    := ARRAY(SELECT DISTINCT u.tgt FROM unnest(cands) u WHERE u.relkind = 'm');
@@ -339,54 +369,176 @@ BEGIN
         CONTINUE WHEN cand.relkind = 'm';
 
         /*
-         * ALTER COLUMN TYPE is refused outright when a view, matview or rule
-         * depends on the column.  Those tables fall back to an UPDATE, which
-         * has no such restriction and takes a weaker lock -- at the cost of
-         * dead tuples to vacuum afterwards, and of firing row triggers, which
-         * is why it is not the default and is reported in "method".
+         * ALTER COLUMN TYPE is refused outright when the column is
+         *   - used by a view, matview or rule          (pg_rewrite dependency)
+         *   - used in a row-level security policy      (pg_policy dependency)
+         *   - used in a trigger WHEN clause or UPDATE OF list
+         *                                              (pg_trigger dependency)
+         *   - used by a generated column               (pg_attrdef dependency;
+         *                                               a plain DEFAULT cannot
+         *                                               reference a column)
+         *   - part of the partition key                (pg_partitioned_table;
+         *                                               an expression key counts
+         *                                               for every column, which
+         *                                               is merely cautious)
+         *   - inherited from a parent (INHERITS)       (attinhcount > 0)
+         *   - in a typed table (CREATE TABLE ... OF)   (reloftype <> 0)
+         * Those tables fall back to an UPDATE, which has no such restriction
+         * and takes a weaker lock -- at the cost of dead tuples to vacuum
+         * afterwards, and of firing row triggers, which is why it is not the
+         * default and is reported in "method".
          */
-        SELECT EXISTS (SELECT 1
-                         FROM pg_catalog.pg_depend d
-                        WHERE d.classid = 'pg_rewrite'::regclass
-                          AND d.refclassid = 'pg_class'::regclass
-                          AND d.refobjid = cand.tgt
-                          AND d.refobjsubid = (SELECT a.attnum
-                                                 FROM pg_catalog.pg_attribute a
-                                                WHERE a.attrelid = cand.tgt
-                                                  AND a.attname = cand.columnname))
-          INTO has_dep;
+        SELECT a.attinhcount > 0,
+               a.attgenerated <> '',
+               c.relkind,
+               a.attinhcount > 0
+               OR c.reloftype <> 0
+               OR EXISTS (SELECT 1
+                            FROM pg_catalog.pg_depend d
+                           WHERE d.refclassid = 'pg_class'::regclass
+                             AND d.refobjid = cand.tgt
+                             AND d.refobjsubid = a.attnum
+                             AND (d.classid IN ('pg_rewrite'::regclass,
+                                                'pg_policy'::regclass,
+                                                'pg_trigger'::regclass)
+                                  /* 'i' is a generated column's own expression */
+                                  OR (d.classid = 'pg_attrdef'::regclass
+                                      AND d.deptype = 'n')))
+               OR EXISTS (SELECT 1
+                            FROM pg_catalog.pg_partitioned_table pt
+                           WHERE pt.partrelid = cand.tgt
+                             AND (a.attnum = ANY (pt.partattrs::int2[])
+                                  OR pt.partexprs IS NOT NULL))
+          INTO inherited, generated, tgt_kind, has_dep
+          FROM pg_catalog.pg_attribute a
+          JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+         WHERE a.attrelid = cand.tgt
+           AND a.attname = cand.columnname;
 
-        stmt := '';
+        schemaname := cand.tgtschema; tablename := cand.tgtname;
+        columnname := cand.columnname;
+
+        /*
+         * Rewriting an INHERITS parent recurses into its children (both the
+         * SET COMPRESSION and the TYPE change), so a child processed after
+         * its parent may already be clean.  Likewise a generated column is
+         * recomputed when a column it is computed from is rewritten.
+         */
+        IF NOT dry_run AND (inherited OR generated)
+           AND NOT EXISTS (SELECT 1 FROM dbblue_toast_check(cand.tgt::regclass) k
+                            WHERE k.columnname = cand.columnname) THEN
+            method := CASE WHEN generated
+                           THEN 'skipped: already recomputed from its source columns'
+                           ELSE 'skipped: already rewritten through its parent' END;
+            command := NULL;
+            RETURN NEXT;
+            CONTINUE;
+        END IF;
 
         /*
          * Only override an explicit zstd marking; a column left on the
          * default is already covered by default_toast_compression, which we
          * checked above is no longer zstd.
          */
+        set_stmts := '';
         IF cand.attcompression = 'z' THEN
-            stmt := format('ALTER TABLE %I.%I ALTER COLUMN %I SET COMPRESSION %s; ',
-                           cand.tgtschema, cand.tgtname, cand.columnname, target);
+            set_stmts := format('ALTER TABLE %I.%I ALTER COLUMN %I SET COMPRESSION %s; ',
+                                cand.tgtschema, cand.tgtname, cand.columnname, target);
         END IF;
 
-        IF has_dep THEN
+        /*
+         * ONLY: every inheritance child is a candidate of its own.  A
+         * partitioned table has no rows of its own, so it must not use ONLY.
+         */
+        upd_stmt := format('UPDATE %s%I.%I SET %I = dbblue_force_detoast(%I);',
+                           CASE WHEN tgt_kind = 'p' THEN '' ELSE 'ONLY ' END,
+                           cand.tgtschema, cand.tgtname,
+                           cand.columnname, cand.columnname);
+
+        IF generated THEN
+            /*
+             * A generated column cannot be assigned, nor rewritten with
+             * USING, and SET col = DEFAULT does not recompute it.  It is
+             * recomputed, and compressed afresh, when a column it is computed
+             * from is updated -- so update one of those to itself.  An
+             * expression reading no column at all is recomputed by
+             * re-setting it, which rewrites the table.
+             */
+            SELECT src.attname, pg_catalog.pg_get_expr(ad.adbin, ad.adrelid)
+              INTO src_col, gen_expr
+              FROM pg_catalog.pg_attribute g
+              JOIN pg_catalog.pg_attrdef ad
+                ON ad.adrelid = g.attrelid AND ad.adnum = g.attnum
+              LEFT JOIN LATERAL (
+                     SELECT a2.attname
+                       FROM pg_catalog.pg_depend d
+                       JOIN pg_catalog.pg_attribute a2
+                         ON a2.attrelid = d.refobjid AND a2.attnum = d.refobjsubid
+                      WHERE d.classid = 'pg_attrdef'::regclass
+                        AND d.objid = ad.oid
+                        AND d.refclassid = 'pg_class'::regclass
+                        AND d.refobjid = g.attrelid
+                        AND d.deptype = 'n'
+                      ORDER BY a2.attnum
+                      LIMIT 1) src ON true
+             WHERE g.attrelid = cand.tgt AND g.attname = cand.columnname;
+
+            IF src_col IS NOT NULL THEN
+                method := 'update';
+                upd_stmt := format('UPDATE %s%I.%I SET %I = %I;',
+                                   CASE WHEN tgt_kind = 'p' THEN '' ELSE 'ONLY ' END,
+                                   cand.tgtschema, cand.tgtname, src_col, src_col);
+            ELSE
+                method := 'rewrite';
+                upd_stmt := format('ALTER TABLE %I.%I ALTER COLUMN %I SET EXPRESSION AS (%s);',
+                                   cand.tgtschema, cand.tgtname, cand.columnname, gen_expr);
+            END IF;
+            stmt := set_stmts || upd_stmt;
+        ELSIF has_dep THEN
             method := 'update';
-            stmt := stmt || format(
-                'UPDATE %I.%I SET %I = dbblue_force_detoast(%I);',
-                cand.tgtschema, cand.tgtname, cand.columnname, cand.columnname);
+            stmt := set_stmts || upd_stmt;
         ELSE
             method := 'rewrite';
-            stmt := stmt || format(
+            stmt := set_stmts || format(
                 'ALTER TABLE %I.%I ALTER COLUMN %I TYPE %s USING dbblue_force_detoast(%I);',
                 cand.tgtschema, cand.tgtname, cand.columnname,
                 cand.coltype, cand.columnname);
         END IF;
 
         IF NOT dry_run THEN
-            EXECUTE stmt;
+            /*
+             * One failing table must not roll back the others, so each runs
+             * in its own subtransaction.  A refused rewrite is retried as an
+             * UPDATE, covering dependency kinds not detected above.
+             */
+            BEGIN
+                EXECUTE stmt;
+            EXCEPTION WHEN OTHERS THEN
+                errmsg := SQLERRM;
+                IF method = 'rewrite' THEN
+                    BEGIN
+                        stmt := set_stmts || upd_stmt;
+                        EXECUTE stmt;
+                        method := 'update (rewrite refused: ' || errmsg || ')';
+                    EXCEPTION WHEN OTHERS THEN
+                        errmsg := SQLERRM;
+                        method := 'failed: ' || errmsg;
+                    END;
+                ELSE
+                    method := 'failed: ' || errmsg;
+                END IF;
+
+                IF method LIKE 'failed:%' THEN
+                    failed := failed || cand.tgt;
+                    RAISE WARNING 'could not normalize %.%.%: %',
+                                  cand.tgtschema, cand.tgtname, cand.columnname, errmsg
+                      USING DETAIL = 'Statement: ' || stmt,
+                            HINT = 'The other relations were still normalized.  Fix the cause and run dbblue_toast_normalize again for this relation.';
+                END IF;
+            END;
         END IF;
 
-        schemaname := cand.tgtschema; tablename := cand.tgtname;
-        columnname := cand.columnname; command := stmt;
+        command := stmt;
         RETURN NEXT;
     END LOOP;
 
@@ -403,7 +555,10 @@ BEGIN
 
             FOR src IN SELECT s FROM dbblue_matview_sources(mv::regclass) s
             LOOP
-                IF src = ANY(pending) AND src <> mv THEN
+                IF src = ANY(failed) THEN
+                    blocker := src;         -- could not be normalized above
+                    EXIT;
+                ELSIF src = ANY(pending) AND src <> mv THEN
                     waiting := true;        -- another matview goes first
                     EXIT;
                 ELSIF src = ANY(table_tgts) THEN
@@ -438,8 +593,12 @@ BEGIN
             schemaname := mvschema; tablename := mvname; columnname := cols;
 
             IF blocker IS NOT NULL THEN
-                method := format('skipped: %s still holds zstd values; normalize it first',
-                                 blocker::regclass);
+                method := CASE WHEN blocker = ANY(failed)
+                               THEN format('skipped: %s could not be normalized',
+                                           blocker::regclass)
+                               ELSE format('skipped: %s still holds zstd values; normalize it first',
+                                           blocker::regclass) END;
+                failed := failed || mv;     -- so views reading this one wait too
                 command := NULL;
                 RETURN NEXT;
                 CONTINUE;
@@ -456,10 +615,19 @@ BEGIN
             method := 'refresh';
 
             IF NOT dry_run AND stmt <> '' THEN
-                EXECUTE stmt;
+                BEGIN
+                    EXECUTE stmt;
+                EXCEPTION WHEN OTHERS THEN
+                    errmsg := SQLERRM;
+                    method := 'failed: ' || errmsg;
+                    failed := failed || mv;
+                    RAISE WARNING 'could not normalize materialized view %.%: %',
+                                  mvschema, mvname, errmsg
+                      USING DETAIL = 'Statement: ' || stmt;
+                END;
 
                 /* catches sources pg_depend can't see, e.g. inside functions */
-                IF EXISTS (SELECT 1 FROM dbblue_toast_check(mv::regclass) k
+                IF method = 'refresh' AND EXISTS (SELECT 1 FROM dbblue_toast_check(mv::regclass) k
                             WHERE k.columnname IS NOT NULL
                               AND k.reason <> 'column is marked zstd') THEN
                     method := 'refresh (incomplete)';
@@ -496,7 +664,14 @@ BEGIN
                        THEN 'reindex (cannot inspect)' ELSE 'reindex' END;
 
         IF NOT dry_run THEN
-            EXECUTE stmt;
+            BEGIN
+                EXECUTE stmt;
+            EXCEPTION WHEN OTHERS THEN
+                errmsg := SQLERRM;
+                method := 'failed: ' || errmsg;
+                RAISE WARNING 'could not reindex %.%: %',
+                              ix.schemaname, ix.indexname, errmsg;
+            END;
         END IF;
 
         schemaname := ix.schemaname; tablename := ix.tablename;
