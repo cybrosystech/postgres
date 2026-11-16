@@ -671,9 +671,7 @@ BackupLauncherMain(Datum main_arg)
 
 	/*
 	 * Recover here after any unexpected error: report it, clean up
-	 * whatever transaction state is left, and go back to the main loop.
-	 * The wait at the end of the loop keeps a persistent failure from
-	 * turning into a busy loop.
+	 * whatever transaction state is left, wait, and go back to the main loop.
 	 */
 	if (sigsetjmp(local_sigjmp_buf, 1) != 0)
 	{
@@ -697,6 +695,19 @@ BackupLauncherMain(Datum main_arg)
 		pgstat_report_activity(STATE_IDLE, NULL);
 
 		RESUME_INTERRUPTS();
+
+		/*
+		 * Wait one naptime before trying again.  An error jumps over the wait
+		 * at the end of the main loop, so without this an error that keeps
+		 * happening (a read-only setting, a full disk, a locked history table)
+		 * would be retried as fast as the loop can run.  A shutdown request or
+		 * a configuration reload sets the latch and ends the wait at once.
+		 */
+		(void) WaitLatch(MyLatch,
+						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						 (long) dbblue_backup_naptime * 1000L,
+						 WAIT_EVENT_DBBLUE_BACKUP_LAUNCHER_MAIN);
+		ResetLatch(MyLatch);
 	}
 	PG_exception_stack = &local_sigjmp_buf;
 
