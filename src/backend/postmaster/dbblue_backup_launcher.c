@@ -215,8 +215,13 @@ typedef struct BackupRetryState
 
 static HTAB *retry_state = NULL;	/* in TopMemoryContext */
 
-/* When report_unmanaged_backups() is next due; 0 = as soon as ready. */
-static TimestampTz next_report_at = 0;
+/*
+ * What report_unmanaged_backups() last logged (-1 = nothing yet), and when:
+ * it logs only when that changes, or once a day as a reminder.
+ */
+static int	last_report_count = -1;
+static int64 last_report_bytes = -1;
+static TimestampTz last_report_at = 0;
 
 static bool ensure_schema(void);
 static bool resolve_environment(void);
@@ -740,20 +745,10 @@ BackupLauncherMain(Datum main_arg)
 			{
 				TimestampTz now = GetCurrentTimestamp();
 
-				/*
-				 * Report backups kept but no longer managed once the launcher
-				 * is ready -- after every server start, and so right after a
-				 * restart that changed dbblue_backup_directory -- and then
-				 * daily, until they are deleted.
-				 */
-				if (next_report_at == 0 || now >= next_report_at)
-				{
-					report_unmanaged_backups();
-					next_report_at = now + (int64) SECS_PER_DAY * USECS_PER_SEC;
-				}
-
 				if (next_run == 0 || now >= next_run)
 				{
+					/* Checked every cycle; logged only on change, or daily. */
+					report_unmanaged_backups();
 					run_backup_cycle();
 					next_run = GetCurrentTimestamp() +
 						(int64) dbblue_backup_naptime * USECS_PER_SEC;
@@ -771,7 +766,7 @@ BackupLauncherMain(Datum main_arg)
 			schema_ready = false;
 			environment_ready = false;
 			next_run = 0;
-			next_report_at = 0;
+			last_report_count = -1;		/* report again once re-enabled */
 			sleep_ms = 5000;
 		}
 
@@ -2488,7 +2483,9 @@ enforce_retention(const char *dbname, const char *status)
  *	- dumps in an earlier dbblue_backup_directory (retention only removes
  *	  files in the current one).
  *
- * Called when the launcher becomes ready (after every start) and then daily.
+ * Checked every cycle, but logged only when the list has changed since it was
+ * last logged (so also right after every start), or a day after that, as a
+ * reminder -- not the same message every naptime.
  * An error here is logged as a WARNING and never stops backups.
  */
 static void
@@ -2529,6 +2526,8 @@ report_unmanaged_backups(void)
 		int			count = 0;
 		int64		bytes = 0;
 		uint64		row;
+		bool		changed;
+		bool		reminder_due;
 
 		initStringInfo(&files);
 
@@ -2563,12 +2562,23 @@ report_unmanaged_backups(void)
 			bytes += size;
 		}
 
-		if (count > 0)
+		/* Log only if the list changed, or the daily reminder is due. */
+		changed = (count != last_report_count || bytes != last_report_bytes);
+		reminder_due = GetCurrentTimestamp() >=
+			last_report_at + (int64) SECS_PER_DAY * USECS_PER_SEC;
+
+		last_report_count = count;
+		last_report_bytes = bytes;
+
+		if (count > 0 && (changed || reminder_due))
+		{
+			last_report_at = GetCurrentTimestamp();
 			ereport(LOG,
 					(errmsg("dbblue backup launcher: keeping %d backups (%lld bytes) that it no longer manages",
 							count, (long long) bytes),
 					 errdetail_internal("%s", files.data),
 					 errhint("They are never removed automatically. Delete them by hand once they are no longer needed.")));
+		}
 
 		PopActiveSnapshot();
 		SPI_finish();

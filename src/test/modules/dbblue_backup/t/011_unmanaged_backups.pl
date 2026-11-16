@@ -58,15 +58,14 @@ my %dump = map { $_ => dump_of($_) } ('db_keep', 'db_gone', 'db_drop');
 # ---------------------------------------------------------------------------
 # A database removed from the list, and a dropped one.
 # ---------------------------------------------------------------------------
+my $offset = -s $node->logfile;
 $node->safe_psql('postgres', 'DROP DATABASE db_drop');
 $node->safe_psql('postgres',
-	q{ALTER SYSTEM SET dbblue_backup_databases = 'db_keep, db_drop'});
-
-my $offset = -s $node->logfile;
-$node->restart;
+	q{ALTER SYSTEM SET dbblue_backup_databases = 'db_keep, db_drop'; SELECT pg_reload_conf()}
+);
 $node->wait_for_log(qr/keeping 2 backups \(\d+ bytes\) that it no longer manages/,
 	$offset);
-pass('the unmanaged backups are reported after a restart');
+pass('the unmanaged backups are reported at the next cycle, without a restart');
 
 foreach my $db ('db_gone', 'db_drop')
 {
@@ -78,6 +77,11 @@ foreach my $db ('db_gone', 'db_drop')
 ok(!$node->log_contains(qr/\Q$dump{db_keep}\E/, $offset),
 	'a managed database\'s backup is not listed');
 ok(-e $dump{db_gone} && -e $dump{db_drop}, 'neither is removed');
+
+# Nothing changes over the next cycle (naptime 10 s), so it is not repeated.
+sleep(12);
+my @reports = slurp_file($node->logfile, $offset) =~ /that it no longer manages/g;
+is(scalar(@reports), 1, 'an unchanged list is not logged again next cycle');
 
 # ---------------------------------------------------------------------------
 # dbblue_backup_directory changes: the dumps in the earlier one are listed.
