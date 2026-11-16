@@ -31,6 +31,10 @@ extern void BackupLauncherMain(Datum main_arg);
 extern bool dbblue_check_backup_enabled(bool *newval, void **extra,
 										 GucSource source);
 
+/* GUC check hook for dbblue_backup_directory */
+extern bool dbblue_check_backup_directory(char **newval, void **extra,
+										  GucSource source);
+
 /* GUC check hook for dbblue_backup_databases */
 extern bool dbblue_check_backup_databases(char **newval, void **extra,
 										   GucSource source);

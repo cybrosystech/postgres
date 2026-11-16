@@ -164,6 +164,14 @@ static char pg_dump_path[MAXPGPATH];
 static char *socket_dir = NULL;	/* NULL means "let libpq pick the default" */
 
 /*
+ * realpath() of the data directory and of dbblue_backup_directory, set by
+ * check_backup_directory() (with symlinks resolved, so a link pointing into
+ * the data directory is seen for what it is).
+ */
+static char data_dir_real[MAXPGPATH];
+static char backup_dir_real[MAXPGPATH];
+
+/*
  * Role name pg_dump connects as (-U), cached in TopMemoryContext.  This is the
  * bootstrap superuser -- the identity the launcher itself attaches as -- named
  * explicitly so pg_dump does not fall back to the operating-system user name,
@@ -332,6 +340,191 @@ dbblue_check_backup_databases(char **newval, void **extra, GucSource source)
 	pfree(rawstring);
 	list_free(elemlist);
 	return ok;
+}
+
+/*
+ * path_is_within
+ *		True if path is dir or lies inside it.  Both must be canonical
+ *		absolute paths.
+ */
+static bool
+path_is_within(const char *path, const char *dir)
+{
+	size_t		len = strlen(dir);
+
+	if (strcmp(dir, "/") == 0)
+		return true;
+
+	return strncmp(path, dir, len) == 0 &&
+		(path[len] == '\0' || path[len] == '/');
+}
+
+/*
+ * get_real_path
+ *		realpath() into a MAXPGPATH buffer.  False, with errno set, if path
+ *		does not exist or cannot be resolved.
+ */
+static bool
+get_real_path(const char *path, char *result)
+{
+	char	   *resolved = realpath(path, NULL);
+
+	if (resolved == NULL)
+		return false;
+
+	if (strlcpy(result, resolved, MAXPGPATH) >= MAXPGPATH)
+	{
+		free(resolved);
+		errno = ENAMETOOLONG;
+		return false;
+	}
+
+	free(resolved);
+	return true;
+}
+
+/*
+ * dbblue_check_backup_directory
+ *		GUC check hook for dbblue_backup_directory.
+ *
+ * Warns, at ALTER SYSTEM time, about a value the launcher will refuse to back
+ * up into (see check_backup_directory()): a relative path, or the data
+ * directory or a directory inside it.  Never rejects the value: this setting
+ * is read from postgresql.conf at postmaster start, where a rejected value
+ * stops the server from starting at all -- far worse than not backing up --
+ * and where the data directory is not even known yet on the first pass.  So
+ * it is only checked where a session can see the warning (IsUnderPostmaster
+ * and IsTransactionState()), the same way dbblue_check_backup_enabled() does.
+ */
+bool
+dbblue_check_backup_directory(char **newval, void **extra, GucSource source)
+{
+	char		path[MAXPGPATH];
+	char		datadir[MAXPGPATH];
+
+	if (*newval == NULL || **newval == '\0')
+		return true;
+
+	if (!IsUnderPostmaster || !IsTransactionState() || DataDir == NULL)
+		return true;
+
+	if (!is_absolute_path(*newval))
+	{
+		ereport(WARNING,
+				(errmsg("dbblue_backup_directory \"%s\" is not an absolute path, so the backup launcher will not back up into it",
+						*newval),
+				 errdetail("A relative path is interpreted against the data directory, so backups would be written inside it."),
+				 errhint("Use an absolute path to a directory outside the data directory.")));
+		return true;
+	}
+
+	/* Resolve symlinks where the paths exist; compare lexically otherwise. */
+	if (!get_real_path(*newval, path))
+	{
+		strlcpy(path, *newval, sizeof(path));
+		canonicalize_path(path);
+	}
+	if (!get_real_path(DataDir, datadir))
+	{
+		strlcpy(datadir, DataDir, sizeof(datadir));
+		canonicalize_path(datadir);
+	}
+
+	if (path_is_within(path, datadir))
+		ereport(WARNING,
+				(errmsg("dbblue_backup_directory \"%s\" is the data directory or inside it, so the backup launcher will not back up into it",
+						*newval),
+				 errhint("Use a directory outside \"%s\".", DataDir)));
+
+	return true;
+}
+
+/*
+ * check_backup_directory
+ *		Verify that dbblue_backup_directory is somewhere the launcher may
+ *		write dumps, and resolve it and the data directory into
+ *		backup_dir_real and data_dir_real.  False, after a WARNING, if not.
+ *
+ * Refused:
+ *	- a relative path: it is interpreted against the data directory (the
+ *	  server's working directory), so the dumps would land inside it;
+ *	- a directory that does not exist (or is not a directory): it must exist
+ *	  for symlinks in it to be resolved, and creating it is the operator's job,
+ *	  with the ownership and permissions they choose;
+ *	- the data directory itself, or any directory inside it, symlinks
+ *	  resolved: every base backup of the data directory would copy the dumps,
+ *	  including the pg_basebackup dbblue_create_standby builds its standby
+ *	  from, and a database named after one of the server's own subdirectories
+ *	  (base, global, pg_wal, ...) would have its dumps written into it.
+ *
+ * An unset value is let through; backup_one_database() records each skipped
+ * backup.
+ */
+static bool
+check_backup_directory(void)
+{
+	struct stat st;
+	bool		usable = true;
+
+	backup_dir_real[0] = '\0';
+
+	if (dbblue_backup_directory == NULL || dbblue_backup_directory[0] == '\0')
+		return true;
+
+	if (!is_absolute_path(dbblue_backup_directory))
+	{
+		ereport(WARNING,
+				(errmsg("dbblue backup launcher: dbblue_backup_directory \"%s\" is not an absolute path, not backing up",
+						dbblue_backup_directory),
+				 errdetail("A relative path is interpreted against the data directory, so backups would be written inside it."),
+				 errhint("Set dbblue_backup_directory to an absolute path outside the data directory (changing it requires a server restart).")));
+		return false;
+	}
+
+	if (!get_real_path(DataDir, data_dir_real))
+	{
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("dbblue backup launcher: could not resolve data directory \"%s\": %m, not backing up",
+						DataDir)));
+		return false;
+	}
+
+	/* Each failure leaves its own errno for %m. */
+	if (!get_real_path(dbblue_backup_directory, backup_dir_real))
+		usable = false;
+	else if (stat(backup_dir_real, &st) != 0)
+		usable = false;
+	else if (!S_ISDIR(st.st_mode))
+	{
+		errno = ENOTDIR;
+		usable = false;
+	}
+
+	if (!usable)
+	{
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("dbblue backup launcher: cannot use dbblue_backup_directory \"%s\": %m, not backing up",
+						dbblue_backup_directory),
+				 errhint("Create the directory, owned by the operating-system user the server runs as, outside the data directory.")));
+		backup_dir_real[0] = '\0';
+		return false;
+	}
+
+	if (path_is_within(backup_dir_real, data_dir_real))
+	{
+		ereport(WARNING,
+				(errmsg("dbblue backup launcher: dbblue_backup_directory \"%s\" is the data directory or inside it, not backing up",
+						dbblue_backup_directory),
+				 errdetail("Dumps there would be copied by every base backup of the data directory, including the one the standby is built from, and a database named after one of the server's own subdirectories, such as pg_wal, would have its dumps written into it."),
+				 errhint("Set dbblue_backup_directory to a directory outside \"%s\" (changing it requires a server restart).",
+						 data_dir_real)));
+		backup_dir_real[0] = '\0';
+		return false;
+	}
+
+	return true;
 }
 
 /*
@@ -527,14 +720,18 @@ BackupLauncherMain(Datum main_arg)
 
 /*
  * resolve_environment
- *		Locate the pg_dump binary installed alongside this postgres
- *		executable, and pick a local Unix socket directory for it to
- *		connect through.  Safe to retry on every wakeup until it succeeds.
+ *		Verify the backup directory, locate the pg_dump binary installed
+ *		alongside this postgres executable, and pick a local Unix socket
+ *		directory for it to connect through.  Safe to retry on every wakeup
+ *		until it succeeds.
  */
 static bool
 resolve_environment(void)
 {
 	int			ret;
+
+	if (!check_backup_directory())
+		return false;
 
 	ret = find_other_exec(my_exec_path, "pg_dump",
 						  DBBLUE_BACKUP_PGDUMP_VERSIONSTR, pg_dump_path);
@@ -1443,6 +1640,38 @@ backup_one_database(const char *dbname)
 	strftime(timebuf, sizeof(timebuf), "%Y%m%d_%H%M%S", &lt);
 
 	snprintf(dbdir, sizeof(dbdir), "%s/%s", dbblue_backup_directory, dbname);
+
+	/*
+	 * The database's own directory must not be inside the data directory
+	 * either.  check_backup_directory() has ruled that out for the backup
+	 * directory, but with the data directory inside the backup directory, a
+	 * database named after the next component of its path would be: with
+	 * dbblue_backup_directory = '/srv' and the data directory /srv/pgdata, a
+	 * database named "pgdata" would be dumped into the data directory.  An
+	 * existing <dbname> directory may also be a symlink pointing into it.
+	 */
+	{
+		char		dbdir_real[MAXPGPATH];
+		struct stat st;
+
+		if (lstat(dbdir, &st) != 0 || !get_real_path(dbdir, dbdir_real))
+			snprintf(dbdir_real, sizeof(dbdir_real), "%s/%s",
+					 backup_dir_real, dbname);
+
+		if (path_is_within(dbdir_real, data_dir_real))
+		{
+			ereport(WARNING,
+					(errmsg("dbblue backup launcher: backup directory \"%s\" of database \"%s\" is the data directory or inside it, skipping",
+							dbdir, dbname),
+					 errhint("Set dbblue_backup_directory to a directory that does not contain the data directory \"%s\".",
+							 data_dir_real)));
+			record_backup_history(dbname, started_at, "failed", NULL, 0,
+								  "backup directory is inside the data directory");
+			enforce_retention(dbname, "failed");
+			return false;
+		}
+	}
+
 	if (pg_mkdir_p(dbdir, DBBLUE_BACKUP_DIR_MODE) != 0)
 	{
 		int			save_errno = errno;
