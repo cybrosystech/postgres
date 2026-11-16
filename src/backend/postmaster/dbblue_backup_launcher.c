@@ -1536,15 +1536,22 @@ note_backup_result(const char *dbname, bool ok)
  *
  * The same once-a-second poll checks the free space on the file system holding
  * space_path, and stops the dump the same way if it falls below
- * dbblue_backup_min_free_space, setting *out_of_space.
+ * dbblue_backup_min_free_space.  A cancel request (pg_cancel_backend() on this
+ * worker) stops it the same way too, instead of raising an ERROR here.  When
+ * the dump is stopped for either reason, *stop_reason says why; otherwise it
+ * is NULL.
+ *
+ * pg_dump never outlives this function: if an ERROR escapes the poll loop
+ * anyway, the process group is killed and reaped before it is re-thrown.
  */
 static int
-run_backup_command(const char *cmd, const char *space_path, bool *out_of_space)
+run_backup_command(const char *cmd, const char *space_path,
+				   const char **stop_reason)
 {
 	pid_t		pid;
 	int			status = -1;
 
-	*out_of_space = false;
+	*stop_reason = NULL;
 
 	/* Flush our own buffers before forking, as system() does. */
 	fflush(NULL);
@@ -1572,6 +1579,14 @@ run_backup_command(const char *cmd, const char *space_path, bool *out_of_space)
 	/* Parent: set the group too, race-free (harmless if the child already did). */
 	setpgid(pid, pid);
 
+	/*
+	 * A cancel must not raise an ERROR in the loop below: that would leave
+	 * pg_dump running with nobody watching it.  Hold it, and handle it in the
+	 * loop as "stop this dump".
+	 */
+	HOLD_CANCEL_INTERRUPTS();
+
+	PG_TRY();
 	{
 		time_t		start = time(NULL);
 		bool		term_sent = false;	/* SIGTERM (timeout/shutdown) sent? */
@@ -1610,6 +1625,22 @@ run_backup_command(const char *cmd, const char *space_path, bool *out_of_space)
 			}
 
 			CHECK_FOR_INTERRUPTS();
+
+			/* Cancel requested: stop the dump, like a timeout. */
+			if (QueryCancelPending)
+			{
+				QueryCancelPending = false;
+				if (!term_sent)
+				{
+					ereport(WARNING,
+							(errmsg("dbblue backup launcher: backup cancelled by request, stopping pg_dump")));
+					kill(-pid, SIGTERM);
+					term_sent = true;
+					term_at = time(NULL);
+					*stop_reason = "stopped: cancelled by pg_cancel_backend()";
+					continue;
+				}
+			}
 
 			/*
 			 * Fast shutdown requested: stop the in-flight dump promptly instead
@@ -1664,7 +1695,7 @@ run_backup_command(const char *cmd, const char *space_path, bool *out_of_space)
 					kill(-pid, SIGTERM);
 					term_sent = true;
 					term_at = time(NULL);
-					*out_of_space = true;
+					*stop_reason = "stopped: free disk space fell below dbblue_backup_min_free_space";
 					continue;
 				}
 			}
@@ -1674,6 +1705,16 @@ run_backup_command(const char *cmd, const char *space_path, bool *out_of_space)
 				kill(-pid, SIGKILL);
 		}
 	}
+	PG_CATCH();
+	{
+		/* Never leave pg_dump running unwatched: kill and reap it first. */
+		kill(-pid, SIGKILL);
+		(void) waitpid(pid, NULL, 0);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	RESUME_CANCEL_INTERRUPTS();
 
 	/*
 	 * The poll loop above called ResetLatch, which consumed the latch the
@@ -1810,7 +1851,7 @@ backup_one_database(const char *dbname, int64 last_backup_size)
 	StringInfoData cmd;
 	int			rc;
 	bool		ok = true;
-	bool		out_of_space;
+	const char *stop_reason;
 
 	if (dbblue_backup_directory == NULL || dbblue_backup_directory[0] == '\0')
 	{
@@ -1992,7 +2033,7 @@ backup_one_database(const char *dbname, int64 last_backup_size)
 	ereport(DEBUG3,
 			(errmsg_internal("dbblue backup launcher: executing \"%s\"", cmd.data)));
 
-	rc = run_backup_command(cmd.data, dbdir, &out_of_space);
+	rc = run_backup_command(cmd.data, dbdir, &stop_reason);
 	pfree(cmd.data);
 
 	dump_errors = read_dump_errors();
@@ -2000,7 +2041,7 @@ backup_one_database(const char *dbname, int64 last_backup_size)
 
 	pgstat_report_activity(STATE_IDLE, NULL);
 
-	if (rc == 0 && !out_of_space)
+	if (rc == 0 && stop_reason == NULL)
 	{
 		struct stat statbuf;
 
@@ -2074,17 +2115,17 @@ backup_one_database(const char *dbname, int64 last_backup_size)
 	}
 
 	/*
-	 * Stopped for lack of space: the dump may well have exited 0 if it had
-	 * just finished, but it was signalled, so it is discarded like any other
-	 * failure -- the space it would keep is exactly what must stay free.
+	 * Stopped by this worker (low disk space, or a cancel): the dump may well
+	 * have exited 0 if it had just finished, but it was signalled, so it is
+	 * discarded like any other failure.
 	 */
 	{
 		/*
-		 * pg_dump's own error message says why it failed ("fe_sendauth: no
-		 * password supplied", ...); its exit status only says that it did.
+		 * Otherwise pg_dump's own error message says why it failed
+		 * ("fe_sendauth: no password supplied", ...); its exit status only
+		 * says that it did.
 		 */
-		const char *reason = out_of_space ?
-			"stopped: free disk space fell below dbblue_backup_min_free_space" :
+		const char *reason = stop_reason != NULL ? stop_reason :
 			dump_errors != NULL ? dump_errors :
 			wait_result_to_str(rc);
 
