@@ -12,6 +12,7 @@ tests += {
       't/004_database_names.pl',
       't/005_partial_dump_cleanup.pl',
       't/006_failure_backoff.pl',
+      't/007_history_timestamps.pl',
     ],
   },
 }

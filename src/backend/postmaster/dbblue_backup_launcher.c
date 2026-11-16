@@ -6,7 +6,8 @@
  * A "cron job" style scheduler that keeps a rotating pg_dump (custom
  * format) backup of each database named in dbblue_backup_databases,
  * re-backing up a database once dbblue_backup_interval has passed since
- * its last successful backup, on a wake-up cycle of dbblue_backup_naptime.
+ * the start of its last successful backup, on a wake-up cycle of
+ * dbblue_backup_naptime.
  * After each successful backup, older successful backups of the same
  * database beyond dbblue_backup_retention_count are pruned (both the dump
  * file and its history row).
@@ -123,7 +124,12 @@ typedef struct BackupCandidate
 	Oid			dboid;			/* InvalidOid if the database does not exist */
 	bool		allowconn;
 	bool		istemplate;
-	TimestampTz last_backup_at;	/* 0 if never successfully backed up */
+	/*
+	 * Start of the last successful backup, 0 if none.  The cooldown runs from
+	 * the start, not the finish, so that a daily backup stays at the same
+	 * time of day instead of moving later by its own duration every day.
+	 */
+	TimestampTz last_backup_at;
 } BackupCandidate;
 
 /*
@@ -952,7 +958,7 @@ load_backup_candidates(List *specs)
 							   "  SELECT s AS dbname FROM pg_catalog.unnest($1::text[]) AS s"
 							   ")"
 							   "SELECT w.dbname, d.oid, d.datallowconn, d.datistemplate,"
-							   "       (SELECT max(h.backup_finished_at)"
+							   "       (SELECT max(h.backup_started_at)"
 							   "        FROM dbblue.dbblue_backup_history h"
 							   "        WHERE h.database_name = w.dbname"
 							   "          AND h.status = 'success') AS last_backup_at"
@@ -1637,6 +1643,15 @@ record_backup_history(const char *dbname, TimestampTz started_at,
 	else
 		nulls[5] = 'n';
 
+	/*
+	 * backup_finished_at is now(), i.e. this transaction's start time, which
+	 * StartTransactionCommand() copies from the statement start time.  A
+	 * background worker must set that itself, so set it here: otherwise it is
+	 * still whatever it was when the cycle began (load_backup_candidates()),
+	 * and every row of a cycle would get the cycle's start as its finish time
+	 * -- before the backup even started.
+	 */
+	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
 	SPI_connect();
 	PushActiveSnapshot(GetTransactionSnapshot());
