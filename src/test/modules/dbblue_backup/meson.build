@@ -15,6 +15,7 @@ tests += {
       't/007_history_timestamps.pl',
       't/008_backup_directory_location.pl',
       't/009_free_space.pl',
+      't/010_retention_every_cycle.pl',
     ],
   },
 }

@@ -223,7 +223,9 @@ static void reload_configuration(void);
 static int64 retry_delay_secs(int failures);
 static void note_backup_result(const char *dbname, bool ok);
 static bool backup_one_database(const char *dbname, int64 last_backup_size);
-static void record_backup_history(const char *dbname, TimestampTz started_at,
+static void apply_retention(const char *dbname);
+static void prune_resolved_failures(const char *dbname);
+static bool record_backup_history(const char *dbname, TimestampTz started_at,
 								  const char *status, const char *file_path,
 								  int64 file_size_bytes,
 								  const char *error_message);
@@ -1330,6 +1332,17 @@ run_backup_cycle(void)
 			continue;
 		}
 
+		/*
+		 * Retention every cycle, not only right after a backup: a lowered
+		 * dbblue_backup_retention_count then takes effect at the next cycle,
+		 * not at the database's next successful backup (which, for a failing
+		 * database, may never come), and failed attempts it has since
+		 * recovered from are cleared.  Only for databases that still exist:
+		 * the last backups of a dropped one may be the only copy left, and
+		 * are not this worker's to delete.
+		 */
+		apply_retention(cand->dbname);
+
 		if (!cand->allowconn || cand->istemplate)
 		{
 			ereport(WARNING,
@@ -1955,12 +1968,29 @@ backup_one_database(const char *dbname, int64 last_backup_size)
 			return false;
 		}
 
-		record_backup_history(dbname, started_at, "success", outfile,
-							  (int64) statbuf.st_size, NULL);
+		/*
+		 * A dump the history does not list would never be pruned, nor show
+		 * up anywhere: if its row cannot be recorded (e.g. lock_timeout on
+		 * the history table, or a full disk), remove it again, and count the
+		 * attempt as failed so it is retried.
+		 */
+		if (!record_backup_history(dbname, started_at, "success", outfile,
+								   (int64) statbuf.st_size, NULL))
+		{
+			ereport(WARNING,
+					(errmsg("dbblue backup launcher: removing backup \"%s\" of database \"%s\", which could not be recorded in dbblue.dbblue_backup_history",
+							outfile, dbname),
+					 errdetail("A backup the history does not list would never be removed by retention.")));
+			unlink(outfile);
+			(void) record_backup_history(dbname, started_at, "failed", NULL, 0,
+										 "could not record the backup in dbblue_backup_history");
+			return false;
+		}
+
 		ereport(LOG,
 				(errmsg("dbblue backup launcher: backed up database \"%s\" to \"%s\" (%lld bytes)",
 						dbname, outfile, (long long) statbuf.st_size)));
-		enforce_retention(dbname, "success");
+		apply_retention(dbname);
 		return true;
 	}
 
@@ -1985,17 +2015,122 @@ backup_one_database(const char *dbname, int64 last_backup_size)
 }
 
 /*
+ * report_caught_error
+ *		Recover from an error caught by PG_CATCH() in this worker: report it
+ *		as a WARNING prefixed with what was being done, clear it, and abort
+ *		the transaction it left open.  Leaves cxt as the current memory
+ *		context; cxt must not be a transaction's.
+ */
+static void
+report_caught_error(MemoryContext cxt, const char *what)
+{
+	ErrorData  *edata;
+
+	MemoryContextSwitchTo(cxt);
+	edata = CopyErrorData();
+	FlushErrorState();
+	AbortCurrentTransaction();
+	MemoryContextSwitchTo(cxt);
+
+	ereport(WARNING,
+			(errmsg("dbblue backup launcher: %s: %s", what, edata->message)));
+	FreeErrorData(edata);
+}
+
+/*
+ * apply_retention
+ *		All of dbname's retention: successful backups beyond
+ *		dbblue_backup_retention_count (files and rows), failed attempts
+ *		beyond it, and failed attempts older than its last success.
+ *
+ * Runs every cycle for every configured database that exists, as well as
+ * after each successful backup, so it must never stop a cycle: an error (e.g.
+ * lock_timeout on the history table) is reported as a WARNING and the cycle
+ * goes on.
+ */
+static void
+apply_retention(const char *dbname)
+{
+	MemoryContext oldcxt = CurrentMemoryContext;
+	char		what[NAMEDATALEN + 64];
+
+	snprintf(what, sizeof(what),
+			 "could not apply retention to the backups of database \"%s\"", dbname);
+
+	PG_TRY();
+	{
+		enforce_retention(dbname, "success");
+		enforce_retention(dbname, "failed");
+		prune_resolved_failures(dbname);
+	}
+	PG_CATCH();
+	{
+		report_caught_error(oldcxt, what);
+	}
+	PG_END_TRY();
+
+	MemoryContextSwitchTo(oldcxt);
+}
+
+/*
+ * prune_resolved_failures
+ *		Delete dbname's failed attempts older than its last successful
+ *		backup.
+ *
+ * Retention of failed rows otherwise runs only when there are failed rows to
+ * keep in check, so the failures a database has recovered from would stay
+ * forever.  They carry no file (a failed attempt removes its dump), so only
+ * the row goes.
+ */
+static void
+prune_resolved_failures(const char *dbname)
+{
+	static const char *sql =
+		"DELETE FROM dbblue.dbblue_backup_history "
+		"WHERE database_name = $1 AND status = 'failed' "
+		"  AND backup_started_at < "
+		"      (SELECT max(backup_started_at) FROM dbblue.dbblue_backup_history "
+		"       WHERE database_name = $1 AND status = 'success')";
+	Oid			argtypes[1] = {TEXTOID};
+	Datum		values[1];
+
+	values[0] = CStringGetTextDatum(dbname);
+
+	SetCurrentStatementStartTimestamp();
+	StartTransactionCommand();
+	SPI_connect();
+	PushActiveSnapshot(GetTransactionSnapshot());
+
+	if (SPI_execute_with_args(sql, 1, argtypes, values, NULL, false, 0) == SPI_OK_DELETE &&
+		SPI_processed > 0)
+		ereport(DEBUG1,
+				(errmsg_internal("dbblue backup launcher: removed %llu failed attempts of database \"%s\" older than its last successful backup",
+								 (unsigned long long) SPI_processed, dbname)));
+
+	PopActiveSnapshot();
+	SPI_finish();
+	CommitTransactionCommand();
+}
+
+/*
  * record_backup_history
  *		Insert one row describing the outcome of a backup attempt.
  *		Append-only -- one row per attempt, not one row per database --
  *		so retention (enforce_retention) is what keeps this table from
  *		growing without bound.
+ *
+ * Returns false, after a WARNING, if the row could not be recorded -- an
+ * error included, which is caught here rather than left to abort the cycle,
+ * so that the caller can deal with a dump the history will not list.
  */
-static void
+static bool
 record_backup_history(const char *dbname, TimestampTz started_at,
 					  const char *status, const char *file_path,
 					  int64 file_size_bytes, const char *error_message)
 {
+	MemoryContext oldcxt = CurrentMemoryContext;
+	volatile bool ok = true;
+	char		what[NAMEDATALEN + 64];
 	static const char *sql =
 		"INSERT INTO dbblue.dbblue_backup_history "
 		"(database_name, backup_started_at, backup_finished_at, status, "
@@ -2032,19 +2167,36 @@ record_backup_history(const char *dbname, TimestampTz started_at,
 	 * and every row of a cycle would get the cycle's start as its finish time
 	 * -- before the backup even started.
 	 */
-	SetCurrentStatementStartTimestamp();
-	StartTransactionCommand();
-	SPI_connect();
-	PushActiveSnapshot(GetTransactionSnapshot());
+	snprintf(what, sizeof(what),
+			 "could not record backup history for database \"%s\"", dbname);
 
-	if (SPI_execute_with_args(sql, 6, (Oid *) argtypes, values, nulls, false, 0) < 0)
-		ereport(WARNING,
-				(errmsg("dbblue backup launcher: failed to record backup history for \"%s\"",
-						dbname)));
+	PG_TRY();
+	{
+		SetCurrentStatementStartTimestamp();
+		StartTransactionCommand();
+		SPI_connect();
+		PushActiveSnapshot(GetTransactionSnapshot());
 
-	PopActiveSnapshot();
-	SPI_finish();
-	CommitTransactionCommand();
+		if (SPI_execute_with_args(sql, 6, (Oid *) argtypes, values, nulls, false, 0) < 0)
+		{
+			ereport(WARNING,
+					(errmsg("dbblue backup launcher: %s", what)));
+			ok = false;
+		}
+
+		PopActiveSnapshot();
+		SPI_finish();
+		CommitTransactionCommand();
+	}
+	PG_CATCH();
+	{
+		report_caught_error(oldcxt, what);
+		ok = false;
+	}
+	PG_END_TRY();
+
+	MemoryContextSwitchTo(oldcxt);
+	return ok;
 }
 
 /*
