@@ -111,6 +111,14 @@ int			dbblue_backup_min_free_space = 2048;	/* MB; 0 disables */
  */
 #define DBBLUE_BACKUP_PARTIAL_SUFFIX ".partial"
 
+/*
+ * Where pg_dump's error output goes, relative to the data directory (the
+ * worker's working directory).  One fixed file: dumps run one at a time.  Not
+ * in the backup directory, which may be the very thing pg_dump cannot write
+ * to; pg_stat_tmp's contents are left out of base backups.
+ */
+#define DBBLUE_BACKUP_STDERR_FILE	PG_STAT_TMP_DIR "/dbblue_backup_pg_dump.stderr"
+
 /* pg_dump's own -V output, for find_other_exec()'s version check. */
 #define DBBLUE_BACKUP_PGDUMP_VERSIONSTR "pg_dump (PostgreSQL) " PG_VERSION "\n"
 
@@ -1669,6 +1677,45 @@ run_backup_command(const char *cmd, const char *space_path, bool *out_of_space)
 }
 
 /*
+ * read_dump_errors
+ *		What the last pg_dump wrote to its error output, or NULL if nothing.
+ *		Only the last 1 kB is kept: pg_dump's error comes last, after any
+ *		warnings.
+ */
+static char *
+read_dump_errors(void)
+{
+	char		buf[1024 + 1];
+	char	   *text = buf;
+	int			fd;
+	off_t		size;
+	off_t		start;
+	ssize_t		len;
+
+	fd = open(DBBLUE_BACKUP_STDERR_FILE, O_RDONLY | PG_BINARY, 0);
+	if (fd < 0)
+		return NULL;
+
+	size = lseek(fd, 0, SEEK_END);
+	start = size > 1024 ? size - 1024 : 0;
+	len = size > 0 ? pg_pread(fd, buf, size - start, start) : 0;
+	close(fd);
+	if (len <= 0)
+		return NULL;
+	buf[len] = '\0';
+
+	/* Read from the middle of the file: begin at the next whole line. */
+	if (start > 0 && strchr(text, '\n') != NULL)
+		text = strchr(text, '\n') + 1;
+
+	/* Drop the trailing newline(s). */
+	while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
+		buf[--len] = '\0';
+
+	return text[0] != '\0' ? pstrdup(text) : NULL;
+}
+
+/*
  * remove_partial_dumps
  *		Delete the <dbname>_*.dump.partial files left in dbdir by dumps that
  *		never finished.
@@ -1744,6 +1791,7 @@ backup_one_database(const char *dbname, int64 last_backup_size)
 	char		dbdir[MAXPGPATH];
 	char		outfile[MAXPGPATH];
 	char		partfile[MAXPGPATH];
+	char	   *dump_errors;
 	char		timebuf[32];
 	time_t		now_t;
 	struct tm	lt;
@@ -1911,6 +1959,10 @@ backup_one_database(const char *dbname, int64 last_backup_size)
 	appendStringInfoString(&cmd, " -- ");
 	ok &= append_shell_quoted(&cmd, dbname);
 
+	/* pg_dump's error output goes to a file, read back if it fails. */
+	appendStringInfoString(&cmd, " 2> ");
+	ok &= append_shell_quoted(&cmd, DBBLUE_BACKUP_STDERR_FILE);
+
 	if (!ok)
 	{
 		ereport(WARNING,
@@ -1931,6 +1983,9 @@ backup_one_database(const char *dbname, int64 last_backup_size)
 
 	rc = run_backup_command(cmd.data, dbdir, &out_of_space);
 	pfree(cmd.data);
+
+	dump_errors = read_dump_errors();
+	unlink(DBBLUE_BACKUP_STDERR_FILE);
 
 	pgstat_report_activity(STATE_IDLE, NULL);
 
@@ -2013,8 +2068,13 @@ backup_one_database(const char *dbname, int64 last_backup_size)
 	 * failure -- the space it would keep is exactly what must stay free.
 	 */
 	{
+		/*
+		 * pg_dump's own error message says why it failed ("fe_sendauth: no
+		 * password supplied", ...); its exit status only says that it did.
+		 */
 		const char *reason = out_of_space ?
 			"stopped: free disk space fell below dbblue_backup_min_free_space" :
+			dump_errors != NULL ? dump_errors :
 			wait_result_to_str(rc);
 
 		ereport(WARNING,
