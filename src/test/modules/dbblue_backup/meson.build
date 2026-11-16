@@ -16,6 +16,7 @@ tests += {
       't/008_backup_directory_location.pl',
       't/009_free_space.pl',
       't/010_retention_every_cycle.pl',
+      't/011_unmanaged_backups.pl',
     ],
   },
 }

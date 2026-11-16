@@ -53,6 +53,7 @@
 #include "catalog/pg_class.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_type.h"
+#include "common/string.h"
 #include "executor/spi.h"
 #include "lib/stringinfo.h"
 #include "libpq/pqsignal.h"
@@ -214,6 +215,9 @@ typedef struct BackupRetryState
 
 static HTAB *retry_state = NULL;	/* in TopMemoryContext */
 
+/* When report_unmanaged_backups() is next due; 0 = as soon as ready. */
+static TimestampTz next_report_at = 0;
+
 static bool ensure_schema(void);
 static bool resolve_environment(void);
 static List *parse_configured_databases(void);
@@ -231,6 +235,7 @@ static bool record_backup_history(const char *dbname, TimestampTz started_at,
 								  const char *error_message);
 static void enforce_retention(const char *dbname, const char *status);
 static bool append_shell_quoted(StringInfo buf, const char *str);
+static void report_unmanaged_backups(void);
 
 /*
  * dbblue_check_backup_enabled
@@ -735,6 +740,18 @@ BackupLauncherMain(Datum main_arg)
 			{
 				TimestampTz now = GetCurrentTimestamp();
 
+				/*
+				 * Report backups kept but no longer managed once the launcher
+				 * is ready -- after every server start, and so right after a
+				 * restart that changed dbblue_backup_directory -- and then
+				 * daily, until they are deleted.
+				 */
+				if (next_report_at == 0 || now >= next_report_at)
+				{
+					report_unmanaged_backups();
+					next_report_at = now + (int64) SECS_PER_DAY * USECS_PER_SEC;
+				}
+
 				if (next_run == 0 || now >= next_run)
 				{
 					run_backup_cycle();
@@ -754,6 +771,7 @@ BackupLauncherMain(Datum main_arg)
 			schema_ready = false;
 			environment_ready = false;
 			next_run = 0;
+			next_report_at = 0;
 			sleep_ms = 5000;
 		}
 
@@ -2287,6 +2305,40 @@ get_prunable_backup_path(const char *dbname, const char *file_path,
 }
 
 /*
+ * looks_like_our_dump
+ *		True if path ends in "<dbname>/<dbname>_<something>.dump", the way
+ *		backup_one_database() names a dump -- in whatever backup directory.
+ *
+ *		Used for dumps outside the current dbblue_backup_directory, which
+ *		are kept and reported rather than removed.  The check keeps a
+ *		file_path rewritten to point elsewhere (e.g. at /etc/passwd) out of
+ *		that report, where it would be listed as a file to delete.
+ */
+static bool
+looks_like_our_dump(const char *path, const char *dbname)
+{
+	char		folder[MAXPGPATH];
+	const char *file_name = last_dir_separator(path);
+	const char *folder_name;
+	size_t		len = strlen(dbname);
+
+	if (file_name == NULL || path_has_parent_component(path))
+		return false;
+	file_name++;
+
+	/* The file is named <dbname>_<something>.dump ... */
+	if (strncmp(file_name, dbname, len) != 0 || file_name[len] != '_' ||
+		!pg_str_endswith(file_name, ".dump"))
+		return false;
+
+	/* ... and sits in a folder named <dbname>. */
+	strlcpy(folder, path, sizeof(folder));
+	get_parent_directory(folder);
+	folder_name = last_dir_separator(folder);
+	return folder_name != NULL && strcmp(folder_name + 1, dbname) == 0;
+}
+
+/*
  * enforce_retention
  *		Delete backups of dbname with the given status beyond
  *		dbblue_backup_retention_count, both the dump file (if any) and the
@@ -2363,13 +2415,27 @@ enforce_retention(const char *dbname, const char *status)
 			if (file_path != NULL)
 			{
 				char		safe_path[MAXPGPATH];
+				struct stat st;
+
+				bool		prunable = get_prunable_backup_path(dbname, file_path,
+																safe_path);
 
 				/*
-				 * Only remove a file this launcher could have written.  The
-				 * row is pruned either way, so a refused path is reported
-				 * once rather than on every cycle.
+				 * Only remove a file in the current backup directory.
+				 *
+				 * Our dump in an earlier backup directory is kept, and so is
+				 * its row: the row is the only record of where the dump is,
+				 * and report_unmanaged_backups() reports it from there.  Once
+				 * the file has been deleted by hand, the row goes too.
+				 *
+				 * Any other path is refused, and its row deleted.
 				 */
-				if (!get_prunable_backup_path(dbname, file_path, safe_path))
+				if (!prunable && looks_like_our_dump(file_path, dbname))
+				{
+					if (lstat(file_path, &st) == 0)
+						continue;	/* keep row and file */
+				}
+				else if (!prunable)
 					ereport(WARNING,
 							(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 							 errmsg("dbblue backup launcher: not removing \"%s\" named in backup history row %lld, which is not a backup file of database \"%s\"",
@@ -2409,6 +2475,112 @@ enforce_retention(const char *dbname, const char *status)
 	PopActiveSnapshot();
 	SPI_finish();
 	CommitTransactionCommand();
+}
+
+/*
+ * report_unmanaged_backups
+ *		Log the dumps this launcher keeps but will never remove, so that an
+ *		administrator can delete them by hand:
+ *
+ *	- dumps of a database that was dropped, or removed from
+ *	  dbblue_backup_databases (retention leaves those alone: they may be
+ *	  the only copy left);
+ *	- dumps in an earlier dbblue_backup_directory (retention only removes
+ *	  files in the current one).
+ *
+ * Called when the launcher becomes ready (after every start) and then daily.
+ * An error here is logged as a WARNING and never stops backups.
+ */
+static void
+report_unmanaged_backups(void)
+{
+	/*
+	 * Every successful backup whose file still exists (pg_stat_file() returns
+	 * NULLs for a missing file), and that is in an earlier backup directory,
+	 * or of a database dropped or no longer configured.
+	 */
+	static const char *sql =
+		"SELECT h.database_name, h.file_path, f.size,"
+		"       NOT starts_with(h.file_path, $2 || '/') AS earlier_directory"
+		" FROM dbblue.dbblue_backup_history h"
+		"      LEFT JOIN pg_catalog.pg_database d ON d.datname = h.database_name,"
+		"      LATERAL pg_catalog.pg_stat_file(h.file_path, true) f"
+		" WHERE h.status = 'success' AND f.size IS NOT NULL"
+		"   AND (NOT starts_with(h.file_path, $2 || '/')"
+		"        OR d.oid IS NULL"
+		"        OR h.database_name <> ALL ($1))"
+		" ORDER BY h.file_path";
+	MemoryContext oldcxt = CurrentMemoryContext;
+	List	   *configured = parse_configured_databases();
+	Datum	   *names = palloc((list_length(configured) + 1) * sizeof(Datum));
+	Oid			argtypes[2] = {TEXTARRAYOID, TEXTOID};
+	Datum		values[2];
+	int			n = 0;
+	ListCell   *lc;
+
+	foreach(lc, configured)
+		names[n++] = CStringGetTextDatum(((BackupDbSpec *) lfirst(lc))->dbname);
+	values[0] = PointerGetDatum(construct_array_builtin(names, n, TEXTOID));
+	values[1] = CStringGetTextDatum(dbblue_backup_directory ? dbblue_backup_directory : "");
+
+	PG_TRY();
+	{
+		StringInfoData files;
+		int			count = 0;
+		int64		bytes = 0;
+		uint64		row;
+
+		initStringInfo(&files);
+
+		SetCurrentStatementStartTimestamp();
+		StartTransactionCommand();
+		SPI_connect();
+		PushActiveSnapshot(GetTransactionSnapshot());
+
+		if (SPI_execute_with_args(sql, 2, argtypes, values, NULL, true, 0) != SPI_OK_SELECT)
+			elog(ERROR, "could not read dbblue.dbblue_backup_history");
+
+		/* One line per dump: its path, size, and why it is no longer managed. */
+		for (row = 0; row < SPI_processed; row++)
+		{
+			HeapTuple	tuple = SPI_tuptable->vals[row];
+			TupleDesc	tupdesc = SPI_tuptable->tupdesc;
+			bool		isnull;
+			char	   *dbname = SPI_getvalue(tuple, tupdesc, 1);
+			char	   *path = SPI_getvalue(tuple, tupdesc, 2);
+			int64		size = DatumGetInt64(SPI_getbinval(tuple, tupdesc, 3, &isnull));
+			bool		earlier = DatumGetBool(SPI_getbinval(tuple, tupdesc, 4, &isnull));
+
+			/* Only our own dumps (see looks_like_our_dump()). */
+			if (!looks_like_our_dump(path, dbname))
+				continue;
+
+			appendStringInfo(&files, "%s%s (%lld bytes): %s",
+							 count > 0 ? "\n" : "", path, (long long) size,
+							 earlier ? "in an earlier dbblue_backup_directory"
+							 : "database no longer backed up");
+			count++;
+			bytes += size;
+		}
+
+		if (count > 0)
+			ereport(LOG,
+					(errmsg("dbblue backup launcher: keeping %d backups (%lld bytes) that it no longer manages",
+							count, (long long) bytes),
+					 errdetail_internal("%s", files.data),
+					 errhint("They are never removed automatically. Delete them by hand once they are no longer needed.")));
+
+		PopActiveSnapshot();
+		SPI_finish();
+		CommitTransactionCommand();
+	}
+	PG_CATCH();
+	{
+		report_caught_error(oldcxt, "could not check for backups it no longer manages");
+	}
+	PG_END_TRY();
+
+	MemoryContextSwitchTo(oldcxt);
 }
 
 /*
