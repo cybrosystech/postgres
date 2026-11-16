@@ -43,6 +43,7 @@
 
 #include <signal.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -83,6 +84,7 @@ int			dbblue_backup_interval = 86400;
 int			dbblue_backup_naptime = 300;
 int			dbblue_backup_retention_count = 7;
 int			dbblue_backup_timeout = 3600;
+int			dbblue_backup_min_free_space = 2048;	/* MB; 0 disables */
 
 /* Permissions for per-database backup subdirectories; not a GUC. */
 #define DBBLUE_BACKUP_DIR_MODE		0700
@@ -130,6 +132,7 @@ typedef struct BackupCandidate
 	 * time of day instead of moving later by its own duration every day.
 	 */
 	TimestampTz last_backup_at;
+	int64		last_backup_size;	/* bytes; 0 if none */
 } BackupCandidate;
 
 /*
@@ -219,7 +222,7 @@ static void run_backup_cycle(void);
 static void reload_configuration(void);
 static int64 retry_delay_secs(int failures);
 static void note_backup_result(const char *dbname, bool ok);
-static bool backup_one_database(const char *dbname);
+static bool backup_one_database(const char *dbname, int64 last_backup_size);
 static void record_backup_history(const char *dbname, TimestampTz started_at,
 								  const char *status, const char *file_path,
 								  int64 file_size_bytes,
@@ -440,6 +443,32 @@ dbblue_check_backup_directory(char **newval, void **extra, GucSource source)
 }
 
 /*
+ * min_free_space_bytes
+ *		dbblue_backup_min_free_space in bytes; 0 means no free-space checks.
+ */
+static int64
+min_free_space_bytes(void)
+{
+	return (int64) dbblue_backup_min_free_space * 1024 * 1024;
+}
+
+/*
+ * get_free_space
+ *		Bytes available to the server's OS user on the file system holding
+ *		path, or -1 (with errno set) if that cannot be determined.
+ */
+static int64
+get_free_space(const char *path)
+{
+	struct statvfs fs;
+
+	if (statvfs(path, &fs) != 0)
+		return -1;
+
+	return (int64) fs.f_bavail * (int64) fs.f_frsize;
+}
+
+/*
  * check_backup_directory
  *		Verify that dbblue_backup_directory is somewhere the launcher may
  *		write dumps, and resolve it and the data directory into
@@ -522,6 +551,32 @@ check_backup_directory(void)
 						 data_dir_real)));
 		backup_dir_real[0] = '\0';
 		return false;
+	}
+
+	/*
+	 * Allowed, but say so if it shares a file system with the data
+	 * directory: a backup that filled it would stop the database's own
+	 * writes too, possibly shutting the server down.  Only
+	 * dbblue_backup_min_free_space guards against that, so warn when it is
+	 * off.
+	 */
+	{
+		struct stat data_st;
+
+		if (stat(data_dir_real, &data_st) == 0 && data_st.st_dev == st.st_dev)
+		{
+			if (dbblue_backup_min_free_space == 0)
+				ereport(WARNING,
+						(errmsg("dbblue backup launcher: dbblue_backup_directory \"%s\" is on the same file system as the data directory, and dbblue_backup_min_free_space is 0",
+								dbblue_backup_directory),
+						 errdetail("A backup that fills the file system would also stop the database from writing, and could shut the server down."),
+						 errhint("Set dbblue_backup_min_free_space, or use a directory on another disk.")));
+			else
+				ereport(LOG,
+						(errmsg("dbblue backup launcher: dbblue_backup_directory \"%s\" is on the same file system as the data directory; backups keep %d MB of it free (dbblue_backup_min_free_space)",
+								dbblue_backup_directory,
+								dbblue_backup_min_free_space)));
+		}
 	}
 
 	return true;
@@ -1158,7 +1213,12 @@ load_backup_candidates(List *specs)
 							   "       (SELECT max(h.backup_started_at)"
 							   "        FROM dbblue.dbblue_backup_history h"
 							   "        WHERE h.database_name = w.dbname"
-							   "          AND h.status = 'success') AS last_backup_at"
+							   "          AND h.status = 'success') AS last_backup_at,"
+							   "       (SELECT h.file_size_bytes"
+							   "        FROM dbblue.dbblue_backup_history h"
+							   "        WHERE h.database_name = w.dbname"
+							   "          AND h.status = 'success'"
+							   "        ORDER BY h.backup_started_at DESC LIMIT 1) AS last_backup_size"
 							   " FROM wanted w"
 							   " LEFT JOIN pg_database d ON d.datname = w.dbname",
 							   1, argtypes, values, NULL, false, 0);
@@ -1202,6 +1262,9 @@ load_backup_candidates(List *specs)
 
 			d = SPI_getbinval(tuple, tupdesc, 5, &isnull);
 			cand->last_backup_at = isnull ? 0 : DatumGetTimestampTz(d);
+
+			d = SPI_getbinval(tuple, tupdesc, 6, &isnull);
+			cand->last_backup_size = isnull ? 0 : DatumGetInt64(d);
 
 			candidates = lappend(candidates, cand);
 			MemoryContextSwitchTo(oldcxt);
@@ -1298,7 +1361,9 @@ run_backup_cycle(void)
 			}
 		}
 
-		note_backup_result(cand->dbname, backup_one_database(cand->dbname));
+		note_backup_result(cand->dbname,
+						   backup_one_database(cand->dbname,
+											   cand->last_backup_size));
 	}
 
 	/* Free this cycle's specs/candidates before the next one. */
@@ -1423,12 +1488,18 @@ note_backup_result(const char *dbname, bool ok)
  * wakes immediately on its latch, so a SIGTERM (fast shutdown) is acted on at
  * once -- the child's whole process group is signalled and reaped, and the
  * non-zero status makes the backup record as failed rather than succeed.
+ *
+ * The same once-a-second poll checks the free space on the file system holding
+ * space_path, and stops the dump the same way if it falls below
+ * dbblue_backup_min_free_space, setting *out_of_space.
  */
 static int
-run_backup_command(const char *cmd)
+run_backup_command(const char *cmd, const char *space_path, bool *out_of_space)
 {
 	pid_t		pid;
 	int			status = -1;
+
+	*out_of_space = false;
 
 	/* Flush our own buffers before forking, as system() does. */
 	fflush(NULL);
@@ -1526,6 +1597,33 @@ run_backup_command(const char *cmd)
 				continue;
 			}
 
+			/*
+			 * Free-space guard: stop the dump before it fills the file system.
+			 * The check before the dump started used an estimate; this one
+			 * also catches a dump larger than its last one, and other writers
+			 * on the same file system -- the database itself among them, when
+			 * it is shared.  It runs once a second, so the margin must exceed
+			 * what pg_dump (and everything else) writes in a second, which
+			 * dbblue_backup_min_free_space's default of 2 GB does by far.
+			 */
+			if (!term_sent && min_free_space_bytes() > 0)
+			{
+				int64		avail = get_free_space(space_path);
+
+				if (avail >= 0 && avail < min_free_space_bytes())
+				{
+					ereport(WARNING,
+							(errmsg("dbblue backup launcher: free space on the file system of \"%s\" fell to %lld bytes, below dbblue_backup_min_free_space (%d MB), stopping pg_dump",
+									space_path, (long long) avail,
+									dbblue_backup_min_free_space)));
+					kill(-pid, SIGTERM);
+					term_sent = true;
+					term_at = time(NULL);
+					*out_of_space = true;
+					continue;
+				}
+			}
+
 			/* Escalate to SIGKILL if the group ignored SIGTERM past the grace. */
 			if (term_sent && time(NULL) - term_at >= DBBLUE_BACKUP_KILL_GRACE_S)
 				kill(-pid, SIGKILL);
@@ -1609,9 +1707,13 @@ remove_partial_dumps(const char *dbdir, const char *dbname)
  * pg_dump has exited successfully and the file has been fsync'd, so that a
  * file ending in .dump is always a complete, durable backup, and a "success"
  * row is never recorded for one that is not.
+ *
+ * last_backup_size, the size of the database's last successful dump (0 if
+ * none), estimates the size of this one for the free-space check before it
+ * starts (see dbblue_backup_min_free_space).
  */
 static bool
-backup_one_database(const char *dbname)
+backup_one_database(const char *dbname, int64 last_backup_size)
 {
 	char		dbdir[MAXPGPATH];
 	char		outfile[MAXPGPATH];
@@ -1623,6 +1725,7 @@ backup_one_database(const char *dbname)
 	StringInfoData cmd;
 	int			rc;
 	bool		ok = true;
+	bool		out_of_space;
 
 	if (dbblue_backup_directory == NULL || dbblue_backup_directory[0] == '\0')
 	{
@@ -1703,6 +1806,45 @@ backup_one_database(const char *dbname)
 		return false;
 	}
 
+	/*
+	 * Don't start a dump that would not fit: it needs about as much space as
+	 * its last one, and dbblue_backup_min_free_space must be left over.
+	 * (Older dumps are pruned only after this one succeeds, so they cannot
+	 * make room for it.)  Done after remove_partial_dumps(), which may have
+	 * just freed space.  The estimate can be low; run_backup_command() keeps
+	 * checking while the dump runs.  If free space cannot be read at all,
+	 * the dump goes ahead: better a backup than none.
+	 */
+	if (min_free_space_bytes() > 0)
+	{
+		int64		avail = get_free_space(dbdir);
+		int64		needed = min_free_space_bytes() + last_backup_size;
+
+		if (avail < 0)
+			ereport(WARNING,
+					(errcode_for_file_access(),
+					 errmsg("dbblue backup launcher: could not determine the free space on the file system of \"%s\": %m",
+							dbdir)));
+		else if (avail < needed)
+		{
+			ereport(WARNING,
+					(errmsg("dbblue backup launcher: not enough free disk space to back up database \"%s\": %lld bytes free on the file system of \"%s\", %lld needed",
+							dbname, (long long) avail, dbdir, (long long) needed),
+					 last_backup_size > 0 ?
+					 errdetail("That is the size of its last backup, %lld bytes, plus dbblue_backup_min_free_space (%d MB).",
+							   (long long) last_backup_size,
+							   dbblue_backup_min_free_space) :
+					 errdetail("That is dbblue_backup_min_free_space (%d MB); the database has no earlier backup to estimate this one's size from.",
+							   dbblue_backup_min_free_space),
+					 errhint("Free some space on that file system, or lower dbblue_backup_min_free_space.")));
+			record_backup_history(dbname, started_at, "failed", NULL, 0,
+								  psprintf("not enough free disk space: %lld bytes free, %lld needed",
+										   (long long) avail, (long long) needed));
+			enforce_retention(dbname, "failed");
+			return false;
+		}
+	}
+
 	initStringInfo(&cmd);
 
 	/*
@@ -1761,12 +1903,12 @@ backup_one_database(const char *dbname)
 	ereport(DEBUG3,
 			(errmsg_internal("dbblue backup launcher: executing \"%s\"", cmd.data)));
 
-	rc = run_backup_command(cmd.data);
+	rc = run_backup_command(cmd.data, dbdir, &out_of_space);
 	pfree(cmd.data);
 
 	pgstat_report_activity(STATE_IDLE, NULL);
 
-	if (rc == 0)
+	if (rc == 0 && !out_of_space)
 	{
 		struct stat statbuf;
 
@@ -1822,14 +1964,24 @@ backup_one_database(const char *dbname)
 		return true;
 	}
 
-	ereport(WARNING,
-			(errmsg("dbblue backup launcher: backing up database \"%s\" failed: %s",
-					dbname, wait_result_to_str(rc))));
-	unlink(partfile);
-	record_backup_history(dbname, started_at, "failed", NULL, 0,
-						  wait_result_to_str(rc));
-	enforce_retention(dbname, "failed");
-	return false;
+	/*
+	 * Stopped for lack of space: the dump may well have exited 0 if it had
+	 * just finished, but it was signalled, so it is discarded like any other
+	 * failure -- the space it would keep is exactly what must stay free.
+	 */
+	{
+		const char *reason = out_of_space ?
+			"stopped: free disk space fell below dbblue_backup_min_free_space" :
+			wait_result_to_str(rc);
+
+		ereport(WARNING,
+				(errmsg("dbblue backup launcher: backing up database \"%s\" failed: %s",
+						dbname, reason)));
+		unlink(partfile);
+		record_backup_history(dbname, started_at, "failed", NULL, 0, reason);
+		enforce_retention(dbname, "failed");
+		return false;
+	}
 }
 
 /*

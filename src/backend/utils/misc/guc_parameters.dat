@@ -872,6 +872,16 @@
   max => 'INT_MAX / 1000',
 },
 
+{ name => 'dbblue_backup_min_free_space', type => 'int', context => 'PGC_SIGHUP', group => 'WAL_ARCHIVING',
+  short_desc => 'Free disk space the dbblue backup launcher always leaves on the file system of dbblue_backup_directory.',
+  long_desc => 'A backup is not started unless the file system holding dbblue_backup_directory has at least this much free space plus the size of the database\'s last successful backup, and a running backup is stopped, and its partial dump removed, as soon as free space falls below this amount. When the backup directory shares a file system with the data directory, this is what keeps a backup from filling it and stopping the database. 0 turns both checks off.',
+  flags => 'GUC_UNIT_MB | GUC_NOT_IN_SAMPLE',
+  variable => 'dbblue_backup_min_free_space',
+  boot_val => '2048',
+  min => '0',
+  max => 'MAX_KILOBYTES',
+},
+
 { name => 'dbblue_backup_naptime', type => 'int', context => 'PGC_SIGHUP', group => 'WAL_ARCHIVING',
   short_desc => 'Time between dbblue backup launcher wake-ups.',
   flags => 'GUC_UNIT_S | GUC_NOT_IN_SAMPLE',

@@ -14,6 +14,7 @@ tests += {
       't/006_failure_backoff.pl',
       't/007_history_timestamps.pl',
       't/008_backup_directory_location.pl',
+      't/009_free_space.pl',
     ],
   },
 }
