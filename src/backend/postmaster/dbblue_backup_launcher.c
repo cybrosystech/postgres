@@ -1872,7 +1872,7 @@ backup_one_database(const char *dbname, int64 last_backup_size)
 						dbname)));
 		record_backup_history(dbname, started_at, "failed", NULL, 0,
 							  "dbblue_backup_directory is not set");
-		enforce_retention(dbname, "failed");
+		apply_retention(dbname);
 		return false;
 	}
 
@@ -1908,7 +1908,7 @@ backup_one_database(const char *dbname, int64 last_backup_size)
 							 data_dir_real)));
 			record_backup_history(dbname, started_at, "failed", NULL, 0,
 								  "backup directory is inside the data directory");
-			enforce_retention(dbname, "failed");
+			apply_retention(dbname);
 			return false;
 		}
 	}
@@ -1924,7 +1924,7 @@ backup_one_database(const char *dbname, int64 last_backup_size)
 		record_backup_history(dbname, started_at, "failed", NULL, 0,
 							  psprintf("could not create backup directory \"%s\": %s",
 									   dbdir, strerror(save_errno)));
-		enforce_retention(dbname, "failed");
+		apply_retention(dbname);
 		return false;
 	}
 
@@ -1940,7 +1940,7 @@ backup_one_database(const char *dbname, int64 last_backup_size)
 						dbname)));
 		record_backup_history(dbname, started_at, "failed", NULL, 0,
 							  "backup file path is too long");
-		enforce_retention(dbname, "failed");
+		apply_retention(dbname);
 		return false;
 	}
 
@@ -1978,7 +1978,7 @@ backup_one_database(const char *dbname, int64 last_backup_size)
 			record_backup_history(dbname, started_at, "failed", NULL, 0,
 								  psprintf("not enough free disk space: %lld bytes free, %lld needed",
 										   (long long) avail, (long long) needed));
-			enforce_retention(dbname, "failed");
+			apply_retention(dbname);
 			return false;
 		}
 	}
@@ -2035,7 +2035,7 @@ backup_one_database(const char *dbname, int64 last_backup_size)
 						dbname)));
 		record_backup_history(dbname, started_at, "failed", NULL, 0,
 							  "database name or path contains an invalid character");
-		enforce_retention(dbname, "failed");
+		apply_retention(dbname);
 		pfree(cmd.data);
 		return false;
 	}
@@ -2066,7 +2066,7 @@ backup_one_database(const char *dbname, int64 last_backup_size)
 			unlink(partfile);
 			record_backup_history(dbname, started_at, "failed", NULL, 0,
 								  "pg_dump exited successfully but produced no output file");
-			enforce_retention(dbname, "failed");
+			apply_retention(dbname);
 			return false;
 		}
 
@@ -2097,7 +2097,7 @@ backup_one_database(const char *dbname, int64 last_backup_size)
 
 			record_backup_history(dbname, started_at, "failed", NULL, 0,
 								  "could not write the backup file to disk durably");
-			enforce_retention(dbname, "failed");
+			apply_retention(dbname);
 			return false;
 		}
 
@@ -2147,7 +2147,7 @@ backup_one_database(const char *dbname, int64 last_backup_size)
 						dbname, reason)));
 		unlink(partfile);
 		record_backup_history(dbname, started_at, "failed", NULL, 0, reason);
-		enforce_retention(dbname, "failed");
+		apply_retention(dbname);
 		return false;
 	}
 }
