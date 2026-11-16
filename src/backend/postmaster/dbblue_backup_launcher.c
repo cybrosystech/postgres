@@ -254,6 +254,7 @@ static void note_backup_result(const char *dbname, bool ok);
 static bool backup_one_database(const char *dbname, int64 last_backup_size);
 static void apply_retention(const char *dbname);
 static void prune_resolved_failures(const char *dbname);
+static void fix_future_dated_rows(const char *dbname);
 static bool record_backup_history(const char *dbname, TimestampTz started_at,
 								  const char *status, const char *file_path,
 								  int64 file_size_bytes,
@@ -2197,6 +2198,7 @@ apply_retention(const char *dbname)
 
 	PG_TRY();
 	{
+		fix_future_dated_rows(dbname);	/* first: the others rely on the times */
 		enforce_retention(dbname, "success");
 		enforce_retention(dbname, "failed");
 		prune_resolved_failures(dbname);
@@ -2208,6 +2210,53 @@ apply_retention(const char *dbname)
 	PG_END_TRY();
 
 	MemoryContextSwitchTo(oldcxt);
+}
+
+/*
+ * fix_future_dated_rows
+ *		Reset to now the times of dbname's history rows that are dated in the
+ *		future, and say so.
+ *
+ * A row gets a future time when the server's clock was ahead while it was
+ * recorded -- e.g. a hardware clock kept in local time but read as UTC until
+ * NTP corrects it, or a wrong date typed in.  Left as is, such a row would
+ * make the waiting period (dbblue_backup_interval, counted from the last
+ * backup's start) run from that future time, skipping the database with no
+ * message until then, and would sort as the newest in retention, crowding out
+ * real backups.  Now is the best estimate of when the row was really written:
+ * the clock has only just been seen to be right again.  A minute of slack
+ * keeps a small clock step back from being reported.
+ */
+static void
+fix_future_dated_rows(const char *dbname)
+{
+	static const char *sql =
+		"UPDATE dbblue.dbblue_backup_history "
+		"SET backup_started_at = least(backup_started_at, now()), "
+		"    backup_finished_at = least(backup_finished_at, now()) "
+		"WHERE database_name = $1 "
+		"  AND (backup_started_at > now() + interval '1 minute' "
+		"       OR backup_finished_at > now() + interval '1 minute')";
+	Oid			argtypes[1] = {TEXTOID};
+	Datum		values[1];
+
+	values[0] = CStringGetTextDatum(dbname);
+
+	SetCurrentStatementStartTimestamp();
+	StartTransactionCommand();
+	SPI_connect();
+	PushActiveSnapshot(GetTransactionSnapshot());
+
+	if (SPI_execute_with_args(sql, 1, argtypes, values, NULL, false, 0) == SPI_OK_UPDATE &&
+		SPI_processed > 0)
+		ereport(WARNING,
+				(errmsg("dbblue backup launcher: %llu backup history rows of database \"%s\" were dated in the future, and have been reset to the current time",
+						(unsigned long long) SPI_processed, dbname),
+				 errdetail("The server's clock was probably ahead when they were recorded. Left as they were, backups of this database would have been skipped until that time.")));
+
+	PopActiveSnapshot();
+	SPI_finish();
+	CommitTransactionCommand();
 }
 
 /*
