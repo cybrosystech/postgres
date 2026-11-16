@@ -102,6 +102,18 @@ int			dbblue_backup_min_free_space = 2048;	/* MB; 0 disables */
 #define DBBLUE_BACKUP_KILL_GRACE_S	30
 
 /*
+ * How long pg_dump may wait for each table lock it takes at the start
+ * (--lock-wait-timeout).  pg_dump sets its own lock_timeout to 0, so without
+ * this a table locked by someone else -- e.g. an Odoo module upgrade running
+ * ALTER TABLE -- holds the dump until dbblue_backup_timeout, and since
+ * databases are dumped one at a time, every database after it waits too.
+ * With it, that dump fails after this long, is retried after the usual retry
+ * delay, and the cycle moves on.  It also keeps pg_dump from queueing behind
+ * an ALTER TABLE that is itself waiting, which would make that jam longer.
+ */
+#define DBBLUE_BACKUP_LOCK_WAIT_TIMEOUT	"30s"
+
+/*
  * pg_dump writes to <dbname>_<time>.dump.partial, which is renamed to
  * <dbname>_<time>.dump only once the dump is complete and on disk.  So a file
  * ending in .dump is always a whole backup, and one ending in .dump.partial
@@ -1982,7 +1994,8 @@ backup_one_database(const char *dbname, int64 last_backup_size)
 	 * signal it for both the timeout and a fast-shutdown.
 	 */
 	ok &= append_shell_quoted(&cmd, pg_dump_path);
-	appendStringInfoString(&cmd, " -Fc --no-password");
+	appendStringInfoString(&cmd, " -Fc --no-password --lock-wait-timeout="
+						   DBBLUE_BACKUP_LOCK_WAIT_TIMEOUT);
 
 	/*
 	 * Connect as the bootstrap superuser rather than letting pg_dump default
