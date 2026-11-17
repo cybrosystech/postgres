@@ -48,6 +48,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "access/parallel.h"
 #include "access/xact.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_class.h"
@@ -342,7 +343,13 @@ dbblue_check_backup_enabled(bool *newval, void **extra, GucSource source)
 	if (!*newval || dbblue_backup_enabled)
 		return true;
 
-	if (!IsUnderPostmaster || !IsTransactionState())
+	/*
+	 * A parallel worker copies the leader's settings one by one, so this
+	 * can run before dbblue_backup_databases has arrived and warn falsely
+	 * -- once per worker of every parallel query.  The leader has already
+	 * warned about anything real.
+	 */
+	if (!IsUnderPostmaster || !IsTransactionState() || IsParallelWorker())
 		return true;
 
 	if (dbblue_backup_database == NULL || dbblue_backup_database[0] == '\0')
@@ -497,7 +504,9 @@ dbblue_check_backup_directory(char **newval, void **extra, GucSource source)
 	if (*newval == NULL || **newval == '\0')
 		return true;
 
-	if (!IsUnderPostmaster || !IsTransactionState() || DataDir == NULL)
+	/* A parallel worker would repeat the leader's warning; see above. */
+	if (!IsUnderPostmaster || !IsTransactionState() || IsParallelWorker() ||
+		DataDir == NULL)
 		return true;
 
 	if (!is_absolute_path(*newval))
