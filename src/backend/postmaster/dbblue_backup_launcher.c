@@ -316,6 +316,7 @@ static void enforce_retention(const char *dbname, const char *status);
 static bool append_shell_quoted(StringInfo buf, const char *str);
 static void append_conninfo_dbname(StringInfo buf, const char *dbname);
 static void report_unmanaged_backups(void);
+static bool path_has_parent_component(const char *path);
 
 /*
  * dbblue_check_backup_enabled
@@ -478,8 +479,9 @@ get_real_path(const char *path, char *result)
  *		GUC check hook for dbblue_backup_directory.
  *
  * Warns, at ALTER SYSTEM time, about a value the launcher will refuse to back
- * up into (see check_backup_directory()): a relative path, or the data
- * directory or a directory inside it.  Never rejects the value: this setting
+ * up into (see check_backup_directory()): a relative path, a path with a ".."
+ * component, or the data directory or a directory inside it.  Never rejects
+ * the value: this setting
  * is read from postgresql.conf at postmaster start, where a rejected value
  * stops the server from starting at all -- far worse than not backing up --
  * and where the data directory is not even known yet on the first pass.  So
@@ -505,6 +507,16 @@ dbblue_check_backup_directory(char **newval, void **extra, GucSource source)
 						*newval),
 				 errdetail("A relative path is interpreted against the data directory, so backups would be written inside it."),
 				 errhint("Use an absolute path to a directory outside the data directory.")));
+		return true;
+	}
+
+	if (path_has_parent_component(*newval))
+	{
+		ereport(WARNING,
+				(errmsg("dbblue_backup_directory \"%s\" contains a \"..\" component, so the backup launcher will not back up into it",
+						*newval),
+				 errdetail("Retention never removes a dump whose path contains \"..\", so old backups would pile up."),
+				 errhint("Write the path without \"..\".")));
 		return true;
 	}
 
@@ -596,6 +608,9 @@ folder_unsafe_reason(const char *path, bool follow_link)
  * Refused:
  *	- a relative path: it is interpreted against the data directory (the
  *	  server's working directory), so the dumps would land inside it;
+ *	- a path with a ".." component: retention refuses to remove any dump
+ *	  whose path contains one (see get_prunable_backup_path()), so dumps
+ *	  written there would never be pruned;
  *	- a directory that does not exist (or is not a directory): it must exist
  *	  for symlinks in it to be resolved, and creating it is the operator's job,
  *	  with the ownership and permissions they choose;
@@ -626,6 +641,16 @@ check_backup_directory(void)
 						dbblue_backup_directory),
 				 errdetail("A relative path is interpreted against the data directory, so backups would be written inside it."),
 				 errhint("Set dbblue_backup_directory to an absolute path outside the data directory (changing it requires a server restart).")));
+		return false;
+	}
+
+	if (path_has_parent_component(dbblue_backup_directory))
+	{
+		ereport(WARNING,
+				(errmsg("dbblue backup launcher: dbblue_backup_directory \"%s\" contains a \"..\" component, not backing up",
+						dbblue_backup_directory),
+				 errdetail("Retention never removes a dump whose path contains \"..\", so old backups would pile up."),
+				 errhint("Write the path without \"..\" (changing it requires a server restart).")));
 		return false;
 	}
 
