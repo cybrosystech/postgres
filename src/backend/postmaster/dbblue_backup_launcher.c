@@ -505,6 +505,38 @@ get_free_space(const char *path)
 }
 
 /*
+ * folder_unsafe_reason
+ *		NULL if path is a directory owned by the operating-system user the
+ *		server runs as, writable by no one else (no group or other write
+ *		permission) and, when follow_link is false, not a symbolic link.
+ *		Otherwise why not, for a message (palloc'd).
+ *
+ * Anyone else who can create files in a folder the launcher dumps into can
+ * plant a symlink under the predictable name of the next dump, which pg_dump
+ * then opens and overwrites as the server's user -- pg_control, relation
+ * files, TDE keys -- or replace a finished dump with one whose SQL runs as
+ * superuser when it is restored.
+ */
+static const char *
+folder_unsafe_reason(const char *path, bool follow_link)
+{
+	struct stat st;
+
+	if ((follow_link ? stat(path, &st) : lstat(path, &st)) != 0)
+		return psprintf("cannot be checked: %s", strerror(errno));
+	if (S_ISLNK(st.st_mode))
+		return "is a symbolic link";
+	if (!S_ISDIR(st.st_mode))
+		return "is not a directory";
+	if (st.st_uid != geteuid())
+		return "is not owned by the operating-system user the server runs as";
+	if (st.st_mode & (S_IWGRP | S_IWOTH))
+		return psprintf("is writable by other users (mode %04o)",
+						(unsigned int) (st.st_mode & 07777));
+	return NULL;
+}
+
+/*
  * check_backup_directory
  *		Verify that dbblue_backup_directory is somewhere the launcher may
  *		write dumps, and resolve it and the data directory into
@@ -575,6 +607,26 @@ check_backup_directory(void)
 				 errhint("Create the directory, owned by the operating-system user the server runs as, outside the data directory.")));
 		backup_dir_real[0] = '\0';
 		return false;
+	}
+
+	/*
+	 * Only a directory no one else can write to (see folder_unsafe_reason()).
+	 * The setting itself may name a symlink: it is the operator's own choice,
+	 * and backup_dir_real is where it leads.
+	 */
+	{
+		const char *reason = folder_unsafe_reason(backup_dir_real, true);
+
+		if (reason != NULL)
+		{
+			ereport(WARNING,
+					(errmsg("dbblue backup launcher: dbblue_backup_directory \"%s\" %s, not backing up",
+							dbblue_backup_directory, reason),
+					 errdetail("Another user who can write there could make a backup overwrite the server's own files, or replace a backup with a malicious one."),
+					 errhint("Make it owned by the operating-system user the server runs as, and not writable by group or others (chmod go-w).")));
+			backup_dir_real[0] = '\0';
+			return false;
+		}
 	}
 
 	if (path_is_within(backup_dir_real, data_dir_real))
@@ -2056,6 +2108,27 @@ backup_one_database(const char *dbname, int64 last_backup_size)
 									   dbdir, strerror(save_errno)));
 		apply_retention(dbname);
 		return false;
+	}
+
+	/*
+	 * The database's own folder must be ours alone as well, and a real
+	 * folder: someone able to write in the backup directory before it was
+	 * secured could have created it, or put a symlink in its place.
+	 */
+	{
+		const char *reason = folder_unsafe_reason(dbdir, false);
+
+		if (reason != NULL)
+		{
+			ereport(WARNING,
+					(errmsg("dbblue backup launcher: backup directory \"%s\" of database \"%s\" %s, skipping",
+							dbdir, dbname, reason),
+					 errhint("Make it a directory owned by the operating-system user the server runs as, and not writable by group or others (chmod go-w).")));
+			record_backup_history(dbname, started_at, "failed", NULL, 0,
+								  psprintf("backup directory \"%s\" %s", dbdir, reason));
+			apply_retention(dbname);
+			return false;
+		}
 	}
 
 	remove_partial_dumps(dbdir, dbname);
