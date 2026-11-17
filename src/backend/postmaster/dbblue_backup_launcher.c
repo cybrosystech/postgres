@@ -302,7 +302,7 @@ dbblue_check_backup_enabled(bool *newval, void **extra, GucSource source)
 		ereport(WARNING,
 				(errmsg("dbblue backup launcher database \"%s\" does not exist",
 						dbblue_backup_database),
-				 errdetail("The launcher worker will fail to connect and will be retried every 5 seconds until the database exists."),
+				 errdetail("The launcher worker will fail to connect and will be retried every minute until the database exists."),
 				 errhint("Create the database, or point dbblue_backup_database at an existing one (changing it requires a server restart).")));
 
 	if (dbblue_backup_directory == NULL || dbblue_backup_directory[0] == '\0')
@@ -653,7 +653,15 @@ BackupLauncherRegister(void)
 	 * then keeps a standby's copy from ever attempting to back anything up.
 	 */
 	worker.bgw_start_time = BgWorkerStart_ConsistentState;
-	worker.bgw_restart_time = 5;
+
+	/*
+	 * Restarted a minute after it exits.  If dbblue_backup_database does not
+	 * exist or does not allow connections, connecting to it fails with FATAL
+	 * on every start; a 5-second restart filled the log with that FATAL
+	 * around the clock.  Backups run at most every naptime, so a minute's
+	 * wait after a crash or pg_terminate_backend() costs nothing.
+	 */
+	worker.bgw_restart_time = 60;
 	snprintf(worker.bgw_library_name, MAXPGPATH, "postgres");
 	snprintf(worker.bgw_function_name, BGW_MAXLEN, "BackupLauncherMain");
 	snprintf(worker.bgw_name, BGW_MAXLEN, "dbblue backup launcher");
