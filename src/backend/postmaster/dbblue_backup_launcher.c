@@ -263,6 +263,7 @@ static bool record_backup_history(const char *dbname, TimestampTz started_at,
 								  const char *error_message);
 static void enforce_retention(const char *dbname, const char *status);
 static bool append_shell_quoted(StringInfo buf, const char *str);
+static void append_conninfo_dbname(StringInfo buf, const char *dbname);
 static void report_unmanaged_backups(void);
 
 /*
@@ -2087,13 +2088,26 @@ backup_one_database(const char *dbname, int64 last_backup_size)
 	appendStringInfo(&cmd, " -p %d -f ", PostPortNumber);
 	ok &= append_shell_quoted(&cmd, partfile);
 	/*
-	 * End-of-options marker before the database name: shell-quoting stops the
-	 * shell from misreading it, but pg_dump's own getopt would still treat a
-	 * name beginning with '-' as an option.  "--" forces it to be taken as the
-	 * positional dbname.
+	 * The database, as the connection string dbname='<name>' rather than the
+	 * bare name: pg_dump hands its dbname argument to libpq, which reads any
+	 * value containing '=' (or starting with postgresql://) as a connection
+	 * string.  A database named "dbname=other" would otherwise be dumped as
+	 * database "other" -- recorded as a successful backup of the wrong
+	 * database -- and one named "host=..." would send this superuser
+	 * connection elsewhere.  Quoted, the name is always taken literally.
+	 *
+	 * "--" still ends pg_dump's options first; shell-quoting keeps the shell
+	 * from misreading the argument.
 	 */
-	appendStringInfoString(&cmd, " -- ");
-	ok &= append_shell_quoted(&cmd, dbname);
+	{
+		StringInfoData conninfo;
+
+		initStringInfo(&conninfo);
+		append_conninfo_dbname(&conninfo, dbname);
+		appendStringInfoString(&cmd, " -- ");
+		ok &= append_shell_quoted(&cmd, conninfo.data);
+		pfree(conninfo.data);
+	}
 
 	/* pg_dump's error output goes to a file, read back if it fails. */
 	appendStringInfoString(&cmd, " 2> ");
@@ -2835,6 +2849,29 @@ report_unmanaged_backups(void)
 	PG_END_TRY();
 
 	MemoryContextSwitchTo(oldcxt);
+}
+
+/*
+ * append_conninfo_dbname
+ *		Append the libpq connection string dbname='<dbname>' to buf, with any
+ *		single quote or backslash in the name escaped by a backslash, so that
+ *		libpq takes the whole name literally -- the same quoting as
+ *		appendConnStrVal() in fe_utils/string_utils.c, which is not linked
+ *		into the backend.
+ */
+static void
+append_conninfo_dbname(StringInfo buf, const char *dbname)
+{
+	const char *p;
+
+	appendStringInfoString(buf, "dbname='");
+	for (p = dbname; *p; p++)
+	{
+		if (*p == '\'' || *p == '\\')
+			appendStringInfoChar(buf, '\\');
+		appendStringInfoChar(buf, *p);
+	}
+	appendStringInfoChar(buf, '\'');
 }
 
 /*
