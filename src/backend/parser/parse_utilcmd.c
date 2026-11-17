@@ -1252,7 +1252,8 @@ transformTableLikeClause(CreateStmtContext *cxt, TableLikeClause *table_like_cla
 			CompressionMethodIsValid(attribute->attcompression) &&
 			!cxt->isforeign)
 			def->compression =
-				pstrdup(GetCompressionMethodName(attribute->attcompression));
+				pstrdup(GetCopiedCompressionMethodName(attribute->attcompression,
+													   NameStr(attribute->attname)));
 		else
 			def->compression = NULL;
 

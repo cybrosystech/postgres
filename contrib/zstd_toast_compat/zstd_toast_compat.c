@@ -31,8 +31,14 @@
  * logical replication workers and other background workers never process
  * it, so autoanalyze and subscriptions fail on zstd values.  CREATE
  * EXTENSION alone only loads the library into the session that runs the
- * install script.  _PG_init() warns when the library is loaded any way
- * other than through shared_preload_libraries.
+ * install script.
+ *
+ * Loaded any way other than through shared_preload_libraries, the library
+ * gives read-only support: _PG_init() sets zstd_hooks_cluster_wide only when
+ * preloaded, and without it core refuses COMPRESSION zstd and
+ * default_toast_compression = zstd, and writes pglz instead of zstd, so that
+ * one session cannot create data the rest of the cluster cannot read.
+ * _PG_init() warns in that case.
  *
  * IDENTIFICATION
  *	  contrib/zstd_toast_compat/zstd_toast_compat.c
@@ -87,17 +93,26 @@ _PG_init(void)
 	loaded_via_shared_preload = process_shared_preload_libraries_in_progress;
 
 	/*
+	 * Tell core whether every process has the hooks.  Only then does it
+	 * allow zstd in DDL and write zstd values; see zstd_hooks_cluster_wide.
+	 * Under EXEC_BACKEND each child reloads shared_preload_libraries, with
+	 * process_shared_preload_libraries_in_progress set, so it is set there
+	 * too.
+	 */
+	if (loaded_via_shared_preload)
+		zstd_hooks_cluster_wide = true;
+
+	/*
 	 * Loaded by session_preload_libraries, LOAD, CREATE EXTENSION or a
-	 * function call: only this process gets the hooks.  Say so, since the
-	 * failures this causes show up later, in other processes (autovacuum,
-	 * logical replication workers, other sessions).  Parallel workers
-	 * reload whatever their leader had loaded, so the leader has already
-	 * been warned.
+	 * function call: only this process gets the hooks, so core will let it
+	 * read zstd values but not create zstd columns or write zstd values.
+	 * Say so.  Parallel workers reload whatever their leader had loaded, so
+	 * the leader has already been warned.
 	 */
 	if (!loaded_via_shared_preload && !IsParallelWorker())
 		ereport(WARNING,
 				(errmsg("zstd_toast_compat is not loaded via \"shared_preload_libraries\""),
-				 errdetail("zstd support is active only in this session.  Other sessions, autovacuum workers and logical replication workers cannot read or write zstd-compressed values."),
+				 errdetail("This session can read zstd-compressed values, but cannot create zstd columns or write zstd values; values are written with pglz instead.  Other sessions, autovacuum workers and logical replication workers cannot read zstd-compressed values at all."),
 				 errhint("Add zstd_toast_compat to \"shared_preload_libraries\" and restart the server.")));
 #endif
 }
@@ -211,9 +226,10 @@ zstd_toast_compat_status(PG_FUNCTION_ARGS)
 		if (loaded_via_shared_preload)
 			PG_RETURN_TEXT_P(cstring_to_text("active in all processes (read/write, loaded via shared_preload_libraries)"));
 		else
-			PG_RETURN_TEXT_P(cstring_to_text("active in this session only -- add zstd_toast_compat to "
-											 "shared_preload_libraries and restart, otherwise other sessions, "
-											 "autovacuum and logical replication workers cannot read or write zstd values"));
+			PG_RETURN_TEXT_P(cstring_to_text("read-only, in this session only -- add zstd_toast_compat to "
+											 "shared_preload_libraries and restart; until then no zstd columns "
+											 "or values can be created, and other sessions, autovacuum and "
+											 "logical replication workers cannot read zstd values"));
 	}
 	else
 		PG_RETURN_TEXT_P(cstring_to_text("NOT active in this session -- add zstd_toast_compat to "

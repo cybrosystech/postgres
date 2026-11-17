@@ -16,11 +16,12 @@ LANGUAGE C STRICT;
 -- to unblock a specific case sees it take effect immediately in this
 -- session.
 --
--- This only affects the current session.  For zstd support in every
--- process, add zstd_toast_compat to shared_preload_libraries and restart
--- the server.  That is the only setting that reaches background processes:
--- autovacuum and logical replication workers never load
--- session_preload_libraries, so autoanalyze and subscriptions fail on zstd
--- values if the module is loaded any other way.  The library warns when it
--- is loaded outside shared_preload_libraries.
+-- This only affects the current session, and only for reading: until the
+-- library is in shared_preload_libraries, the server refuses to create zstd
+-- columns or write zstd values, since other processes could not read them.
+-- For zstd support in every process, add zstd_toast_compat to
+-- shared_preload_libraries and restart the server.  That is the only
+-- setting that reaches background processes: autovacuum and logical
+-- replication workers never load session_preload_libraries.  The library
+-- warns when it is loaded outside shared_preload_libraries.
 SELECT zstd_toast_compat_enable();

@@ -2816,7 +2816,8 @@ MergeAttributes(List *columns, const List *supers, char relpersistence,
 			newdef->generated = attribute->attgenerated;
 			if (CompressionMethodIsValid(attribute->attcompression))
 				newdef->compression =
-					pstrdup(GetCompressionMethodName(attribute->attcompression));
+					pstrdup(GetCopiedCompressionMethodName(attribute->attcompression,
+														   attributeName));
 
 			/*
 			 * Regular inheritance children are independent enough not to

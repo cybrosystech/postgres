@@ -27,6 +27,7 @@
 #include "common/pg_lzcompress.h"
 #include "miscadmin.h"
 #include "utils/guc_hooks.h"
+#include "utils/guc_tables.h"
 #include "utils/rel.h"
 #include "varatt.h"
 
@@ -45,6 +46,7 @@ bool		dbblue_allow_zstd = true;
 /* set by contrib/zstd_toast_compat on a build without USE_ZSTD */
 zstd_compress_datum_hook_type zstd_compress_datum_hook = NULL;
 zstd_decompress_datum_hook_type zstd_decompress_datum_hook = NULL;
+bool		zstd_hooks_cluster_wide = false;
 
 #define NO_COMPRESSION_SUPPORT(method) \
 	ereport(ERROR, \
@@ -65,7 +67,7 @@ zstd_decompress_datum_hook_type zstd_decompress_datum_hook = NULL;
 	ereport(ERROR, \
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED), \
 			 errmsg("compression method zstd is not available"), \
-			 errdetail("This server was not built with --with-zstd, and no module supplying zstd support is loaded."), \
+			 errdetail("This server was not built with --with-zstd, and no module supplying zstd support is loaded through shared_preload_libraries."), \
 			 errhint(ZSTD_COMPAT_HINT)))
 
 #define ZSTD_DISABLED() \
@@ -76,17 +78,25 @@ zstd_decompress_datum_hook_type zstd_decompress_datum_hook = NULL;
 			 errhint("Set dbblue_allow_zstd = on in postgresql.conf and restart to re-enable it.")))
 
 /*
- * Can this process actually compress with zstd?  Either the server was built
+ * Can the whole cluster compress with zstd?  Either the server was built
  * --with-zstd, or a loadable module (contrib/zstd_toast_compat) has supplied
- * the compression hook.
+ * the compression hook from shared_preload_libraries.
+ *
+ * It is not enough for this process to have the hook.  A module loaded into
+ * one session (LOAD, CREATE EXTENSION, session_preload_libraries) leaves
+ * every other session, autovacuum and logical replication workers without
+ * it, yet a zstd column created or a zstd value written by that session is
+ * visible to all of them -- and unreadable by them.  So DDL choosing zstd,
+ * default_toast_compression = zstd and the write path all ask this, not
+ * merely whether the hook is set here.
  */
-static bool
+bool
 zstd_compression_available(void)
 {
 #ifdef USE_ZSTD
 	return true;
 #else
-	return zstd_compress_datum_hook != NULL;
+	return zstd_compress_datum_hook != NULL && zstd_hooks_cluster_wide;
 #endif
 }
 
@@ -114,21 +124,27 @@ toast_resolve_compression(Relation rel, char cmethod)
 }
 
 /*
+ * Set by toast_compression_check_preload() once the configuration files and
+ * shared_preload_libraries have been processed.  Child processes inherit it
+ * through fork(); under EXEC_BACKEND they are covered by IsUnderPostmaster.
+ */
+static bool toast_config_loaded = false;
+
+/*
  * GUC check hook for default_toast_compression.
  *
  * Reject zstd up front when this process can't actually compress with it,
  * rather than letting the setting be accepted and then failing on the first
  * INSERT large enough to be toasted.
  *
- * Startup is exempt: libraries named in shared_preload_libraries are loaded
- * only once GUC processing is complete, so a value arriving from
+ * Initial startup is exempt: libraries named in shared_preload_libraries are
+ * loaded only once GUC processing is complete, so a value arriving from
  * postgresql.conf may well become valid moments later.  Rejecting it here
- * would break that ordering, so those sources are accepted;
- * toast_compression_check_preload() warns once the preload libraries have
- * been loaded if the value is still unusable, and the check in
- * zstd_compress_datum() remains the backstop.  What we do catch is the
- * interactive cases -- SET, and ALTER SYSTEM SET run from a live backend --
- * where the module, if it were coming at all, would already be loaded.
+ * would break that ordering, so it is accepted, and
+ * toast_compression_check_preload() settles it once the preload libraries
+ * have been loaded.  After that the answer is final: a reload of
+ * postgresql.conf, SET, and ALTER SYSTEM SET are all refused.  The check in
+ * zstd_compress_datum() remains the backstop.
  */
 bool
 check_default_toast_compression(int *newval, void **extra, GucSource source)
@@ -137,12 +153,32 @@ check_default_toast_compression(int *newval, void **extra, GucSource source)
 		return true;
 
 	/*
-	 * A cluster-wide "off" is a deliberate stance, not an ordering artifact,
-	 * so reject it from every source including startup -- unlike the
-	 * availability check below.
+	 * Reject zstd while it is disabled cluster-wide -- but only once
+	 * dbblue_allow_zstd has its final value.  While the configuration files
+	 * are first being read, settings are applied in file order, so here we
+	 * may still be looking at its boot value, or already at its new one,
+	 * depending only on which line comes first.  Judging the combination
+	 * then would make the server start or refuse to start on line order
+	 * alone; toast_compression_check_preload() resolves it instead, once
+	 * everything is loaded.  In child processes, and in the postmaster after
+	 * startup, the value can no longer change (it is PGC_POSTMASTER).
 	 */
-	if (!dbblue_allow_zstd)
+	if (!dbblue_allow_zstd && (IsUnderPostmaster || toast_config_loaded))
 	{
+		/*
+		 * The compiled-in default (zstd on a --with-zstd build) is not
+		 * something anyone asked for; it comes back whenever a setting is
+		 * removed from postgresql.conf and the configuration is reloaded.
+		 * Refusing it would leave the previous value in place and log an
+		 * error about a zstd nobody wrote, so resolve it to pglz instead,
+		 * as toast_compression_check_preload() does at startup.
+		 */
+		if (source == PGC_S_DEFAULT)
+		{
+			*newval = TOAST_PGLZ_COMPRESSION;
+			return true;
+		}
+
 		GUC_check_errcode(ERRCODE_FEATURE_NOT_SUPPORTED);
 		GUC_check_errmsg("compression method zstd is disabled on this cluster");
 		GUC_check_errdetail("dbblue_allow_zstd is off, so no new data may be compressed with zstd.");
@@ -153,12 +189,21 @@ check_default_toast_compression(int *newval, void **extra, GucSource source)
 	if (zstd_compression_available())
 		return true;
 
+	/*
+	 * Configuration file: refuse on reload, in the postmaster as well as in
+	 * backends.  The postmaster is what matters most -- every process forked
+	 * after the reload inherits its value, and would otherwise start with a
+	 * default it cannot write.  Backends without a database (and per-database
+	 * or per-role settings, which are applied before session_preload_libraries
+	 * are loaded) are still let through.
+	 */
 	if (source >= PGC_S_INTERACTIVE ||
-		(source == PGC_S_FILE && IsUnderPostmaster && OidIsValid(MyDatabaseId)))
+		(source == PGC_S_FILE &&
+		 (IsUnderPostmaster ? OidIsValid(MyDatabaseId) : toast_config_loaded)))
 	{
 		GUC_check_errcode(ERRCODE_FEATURE_NOT_SUPPORTED);
 		GUC_check_errmsg("compression method zstd is not available");
-		GUC_check_errdetail("This server was not built with --with-zstd, and no module supplying zstd support is loaded.");
+		GUC_check_errdetail("This server was not built with --with-zstd, and no module supplying zstd support is loaded through shared_preload_libraries.");
 		GUC_check_errhint(ZSTD_COMPAT_HINT);
 		return false;
 	}
@@ -167,15 +212,21 @@ check_default_toast_compression(int *newval, void **extra, GucSource source)
 }
 
 /*
- * Called by the postmaster right after shared_preload_libraries has been
- * processed.
+ * Called by the postmaster (and by a single-user backend) right after
+ * shared_preload_libraries has been processed, i.e. once the configuration
+ * is complete.
  *
- * check_default_toast_compression() has to accept zstd from postgresql.conf
+ * First it settles default_toast_compression = zstd combined with
+ * dbblue_allow_zstd = off, which the check hook cannot judge reliably while
+ * the configuration files are still being read.
+ *
+ * check_default_toast_compression() also has to accept zstd from postgresql.conf
  * at startup, because the module that supplies it is loaded afterwards.
  * Now that every preload library has had its chance to install the hooks,
- * warn if zstd is the default and still nothing can compress with it: every
- * process forked from here inherits that state, so every write of a large
- * value to a column using the default would fail.
+ * if zstd is the default and still nothing can compress with it, warn and
+ * fall back to pglz: every process forked from here inherits that state, so
+ * otherwise every write of a large value to a column using the default would
+ * fail.
  *
  * Catalog contents (columns explicitly marked COMPRESSION zstd) cannot be
  * checked here, since the postmaster has no database access; the module
@@ -184,16 +235,70 @@ check_default_toast_compression(int *newval, void **extra, GucSource source)
 void
 toast_compression_check_preload(void)
 {
-#ifndef USE_ZSTD
+	/*
+	 * zstd as the default while zstd is disabled.  The check hook lets this
+	 * through while the configuration is being read (see there), so settle
+	 * it now that both values are final: fall back to pglz, as the write
+	 * path would anyway, so that SHOW reports what is actually used and the
+	 * server starts regardless of the order of the lines.
+	 *
+	 * Warn only when someone asked for zstd.  On a build whose compiled-in
+	 * default is zstd, turning zstd off without touching
+	 * default_toast_compression is the normal way to disable it.
+	 */
 	if (default_toast_compression == TOAST_ZSTD_COMPRESSION &&
-		dbblue_allow_zstd &&
-		zstd_compress_datum_hook == NULL)
+		!dbblue_allow_zstd)
+	{
+		struct config_generic *rec = find_option("default_toast_compression",
+												 false, false, ERROR);
+		GucSource	src = rec->source;
+
+		if (src != PGC_S_DEFAULT)
+			ereport(WARNING,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("\"default_toast_compression\" is set to zstd, but \"dbblue_allow_zstd\" is off; using pglz"),
+					 errdetail("The setting comes from %s.",
+							   rec->sourcefile ?
+							   psprintf("\"%s\" line %d", rec->sourcefile, rec->sourceline) :
+							   GucSource_Names[src]),
+					 errhint("Remove the zstd setting of \"default_toast_compression\", or set it to pglz or lz4.")));
+
+		/*
+		 * Same priority as the configuration file, so that per-database and
+		 * per-role settings still override it.  A value the server merely
+		 * defaulted to stays a default, so that a later reload adding a real
+		 * setting still takes effect.
+		 */
+		SetConfigOption("default_toast_compression", "pglz", PGC_POSTMASTER,
+						src == PGC_S_DEFAULT ? PGC_S_DYNAMIC_DEFAULT : src);
+	}
+
+	/*
+	 * zstd as the default on a build without zstd, with no module supplying
+	 * it.  Left alone, every write of a large value to a column using the
+	 * default would fail.  Fall back to pglz the same way as above.
+	 */
+	if (default_toast_compression == TOAST_ZSTD_COMPRESSION &&
+		!zstd_compression_available())
+	{
+		struct config_generic *rec = find_option("default_toast_compression",
+												 false, false, ERROR);
+		GucSource	src = rec->source;
+
 		ereport(WARNING,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("\"default_toast_compression\" is set to zstd, but no module supplying zstd support is loaded"),
-				 errdetail("This server was not built with --with-zstd.  Every write of a large value to a column using the default compression method will fail."),
+				 errmsg("\"default_toast_compression\" is set to zstd, but no module supplying zstd support is loaded through \"shared_preload_libraries\"; using pglz"),
+				 rec->sourcefile ?
+				 errdetail("This server was not built with --with-zstd.  The setting comes from \"%s\" line %d.",
+						   rec->sourcefile, rec->sourceline) :
+				 errdetail("This server was not built with --with-zstd."),
 				 errhint(ZSTD_COMPAT_HINT)));
-#endif
+
+		SetConfigOption("default_toast_compression", "pglz", PGC_POSTMASTER,
+						src == PGC_S_DEFAULT ? PGC_S_DYNAMIC_DEFAULT : src);
+	}
+
+	toast_config_loaded = true;
 }
 
 /*
@@ -619,4 +724,36 @@ GetCompressionMethodName(char method)
 			elog(ERROR, "invalid compression method %c", method);
 			return NULL;		/* keep compiler quiet */
 	}
+}
+
+/*
+ * GetCopiedCompressionMethodName - name of the compression method a new
+ * column copies from an existing one
+ *
+ * Partitions, INHERITS children and LIKE ... INCLUDING COMPRESSION copy a
+ * column's compression by turning it back into a name, which is then
+ * resolved through CompressionNameToMethod() exactly as if the user had
+ * typed it.  For zstd that would refuse the copy whenever zstd is disabled
+ * or unavailable -- which is precisely when tables marked zstd are waiting
+ * to be normalized, and must still be able to get new partitions.  The user
+ * did not ask for zstd here, so copy pglz instead; that is also what the
+ * write path falls back to for such columns.  An explicit COMPRESSION zstd
+ * still goes through CompressionNameToMethod() and is still rejected.
+ */
+const char *
+GetCopiedCompressionMethodName(char method, const char *attname)
+{
+	if (method == TOAST_ZSTD_COMPRESSION &&
+		(!dbblue_allow_zstd || !zstd_compression_available()))
+	{
+		ereport(NOTICE,
+				(errmsg("column \"%s\" will use compression method pglz instead of zstd",
+						attname),
+				 errdetail(!dbblue_allow_zstd
+						   ? "Compression method zstd is disabled on this cluster."
+						   : "Compression method zstd is not available on this server.")));
+		return "pglz";
+	}
+
+	return GetCompressionMethodName(method);
 }

@@ -69,6 +69,16 @@ toast_compress_datum(Datum value, char cmethod)
 		cmethod = TOAST_PGLZ_COMPRESSION;
 
 	/*
+	 * Likewise when zstd is not available to the whole cluster: on a build
+	 * without zstd, with no module supplying it from shared_preload_libraries.
+	 * A zstd value written here could not be read by other sessions,
+	 * autovacuum or logical replication workers, even if this session has
+	 * loaded such a module itself.
+	 */
+	if (cmethod == TOAST_ZSTD_COMPRESSION && !zstd_compression_available())
+		cmethod = TOAST_PGLZ_COMPRESSION;
+
+	/*
 	 * Call appropriate compression routine for the compression method.
 	 */
 	switch (cmethod)

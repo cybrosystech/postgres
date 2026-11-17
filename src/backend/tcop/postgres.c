@@ -33,6 +33,7 @@
 
 #include "access/parallel.h"
 #include "access/printtup.h"
+#include "access/toast_compression.h"
 #include "access/xact.h"
 #include "catalog/pg_type.h"
 #include "commands/async.h"
@@ -4254,6 +4255,9 @@ PostgresSingleUserMain(int argc, char *argv[],
 	 * process any libraries that should be preloaded at postmaster start
 	 */
 	process_shared_preload_libraries();
+
+	/* settle the TOAST compression settings, now that they are all loaded */
+	toast_compression_check_preload();
 
 	/* Initialize MaxBackends */
 	InitializeMaxBackends();

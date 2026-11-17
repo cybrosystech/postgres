@@ -490,6 +490,8 @@ SELECT JSON_QUERY(jsonb 'null', '$"Xyz"' PASSING 1 AS "Xyz");
 
 -- Test PASSING and toasted values
 CREATE TABLE test_passing_toast (t text);
+-- dbblue: pin the method; zstd would compress the first row small enough to stay inline
+ALTER TABLE test_passing_toast ALTER COLUMN t SET COMPRESSION pglz;
 ALTER TABLE test_passing_toast ALTER COLUMN t SET STORAGE EXTENDED;
 INSERT INTO test_passing_toast(t)
   SELECT repeat(string_agg(to_char(g.i, 'FM0000'), ''), 50)

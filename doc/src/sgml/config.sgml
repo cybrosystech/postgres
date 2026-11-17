@@ -10518,15 +10518,25 @@ COPY postgres_log FROM '/full/path/to/logfile.csv' WITH csv;
         support, such as
         <filename>contrib/zstd_toast_compat</filename>, loaded through
         <xref linkend="guc-shared-preload-libraries"/>; otherwise setting
-        this parameter to <literal>zstd</literal> is rejected, and if it is
-        set in <filename>postgresql.conf</filename> a warning is logged at
-        server start.  Load the module through
+        this parameter to <literal>zstd</literal> is rejected.  If it is set
+        in <filename>postgresql.conf</filename>, the server still starts, but
+        logs a warning naming the file and line and uses
+        <literal>pglz</literal> as the default instead; on a configuration
+        reload the setting is rejected and the previous value kept.  Load the
+        module through
         <varname>shared_preload_libraries</varname> only:
         autovacuum workers, logical replication workers and other background
         workers never load <xref linkend="guc-session-preload-libraries"/>,
         so with any other method they cannot read or write
         <literal>zstd</literal> values, and automatic analyze and
-        subscriptions fail on such tables.  It is also
+        subscriptions fail on such tables.  A module loaded any other way
+        (<command>LOAD</command>, <command>CREATE EXTENSION</command>,
+        <varname>session_preload_libraries</varname>) therefore only lets
+        that session read <literal>zstd</literal> values: the server does
+        not accept <literal>zstd</literal> for this parameter or as a column
+        option, and writes <literal>pglz</literal> instead of
+        <literal>zstd</literal>, so that no session creates data the rest of
+        the cluster cannot read.  It is also
         rejected outright when <xref linkend="guc-dbblue-allow-zstd"/> is
         off.  Note that data compressed with <literal>zstd</literal> cannot
         be read by a server that lacks zstd support, which matters when a
@@ -10567,23 +10577,46 @@ COPY postgres_log FROM '/full/path/to/logfile.csv' WITH csv;
         <literal>zstd</literal> remain writable; their values are
         compressed with <literal>pglz</literal> instead of raising an
         error, so existing tables keep working until they are converted.
+        New partitions, inheritance children and
+        <literal>LIKE ... INCLUDING COMPRESSION</literal> copies of such
+        tables can still be created; their columns get
+        <literal>pglz</literal> instead of copying <literal>zstd</literal>,
+        with a notice.
+       </para>
+
+       <para>
+        If the configuration files set
+        <xref linkend="guc-default-toast-compression"/> to
+        <literal>zstd</literal> while this parameter is
+        <literal>off</literal>, the server still starts, in whatever order
+        the two settings appear: it logs a warning naming the file and line,
+        and uses <literal>pglz</literal> as the default instead.
        </para>
 
        <para>
         Setting <xref linkend="guc-default-toast-compression"/> to something
         other than <literal>zstd</literal> only changes the
         <emphasis>default</emphasis>; a session can still request zstd
-        explicitly.  Turning this parameter off is therefore the only way to
-        guarantee that a cluster produces no new zstd-compressed data.
-        That is required when the data directory must remain readable by a
-        server built without zstd support, such as a standby running
-        unmodified <productname>PostgreSQL</productname>.
+        explicitly.  Turning this parameter off is the only way to ensure that
+        no value is newly compressed with zstd.  It does not remove zstd from
+        the cluster: values already compressed with zstd stay as they are, and
+        are copied unchanged by statements such as
+        <command>INSERT ... SELECT</command>,
+        <command>CREATE TABLE ... AS</command> and
+        <command>REFRESH MATERIALIZED VIEW</command>, even into columns using
+        another method.
        </para>
 
        <para>
-        Turning it off does not convert data that is already compressed with
-        zstd.  Use the <filename>contrib/dbblue_toast_tools</filename>
-        extension to find and rewrite such values.
+        A data directory that must be readable by a server built without zstd
+        support, such as a standby running unmodified
+        <productname>PostgreSQL</productname>, therefore needs three steps:
+        turn this parameter off, rewrite the existing zstd values with
+        <function>dbblue_toast_normalize</function> from
+        <filename>contrib/dbblue_toast_tools</filename>, and confirm with
+        <function>dbblue_toast_check</function> that none remain (repeating the
+        rewrite for values copied while it ran).  From then on, with this
+        parameter off, no zstd data can reappear.
        </para>
       </listitem>
      </varlistentry>

@@ -21,6 +21,9 @@ my $filler_size = 1900;
 $node = PostgreSQL::Test::Cluster->new('test');
 $node->init(no_data_checksums => 1);
 $node->append_conf('postgresql.conf', 'autovacuum=off');
+# dbblue: the tests corrupt pages by searching for plaintext keys, which
+# zstd (the default on --with-zstd builds) compresses beyond recognition
+$node->append_conf('postgresql.conf', 'default_toast_compression=pglz');
 $node->start;
 $blksize = int($node->safe_psql('postgres', 'SHOW block_size;'));
 $node->safe_psql('postgres', q(CREATE EXTENSION amcheck));

@@ -110,6 +110,19 @@ extern PGDLLIMPORT zstd_compress_datum_hook_type zstd_compress_datum_hook;
 typedef varlena *(*zstd_decompress_datum_hook_type) (const varlena *value);
 extern PGDLLIMPORT zstd_decompress_datum_hook_type zstd_decompress_datum_hook;
 
+/*
+ * A module installing zstd_compress_datum_hook must set this to true when,
+ * and only when, it is being loaded from shared_preload_libraries
+ * (process_shared_preload_libraries_in_progress).  Only then does every
+ * process have the hooks, and only then will the server write zstd: tables
+ * marked zstd, and values compressed with zstd, are visible to the whole
+ * cluster, so the method must be usable by all of it.  A module loaded into
+ * a single session still lets that session read zstd values.
+ */
+extern PGDLLIMPORT bool zstd_hooks_cluster_wide;
+
+extern bool zstd_compression_available(void);
+
 /* other stuff */
 struct RelationData;
 extern char toast_resolve_compression(struct RelationData *rel, char cmethod);
@@ -117,5 +130,7 @@ extern void toast_compression_check_preload(void);
 extern ToastCompressionId toast_get_compression_id(varlena *attr);
 extern char CompressionNameToMethod(const char *compression);
 extern const char *GetCompressionMethodName(char method);
+extern const char *GetCopiedCompressionMethodName(char method,
+												  const char *attname);
 
 #endif							/* TOAST_COMPRESSION_H */

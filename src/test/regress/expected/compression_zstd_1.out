@@ -1,0 +1,17 @@
+-- Tests for TOAST compression with zstd
+-- zstd is listed as a value of default_toast_compression on every build, so
+-- probe whether it can actually be used: it can't on a build without
+-- --with-zstd unless zstd_toast_compat is in shared_preload_libraries, nor
+-- when dbblue_allow_zstd is off.
+CREATE FUNCTION pg_temp.zstd_usable() RETURNS boolean LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM set_config('default_toast_compression', 'zstd', true);
+  RETURN true;
+EXCEPTION WHEN feature_not_supported THEN
+  RETURN false;
+END $$;
+SELECT NOT pg_temp.zstd_usable() AS skip_test \gset
+\if :skip_test
+   \echo '*** skipping TOAST tests with zstd (not supported) ***'
+*** skipping TOAST tests with zstd (not supported) ***
+   \quit
