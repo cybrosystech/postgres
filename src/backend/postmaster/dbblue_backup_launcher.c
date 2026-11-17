@@ -938,6 +938,54 @@ lookup_relation(const char *nspname, const char *relname,
 }
 
 /*
+ * create_history_guard
+ *		Put a trigger on dbblue.dbblue_backup_history that refuses INSERT,
+ *		UPDATE and DELETE by anyone but a superuser.
+ *
+ * The table's grants already allow non-superusers nothing but SELECT, but
+ * members of pg_write_all_data bypass grants.  Retention deletes the dump
+ * files of the rows it prunes, so such a member could add fake "success"
+ * rows that push the real ones past dbblue_backup_retention_count -- and the
+ * launcher itself would then delete every real backup from disk.  Triggers
+ * are not bypassed by pg_write_all_data, and only the table's owner (the
+ * bootstrap superuser) can disable or drop this one.
+ *
+ * Runs on every start, so existing installations get it too.  Needs
+ * PL/pgSQL; without it, the guard is skipped with a WARNING rather than
+ * stopping backups.
+ */
+static void
+create_history_guard(void)
+{
+	if (SPI_execute("SELECT 1 FROM pg_catalog.pg_language WHERE lanname = 'plpgsql'",
+					true, 0) != SPI_OK_SELECT || SPI_processed != 1)
+	{
+		ereport(WARNING,
+				(errmsg("dbblue backup launcher: PL/pgSQL is not installed in database \"%s\", so dbblue.dbblue_backup_history is not protected against changes by pg_write_all_data members",
+						dbblue_backup_database)));
+		return;
+	}
+
+	if (SPI_execute("CREATE OR REPLACE FUNCTION dbblue.dbblue_backup_history_guard() "
+					"RETURNS trigger LANGUAGE plpgsql "
+					"SET search_path = pg_catalog, pg_temp AS $$ "
+					"BEGIN "
+					"  IF NOT (SELECT rolsuper FROM pg_catalog.pg_roles WHERE rolname = current_user) THEN "
+					"    RAISE EXCEPTION 'dbblue.dbblue_backup_history can only be changed by the backup launcher' "
+					"      USING ERRCODE = 'insufficient_privilege'; "
+					"  END IF; "
+					"  RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END; "
+					"END $$",
+					false, 0) != SPI_OK_UTILITY ||
+		SPI_execute("CREATE OR REPLACE TRIGGER dbblue_backup_history_guard "
+					"BEFORE INSERT OR UPDATE OR DELETE ON dbblue.dbblue_backup_history "
+					"FOR EACH ROW EXECUTE FUNCTION dbblue.dbblue_backup_history_guard()",
+					false, 0) != SPI_OK_UTILITY)
+		ereport(WARNING,
+				(errmsg("dbblue backup launcher: failed to create the guard trigger on dbblue.dbblue_backup_history")));
+}
+
+/*
  * create_history_objects
  *		The body of ensure_schema(); runs inside its transaction and SPI
  *		connection.  Returns false, after a WARNING, if the history table
@@ -1057,6 +1105,8 @@ create_history_objects(void)
 				(errmsg("dbblue backup launcher: failed to create index on dbblue.dbblue_backup_history")));
 		return false;
 	}
+
+	create_history_guard();
 
 	/*
 	 * Read-only to everyone, writable by no one but the owning worker.
