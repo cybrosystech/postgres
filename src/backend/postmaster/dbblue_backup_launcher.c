@@ -882,8 +882,18 @@ BackupLauncherMain(Datum main_arg)
 		if (ShutdownRequestPending)
 			break;
 
+		/*
+		 * Run a cycle right after a reload instead of sleeping until the
+		 * wake-up computed from the old settings (up to the old naptime
+		 * away), so that a newly listed database, a lower retention count or
+		 * the retries reload_configuration() announces happen now.  A cycle
+		 * still backs up only the databases that are due.
+		 */
 		if (ConfigReloadPending)
+		{
 			reload_configuration();
+			next_run = 0;
+		}
 
 		if (dbblue_backup_enabled && !RecoveryInProgress())
 		{
