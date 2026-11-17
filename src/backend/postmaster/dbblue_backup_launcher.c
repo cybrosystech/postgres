@@ -58,7 +58,9 @@
 #include "lib/stringinfo.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
+#include "mb/pg_wchar.h"
 #include "pgstat.h"
+#include "portability/instr_time.h"
 #include "postmaster/bgworker.h"
 #include "postmaster/dbblue_backup_launcher.h"
 #include "postmaster/interrupt.h"
@@ -125,6 +127,39 @@ static const char *const timed_out_reason = "stopped: exceeded dbblue_backup_tim
 
 /* Set by backup_one_database(): its last attempt was stopped by the timeout. */
 static bool last_attempt_timed_out = false;
+
+/*
+ * Process group of the running pg_dump, 0 if none.  backup_launcher_quickdie()
+ * kills it when the postmaster tells this worker to exit at once.
+ */
+static volatile pid_t dump_pgid = 0;
+
+/*
+ * backup_launcher_quickdie
+ *		SIGQUIT handler: on an immediate shutdown or a crash-restart, kill the
+ *		running pg_dump's process group too, then exit at once, as
+ *		SignalHandlerForCrashExit() does.  pg_dump runs in a process group of
+ *		its own, which the postmaster's signal to this worker does not reach;
+ *		without this it would run on until its own server connection died.
+ *		Only async-signal-safe calls here.
+ */
+static void
+backup_launcher_quickdie(SIGNAL_ARGS)
+{
+	if (dump_pgid > 0)
+		kill(-dump_pgid, SIGKILL);
+	_exit(2);
+}
+
+/* Seconds on a monotonic clock, for timeouts that a time change must not affect. */
+static double
+monotonic_seconds(void)
+{
+	instr_time	now;
+
+	INSTR_TIME_SET_CURRENT(now);
+	return INSTR_TIME_GET_DOUBLE(now);
+}
 
 /*
  * pg_dump writes to <dbname>_<time>.dump.partial, which is renamed to
@@ -262,7 +297,8 @@ static bool ensure_schema(void);
 static bool resolve_environment(void);
 static List *parse_configured_databases(void);
 static List *load_backup_candidates(List *specs);
-static void run_backup_cycle(void);
+static TimestampTz run_backup_cycle(void);
+static void backup_launcher_quickdie(SIGNAL_ARGS);
 static void reload_configuration(void);
 static void warn_if_backup_database_listed(void);
 static int64 retry_delay_secs(int failures);
@@ -751,6 +787,7 @@ BackupLauncherMain(Datum main_arg)
 
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
+	pqsignal(SIGQUIT, backup_launcher_quickdie);
 	BackgroundWorkerUnblockSignals();
 
 	ereport(LOG, (errmsg("dbblue backup launcher started")));
@@ -818,8 +855,17 @@ BackupLauncherMain(Datum main_arg)
 		{
 			if (!launcher_connected)
 			{
+				/*
+				 * Connect outside the recovery block's reach: an ERROR while
+				 * the connection is half set up must end the process (as it
+				 * would in any backend) rather than be "recovered" from by
+				 * looping round to connect again on a half-initialized
+				 * backend.  With no exception stack, ERROR becomes FATAL.
+				 */
+				PG_exception_stack = NULL;
 				BackgroundWorkerInitializeConnection(dbblue_backup_database,
 													 NULL, 0);
+				PG_exception_stack = &local_sigjmp_buf;
 
 				/*
 				 * Bound how long the launcher will wait for a lock while
@@ -861,11 +907,28 @@ BackupLauncherMain(Datum main_arg)
 
 				if (next_run == 0 || now >= next_run)
 				{
+					TimestampTz next_due;
+
 					/* Checked every cycle; logged only on change, or daily. */
 					report_unmanaged_backups();
-					run_backup_cycle();
+					next_due = run_backup_cycle();
+
+					/*
+					 * Wake up after naptime, or as soon as the next database
+					 * is due if that is sooner -- so that a backup starts when
+					 * it is due, not up to a naptime later, which made each
+					 * backup start a little later than the one before.
+					 */
 					next_run = GetCurrentTimestamp() +
 						(int64) dbblue_backup_naptime * USECS_PER_SEC;
+					if (next_due != 0 && next_due < next_run)
+						next_run = next_due;
+
+					/* This cycle's working memory, and its table statistics. */
+					MemoryContextSwitchTo(TopMemoryContext);
+					MemoryContextReset(launcher_cxt);
+					MemoryContextSwitchTo(launcher_cxt);
+					(void) pgstat_report_stat(false);
 				}
 
 				sleep_ms = (long) ((next_run - GetCurrentTimestamp()) / 1000);
@@ -943,6 +1006,20 @@ resolve_environment(void)
 			list_free(elemlist);
 			pfree(rawstring);
 		}
+	}
+
+	/*
+	 * pg_dump connects through this server's own Unix socket.  With none
+	 * configured it would fall back to libpq's compiled-in socket directory,
+	 * where any socket -- not necessarily this server's -- may be listening.
+	 */
+	if (socket_dir == NULL)
+	{
+		ereport(WARNING,
+				(errmsg("dbblue backup launcher: unix_socket_directories is empty, not backing up"),
+				 errdetail("pg_dump connects to this server through its Unix socket."),
+				 errhint("Set unix_socket_directories (changing it requires a server restart).")));
+		return false;
 	}
 
 	ereport(LOG,
@@ -1471,16 +1548,21 @@ load_backup_candidates(List *specs)
  *		One full pass: resolve the current state of every configured
  *		database, then back up whichever ones exist, accept connections,
  *		are not templates, and are past their cooldown.
+ *
+ * Returns when the earliest of the databases it skipped as not yet due will
+ * be due (0 if none), so that the caller can wake up then.  Its memory lives
+ * in launcher_cxt, which the caller resets afterwards.
  */
-static void
+static TimestampTz
 run_backup_cycle(void)
 {
 	List	   *specs = parse_configured_databases();
 	List	   *candidates;
 	ListCell   *lc;
+	TimestampTz next_due = 0;
 
 	if (specs == NIL)
-		return;
+		return 0;
 
 	candidates = load_backup_candidates(specs);
 
@@ -1540,7 +1622,14 @@ run_backup_cycle(void)
 		if (cand->last_backup_at != 0 &&
 			now < cand->last_backup_at +
 			(int64) dbblue_backup_interval * USECS_PER_SEC)
+		{
+			TimestampTz due = cand->last_backup_at +
+				(int64) dbblue_backup_interval * USECS_PER_SEC;
+
+			if (next_due == 0 || due < next_due)
+				next_due = due;
 			continue;
+		}
 
 		/* Failing lately?  Then wait out its retry delay (see BackupRetryState). */
 		if (retry_state != NULL)
@@ -1552,6 +1641,11 @@ run_backup_cycle(void)
 				now < rs->last_failure_at +
 				retry_delay_secs(rs->failures) * USECS_PER_SEC)
 			{
+				TimestampTz due = rs->last_failure_at +
+					retry_delay_secs(rs->failures) * USECS_PER_SEC;
+
+				if (next_due == 0 || due < next_due)
+					next_due = due;
 				ereport(DEBUG1,
 						(errmsg_internal("dbblue backup launcher: database \"%s\" is waiting out its retry delay after %d failed attempts",
 										 cand->dbname, rs->failures)));
@@ -1583,10 +1677,7 @@ run_backup_cycle(void)
 						   cand->last_backup_at);
 	}
 
-	/* Free this cycle's specs/candidates before the next one. */
-	MemoryContextSwitchTo(TopMemoryContext);
-	MemoryContextReset(launcher_cxt);
-	MemoryContextSwitchTo(launcher_cxt);
+	return next_due;
 }
 
 /*
@@ -1782,15 +1873,28 @@ run_backup_command(const char *cmd, const char *space_path,
 {
 	pid_t		pid;
 	int			status = -1;
+	sigset_t	save_mask;
 
 	*stop_reason = NULL;
+
+	/* A shutdown already asked for: don't start a dump only to kill it. */
+	if (ShutdownRequestPending)
+		return -1;
 
 	/* Flush our own buffers before forking, as system() does. */
 	fflush(NULL);
 
+	/*
+	 * Block signals across fork(), so that none is handled in the child by
+	 * this worker's own handlers (which only set flags in our memory, so a
+	 * SIGTERM sent to the new process group would be swallowed and pg_dump
+	 * would start regardless).  The child resets them before exec.
+	 */
+	sigprocmask(SIG_SETMASK, &BlockSig, &save_mask);
 	pid = fork();
 	if (pid < 0)
 	{
+		sigprocmask(SIG_SETMASK, &save_mask, NULL);
 		ereport(WARNING,
 				(errmsg("dbblue backup launcher: could not fork to run pg_dump: %m")));
 		return -1;
@@ -1798,18 +1902,28 @@ run_backup_command(const char *cmd, const char *space_path,
 	if (pid == 0)
 	{
 		/*
-		 * Child: start a new process group so the whole pipeline (the "timeout"
-		 * wrapper and the pg_dump beneath it) can be signalled together, then
-		 * run exactly the command the caller built, via the shell as system()
-		 * would.
+		 * Child: start a new process group so the whole pipeline (the shell
+		 * and the pg_dump beneath it) can be signalled together, put the
+		 * signals back to their defaults -- a signal already sent to the group
+		 * then acts on it as soon as they are unblocked -- and run exactly the
+		 * command the caller built, via the shell as system() would.
 		 */
 		setpgid(0, 0);
+		signal(SIGTERM, SIG_DFL);
+		signal(SIGINT, SIG_DFL);
+		signal(SIGQUIT, SIG_DFL);
+		signal(SIGHUP, SIG_DFL);
+		signal(SIGUSR1, SIG_DFL);
+		signal(SIGUSR2, SIG_DFL);
+		sigprocmask(SIG_SETMASK, &UnBlockSig, NULL);
 		execl("/bin/sh", "sh", "-c", cmd, (char *) NULL);
 		_exit(127);				/* only reached if exec itself failed */
 	}
 
 	/* Parent: set the group too, race-free (harmless if the child already did). */
 	setpgid(pid, pid);
+	dump_pgid = pid;			/* for backup_launcher_quickdie() */
+	sigprocmask(SIG_SETMASK, &save_mask, NULL);
 
 	/*
 	 * A cancel must not raise an ERROR in the loop below: that would leave
@@ -1820,9 +1934,10 @@ run_backup_command(const char *cmd, const char *space_path,
 
 	PG_TRY();
 	{
-		time_t		start = time(NULL);
+		/* A monotonic clock: a change of the system time must not end a dump. */
+		double		start = monotonic_seconds();
 		bool		term_sent = false;	/* SIGTERM (timeout/shutdown) sent? */
-		time_t		term_at = 0;		/* when, so SIGKILL can follow after grace */
+		double		term_at = 0;		/* when, so SIGKILL can follow after grace */
 
 		for (;;)
 		{
@@ -1834,6 +1949,8 @@ run_backup_command(const char *cmd, const char *space_path,
 			{
 				ereport(WARNING,
 						(errmsg("dbblue backup launcher: waitpid for pg_dump failed: %m")));
+				/* Can't watch it any more: don't leave it running. */
+				kill(-pid, SIGKILL);
 				status = -1;
 				break;
 			}
@@ -1868,7 +1985,7 @@ run_backup_command(const char *cmd, const char *space_path,
 							(errmsg("dbblue backup launcher: backup cancelled by request, stopping pg_dump")));
 					kill(-pid, SIGTERM);
 					term_sent = true;
-					term_at = time(NULL);
+					term_at = monotonic_seconds();
 					*stop_reason = "stopped: cancelled by pg_cancel_backend()";
 					continue;
 				}
@@ -1883,7 +2000,7 @@ run_backup_command(const char *cmd, const char *space_path,
 			{
 				kill(-pid, SIGTERM);
 				term_sent = true;
-				term_at = time(NULL);
+				term_at = monotonic_seconds();
 				continue;
 			}
 
@@ -1894,14 +2011,14 @@ run_backup_command(const char *cmd, const char *space_path,
 			 * timeout of 0 disables the limit.
 			 */
 			if (!term_sent && dbblue_backup_timeout > 0 &&
-				time(NULL) - start >= dbblue_backup_timeout)
+				monotonic_seconds() - start >= dbblue_backup_timeout)
 			{
 				ereport(WARNING,
 						(errmsg("dbblue backup launcher: pg_dump exceeded dbblue_backup_timeout (%d s), terminating",
 								dbblue_backup_timeout)));
 				kill(-pid, SIGTERM);
 				term_sent = true;
-				term_at = time(NULL);
+				term_at = monotonic_seconds();
 				*stop_reason = timed_out_reason;
 				continue;
 			}
@@ -1927,14 +2044,14 @@ run_backup_command(const char *cmd, const char *space_path,
 									dbblue_backup_min_free_space)));
 					kill(-pid, SIGTERM);
 					term_sent = true;
-					term_at = time(NULL);
+					term_at = monotonic_seconds();
 					*stop_reason = "stopped: free disk space fell below dbblue_backup_min_free_space";
 					continue;
 				}
 			}
 
 			/* Escalate to SIGKILL if the group ignored SIGTERM past the grace. */
-			if (term_sent && time(NULL) - term_at >= DBBLUE_BACKUP_KILL_GRACE_S)
+			if (term_sent && monotonic_seconds() - term_at >= DBBLUE_BACKUP_KILL_GRACE_S)
 				kill(-pid, SIGKILL);
 		}
 	}
@@ -1943,10 +2060,12 @@ run_backup_command(const char *cmd, const char *space_path,
 		/* Never leave pg_dump running unwatched: kill and reap it first. */
 		kill(-pid, SIGKILL);
 		(void) waitpid(pid, NULL, 0);
+		dump_pgid = 0;
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
 
+	dump_pgid = 0;
 	RESUME_CANCEL_INTERRUPTS();
 
 	/*
@@ -1997,7 +2116,35 @@ read_dump_errors(void)
 	while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
 		buf[--len] = '\0';
 
-	return text[0] != '\0' ? pstrdup(text) : NULL;
+	if (text[0] == '\0')
+		return NULL;
+
+	/*
+	 * It goes into a text column, so it must be valid in the database's
+	 * encoding: pg_dump writes in the OS locale's, and the 1 kB tail can
+	 * start in the middle of a multibyte character.  Replace each byte that
+	 * does not begin a valid character with '?'.
+	 */
+	{
+		char	   *out = pstrdup(text);
+		int			enc = GetDatabaseEncoding();
+		int			left = strlen(out);
+		char	   *p = out;
+
+		while (left > 0)
+		{
+			int			l = pg_encoding_verifymbchar(enc, p, left);
+
+			if (l <= 0)
+			{
+				*p = '?';
+				l = 1;
+			}
+			p += l;
+			left -= l;
+		}
+		return out;
+	}
 }
 
 /*
@@ -2103,7 +2250,25 @@ backup_one_database(const char *dbname, int64 last_backup_size)
 	(void) localtime_r(&now_t, &lt);
 	strftime(timebuf, sizeof(timebuf), "%Y%m%d_%H%M%S", &lt);
 
-	snprintf(dbdir, sizeof(dbdir), "%s/%s", dbblue_backup_directory, dbname);
+	/*
+	 * Every path this backup uses, checked for length before anything is
+	 * created on disk -- a truncated path would name some other folder.
+	 */
+	if (snprintf(dbdir, sizeof(dbdir), "%s/%s",
+				 dbblue_backup_directory, dbname) >= MAXPGPATH ||
+		snprintf(outfile, sizeof(outfile), "%s/%s_%s.dump",
+				 dbdir, dbname, timebuf) >= MAXPGPATH ||
+		snprintf(partfile, sizeof(partfile), "%s%s",
+				 outfile, DBBLUE_BACKUP_PARTIAL_SUFFIX) >= MAXPGPATH)
+	{
+		ereport(WARNING,
+				(errmsg("dbblue backup launcher: backup file path for database \"%s\" is too long, skipping",
+						dbname)));
+		record_backup_history(dbname, started_at, "failed", NULL, 0,
+							  "backup file path is too long");
+		apply_retention(dbname);
+		return false;
+	}
 
 	/*
 	 * The database's own directory must not be inside the data directory
@@ -2173,20 +2338,6 @@ backup_one_database(const char *dbname, int64 last_backup_size)
 	}
 
 	remove_partial_dumps(dbdir, dbname);
-
-	if (snprintf(outfile, sizeof(outfile), "%s/%s_%s.dump",
-				 dbdir, dbname, timebuf) >= MAXPGPATH ||
-		snprintf(partfile, sizeof(partfile), "%s%s",
-				 outfile, DBBLUE_BACKUP_PARTIAL_SUFFIX) >= MAXPGPATH)
-	{
-		ereport(WARNING,
-				(errmsg("dbblue backup launcher: backup file path for database \"%s\" is too long, skipping",
-						dbname)));
-		record_backup_history(dbname, started_at, "failed", NULL, 0,
-							  "backup file path is too long");
-		apply_retention(dbname);
-		return false;
-	}
 
 	/*
 	 * Don't start a dump that would not fit: it needs about as much space as
