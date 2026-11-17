@@ -2650,6 +2650,30 @@ looks_like_our_dump(const char *path, const char *dbname)
 }
 
 /*
+ * dump_is_gone
+ *		True only if path no longer exists while the folder it was in still
+ *		does, i.e. the file was deleted.  False when the folder is missing
+ *		too -- a backup disk that is not mounted looks just like that -- and
+ *		when the file cannot be checked at all (permissions, I/O errors).
+ *
+ *		Retention deletes a history row only once its file is gone, so that
+ *		a dump that is merely out of reach for now never loses its row.
+ */
+static bool
+dump_is_gone(const char *path)
+{
+	char		folder[MAXPGPATH];
+	struct stat st;
+
+	if (lstat(path, &st) == 0 || errno != ENOENT)
+		return false;			/* still there, or can't tell */
+
+	strlcpy(folder, path, sizeof(folder));
+	get_parent_directory(folder);
+	return stat(folder, &st) == 0;	/* folder there, file not: deleted */
+}
+
+/*
  * enforce_retention
  *		Delete backups of dbname with the given status beyond
  *		dbblue_backup_retention_count, both the dump file (if any) and the
@@ -2726,8 +2750,6 @@ enforce_retention(const char *dbname, const char *status)
 			if (file_path != NULL)
 			{
 				char		safe_path[MAXPGPATH];
-				struct stat st;
-
 				bool		prunable = get_prunable_backup_path(dbname, file_path,
 																safe_path);
 
@@ -2737,13 +2759,19 @@ enforce_retention(const char *dbname, const char *status)
 				 * Our dump in an earlier backup directory is kept, and so is
 				 * its row: the row is the only record of where the dump is,
 				 * and report_unmanaged_backups() reports it from there.  Once
-				 * the file has been deleted by hand, the row goes too.
+				 * the file has been deleted by hand, the row goes too -- but
+				 * only then (see dump_is_gone()), not while its disk is
+				 * unmounted or the file cannot be checked.
 				 *
 				 * Any other path is refused, and its row deleted.
+				 *
+				 * A row is deleted only once its file is known to be gone:
+				 * a dump that could not be removed keeps its row, so that it
+				 * is retried next cycle rather than left on disk untracked.
 				 */
 				if (!prunable && looks_like_our_dump(file_path, dbname))
 				{
-					if (lstat(file_path, &st) == 0)
+					if (!dump_is_gone(file_path))
 						continue;	/* keep row and file */
 				}
 				else if (!prunable)
@@ -2754,11 +2782,23 @@ enforce_retention(const char *dbname, const char *status)
 									dbname),
 							 errdetail("Retention removes only files named \"%s/%s/%s_*.dump\". The row has been deleted; the file was left in place.",
 									   dbblue_backup_directory, dbname, dbname)));
-				else if (unlink(safe_path) != 0 && errno != ENOENT)
-					ereport(WARNING,
-							(errcode_for_file_access(),
-							 errmsg("dbblue backup launcher: could not remove old backup \"%s\": %m",
-									safe_path)));
+				else if (unlink(safe_path) != 0)
+				{
+					int			save_errno = errno;
+
+					if (!dump_is_gone(safe_path))
+					{
+						errno = save_errno;
+						ereport(WARNING,
+								(errcode_for_file_access(),
+								 errmsg("dbblue backup launcher: could not remove old backup \"%s\": %m",
+										safe_path),
+								 save_errno == ENOENT ?
+								 errhint("Its folder is missing too; is the backup disk mounted? It will be retried.") :
+								 errhint("It will be retried at the next cycle.")));
+						continue;	/* keep the row: retry next cycle */
+					}
+				}
 			}
 
 			ids_to_delete[n_to_delete++] = id;
