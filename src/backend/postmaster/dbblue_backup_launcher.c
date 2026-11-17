@@ -154,6 +154,7 @@ typedef struct BackupCandidate
 	 */
 	TimestampTz last_backup_at;
 	int64		last_backup_size;	/* bytes; 0 if none */
+	char	   *last_backup_path;	/* its dump file; NULL if none */
 } BackupCandidate;
 
 /*
@@ -1270,7 +1271,12 @@ load_backup_candidates(List *specs)
 							   "        FROM dbblue.dbblue_backup_history h"
 							   "        WHERE h.database_name = w.dbname"
 							   "          AND h.status = 'success'"
-							   "        ORDER BY h.backup_started_at DESC LIMIT 1) AS last_backup_size"
+							   "        ORDER BY h.backup_started_at DESC LIMIT 1) AS last_backup_size,"
+							   "       (SELECT h.file_path"
+							   "        FROM dbblue.dbblue_backup_history h"
+							   "        WHERE h.database_name = w.dbname"
+							   "          AND h.status = 'success'"
+							   "        ORDER BY h.backup_started_at DESC LIMIT 1) AS last_backup_path"
 							   " FROM wanted w"
 							   " LEFT JOIN pg_database d ON d.datname = w.dbname",
 							   1, argtypes, values, NULL, false, 0);
@@ -1317,6 +1323,9 @@ load_backup_candidates(List *specs)
 
 			d = SPI_getbinval(tuple, tupdesc, 6, &isnull);
 			cand->last_backup_size = isnull ? 0 : DatumGetInt64(d);
+
+			d = SPI_getbinval(tuple, tupdesc, 7, &isnull);
+			cand->last_backup_path = isnull ? NULL : TextDatumGetCString(d);
 
 			candidates = lappend(candidates, cand);
 			MemoryContextSwitchTo(oldcxt);
@@ -1422,6 +1431,24 @@ run_backup_cycle(void)
 										 cand->dbname, rs->failures)));
 				continue;
 			}
+		}
+
+		/*
+		 * The last dump gone is how a backup disk that has been unmounted
+		 * shows up: its mount point is then an empty folder on another disk,
+		 * which this backup would silently be written to.  Warn only -- old
+		 * dumps deleted by hand must not stop backups -- and only just before
+		 * backing up, so it is said once per attempt, not every cycle.
+		 */
+		if (cand->last_backup_path != NULL)
+		{
+			struct stat st;
+
+			if (stat(cand->last_backup_path, &st) != 0 && errno == ENOENT)
+				ereport(WARNING,
+						(errmsg("dbblue backup launcher: the last backup of database \"%s\", \"%s\", is missing",
+								cand->dbname, cand->last_backup_path),
+						 errhint("If the backup disk is not mounted, this backup is being written to another disk.")));
 		}
 
 		note_backup_result(cand->dbname,
