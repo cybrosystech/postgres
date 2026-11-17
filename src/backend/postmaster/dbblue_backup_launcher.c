@@ -2848,33 +2848,29 @@ static void
 report_unmanaged_backups(void)
 {
 	/*
-	 * Every successful backup whose file still exists (pg_stat_file() returns
-	 * NULLs for a missing file), and that is in an earlier backup directory,
-	 * or of a database dropped or no longer configured.
+	 * Every successful backup, and whether its database is still backed up
+	 * (exists and is configured).  Which of them are leftovers is decided in
+	 * C below, with the same checks retention uses, so that the two always
+	 * agree.
 	 */
 	static const char *sql =
-		"SELECT h.database_name, h.file_path, f.size,"
-		"       NOT starts_with(h.file_path, $2 || '/') AS earlier_directory"
+		"SELECT h.database_name, h.file_path,"
+		"       (d.oid IS NOT NULL AND h.database_name = ANY ($1)) AS managed"
 		" FROM dbblue.dbblue_backup_history h"
-		"      LEFT JOIN pg_catalog.pg_database d ON d.datname = h.database_name,"
-		"      LATERAL pg_catalog.pg_stat_file(h.file_path, true) f"
-		" WHERE h.status = 'success' AND f.size IS NOT NULL"
-		"   AND (NOT starts_with(h.file_path, $2 || '/')"
-		"        OR d.oid IS NULL"
-		"        OR h.database_name <> ALL ($1))"
+		"      LEFT JOIN pg_catalog.pg_database d ON d.datname = h.database_name"
+		" WHERE h.status = 'success' AND h.file_path IS NOT NULL"
 		" ORDER BY h.file_path";
 	MemoryContext oldcxt = CurrentMemoryContext;
 	List	   *configured = parse_configured_databases();
 	Datum	   *names = palloc((list_length(configured) + 1) * sizeof(Datum));
-	Oid			argtypes[2] = {TEXTARRAYOID, TEXTOID};
-	Datum		values[2];
+	Oid			argtypes[1] = {TEXTARRAYOID};
+	Datum		values[1];
 	int			n = 0;
 	ListCell   *lc;
 
 	foreach(lc, configured)
 		names[n++] = CStringGetTextDatum(((BackupDbSpec *) lfirst(lc))->dbname);
 	values[0] = PointerGetDatum(construct_array_builtin(names, n, TEXTOID));
-	values[1] = CStringGetTextDatum(dbblue_backup_directory ? dbblue_backup_directory : "");
 
 	PG_TRY();
 	{
@@ -2892,10 +2888,10 @@ report_unmanaged_backups(void)
 		SPI_connect();
 		PushActiveSnapshot(GetTransactionSnapshot());
 
-		if (SPI_execute_with_args(sql, 2, argtypes, values, NULL, true, 0) != SPI_OK_SELECT)
+		if (SPI_execute_with_args(sql, 1, argtypes, values, NULL, true, 0) != SPI_OK_SELECT)
 			elog(ERROR, "could not read dbblue.dbblue_backup_history");
 
-		/* One line per dump: its path, size, and why it is no longer managed. */
+		/* One line per leftover dump: its path, size, and why. */
 		for (row = 0; row < SPI_processed; row++)
 		{
 			HeapTuple	tuple = SPI_tuptable->vals[row];
@@ -2903,19 +2899,39 @@ report_unmanaged_backups(void)
 			bool		isnull;
 			char	   *dbname = SPI_getvalue(tuple, tupdesc, 1);
 			char	   *path = SPI_getvalue(tuple, tupdesc, 2);
-			int64		size = DatumGetInt64(SPI_getbinval(tuple, tupdesc, 3, &isnull));
-			bool		earlier = DatumGetBool(SPI_getbinval(tuple, tupdesc, 4, &isnull));
+			bool		managed = DatumGetBool(SPI_getbinval(tuple, tupdesc, 3, &isnull));
+			char		safe_path[MAXPGPATH];
+			struct stat st;
+			bool		in_current_dir;
+
+			/*
+			 * In the current backup directory?  Decided as retention decides
+			 * it -- on normalized paths, so "/b" and "/b/" are the same
+			 * directory -- so that a dump retention still manages is never
+			 * reported as one to delete by hand.
+			 */
+			in_current_dir = get_prunable_backup_path(dbname, path, safe_path);
+
+			if (in_current_dir && managed)
+				continue;		/* a managed backup, not a leftover */
 
 			/* Only our own dumps (see looks_like_our_dump()). */
 			if (!looks_like_our_dump(path, dbname))
 				continue;
 
+			/*
+			 * Gone, or not checkable (permissions, I/O): skip just this one,
+			 * rather than failing the whole report as an ERROR would.
+			 */
+			if (lstat(path, &st) != 0 || !S_ISREG(st.st_mode))
+				continue;
+
 			appendStringInfo(&files, "%s%s (%lld bytes): %s",
-							 count > 0 ? "\n" : "", path, (long long) size,
-							 earlier ? "in an earlier dbblue_backup_directory"
-							 : "database no longer backed up");
+							 count > 0 ? "\n" : "", path, (long long) st.st_size,
+							 in_current_dir ? "database no longer backed up"
+							 : "in an earlier dbblue_backup_directory");
 			count++;
-			bytes += size;
+			bytes += st.st_size;
 		}
 
 		/* Log only if the list changed, or the daily reminder is due. */
