@@ -114,6 +114,19 @@ int			dbblue_backup_min_free_space = 2048;	/* MB; 0 disables */
 #define DBBLUE_BACKUP_LOCK_WAIT_TIMEOUT	"30s"
 
 /*
+ * After this many timeouts in a row for one database, warn that its dump has
+ * outgrown dbblue_backup_timeout: each attempt is stopped, so it is not being
+ * backed up at all, while each timeout's own WARNING reads like a one-off.
+ */
+#define DBBLUE_BACKUP_TIMEOUT_WARN_AFTER	5
+
+/* stop_reason of a dump stopped by dbblue_backup_timeout */
+static const char *const timed_out_reason = "stopped: exceeded dbblue_backup_timeout";
+
+/* Set by backup_one_database(): its last attempt was stopped by the timeout. */
+static bool last_attempt_timed_out = false;
+
+/*
  * pg_dump writes to <dbname>_<time>.dump.partial, which is renamed to
  * <dbname>_<time>.dump only once the dump is complete and on disk.  So a file
  * ending in .dump is always a whole backup, and one ending in .dump.partial
@@ -231,6 +244,7 @@ typedef struct BackupRetryState
 {
 	char		dbname[NAMEDATALEN];	/* hash key */
 	int			failures;		/* consecutive failed attempts */
+	int			timeouts;		/* of which the latest ones in a row timed out */
 	TimestampTz last_failure_at;	/* when the latest one ended */
 } BackupRetryState;
 
@@ -252,7 +266,8 @@ static void run_backup_cycle(void);
 static void reload_configuration(void);
 static void warn_if_backup_database_listed(void);
 static int64 retry_delay_secs(int failures);
-static void note_backup_result(const char *dbname, bool ok);
+static void note_backup_result(const char *dbname, bool ok,
+							   TimestampTz last_backup_at);
 static bool backup_one_database(const char *dbname, int64 last_backup_size);
 static void apply_retention(const char *dbname);
 static void prune_resolved_failures(const char *dbname);
@@ -1564,7 +1579,8 @@ run_backup_cycle(void)
 
 		note_backup_result(cand->dbname,
 						   backup_one_database(cand->dbname,
-											   cand->last_backup_size));
+											   cand->last_backup_size),
+						   cand->last_backup_at);
 	}
 
 	/* Free this cycle's specs/candidates before the next one. */
@@ -1663,10 +1679,12 @@ retry_delay_secs(int failures)
 
 /*
  * note_backup_result
- *		Update dbname's retry state after a backup attempt.
+ *		Update dbname's retry state after a backup attempt, and warn once its
+ *		backups keep timing out.  last_backup_at is the start of its last
+ *		successful backup (0 if none), for that warning.
  */
 static void
-note_backup_result(const char *dbname, bool ok)
+note_backup_result(const char *dbname, bool ok, TimestampTz last_backup_at)
 {
 	BackupRetryState *rs;
 	bool		found;
@@ -1701,10 +1719,30 @@ note_backup_result(const char *dbname, bool ok)
 
 	rs = hash_search(retry_state, dbname, HASH_ENTER, &found);
 	if (!found)
+	{
 		rs->failures = 0;
+		rs->timeouts = 0;
+	}
 	if (rs->failures < INT_MAX)
 		rs->failures++;
 	rs->last_failure_at = GetCurrentTimestamp();
+
+	/* Timeouts in a row; any other failure ends the run. */
+	if (!last_attempt_timed_out)
+		rs->timeouts = 0;
+	else if (rs->timeouts < INT_MAX)
+		rs->timeouts++;
+
+	if (rs->timeouts >= DBBLUE_BACKUP_TIMEOUT_WARN_AFTER)
+		ereport(WARNING,
+				(errmsg("dbblue backup launcher: backups of database \"%s\" have timed out %d times in a row; %s",
+						dbname, rs->timeouts,
+						last_backup_at != 0 ?
+						psprintf("its newest backup is from %s", timestamptz_to_str(last_backup_at)) :
+						"it has never been backed up"),
+				 errdetail("Each attempt was stopped after dbblue_backup_timeout (%d s). The database has probably grown too large to dump within that time.",
+						   dbblue_backup_timeout),
+				 errhint("Increase dbblue_backup_timeout, or set it to 0 for no limit.")));
 
 	ereport(LOG,
 			(errmsg_plural("dbblue backup launcher: backup of database \"%s\" has failed %d time in a row, next attempt in %lld s",
@@ -1864,6 +1902,7 @@ run_backup_command(const char *cmd, const char *space_path,
 				kill(-pid, SIGTERM);
 				term_sent = true;
 				term_at = time(NULL);
+				*stop_reason = timed_out_reason;
 				continue;
 			}
 
@@ -2046,6 +2085,8 @@ backup_one_database(const char *dbname, int64 last_backup_size)
 	int			rc;
 	bool		ok = true;
 	const char *stop_reason;
+
+	last_attempt_timed_out = false;
 
 	if (dbblue_backup_directory == NULL || dbblue_backup_directory[0] == '\0')
 	{
@@ -2264,6 +2305,7 @@ backup_one_database(const char *dbname, int64 last_backup_size)
 
 	rc = run_backup_command(cmd.data, dbdir, &stop_reason);
 	pfree(cmd.data);
+	last_attempt_timed_out = (stop_reason == timed_out_reason);
 
 	dump_errors = read_dump_errors();
 	unlink(DBBLUE_BACKUP_STDERR_FILE);
