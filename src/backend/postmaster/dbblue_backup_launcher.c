@@ -2751,11 +2751,21 @@ record_backup_history(const char *dbname, TimestampTz started_at,
 	MemoryContext oldcxt = CurrentMemoryContext;
 	volatile bool ok = true;
 	char		what[NAMEDATALEN + 64];
+	/*
+	 * The id is picked here rather than taken from the identity sequence:
+	 * pg_write_all_data grants UPDATE on every sequence, which no REVOKE
+	 * removes, so a member could setval() it to its maximum and make every
+	 * insert fail -- and with it every backup, whose dump is removed when its
+	 * row cannot be saved.  The guard trigger lets no one but this worker
+	 * insert, so max(id) + 1 cannot collide.
+	 */
 	static const char *sql =
 		"INSERT INTO dbblue.dbblue_backup_history "
-		"(database_name, backup_started_at, backup_finished_at, status, "
+		"(id, database_name, backup_started_at, backup_finished_at, status, "
 		" file_path, file_size_bytes, error_message) "
-		"VALUES ($1, $2, now(), $3, $4, $5, $6)";
+		"OVERRIDING SYSTEM VALUE "
+		"VALUES ((SELECT coalesce(max(id), 0) + 1 FROM dbblue.dbblue_backup_history), "
+		"        $1, $2, now(), $3, $4, $5, $6)";
 	static const Oid argtypes[6] = {TEXTOID, TIMESTAMPTZOID, TEXTOID, TEXTOID, INT8OID, TEXTOID};
 	Datum		values[6];
 	char		nulls[7] = "      ";	/* SPI convention: ' ' = not null, 'n' = null */
