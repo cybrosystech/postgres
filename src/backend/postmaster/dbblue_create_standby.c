@@ -16,7 +16,8 @@
  *      cluster with tablespaces gets none; see standby_copyable().
  *   2. A free TCP port is picked by probing PostPortNumber+1, +2, ...
  *      and written, along with the primary's unix_socket_directories,
- *      hot_standby_feedback = on, dbblue_create_standby = off, an empty
+ *      hot_standby_feedback = on, dbblue_create_standby = off,
+ *      dbblue_backup_enabled = off, an empty
  *      dbblue_standby_directory, a log_filename of its own, half of the
  *      primary's shared_buffers, work_mem and effective_cache_size, and the
  *      settings a hot standby must have at least as high as its primary
@@ -2240,6 +2241,14 @@ standby_limits_behind(const char *dir)
  * Whether a promoted standby should get a replica is for the operator to
  * decide, with ALTER SYSTEM.
  *
+ * dbblue_backup_enabled is turned off, for the same reason.  The copied value
+ * is ours, and so is dbblue_backup_directory: promoted while we still run --
+ * say, to have a writable copy -- its backup launcher would start at once,
+ * dumping into our backup folders, and with its copy of our backup history
+ * it would prune, as its own, the dumps we made and keep making.  Whether a
+ * promoted standby should take backups, and where, is for the operator to
+ * decide, with ALTER SYSTEM.
+ *
  * dbblue_standby_directory is reset.  The copied value, when set, names the
  * directory the standby was built in: its own data directory.  A parallel
  * worker restores it inside a transaction, where
@@ -2383,6 +2392,7 @@ write_standby_settings(const char *dir, int port, bool fenced)
 			conf_line_sets(line, "hot_standby") ||
 			conf_line_sets(line, "cluster_name") ||
 			conf_line_sets(line, "dbblue_create_standby") ||
+			conf_line_sets(line, "dbblue_backup_enabled") ||
 			conf_line_sets(line, "dbblue_standby_directory") ||
 			conf_line_sets(line, "log_filename") ||
 			conf_line_sets(line, "shared_buffers") ||
@@ -2412,6 +2422,7 @@ write_standby_settings(const char *dir, int port, bool fenced)
 	appendStringInfo(&buf, "hot_standby = %s\n", fenced ? "off" : "on");
 	appendStringInfoString(&buf, "cluster_name = '" DBBLUE_STANDBY_NAME "'\n");
 	appendStringInfoString(&buf, "dbblue_create_standby = off\n");
+	appendStringInfoString(&buf, "dbblue_backup_enabled = off\n");
 	appendStringInfoString(&buf, "dbblue_standby_directory = ''\n");
 
 	logname = standby_log_filename();
