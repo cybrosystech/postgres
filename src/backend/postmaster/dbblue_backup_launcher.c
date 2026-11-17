@@ -249,6 +249,7 @@ static List *parse_configured_databases(void);
 static List *load_backup_candidates(List *specs);
 static void run_backup_cycle(void);
 static void reload_configuration(void);
+static void warn_if_backup_database_listed(void);
 static int64 retry_delay_secs(int failures);
 static void note_backup_result(const char *dbname, bool ok);
 static bool backup_one_database(const char *dbname, int64 last_backup_size);
@@ -771,7 +772,11 @@ BackupLauncherMain(Datum main_arg)
 				environment_ready = resolve_environment();
 
 			if (environment_ready && !schema_ready)
+			{
 				schema_ready = ensure_schema();
+				if (schema_ready)
+					warn_if_backup_database_listed();
+			}
 
 			if (environment_ready && schema_ready)
 			{
@@ -1431,6 +1436,40 @@ run_backup_cycle(void)
 }
 
 /*
+ * warn_if_backup_database_listed
+ *		Warn when dbblue_backup_database, the database this worker stays
+ *		connected to, is also one of the databases it backs up.
+ *
+ * Such a database is typically an application database (an Odoo database,
+ * say), and the worker's connection, which it never closes, stops anyone
+ * from dropping, renaming or copying it: those need every other session
+ * gone, and a non-superuser such as Odoo's role cannot terminate the
+ * worker's superuser session.  'postgres' (the default) avoids that.
+ */
+static void
+warn_if_backup_database_listed(void)
+{
+	List	   *specs = parse_configured_databases();
+	ListCell   *lc;
+
+	foreach(lc, specs)
+	{
+		BackupDbSpec *spec = (BackupDbSpec *) lfirst(lc);
+
+		if (strcmp(spec->dbname, dbblue_backup_database) == 0)
+		{
+			ereport(WARNING,
+					(errmsg("dbblue backup launcher: dbblue_backup_database \"%s\" is also one of the databases being backed up",
+							dbblue_backup_database),
+					 errdetail("The backup launcher stays connected to it, so dropping, renaming or copying it (Odoo's Drop, Rename and Duplicate) fails with \"being accessed by other users\"."),
+					 errhint("Set dbblue_backup_database to 'postgres' (changing it requires a server restart).")));
+			break;
+		}
+	}
+	list_free_deep(specs);
+}
+
+/*
  * reload_configuration
  *		Process a pending SIGHUP, and end every failing database's current
  *		retry wait so that it is tried again at the next cycle (see
@@ -1441,6 +1480,10 @@ reload_configuration(void)
 {
 	ConfigReloadPending = false;
 	ProcessConfigFile(PGC_SIGHUP);
+
+	/* dbblue_backup_databases may have changed. */
+	if (dbblue_backup_enabled && launcher_connected)
+		warn_if_backup_database_listed();
 
 	if (retry_state != NULL)
 	{
