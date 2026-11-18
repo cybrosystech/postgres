@@ -1065,7 +1065,18 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 		dblocale = "C.UTF-8";
 		/* Clear the collateEl so it doesn't override our defaults */
 		collateEl = NULL;
-		dbcollate = NULL;
+
+		/*
+		 * Use "C" for LC_COLLATE and LC_CTYPE rather than inheriting
+		 * template0's OS locale (e.g. en_IN).  With the builtin provider
+		 * neither decides comparison or case mapping -- C.UTF-8 does -- but
+		 * the backend still loads them at connect time and pg_dump -C writes
+		 * them out, so an inherited OS locale would tie the database to hosts
+		 * that have it installed.  "C" exists on every platform and matches
+		 * any encoding (template0 may be non-UTF8 while we force UTF8 here).
+		 */
+		dbcollate = "C";
+		dbctype = "C";
 
 		/*
 		 * Report what was substituted.  The two branches above are different
