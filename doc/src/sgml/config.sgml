@@ -3686,7 +3686,11 @@ include_dir 'conf.d'
         <literal>pglz</literal>.
         The value <literal>on</literal> selects the first of <literal>zstd</literal>,
         <literal>lz4</literal>, <literal>pglz</literal> that is available.
-        The default value is <literal>off</literal>.
+        The default value is <literal>lz4</literal> if
+        <productname>PostgreSQL</productname> was compiled with
+        <option>--with-lz4</option>, and <literal>pglz</literal> otherwise,
+        so full page images are compressed out of the box.  Set it to
+        <literal>off</literal> to write them uncompressed.
         Only superusers and users with the appropriate <literal>SET</literal>
         privilege can change this setting.
        </para>
