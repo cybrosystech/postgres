@@ -1045,10 +1045,18 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 			collate_str = defGetString(collateEl);
 			if (pg_strcasecmp(collate_str, "C") == 0)
 			{
-				/* Check if template is template0 (or NULL) and encoding is utf8 (or NULL) */
-				bool template_ok = (templateEl == NULL ||
-									 (templateEl->arg &&
-									  pg_strcasecmp(defGetString(templateEl), "template0") == 0));
+				/*
+				 * TEMPLATE template0 must be named explicitly.  Without it the
+				 * caller asked for template1, and substituting template0 would
+				 * silently drop whatever the administrator installed there
+				 * (extensions, schemas, seed data) behind a NOTICE that only
+				 * mentions the collation.  Leave that case to standard
+				 * PostgreSQL: it either copies template1 or reports the
+				 * collation mismatch and points at template0.  Encoding may
+				 * still be omitted (template0 is cloned with UTF8 forced).
+				 */
+				bool template_ok = (templateEl != NULL && templateEl->arg &&
+									pg_strcasecmp(defGetString(templateEl), "template0") == 0);
 				bool encoding_ok = (encodingEl == NULL || encoding == PG_UTF8);
 
 				if (template_ok && encoding_ok)
