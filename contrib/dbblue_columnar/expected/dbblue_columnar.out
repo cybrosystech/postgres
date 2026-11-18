@@ -1,0 +1,1466 @@
+-- dbblue_columnar regression test: columnar results must be byte-identical to
+-- heap results across the engine's shape matrix. Self-validating (compares
+-- enable_columnar_scan on vs off), so the expected output is stable 'ok's.
+-- Requires shared_preload_libraries='dbblue_columnar'.
+CREATE EXTENSION dbblue_columnar;
+SET max_parallel_workers_per_gather = 0;
+SET client_min_messages = warning;
+-- deterministic dataset: ints (keys), nullable int, text (varlena), numeric, date
+CREATE TABLE t (
+	id    int,
+	k7    int,          -- 7 distinct
+	grp   int,          -- 13 distinct
+	txt   text,
+	amt   numeric,
+	d     date,
+	pid   int           -- nullable (every 5th row)
+);
+INSERT INTO t
+SELECT g,
+	   g % 7,
+	   g % 13,
+	   'v' || (g % 17),
+	   ((g % 100) + 1) * 1.25,
+	   DATE '2024-01-01' + (g % 365),
+	   CASE WHEN g % 5 = 0 THEN NULL ELSE g % 23 END
+FROM generate_series(1, 50000) g;
+-- set all pages all-visible deterministically so blocks are servable
+VACUUM (DISABLE_PAGE_SKIPPING) t;
+SELECT dbblue_columnar_add('t', ARRAY['id','k7','grp','txt','amt','d','pid']);
+ dbblue_columnar_add 
+---------------------
+                   7
+(1 row)
+
+-- assert the store actually built blocks (else the differential below could
+-- silently pass by falling back to heap on both sides)
+SELECT dbblue_columnar_populate('t') > 0 AS blocks_built;
+ blocks_built 
+--------------
+ t
+(1 row)
+
+-- does the plan for q use the named custom node?
+CREATE FUNCTION uses_node(q text, node text) RETURNS boolean LANGUAGE plpgsql AS $$
+DECLARE line text; found boolean := false;
+BEGIN
+	FOR line IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF position(node IN line) > 0 THEN found := true; END IF;
+	END LOOP;
+	RETURN found;
+END $$;
+-- differential helper: run q with columnar on and off, must be identical
+CREATE FUNCTION agree(q text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE n bigint;
+BEGIN
+	EXECUTE 'SET dbblue_columnar.enable_columnar_scan = on';
+	EXECUTE format('CREATE TEMP TABLE _c AS %s', q);
+	EXECUTE 'SET dbblue_columnar.enable_columnar_scan = off';
+	EXECUTE format('CREATE TEMP TABLE _h AS %s', q);
+	EXECUTE 'SET dbblue_columnar.enable_columnar_scan = on';
+	EXECUTE '(TABLE _c EXCEPT ALL TABLE _h) UNION ALL (TABLE _h EXCEPT ALL TABLE _c)';
+	GET DIAGNOSTICS n = ROW_COUNT;
+	DROP TABLE _c; DROP TABLE _h;
+	RETURN CASE WHEN n = 0 THEN 'ok' ELSE n || ' MISMATCH' END;
+END $$;
+SET dbblue_columnar.enable_columnar_scan = on;
+-- the columnar nodes must actually be chosen (guards the differential tests)
+SELECT uses_node($$SELECT id, amt FROM t WHERE k7 = 3$$, 'DBBlueColumnarScan') AS scan_used;
+ scan_used 
+-----------
+ t
+(1 row)
+
+SELECT uses_node($$SELECT grp, sum(amt) FROM t GROUP BY grp$$, 'DBBlueColumnarAgg') AS grouped_agg_used;
+ grouped_agg_used 
+------------------
+ t
+(1 row)
+
+SELECT uses_node($$SELECT count(*) FROM t$$, 'DBBlueColumnarAgg') AS meta_agg_used;
+ meta_agg_used 
+---------------
+ t
+(1 row)
+
+-- global aggregate (zero GROUP BY) with a transition agg must use the fused
+-- node too, not fall back to scan-serve + a plain Aggregate (the plain Agg has
+-- no HashAgg overhead, so the fused cost must not be over-priced for it).
+SELECT uses_node($$SELECT sum(amt) FROM t WHERE k7 = 4$$, 'DBBlueColumnarAgg') AS scalar_agg_used;
+ scalar_agg_used 
+-----------------
+ t
+(1 row)
+
+-- ---- scan: predicate pushdown (all extractable shapes) ----
+SELECT 'scan-eq       ', agree($$SELECT id, amt, txt FROM t WHERE k7 = 3 ORDER BY id$$);
+    ?column?    | agree 
+----------------+-------
+ scan-eq        | ok
+(1 row)
+
+SELECT 'scan-range    ', agree($$SELECT id, d FROM t WHERE d >= DATE '2024-06-01' AND id < 2000 ORDER BY id$$);
+    ?column?    | agree 
+----------------+-------
+ scan-range     | ok
+(1 row)
+
+SELECT 'scan-in       ', agree($$SELECT id FROM t WHERE grp IN (1,5,9) ORDER BY id$$);
+    ?column?    | agree 
+----------------+-------
+ scan-in        | ok
+(1 row)
+
+SELECT 'scan-nulltest ', agree($$SELECT id, pid FROM t WHERE pid IS NULL ORDER BY id$$);
+    ?column?    | agree 
+----------------+-------
+ scan-nulltest  | ok
+(1 row)
+
+SELECT 'scan-notnull  ', agree($$SELECT id FROM t WHERE pid IS NOT NULL AND k7 = 2 ORDER BY id$$);
+    ?column?    | agree 
+----------------+-------
+ scan-notnull   | ok
+(1 row)
+
+SELECT 'scan-text     ', agree($$SELECT id, txt FROM t WHERE txt = 'v3' ORDER BY id$$);
+    ?column?    | agree 
+----------------+-------
+ scan-text      | ok
+(1 row)
+
+-- ---- metadata aggregate mode (scalar count/min/max, no WHERE) ----
+SELECT 'meta-count    ', agree($$SELECT count(*) a, count(pid) b FROM t$$);
+    ?column?    | agree 
+----------------+-------
+ meta-count     | ok
+(1 row)
+
+SELECT 'meta-minmax   ', agree($$SELECT min(d) a, max(d) b, min(id) c, max(id) e, min(txt) f, max(txt) g FROM t$$);
+    ?column?    | agree 
+----------------+-------
+ meta-minmax    | ok
+(1 row)
+
+-- ---- grouped aggregate pushdown ----
+SELECT 'grp-1key-sum  ', agree($$SELECT grp, sum(amt) s, count(*) c FROM t GROUP BY grp ORDER BY grp$$);
+    ?column?    | agree 
+----------------+-------
+ grp-1key-sum   | ok
+(1 row)
+
+SELECT 'grp-2key      ', agree($$SELECT k7, grp, sum(amt) s, avg(amt) a FROM t GROUP BY k7, grp ORDER BY k7, grp$$);
+    ?column?    | agree 
+----------------+-------
+ grp-2key       | ok
+(1 row)
+
+SELECT 'grp-filter    ', agree($$SELECT grp, sum(amt) s FROM t WHERE d >= DATE '2024-04-01' GROUP BY grp ORDER BY grp$$);
+    ?column?    | agree 
+----------------+-------
+ grp-filter     | ok
+(1 row)
+
+SELECT 'grp-minmaxtext', agree($$SELECT k7, min(txt) a, max(txt) b, min(amt) c, max(amt) e FROM t GROUP BY k7 ORDER BY k7$$);
+    ?column?    | agree 
+----------------+-------
+ grp-minmaxtext | ok
+(1 row)
+
+SELECT 'grp-nullkey   ', agree($$SELECT pid, count(*) c, sum(amt) s FROM t GROUP BY pid ORDER BY pid$$);
+    ?column?    | agree 
+----------------+-------
+ grp-nullkey    | ok
+(1 row)
+
+SELECT 'grp-avgint    ', agree($$SELECT k7, avg(grp) a, sum(grp) s FROM t GROUP BY k7 ORDER BY k7$$);
+    ?column?    | agree 
+----------------+-------
+ grp-avgint     | ok
+(1 row)
+
+SELECT 'grp-scalar-agg', agree($$SELECT sum(amt) s, avg(amt) a, count(*) c, count(pid) c2 FROM t WHERE k7 = 4$$);
+    ?column?    | agree 
+----------------+-------
+ grp-scalar-agg | ok
+(1 row)
+
+SELECT 'grp-zero-rows ', agree($$SELECT sum(amt) s, min(d) m, count(*) c FROM t WHERE id < 0$$);
+    ?column?    | agree 
+----------------+-------
+ grp-zero-rows  | ok
+(1 row)
+
+SELECT 'grp-zero-grp  ', agree($$SELECT grp, sum(amt) FROM t WHERE id < 0 GROUP BY grp$$);
+    ?column?    | agree 
+----------------+-------
+ grp-zero-grp   | ok
+(1 row)
+
+SELECT 'grp-nogby-agg ', agree($$SELECT grp FROM t GROUP BY grp ORDER BY grp$$);
+    ?column?    | agree 
+----------------+-------
+ grp-nogby-agg  | ok
+(1 row)
+
+SELECT 'grp-saop      ', agree($$SELECT grp, count(*) c FROM t WHERE k7 = ANY(ARRAY[1,3,5]) GROUP BY grp ORDER BY grp$$);
+    ?column?    | agree 
+----------------+-------
+ grp-saop       | ok
+(1 row)
+
+-- text/varchar group keys: not bit-equal, so each value is canonicalized through
+-- the intern table (equal bytes -> one pointer) and the fixed hash key stays
+-- byte-comparable. Matches core HashAgg under the (deterministic) DB collation.
+SELECT uses_node($$SELECT txt, sum(amt) FROM t GROUP BY txt$$, 'DBBlueColumnarAgg') AS text_key_agg_used;
+ text_key_agg_used 
+-------------------
+ t
+(1 row)
+
+SELECT 'grp-textkey   ', agree($$SELECT txt, sum(amt) s, count(*) c FROM t GROUP BY txt ORDER BY txt$$);
+    ?column?    | agree 
+----------------+-------
+ grp-textkey    | ok
+(1 row)
+
+SELECT 'grp-text+int  ', agree($$SELECT k7, txt, sum(amt) s FROM t GROUP BY k7, txt ORDER BY k7, txt$$);
+    ?column?    | agree 
+----------------+-------
+ grp-text+int   | ok
+(1 row)
+
+SELECT 'grp-textexpr  ', agree($$SELECT upper(txt) u, count(*) c FROM t GROUP BY upper(txt) ORDER BY 1$$);
+    ?column?    | agree 
+----------------+-------
+ grp-textexpr   | ok
+(1 row)
+
+SELECT 'grp-textfilter', agree($$SELECT txt, sum(amt) s FROM t WHERE k7 > 2 GROUP BY txt ORDER BY txt$$);
+    ?column?    | agree 
+----------------+-------
+ grp-textfilter | ok
+(1 row)
+
+-- memory-aware gate: the grouped agg has no spill, so it must DECLINE when the
+-- estimated groups would not fit hash_mem (work_mem * hash_mem_multiplier) and
+-- let a spill-capable HashAgg run - not error at runtime. Self-contained + ANALYZEd
+-- so the group-count estimate is accurate; a small work_mem makes the 20000-distinct
+-- id key overflow deterministically while the 50-distinct key still fits and uses
+-- the node. (Without the gate the high-card query ERRORs with a numeric sum.)
+CREATE TABLE mg (id int, lc int, amt numeric) WITH (autovacuum_enabled = off);
+INSERT INTO mg SELECT g, g % 50, g * 1.5 FROM generate_series(1, 20000) g;
+VACUUM (DISABLE_PAGE_SKIPPING) mg;
+SELECT dbblue_columnar_add('mg', ARRAY['id','lc','amt']);
+ dbblue_columnar_add 
+---------------------
+                   3
+(1 row)
+
+SELECT dbblue_columnar_populate('mg') > 0 AS mg_built;
+ mg_built 
+----------
+ t
+(1 row)
+
+ANALYZE mg;
+SET work_mem = '1MB';
+SELECT uses_node($$SELECT id, sum(amt) FROM mg GROUP BY id$$, 'DBBlueColumnarAgg') AS highcard_declines;
+ highcard_declines 
+-------------------
+ f
+(1 row)
+
+SELECT 'mg-highcard   ', agree($$SELECT id, sum(amt) s FROM mg GROUP BY id ORDER BY id$$);
+    ?column?    | agree 
+----------------+-------
+ mg-highcard    | ok
+(1 row)
+
+SELECT uses_node($$SELECT lc, sum(amt) FROM mg GROUP BY lc$$, 'DBBlueColumnarAgg') AS lowcard_still_used;
+ lowcard_still_used 
+--------------------
+ t
+(1 row)
+
+SELECT 'mg-lowcard    ', agree($$SELECT lc, sum(amt) s FROM mg GROUP BY lc ORDER BY lc$$);
+    ?column?    | agree 
+----------------+-------
+ mg-lowcard     | ok
+(1 row)
+
+RESET work_mem;
+-- array_agg/string_agg have aggtransspace = -1 (not 0); the memory-gate size
+-- estimate must read it as a SIGNED int32 - a raw Size assignment wraps -1 to
+-- SIZE_MAX and crashes hash_agg_entry_size (pg_nextpower2). Just planning these
+-- exercises the gate; agree() also checks the result.
+SELECT 'mg-arrayagg   ', agree($$SELECT lc, array_agg(id ORDER BY id) a FROM mg GROUP BY lc ORDER BY lc$$);
+    ?column?    | agree 
+----------------+-------
+ mg-arrayagg    | ok
+(1 row)
+
+SELECT 'mg-stringagg  ', agree($$SELECT lc, string_agg(id::text, ',' ORDER BY id) s FROM mg GROUP BY lc ORDER BY lc$$);
+    ?column?    | agree 
+----------------+-------
+ mg-stringagg   | ok
+(1 row)
+
+DROP TABLE mg;
+-- ---- multi-pass hash-partition spill (serial) ----
+-- When a low row estimate lets the columnar agg be chosen but the store actually
+-- holds far more distinct groups than fit a small work_mem, the node must SPILL -
+-- re-scan the store aggregating one hash-partition per pass - not error. Force it:
+-- lie about reltuples (autovacuum off) so the plan-time gate passes, then a small
+-- work_mem overflows on the real cardinality. Byte-identical to core HashAgg.
+CREATE TABLE sp (g int, t text, amt numeric) WITH (autovacuum_enabled = off);
+INSERT INTO sp SELECT i, 'k' || i, (i % 100) * 1.5 FROM generate_series(1, 60000) i;
+VACUUM (DISABLE_PAGE_SKIPPING) sp;
+SELECT dbblue_columnar_add('sp', ARRAY['g','t','amt']);
+ dbblue_columnar_add 
+---------------------
+                   3
+(1 row)
+
+SELECT dbblue_columnar_populate('sp') > 0 AS sp_built;
+ sp_built 
+----------
+ t
+(1 row)
+
+ANALYZE sp;
+UPDATE pg_class SET reltuples = 500 WHERE relname = 'sp';
+SET work_mem = '256kB';
+SELECT uses_node($$SELECT g, sum(amt) FROM sp GROUP BY g$$, 'DBBlueColumnarAgg') AS spill_fires;
+ spill_fires 
+-------------
+ t
+(1 row)
+
+SELECT 'sp-int-spill  ', agree($$SELECT g, sum(amt) s, count(*) c, avg(amt) a FROM sp GROUP BY g ORDER BY g$$);
+    ?column?    | agree 
+----------------+-------
+ sp-int-spill   | ok
+(1 row)
+
+SELECT 'sp-text-spill ', agree($$SELECT t, sum(amt) s, count(*) c FROM sp GROUP BY t ORDER BY t$$);
+    ?column?    | agree 
+----------------+-------
+ sp-text-spill  | ok
+(1 row)
+
+SELECT 'sp-multi-spill', agree($$SELECT g, t, count(*) c FROM sp GROUP BY g, t ORDER BY g, t$$);
+    ?column?    | agree 
+----------------+-------
+ sp-multi-spill | ok
+(1 row)
+
+SELECT 'sp-minmax-spl ', agree($$SELECT g % 3000 m, min(t) a, max(t) b, sum(amt) s FROM sp GROUP BY g % 3000 ORDER BY 1$$);
+    ?column?    | agree 
+----------------+-------
+ sp-minmax-spl  | ok
+(1 row)
+
+RESET work_mem;
+DROP TABLE sp;
+-- ---- fast SUM(numeric): scaled-int128 accumulation ----
+-- Serial sum(numeric) accumulates into a per-group scaled int128 instead of
+-- per-row numeric_avg_accum; values that don't fit the fast lane (higher scale
+-- than the group's, NaN/Inf, int64-overflowing coefficient) fall back to a side
+-- numeric_avg_accum state, combined at finalize. Must be byte-identical to core
+-- INCLUDING display scale, so these cases compare sum(amt)::TEXT (agree() alone
+-- compares numeric VALUES, which ignore dscale). Each case is run twice - with
+-- the fast lane on (default) and off - so heap, the int128 lane, and the generic
+-- lane are all cross-checked. Deterministic data: mixed scales, negatives,
+-- zeros, a scale-escalating group, a NaN, and a coefficient too big for int64.
+CREATE TABLE ns (g int, amt numeric) WITH (autovacuum_enabled = off);
+INSERT INTO ns
+SELECT g % 11,
+	   (ARRAY[ (g % 100)::numeric / 100,		-- scale 2 (money)
+			   (g % 100)::numeric / 1000,		-- scale 3
+			   (g % 7)::numeric,				-- scale 0 (integer)
+			   (g % 50)::numeric / 10000,		-- scale 4
+			   -((g % 30)::numeric / 100) ])[1 + g % 5]		-- negative, scale 2
+FROM generate_series(1, 30000) g;
+-- adversarial fixed rows into groups that ALSO hold fast-lane values above
+INSERT INTO ns VALUES
+	(0, 'NaN'), (1, 0.00), (2, 0), (3, -0.01),
+	(4, 123456789012345678901234567890.12),		-- coeff > int64 -> fallback lane
+	(5, 1.0), (5, 2.00), (5, 3.0000), (5, 4.000000), (5, 5.00);	-- scale escalation
+VACUUM (DISABLE_PAGE_SKIPPING) ns;
+SELECT dbblue_columnar_add('ns', ARRAY['g','amt']);
+ dbblue_columnar_add 
+---------------------
+                   2
+(1 row)
+
+SELECT dbblue_columnar_populate('ns') > 0 AS ns_built;
+ ns_built 
+----------
+ t
+(1 row)
+
+SELECT uses_node($$SELECT g, sum(amt) FROM ns GROUP BY g$$, 'DBBlueColumnarAgg') AS numsum_fires;
+ numsum_fires 
+--------------
+ t
+(1 row)
+
+-- fast lane on (default): heap vs int128
+SELECT 'ns-grouped-f  ', agree($$SELECT g, sum(amt)::text s, count(*) c FROM ns GROUP BY g ORDER BY g$$);
+    ?column?    | agree 
+----------------+-------
+ ns-grouped-f   | ok
+(1 row)
+
+SELECT 'ns-scalar-f   ', agree($$SELECT sum(amt)::text s FROM ns$$);
+    ?column?    | agree 
+----------------+-------
+ ns-scalar-f    | ok
+(1 row)
+
+SELECT 'ns-filter-f   ', agree($$SELECT g, (sum(amt) FILTER (WHERE amt > 0))::text s FROM ns GROUP BY g ORDER BY g$$);
+    ?column?    | agree 
+----------------+-------
+ ns-filter-f    | ok
+(1 row)
+
+SELECT 'ns-where-f    ', agree($$SELECT g, sum(amt)::text s FROM ns WHERE amt <> 0 GROUP BY g ORDER BY g$$);
+    ?column?    | agree 
+----------------+-------
+ ns-where-f     | ok
+(1 row)
+
+-- avg(numeric) shares numeric_avg_accum but is NOT the fast lane (finalfn differs)
+SELECT 'ns-avg-untouch', agree($$SELECT g, avg(amt)::text a, sum(amt)::text s FROM ns GROUP BY g ORDER BY g$$);
+    ?column?    | agree 
+----------------+-------
+ ns-avg-untouch | ok
+(1 row)
+
+-- fast lane off: heap vs generic numeric_avg_accum (must also match, hence match
+-- the fast lane). The GUC flip proves the fast path introduces no divergence.
+SET dbblue_columnar.enable_int128_sum = off;
+SELECT 'ns-grouped-g  ', agree($$SELECT g, sum(amt)::text s, count(*) c FROM ns GROUP BY g ORDER BY g$$);
+    ?column?    | agree 
+----------------+-------
+ ns-grouped-g   | ok
+(1 row)
+
+SELECT 'ns-scalar-g   ', agree($$SELECT sum(amt)::text s FROM ns$$);
+    ?column?    | agree 
+----------------+-------
+ ns-scalar-g    | ok
+(1 row)
+
+SELECT 'ns-filter-g   ', agree($$SELECT g, (sum(amt) FILTER (WHERE amt > 0))::text s FROM ns GROUP BY g ORDER BY g$$);
+    ?column?    | agree 
+----------------+-------
+ ns-filter-g    | ok
+(1 row)
+
+RESET dbblue_columnar.enable_int128_sum;
+DROP TABLE ns;
+-- ---- numeric & float GROUP BY keys ----
+-- The raw-bits group hash cannot compare these by bytes: numeric 1.0 == 1.00 and
+-- float -0.0 == +0.0 / every NaN groups together. numeric keys are value-interned
+-- to the FIRST-SEEN representation, so the emitted key keeps core HashAgg's
+-- byte-identical display scale (hence these cases compare the key ::text). float
+-- keys are normalized in place (-0.0 -> +0.0, one canonical NaN) - float group
+-- ordering/representation is a documented non-defect, so float cases compare by
+-- value via agree(). Deterministic data mixes value-equal numeric scales and the
+-- float zero-sign / NaN edges.
+CREATE TABLE nk (id int, nk numeric, f8 float8, f4 float4, amt numeric)
+	WITH (autovacuum_enabled = off);
+INSERT INTO nk
+SELECT g,
+	   (ARRAY[1.0, 1.00, 2.5, 2.50, 2.500, 3, 3.0, 1.000])[1 + g % 8],
+	   (ARRAY[0.0::float8, -0.0, 1.5, 2.5, 'NaN', '-0'])[1 + g % 6],
+	   (ARRAY[0.0::float4, -0.0, 1.25, 'NaN'])[1 + g % 4],
+	   (g % 100) * 1.5
+FROM generate_series(1, 20000) g;
+VACUUM (DISABLE_PAGE_SKIPPING) nk;
+SELECT dbblue_columnar_add('nk', ARRAY['id','nk','f8','f4','amt']);
+ dbblue_columnar_add 
+---------------------
+                   5
+(1 row)
+
+SELECT dbblue_columnar_populate('nk') > 0 AS nk_built;
+ nk_built 
+----------
+ t
+(1 row)
+
+SELECT uses_node($$SELECT nk, count(*) FROM nk GROUP BY nk$$, 'DBBlueColumnarAgg') AS numkey_fires;
+ numkey_fires 
+--------------
+ t
+(1 row)
+
+SELECT uses_node($$SELECT f8, count(*) FROM nk GROUP BY f8$$, 'DBBlueColumnarAgg') AS fltkey_fires;
+ fltkey_fires 
+--------------
+ t
+(1 row)
+
+-- numeric key: byte-identical INCLUDING display scale (compare key ::text)
+SELECT 'nk-numkey     ', agree($$SELECT nk::text k, sum(amt)::text s, count(*) c FROM nk GROUP BY nk ORDER BY 1$$);
+    ?column?    | agree 
+----------------+-------
+ nk-numkey      | ok
+(1 row)
+
+SELECT 'nk-num+int    ', agree($$SELECT id % 7 g, nk::text k, count(*) c FROM nk GROUP BY id % 7, nk ORDER BY 1, 2$$);
+    ?column?    | agree 
+----------------+-------
+ nk-num+int     | ok
+(1 row)
+
+SELECT 'nk-num-expr   ', agree($$SELECT round(amt, 0)::text r, count(*) c FROM nk GROUP BY round(amt, 0) ORDER BY 1$$);
+    ?column?    | agree 
+----------------+-------
+ nk-num-expr    | ok
+(1 row)
+
+SELECT 'nk-num-aggs   ', agree($$SELECT nk::text k, sum(amt)::text s, avg(amt)::text a, min(amt)::text mn, max(amt)::text mx FROM nk GROUP BY nk ORDER BY 1$$);
+    ?column?    | agree 
+----------------+-------
+ nk-num-aggs    | ok
+(1 row)
+
+-- float keys: value-based grouping (agree() compares values; -0/+0 & NaN fold)
+SELECT 'nk-f8key      ', agree($$SELECT f8, count(*) c, sum(amt)::text s FROM nk GROUP BY f8 ORDER BY f8$$);
+    ?column?    | agree 
+----------------+-------
+ nk-f8key       | ok
+(1 row)
+
+SELECT 'nk-f4key      ', agree($$SELECT f4, count(*) c FROM nk GROUP BY f4 ORDER BY f4$$);
+    ?column?    | agree 
+----------------+-------
+ nk-f4key       | ok
+(1 row)
+
+SELECT 'nk-f8+int     ', agree($$SELECT id % 5 g, f8, count(*) c FROM nk GROUP BY id % 5, f8 ORDER BY 1, 2$$);
+    ?column?    | agree 
+----------------+-------
+ nk-f8+int      | ok
+(1 row)
+
+DROP TABLE nk;
+-- forced multi-pass spill on a NUMERIC key: a low reltuples lie lets the columnar
+-- agg be chosen, then the real 40000 distinct numeric keys overflow a small
+-- work_mem and the node spills (re-scans, aggregating one hash-partition per
+-- pass). The content parthash routes by numeric VALUE, stable across passes.
+CREATE TABLE nsp (nk numeric, amt numeric) WITH (autovacuum_enabled = off);
+INSERT INTO nsp SELECT g::numeric / 100, (g % 50) * 1.5 FROM generate_series(1, 40000) g;
+VACUUM (DISABLE_PAGE_SKIPPING) nsp;
+SELECT dbblue_columnar_add('nsp', ARRAY['nk','amt']);
+ dbblue_columnar_add 
+---------------------
+                   2
+(1 row)
+
+SELECT dbblue_columnar_populate('nsp') > 0 AS nsp_built;
+ nsp_built 
+-----------
+ t
+(1 row)
+
+ANALYZE nsp;
+UPDATE pg_class SET reltuples = 400 WHERE relname = 'nsp';
+SET work_mem = '256kB';
+SELECT uses_node($$SELECT nk, sum(amt) FROM nsp GROUP BY nk$$, 'DBBlueColumnarAgg') AS numspill_fires;
+ numspill_fires 
+----------------
+ t
+(1 row)
+
+SELECT 'nk-num-spill  ', agree($$SELECT nk::text k, sum(amt)::text s, count(*) c FROM nsp GROUP BY nk ORDER BY 1$$);
+    ?column?    | agree 
+----------------+-------
+ nk-num-spill   | ok
+(1 row)
+
+RESET work_mem;
+DROP TABLE nsp;
+-- ---- correctness under a rescan (LATERAL nestloop, columnar agg on inner) ----
+SELECT 'rescan        ', agree($$SELECT o.k, g.s FROM (VALUES (1),(3),(5)) o(k)
+	JOIN LATERAL (SELECT k7 kk, sum(amt) s FROM t GROUP BY k7) g ON g.kk = o.k ORDER BY o.k$$);
+    ?column?    | agree 
+----------------+-------
+ rescan         | ok
+(1 row)
+
+-- ---- parallel partial-aggregate pushdown: workers aggregate partial states,
+-- core Finalize Aggregate combines. Force the path (small table needs parallel
+-- enabled + the fused agg preferred over scan-serve/hashagg) and prove results
+-- stay byte-identical to heap. ----
+SET max_parallel_workers_per_gather = 4;
+SET min_parallel_table_scan_size = 0;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET enable_seqscan = off;
+SET enable_hashagg = off;
+-- the parallel partial-agg node must actually be chosen (else the checks below
+-- could pass by silently running some other path)
+SELECT uses_node($$SELECT k7, sum(amt) FROM t GROUP BY k7$$,
+				 'Parallel Custom Scan (DBBlueColumnarAgg)') AS par_agg_used;
+ par_agg_used 
+--------------
+ t
+(1 row)
+
+SELECT 'par-1key      ', agree($$SELECT k7, sum(amt) s, count(*) c, avg(amt) a FROM t GROUP BY k7 ORDER BY k7$$);
+    ?column?    | agree 
+----------------+-------
+ par-1key       | ok
+(1 row)
+
+SELECT 'par-2key      ', agree($$SELECT k7, grp, sum(amt) s, min(amt) mn, max(amt) mx FROM t GROUP BY k7, grp ORDER BY k7, grp$$);
+    ?column?    | agree 
+----------------+-------
+ par-2key       | ok
+(1 row)
+
+SELECT 'par-nullkey   ', agree($$SELECT pid, count(*) c, sum(amt) s FROM t GROUP BY pid ORDER BY pid$$);
+    ?column?    | agree 
+----------------+-------
+ par-nullkey    | ok
+(1 row)
+
+SELECT 'par-filter    ', agree($$SELECT k7, sum(amt) FILTER (WHERE amt > 50) s, count(*) FILTER (WHERE pid IS NOT NULL) c FROM t GROUP BY k7 ORDER BY k7$$);
+    ?column?    | agree 
+----------------+-------
+ par-filter     | ok
+(1 row)
+
+SELECT 'par-where     ', agree($$SELECT grp, sum(amt) s FROM t WHERE k7 > 2 GROUP BY grp ORDER BY grp$$);
+    ?column?    | agree 
+----------------+-------
+ par-where      | ok
+(1 row)
+
+SELECT 'par-exprkey   ', agree($$SELECT date_trunc('month', d) m, sum(amt) s FROM t GROUP BY 1 ORDER BY 1$$);
+    ?column?    | agree 
+----------------+-------
+ par-exprkey    | ok
+(1 row)
+
+SELECT 'par-stddev    ', agree($$SELECT k7, round(stddev(amt),8) sd, round(variance(amt),8) v FROM t GROUP BY k7 ORDER BY k7$$);
+    ?column?    | agree 
+----------------+-------
+ par-stddev     | ok
+(1 row)
+
+RESET enable_seqscan;
+RESET enable_hashagg;
+RESET min_parallel_table_scan_size;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+SET max_parallel_workers_per_gather = 0;
+-- ---- eager-aggregation fusion (aggregate-below-join): PG core's eager
+-- aggregation pushes a partial aggregate below a join; our fused
+-- DBBlueColumnarAgg should be that below-join aggregate. Force it and prove the
+-- results stay byte-identical to heap, including a many-to-many FAN-OUT join
+-- (the partial states are multiplied by the join, then a Finalize Aggregate
+-- above re-combines - the correctness-critical case). Uses grp (13 distinct,
+-- above min_eager_agg_group_size) as the join/group key so core offers it. ----
+CREATE TABLE dt (id int PRIMARY KEY, seq int);
+INSERT INTO dt SELECT g, g * 10 FROM generate_series(0, 12) g;			-- unique PK
+CREATE TABLE dtf (id int, seq int);
+INSERT INTO dtf SELECT g, g * 10 FROM generate_series(0, 12) g, generate_series(1, 2);	-- 2x fan-out
+ANALYZE dt;
+ANALYZE dtf;
+SET enable_eager_aggregate = on;
+SET max_parallel_workers_per_gather = 4;
+SET min_parallel_table_scan_size = 0;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET enable_seqscan = off;
+SET enable_hashagg = off;
+-- our fused node must be the below-join aggregate
+SELECT uses_node($$SELECT t.grp, dt.seq, sum(t.amt) FROM t LEFT JOIN dt ON dt.id = t.grp GROUP BY t.grp, dt.seq, dt.id$$,
+				 'Custom Scan (DBBlueColumnarAgg)') AS eager_fused_used;
+ eager_fused_used 
+------------------
+ t
+(1 row)
+
+SELECT 'eager-leftjoin  ', agree($$SELECT t.grp, dt.seq, sum(t.amt) s, count(*) c, avg(t.amt) a FROM t LEFT JOIN dt ON dt.id = t.grp GROUP BY t.grp, dt.seq, dt.id ORDER BY t.grp$$);
+     ?column?     | agree 
+------------------+-------
+ eager-leftjoin   | ok
+(1 row)
+
+SELECT 'eager-innerjoin ', agree($$SELECT t.grp, dt.seq, min(t.amt) mn, max(t.amt) mx, count(*) c FROM t JOIN dt ON dt.id = t.grp GROUP BY t.grp, dt.seq, dt.id ORDER BY t.grp$$);
+     ?column?     | agree 
+------------------+-------
+ eager-innerjoin  | ok
+(1 row)
+
+SELECT 'eager-where     ', agree($$SELECT t.grp, sum(t.amt) s FROM t LEFT JOIN dt ON dt.id = t.grp WHERE t.k7 > 3 GROUP BY t.grp, dt.id ORDER BY t.grp$$);
+     ?column?     | agree 
+------------------+-------
+ eager-where      | ok
+(1 row)
+
+SELECT 'eager-fanout    ', agree($$SELECT t.grp, sum(t.amt) s, count(*) c FROM t JOIN dtf ON dtf.id = t.grp GROUP BY t.grp ORDER BY t.grp$$);
+     ?column?     | agree 
+------------------+-------
+ eager-fanout     | ok
+(1 row)
+
+SELECT 'eager-fanout-left', agree($$SELECT t.grp, count(*) c, sum(t.amt) s, avg(t.amt) a FROM t LEFT JOIN dtf ON dtf.id = t.grp GROUP BY t.grp ORDER BY t.grp$$);
+     ?column?      | agree 
+-------------------+-------
+ eager-fanout-left | ok
+(1 row)
+
+RESET enable_seqscan;
+RESET enable_hashagg;
+RESET min_parallel_table_scan_size;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET enable_eager_aggregate;
+SET max_parallel_workers_per_gather = 0;
+DROP TABLE dt;
+DROP TABLE dtf;
+-- ---- expression group key WITH heap fallback: dirty some rows so the fused
+-- node interleaves columnar blocks with heap-range fallback in one scan, and
+-- the per-row group-key expression is evaluated over BOTH. Regression for a
+-- crash where the heap path pointed the expr context at an un-deformed raw heap
+-- slot (EEOP_SCAN_VAR "attnum < tts_nvalid" assert) - the block path populated a
+-- virtual scratch slot but the heap path did not. Must not crash; the result
+-- must equal heap. (Runs last: the UPDATE invalidates blocks for t.) ----
+UPDATE t SET amt = amt WHERE id < 500;
+SET max_parallel_workers_per_gather = 4;
+SET min_parallel_table_scan_size = 0;
+SET parallel_setup_cost = 0;
+SET enable_seqscan = off;
+SET enable_hashagg = off;
+SELECT uses_node($$SELECT date_trunc('year', d) FROM t GROUP BY 1$$,
+				 'DBBlueColumnarAgg') AS exprkey_heapfb_fused;
+ exprkey_heapfb_fused 
+----------------------
+ t
+(1 row)
+
+SELECT 'exprkey-heapfb  ', agree($$SELECT date_trunc('year', d) y, count(*) c, sum(amt) s, min(amt) mn FROM t GROUP BY 1 ORDER BY 1$$);
+     ?column?     | agree 
+------------------+-------
+ exprkey-heapfb   | ok
+(1 row)
+
+RESET enable_seqscan;
+RESET enable_hashagg;
+RESET min_parallel_table_scan_size;
+RESET parallel_setup_cost;
+SET max_parallel_workers_per_gather = 0;
+-- ---- M6 VM fast-path RE-STAMP: after a vacuum bumps a block's covering
+-- visibility-map page LSN, a byte-identical block fails the cheap VM proof and
+-- would pay the per-page proof on EVERY later scan. The serve path now re-arms
+-- (re-stamps) the VM stamp in place once it has proven the block unchanged, so
+-- the next scan is fast again. Deterministic: autovacuum off + explicit VACUUM
+-- fully control the VM state. Correctness never depends on the stamp. ----
+CREATE TABLE rs (id int, k int, amt numeric, d date) WITH (autovacuum_enabled = off);
+INSERT INTO rs SELECT g, g % 7, ((g % 100) + 1) * 1.25, DATE '2024-01-01' + (g % 365)
+FROM generate_series(1, 50000) g;
+VACUUM (DISABLE_PAGE_SKIPPING) rs;                       -- all pages all-visible
+SELECT dbblue_columnar_add('rs', ARRAY['id','k','amt','d']);
+ dbblue_columnar_add 
+---------------------
+                   4
+(1 row)
+
+SELECT dbblue_columnar_populate('rs') > 1 AS rs_multiblock;  -- need >1 block
+ rs_multiblock 
+---------------
+ t
+(1 row)
+
+-- read three DBBlueColumnarScan counters from ONE EXPLAIN ANALYZE (a second
+-- scan would already see the re-stamp, so all three must come from one run)
+CREATE FUNCTION cstat(q text, OUT vm bigint, OUT restamped bigint, OUT heap bigint)
+LANGUAGE plpgsql AS $$
+DECLARE line text;
+BEGIN
+	vm := 0; restamped := 0; heap := 0;
+	FOR line IN EXECUTE
+		'EXPLAIN (ANALYZE, TIMING OFF, COSTS OFF, SUMMARY OFF) ' || q
+	LOOP
+		IF position('Columnar VM-Validated Blocks:' IN line) > 0 THEN
+			vm := substring(line from '([0-9]+)$')::bigint;
+		ELSIF position('Columnar Blocks Re-stamped:' IN line) > 0 THEN
+			restamped := substring(line from '([0-9]+)$')::bigint;
+		ELSIF position('Heap Fallback Ranges:' IN line) > 0 THEN
+			heap := substring(line from '([0-9]+)$')::bigint;
+		END IF;
+	END LOOP;
+END $$;
+SET enable_seqscan = off;                   -- force the columnar scan node
+SELECT uses_node($$SELECT id, amt FROM rs WHERE id >= 0$$,
+				 'DBBlueColumnarScan') AS rs_scan_used;
+ rs_scan_used 
+--------------
+ t
+(1 row)
+
+-- baseline: freshly built + all-visible => every block proven by the cheap VM
+-- proof; nothing re-stamped, no heap fallback
+SELECT 'rs-baseline-fast ' t, vm > 0 AND restamped = 0 AND heap = 0 AS ok
+FROM cstat($q$SELECT id, amt FROM rs WHERE id >= 0$q$);
+         t         | ok 
+-------------------+----
+ rs-baseline-fast  | t
+(1 row)
+
+-- touch ONE row + vacuum: re-sets all-visible but advances the shared VM page
+-- LSN, so EVERY block on that VM page fails the cheap proof (the fragility)
+UPDATE rs SET amt = amt WHERE id = 1;
+VACUUM (DISABLE_PAGE_SKIPPING) rs;
+-- first scan after invalidation: cheap proof fails for all (vm = 0); the block
+-- holding id=1 genuinely changed -> heap fallback; every other block is proven
+-- unchanged and RE-STAMPED in place
+SELECT 'rs-heal-run1     ' t, vm = 0 AND restamped > 0 AND heap > 0 AS ok
+FROM cstat($q$SELECT id, amt FROM rs WHERE id >= 0$q$);
+         t         | ok 
+-------------------+----
+ rs-heal-run1      | t
+(1 row)
+
+-- second scan: the re-stamped blocks pass the cheap proof again (vm > 0),
+-- nothing left to re-stamp; the changed block still falls back to heap
+SELECT 'rs-heal-run2     ' t, vm > 0 AND restamped = 0 AND heap > 0 AS ok
+FROM cstat($q$SELECT id, amt FROM rs WHERE id >= 0$q$);
+         t         | ok 
+-------------------+----
+ rs-heal-run2      | t
+(1 row)
+
+-- correctness never depends on the stamp: columnar == heap throughout
+SELECT 'rs-correct       ' t, agree($q$SELECT id, amt FROM rs WHERE id >= 0 ORDER BY id$q$) c;
+         t         | c  
+-------------------+----
+ rs-correct        | ok
+(1 row)
+
+-- re-stamp OFF: the block stays on the slow proof, no recovery across scans
+SET dbblue_columnar.enable_restamp = off;
+UPDATE rs SET amt = amt WHERE id = 2;
+VACUUM (DISABLE_PAGE_SKIPPING) rs;
+SELECT 'rs-off-run1      ' t, vm = 0 AND restamped = 0 AS ok
+FROM cstat($q$SELECT id, amt FROM rs WHERE id >= 0$q$);
+         t         | ok 
+-------------------+----
+ rs-off-run1       | t
+(1 row)
+
+SELECT 'rs-off-run2      ' t, vm = 0 AND restamped = 0 AS ok
+FROM cstat($q$SELECT id, amt FROM rs WHERE id >= 0$q$);
+         t         | ok 
+-------------------+----
+ rs-off-run2       | t
+(1 row)
+
+-- turn it back on: healing resumes on the next scan
+SET dbblue_columnar.enable_restamp = on;
+SELECT 'rs-on-again      ' t, vm = 0 AND restamped > 0 AS ok
+FROM cstat($q$SELECT id, amt FROM rs WHERE id >= 0$q$);
+         t         | ok 
+-------------------+----
+ rs-on-again       | t
+(1 row)
+
+SELECT 'rs-on-recovered  ' t, vm > 0 AND restamped = 0 AS ok
+FROM cstat($q$SELECT id, amt FROM rs WHERE id >= 0$q$);
+         t         | ok 
+-------------------+----
+ rs-on-recovered   | t
+(1 row)
+
+-- SAME re-stamp on the refresh path: invalidate, then a POPULATE (not a query)
+-- must re-arm the cold blocks it reuses (dbbc_restamp_block, shared with the
+-- serve path), so the VERY FIRST scan afterwards is already fast - vm > 0 with
+-- nothing left for the serve path to re-stamp
+UPDATE rs SET amt = amt WHERE id = 3;
+VACUUM (DISABLE_PAGE_SKIPPING) rs;
+SELECT dbblue_columnar_populate('rs') > 0 AS rs_repopulated;
+ rs_repopulated 
+----------------
+ t
+(1 row)
+
+SELECT 'rs-refresh-armed ' t, vm > 0 AND restamped = 0 AND heap = 0 AS ok
+FROM cstat($q$SELECT id, amt FROM rs WHERE id >= 0$q$);
+         t         | ok 
+-------------------+----
+ rs-refresh-armed  | t
+(1 row)
+
+RESET enable_seqscan;
+DROP FUNCTION cstat(text);
+DROP TABLE rs;
+-- ---- in-node dimension hash-join (DBBlueColumnarAgg dim-join sub-mode) ----
+-- Aggregate a fact (t) LEFT JOIN a small unique-key dimension entirely in the
+-- engine (no join node); the dimension is probed live under the query snapshot.
+-- dj_dim covers only grp 0..6, so grp 7..12 exercise the LEFT-join NULL path;
+-- t carries stale blocks here (the earlier UPDATE), so the per-row probe runs on
+-- BOTH the columnar and heap-fallback paths in one scan. Differential vs the
+-- plain plan must be byte-identical. eager_aggregate off isolates the fused node.
+CREATE TABLE dj_dim (id int PRIMARY KEY, seq int, label text) WITH (autovacuum_enabled = off);
+INSERT INTO dj_dim SELECT g, (g * 3) % 20, 'lbl' || (g % 3) FROM generate_series(0, 6) g;
+ANALYZE dj_dim;
+SET dbblue_columnar.enable_dimjoin_agg = on;
+SET enable_eager_aggregate = off;
+SELECT uses_node($$SELECT t.grp, dj.seq, count(*) FROM t LEFT JOIN dj_dim dj ON dj.id = t.grp GROUP BY t.grp, dj.seq, dj.id$$,
+				 'DBBlueColumnarAgg') AS dimjoin_fires;
+ dimjoin_fires 
+---------------
+ t
+(1 row)
+
+SELECT 'dj-basic     ', agree($$SELECT t.grp, dj.seq, count(*) c, sum(t.amt) s FROM t LEFT JOIN dj_dim dj ON dj.id = t.grp GROUP BY t.grp, dj.seq, dj.id ORDER BY t.grp, dj.seq$$);
+   ?column?    | agree 
+---------------+-------
+ dj-basic      | ok
+(1 row)
+
+SELECT 'dj-exprkey   ', agree($$SELECT date_trunc('month', t.d) m, t.grp, dj.seq, count(*) c, sum(t.amt) s FROM t LEFT JOIN dj_dim dj ON dj.id = t.grp WHERE t.k7 > 0 GROUP BY 1, t.grp, dj.seq, dj.id ORDER BY 1, t.grp$$);
+   ?column?    | agree 
+---------------+-------
+ dj-exprkey    | ok
+(1 row)
+
+SELECT 'dj-filter    ', agree($$SELECT t.grp, dj.seq, count(*) FILTER (WHERE t.amt > 50) c, sum(t.amt) s FROM t LEFT JOIN dj_dim dj ON dj.id = t.grp GROUP BY t.grp, dj.seq, dj.id ORDER BY t.grp, dj.seq$$);
+   ?column?    | agree 
+---------------+-------
+ dj-filter     | ok
+(1 row)
+
+SELECT 'dj-scalaragg ', agree($$SELECT dj.seq, sum(t.amt) s, count(*) c FROM t LEFT JOIN dj_dim dj ON dj.id = t.grp GROUP BY dj.seq, dj.id ORDER BY dj.seq$$);
+   ?column?    | agree 
+---------------+-------
+ dj-scalaragg  | ok
+(1 row)
+
+-- Phase 2: INNER join + a dimension-side WHERE filter. Only passing dim rows
+-- enter the in-node hash; a fact row whose grp matches no passing dim row is
+-- dropped (INNER) - grp 7..12 (no dim at all) and a grp whose dim was filtered
+-- out alike. A "LEFT JOIN ... WHERE dj.col" reduces to the same inner join.
+-- At this fixture's tiny scale PG's plain HashAggregate over a Hash Join is
+-- cost-competitive (it collapses the FD group keys down to t.grp), so force the
+-- join methods off to exercise the fused node deterministically - at production
+-- scale the cost router picks it. Correctness is still the on-vs-off differential.
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_nestloop = off;
+SELECT uses_node($$SELECT t.grp, dj.seq, count(*) FROM t JOIN dj_dim dj ON dj.id = t.grp WHERE dj.seq > 5 GROUP BY t.grp, dj.seq, dj.id$$,
+				 'DBBlueColumnarAgg') AS dimjoin_filter_fires;
+ dimjoin_filter_fires 
+----------------------
+ t
+(1 row)
+
+SELECT 'dj2-inner-flt ', agree($$SELECT t.grp, dj.seq, count(*) c, sum(t.amt) s FROM t JOIN dj_dim dj ON dj.id = t.grp WHERE dj.seq > 5 GROUP BY t.grp, dj.seq, dj.id ORDER BY t.grp, dj.seq$$);
+    ?column?    | agree 
+----------------+-------
+ dj2-inner-flt  | ok
+(1 row)
+
+SELECT 'dj2-left-where', agree($$SELECT t.grp, dj.seq, count(*) c, sum(t.amt) s FROM t LEFT JOIN dj_dim dj ON dj.id = t.grp WHERE dj.seq > 5 GROUP BY t.grp, dj.seq, dj.id ORDER BY t.grp, dj.seq$$);
+    ?column?    | agree 
+----------------+-------
+ dj2-left-where | ok
+(1 row)
+
+SELECT 'dj2-keyrange  ', agree($$SELECT t.grp, dj.seq, sum(t.amt) s, count(*) c FROM t JOIN dj_dim dj ON dj.id = t.grp WHERE dj.id <= 3 GROUP BY t.grp, dj.seq, dj.id ORDER BY t.grp$$);
+    ?column?    | agree 
+----------------+-------
+ dj2-keyrange   | ok
+(1 row)
+
+SELECT 'dj2-twoquals  ', agree($$SELECT t.grp, sum(t.amt) s FROM t JOIN dj_dim dj ON dj.id = t.grp WHERE dj.seq > 3 AND dj.id < 6 GROUP BY t.grp, dj.id ORDER BY t.grp$$);
+    ?column?    | agree 
+----------------+-------
+ dj2-twoquals   | ok
+(1 row)
+
+SELECT 'dj2-empty     ', agree($$SELECT t.grp, dj.seq, count(*) c FROM t JOIN dj_dim dj ON dj.id = t.grp WHERE dj.seq > 999 GROUP BY t.grp, dj.seq, dj.id ORDER BY t.grp$$);
+    ?column?    | agree 
+----------------+-------
+ dj2-empty      | ok
+(1 row)
+
+-- group by a TEXT dimension column (FD on the dim key, not in GROUP BY): the
+-- probe supplies the label, interned so equal labels across dims share a group.
+SELECT uses_node($$SELECT dj.label, sum(t.amt) FROM t JOIN dj_dim dj ON dj.id = t.grp WHERE dj.seq > 3 GROUP BY dj.label$$,
+				 'DBBlueColumnarAgg') AS dimjoin_textkey_fires;
+ dimjoin_textkey_fires 
+-----------------------
+ t
+(1 row)
+
+SELECT 'dj2-dimtext   ', agree($$SELECT dj.label, sum(t.amt) s, count(*) c FROM t JOIN dj_dim dj ON dj.id = t.grp WHERE dj.seq > 3 GROUP BY dj.label ORDER BY dj.label$$);
+    ?column?    | agree 
+----------------+-------
+ dj2-dimtext    | ok
+(1 row)
+
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_nestloop;
+-- parallel: Finalize -> Gather -> Parallel Custom Scan (DBBlueColumnarAgg); each
+-- worker builds its own dim hash under the shared snapshot. Still byte-identical.
+SET max_parallel_workers_per_gather = 4;
+SET min_parallel_table_scan_size = 0;
+SET parallel_setup_cost = 0;
+SELECT uses_node($$SELECT t.grp, dj.seq, count(*), sum(t.amt) FROM t LEFT JOIN dj_dim dj ON dj.id = t.grp GROUP BY t.grp, dj.seq, dj.id$$,
+				 'DBBlueColumnarAgg') AS dimjoin_parallel_fires;
+ dimjoin_parallel_fires 
+------------------------
+ t
+(1 row)
+
+SELECT 'dj-parallel  ', agree($$SELECT t.grp, dj.seq, count(*) c, sum(t.amt) s FROM t LEFT JOIN dj_dim dj ON dj.id = t.grp GROUP BY t.grp, dj.seq, dj.id ORDER BY t.grp, dj.seq$$);
+   ?column?    | agree 
+---------------+-------
+ dj-parallel   | ok
+(1 row)
+
+RESET min_parallel_table_scan_size;
+RESET parallel_setup_cost;
+SET max_parallel_workers_per_gather = 0;
+-- runtime dim cap: a dimension whose planner estimate under-counts it must fail
+-- cleanly (not OOM). Force the estimate below a tiny cap via pg_class so the gate
+-- plans the dim-join; the build then overruns the cap and errors with a hint.
+-- (dj_dim has autovacuum off so the forced estimate is not re-ANALYZEd away.)
+SET dbblue_columnar.dimjoin_max_dim_rows = 3;
+UPDATE pg_class SET reltuples = 2 WHERE relname = 'dj_dim';
+SELECT t.grp, dj.seq, count(*) FROM t LEFT JOIN dj_dim dj ON dj.id = t.grp
+GROUP BY t.grp, dj.seq, dj.id;
+ERROR:  dbblue_columnar: dimension exceeds dbblue_columnar.dimjoin_max_dim_rows (3) at runtime
+HINT:  ANALYZE the dimension so the planner sizes it correctly and does not choose the in-node dimension join.
+RESET dbblue_columnar.dimjoin_max_dim_rows;
+ANALYZE dj_dim;
+RESET enable_eager_aggregate;
+SET dbblue_columnar.enable_dimjoin_agg = off;
+DROP TABLE dj_dim;
+-- ---------------------------------------------------------------------------
+-- Workload advisor. Asserts STRUCTURAL facts only: which columns each query
+-- shape bundles, which of those are filter columns, and whether the shape was
+-- seen under a grouped aggregate. Scores, widths, queryids and timestamps are
+-- all environment-dependent and deliberately not compared.
+-- ---------------------------------------------------------------------------
+SET dbblue_columnar.suggestions = on;
+SET dbblue_columnar.suggest_min_pages = 1;
+CREATE TABLE adv (a int, b int, c int, d text, e numeric);
+INSERT INTO adv SELECT g, g % 7, g % 13, 'x' || (g % 5), (g % 11) * 1.5
+FROM generate_series(1, 20000) g;
+VACUUM (ANALYZE, DISABLE_PAGE_SKIPPING) adv;
+-- shape 1: aggregate, projects a+e, filters on b
+SELECT a, sum(e) FROM adv WHERE b = 3 GROUP BY a ORDER BY a LIMIT 1;
+ a | sum 
+---+-----
+ 3 | 4.5
+(1 row)
+
+SELECT a, sum(e) FROM adv WHERE b = 3 GROUP BY a ORDER BY a LIMIT 1;
+ a | sum 
+---+-----
+ 3 | 4.5
+(1 row)
+
+-- shape 2: no aggregate, different columns, filters on d
+SELECT c FROM adv WHERE d = 'x2' ORDER BY c LIMIT 1;
+ c 
+---
+ 0
+(1 row)
+
+SELECT dbblue_columnar_suggestions_flush() > 0 AS flushed;
+ flushed 
+---------
+ t
+(1 row)
+
+-- exactly two bundles, each with exactly the columns its shape touches
+SELECT ncolumns, columns, filter_columns, aggregate_shape, eligibility, nplans
+FROM dbblue_columnar_suggestion_status
+WHERE relid = 'adv'::regclass
+ORDER BY aggregate_shape DESC;
+ ncolumns | columns | filter_columns | aggregate_shape | eligibility | nplans 
+----------+---------+----------------+-----------------+-------------+--------
+        3 | {a,b,e} | {b}            | t               | eligible    |      2
+        2 | {c,d}   | {d}            | f               | eligible    |      1
+(2 rows)
+
+-- the collector's own accounting must reconcile: every observation either
+-- landed or is explained by a drop counter
+SELECT collecting,
+       observations > 0 AS saw_something,
+       observations = recorded + noqueryid_drops + contended_drops + full_drops
+           AS accounting_balances
+FROM dbblue_columnar_suggestion_stats();
+ collecting | saw_something | accounting_balances 
+------------+---------------+---------------------
+ t          | t             | t
+(1 row)
+
+-- a partitioned table can never be accelerated. The advisor must say so on
+-- the PARENT (which is what the admin queried) and must NOT emit a
+-- zero-column row per partition.
+CREATE TABLE advp (id int, k int) PARTITION BY RANGE (id);
+CREATE TABLE advp1 PARTITION OF advp FOR VALUES FROM (0) TO (10000);
+CREATE TABLE advp2 PARTITION OF advp FOR VALUES FROM (10000) TO (40000);
+INSERT INTO advp SELECT g, g % 7 FROM generate_series(1, 30000) g;
+VACUUM (ANALYZE, DISABLE_PAGE_SKIPPING) advp;
+SELECT k, count(*) FROM advp WHERE id > 50 GROUP BY k ORDER BY k LIMIT 1;
+ k | count 
+---+-------
+ 0 |  4278
+(1 row)
+
+SELECT dbblue_columnar_suggestions_flush() > 0 AS flushed_parted;
+ flushed_parted 
+----------------
+ t
+(1 row)
+
+SELECT relid::text, eligibility, ncolumns
+FROM dbblue_columnar_suggestion_status
+WHERE relid::text LIKE 'advp%' ORDER BY relid::text;
+ relid | eligibility | ncolumns 
+-------+-------------+----------
+ advp  | partitioned |        0
+(1 row)
+
+DROP TABLE advp;
+-- a relation below the size floor must produce no advice at all
+SET dbblue_columnar.suggest_min_pages = 100000;
+CREATE TABLE adv_small (a int);
+INSERT INTO adv_small SELECT generate_series(1, 10);
+VACUUM (ANALYZE) adv_small;
+SELECT a FROM adv_small WHERE a = 5;
+ a 
+---
+ 5
+(1 row)
+
+SELECT dbblue_columnar_suggestions_flush() >= 0 AS flushed_again;
+ flushed_again 
+---------------
+ t
+(1 row)
+
+SELECT count(*) AS small_table_bundles
+FROM dbblue_columnar_suggestions WHERE relid = 'adv_small'::regclass;
+ small_table_bundles 
+---------------------
+                   0
+(1 row)
+
+RESET dbblue_columnar.suggest_min_pages;
+-- flushing twice must be idempotent, not a primary-key collision: the second
+-- pass has existing column rows to replace
+SELECT a, sum(e) FROM adv WHERE b = 3 GROUP BY a ORDER BY a LIMIT 1;
+ a | sum 
+---+-----
+ 3 | 4.5
+(1 row)
+
+SELECT dbblue_columnar_suggestions_flush() > 0 AS reflushed;
+ reflushed 
+-----------
+ t
+(1 row)
+
+SELECT ncolumns, columns FROM dbblue_columnar_suggestion_status
+WHERE relid = 'adv'::regclass AND aggregate_shape ORDER BY ncolumns;
+ ncolumns | columns 
+----------+---------
+        3 | {a,b,e}
+(1 row)
+
+-- deleting a bundle cascades its column rows away
+DELETE FROM dbblue_columnar_suggestions WHERE relid = 'adv'::regclass;
+SELECT count(*) AS columns_after_bundle_delete
+FROM dbblue_columnar_suggestion_columns WHERE relid = 'adv'::regclass;
+ columns_after_bundle_delete 
+-----------------------------
+                           0
+(1 row)
+
+-- DROP TABLE leaves nothing behind to strand, because relid is a plain
+-- regclass with no pg_depend edge: the flush skips vanished relations rather
+-- than writing rows whose relid renders as a bare OID
+DROP TABLE adv;
+SELECT dbblue_columnar_suggestions_flush() >= 0 AS flush_after_drop;
+ flush_after_drop 
+------------------
+ t
+(1 row)
+
+DROP TABLE adv_small;
+RESET dbblue_columnar.suggestions;
+-- ---------------------------------------------------------------------------
+-- Per-database budget isolation. The store is one cluster-wide area, so its
+-- memory must be accounted per database: otherwise one database's store
+-- consumes budget another database's store then cannot get, and tuning the
+-- engine for one tenant silently degrades every other tenant on the server.
+-- True cross-database isolation needs two databases and cannot be expressed
+-- here, so this covers the mechanism: the GUCs are now per-database settable,
+-- the quota is enforced, and the denial is attributed to the right limit.
+-- ---------------------------------------------------------------------------
+-- enabled and the worker cadence became PGC_SUSET, so a superuser can scope
+-- them per database (ALTER DATABASE) instead of per server. A plain SET
+-- proves the context changed; under PGC_POSTMASTER/PGC_SIGHUP these error.
+SET dbblue_columnar.enabled = on;
+SET dbblue_columnar.naptime = 30;
+SET dbblue_columnar.refresh_threshold = 10;
+SET dbblue_columnar.auto_columnarize = off;
+RESET dbblue_columnar.naptime;
+RESET dbblue_columnar.refresh_threshold;
+RESET dbblue_columnar.auto_columnarize;
+-- with no quota, this database competes with the others for memory_mb
+SELECT database_quota_mb, verdict
+FROM dbblue_columnar_database_memory_status;
+ database_quota_mb |                                     verdict                                      
+-------------------+----------------------------------------------------------------------------------
+                 0 | no per-database quota set - this database competes with the others for memory_mb
+(1 row)
+
+-- A 1 MB quota must stop this database's build, and the denial must be charged
+-- to the quota rather than to the server-wide budget - those have opposite
+-- fixes, so mis-attributing one sends an operator to change the wrong limit.
+--
+-- NB a quota bounds new RESERVATIONS; it does not retroactively evict a store
+-- that was already charged before the quota was lowered (same as memory_mb).
+-- So database_used_bytes may legitimately exceed the quota here, and the
+-- assertions below deliberately do not claim otherwise.
+SELECT dbblue_columnar_drop('t');
+ dbblue_columnar_drop 
+----------------------
+ t
+(1 row)
+
+SET dbblue_columnar.database_memory_mb = 1;
+SET client_min_messages = warning;   -- the block count in the NOTICE varies
+SELECT dbblue_columnar_populate('t') AS blocks_under_quota;
+ blocks_under_quota 
+--------------------
+                  0
+(1 row)
+
+RESET client_min_messages;
+SELECT database_quota_mb,
+       database_used_bytes > 0 AS charged_to_this_database,
+       denials_db_quota > 0    AS hit_own_quota,
+       denials_cluster         AS blamed_on_server,
+       verdict
+FROM dbblue_columnar_database_memory_status;
+ database_quota_mb | charged_to_this_database | hit_own_quota | blamed_on_server |                                     verdict                                     
+-------------------+--------------------------+---------------+------------------+---------------------------------------------------------------------------------
+                 1 | t                        | t             |                0 | this database hit its own database_memory_mb quota - raise it for this database
+(1 row)
+
+-- lifting the quota lets the same relation build out fully again, and the
+-- release must land back on this database's account
+RESET dbblue_columnar.database_memory_mb;
+SELECT dbblue_columnar_drop('t');
+ dbblue_columnar_drop 
+----------------------
+ t
+(1 row)
+
+SET client_min_messages = warning;
+SELECT dbblue_columnar_populate('t') > 0 AS rebuilt_without_a_quota;
+ rebuilt_without_a_quota 
+-------------------------
+ t
+(1 row)
+
+RESET client_min_messages;
+-- and the denial counter is this database's own, not the cluster's
+SELECT denials_cluster AS still_not_blamed_on_server
+FROM dbblue_columnar_database_memory_status;
+ still_not_blamed_on_server 
+----------------------------
+                          0
+(1 row)
+
+-- ---------------------------------------------------------------------------
+-- Orphan recovery. DROP EXTENSION removes dbblue_columnar_relations (an
+-- ordinary heap table owned by the extension) but has NO effect on the
+-- column store, which lives in raw shared memory outside any extension's SQL
+-- objects - so a store built before the drop survives it, unregistered and
+-- invisible to dbblue_columnar_status, while still being served. This is a
+-- self-contained section on its own throwaway table, run last so the
+-- DROP/CREATE EXTENSION here cannot disturb anything earlier in the file; it
+-- ends with the extension freshly (re)created so the trailing teardown below
+-- still finds it installed.
+-- ---------------------------------------------------------------------------
+CREATE TABLE orph (a int, b int);
+INSERT INTO orph SELECT g, g % 11 FROM generate_series(1, 20000) g;
+VACUUM (ANALYZE, DISABLE_PAGE_SKIPPING) orph;
+SELECT dbblue_columnar_add('orph', ARRAY['a','b']);
+ dbblue_columnar_add 
+---------------------
+                   2
+(1 row)
+
+SELECT dbblue_columnar_populate('orph') > 0 AS built;
+ built 
+-------
+ t
+(1 row)
+
+-- reproduce: DROP EXTENSION CASCADE leaves the store live but unregistered
+DROP EXTENSION dbblue_columnar CASCADE;
+CREATE EXTENSION dbblue_columnar VERSION '1.3';
+SELECT count(*) AS registrations_after_recreate FROM dbblue_columnar_relations;
+ registrations_after_recreate 
+------------------------------
+                            0
+(1 row)
+
+-- still being served, despite zero registrations - the orphan
+SELECT uses_node('SELECT count(*) FROM orph', 'Custom Scan') AS orphan_still_served;
+ orphan_still_served 
+---------------------
+ t
+(1 row)
+
+-- upgrading to 1.4 must not silently disturb it - the admin decides
+ALTER EXTENSION dbblue_columnar UPDATE TO '1.4';
+SELECT reloid::regclass::text, registered
+FROM dbblue_columnar_store_status WHERE reloid = 'orph'::regclass;
+ reloid | registered 
+--------+------------
+ orph   | f
+(1 row)
+
+SELECT uses_node('SELECT count(*) FROM orph', 'Custom Scan') AS still_served_after_alter_update;
+ still_served_after_alter_update 
+---------------------------------
+ t
+(1 row)
+
+-- manual reclaim finds and clears exactly the orphan, nothing else
+SET client_min_messages = warning;   -- the reclaimed count varies by test order
+SELECT dbblue_columnar_reset_database() >= 1 AS reclaimed_at_least_the_orphan;
+ reclaimed_at_least_the_orphan 
+-------------------------------
+ t
+(1 row)
+
+RESET client_min_messages;
+SELECT count(*) FROM dbblue_columnar_store_status WHERE reloid = 'orph'::regclass;
+ count 
+-------
+     0
+(1 row)
+
+SELECT uses_node('SELECT count(*) FROM orph', 'Seq Scan') AS heap_after_reclaim;
+ heap_after_reclaim 
+--------------------
+ t
+(1 row)
+
+-- a FRESH create (the reproduction again, but landing on the new default 1.4)
+-- must auto-heal: no registrations, no store, no leftover orphan - the exact
+-- state you would see after a server restart, just scoped to this database
+SELECT dbblue_columnar_add('orph', ARRAY['a','b']);
+ dbblue_columnar_add 
+---------------------
+                   2
+(1 row)
+
+SET client_min_messages = warning;
+SELECT dbblue_columnar_populate('orph') > 0 AS rebuilt;
+ rebuilt 
+---------
+ t
+(1 row)
+
+RESET client_min_messages;
+DROP EXTENSION dbblue_columnar CASCADE;
+CREATE EXTENSION dbblue_columnar;   -- picks up the new default_version, 1.4
+SELECT extversion FROM pg_extension WHERE extname = 'dbblue_columnar';
+ extversion 
+------------
+ 1.4
+(1 row)
+
+SELECT count(*) FROM dbblue_columnar_relations;
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM dbblue_columnar_store_status;
+ count 
+-------
+     0
+(1 row)
+
+SELECT uses_node('SELECT count(*) FROM orph', 'Seq Scan') AS auto_healed_to_heap;
+ auto_healed_to_heap 
+---------------------
+ t
+(1 row)
+
+-- and a LEGITIMATE store must never be touched by an ordinary upgrade: the
+-- auto-heal only ever runs from a genuinely fresh CREATE EXTENSION, never
+-- from an --X--Y.sql delta, so ALTER EXTENSION UPDATE on a live install is
+-- exercised throughout this whole file (every earlier ALTER EXTENSION UPDATE
+-- TO '1.x' left t's real store intact) - reconfirmed here for orph too.
+SELECT dbblue_columnar_add('orph', ARRAY['a','b']);
+ dbblue_columnar_add 
+---------------------
+                   2
+(1 row)
+
+SET client_min_messages = warning;
+SELECT dbblue_columnar_populate('orph') > 0 AS rebuilt_again;
+ rebuilt_again 
+---------------
+ t
+(1 row)
+
+RESET client_min_messages;
+DROP EXTENSION dbblue_columnar;
+CREATE EXTENSION dbblue_columnar VERSION '1.3';
+SELECT dbblue_columnar_add('orph', ARRAY['a','b']);
+ dbblue_columnar_add 
+---------------------
+                   2
+(1 row)
+
+SET client_min_messages = warning;
+SELECT dbblue_columnar_populate('orph') > 0 AS rebuilt_at_13;
+ rebuilt_at_13 
+---------------
+ t
+(1 row)
+
+RESET client_min_messages;
+ALTER EXTENSION dbblue_columnar UPDATE TO '1.4';
+SELECT registered FROM dbblue_columnar_store_status WHERE reloid = 'orph'::regclass;
+ registered 
+------------
+ t
+(1 row)
+
+SELECT uses_node('SELECT count(*) FROM orph', 'Custom Scan') AS legit_store_survives_upgrade;
+ legit_store_survives_upgrade 
+------------------------------
+ t
+(1 row)
+
+DROP TABLE orph;
+DROP FUNCTION agree(text);
+DROP FUNCTION uses_node(text, text);
+DROP TABLE t;
+DROP EXTENSION dbblue_columnar;

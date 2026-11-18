@@ -14,6 +14,7 @@
 #ifndef _PG_NUMERIC_H_
 #define _PG_NUMERIC_H_
 
+#include "common/int128.h"
 #include "common/pg_prng.h"
 #include "fmgr.h"
 
@@ -101,6 +102,9 @@ extern Numeric numeric_div_safe(Numeric num1, Numeric num2, Node *escontext);
 extern Numeric numeric_mod_safe(Numeric num1, Numeric num2, Node *escontext);
 extern int32 numeric_int4_safe(Numeric num, Node *escontext);
 extern int64 numeric_int8_safe(Numeric num, Node *escontext);
+/* DBblue columnar fast SUM(numeric): scaled-int128 accumulation */
+extern bool numeric_to_int64_scaled(Numeric num, int *scale, int64 *result);
+extern Numeric numeric_from_int128_scaled(INT128 acc, int scale);
 extern int32 make_numeric_typmod_safe(int32 precision, int32 scale,
 									  Node *escontext);
 
