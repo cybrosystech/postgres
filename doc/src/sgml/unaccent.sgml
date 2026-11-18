@@ -215,4 +215,54 @@ SELECT unaccent('H&ocirc;tel');
  </para>
  </sect2>
 
+ <sect2 id="unaccent-refresh">
+ <title>Refreshing After a Rules Change</title>
+
+ <para>
+  Indexes on <function>unaccent()</function> expressions are only correct for
+  the rules that were in effect when they were built, and
+  <productname>PostgreSQL</productname> cannot detect that the rules file has
+  changed (edited in place, replaced by an upgrade, or switched to another
+  file).  The following function repairs this in one step.
+ </para>
+
+ <para>
+  In this build, both forms of <function>unaccent()</function> are declared
+  <literal>IMMUTABLE</literal> rather than <literal>STABLE</literal>, so that SQL
+  wrappers around them can be inlined by the planner and they can be used in
+  index expressions.  The consequence is that
+  <productname>PostgreSQL</productname> cannot notice that the rules changed,
+  which is why the function below is provided.
+ </para>
+
+<synopsis>
+unaccent_refresh(<optional><replaceable class="parameter">new_rules</replaceable> <type>text</type> DEFAULT NULL, <replaceable class="parameter">dry_run</replaceable> <type>boolean</type> DEFAULT false, <replaceable class="parameter">dict</replaceable> <type>regdictionary</type> DEFAULT NULL</optional>) returns setof record (step text, object text, detail text)
+</synopsis>
+
+ <para>
+  It first reloads the rules of every text search dictionary built from the
+  <literal>unaccent</literal> template (or only <replaceable>dict</replaceable>),
+  optionally switching them to <replaceable>new_rules</replaceable>, the base
+  name of a <filename>.rules</filename> file as for
+  <command>ALTER TEXT SEARCH DICTIONARY</command>.  It then rebuilds, with
+  <command>REINDEX</command>, every index whose definition uses a function named
+  <function>unaccent</function>, whatever its access method.  With
+  <replaceable>dry_run</replaceable> it only reports what it would do.  Everything
+  runs in one transaction, so a failure changes nothing.
+ </para>
+
+ <para>
+  The indexes are rebuilt without <literal>CONCURRENTLY</literal>, so writes to
+  the tables are blocked meanwhile; for large busy tables reload the dictionary
+  and run <command>REINDEX INDEX CONCURRENTLY</command> by hand.  Data stored
+  from <function>unaccent()</function>, such as generated columns or
+  materialized view contents, is not refreshed.
+ </para>
+
+<programlisting>
+SELECT * FROM unaccent_refresh(dry_run =&gt; true);
+SELECT * FROM unaccent_refresh('my_rules');
+</programlisting>
+ </sect2>
+
 </sect1>
