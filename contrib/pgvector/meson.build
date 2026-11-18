@@ -2,7 +2,7 @@
 
 # pgvector is vendored third-party code; upstream pgvector only ships a
 # Makefile/PGXS build, with no meson.build of its own (true as of pgvector
-# 0.8.6, the version vendored here). This file mirrors contrib/pgvector/
+# 0.8.7, the version vendored here). This file mirrors contrib/pgvector/
 # Makefile for the meson build, the same way contrib/pg_partman/meson.build
 # does for pg_partman.
 
@@ -34,19 +34,10 @@ if host_system == 'windows'
     '--FILEDESC', 'vector - vector data type and ivfflat/hnsw access methods',])
 endif
 
-# Mirrors the Makefile's OPTFLAGS logic: -march=native speeds up pgvector's
-# distance-computation kernels almost everywhere, but the Makefile
-# deliberately skips it on Apple Silicon, PowerPC, and RISC-V64, where it's
-# known to be unreliable for this code, not merely unsupported by the
-# compiler -- so this is a platform check, not a cc.has_argument() check.
+# DBblue: -march=native is deliberately NOT used.  It ties the binary to the
+# build host's CPU, so a package built on a new machine dies with SIGILL on
+# older ones.
 vector_cflags = []
-if not (host_machine.system() == 'darwin' and host_machine.cpu_family() == 'aarch64') \
-    and not host_machine.cpu_family().startswith('ppc64') \
-    and host_machine.cpu_family() != 'riscv64'
-  if cc.has_argument('-march=native')
-    vector_cflags += ['-march=native']
-  endif
-endif
 
 # These are plain auto-vectorization/fast-math hints; unlike -march=native
 # they're safe to add wherever the compiler accepts the flag at all (they
@@ -66,13 +57,13 @@ vector = shared_module('vector',
 )
 contrib_targets += vector
 
-# The Makefile generates sql/vector--0.8.6.sql by copying sql/vector.sql at
+# The Makefile generates sql/vector--0.8.7.sql by copying sql/vector.sql at
 # build time (DATA_built); do the same thing here instead of installing
 # vector.sql directly, so the installed script is named the way PostgreSQL's
 # extension loader (CREATE EXTENSION vector) expects.
-vector_base_sql = custom_target('vector--0.8.6.sql',
+vector_base_sql = custom_target('vector--0.8.7.sql',
   input: 'sql/vector.sql',
-  output: 'vector--0.8.6.sql',
+  output: 'vector--0.8.7.sql',
   command: [python, '-c', 'import sys,shutil; shutil.copyfile(sys.argv[1], sys.argv[2])', '@INPUT@', '@OUTPUT@'],
   install: true,
   install_dir: contrib_data_dir,

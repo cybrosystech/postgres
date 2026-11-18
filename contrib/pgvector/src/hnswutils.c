@@ -13,6 +13,7 @@
 #include "sparsevec.h"
 #include "storage/bufmgr.h"
 #include "utils/datum.h"
+#include "utils/fmgrprotos.h"
 #include "utils/memdebug.h"
 #include "utils/rel.h"
 #include "vector.h"
@@ -51,7 +52,7 @@ hash_tid(ItemPointerData tid)
 	x.i = 0;
 	x.tid = tid;
 
-	return (uint32) murmurhash64(x.i);
+	return murmurhash64(x.i);
 }
 
 #define SH_PREFIX		tidhash
@@ -69,7 +70,7 @@ static uint32
 hash_pointer(uintptr_t ptr)
 {
 #if SIZEOF_VOID_P == 8
-	return (uint32) murmurhash64((uint64) ptr);
+	return murmurhash64((uint64) ptr);
 #else
 	return murmurhash32((uint32) ptr);
 #endif
@@ -90,7 +91,7 @@ static uint32
 hash_offset(Size offset)
 {
 #if SIZEOF_SIZE_T == 8
-	return (uint32) murmurhash64((uint64) offset);
+	return murmurhash64((uint64) offset);
 #else
 	return murmurhash32((uint32) offset);
 #endif
@@ -218,7 +219,7 @@ void
 HnswInitNeighbors(char *base, HnswElement element, int m, HnswAllocator * allocator)
 {
 	int			level = element->level;
-	HnswNeighborArrayPtr *neighborList = (HnswNeighborArrayPtr *) HnswAlloc(allocator, mul_size(sizeof(HnswNeighborArrayPtr), add_size((Size) level, 1)));
+	HnswNeighborArrayPtr *neighborList = (HnswNeighborArrayPtr *) HnswAlloc(allocator, mul_size(sizeof(HnswNeighborArrayPtr), add_size(level, 1)));
 
 	HnswPtrStore(base, element->neighbors, neighborList);
 
@@ -246,7 +247,8 @@ HnswInitElement(char *base, ItemPointer heaptid, int m, double ml, int maxLevel,
 {
 	HnswElement element = HnswAlloc(allocator, sizeof(HnswElementData));
 
-	int			level = (int) (-log(RandomDouble()) * ml);
+	double		uniform = RandomDouble();
+	int			level = uniform == 0.0 ? maxLevel : (int) (-log(uniform) * ml);
 
 	/* Cap level */
 	if (level > maxLevel)
@@ -255,7 +257,7 @@ HnswInitElement(char *base, ItemPointer heaptid, int m, double ml, int maxLevel,
 	element->heaptidsLength = 0;
 	HnswAddHeapTid(element, heaptid);
 
-	element->level = (uint8) level;
+	element->level = level;
 	element->deleted = 0;
 	/* Start at one to make it easier to find issues */
 	element->version = 1;
@@ -296,7 +298,7 @@ HnswInitElementFromBlock(BlockNumber blkno, OffsetNumber offno)
  * Get the metapage info
  */
 void
-HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint)
+HnswGetMetaPageInfo(Relation index, int *m, int *dimensions, HnswElement * entryPoint)
 {
 	Buffer		buf;
 	Page		page;
@@ -313,12 +315,15 @@ HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint)
 	if (m != NULL)
 		*m = metap->m;
 
+	if (dimensions != NULL)
+		*dimensions = metap->dimensions;
+
 	if (entryPoint != NULL)
 	{
 		if (BlockNumberIsValid(metap->entryBlkno))
 		{
 			*entryPoint = HnswInitElementFromBlock(metap->entryBlkno, metap->entryOffno);
-			(*entryPoint)->level = (uint8) metap->entryLevel;
+			(*entryPoint)->level = metap->entryLevel;
 		}
 		else
 			*entryPoint = NULL;
@@ -335,7 +340,7 @@ HnswGetEntryPoint(Relation index)
 {
 	HnswElement entryPoint;
 
-	HnswGetMetaPageInfo(index, NULL, &entryPoint);
+	HnswGetMetaPageInfo(index, NULL, NULL, &entryPoint);
 
 	return entryPoint;
 }
@@ -480,7 +485,7 @@ HnswSetNeighborTuple(char *base, HnswNeighborTuple ntup, HnswElement e, int m)
 		}
 	}
 
-	ntup->count = (uint16) idx;
+	ntup->count = idx;
 	ntup->version = e->version;
 }
 
@@ -671,14 +676,12 @@ CompareFurthestCandidates(const pairingheap_node *a, const pairingheap_node *b, 
 static inline void
 InitVisited(char *base, visited_hash * v, bool inMemory, int ef, int m)
 {
-	uint32		initialElements = (uint32) ef * (uint32) m * 2;
-
 	if (!inMemory)
-		v->tids = tidhash_create(CurrentMemoryContext, initialElements, NULL);
+		v->tids = tidhash_create(CurrentMemoryContext, ef * m * 2, NULL);
 	else if (base != NULL)
-		v->offsets = offsethash_create(CurrentMemoryContext, initialElements, NULL);
+		v->offsets = offsethash_create(CurrentMemoryContext, ef * m * 2, NULL);
 	else
-		v->pointers = pointerhash_create(CurrentMemoryContext, initialElements, NULL);
+		v->pointers = pointerhash_create(CurrentMemoryContext, ef * m * 2, NULL);
 }
 
 /*
@@ -783,8 +786,8 @@ HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation i
 	}
 
 	/* Copy to minimize lock time */
-	start = mul_size((Size) (element->level - lc), (Size) m);
-	memcpy(indextids, ntup->indextids + start, mul_size(sizeof(ItemPointerData), (Size) lm));
+	start = mul_size(element->level - lc, m);
+	memcpy(indextids, ntup->indextids + start, mul_size(sizeof(ItemPointerData), lm));
 
 	UnlockReleaseBuffer(buf);
 	return true;
@@ -833,7 +836,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 	HnswNeighborArray *localNeighborhood = NULL;
 	Size		neighborhoodSize = 0;
 	int			lm = HnswGetLayerM(m, lc);
-	HnswUnvisited *unvisited = palloc_array_checked(HnswUnvisited, (Size) lm);
+	HnswUnvisited *unvisited = palloc_array_checked(HnswUnvisited, lm);
 	int			unvisitedLength;
 	bool		inMemory = index == NULL;
 
@@ -1049,7 +1052,7 @@ CheckElementCloser(char *base, HnswCandidate * e, List *r, HnswSupport * support
 		HnswCandidate *ri = lfirst(lc2);
 		HnswElement riElement = HnswPtrAccess(base, ri->element);
 		Datum		riValue = HnswGetValue(base, riElement);
-		float		distance = (float) HnswGetDistance(eValue, riValue, support);
+		float		distance = HnswGetDistance(eValue, riValue, support);
 
 		if (distance <= e->distance)
 			return false;
@@ -1076,7 +1079,7 @@ SelectNeighbors(char *base, List *c, int lm, HnswSupport * support, bool *closer
 	if (list_length(w) <= lm)
 		return w;
 
-	wd = palloc_array_checked(HnswCandidate *, (Size) list_length(w));
+	wd = palloc_array_checked(HnswCandidate *, list_length(w));
 
 	/* Ensure order of candidates is deterministic for closer caching */
 	if (sortCandidates)
@@ -1333,7 +1336,7 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
 			HnswCandidate *hc = palloc_object(HnswCandidate);
 
 			hc->element = sc->element;
-			hc->distance = (float) sc->distance;
+			hc->distance = sc->distance;
 
 			lw = lappend(lw, hc);
 		}
@@ -1355,6 +1358,24 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
 		ep = w;
 	}
 }
+
+/*
+ * Check dimensions match index
+ */
+void
+HnswCheckDim(int expected, const HnswTypeInfo * typeInfo, Oid collation, Datum value)
+{
+	int32		dim = DatumGetInt32(DirectFunctionCall1Coll(typeInfo->dimensions, collation, value));
+
+	if (dim != expected)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_EXCEPTION),
+				 errmsg("expected %d dimensions, not %d", expected, dim)));
+}
+
+PGDLLEXPORT Datum vector_dims(PG_FUNCTION_ARGS);
+PGDLLEXPORT Datum halfvec_vector_dims(PG_FUNCTION_ARGS);
+PGDLLEXPORT Datum sparsevec_vector_dims(PG_FUNCTION_ARGS);
 
 PGDLLEXPORT Datum l2_normalize(PG_FUNCTION_ARGS);
 PGDLLEXPORT Datum halfvec_l2_normalize(PG_FUNCTION_ARGS);
@@ -1383,6 +1404,7 @@ HnswGetTypeInfo(Relation index)
 	{
 		static const HnswTypeInfo typeInfo = {
 			.maxDimensions = HNSW_MAX_DIM,
+			.dimensions = vector_dims,
 			.normalize = l2_normalize,
 			.checkValue = NULL
 		};
@@ -1399,6 +1421,7 @@ hnsw_halfvec_support(PG_FUNCTION_ARGS)
 {
 	static const HnswTypeInfo typeInfo = {
 		.maxDimensions = HNSW_MAX_DIM * 2,
+		.dimensions = halfvec_vector_dims,
 		.normalize = halfvec_l2_normalize,
 		.checkValue = NULL
 	};
@@ -1412,6 +1435,7 @@ hnsw_bit_support(PG_FUNCTION_ARGS)
 {
 	static const HnswTypeInfo typeInfo = {
 		.maxDimensions = HNSW_MAX_DIM * 32,
+		.dimensions = bitlength,
 		.normalize = NULL,
 		.checkValue = NULL
 	};
@@ -1425,6 +1449,7 @@ hnsw_sparsevec_support(PG_FUNCTION_ARGS)
 {
 	static const HnswTypeInfo typeInfo = {
 		.maxDimensions = SPARSEVEC_MAX_DIM,
+		.dimensions = sparsevec_vector_dims,
 		.normalize = sparsevec_l2_normalize,
 		.checkValue = SparsevecCheckValue
 	};

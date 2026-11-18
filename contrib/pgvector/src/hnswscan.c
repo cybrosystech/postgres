@@ -31,12 +31,17 @@ GetScanItems(IndexScanDesc scan, Datum value)
 	List	   *ep;
 	List	   *w;
 	int			m;
+	int			dimensions;
 	HnswElement entryPoint;
 	char	   *base = NULL;
 	HnswQuery  *q = &so->q;
 
-	/* Get m and entry point */
-	HnswGetMetaPageInfo(index, &m, &entryPoint);
+	/* Get m, dimensions, and entry point */
+	HnswGetMetaPageInfo(index, &m, &dimensions, &entryPoint);
+
+	/* Check dimensions match index */
+	if (DatumGetPointer(value) != NULL)
+		HnswCheckDim(dimensions, so->typeInfo, support->collation, value);
 
 	q->value = value;
 	so->m = m;
@@ -153,7 +158,7 @@ hnswbeginscan(Relation index, int nkeys, int norderbys)
 	/* Calculate max memory */
 	/* Add 256 extra bytes to fill last block when close */
 	maxMemory = (double) work_mem * hnsw_scan_mem_multiplier * 1024.0 + 256;
-	so->maxMemory = (Size) Min(maxMemory, (double) (SIZE_MAX / 2));
+	so->maxMemory = Min(maxMemory, (double) (SIZE_MAX / 2));
 
 	scan->opaque = so;
 
@@ -177,10 +182,10 @@ hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int no
 	MemoryContextReset(so->tmpCtx);
 
 	if (keys && scan->numberOfKeys > 0)
-		memmove(scan->keyData, keys, (Size) scan->numberOfKeys * sizeof(ScanKeyData));
+		memmove(scan->keyData, keys, scan->numberOfKeys * sizeof(ScanKeyData));
 
 	if (orderbys && scan->numberOfOrderBys > 0)
-		memmove(scan->orderByData, orderbys, (Size) scan->numberOfOrderBys * sizeof(ScanKeyData));
+		memmove(scan->orderByData, orderbys, scan->numberOfOrderBys * sizeof(ScanKeyData));
 }
 
 /*

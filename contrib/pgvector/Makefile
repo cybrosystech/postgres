@@ -1,5 +1,5 @@
 EXTENSION = vector
-EXTVERSION = 0.8.6
+EXTVERSION = 0.8.7
 
 MODULE_big = vector
 DATA = $(wildcard sql/*--*--*.sql)
@@ -11,26 +11,10 @@ TESTS = $(wildcard test/sql/*.sql)
 REGRESS = $(patsubst test/sql/%.sql,%,$(TESTS))
 REGRESS_OPTS = --inputdir=test --load-extension=$(EXTENSION)
 
-# To compile for portability, run: make OPTFLAGS=""
-OPTFLAGS = -march=native
-
-# Mac ARM doesn't always support -march=native
-ifeq ($(shell uname -s), Darwin)
-	ifeq ($(shell uname -p), arm)
-		# no difference with -march=armv8.5-a
-		OPTFLAGS =
-	endif
-endif
-
-# PowerPC doesn't support -march=native
-ifneq ($(filter ppc64%, $(shell uname -m)), )
-	OPTFLAGS =
-endif
-
-# RISC-V64 doesn't support -march=native
-ifeq ($(shell uname -m), riscv64)
-	OPTFLAGS =
-endif
+# DBblue: -march=native is deliberately NOT used.  It ties the binary to the
+# build host's CPU, so a package built on a new machine dies with SIGILL on
+# older ones.  To tune for the build host, run: make OPTFLAGS=-march=native
+OPTFLAGS =
 
 # For auto-vectorization:
 # - GCC (needs -ftree-vectorize OR -O3) - https://gcc.gnu.org/projects/tree-ssa/vectorization.html

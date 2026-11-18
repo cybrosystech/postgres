@@ -8,6 +8,7 @@
 #include "ivfflat.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
+#include "utils/fmgrprotos.h"
 #include "utils/memutils.h"
 #include "utils/relcache.h"
 #include "utils/varbit.h"
@@ -37,7 +38,7 @@ VectorArrayInit(int maxlen, int dimensions, Size itemsize)
 	res->maxlen = maxlen;
 	res->dim = dimensions;
 	res->itemsize = itemsize;
-	res->items = palloc_extended(mul_size((Size) maxlen, itemsize), MCXT_ALLOC_ZERO | MCXT_ALLOC_HUGE);
+	res->items = palloc_extended(mul_size(maxlen, itemsize), MCXT_ALLOC_ZERO | MCXT_ALLOC_HUGE);
 	return res;
 }
 
@@ -107,6 +108,9 @@ IvfflatNormVectors(const IvfflatTypeInfo * typeInfo, Oid collation, VectorArray 
 	{
 		Datum		value = PointerGetDatum(VectorArrayGet(arr, i));
 		Datum		newValue = IvfflatNormValue(typeInfo, collation, value);
+
+		/* Safety check */
+		IvfflatCheckDim(arr->dim, typeInfo, collation, newValue);
 
 		VectorArraySet(arr, i, DatumGetPointer(newValue));
 		MemoryContextReset(tmpCtx);
@@ -276,9 +280,31 @@ IvfflatUpdateList(Relation index, ListInfo listInfo,
 	}
 }
 
+static void
+IvfflatCheckExpectedDim(int expected, int32 dim)
+{
+	if (dim != expected)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_EXCEPTION),
+				 errmsg("expected %d dimensions, not %d", expected, dim)));
+}
+
+/*
+ * Check dimensions match index
+ */
+void
+IvfflatCheckDim(int expected, const IvfflatTypeInfo * typeInfo, Oid collation, Datum value)
+{
+	int32		dim = DatumGetInt32(DirectFunctionCall1Coll(typeInfo->dimensions, collation, value));
+
+	IvfflatCheckExpectedDim(expected, dim);
+}
+
+PGDLLEXPORT Datum vector_dims(PG_FUNCTION_ARGS);
+PGDLLEXPORT Datum halfvec_vector_dims(PG_FUNCTION_ARGS);
+
 PGDLLEXPORT Datum l2_normalize(PG_FUNCTION_ARGS);
 PGDLLEXPORT Datum halfvec_l2_normalize(PG_FUNCTION_ARGS);
-PGDLLEXPORT Datum sparsevec_l2_normalize(PG_FUNCTION_ARGS);
 
 static Size
 VectorItemSize(int dimensions)
@@ -295,7 +321,7 @@ HalfvecItemSize(int dimensions)
 static Size
 BitItemSize(int dimensions)
 {
-	return VARBITTOTALLEN((Size) dimensions);
+	return VARBITTOTALLEN(dimensions);
 }
 
 static void
@@ -304,7 +330,7 @@ VectorUpdateCenter(Pointer v, int dimensions, float *x)
 	Vector	   *vec = (Vector *) v;
 
 	SET_VARSIZE(vec, VECTOR_SIZE(dimensions));
-	vec->dim = (int16) dimensions;
+	vec->dim = dimensions;
 
 	for (int i = 0; i < dimensions; i++)
 		vec->x[i] = x[i];
@@ -316,7 +342,7 @@ HalfvecUpdateCenter(Pointer v, int dimensions, float *x)
 	HalfVector *vec = (HalfVector *) v;
 
 	SET_VARSIZE(vec, HALFVEC_SIZE(dimensions));
-	vec->dim = (int16) dimensions;
+	vec->dim = dimensions;
 
 	for (int i = 0; i < dimensions; i++)
 		vec->x[i] = Float4ToHalfUnchecked(x[i]);
@@ -328,7 +354,7 @@ BitUpdateCenter(Pointer v, int dimensions, float *x)
 	VarBit	   *vec = (VarBit *) v;
 	unsigned char *nx = VARBITS(vec);
 
-	SET_VARSIZE(vec, VARBITTOTALLEN((Size) dimensions));
+	SET_VARSIZE(vec, VARBITTOTALLEN(dimensions));
 	VARBITLEN(vec) = dimensions;
 
 	for (uint32 i = 0; i < VARBITBYTES(vec); i++)
@@ -339,33 +365,40 @@ BitUpdateCenter(Pointer v, int dimensions, float *x)
 }
 
 static void
-VectorSumCenter(Pointer v, float *x)
+VectorSumCenter(Pointer v, int dimensions, float *x)
 {
 	Vector	   *vec = (Vector *) v;
-	int			dim = vec->dim;
+
+	/* Safety check */
+	IvfflatCheckExpectedDim(dimensions, vec->dim);
 
 	/* Auto-vectorized */
-	for (int i = 0; i < dim; i++)
+	for (int i = 0; i < dimensions; i++)
 		x[i] += vec->x[i];
 }
 
 static void
-HalfvecSumCenter(Pointer v, float *x)
+HalfvecSumCenter(Pointer v, int dimensions, float *x)
 {
 	HalfVector *vec = (HalfVector *) v;
-	int			dim = vec->dim;
+
+	/* Safety check */
+	IvfflatCheckExpectedDim(dimensions, vec->dim);
 
 	/* Auto-vectorized on aarch64 */
-	for (int i = 0; i < dim; i++)
+	for (int i = 0; i < dimensions; i++)
 		x[i] += HalfToFloat4(vec->x[i]);
 }
 
 static void
-BitSumCenter(Pointer v, float *x)
+BitSumCenter(Pointer v, int dimensions, float *x)
 {
 	VarBit	   *vec = (VarBit *) v;
 
-	for (int i = 0; i < VARBITLEN(vec); i++)
+	/* Safety check */
+	IvfflatCheckExpectedDim(dimensions, VARBITLEN(vec));
+
+	for (int i = 0; i < dimensions; i++)
 		x[i] += (float) (((VARBITS(vec)[i / 8]) >> (7 - (i % 8))) & 0x01);
 }
 
@@ -381,6 +414,7 @@ IvfflatGetTypeInfo(Relation index)
 	{
 		static const IvfflatTypeInfo typeInfo = {
 			.maxDimensions = IVFFLAT_MAX_DIM,
+			.dimensions = vector_dims,
 			.normalize = l2_normalize,
 			.itemSize = VectorItemSize,
 			.updateCenter = VectorUpdateCenter,
@@ -399,6 +433,7 @@ ivfflat_halfvec_support(PG_FUNCTION_ARGS)
 {
 	static const IvfflatTypeInfo typeInfo = {
 		.maxDimensions = IVFFLAT_MAX_DIM * 2,
+		.dimensions = halfvec_vector_dims,
 		.normalize = halfvec_l2_normalize,
 		.itemSize = HalfvecItemSize,
 		.updateCenter = HalfvecUpdateCenter,
@@ -414,6 +449,7 @@ ivfflat_bit_support(PG_FUNCTION_ARGS)
 {
 	static const IvfflatTypeInfo typeInfo = {
 		.maxDimensions = IVFFLAT_MAX_DIM * 32,
+		.dimensions = bitlength,
 		.normalize = NULL,
 		.itemSize = BitItemSize,
 		.updateCenter = BitUpdateCenter,

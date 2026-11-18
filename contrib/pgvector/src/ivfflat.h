@@ -188,10 +188,11 @@ typedef struct IvfflatLeader
 typedef struct IvfflatTypeInfo
 {
 	int			maxDimensions;
+	Datum		(*dimensions) (PG_FUNCTION_ARGS);
 	Datum		(*normalize) (PG_FUNCTION_ARGS);
 	Size		(*itemSize) (int dimensions);
 	void		(*updateCenter) (Pointer v, int dimensions, float *x);
-	void		(*sumCenter) (Pointer v, float *x);
+	void		(*sumCenter) (Pointer v, int dimensions, float *x);
 }			IvfflatTypeInfo;
 
 typedef struct IvfflatBuildState
@@ -315,7 +316,7 @@ typedef struct IvfflatScanOpaqueData
 
 typedef IvfflatScanOpaqueData * IvfflatScanOpaque;
 
-#define VECTOR_ARRAY_SIZE(_length, _size) add_size(sizeof(VectorArrayData), mul_size((Size) (_length), MAXALIGN(_size)))
+#define VECTOR_ARRAY_SIZE(_length, _size) add_size(sizeof(VectorArrayData), mul_size(_length, MAXALIGN(_size)))
 
 /* Use functions instead of macros to avoid double evaluation */
 
@@ -326,7 +327,7 @@ VectorArrayGet(VectorArray arr, int offset)
 	if (offset < 0 || offset >= arr->maxlen)
 		elog(ERROR, "index out of bounds");
 
-	return ((char *) arr->items) + ((Size) offset * arr->itemsize);
+	return ((char *) arr->items) + (offset * arr->itemsize);
 }
 
 static inline void
@@ -359,6 +360,7 @@ Buffer		IvfflatNewBuffer(Relation index, ForkNumber forkNum);
 void		IvfflatInitPage(Buffer buf, Page page);
 void		IvfflatInitRegisterPage(Relation index, Buffer *buf, Page *page, GenericXLogState **state);
 void		IvfflatInit(void);
+void		IvfflatCheckDim(int expected, const IvfflatTypeInfo * typeInfo, Oid collation, Datum value);
 const		IvfflatTypeInfo *IvfflatGetTypeInfo(Relation index);
 PGDLLEXPORT void IvfflatParallelBuildMain(dsm_segment *seg, shm_toc *toc);
 
