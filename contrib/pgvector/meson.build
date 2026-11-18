@@ -123,8 +123,38 @@ install_headers(
   install_dir: dir_include_extension / 'vector',
 )
 
-# NOTE: pgvector's regression tests use a non-standard layout
-# (test/sql + test/expected, --inputdir=test, --load-extension=vector, see
-# the Makefile's REGRESS_OPTS) that isn't wired into meson's test harness
-# here. Run them via the classic PGXS path instead:
-#   cd contrib/pgvector && make installcheck
+# pgvector keeps its regression tests under test/ (test/sql, test/expected)
+# rather than in sql/ and expected/ at the top, so point the harness there,
+# the same way the Makefile's REGRESS_OPTS does.  Keep this list in sync with
+# test/sql/*.sql (the Makefile picks them up with a wildcard).
+#
+# "copy" is left out on purpose: it does \copy ... TO 'results/vector.bin',
+# a path relative to psql's working directory.  Under make that is the
+# directory pg_regress writes results/ into; under meson, testwrap runs from
+# the source directory, where no results/ exists.  It still runs under
+# "make check".
+tests += {
+  'name': 'pgvector',
+  'sd': meson.current_source_dir(),
+  'bd': meson.current_build_dir(),
+  'regress': {
+    'sql': [
+      'bit',
+      'btree',
+      'cast',
+      'halfvec',
+      'hnsw_bit',
+      'hnsw_halfvec',
+      'hnsw_sparsevec',
+      'hnsw_vector',
+      'ivfflat_bit',
+      'ivfflat_halfvec',
+      'ivfflat_vector',
+      'sparsevec',
+      'vector_type',
+    ],
+    'inputdir': meson.current_source_dir() / 'test',
+    'expecteddir': meson.current_source_dir() / 'test',
+    'regress_args': ['--load-extension=vector'],
+  },
+}
