@@ -1109,7 +1109,7 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 			ereport(NOTICE,
 					(errmsg("database \"%s\" will use the builtin \"C.UTF-8\" locale instead of the requested libc \"C\" collation",
 							dbname),
-					 errdetail("The builtin locale orders text the same way but applies Unicode case and character rules, where libc \"C\" is limited to ASCII."),
+					 errdetail("The builtin locale orders text the same way, and takes its Unicode case and character rules from PostgreSQL rather than from the operating system's locales."),
 					 errhint("Set dbblue_default_builtin_locale to off, or name LOCALE_PROVIDER explicitly, to keep the requested collation.")));
 	}
 

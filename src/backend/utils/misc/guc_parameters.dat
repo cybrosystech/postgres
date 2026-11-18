@@ -962,7 +962,7 @@
 
 { name => 'dbblue_default_builtin_locale', type => 'bool', context => 'PGC_USERSET', group => 'CLIENT_CONN_LOCALE',
   short_desc => 'Gives a CREATE DATABASE with no locale or encoding options the builtin C.UTF-8 locale.',
-  long_desc => 'When on, CREATE DATABASE with no TEMPLATE, ENCODING, LOCALE, COLLATE, CTYPE or LOCALE_PROVIDER option creates the database from template0 with UTF8 encoding and the builtin C.UTF-8 locale, which is what Odoo expects and sorts considerably faster than libc. The same applies to an explicit LC_COLLATE of "C" with UTF8 encoding and template0. Because such a database is cloned from template0, template1 and anything the administrator has put in it are not used; a NOTICE is emitted whenever this happens. Turn this off for standard PostgreSQL behaviour, where CREATE DATABASE inherits template1.',
+  long_desc => 'When on, CREATE DATABASE with no TEMPLATE, ENCODING, LOCALE, COLLATE, CTYPE or LOCALE_PROVIDER option creates the database from template0 with UTF8 encoding, the builtin C.UTF-8 locale and LC_COLLATE/LC_CTYPE "C", which is what Odoo expects, sorts considerably faster than a libc language locale and depends on no operating-system locale. The same applies to an explicit LC_COLLATE of "C" with UTF8 encoding and template0. Because such a database is cloned from template0, template1 and anything the administrator has put in it are not used; a WARNING is emitted when no options were given, and a NOTICE for the LC_COLLATE "C" form. Turn this off for standard PostgreSQL behaviour, where CREATE DATABASE inherits template1.',
   variable => 'dbblue_default_builtin_locale',
   boot_val => 'true',
 },

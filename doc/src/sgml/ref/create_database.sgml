@@ -85,16 +85,28 @@ CREATE DATABASE <replaceable class="parameter">name</replaceable>
     <literal>LC_COLLATE = 'C'</literal> combined with
     <literal>UTF8</literal> encoding and
     <literal>TEMPLATE template0</literal>.  This is the combination Odoo
-    expects, and the builtin provider sorts considerably faster than
-    <literal>libc</literal>.
+    expects.  The builtin provider compares text in byte order, which sorts
+    considerably faster than a <literal>libc</literal> language locale such
+    as <literal>en_US.UTF-8</literal>, and its Unicode case mapping does
+    not depend on the locales installed in the operating system.
+    <literal>LC_COLLATE</literal> and <literal>LC_CTYPE</literal> are set
+    to <literal>C</literal> rather than inherited from
+    <literal>template0</literal>, so the database does not depend on any
+    operating-system locale and can be dumped with
+    <command>pg_dump -C</command> and restored on any host.
    </para>
 
    <para>
     Because such a database is cloned from <literal>template0</literal>,
     nothing that has been added to <literal>template1</literal> -- a
     customised locale, but equally any extensions, schemas or seed data --
-    is carried into it.  A <literal>NOTICE</literal> is emitted whenever
-    this substitution happens.  Set
+    is carried into it.  When the command names no options at all, a
+    <literal>WARNING</literal> is emitted, since the database would
+    otherwise have been cloned from <literal>template1</literal>.  For the
+    <literal>LC_COLLATE = 'C'</literal> form only a
+    <literal>NOTICE</literal> is emitted, since the caller already asked
+    for <literal>template0</literal> and only the collation provider
+    changes.  Set
     <varname>dbblue_default_builtin_locale</varname> to <literal>off</literal>,
     or name any of the options above explicitly, for the standard
     <literal>template1</literal> behaviour described above.
