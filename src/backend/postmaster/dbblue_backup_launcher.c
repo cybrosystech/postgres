@@ -318,6 +318,9 @@ static bool append_shell_quoted(StringInfo buf, const char *str);
 static void append_conninfo_dbname(StringInfo buf, const char *dbname);
 static void report_unmanaged_backups(void);
 static bool path_has_parent_component(const char *path);
+static const char *database_list_problem(const char *value, const char *item);
+static const char *parent_folder_unsafe_reason(const char *path);
+static bool backup_directory_still_usable(void);
 
 /*
  * dbblue_check_backup_enabled
@@ -396,48 +399,76 @@ dbblue_check_backup_enabled(bool *newval, void **extra, GucSource source)
  * (<dbblue_backup_directory>/<name>/<name>_<time>.dump), so the names that
  * cannot be one -- empty, ".", "..", or containing '/' -- are refused.  Any
  * other character, '.' included (Odoo allows it), is safe there.
+ *
+ * Only ALTER SYSTEM rejects a bad value (a session in a transaction).  At
+ * server start a rejected value in postgresql.conf would be FATAL -- far
+ * worse than not backing up some database -- so there, and on a reload, it
+ * is accepted, and the launcher skips the bad names and says why (see
+ * parse_configured_databases()).  A parallel worker only copies the value
+ * its leader already accepted.
  */
 bool
 dbblue_check_backup_databases(char **newval, void **extra, GucSource source)
 {
-	char	   *rawstring;
-	List	   *elemlist;
-	ListCell   *lc;
-	bool		ok = true;
+	const char *problem;
 
 	if (*newval == NULL || **newval == '\0')
 		return true;
 
-	rawstring = pstrdup(*newval);
+	problem = database_list_problem(*newval, NULL);
+	if (problem == NULL)
+		return true;
 
-	if (!SplitGUCList(rawstring, ',', &elemlist))
+	if (IsUnderPostmaster && IsTransactionState() && !IsParallelWorker())
 	{
-		GUC_check_errdetail("List syntax is invalid.");
-		pfree(rawstring);
-		list_free(elemlist);
+		GUC_check_errdetail("%s", problem);
+		GUC_check_errhint("List database names separated by commas. A database named \".\" or \"..\", or whose name contains \"/\", cannot be listed.");
 		return false;
 	}
 
-	foreach(lc, elemlist)
-	{
-		char	   *item = (char *) lfirst(lc);
+	return true;
+}
 
+/*
+ * database_list_problem
+ *		NULL if value is a valid dbblue_backup_databases list, else why not.
+ *		If item is not NULL, check only that one name of the list.
+ */
+static const char *
+database_list_problem(const char *value, const char *item)
+{
+	char	   *rawstring;
+	List	   *elemlist;
+	ListCell   *lc;
+	const char *problem = NULL;
+
+	if (item != NULL)
+	{
 		if (item[0] == '\0' ||
 			strcmp(item, ".") == 0 ||
 			strcmp(item, "..") == 0 ||
 			strchr(item, '/') != NULL)
+			return psprintf("\"%s\" cannot be backed up, as its name cannot be used as a backup directory name.",
+							item);
+		return NULL;
+	}
+
+	rawstring = pstrdup(value);
+	if (!SplitGUCList(rawstring, ',', &elemlist))
+		problem = "List syntax is invalid.";
+	else
+	{
+		foreach(lc, elemlist)
 		{
-			GUC_check_errdetail("\"%s\" cannot be backed up, as its name cannot be used as a backup directory name.",
-								item);
-			GUC_check_errhint("A database named \".\" or \"..\", or whose name contains \"/\", cannot be listed.");
-			ok = false;
-			break;
+			problem = database_list_problem(NULL, (char *) lfirst(lc));
+			if (problem != NULL)
+				break;
 		}
 	}
 
-	pfree(rawstring);
 	list_free(elemlist);
-	return ok;
+	pfree(rawstring);
+	return problem;
 }
 
 /*
@@ -609,6 +640,49 @@ folder_unsafe_reason(const char *path, bool follow_link)
 }
 
 /*
+ * parent_folder_unsafe_reason
+ *		Why a folder above path (a canonical absolute path) would let another
+ *		user put something else in path's place, or NULL if none would.
+ *
+ * Whoever can write to a folder can rename what is in it, so a backup
+ * directory no one else can write to is still not safe inside one they can:
+ * they could move it aside and put a symlink to, say, the data directory in
+ * its place.  So each folder above it must be owned by root or the server's
+ * user, and not writable by group or others -- unless it has the sticky bit,
+ * as /tmp does, which keeps others from renaming what they do not own.
+ */
+static const char *
+parent_folder_unsafe_reason(const char *path)
+{
+	char		parent[MAXPGPATH];
+	struct stat st;
+
+	strlcpy(parent, path, sizeof(parent));
+	while (strcmp(parent, "/") != 0)
+	{
+		char		previous[MAXPGPATH];
+
+		strlcpy(previous, parent, sizeof(previous));
+		get_parent_directory(parent);
+		if (parent[0] == '\0')
+			strlcpy(parent, "/", sizeof(parent));
+		if (strcmp(parent, previous) == 0)
+			break;
+
+		if (stat(parent, &st) != 0)
+			return psprintf("is inside \"%s\", which cannot be checked: %s",
+							parent, strerror(errno));
+		if (st.st_uid != 0 && st.st_uid != geteuid())
+			return psprintf("is inside \"%s\", which is owned by another operating-system user",
+							parent);
+		if ((st.st_mode & (S_IWGRP | S_IWOTH)) && !(st.st_mode & S_ISVTX))
+			return psprintf("is inside \"%s\", which is writable by other users (mode %04o)",
+							parent, (unsigned int) (st.st_mode & 07777));
+	}
+	return NULL;
+}
+
+/*
  * check_backup_directory
  *		Verify that dbblue_backup_directory is somewhere the launcher may
  *		write dumps, and resolve it and the data directory into
@@ -712,6 +786,18 @@ check_backup_directory(void)
 			backup_dir_real[0] = '\0';
 			return false;
 		}
+
+		reason = parent_folder_unsafe_reason(backup_dir_real);
+		if (reason != NULL)
+		{
+			ereport(WARNING,
+					(errmsg("dbblue backup launcher: dbblue_backup_directory \"%s\" %s, not backing up",
+							dbblue_backup_directory, reason),
+					 errdetail("Another user who can write there could move the backup directory aside and put a link to the server's own files in its place."),
+					 errhint("Use a directory whose parent folders are owned by root or by the operating-system user the server runs as, and are not writable by group or others.")));
+			backup_dir_real[0] = '\0';
+			return false;
+		}
 	}
 
 	if (path_is_within(backup_dir_real, data_dir_real))
@@ -750,6 +836,62 @@ check_backup_directory(void)
 								dbblue_backup_directory,
 								dbblue_backup_min_free_space)));
 		}
+	}
+
+	return true;
+}
+
+/*
+ * backup_directory_still_usable
+ *		Re-check, at the start of each cycle, what check_backup_directory()
+ *		verified when the launcher got ready: since then the directory may
+ *		have been removed, made writable by others, put inside a folder
+ *		others can write to, or -- through a symlink in its path -- moved.
+ *		False, after a WARNING, if this cycle must neither back up nor prune.
+ *
+ * A missing directory is no longer re-created: backup_one_database() only
+ * creates the per-database folder inside it, as the setting's own
+ * description says it must exist.
+ */
+static bool
+backup_directory_still_usable(void)
+{
+	char		real[MAXPGPATH];
+	const char *reason;
+
+	if (dbblue_backup_directory == NULL || dbblue_backup_directory[0] == '\0')
+		return true;			/* backup_one_database() records each skip */
+
+	if (!get_real_path(dbblue_backup_directory, real))
+	{
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("dbblue backup launcher: cannot use dbblue_backup_directory \"%s\": %m, not backing up",
+						dbblue_backup_directory),
+				 errhint("Is the backup disk mounted?  Backups resume once the directory is back.")));
+		return false;
+	}
+
+	if (strcmp(real, backup_dir_real) != 0)
+	{
+		ereport(WARNING,
+				(errmsg("dbblue backup launcher: dbblue_backup_directory \"%s\" now leads to \"%s\" instead of \"%s\", not backing up",
+						dbblue_backup_directory, real, backup_dir_real),
+				 errhint("Restart the server to check and use the new location.")));
+		return false;
+	}
+
+	reason = folder_unsafe_reason(backup_dir_real, true);
+	if (reason == NULL)
+		reason = parent_folder_unsafe_reason(backup_dir_real);
+	if (reason != NULL)
+	{
+		ereport(WARNING,
+				(errmsg("dbblue backup launcher: dbblue_backup_directory \"%s\" %s, not backing up",
+						dbblue_backup_directory, reason),
+				 errdetail("Another user who can write there could make a backup overwrite the server's own files, or replace a backup with a malicious one."),
+				 errhint("Make it, and the folders above it, owned by the operating-system user the server runs as (or root), and not writable by group or others.")));
+		return false;
 	}
 
 	return true;
@@ -1404,21 +1546,43 @@ ensure_schema(void)
  *		Split dbblue_backup_databases into database names, the same way
  *		dbblue_check_backup_databases() does (case kept as written).  The
  *		returned list and its entries live in launcher_cxt.
+ *
+ *		A bad value can get here from postgresql.conf, which the check hook
+ *		accepts (see dbblue_check_backup_databases()): a list that cannot be
+ *		split backs up nothing, and a name that cannot be a folder name is
+ *		skipped.  Either is warned about once per value, not every cycle.
  */
 static List *
 parse_configured_databases(void)
 {
+	static char *warned_value = NULL;
 	char	   *rawstring;
 	List	   *elemlist;
 	List	   *result = NIL;
 	ListCell   *lc;
+	bool		warn;
 
 	if (dbblue_backup_databases == NULL || dbblue_backup_databases[0] == '\0')
 		return NIL;
 
+	warn = (warned_value == NULL ||
+			strcmp(warned_value, dbblue_backup_databases) != 0);
+	if (warn)
+	{
+		if (warned_value != NULL)
+			pfree(warned_value);
+		warned_value = MemoryContextStrdup(TopMemoryContext,
+										   dbblue_backup_databases);
+	}
+
 	rawstring = pstrdup(dbblue_backup_databases);
 	if (!SplitGUCList(rawstring, ',', &elemlist))
 	{
+		if (warn)
+			ereport(WARNING,
+					(errmsg("dbblue backup launcher: dbblue_backup_databases \"%s\" is not a valid list, not backing up any database",
+							dbblue_backup_databases),
+					 errhint("List database names separated by commas, with double quotes around a name that contains a comma or a space.")));
 		pfree(rawstring);
 		list_free(elemlist);
 		return NIL;
@@ -1430,9 +1594,19 @@ parse_configured_databases(void)
 		BackupDbSpec *spec;
 		ListCell   *lc2;
 		bool		duplicate = false;
+		const char *problem;
 
-		if (item[0] == '\0')
+		problem = database_list_problem(NULL, item);
+		if (problem != NULL)
+		{
+			if (warn)
+				ereport(WARNING,
+						(errmsg("dbblue backup launcher: skipping \"%s\" in dbblue_backup_databases",
+								item),
+						 errdetail("%s", problem),
+						 errhint("A database named \".\" or \"..\", or whose name contains \"/\", cannot be listed.")));
 			continue;
+		}
 
 		/*
 		 * A repeated entry (e.g. a copy-paste mistake in the GUC) would
@@ -1606,6 +1780,9 @@ run_backup_cycle(void)
 	TimestampTz next_due = 0;
 
 	if (specs == NIL)
+		return 0;
+
+	if (!backup_directory_still_usable())
 		return 0;
 
 	candidates = load_backup_candidates(specs);
@@ -2126,65 +2303,108 @@ run_backup_command(const char *cmd, const char *space_path,
 
 /*
  * read_dump_errors
- *		What the last pg_dump wrote to its error output, or NULL if nothing.
- *		Only the last 1 kB is kept: pg_dump's error comes last, after any
- *		warnings.
+ *		What the last pg_dump wrote to its error output, or NULL if nothing,
+ *		cut to DUMP_ERRORS_KEEP bytes.
+ *
+ * pg_dump's own error is the last line starting "pg_dump: error:", after any
+ * warnings, but it can be followed by a detail line far longer than what is
+ * kept: on a lock timeout, "Query was: LOCK TABLE" with every table, several
+ * kB on an Odoo database.  Keeping just the end of the output then kept a
+ * piece of that table list, or nothing, and lost the error itself.  So keep
+ * the text from that error line on; only output with no such line (e.g. the
+ * shell's own "not found") falls back to its last DUMP_ERRORS_KEEP bytes.
  */
+#define DUMP_ERRORS_SCAN	(64 * 1024)
+#define DUMP_ERRORS_KEEP	1024
+
 static char *
 read_dump_errors(void)
 {
-	char		buf[1024 + 1];
-	char	   *text = buf;
+	char	   *buf;
+	char	   *text = NULL;
+	char	   *p;
 	int			fd;
 	off_t		size;
 	off_t		start;
 	ssize_t		len;
+	size_t		textlen;
 
 	fd = open(DBBLUE_BACKUP_STDERR_FILE, O_RDONLY | PG_BINARY, 0);
 	if (fd < 0)
 		return NULL;
 
+	buf = palloc(DUMP_ERRORS_SCAN + 1);
 	size = lseek(fd, 0, SEEK_END);
-	start = size > 1024 ? size - 1024 : 0;
+	start = size > DUMP_ERRORS_SCAN ? size - DUMP_ERRORS_SCAN : 0;
 	len = size > 0 ? pg_pread(fd, buf, size - start, start) : 0;
 	close(fd);
 	if (len <= 0)
+	{
+		pfree(buf);
 		return NULL;
+	}
 	buf[len] = '\0';
 
-	/* Read from the middle of the file: begin at the next whole line. */
-	if (start > 0 && strchr(text, '\n') != NULL)
-		text = strchr(text, '\n') + 1;
+	/* The last "pg_dump: error:" that begins a line. */
+	for (p = buf; (p = strstr(p, "pg_dump: error:")) != NULL; p++)
+	{
+		if (p == buf ? start == 0 : p[-1] == '\n')
+			text = p;
+	}
 
-	/* Drop the trailing newline(s). */
-	while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
-		buf[--len] = '\0';
+	if (text == NULL)
+	{
+		/* The last DUMP_ERRORS_KEEP bytes, from a line start if one follows. */
+		text = buf + (len > DUMP_ERRORS_KEEP ? len - DUMP_ERRORS_KEEP : 0);
+		if (text > buf || start > 0)
+		{
+			char	   *nl = strchr(text, '\n');
+
+			if (nl != NULL && nl[1] != '\0')
+				text = nl + 1;
+		}
+	}
+
+	/* Cut to size, marking the cut, and drop the trailing newline(s). */
+	textlen = strlen(text);
+	if (textlen > DUMP_ERRORS_KEEP)
+	{
+		textlen = DUMP_ERRORS_KEEP;
+		memcpy(text + textlen - 3, "...", 3);
+		text[textlen] = '\0';
+	}
+	while (textlen > 0 && (text[textlen - 1] == '\n' || text[textlen - 1] == '\r'))
+		text[--textlen] = '\0';
 
 	if (text[0] == '\0')
+	{
+		pfree(buf);
 		return NULL;
+	}
 
 	/*
 	 * It goes into a text column, so it must be valid in the database's
-	 * encoding: pg_dump writes in the OS locale's, and the 1 kB tail can
-	 * start in the middle of a multibyte character.  Replace each byte that
+	 * encoding: pg_dump writes in the OS locale's, and the text can start or
+	 * be cut in the middle of a multibyte character.  Replace each byte that
 	 * does not begin a valid character with '?'.
 	 */
 	{
 		char	   *out = pstrdup(text);
 		int			enc = GetDatabaseEncoding();
 		int			left = strlen(out);
-		char	   *p = out;
+		char	   *q = out;
 
+		pfree(buf);
 		while (left > 0)
 		{
-			int			l = pg_encoding_verifymbchar(enc, p, left);
+			int			l = pg_encoding_verifymbchar(enc, q, left);
 
 			if (l <= 0)
 			{
-				*p = '?';
+				*q = '?';
 				l = 1;
 			}
-			p += l;
+			q += l;
 			left -= l;
 		}
 		return out;
@@ -2345,7 +2565,12 @@ backup_one_database(const char *dbname, int64 last_backup_size)
 		}
 	}
 
-	if (pg_mkdir_p(dbdir, DBBLUE_BACKUP_DIR_MODE) != 0)
+	/*
+	 * Only the database's own folder: the backup directory itself must
+	 * already exist (see backup_directory_still_usable()), and re-creating it
+	 * on the root disk while a backup disk is unmounted would hide that.
+	 */
+	if (mkdir(dbdir, DBBLUE_BACKUP_DIR_MODE) != 0 && errno != EEXIST)
 	{
 		int			save_errno = errno;
 
@@ -2376,7 +2601,7 @@ backup_one_database(const char *dbname, int64 last_backup_size)
 					 errhint("Make it a directory owned by the operating-system user the server runs as, and not writable by group or others (chmod go-w).")));
 			record_backup_history(dbname, started_at, "failed", NULL, 0,
 								  psprintf("backup directory \"%s\" %s", dbdir, reason));
-			apply_retention(dbname);
+			/* No apply_retention(): it refuses this folder too, and says so. */
 			return false;
 		}
 	}
@@ -2647,6 +2872,35 @@ apply_retention(const char *dbname)
 
 	snprintf(what, sizeof(what),
 			 "could not apply retention to the backups of database \"%s\"", dbname);
+
+	/*
+	 * Not through a database folder that is a symlink or not ours alone (see
+	 * folder_unsafe_reason()): retention removes <folder>/<file> by name,
+	 * which would follow the link and delete a file of that name wherever it
+	 * points, then drop the history row of the real dump.  A folder that is
+	 * missing altogether is fine; see dump_is_gone().
+	 */
+	if (dbblue_backup_directory != NULL && dbblue_backup_directory[0] != '\0')
+	{
+		char		dbdir[MAXPGPATH];
+		struct stat st;
+
+		if (snprintf(dbdir, sizeof(dbdir), "%s/%s",
+					 dbblue_backup_directory, dbname) < MAXPGPATH &&
+			(lstat(dbdir, &st) == 0 || errno != ENOENT))
+		{
+			const char *reason = folder_unsafe_reason(dbdir, false);
+
+			if (reason != NULL)
+			{
+				ereport(WARNING,
+						(errmsg("dbblue backup launcher: not applying retention to the backups of database \"%s\": backup directory \"%s\" %s",
+								dbname, dbdir, reason),
+						 errhint("Make it a directory owned by the operating-system user the server runs as, and not writable by group or others (chmod go-w).")));
+				return;
+			}
+		}
+	}
 
 	PG_TRY();
 	{
