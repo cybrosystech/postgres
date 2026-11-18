@@ -42,7 +42,6 @@ SUBDIRS = \
 		pg_stash_advice	\
 		pg_stat_statements \
 		pg_surgery	\
-		pg_tde		\
 		pg_trgm		\
 		pgrowlocks	\
 		pgstattuple	\
@@ -59,6 +58,11 @@ SUBDIRS = \
 		tsm_system_time \
 		unaccent	\
 		vacuumlo
+
+# pg_tde is not built or installed by default (TDE is a phase-2 feature); it is
+# kept in ALWAYS_SUBDIRS so that clean targets still reach it.  To use it, run
+# "make -C contrib/pg_tde install" and initdb with --enable-tde.
+ALWAYS_SUBDIRS += pg_tde
 
 ifeq ($(with_ssl),openssl)
 SUBDIRS += pgcrypto sslinfo

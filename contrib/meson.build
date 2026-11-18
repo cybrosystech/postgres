@@ -59,7 +59,8 @@ subdir('pg_stat_statements')
 subdir('pgstattuple')
 subdir('pgvector')
 subdir('pg_surgery')
-subdir('pg_tde')
+# pg_tde is not part of the phase-1 build; see contrib/pg_tde.  To build and
+# install it anyway, configure with a source tree that re-enables it here.
 subdir('pg_trgm')
 subdir('pg_visibility')
 subdir('pg_walinspect')
