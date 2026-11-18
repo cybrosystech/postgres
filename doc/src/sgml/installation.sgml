@@ -322,8 +322,10 @@
 
     <listitem>
      <para>
-      You need <productname>LZ4</productname>, if you want to support
-      compression of data with that method; see
+      You need <productname>LZ4</productname>.  It is required by default,
+      because <xref linkend="guc-wal-compression"/> defaults to it, but it can
+      be left out explicitly (<option>--without-lz4</option> or
+      <option>-Dlz4=disabled</option>).  It is used for compression of data; see
       <xref linkend="guc-default-toast-compression"/> and
       <xref linkend="guc-wal-compression"/>.
      </para>
@@ -976,10 +978,16 @@ build-postgresql:
       </varlistentry>
 
       <varlistentry id="configure-option-with-lz4">
-       <term><option>--with-lz4</option></term>
+       <term><option>--without-lz4</option></term>
        <listitem>
         <para>
-         Build with <productname>LZ4</productname> compression support.
+         Build without <productname>LZ4</productname> compression support.
+         <productname>LZ4</productname> support is built by default, and
+         <filename>configure</filename> fails if the library is missing.
+         Because <xref linkend="guc-wal-compression"/> defaults to
+         <literal>lz4</literal>, a server, standby, <application>pg_rewind</application>
+         or <application>pg_waldump</application> built without it cannot
+         read WAL written by other servers using the default.
         </para>
        </listitem>
       </varlistentry>
@@ -2470,7 +2478,12 @@ ninja install
       <listitem>
        <para>
         Build with <productname>LZ4</productname> compression support.
-        Defaults to auto.
+        Defaults to enabled, so setup fails if the library is missing; use
+        <literal>disabled</literal> to build without it.  Because
+        <xref linkend="guc-wal-compression"/> defaults to <literal>lz4</literal>,
+        a server, standby, <application>pg_rewind</application> or
+        <application>pg_waldump</application> built without it cannot read
+        WAL written by other servers using the default.
        </para>
       </listitem>
      </varlistentry>

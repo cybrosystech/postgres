@@ -121,7 +121,11 @@ option('libxslt', type: 'feature', value: 'auto',
 option('llvm', type: 'feature', value: 'disabled',
   description: 'LLVM support')
 
-option('lz4', type: 'feature', value: 'auto',
+# DBblue: 'enabled', not upstream's 'auto'.  wal_compression defaults to lz4,
+# so every DBblue server, standby, pg_rewind and pg_waldump must be able to
+# decode lz4 full-page images; a silent fallback would build binaries that fail
+# on another DBblue node's WAL.  Use -Dlz4=disabled to opt out deliberately.
+option('lz4', type: 'feature', value: 'enabled',
   description: 'LZ4 support')
 
 option('nls', type: 'feature', value: 'auto',

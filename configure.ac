@@ -1181,7 +1181,9 @@ AC_SUBST(with_zlib)
 # LZ4
 #
 AC_MSG_CHECKING([whether to build with LZ4 support])
-PGAC_ARG_BOOL(with, lz4, no, [build with LZ4 support],
+# DBblue: on by default (upstream: off).  wal_compression defaults to lz4, so
+# every DBblue binary must be able to decode lz4 full-page images.
+PGAC_ARG_BOOL(with, lz4, yes, [do not build with LZ4 support],
               [AC_DEFINE([USE_LZ4], 1, [Define to 1 to build with LZ4 support. (--with-lz4)])])
 AC_MSG_RESULT([$with_lz4])
 AC_SUBST(with_lz4)
@@ -1470,7 +1472,9 @@ if test "$with_liburing" = yes; then
 fi
 
 if test "$with_lz4" = yes ; then
-  AC_CHECK_LIB(lz4, LZ4_compress_default, [], [AC_MSG_ERROR([library 'lz4' is required for LZ4 support])])
+  AC_CHECK_LIB(lz4, LZ4_compress_default, [], [AC_MSG_ERROR([library 'lz4' is required for LZ4 support.
+Install the lz4 development package, or use --without-lz4 to build without
+it (such a build cannot replay lz4-compressed WAL from other DBblue servers).])])
 fi
 
 if test "$with_zstd" = yes ; then

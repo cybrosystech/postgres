@@ -1603,7 +1603,7 @@ Optional Packages:
   --with-system-tzdata=DIR
                           use system time zone data in DIR
   --without-zlib          do not use Zlib
-  --with-lz4              build with LZ4 support
+  --without-lz4           do not build with LZ4 support
   --with-zstd             build with ZSTD support
   --with-ssl=LIB          use LIB for SSL/TLS support (openssl)
   --with-openssl          obsolete spelling of --with-ssl=openssl
@@ -9547,7 +9547,9 @@ $as_echo "#define USE_LZ4 1" >>confdefs.h
   esac
 
 else
-  with_lz4=no
+  with_lz4=yes
+
+$as_echo "#define USE_LZ4 1" >>confdefs.h
 
 fi
 
@@ -13409,7 +13411,9 @@ _ACEOF
   LIBS="-llz4 $LIBS"
 
 else
-  as_fn_error $? "library 'lz4' is required for LZ4 support" "$LINENO" 5
+  as_fn_error $? "library 'lz4' is required for LZ4 support.
+Install the lz4 development package, or use --without-lz4 to build without
+it (such a build cannot replay lz4-compressed WAL from other DBblue servers)." "$LINENO" 5
 fi
 
 fi
