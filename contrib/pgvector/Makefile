@@ -2,14 +2,20 @@ EXTENSION = vector
 EXTVERSION = 0.8.7
 
 MODULE_big = vector
-DATA = $(wildcard sql/*--*--*.sql)
+# DBblue: $(wildcard) does not search VPATH, so in an out-of-tree (VPATH)
+# build a bare "sql/..." pattern looks in the empty build directory and finds
+# nothing: no upgrade scripts get installed and no regression tests run.  Glob
+# in $(srcdir) instead and strip that prefix, since PGXS prepends $(srcdir)/
+# itself when installing DATA.  (Recursive "=" defers expansion until after
+# Makefile.global or PGXS has defined srcdir below.)
+DATA = $(patsubst $(srcdir)/%,%,$(wildcard $(srcdir)/sql/*--*--*.sql))
 DATA_built = sql/$(EXTENSION)--$(EXTVERSION).sql
 OBJS = src/bitutils.o src/bitvec.o src/halfutils.o src/halfvec.o src/hnsw.o src/hnswbuild.o src/hnswinsert.o src/hnswscan.o src/hnswutils.o src/hnswvacuum.o src/ivfbuild.o src/ivfflat.o src/ivfinsert.o src/ivfkmeans.o src/ivfscan.o src/ivfutils.o src/ivfvacuum.o src/sparsevec.o src/vector.o
 HEADERS = src/halfvec.h src/sparsevec.h src/vector.h
 
-TESTS = $(wildcard test/sql/*.sql)
+TESTS = $(patsubst $(srcdir)/%,%,$(wildcard $(srcdir)/test/sql/*.sql))
 REGRESS = $(patsubst test/sql/%.sql,%,$(TESTS))
-REGRESS_OPTS = --inputdir=test --load-extension=$(EXTENSION)
+REGRESS_OPTS = --inputdir=$(srcdir)/test --load-extension=$(EXTENSION)
 
 # DBblue: -march=native is deliberately NOT used.  It ties the binary to the
 # build host's CPU, so a package built on a new machine dies with SIGILL on
