@@ -1040,6 +1040,13 @@ SoftPinRelationIndexes(PinEntry *entry)
 static void
 PinnerHandleSignals(void)
 {
+    /*
+     * SIGTERM is wired to die(), which only sets ProcDiePending; it is acted
+     * on here.  Without this the worker never exits and a fast/smart shutdown
+     * of the postmaster hangs forever waiting for it.
+     */
+    CHECK_FOR_INTERRUPTS();
+
     if (ConfigReloadPending)
     {
         ConfigReloadPending = false;
