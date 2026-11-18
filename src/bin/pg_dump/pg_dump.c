@@ -17255,6 +17255,7 @@ dumpTableSchema(Archive *fout, const TableInfo *tbinfo)
 	PQExpBuffer q = createPQExpBuffer();
 	PQExpBuffer delq = createPQExpBuffer();
 	PQExpBuffer extra = createPQExpBuffer();
+	SimpleStringList cmstmts = {NULL, NULL};
 	char	   *qrelname;
 	char	   *qualrelname;
 	int			numParents;
@@ -18076,11 +18077,27 @@ dumpTableSchema(Archive *fout, const TableInfo *tbinfo)
 						break;
 				}
 
+				/*
+				 * dbblue: into a TOC entry of its own per column (below),
+				 * not the table's.  A target server that can't use the
+				 * method -- zstd on a build without it -- then fails only
+				 * that column's entry, instead of the whole CREATE TABLE
+				 * and with it every row of the table.  One entry per
+				 * column, because the statements of one entry run in one
+				 * transaction, so a zstd failure would also undo the
+				 * other columns' settings.
+				 */
 				if (cmname != NULL)
-					appendPQExpBuffer(q, "ALTER %sTABLE ONLY %s ALTER COLUMN %s SET COMPRESSION %s;\n",
+				{
+					PQExpBuffer cmq = createPQExpBuffer();
+
+					appendPQExpBuffer(cmq, "ALTER %sTABLE ONLY %s ALTER COLUMN %s SET COMPRESSION %s;\n",
 									  foreign, qualrelname,
 									  fmtId(tbinfo->attnames[j]),
 									  cmname);
+					simple_string_list_append(&cmstmts, cmq->data);
+					destroyPQExpBuffer(cmq);
+				}
 			}
 
 			/*
@@ -18175,6 +18192,25 @@ dumpTableSchema(Archive *fout, const TableInfo *tbinfo)
 								  SECTION_POST_DATA : SECTION_PRE_DATA,
 								  .createStmt = q->data,
 								  .dropStmt = delq->data));
+
+		/*
+		 * Per-column compression methods, as separate entries depending on
+		 * the table; see above.  Like TABLE ATTACH they have no drop
+		 * statement (dropping the table covers them), but an owner, so that
+		 * they run as the table's owner.  The tag is the table's name, so
+		 * that pg_restore --table selects them along with the table.
+		 */
+		for (SimpleStringListCell *cell = cmstmts.head; cell; cell = cell->next)
+			ArchiveEntry(fout, nilCatalogId, createDumpId(),
+						 ARCHIVE_OPTS(.tag = tbinfo->dobj.name,
+									  .namespace = tbinfo->dobj.namespace->dobj.name,
+									  .owner = tbinfo->rolname,
+									  .description = "TABLE COMPRESSION",
+									  .section = tbinfo->postponed_def ?
+									  SECTION_POST_DATA : SECTION_PRE_DATA,
+									  .createStmt = cell->val,
+									  .deps = &(tbinfo->dobj.dumpId),
+									  .nDeps = 1));
 	}
 
 	/* Dump Table Comments */
@@ -18250,6 +18286,7 @@ dumpTableSchema(Archive *fout, const TableInfo *tbinfo)
 	destroyPQExpBuffer(q);
 	destroyPQExpBuffer(delq);
 	destroyPQExpBuffer(extra);
+	simple_string_list_destroy(&cmstmts);
 	free(qrelname);
 	free(qualrelname);
 }

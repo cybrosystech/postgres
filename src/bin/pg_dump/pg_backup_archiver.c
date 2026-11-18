@@ -3239,6 +3239,7 @@ _tocEntryRequired(TocEntry *te, teSection curSection, ArchiveHandle *AH)
 			}
 			else if (strcmp(te->desc, "TABLE") == 0 ||
 					 strcmp(te->desc, "TABLE DATA") == 0 ||
+					 strcmp(te->desc, "TABLE COMPRESSION") == 0 ||
 					 strcmp(te->desc, "VIEW") == 0 ||
 					 strcmp(te->desc, "FOREIGN TABLE") == 0 ||
 					 strcmp(te->desc, "MATERIALIZED VIEW") == 0 ||

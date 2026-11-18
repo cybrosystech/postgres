@@ -15,6 +15,45 @@
 --
 
 --
+-- Which relations are scanned:
+--
+--  * System catalogs are skipped.  The server never compresses them with
+--    zstd (toast_resolve_compression()), and scanning them only made the
+--    tools fail for non-superusers on catalogs such as pg_authid.
+--  * The current session's own temporary tables are included.  Other
+--    sessions' temporary tables cannot be read, so they are skipped; they
+--    disappear with their session anyway.
+--
+-- The views list only catalog metadata and are readable by everyone.  The
+-- scans skip tables the caller may not SELECT from, with a warning saying
+-- how many; normalizing a table requires owning it.
+--
+CREATE OR REPLACE VIEW dbblue_toastable_columns AS
+SELECT n.nspname::text AS schemaname,
+       c.relname::text AS tablename,
+       a.attname::text AS columnname,
+       c.oid            AS reloid,
+       a.attnum,
+       c.relkind,
+       c.relispartition,
+       a.attcompression,
+       pg_catalog.format_type(a.atttypid, a.atttypmod) AS coltype
+  FROM pg_catalog.pg_class c
+  JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+  JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid
+ WHERE c.relkind IN ('r', 'm')
+   AND (c.relpersistence <> 't' OR c.relnamespace = pg_catalog.pg_my_temp_schema())
+   AND a.attnum > 0
+   AND NOT a.attisdropped
+   AND a.attlen = -1
+   AND n.nspname NOT IN ('pg_catalog', 'pg_toast');
+
+COMMENT ON VIEW dbblue_toastable_columns IS
+'Columns that can hold TOASTed values, except in system catalogs (never zstd) and other sessions'' temporary tables.';
+
+GRANT SELECT ON dbblue_toastable_columns TO PUBLIC;
+
+--
 -- dbblue_force_detoast() now also flattens composite fields and array
 -- elements (C change, same signature).  Two new C helpers:
 --
@@ -51,14 +90,16 @@ SELECT n.nspname::text  AS schemaname,
   JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
   JOIN pg_catalog.pg_am am ON am.oid = i.relam
  WHERE c.relkind IN ('r', 'm')
-   AND c.relpersistence <> 't'
+   AND (c.relpersistence <> 't' OR c.relnamespace = pg_catalog.pg_my_temp_schema())
    AND i.relkind = 'i'
-   AND n.nspname <> 'pg_toast'
+   AND n.nspname NOT IN ('pg_catalog', 'pg_toast')
    AND EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a
                 WHERE a.attrelid = i.oid AND a.attnum > 0 AND a.attlen = -1);
 
 COMMENT ON VIEW dbblue_toastable_indexes IS
-'Indexes with variable-length columns, which can hold compressed entries.';
+'Indexes with variable-length columns, which can hold compressed entries, except on system catalogs and other sessions'' temporary tables.';
+
+GRANT SELECT ON dbblue_toastable_indexes TO PUBLIC;
 
 --
 -- Indexes holding zstd entries, or that cannot be inspected.
@@ -71,12 +112,18 @@ AS $$
 DECLARE
     ix      record;
     n       bigint;
+    skipped int := 0;
     targets oid[] := dbblue_toast_targets(relation);
 BEGIN
     FOR ix IN SELECT * FROM dbblue_toastable_indexes t
                WHERE targets IS NULL OR t.reloid = ANY(targets)
                ORDER BY 1, 2, 3
     LOOP
+        IF NOT pg_catalog.has_table_privilege(ix.reloid, 'SELECT') THEN
+            skipped := skipped + 1;
+            CONTINUE;
+        END IF;
+
         n := dbblue_index_zstd_entries(ix.indexoid);
 
         IF n IS NULL THEN
@@ -92,6 +139,11 @@ BEGIN
         indexname := ix.indexname; zstd_entries := n;
         RETURN NEXT;
     END LOOP;
+
+    IF skipped > 0 THEN
+        RAISE WARNING 'skipped % index(es) on tables you do not have SELECT privilege on', skipped
+          USING HINT = 'Run this as a superuser or as a role that can read every table to inspect them.';
+    END IF;
 END;
 $$;
 
@@ -110,12 +162,20 @@ DECLARE
     col     record;
     ix      record;
     found   boolean;
+    skipped oid[] := '{}';
     targets oid[] := dbblue_toast_targets(relation);
 BEGIN
     FOR col IN SELECT * FROM dbblue_toastable_columns c
                 WHERE targets IS NULL OR c.reloid = ANY(targets)
                 ORDER BY 1, 2, 5
     LOOP
+        IF NOT pg_catalog.has_table_privilege(col.reloid, 'SELECT') THEN
+            IF NOT col.reloid = ANY(skipped) THEN
+                skipped := skipped || col.reloid;
+            END IF;
+            CONTINUE;
+        END IF;
+
         IF col.attcompression = 'z' THEN
             schemaname := col.schemaname; tablename := col.tablename;
             columnname := col.columnname; reason := 'column is marked zstd';
@@ -138,6 +198,11 @@ BEGIN
             RETURN NEXT;
         END IF;
     END LOOP;
+
+    IF cardinality(skipped) > 0 THEN
+        RAISE WARNING 'skipped % table(s) you do not have SELECT privilege on', cardinality(skipped)
+          USING HINT = 'Run this as a superuser or as a role that can read every table, otherwise zstd data in them goes unreported.';
+    END IF;
 
     FOR ix IN SELECT * FROM dbblue_toast_check_indexes(relation) LOOP
         schemaname := ix.schemaname; tablename := ix.tablename;
@@ -163,12 +228,20 @@ AS $$
 DECLARE
     col     record;
     ix      record;
+    skipped oid[] := '{}';
     targets oid[] := dbblue_toast_targets(relation);
 BEGIN
     FOR col IN SELECT * FROM dbblue_toastable_columns c
                 WHERE targets IS NULL OR c.reloid = ANY(targets)
                 ORDER BY 1, 2, 5
     LOOP
+        IF NOT pg_catalog.has_table_privilege(col.reloid, 'SELECT') THEN
+            IF NOT col.reloid = ANY(skipped) THEN
+                skipped := skipped || col.reloid;
+            END IF;
+            CONTINUE;
+        END IF;
+
         /* an unpopulated matview holds no data, and cannot be scanned */
         CONTINUE WHEN col.relkind = 'm' AND NOT
             (SELECT relispopulated FROM pg_catalog.pg_class WHERE oid = col.reloid);
@@ -188,6 +261,11 @@ BEGIN
             col.columnname, col.columnname, col.columnname,
             col.reloid::regclass, col.columnname);
     END LOOP;
+
+    IF cardinality(skipped) > 0 THEN
+        RAISE WARNING 'skipped % table(s) you do not have SELECT privilege on', cardinality(skipped)
+          USING HINT = 'Run this as a superuser or as a role that can read every table, otherwise they are missing from the audit.';
+    END IF;
 
     FOR ix IN SELECT * FROM dbblue_toast_check_indexes(relation) LOOP
         schemaname := ix.schemaname; tablename := ix.tablename;
@@ -267,7 +345,9 @@ CREATE TYPE dbblue_toast_candidate AS (
 -- Each statement runs in its own subtransaction: a relation that fails is
 -- reported with method 'failed: <error>' and a WARNING, matviews reading it
 -- are skipped, and everything else is still normalized.  All of it still
--- commits together at the end, so locks are held until the call returns.
+-- commits together at the end, so every rewritten table stays locked (ACCESS
+-- EXCLUSIVE for a rewrite) until the call returns.  On a large database use
+-- CALL dbblue_toast_normalize_run() instead, which commits after each table.
 --
 CREATE OR REPLACE FUNCTION dbblue_toast_normalize(target text DEFAULT 'pglz',
                                                   dry_run boolean DEFAULT true,
@@ -683,3 +763,52 @@ $$;
 
 COMMENT ON FUNCTION dbblue_toast_normalize(text, boolean, regclass) IS
 'Rewrite zstd-compressed values (including inside composite values, materialized views and indexes) to pglz or lz4, optionally for one relation. Dry run unless dry_run := false.';
+
+--
+-- Normalize the whole database, committing after each table, so that each
+-- table's lock is released as soon as it is done and work already finished
+-- survives an interruption.  Materialized views and indexes are handled in
+-- one final pass, since their order depends on each other.  Progress is
+-- reported as NOTICEs; the remaining zstd data, if any, as a WARNING.
+--
+-- Must be CALLed outside an explicit transaction block.
+--
+CREATE PROCEDURE dbblue_toast_normalize_run(target text DEFAULT 'pglz')
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    rel       regclass;
+    r         record;
+    remaining bigint;
+BEGIN
+    /* tables, one transaction each; partitions are driven from their root */
+    FOR rel IN
+        SELECT DISTINCT (CASE WHEN c.relispartition
+                              THEN pg_catalog.pg_partition_root(c.reloid)
+                              ELSE c.reloid END)::regclass
+          FROM dbblue_toast_check() k
+          JOIN dbblue_toastable_columns c USING (schemaname, tablename, columnname)
+         WHERE c.relkind <> 'm'
+    LOOP
+        FOR r IN SELECT * FROM dbblue_toast_normalize(target, false, rel) LOOP
+            RAISE NOTICE '%: %', concat_ws('.', r.schemaname, r.tablename, r.columnname), r.method;
+        END LOOP;
+        COMMIT;
+    END LOOP;
+
+    /* then materialized views and indexes, in dependency order */
+    FOR r IN SELECT * FROM dbblue_toast_normalize(target, false) LOOP
+        RAISE NOTICE '%: %', concat_ws('.', r.schemaname, r.tablename, r.columnname), r.method;
+    END LOOP;
+    COMMIT;
+
+    SELECT count(*) INTO remaining FROM dbblue_toast_check();
+    IF remaining > 0 THEN
+        RAISE WARNING '% column(s) or index(es) still hold zstd data', remaining
+          USING HINT = 'See the "failed" and "skipped" notices above, and SELECT * FROM dbblue_toast_check().';
+    END IF;
+END;
+$$;
+
+COMMENT ON PROCEDURE dbblue_toast_normalize_run(text) IS
+'Normalize every table to pglz or lz4, committing after each one so locks are released as it goes.';

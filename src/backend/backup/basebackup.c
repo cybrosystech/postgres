@@ -102,12 +102,14 @@ static bool sendFile(bbsink *sink, const char *readfilename, const char *tarfile
 					 unsigned num_incremental_blocks,
 					 BlockNumber *incremental_blocks,
 					 unsigned truncation_block_length);
+struct DirectReadState;
 static off_t read_file_data_into_buffer(bbsink *sink,
 										const char *readfilename, int fd,
 										off_t offset, size_t length,
 										BlockNumber blkno,
 										bool verify_checksum,
-										int *checksum_failures);
+										int *checksum_failures,
+										struct DirectReadState *dr);
 static void push_to_sink(bbsink *sink, pg_checksum_context *checksum_ctx,
 						 size_t *bytes_done, void *data, size_t length);
 static bool verify_page_checksum(Page page, XLogRecPtr start_lsn,
@@ -136,6 +138,32 @@ static long long int total_checksum_failures;
 
 /* Do not verify checksums. */
 static bool noverify_checksums = false;
+
+/* GUCs: how data files are read (see BaseBackupReadMode). */
+int			basebackup_read_mode = BASEBACKUP_READ_BUFFERED;
+int			basebackup_direct_read_size = 1024;	/* kB */
+
+const struct config_enum_entry basebackup_read_mode_options[] = {
+	{"buffered", BASEBACKUP_READ_BUFFERED, false},
+	{"direct", BASEBACKUP_READ_DIRECT, false},
+	{"noreuse", BASEBACKUP_READ_NOREUSE, false},
+	{"dontneed", BASEBACKUP_READ_DONTNEED, false},
+	{NULL, 0, false}
+};
+
+/*
+ * Staging buffer for O_DIRECT reads.  Direct reads need an aligned buffer,
+ * aligned offsets and aligned lengths, and they get no kernel readahead, so we
+ * read large aligned chunks here and hand them to the sink in pieces of
+ * bbs_buffer_length.
+ */
+typedef struct DirectReadState
+{
+	char	   *buf;			/* PG_IO_ALIGN_SIZE-aligned */
+	size_t		size;			/* allocated size, multiple of BLCKSZ */
+	off_t		file_off;		/* file offset of buf[0] */
+	size_t		valid;			/* bytes of buf holding file data */
+} DirectReadState;
 
 /*
  * Definition of one element part of an exclusion list, used for paths part
@@ -1603,12 +1631,34 @@ sendFile(bbsink *sink, const char *readfilename, const char *tarfilename,
 	pg_checksum_context checksum_ctx;
 	int			ibindex = 0;
 	struct stat filestat;
+	DirectReadState dr_state;
+	DirectReadState *dr = NULL;
+	int			read_mode = basebackup_read_mode;
 
 	if (pg_checksum_init(&checksum_ctx, manifest->checksum_type) < 0)
 		elog(ERROR, "could not initialize checksum of file \"%s\"",
 			 readfilename);
 
-	fd = OpenTransientFile(readfilename, O_RDONLY | PG_BINARY);
+	/* Incremental files read scattered single blocks; keep them buffered. */
+	if (incremental_blocks != NULL && read_mode == BASEBACKUP_READ_DIRECT)
+		read_mode = BASEBACKUP_READ_BUFFERED;
+
+	if (read_mode == BASEBACKUP_READ_DIRECT && PG_O_DIRECT != 0)
+	{
+		fd = OpenTransientFile(readfilename, O_RDONLY | PG_BINARY | PG_O_DIRECT);
+		/* Some filesystems (e.g. tmpfs) reject O_DIRECT; fall back. */
+		if (fd < 0 && errno == EINVAL)
+		{
+			read_mode = BASEBACKUP_READ_BUFFERED;
+			fd = OpenTransientFile(readfilename, O_RDONLY | PG_BINARY);
+		}
+	}
+	else
+	{
+		if (read_mode == BASEBACKUP_READ_DIRECT)
+			read_mode = BASEBACKUP_READ_BUFFERED;
+		fd = OpenTransientFile(readfilename, O_RDONLY | PG_BINARY);
+	}
 	if (fd < 0)
 	{
 		if (errno == ENOENT && missing_ok)
@@ -1617,6 +1667,19 @@ sendFile(bbsink *sink, const char *readfilename, const char *tarfilename,
 				(errcode_for_file_access(),
 				 errmsg("could not open file \"%s\": %m", readfilename)));
 	}
+
+	if (read_mode == BASEBACKUP_READ_DIRECT)
+	{
+		dr_state.size = Max((size_t) basebackup_direct_read_size * 1024 / BLCKSZ, 1) * BLCKSZ;
+		dr_state.buf = palloc_aligned(dr_state.size, PG_IO_ALIGN_SIZE, 0);
+		dr_state.file_off = 0;
+		dr_state.valid = 0;
+		dr = &dr_state;
+	}
+#if defined(USE_POSIX_FADVISE) && defined(POSIX_FADV_NOREUSE)
+	else if (read_mode == BASEBACKUP_READ_NOREUSE)
+		(void) posix_fadvise(fd, 0, 0, POSIX_FADV_NOREUSE);
+#endif
 
 	/*
 	 * Non-relation files may be replaced by a rename(), making irrelevant the
@@ -1733,7 +1796,12 @@ sendFile(bbsink *sink, const char *readfilename, const char *tarfilename,
 											 bytes_done, remaining,
 											 blkno + segno * RELSEG_SIZE,
 											 verify_checksum,
-											 &checksum_failures);
+											 &checksum_failures, dr);
+
+#if defined(USE_POSIX_FADVISE) && defined(POSIX_FADV_DONTNEED)
+			if (read_mode == BASEBACKUP_READ_DONTNEED && cnt > 0)
+				(void) posix_fadvise(fd, bytes_done, cnt, POSIX_FADV_DONTNEED);
+#endif
 		}
 		else
 		{
@@ -1755,7 +1823,7 @@ sendFile(bbsink *sink, const char *readfilename, const char *tarfilename,
 											 BLCKSZ,
 											 relative_blkno + segno * RELSEG_SIZE,
 											 verify_checksum,
-											 &checksum_failures);
+											 &checksum_failures, NULL);
 
 			/*
 			 * If we get a partial read, that must mean that the relation is
@@ -1837,6 +1905,8 @@ sendFile(bbsink *sink, const char *readfilename, const char *tarfilename,
 	_tarWritePadding(sink, bytes_done);
 
 	CloseTransientFile(fd);
+	if (dr != NULL)
+		pfree(dr->buf);
 
 	if (checksum_failures > 0)
 	{
@@ -1878,16 +1948,42 @@ sendFile(bbsink *sink, const char *readfilename, const char *tarfilename,
 static off_t
 read_file_data_into_buffer(bbsink *sink, const char *readfilename, int fd,
 						   off_t offset, size_t length, BlockNumber blkno,
-						   bool verify_checksum, int *checksum_failures)
+						   bool verify_checksum, int *checksum_failures,
+						   DirectReadState *dr)
 {
 	off_t		cnt;
 	int			i;
 	char	   *page;
+	size_t		want = Min(sink->bbs_buffer_length, length);
 
-	/* Try to read some more data. */
-	cnt = basebackup_read_file(fd, sink->bbs_buffer,
-							   Min(sink->bbs_buffer_length, length),
-							   offset, readfilename, true);
+	if (dr == NULL)
+	{
+		/* Try to read some more data. */
+		cnt = basebackup_read_file(fd, sink->bbs_buffer, want,
+								   offset, readfilename, true);
+	}
+	else
+	{
+		/*
+		 * O_DIRECT: refill the staging buffer with one large aligned read if
+		 * the requested offset isn't in it, then copy out of it.
+		 */
+		if (offset < dr->file_off || offset >= dr->file_off + (off_t) dr->valid)
+		{
+			off_t		aoff = offset - (offset % PG_IO_ALIGN_SIZE);
+
+			dr->file_off = aoff;
+			dr->valid = basebackup_read_file(fd, dr->buf, dr->size, aoff,
+											 readfilename, true);
+		}
+		if (offset >= dr->file_off + (off_t) dr->valid)
+			cnt = 0;			/* EOF */
+		else
+		{
+			cnt = Min(want, (size_t) (dr->file_off + dr->valid - offset));
+			memcpy(sink->bbs_buffer, dr->buf + (offset - dr->file_off), cnt);
+		}
+	}
 
 	/* Can't verify checksums if read length is not a multiple of BLCKSZ. */
 	if (!verify_checksum || (cnt % BLCKSZ) != 0)
@@ -1922,10 +2018,22 @@ read_file_data_into_buffer(bbsink *sink, const char *readfilename, int fd,
 		 * block is in progress. Since we don't have any such thing right now,
 		 * we just do this and hope for the best.
 		 */
-		reread_cnt =
-			basebackup_read_file(fd, sink->bbs_buffer + BLCKSZ * i,
-								 BLCKSZ, offset + BLCKSZ * i,
-								 readfilename, false);
+		if (dr == NULL)
+			reread_cnt =
+				basebackup_read_file(fd, sink->bbs_buffer + BLCKSZ * i,
+									 BLCKSZ, offset + BLCKSZ * i,
+									 readfilename, false);
+		else
+		{
+			/* O_DIRECT needs an aligned destination. */
+			PGIOAlignedBlock blk;
+
+			reread_cnt = basebackup_read_file(fd, blk.data, BLCKSZ,
+											  offset + BLCKSZ * i,
+											  readfilename, false);
+			if (reread_cnt > 0)
+				memcpy(sink->bbs_buffer + BLCKSZ * i, blk.data, BLCKSZ);
+		}
 		if (reread_cnt == 0)
 		{
 			/*

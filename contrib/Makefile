@@ -16,6 +16,7 @@ SUBDIRS = \
 		citext		\
 		cube		\
 		dblink		\
+		dbblue_toast_tools	\
 		dict_int	\
 		dict_xsyn	\
 		earthdistance	\
@@ -77,6 +78,18 @@ ifeq ($(with_selinux),yes)
 SUBDIRS += sepgsql
 else
 ALWAYS_SUBDIRS += sepgsql
+endif
+
+# zstd_toast_compat needs the libzstd headers, whether or not the server was
+# built --with-zstd (it is meant for servers built without it).  Build it
+# whenever <zstd.h> can be found.
+zstd_compat_available := $(shell printf '\043include <zstd.h>\n' | \
+	$(CC) $(CPPFLAGS) $(shell pkg-config --cflags libzstd 2>/dev/null) \
+	-E -x c - >/dev/null 2>&1 && echo yes)
+ifeq ($(zstd_compat_available),yes)
+SUBDIRS += zstd_toast_compat
+else
+ALWAYS_SUBDIRS += zstd_toast_compat
 endif
 
 ifeq ($(with_perl),yes)

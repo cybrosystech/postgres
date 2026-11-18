@@ -111,6 +111,14 @@ typedef varlena *(*zstd_decompress_datum_hook_type) (const varlena *value);
 extern PGDLLIMPORT zstd_decompress_datum_hook_type zstd_decompress_datum_hook;
 
 /*
+ * Optional: decompress only the first slicelength bytes.  Without it, a
+ * slice is taken by decompressing the whole value with the hook above.
+ */
+typedef varlena *(*zstd_decompress_datum_slice_hook_type) (const varlena *value,
+														   int32 slicelength);
+extern PGDLLIMPORT zstd_decompress_datum_slice_hook_type zstd_decompress_datum_slice_hook;
+
+/*
  * A module installing zstd_compress_datum_hook must set this to true when,
  * and only when, it is being loaded from shared_preload_libraries
  * (process_shared_preload_libraries_in_progress).  Only then does every

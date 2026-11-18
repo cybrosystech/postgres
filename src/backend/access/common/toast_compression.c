@@ -19,6 +19,7 @@
 
 #ifdef USE_ZSTD
 #include <zstd.h>
+#include <zstd_errors.h>
 #endif
 
 #include "access/detoast.h"
@@ -28,6 +29,7 @@
 #include "miscadmin.h"
 #include "utils/guc_hooks.h"
 #include "utils/guc_tables.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 #include "varatt.h"
 
@@ -46,7 +48,52 @@ bool		dbblue_allow_zstd = true;
 /* set by contrib/zstd_toast_compat on a build without USE_ZSTD */
 zstd_compress_datum_hook_type zstd_compress_datum_hook = NULL;
 zstd_decompress_datum_hook_type zstd_decompress_datum_hook = NULL;
+zstd_decompress_datum_slice_hook_type zstd_decompress_datum_slice_hook = NULL;
 bool		zstd_hooks_cluster_wide = false;
+
+#ifdef USE_ZSTD
+/*
+ * Compression and decompression contexts, created on first use and kept for
+ * the life of the backend.  ZSTD_compress() and ZSTD_decompress() would
+ * create and free one for every value; a level-3 compression context alone
+ * is over a megabyte.  Every use starts a new frame, so one left mid-frame
+ * by an error is harmless.
+ */
+static ZSTD_CCtx *zstd_cctx = NULL;
+static ZSTD_DCtx *zstd_dctx = NULL;
+
+static ZSTD_CCtx *
+zstd_get_cctx(void)
+{
+	if (zstd_cctx == NULL)
+	{
+		zstd_cctx = ZSTD_createCCtx();
+		if (zstd_cctx == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_OUT_OF_MEMORY),
+					 errmsg("out of memory"),
+					 errdetail("Failed to create a zstd compression context.")));
+	}
+	return zstd_cctx;
+}
+
+static ZSTD_DCtx *
+zstd_get_dctx(void)
+{
+	if (zstd_dctx == NULL)
+	{
+		zstd_dctx = ZSTD_createDCtx();
+		if (zstd_dctx == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_OUT_OF_MEMORY),
+					 errmsg("out of memory"),
+					 errdetail("Failed to create a zstd decompression context.")));
+	}
+	else
+		ZSTD_DCtx_reset(zstd_dctx, ZSTD_reset_session_only);
+	return zstd_dctx;
+}
+#endif
 
 #define NO_COMPRESSION_SUPPORT(method) \
 	ereport(ERROR, \
@@ -538,18 +585,26 @@ zstd_compress_datum(const varlena *value)
 	valsize = VARSIZE_ANY_EXHDR(value);
 
 	/*
-	 * Figure out the maximum possible size of the ZSTD output, add the bytes
-	 * that will be needed for varlena overhead, and allocate that amount.
+	 * Give zstd room for its worst case, ZSTD_compressBound(), which lets it
+	 * skip bounds checks.  For values near the 1GB varlena limit that would
+	 * exceed MaxAllocSize, though.  Only a result smaller than the input is
+	 * of any use (see toast_compress_datum()), so then offer just the
+	 * input's size, and treat running out of room as incompressible.
 	 */
 	max_size = ZSTD_compressBound(valsize);
+	if (max_size > MaxAllocSize - VARHDRSZ_COMPRESSED)
+		max_size = Min((size_t) valsize, MaxAllocSize - VARHDRSZ_COMPRESSED);
 	tmp = (varlena *) palloc(max_size + VARHDRSZ_COMPRESSED);
 
-	len = ZSTD_compress((char *) tmp + VARHDRSZ_COMPRESSED, max_size,
-						VARDATA_ANY(value), valsize,
-						ZSTD_TOAST_COMPRESS_LEVEL);
+	len = ZSTD_compressCCtx(zstd_get_cctx(),
+							(char *) tmp + VARHDRSZ_COMPRESSED, max_size,
+							VARDATA_ANY(value), valsize,
+							ZSTD_TOAST_COMPRESS_LEVEL);
 	if (ZSTD_isError(len))
 	{
 		pfree(tmp);
+		if (ZSTD_getErrorCode(len) == ZSTD_error_dstSize_tooSmall)
+			return NULL;		/* would not have been smaller */
 		elog(ERROR, "zstd compression failed: %s", ZSTD_getErrorName(len));
 	}
 
@@ -587,9 +642,10 @@ zstd_decompress_datum(const varlena *value)
 	result = (varlena *) palloc(rawsize + VARHDRSZ);
 
 	/* decompress the data */
-	decompressed = ZSTD_decompress(VARDATA(result), rawsize,
-								   (const char *) value + VARHDRSZ_COMPRESSED,
-								   VARSIZE(value) - VARHDRSZ_COMPRESSED);
+	decompressed = ZSTD_decompressDCtx(zstd_get_dctx(),
+									   VARDATA(result), rawsize,
+									   (const char *) value + VARHDRSZ_COMPRESSED,
+									   VARSIZE(value) - VARHDRSZ_COMPRESSED);
 	if (ZSTD_isError(decompressed))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
@@ -611,22 +667,72 @@ zstd_decompress_datum(const varlena *value)
 /*
  * Decompress part of a varlena that was compressed using ZSTD.
  *
- * ZSTD does not natively support partial decompression of arbitrary slices,
- * so we decompress the whole value and then copy out the requested prefix.
- * This matches the behaviour Postgres uses for lz4 versions that lack
- * partial-decode support.
- *
- * This delegates to zstd_decompress_datum() for the actual decompression,
- * so it works unmodified whether that came from a compiled-in USE_ZSTD or
- * from zstd_decompress_datum_hook.
+ * Only a prefix is ever requested.  With USE_ZSTD the frame is streamed and
+ * decompression stops once slicelength bytes have been produced.  Otherwise
+ * a module's zstd_decompress_datum_slice_hook is used if it offers one, and
+ * failing that the whole value is decompressed and the prefix copied out.
  */
 varlena *
 zstd_decompress_datum_slice(const varlena *value, int32 slicelength)
 {
+#ifdef USE_ZSTD
+	int32		rawsize;
+	int32		want;
+	varlena    *result;
+	ZSTD_DCtx  *dctx;
+	ZSTD_inBuffer in;
+	ZSTD_outBuffer out;
+	size_t		ret = 1;
+
+	/*
+	 * Stream the frame, stopping as soon as the requested prefix has been
+	 * produced, rather than decompressing the whole value just to copy out
+	 * its beginning.
+	 */
+	rawsize = VARDATA_COMPRESSED_GET_EXTSIZE(value);
+	want = Min(slicelength, rawsize);
+	result = (varlena *) palloc(want + VARHDRSZ);
+
+	dctx = zstd_get_dctx();
+	in.src = (const char *) value + VARHDRSZ_COMPRESSED;
+	in.size = VARSIZE(value) - VARHDRSZ_COMPRESSED;
+	in.pos = 0;
+	out.dst = VARDATA(result);
+	out.size = want;
+	out.pos = 0;
+
+	while (out.pos < out.size)
+	{
+		ret = ZSTD_decompressStream(dctx, &out, &in);
+		if (ZSTD_isError(ret))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg_internal("compressed zstd data is corrupt: %s",
+									 ZSTD_getErrorName(ret))));
+		if (ret == 0)
+			break;				/* frame complete */
+		if (in.pos == in.size && out.pos < out.size)
+			break;				/* input exhausted, frame unfinished */
+	}
+
+	if (out.pos != (size_t) want)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg_internal("compressed zstd data is corrupt"),
+				 errdetail_internal("Decompressed %zu bytes, expected %d.",
+									out.pos, want)));
+
+	SET_VARSIZE(result, want + VARHDRSZ);
+	return result;
+#else
 	varlena    *full;
 	varlena    *result;
 	int32		rawsize;
 	int32		copylen;
+
+	/* a module may offer partial decompression; otherwise do it all */
+	if (zstd_decompress_datum_slice_hook)
+		return zstd_decompress_datum_slice_hook(value, slicelength);
 
 	full = zstd_decompress_datum(value);
 	rawsize = VARSIZE(full) - VARHDRSZ;
@@ -638,6 +744,7 @@ zstd_decompress_datum_slice(const varlena *value, int32 slicelength)
 
 	pfree(full);
 	return result;
+#endif
 }
 
 /*

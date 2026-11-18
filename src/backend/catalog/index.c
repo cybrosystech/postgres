@@ -479,6 +479,17 @@ ConstructTupleDescriptor(Relation heapRelation,
 			ReleaseSysCache(tuple);
 		}
 
+		/*
+		 * dbblue: system catalogs are never compressed with zstd (see
+		 * toast_resolve_compression()).  But index tuples are compressed by
+		 * index_form_tuple() straight from attcompression, which has no
+		 * relation to check, and "default" means zstd on a --with-zstd
+		 * build.  So pin catalog index columns to pglz here.
+		 */
+		if (IsCatalogRelation(heapRelation) &&
+			to->attlen == -1 && to->attstorage != TYPSTORAGE_PLAIN)
+			to->attcompression = TOAST_PGLZ_COMPRESSION;
+
 		populate_compact_attribute(indexTupDesc, i);
 	}
 

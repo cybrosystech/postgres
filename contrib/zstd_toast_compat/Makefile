@@ -9,7 +9,16 @@ EXTENSION = zstd_toast_compat
 DATA = zstd_toast_compat--1.0.sql
 PGFILEDESC = "zstd_toast_compat - read/write zstd-compressed TOAST data without --with-zstd"
 
-SHLIB_LINK += -lzstd
+# libzstd is needed whether or not the server was built --with-zstd -- the
+# module exists for servers built without it, so configure's ZSTD_* settings
+# can't be relied on.  Ask pkg-config, falling back to plain -lzstd.
+ZSTD_COMPAT_CFLAGS := $(shell pkg-config --cflags libzstd 2>/dev/null)
+ZSTD_COMPAT_LIBS := $(shell pkg-config --libs libzstd 2>/dev/null)
+ifeq ($(strip $(ZSTD_COMPAT_LIBS)),)
+ZSTD_COMPAT_LIBS = -lzstd
+endif
+PG_CPPFLAGS += $(ZSTD_COMPAT_CFLAGS)
+SHLIB_LINK += $(ZSTD_COMPAT_LIBS)
 
 ifdef USE_PGXS
 PG_CONFIG = pg_config
