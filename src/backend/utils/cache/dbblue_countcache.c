@@ -1,0 +1,651 @@
+/*-------------------------------------------------------------------------
+ *
+ * dbblue_countcache.c
+ *	  Session-local cache of exact COUNT(*) results.
+ *
+ * Each entry pairs a (relation, predicate fingerprint) key with the row
+ * count observed under that predicate at a particular snapshot horizon.
+ * The cache is populated as a side effect of executing Odoo's leading
+ * COUNT query for a list view, and the planner consults it later in the
+ * same request when shaping the paginated SELECT.
+ *
+ * Sizing: a small fixed bound (DBBLUE_COUNTCACHE_DEFAULT_SIZE) is
+ * sufficient because Odoo paginates one view at a time per HTTP request.
+ * When full, the entry with the oldest captured_at is evicted; for a
+ * 16-entry bound the linear scan to find it is cheap.
+ *
+ * Invalidation: correctness rests on the shared per-relation modification
+ * stamp maintained by dbblue_relmod.c.  An entry records the stamp it was
+ * captured under and is served only while a fresh reading still matches,
+ * which holds exactly when no transaction -- in this backend or any other
+ * -- has written to the relation in the meantime.  A relcache callback
+ * additionally drops entries for relations flushed from the relcache
+ * (DDL), and the TTL bounds how long an idle entry holds a slot.  Neither
+ * of those two is load-bearing for correctness on its own.
+ *
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ *
+ * IDENTIFICATION
+ *	  src/backend/utils/cache/dbblue_countcache.c
+ *
+ *-------------------------------------------------------------------------
+ */
+#include "postgres.h"
+
+#include "access/xact.h"
+#include "access/xlog.h"
+#include "catalog/pg_type_d.h"
+#include "executor/execdesc.h"
+#include "executor/executor.h"
+#include "miscadmin.h"
+#include "nodes/execnodes.h"
+#include "nodes/plannodes.h"
+#include "tcop/dest.h"
+#include "utils/dbblue_countcache.h"
+#include "utils/dbblue_relmod.h"
+#include "utils/hsearch.h"
+#include "utils/inval.h"
+#include "utils/lsyscache.h"
+#include "utils/memutils.h"
+#include "utils/snapmgr.h"
+#include "utils/timestamp.h"
+
+#define DBBLUE_COUNTCACHE_DEFAULT_SIZE	16
+
+bool		dbblue_count_cache = false; /* enable COUNT result caching */
+int			dbblue_countcache_ttl = 300;	/* cache TTL in seconds (GUC) */
+
+static HTAB *countcache = NULL;
+static int	countcache_count = 0;
+static int	countcache_max_entries = DBBLUE_COUNTCACHE_DEFAULT_SIZE;
+static bool callback_registered = false;
+
+/*
+ * Counts captured during the current transaction, awaiting commit.  Nothing
+ * reaches the cache proper until the transaction commits, so a count taken
+ * inside a transaction that later aborts is never published.
+ */
+typedef struct PendingCount
+{
+	Oid			reloid;
+	int64		fingerprint;
+	int64		count;
+	DBBlueRelModStamp relmod;	/* stamp as of capture */
+} PendingCount;
+
+static List *pending_counts = NIL;
+
+static void countcache_relcache_callback(Datum arg, Oid relid);
+static void countcache_xact_callback(XactEvent event, void *arg);
+static void ensure_init(void);
+static void evict_oldest(void);
+static void countcache_publish_pending(void);
+
+/*
+ * Lazy initialization.  We don't pay for the HTAB until the first time
+ * an Odoo COUNT actually lands.  hash_create allocates in
+ * TopMemoryContext so the cache lives for the backend's lifetime.
+ */
+static void
+ensure_init(void)
+{
+	HASHCTL		ctl;
+
+	if (countcache != NULL)
+		return;
+
+	memset(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(CountCacheKey);
+	ctl.entrysize = sizeof(CountCacheEntry);
+	ctl.hcxt = TopMemoryContext;
+
+	countcache = hash_create("dbblue COUNT cache",
+							 countcache_max_entries,
+							 &ctl,
+							 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	countcache_count = 0;
+
+	if (!callback_registered)
+	{
+		CacheRegisterRelcacheCallback(countcache_relcache_callback,
+									  (Datum) 0);
+		RegisterXactCallback(countcache_xact_callback, NULL);
+		callback_registered = true;
+	}
+}
+
+/*
+ * TTL for cache entries.  Driven by the dbblue_count_cache_ttl GUC (seconds).
+ *
+ * This is a memory-hygiene bound, not a correctness mechanism: an entry that
+ * outlives its usefulness should not occupy one of the few slots forever.
+ * Staleness is prevented by the modification-stamp check below, which is why
+ * a cache *hit* must not renew captured_at -- otherwise a shape polled faster
+ * than the TTL would never age out at all.
+ */
+#define DBBLUE_COUNTCACHE_TTL_USEC	((int64) dbblue_countcache_ttl * USECS_PER_SEC)
+
+const CountCacheEntry *
+dbblue_countcache_lookup(Oid reloid, int64 fingerprint)
+{
+	CountCacheKey key;
+	CountCacheEntry *entry;
+	bool		found;
+
+	if (!dbblue_count_cache)
+		return NULL;
+	if (countcache == NULL)
+		return NULL;
+	if (!OidIsValid(reloid) || fingerprint == INT64CONST(0))
+		return NULL;
+
+	/*
+	 * Never serve a cached count during recovery.  Write stamps are moved by
+	 * the tableam wrappers, which redo does not go through, so on a hot
+	 * standby a relation can change under us with no stamp movement at all --
+	 * an entry cached there would stay "valid" and wrong indefinitely.
+	 *
+	 * This makes the cache inert on standbys rather than merely cautious.
+	 * Lifting it means teaching the redo handlers to bump stamps; until then
+	 * the optimisation is forfeited on replicas, which is the safe direction.
+	 */
+	if (RecoveryInProgress())
+		return NULL;
+
+	memset(&key, 0, sizeof(key));
+	key.reloid = reloid;
+	key.qual_fingerprint = fingerprint;
+
+	entry = (CountCacheEntry *) hash_search(countcache, &key, HASH_FIND,
+											&found);
+	if (!found)
+		return NULL;
+
+	/* TTL: retire entries nobody has needed for a while. */
+	if (GetCurrentTimestamp() - entry->captured_at > DBBLUE_COUNTCACHE_TTL_USEC)
+	{
+		(void) hash_search(countcache, &key, HASH_REMOVE, NULL);
+		countcache_count--;
+		return NULL;
+	}
+
+	/*
+	 * The correctness gate.  The count was computed against a particular
+	 * state of the relation; serving it now is sound only if that state is
+	 * demonstrably unchanged.  A differing stamp means somebody wrote to the
+	 * relation -- possibly in another backend, possibly a transaction that
+	 * was already in flight when we captured and has since committed -- so
+	 * the entry is worthless and we drop it rather than keep re-testing it.
+	 */
+	if (!dbblue_relmod_stamp_equal(dbblue_relmod_read(reloid), entry->relmod))
+	{
+		(void) hash_search(countcache, &key, HASH_REMOVE, NULL);
+		countcache_count--;
+		return NULL;
+	}
+
+	entry->hits++;
+	return entry;
+}
+
+void
+dbblue_countcache_insert(Oid reloid, int64 fingerprint, int64 count)
+{
+	PendingCount *pc;
+	MemoryContext oldcxt;
+
+	if (!dbblue_count_cache)
+		return;
+	if (!OidIsValid(reloid) || fingerprint == INT64CONST(0))
+		return;
+
+	/*
+	 * Don't populate during recovery either -- see dbblue_countcache_lookup().
+	 * Refusing here as well means a standby that is later promoted cannot
+	 * inherit an entry captured while stamps were not being maintained.
+	 */
+	if (RecoveryInProgress())
+		return;
+
+	/*
+	 * A count over a relation this transaction has written to is not
+	 * cacheable: it includes our own uncommitted rows, which may yet be
+	 * rolled back.  Writes to other relations are irrelevant to it.
+	 */
+	if (dbblue_relmod_xact_wrote(reloid))
+		return;
+	if (!IsTransactionState())
+		return;
+
+	/* Also registers the transaction callback that drains the queue. */
+	ensure_init();
+
+	/*
+	 * Queue it rather than publishing now.  The stamp is read here, at
+	 * capture, because that is the state the count actually describes; at
+	 * commit we re-read and only publish if it still holds.
+	 */
+	oldcxt = MemoryContextSwitchTo(TopTransactionContext);
+	pc = (PendingCount *) palloc(sizeof(PendingCount));
+	pc->reloid = reloid;
+	pc->fingerprint = fingerprint;
+	pc->count = count;
+	pc->relmod = dbblue_relmod_read(reloid);
+	pending_counts = lappend(pending_counts, pc);
+	MemoryContextSwitchTo(oldcxt);
+}
+
+/*
+ * Move committed pending counts into the cache proper.
+ */
+static void
+countcache_publish_pending(void)
+{
+	ListCell   *lc;
+
+	if (pending_counts == NIL)
+		return;
+
+	foreach(lc, pending_counts)
+	{
+		PendingCount *pc = (PendingCount *) lfirst(lc);
+		CountCacheKey key;
+		CountCacheEntry *entry;
+		bool		found;
+
+		/*
+		 * Between capture and commit somebody may have written to the
+		 * relation, which would make the count wrong the moment we published
+		 * it.  Re-check and drop it if so.
+		 */
+		if (!dbblue_relmod_stamp_equal(dbblue_relmod_read(pc->reloid),
+									   pc->relmod))
+			continue;
+
+		ensure_init();
+
+		/*
+		 * Evict before HASH_ENTER so the htab never exceeds its size budget.
+		 * The check is on the *current* count (before insert); if the key
+		 * happens to already exist below we'll overwrite, not grow, so an
+		 * unnecessary eviction is harmless in that case.
+		 */
+		if (countcache_count >= countcache_max_entries)
+			evict_oldest();
+
+		memset(&key, 0, sizeof(key));
+		key.reloid = pc->reloid;
+		key.qual_fingerprint = pc->fingerprint;
+
+		entry = (CountCacheEntry *) hash_search(countcache, &key, HASH_ENTER,
+												&found);
+		if (!found)
+			countcache_count++;
+
+		entry->count = pc->count;
+		entry->relmod = pc->relmod;
+		entry->captured_at = GetCurrentTimestamp();
+		entry->hits = 0;
+	}
+
+	pending_counts = NIL;
+}
+
+/*
+ * Drop any queued counts without publishing them.  Called at transaction
+ * start: like the relmod write set, pending_counts lives in
+ * TopTransactionContext and must never be carried across a transaction
+ * boundary, whatever path the previous transaction exited by.
+ */
+void
+dbblue_countcache_reset_xact(void)
+{
+	pending_counts = NIL;
+}
+
+/*
+ * Pending counts are published on commit and thrown away on abort, which is
+ * what keeps a rolled-back transaction's counts out of the cache.
+ */
+static void
+countcache_xact_callback(XactEvent event, void *arg)
+{
+	switch (event)
+	{
+		case XACT_EVENT_COMMIT:
+		case XACT_EVENT_PARALLEL_COMMIT:
+			countcache_publish_pending();
+			break;
+		case XACT_EVENT_ABORT:
+		case XACT_EVENT_PARALLEL_ABORT:
+		case XACT_EVENT_PREPARE:
+			pending_counts = NIL;
+			break;
+		default:
+			break;
+	}
+}
+
+int
+dbblue_countcache_current_size(void)
+{
+	return countcache_count;
+}
+
+/*
+ * FIFO eviction: scan the table, remember the oldest captured_at, then
+ * remove it.  For a 16-entry bound this is ~32ns total -- negligible.
+ *
+ * Note: hash_search(HASH_REMOVE) is safe to call after a hash_seq_search
+ * loop has terminated normally (returned NULL); we collect the doomed
+ * key first and remove it after the scan.
+ */
+static void
+evict_oldest(void)
+{
+	HASH_SEQ_STATUS scan;
+	CountCacheEntry *entry;
+	CountCacheKey doomed_key = {0};
+	TimestampTz oldest_ts = 0;
+	bool		have_doomed = false;
+
+	if (countcache == NULL)
+		return;
+
+	hash_seq_init(&scan, countcache);
+	while ((entry = (CountCacheEntry *) hash_seq_search(&scan)) != NULL)
+	{
+		if (!have_doomed || entry->captured_at < oldest_ts)
+		{
+			doomed_key = entry->key;
+			oldest_ts = entry->captured_at;
+			have_doomed = true;
+		}
+	}
+
+	if (have_doomed)
+	{
+		(void) hash_search(countcache, &doomed_key, HASH_REMOVE, NULL);
+		countcache_count--;
+	}
+}
+
+/* ------------------------------------------------------------------ */
+/*	COUNT result capture: DestReceiver wrapper installed at run start */
+/* ------------------------------------------------------------------ */
+
+typedef struct CountCaptureDest
+{
+	DestReceiver pub;			/* must be first */
+	DestReceiver *wrapped;		/* original dest we forward to */
+	Oid			reloid;
+	int64		fingerprint;
+
+	int			tuples_seen;	/* receiveSlot calls during this run */
+	bool		shape_ok;		/* TupleDesc is single int8 attr */
+	int64		captured_count;	/* first row's first attribute */
+	bool		served_from_cache;	/* tuple came from the cache, not a scan */
+} CountCaptureDest;
+
+static bool
+ccd_receiveSlot(TupleTableSlot *slot, DestReceiver *self)
+{
+	CountCaptureDest *ccd = (CountCaptureDest *) self;
+	bool		isnull;
+
+	/*
+	 * Capture the count value from the first row only.  Subsequent
+	 * receives bump the counter so rShutdown can decide not to insert
+	 * when the result was not exactly one row.  Either way we forward
+	 * the tuple unmodified to the real receiver so the client sees
+	 * normal behavior.
+	 */
+	if (ccd->tuples_seen == 0 && ccd->shape_ok)
+	{
+		Datum		d = slot_getattr(slot, 1, &isnull);
+
+		if (!isnull)
+			ccd->captured_count = DatumGetInt64(d);
+		else
+			ccd->shape_ok = false;	/* NULL count is uncacheable */
+	}
+	ccd->tuples_seen++;
+
+	return ccd->wrapped->receiveSlot(slot, ccd->wrapped);
+}
+
+static void
+ccd_rStartup(DestReceiver *self, int operation, TupleDesc typeinfo)
+{
+	CountCaptureDest *ccd = (CountCaptureDest *) self;
+
+	/*
+	 * Validate the result shape here, where we can see the TupleDesc.
+	 * A bona fide COUNT(*) returns exactly one BIGINT column; anything
+	 * else (multi-column aggregates like (sum, avg), other types) is
+	 * not cacheable and we just become a transparent pass-through.
+	 */
+	ccd->shape_ok = (typeinfo->natts == 1 &&
+					 TupleDescAttr(typeinfo, 0)->atttypid == INT8OID);
+
+	ccd->wrapped->rStartup(ccd->wrapped, operation, typeinfo);
+}
+
+static void
+ccd_rShutdown(DestReceiver *self)
+{
+	CountCaptureDest *ccd = (CountCaptureDest *) self;
+
+	ccd->wrapped->rShutdown(ccd->wrapped);
+
+	/*
+	 * Never re-record a value we just read out of the cache.  Doing so would
+	 * renew the entry's captured_at on every hit, turning the TTL into an
+	 * idle timeout that a steadily-polled query shape never reaches.
+	 */
+	if (ccd->served_from_cache)
+		return;
+
+	/*
+	 * Insert only when we observed exactly one BIGINT row.  More tuples
+	 * means the plan wasn't a single COUNT; zero tuples means an error
+	 * path or aborted scan and we have nothing to record.
+	 */
+	if (ccd->shape_ok && ccd->tuples_seen == 1 && ccd->captured_count >= 0)
+		dbblue_countcache_insert(ccd->reloid, ccd->fingerprint,
+								 ccd->captured_count);
+}
+
+static void
+ccd_rDestroy(DestReceiver *self)
+{
+	/*
+	 * No-op.  The wrapper does not own the wrapped DestReceiver's
+	 * lifetime, so we must not forward rDestroy.  Storage for the
+	 * wrapper itself is released by dbblue_count_capture_finalize.
+	 * If finalize was somehow skipped, the leak is bounded by the
+	 * executor memory context and harmless.
+	 */
+	(void) self;
+}
+
+bool
+dbblue_count_capture_install(QueryDesc *queryDesc)
+{
+	PlannedStmt *pstmt;
+	CountCaptureDest *ccd;
+
+	if (queryDesc == NULL)
+		return false;
+
+	pstmt = queryDesc->plannedstmt;
+	if (pstmt == NULL || pstmt->dbblue_pred_fingerprint == INT64CONST(0))
+		return false;
+	if (!OidIsValid(pstmt->dbblue_pred_reloid))
+		return false;
+
+	/*
+	 * Cheap shape gate: only Agg-rooted plans are candidates.  This
+	 * keeps the wrapper off normal SELECT id, ... FROM ... paths.  The
+	 * TupleDesc check in ccd_rStartup is the final guard that rejects
+	 * non-COUNT aggregates (SUM, MAX, etc.).
+	 */
+	if (pstmt->planTree == NULL || !IsA(pstmt->planTree, Agg))
+		return false;
+
+	ccd = (CountCaptureDest *) palloc0(sizeof(CountCaptureDest));
+	ccd->pub.receiveSlot = ccd_receiveSlot;
+	ccd->pub.rStartup = ccd_rStartup;
+	ccd->pub.rShutdown = ccd_rShutdown;
+	ccd->pub.rDestroy = ccd_rDestroy;
+	ccd->pub.mydest = queryDesc->dest->mydest;
+	ccd->wrapped = queryDesc->dest;
+	ccd->reloid = pstmt->dbblue_pred_reloid;
+	ccd->fingerprint = pstmt->dbblue_pred_fingerprint;
+	ccd->tuples_seen = 0;
+	ccd->shape_ok = false;		/* set true in rStartup if natts/type ok */
+	ccd->captured_count = 0;
+	ccd->served_from_cache = false;
+
+	queryDesc->dest = (DestReceiver *) ccd;
+	return true;
+}
+
+void
+dbblue_count_capture_finalize(QueryDesc *queryDesc)
+{
+	CountCaptureDest *ccd;
+
+	if (queryDesc == NULL || queryDesc->dest == NULL)
+		return;
+
+	/*
+	 * Cheap identity check: the install path is the only thing that
+	 * installs ccd_receiveSlot, so it doubles as a "is our wrapper"
+	 * tag.  If it isn't ours, leave dest alone.
+	 */
+	if (queryDesc->dest->receiveSlot != ccd_receiveSlot)
+		return;
+
+	ccd = (CountCaptureDest *) queryDesc->dest;
+	queryDesc->dest = ccd->wrapped;
+	pfree(ccd);
+}
+
+/*
+ * Drop cached entries for one relation (or all, when relid is invalid).
+ * PG fires this callback whenever the relcache entry for that relation
+ * is flushed -- which covers DDL on the relation and the periodic
+ * relcache resets that PG performs after any heavy write activity.
+ *
+ * HASH_REMOVE on the entry just returned by hash_seq_search is allowed;
+ * we walk the table once and drop matches inline.
+ */
+static void
+countcache_relcache_callback(Datum arg, Oid relid)
+{
+	HASH_SEQ_STATUS scan;
+	CountCacheEntry *entry;
+
+	(void) arg;
+
+	if (countcache == NULL)
+		return;
+
+	hash_seq_init(&scan, countcache);
+	while ((entry = (CountCacheEntry *) hash_seq_search(&scan)) != NULL)
+	{
+		if (!OidIsValid(relid) || entry->key.reloid == relid)
+		{
+			(void) hash_search(countcache, &entry->key, HASH_REMOVE, NULL);
+			countcache_count--;
+		}
+	}
+}
+
+/* ------------------------------------------------------------------ */
+/*	COUNT result serving: skip the table scan when cache is fresh     */
+/* ------------------------------------------------------------------ */
+
+/*
+ * dbblue_count_serve_if_cached
+ *
+ * Called from standard_ExecutorRun after rStartup but before ExecutePlan.
+ * When the current query is an Agg-rooted COUNT and the cache has a fresh
+ * hit, inject the cached count into queryDesc->dest (which at this point is
+ * the CountCaptureDest wrapper) and return true so the caller skips the
+ * real table scan.
+ *
+ * The injected tuple goes through the capture wrapper's receiveSlot, which
+ * re-inserts the count into the cache (refreshing its TTL) and then
+ * forwards it to the real DestReceiver so the client sees a normal result.
+ *
+ * Returns false if no cached value is available or the query shape doesn't
+ * qualify.
+ */
+bool
+dbblue_count_serve_if_cached(QueryDesc *queryDesc)
+{
+	PlannedStmt *pstmt;
+	const CountCacheEntry *ce;
+	TupleTableSlot *slot;
+	Datum		values[1];
+	bool		isnull[1];
+
+	if (queryDesc == NULL)
+		return false;
+
+	pstmt = queryDesc->plannedstmt;
+	if (pstmt == NULL || pstmt->dbblue_pred_fingerprint == INT64CONST(0))
+		return false;
+	if (!OidIsValid(pstmt->dbblue_pred_reloid))
+		return false;
+
+	/* Must be an Agg-rooted plan (COUNT shape) */
+	if (pstmt->planTree == NULL || !IsA(pstmt->planTree, Agg))
+		return false;
+
+	/* TupleDesc must be single INT8 column — same guard as ccd_rStartup */
+	if (queryDesc->tupDesc == NULL ||
+		queryDesc->tupDesc->natts != 1 ||
+		TupleDescAttr(queryDesc->tupDesc, 0)->atttypid != INT8OID)
+		return false;
+
+	ce = dbblue_countcache_lookup(pstmt->dbblue_pred_reloid,
+								  pstmt->dbblue_pred_fingerprint);
+	if (ce == NULL)
+		return false;
+
+	ereport(DEBUG1,
+			(errmsg("dbblue count-serve: rel=%s count=%lld hits=%d",
+					get_rel_name(pstmt->dbblue_pred_reloid),
+					(long long) ce->count,
+					ce->hits)));
+
+	/*
+	 * Inject a virtual tuple containing the cached count.  queryDesc->dest
+	 * is the CountCaptureDest wrapper at this point; its receiveSlot will
+	 * capture the value (refreshing the TTL) and forward to the real dest.
+	 */
+	slot = MakeSingleTupleTableSlot(queryDesc->tupDesc, &TTSOpsVirtual);
+	values[0] = Int64GetDatum(ce->count);
+	isnull[0] = false;
+	ExecClearTuple(slot);
+	slot->tts_values = values;
+	slot->tts_isnull = isnull;
+	ExecStoreVirtualTuple(slot);
+
+	/*
+	 * Tell the capture wrapper this tuple came from the cache so it does not
+	 * feed it straight back in and renew the entry's age.
+	 */
+	if (queryDesc->dest->receiveSlot == ccd_receiveSlot)
+		((CountCaptureDest *) queryDesc->dest)->served_from_cache = true;
+
+	queryDesc->dest->receiveSlot(slot, queryDesc->dest);
+
+	ExecDropSingleTupleTableSlot(slot);
+
+	return true;
+}

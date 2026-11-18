@@ -65,6 +65,15 @@ typedef struct JumbleState
 	bool		has_squashed_lists;
 
 	/*
+	 * DBblue: when true, the bytes of Const.constvalue are also fed into
+	 * the jumble buffer (in addition to the usual constant-location record).
+	 * This lets the COUNT cache use the jumble as a value-sensitive
+	 * predicate fingerprint while leaving pg_stat_statements normalization
+	 * unaffected when the flag is left at its default of false.
+	 */
+	bool		include_consts;
+
+	/*
 	 * Count of the number of NULL nodes seen since last appending a value.
 	 * These are flushed out to the jumble buffer before subsequent appends
 	 * and before performing the final jumble hash.
@@ -96,6 +105,16 @@ extern LocationLen *ComputeConstantLengths(const JumbleState *jstate,
 										   int query_loc);
 extern JumbleState *JumbleQuery(Query *query);
 extern void EnableQueryId(void);
+
+/*
+ * DBblue extension: JumbleExpr fingerprints a non-Query node tree (typically
+ * a predicate subtree such as Query->jointree->quals) and returns the
+ * resulting 64-bit hash.  Unlike JumbleQuery it does not touch any queryId
+ * field.  When include_consts is true the bytes of each Const.constvalue
+ * are folded into the hash, producing a value-sensitive fingerprint suitable
+ * for use as a COUNT-cache key.
+ */
+extern int64 JumbleExpr(Node *expr, bool include_consts);
 
 extern PGDLLIMPORT bool query_id_enabled;
 

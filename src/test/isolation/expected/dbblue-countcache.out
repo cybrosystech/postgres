@@ -1,0 +1,167 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1warm s2begin s2ins s2commit s1read
+step s1warm: SELECT count(*) FROM dbb_iso WHERE id > 0;
+count
+-----
+  100
+(1 row)
+
+step s2begin: BEGIN;
+step s2ins: INSERT INTO dbb_iso SELECT generate_series(101, 130);
+step s2commit: COMMIT;
+step s1read: SELECT count(*) FROM dbb_iso WHERE id > 0;
+count
+-----
+  130
+(1 row)
+
+
+starting permutation: s1warm s2begin s2ins s1read s2commit s1read
+step s1warm: SELECT count(*) FROM dbb_iso WHERE id > 0;
+count
+-----
+  100
+(1 row)
+
+step s2begin: BEGIN;
+step s2ins: INSERT INTO dbb_iso SELECT generate_series(101, 130);
+step s1read: SELECT count(*) FROM dbb_iso WHERE id > 0;
+count
+-----
+  100
+(1 row)
+
+step s2commit: COMMIT;
+step s1read: SELECT count(*) FROM dbb_iso WHERE id > 0;
+count
+-----
+  130
+(1 row)
+
+
+starting permutation: s1warm s2begin s2ins s2abort s1read
+step s1warm: SELECT count(*) FROM dbb_iso WHERE id > 0;
+count
+-----
+  100
+(1 row)
+
+step s2begin: BEGIN;
+step s2ins: INSERT INTO dbb_iso SELECT generate_series(101, 130);
+step s2abort: ROLLBACK;
+step s1read: SELECT count(*) FROM dbb_iso WHERE id > 0;
+count
+-----
+  100
+(1 row)
+
+
+starting permutation: s1warm s2begin s2del s2commit s1read
+step s1warm: SELECT count(*) FROM dbb_iso WHERE id > 0;
+count
+-----
+  100
+(1 row)
+
+step s2begin: BEGIN;
+step s2del: DELETE FROM dbb_iso WHERE id > 90;
+step s2commit: COMMIT;
+step s1read: SELECT count(*) FROM dbb_iso WHERE id > 0;
+count
+-----
+   90
+(1 row)
+
+
+starting permutation: s1warm s2begin s2trunc s2commit s1read
+step s1warm: SELECT count(*) FROM dbb_iso WHERE id > 0;
+count
+-----
+  100
+(1 row)
+
+step s2begin: BEGIN;
+step s2trunc: TRUNCATE dbb_iso;
+step s2commit: COMMIT;
+step s1read: SELECT count(*) FROM dbb_iso WHERE id > 0;
+count
+-----
+    0
+(1 row)
+
+
+starting permutation: s2begin s2ins s1warm s2commit s1read
+step s2begin: BEGIN;
+step s2ins: INSERT INTO dbb_iso SELECT generate_series(101, 130);
+step s1warm: SELECT count(*) FROM dbb_iso WHERE id > 0;
+count
+-----
+  100
+(1 row)
+
+step s2commit: COMMIT;
+step s1read: SELECT count(*) FROM dbb_iso WHERE id > 0;
+count
+-----
+  130
+(1 row)
+
+
+starting permutation: s1warm s2begin s2ins s2commit s1page
+step s1warm: SELECT count(*) FROM dbb_iso WHERE id > 0;
+count
+-----
+  100
+(1 row)
+
+step s2begin: BEGIN;
+step s2ins: INSERT INTO dbb_iso SELECT generate_series(101, 130);
+step s2commit: COMMIT;
+step s1page: SELECT id FROM dbb_iso WHERE id > 0 ORDER BY id LIMIT 5 OFFSET 90;
+id
+--
+91
+92
+93
+94
+95
+(5 rows)
+
+
+starting permutation: s1warm s2begin s2del s2commit s1page
+step s1warm: SELECT count(*) FROM dbb_iso WHERE id > 0;
+count
+-----
+  100
+(1 row)
+
+step s2begin: BEGIN;
+step s2del: DELETE FROM dbb_iso WHERE id > 90;
+step s2commit: COMMIT;
+step s1page: SELECT id FROM dbb_iso WHERE id > 0 ORDER BY id LIMIT 5 OFFSET 90;
+id
+--
+(0 rows)
+
+
+starting permutation: s2begin s2ins s1warm s2commit s1page
+step s2begin: BEGIN;
+step s2ins: INSERT INTO dbb_iso SELECT generate_series(101, 130);
+step s1warm: SELECT count(*) FROM dbb_iso WHERE id > 0;
+count
+-----
+  100
+(1 row)
+
+step s2commit: COMMIT;
+step s1page: SELECT id FROM dbb_iso WHERE id > 0 ORDER BY id LIMIT 5 OFFSET 90;
+id
+--
+91
+92
+93
+94
+95
+(5 rows)
+
