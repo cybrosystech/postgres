@@ -320,6 +320,7 @@ static void report_unmanaged_backups(void);
 static bool path_has_parent_component(const char *path);
 static const char *database_list_problem(const char *value, const char *item);
 static const char *parent_folder_unsafe_reason(const char *path);
+static const char *symlink_unsafe_reason(const char *path);
 static bool backup_directory_still_usable(void);
 
 /*
@@ -683,6 +684,70 @@ parent_folder_unsafe_reason(const char *path)
 }
 
 /*
+ * symlink_unsafe_reason
+ *		Why a symbolic link on path -- dbblue_backup_directory as written,
+ *		before symlinks are resolved -- could be changed by another user, or
+ *		NULL if none could.
+ *
+ * Every dump path is built from the setting as written, so each file
+ * operation follows its symlinks anew.  Checking only where they lead
+ * (backup_dir_real) is not enough: a link kept in a folder others can write
+ * to can be swapped between the launcher's checks and pg_dump opening its
+ * file, sending the dump through a link of theirs onto any file the server
+ * can write.  So a link is held to the rules for folders: it must be owned by
+ * root or the server's user -- in a sticky folder such as /tmp, whoever
+ * created a link can still change it -- and every folder above it must pass
+ * parent_folder_unsafe_reason().
+ */
+static const char *
+symlink_unsafe_reason(const char *path)
+{
+	char		prefix[MAXPGPATH];
+	char	   *slash;
+
+	strlcpy(prefix, path, sizeof(prefix));
+	canonicalize_path(prefix);
+
+	/* Each leading part in turn: "/a", "/a/b", ..., then the whole path. */
+	slash = prefix;
+	for (;;)
+	{
+		struct stat st;
+		bool		last;
+
+		slash = strchr(slash + 1, '/');
+		last = (slash == NULL);
+		if (!last)
+			*slash = '\0';
+
+		if (lstat(prefix, &st) != 0)
+		{
+			if (errno == ENOENT)
+				return NULL;	/* the caller's realpath() reports that */
+			return psprintf("goes through \"%s\", which cannot be checked: %s",
+							prefix, strerror(errno));
+		}
+
+		if (S_ISLNK(st.st_mode))
+		{
+			const char *reason;
+
+			if (st.st_uid != 0 && st.st_uid != geteuid())
+				return psprintf("goes through the symbolic link \"%s\", which is owned by another operating-system user",
+								prefix);
+			reason = parent_folder_unsafe_reason(prefix);
+			if (reason != NULL)
+				return psprintf("goes through the symbolic link \"%s\", which %s",
+								prefix, reason);
+		}
+
+		if (last)
+			return NULL;
+		*slash = '/';
+	}
+}
+
+/*
  * check_backup_directory
  *		Verify that dbblue_backup_directory is somewhere the launcher may
  *		write dumps, and resolve it and the data directory into
@@ -788,13 +853,15 @@ check_backup_directory(void)
 		}
 
 		reason = parent_folder_unsafe_reason(backup_dir_real);
+		if (reason == NULL)
+			reason = symlink_unsafe_reason(dbblue_backup_directory);
 		if (reason != NULL)
 		{
 			ereport(WARNING,
 					(errmsg("dbblue backup launcher: dbblue_backup_directory \"%s\" %s, not backing up",
 							dbblue_backup_directory, reason),
-					 errdetail("Another user who can write there could move the backup directory aside and put a link to the server's own files in its place."),
-					 errhint("Use a directory whose parent folders are owned by root or by the operating-system user the server runs as, and are not writable by group or others.")));
+					 errdetail("Another user who can write there could move the backup directory aside, or change a symbolic link on its path, and put a link to the server's own files in its place."),
+					 errhint("Use a path whose folders and symbolic links are owned by root or by the operating-system user the server runs as, and whose folders are not writable by group or others.")));
 			backup_dir_real[0] = '\0';
 			return false;
 		}
@@ -884,13 +951,15 @@ backup_directory_still_usable(void)
 	reason = folder_unsafe_reason(backup_dir_real, true);
 	if (reason == NULL)
 		reason = parent_folder_unsafe_reason(backup_dir_real);
+	if (reason == NULL)
+		reason = symlink_unsafe_reason(dbblue_backup_directory);
 	if (reason != NULL)
 	{
 		ereport(WARNING,
 				(errmsg("dbblue backup launcher: dbblue_backup_directory \"%s\" %s, not backing up",
 						dbblue_backup_directory, reason),
 				 errdetail("Another user who can write there could make a backup overwrite the server's own files, or replace a backup with a malicious one."),
-				 errhint("Make it, and the folders above it, owned by the operating-system user the server runs as (or root), and not writable by group or others.")));
+				 errhint("Make it, the folders above it and any symbolic link on its path owned by the operating-system user the server runs as (or root), with the folders not writable by group or others.")));
 		return false;
 	}
 
