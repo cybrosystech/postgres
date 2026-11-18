@@ -1143,6 +1143,18 @@ BackupLauncherMain(Datum main_arg)
 				SetConfigOption("search_path", "pg_catalog, pg_temp",
 								PGC_SUSET, PGC_S_SESSION);
 
+				/*
+				 * The launcher must be able to write its history table.  A
+				 * default_transaction_read_only = on from ALTER DATABASE
+				 * would otherwise stick to this connection even after it is
+				 * reset (it is read only at connect), and one from
+				 * postgresql.conf would make every backup run a full pg_dump
+				 * only to delete it when its row cannot be saved.  Like
+				 * search_path above, PGC_S_SESSION wins over both.
+				 */
+				SetConfigOption("default_transaction_read_only", "off",
+								PGC_SUSET, PGC_S_SESSION);
+
 				launcher_connected = true;
 			}
 
