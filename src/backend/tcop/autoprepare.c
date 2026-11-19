@@ -97,7 +97,7 @@
 /* ---- GUCs ---- */
 bool		autoprepare_enabled = false;	/* off by default -- opt in */
 int			autoprepare_threshold = 2;		/* cache once seen this many times */
-int			autoprepare_limit = 1024;		/* cap entries per backend */
+int			autoprepare_limit = 256;		/* cap entries per backend */
 
 /* ---- the notebook ---- */
 typedef struct AutoprepareEntry
@@ -805,12 +805,16 @@ AutoprepareReset(void)
  * 10% reserve (at least one slot) kept for counting new shapes.  A limit of 1
  * has no room for a reserve.
  */
+static int	aprep_effective_limit(void);
+
 static int
 aprep_fixed_cap(void)
 {
-	if (autoprepare_limit < 2)
-		return autoprepare_limit;
-	return autoprepare_limit - Max(1, autoprepare_limit / 10);
+	int			limit = aprep_effective_limit();
+
+	if (limit < 2)
+		return limit;
+	return limit - Max(1, limit / 10);
 }
 
 /* Reuse count as of now: halves every APREP_REUSE_HALF_LIFE statements. */
@@ -1175,7 +1179,7 @@ AutoprepareConsult(Query *analyzed_query, const char *query_string,
 		 * lowest-value fixed entry instead.  Looping also shrinks the table
 		 * after the limit is lowered.  Safe here: no entry is in use.
 		 */
-		while (hash_get_num_entries(autoprepare_table) >= autoprepare_limit)
+		while (hash_get_num_entries(autoprepare_table) >= aprep_effective_limit())
 		{
 			if (!dlist_is_empty(&aprep_tracking_lru))
 			{
@@ -1346,8 +1350,9 @@ assign_dbblue_autoprepare_enabled(bool newval, void *extra)
  * rather than any live memory accounting (so there is no ongoing runtime
  * cost -- this only runs when the GUC is actually set or reloaded):
  *
- *	- APREP_ASSUMED_BYTES_PER_SHAPE: real cached shapes measured on an Odoo
- *	  workload ranged from about 4kB to 64kB; we assume a conservative 32kB.
+ *	- APREP_ASSUMED_BYTES_PER_SHAPE: measured cached shapes range from about
+ *	  37kB (simple queries) to 200-320kB (6-11 way joins with many columns);
+ *	  we assume 128kB, a middle figure for Odoo-style queries.
  *	- APREP_MEM_SAFETY_FRACTION: of the RAM left after shared_buffers, the
  *	  fraction the worst case above may use, leaving the rest for work_mem,
  *	  OS cache, and everything else running on the box.
@@ -1356,7 +1361,7 @@ assign_dbblue_autoprepare_enabled(bool newval, void *extra)
  * net against an obviously dangerous value, not a precise budget.
  * ---------------------------------------------------------------- */
 
-#define APREP_ASSUMED_BYTES_PER_SHAPE	(32 * 1024)		/* 32kB */
+#define APREP_ASSUMED_BYTES_PER_SHAPE	(128 * 1024)	/* 128kB */
 #define APREP_MEM_SAFETY_FRACTION		0.10			/* 10% */
 
 /*
@@ -1387,44 +1392,86 @@ aprep_total_system_memory_bytes(void)
 }
 
 /*
+ * aprep_safe_limit
+ *		The largest per-backend limit whose worst case (every one of
+ *		max_connections backends filling its table with
+ *		APREP_ASSUMED_BYTES_PER_SHAPE-sized plans) stays within
+ *		APREP_MEM_SAFETY_FRACTION of the RAM left after shared_buffers.
+ *		Returns INT_MAX if system memory cannot be determined (fail open).
+ *		Also reports the figures used, for the error message.
+ */
+static int
+aprep_safe_limit(int64 *total_ram_out, double *sb_bytes_out)
+{
+	int64		total_ram = aprep_total_system_memory_bytes();
+	double		shared_buffers_bytes = (double) NBuffers * BLCKSZ;
+	double		usable_bytes;
+	int			safe_limit;
+
+	if (total_ram_out)
+		*total_ram_out = total_ram;
+	if (sb_bytes_out)
+		*sb_bytes_out = shared_buffers_bytes;
+
+	if (total_ram <= 0)
+		return INT_MAX;
+
+	usable_bytes = ((double) total_ram - shared_buffers_bytes) *
+		APREP_MEM_SAFETY_FRACTION;
+	if (usable_bytes < 0)
+		usable_bytes = 0;
+
+	safe_limit = (int) Min(usable_bytes /
+						   ((double) Max(MaxConnections, 1) *
+							APREP_ASSUMED_BYTES_PER_SHAPE),
+						   (double) INT_MAX);
+	return Max(safe_limit, 1);
+}
+
+/*
+ * aprep_effective_limit
+ *		The limit actually enforced: dbblue_autoprepare_limit, clamped to the
+ *		safe ceiling.  The check hook below cannot reject the compiled-in
+ *		default (that would be FATAL at startup), so the clamp is what makes
+ *		the safety net apply to the default and to values from before the
+ *		ceiling was known.  The ceiling depends only on settings fixed at
+ *		server start, so it is computed once per backend.
+ */
+static int
+aprep_effective_limit(void)
+{
+	static int	ceiling = 0;
+
+	if (ceiling == 0)
+		ceiling = aprep_safe_limit(NULL, NULL);
+	return Min(autoprepare_limit, ceiling);
+}
+
+/*
  * check_dbblue_autoprepare_limit
- *		Reject a limit whose worst case (every one of max_connections
- *		backends filling its table with APREP_ASSUMED_BYTES_PER_SHAPE-sized
- *		plans) would use more than APREP_MEM_SAFETY_FRACTION of the RAM left
- *		after shared_buffers.
+ *		Reject a limit above the safe ceiling.
  *
  * Only applied to values a user or the config file actually asked for
  * (never to the compiled-in boot_val: InitializeOneGUCOption() treats a
  * check-hook failure there as FATAL, since there is no prior good value to
- * fall back to -- see guc.c).  A config-file value that fails here is
- * logged and the GUC keeps its previous value, same as any other invalid
- * setting in postgresql.conf; it does not stop the server from starting.
+ * fall back to -- see guc.c; the default is clamped at use instead, see
+ * aprep_effective_limit()).  A config-file value that fails here is logged
+ * and the GUC keeps its previous value, same as any other invalid setting
+ * in postgresql.conf; it does not stop the server from starting.
  */
 bool
 check_dbblue_autoprepare_limit(int *newval, void **extra, GucSource source)
 {
 	int64		total_ram;
 	double		shared_buffers_bytes;
-	double		usable_bytes;
 	int			safe_limit;
 
 	if (source <= PGC_S_DEFAULT)
 		return true;			/* never reject our own compiled-in default */
 
-	total_ram = aprep_total_system_memory_bytes();
+	safe_limit = aprep_safe_limit(&total_ram, &shared_buffers_bytes);
 	if (total_ram <= 0)
 		return true;			/* can't tell on this platform: don't guess */
-
-	shared_buffers_bytes = (double) NBuffers * BLCKSZ;
-	usable_bytes = ((double) total_ram - shared_buffers_bytes) *
-		APREP_MEM_SAFETY_FRACTION;
-	if (usable_bytes < 0)
-		usable_bytes = 0;
-
-	safe_limit = (int) (usable_bytes /
-						((double) Max(MaxConnections, 1) *
-						 APREP_ASSUMED_BYTES_PER_SHAPE));
-	safe_limit = Max(safe_limit, 1);
 
 	if (*newval > safe_limit)
 	{
@@ -1441,7 +1488,6 @@ check_dbblue_autoprepare_limit(int *newval, void **extra, GucSource source)
 	}
 	return true;
 }
-
 
 /* ----------------------------------------------------------------
  *		introspection
@@ -1645,7 +1691,7 @@ aprep_fill_summary(AprepMsgSummary *s)
 	memset(s, 0, sizeof(*s));
 	s->kind = APREP_MSG_SUMMARY;
 	s->enabled = autoprepare_enabled;
-	s->limit = autoprepare_limit;
+	s->limit = aprep_effective_limit();
 	s->fixed_cap = aprep_fixed_cap();
 	s->hits = aprep_hits;
 	s->fallbacks = aprep_fallbacks;
