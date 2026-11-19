@@ -383,3 +383,28 @@ smgr_bulk_get_buf(BulkWriteState *bulkstate)
 {
 	return MemoryContextAllocAligned(bulkstate->memcxt, BLCKSZ, PG_IO_ALIGN_SIZE, 0);
 }
+
+/*
+ * Return the size of the fork, in blocks, as far as this bulk write knows:
+ * its size when the bulk write began, plus whatever smgr_bulk_flush() has
+ * extended it by since.  Pages still queued are not included.
+ *
+ * If the fork is physically longer than this, something other than this bulk
+ * write has extended it in the meantime (see
+ * heap_raw_bulk_insert_check_sole_writer()).
+ */
+BlockNumber
+smgr_bulk_get_relsize(BulkWriteState *bulkstate)
+{
+	return bulkstate->relsize;
+}
+
+/*
+ * Would the next smgr_bulk_write() flush the queued pages to the file?
+ * (smgr_bulk_finish() always does.)
+ */
+bool
+smgr_bulk_write_will_flush(BulkWriteState *bulkstate)
+{
+	return bulkstate->npending + 1 >= bulkstate->maxpages;
+}

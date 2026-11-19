@@ -2775,19 +2775,50 @@ RelationSupportsRawBulkInsert(Relation rel)
  * the two writers both start at block 0 and silently overwrite each other,
  * losing rows.
  *
- * Every buffer-managed insert records a target block on the relcache entry
- * (RelationGetBufferForTuple -> RelationSetTargetBlock), which this path never
- * does, so a target block that has become valid is a reliable, cheap signal
- * that such a second writer exists.  It is a hard error: a CTAS / matview
- * refresh is a single transaction, so erroring rolls the whole load back and
- * discards the partially written relation rather than leaving silently
- * corrupted contents behind.  The ordinary case -- a SELECT that does not write
- * to its own target -- never trips this and keeps the fast path.
+ * The authoritative signal is the physical length of the relation.  A
+ * buffer-managed writer can only get a page of its own by extending the
+ * relation, and ExtendBufferedRelBy() grows the file right away
+ * (smgrzeroextend()), long before its buffer is written out.  This path
+ * extends the file only from smgr_bulk_flush(), which keeps the bulk writer's
+ * idea of the relation size in step.  So as long as we are the sole writer,
+ * the file is exactly as long as the bulk writer believes; if it is longer,
+ * someone else has claimed blocks that we are about to write, and a later
+ * flush would clobber them (or they would clobber ours).  smgrnblocks() asks
+ * the kernel for the size outside of recovery, so neither a relcache
+ * invalidation nor a PROCSIGNAL_BARRIER_SMGRRELEASE (DROP DATABASE, DROP
+ * TABLESPACE, ALTER DATABASE SET TABLESPACE) can hide the extension.
+ *
+ * The relation's insertion target block is checked as well: every
+ * buffer-managed insert sets it (RelationGetBufferForTuple ->
+ * RelationSetTargetBlock) and this path never does, so it also catches a
+ * second writer that slipped a row into one of the pages we have already
+ * flushed.  It is only a hint, though: it lives in the SMgrRelation and is
+ * reset whenever that is released or closed, which is why it cannot be relied
+ * on alone.
+ *
+ * This must be called before every smgr_bulk_write() and smgr_bulk_finish(),
+ * the only places our pages can reach the file.  The file length is compared
+ * whenever that call is going to flush (check_file_length): then no write of
+ * ours can happen after a second writer's extension went unnoticed.  Pages
+ * that are only queued don't touch the file, so skipping the comparison for
+ * them is safe, and it keeps the cost at one lseek() per flush rather than
+ * per page.
+ *
+ * It is a hard error: a CTAS / matview refresh is a single transaction, so
+ * erroring rolls the whole load back and discards the partially written
+ * relation rather than leaving silently corrupted contents behind.  The
+ * ordinary case -- a SELECT that does not write to its own target -- never
+ * trips this and keeps the fast path.
  */
-static inline void
-heap_raw_bulk_insert_check_sole_writer(Relation relation)
+static void
+heap_raw_bulk_insert_check_sole_writer(HeapRawBulkInsertState state,
+									   bool check_file_length)
 {
-	if (RelationGetTargetBlock(relation) != InvalidBlockNumber)
+	Relation	relation = state->rel;
+
+	if (RelationGetTargetBlock(relation) != InvalidBlockNumber ||
+		(check_file_length &&
+		 RelationGetNumberOfBlocks(relation) != smgr_bulk_get_relsize(state->bulkstate)))
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("cannot bulk-load relation \"%s\" that is being modified by the same command",
@@ -2864,12 +2895,6 @@ heap_raw_bulk_insert_tuple(HeapRawBulkInsertState state, TupleTableSlot *slot)
 
 	AssertHasSnapshotForToast(relation);
 
-	/*
-	 * Bail out if a buffer-managed writer has touched this relation since the
-	 * load began; continuing would silently overwrite its rows (or ours).
-	 */
-	heap_raw_bulk_insert_check_sole_writer(relation);
-
 	tuple = ExecFetchSlotHeapTuple(slot, true, &shouldFree);
 	slot->tts_tableOid = RelationGetRelid(relation);
 	tuple->t_tableOid = slot->tts_tableOid;
@@ -2909,7 +2934,14 @@ heap_raw_bulk_insert_tuple(HeapRawBulkInsertState state, TupleTableSlot *slot)
 
 		if (len + state->saveFreeSpace > pageFreeSpace)
 		{
-			/* Doesn't fit on the current page: flush it, start a new one */
+			/*
+			 * Doesn't fit on the current page: flush it, start a new one.
+			 * First bail out if a buffer-managed writer has touched this
+			 * relation since the load began; handing the page to the bulk
+			 * writer could then overwrite its rows (or have ours overwritten).
+			 */
+			heap_raw_bulk_insert_check_sole_writer(state,
+												   smgr_bulk_write_will_flush(state->bulkstate));
 			smgr_bulk_write(state->bulkstate, state->blockno, state->buffer, true);
 			state->buffer = NULL;
 			page = NULL;
@@ -2981,12 +3013,13 @@ void
 heap_raw_bulk_insert_end(HeapRawBulkInsertState state)
 {
 	/*
-	 * A buffer-managed writer may have touched the relation after the last
-	 * tuple was handed to us, which heap_raw_bulk_insert_tuple() could not
-	 * have seen.  Catch it here, before flushing our final page over whatever
-	 * that writer left behind.
+	 * A buffer-managed writer may have touched the relation since the last
+	 * page was handed to the bulk writer, which heap_raw_bulk_insert_tuple()
+	 * could not have seen.  Catch it here, before the pages still queued in
+	 * the bulk writer and our final page are flushed over whatever that
+	 * writer left behind.
 	 */
-	heap_raw_bulk_insert_check_sole_writer(state->rel);
+	heap_raw_bulk_insert_check_sole_writer(state, true);
 
 	if (state->buffer != NULL)
 		smgr_bulk_write(state->bulkstate, state->blockno, state->buffer, true);

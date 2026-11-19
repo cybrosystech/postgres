@@ -50,4 +50,7 @@ extern void smgr_bulk_write(BulkWriteState *bulkstate, BlockNumber blocknum, Bul
 
 extern void smgr_bulk_finish(BulkWriteState *bulkstate);
 
+extern BlockNumber smgr_bulk_get_relsize(BulkWriteState *bulkstate);
+extern bool smgr_bulk_write_will_flush(BulkWriteState *bulkstate);
+
 #endif							/* BULK_WRITE_H */
