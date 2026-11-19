@@ -962,47 +962,44 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 		ownerId = GetUserId();
 
 	/*
+	 * dbblue: give a new plain table the fillfactor that dbblue_fillfactor_map
+	 * assigns to its name, unless the statement sets one itself.
+	 */
+	if (relkind == RELKIND_RELATION)
+	{
+		int			ff = dbblue_fillfactor_lookup(stmt->relation->relname);
+
+		if (ff > 0)
+		{
+			bool		found_existing = false;
+			ListCell   *lc;
+
+			foreach(lc, stmt->options)
+			{
+				DefElem    *opt = (DefElem *) lfirst(lc);
+
+				if (pg_strcasecmp(opt->defname, "fillfactor") == 0)
+				{
+					found_existing = true;
+					break;
+				}
+			}
+
+			if (!found_existing)
+			{
+				stmt->options = lappend(stmt->options,
+										makeDefElem("fillfactor",
+													(Node *) makeInteger(ff), -1));
+				ereport(DEBUG2,
+						(errmsg_internal("dbblue_fillfactor: injecting fillfactor=%d for table \"%s\"",
+										 ff, stmt->relation->relname)));
+			}
+		}
+	}
+
+	/*
 	 * Parse and validate reloptions, if any.
-	 */	
-   if (relkind == RELKIND_RELATION)
-   {
-       ereport(DEBUG2,errmsg("DefineRelation: looking up fillfactor for table \"%s\"", stmt->relation->relname));
-       int ff = dbblue_fillfactor_lookup(stmt->relation->relname);
-        ereport(DEBUG2,
-                       (errmsg("dbblue_fillfactor: injecting fillfactor=%d "
-                               "for table \"%s\"",
-                               ff, stmt->relation->relname)));
-       if (ff > 0)
-       {
-           bool found_existing = false;
-           ListCell *lc;
-
-
-           foreach(lc, stmt->options)
-           {
-               DefElem *opt = (DefElem *) lfirst(lc);
-               if (pg_strcasecmp(opt->defname, "fillfactor") == 0)
-               {
-                   found_existing = true;
-                   break;
-               }
-           }
-
-
-           if (!found_existing)
-           {
-               DefElem *ff_elem = makeDefElem("fillfactor",
-                                              (Node *) makeInteger(ff),
-                                              -1);
-               stmt->options = lappend(stmt->options, ff_elem);
-               ereport(DEBUG2,
-                       (errmsg("dbblue_fillfactor: injecting fillfactor=%d "
-                               "for table \"%s\"",
-                               ff, stmt->relation->relname)));
-           }
-       }
-   }
-
+	 */
 	reloptions = transformRelOptions((Datum) 0, stmt->options, NULL, validnsps,
 									 true, false);
 
