@@ -1003,8 +1003,8 @@
 },
 
 { name => 'dbblue_heap_bulk_extend_size', type => 'int', context => 'PGC_USERSET', group => 'RESOURCES_IO',
-  short_desc => 'Size of bulk extend for heap table.',
-  long_desc => '0 turns this feature off, -1 uses a size based on "shared_buffers".',
+  short_desc => 'Sets the number of pages a table is extended by at a time.',
+  long_desc => 'Applies to every insert or update that has to extend any table of at least 128 pages, not only to bulk loads. The extension is limited to 1/16 of the table\'s current size and to 999 pages, so that VACUUM never truncates the unused tail again. 0 turns this feature off, -1 uses a size based on "shared_buffers".',
   flags => 'GUC_UNIT_BLOCKS',
   variable => 'dbblue_heap_bulk_extend_size',
   boot_val => '0',
@@ -1013,8 +1013,8 @@
 },
 
 { name => 'dbblue_index_bulk_extend_size', type => 'int', context => 'PGC_USERSET', group => 'RESOURCES_IO',
-  short_desc => 'Size of bulk extend for index table.',
-  long_desc => '0 turns this feature off, -1 uses a size based on "shared_buffers".',
+  short_desc => 'Sets the number of pages a B-tree index is extended by at a time.',
+  long_desc => 'Applies to every page split that has to extend any B-tree index of at least 128 pages, not only to bulk loads. The extension is limited to 1/16 of the index\'s current size; the unused pages are kept in the free space map for later splits. 0 turns this feature off, -1 uses a size based on "shared_buffers".',
   flags => 'GUC_UNIT_BLOCKS',
   variable => 'dbblue_index_bulk_extend_size',
   boot_val => '0',

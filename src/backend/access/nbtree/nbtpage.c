@@ -53,6 +53,12 @@ int			dbblue_index_bulk_extend_size = 0;
  */
 #define DBBLUE_MIN_BULK_EXTEND_BLOCKS 128
 
+/*
+ * Never bulk extend an index by more than 1/this of its current size. Keep in
+ * sync with DBBLUE_BULK_EXTEND_TAIL_FRACTION in hio.c.
+ */
+#define DBBLUE_BULK_EXTEND_SIZE_FRACTION 16
+
 static BTMetaPageData *_bt_getmeta(Relation rel, Buffer metabuf);
 static void _bt_delitems_delete(Relation rel, Buffer buf,
 								TransactionId snapshotConflictHorizon,
@@ -994,8 +1000,8 @@ _bt_allocbuf(Relation rel, Relation heaprel)
 	 * us to repeat the valgrind request that _bt_lockbuf() otherwise would
 	 * make, as we can't use _bt_lockbuf() without introducing a race.
 	 *
-	 * If dbblue_index_bulk_extend_size is set, extend by that many pages in
-	 * one go (like RelationAddBlocks() does for heap, in hio.c). We keep the
+	 * If dbblue_index_bulk_extend_size is set, extend by up to that many pages
+	 * in one go (like RelationAddBlocks() does for heap, in hio.c). We keep the
 	 * first page for the caller and hand the rest to the index FSM, so later
 	 * callers of GetFreeIndexPage() find them instead of triggering another
 	 * relation extension.
@@ -1010,13 +1016,19 @@ _bt_allocbuf(Relation rel, Relation heaprel)
 		uint32		extend_by_pages;
 
 		/*
+		 * This runs on every page split that can't reuse a free page, of
+		 * every btree index, not only during bulk loads.
+		 *
 		 * -1 sizes the extension from what the buffer manager can currently
 		 * spare, which is derived from shared_buffers.
 		 *
-		 * Don't bulk extend a small index by much more than its current size
-		 * (same reasoning as RelationAddBlocks() in hio.c): an index only
-		 * reaches the full bulk extend size once it is already about that
-		 * large. Always extend by at least one page.
+		 * Don't bulk extend an index by more than 1/16 of its current size
+		 * (same cap as RelationAddBlocks() in hio.c): extending by up to the
+		 * index's whole size would double every index just past
+		 * DBBLUE_MIN_BULK_EXTEND_BLOCKS on its next split, and VACUUM never
+		 * truncates an index to give that space back. An index only reaches
+		 * the full bulk extend size once it is about 16 times that large.
+		 * Always extend by at least one page.
 		 */
 		if (dbblue_index_bulk_extend_size < 0)
 			extend_by_pages = GetAdditionalPinLimit();
@@ -1026,7 +1038,7 @@ _bt_allocbuf(Relation rel, Relation heaprel)
 		extend_by_pages = Min(extend_by_pages,
 							  MAX_INDEX_BUFFERS_TO_EXTEND_BY);
 		extend_by_pages = Min(extend_by_pages,
-							  RelationGetNumberOfBlocks(rel));
+							  RelationGetNumberOfBlocks(rel) / DBBLUE_BULK_EXTEND_SIZE_FRACTION);
 		extend_by_pages = Max(extend_by_pages, 1);
 
 		first_block = ExtendBufferedRelBy(BMR_REL(rel), MAIN_FORKNUM, NULL,

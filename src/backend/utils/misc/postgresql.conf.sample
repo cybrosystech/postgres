@@ -212,10 +212,14 @@
 #backend_flush_after = 0                # measured in pages, 0 disables
 #dbblue_heap_bulk_extend_size = 0      # measured in pages, 0 disables
                                         # (upstream behaviour), -1 sizes it
-                                        # from shared_buffers
+                                        # from shared_buffers; applies to all
+                                        # inserts, capped at 1/16 of the
+                                        # table and 999 pages
 #dbblue_index_bulk_extend_size = 0     # measured in pages, 0 disables
                                         # (upstream behaviour), -1 sizes it
-                                        # from shared_buffers
+                                        # from shared_buffers; applies to all
+                                        # btree page splits, capped at 1/16
+                                        # of the index
 #dbblue_bulk_write_maxpages = 32        # pages buffered before each flush
                                         # during bulk writes (1-512)
 #dbblue_enable_tableam_multi_insert = off  # batch the initial insert of

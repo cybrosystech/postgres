@@ -247,14 +247,21 @@ RelationAddBlocks(Relation relation, BulkInsertState bistate,
 				  int num_pages, bool use_fsm, bool *did_unlock)
 {
 	/*
-	 * Upper bound matches dbblue_heap_bulk_extend_size's max_val, so the GUC
-	 * alone (see below) determines how aggressively we bulk extend.
+	 * Upper bound matches dbblue_heap_bulk_extend_size's max_val. The tail
+	 * caps below keep the actual extension under DBBLUE_BULK_EXTEND_MAX_TAIL.
 	 */
 #define MAX_BUFFERS_TO_EXTEND_BY 1024
-	/* the ceiling upstream PostgreSQL uses, applied when our GUC is off */
+	/* the ceiling upstream PostgreSQL applies to its own heuristics */
 #define STOCK_MAX_BUFFERS_TO_EXTEND_BY 64
 	/* below this size a relation gains nothing from bulk extension */
 #define DBBLUE_MIN_BULK_EXTEND_BLOCKS 128
+	/*
+	 * Keep an extension's empty tail below VACUUM's truncation thresholds,
+	 * REL_TRUNCATE_FRACTION (16) and REL_TRUNCATE_MINIMUM (1000) in
+	 * vacuumlazy.c; keep these in sync with those.
+	 */
+#define DBBLUE_BULK_EXTEND_TAIL_FRACTION 16
+#define DBBLUE_BULK_EXTEND_MAX_TAIL 999
 	Buffer		victim_buffers[MAX_BUFFERS_TO_EXTEND_BY];
 	BlockNumber first_block = InvalidBlockNumber;
 	BlockNumber last_block = InvalidBlockNumber;
@@ -316,48 +323,65 @@ RelationAddBlocks(Relation relation, BulkInsertState bistate,
 		if (bistate)
 			extend_by_pages = Max(extend_by_pages, bistate->already_extended_by);
 
+		/* The upstream heuristics above keep the upstream ceiling. */
+		extend_by_pages = Min(extend_by_pages, STOCK_MAX_BUFFERS_TO_EXTEND_BY);
+
 		/* ---
 		 * dbblue_heap_bulk_extend_size is the target size of a bulk extend,
-		 * so extend by at least that many pages. The heuristics above can
-		 * still ask for more when there's contention.
+		 * so extend by at least that many pages. This applies to every
+		 * insert into the relation that has to extend it (INSERT, COPY, an
+		 * UPDATE that moves the row to a new page, ...), not only to bulk
+		 * loads.
 		 *
 		 * A setting of 0 turns our bulk extension off, leaving the upstream
-		 * heuristics (and the upstream ceiling) exactly as they are. -1 sizes
-		 * the extension from what the buffer manager can currently spare,
-		 * which is derived from shared_buffers.
+		 * heuristics exactly as they are. -1 sizes the extension from what
+		 * the buffer manager can currently spare, which is derived from
+		 * shared_buffers.
 		 *
-		 * Don't bulk extend a small relation by much more than its current
-		 * size though. Extending a nearly empty table by e.g. 4MB would
-		 * balloon it, waste space in schemas with many small tables, and make
-		 * sequential scans read mostly empty pages. Growing proportionally
-		 * means a relation only reaches the full bulk extend size once it is
-		 * already about that large, which is where the syscall and
-		 * extension-lock savings actually matter.
+		 * The empty tail an extension leaves must never be large enough for
+		 * VACUUM to truncate it: lazy_truncate_heap() takes an
+		 * AccessExclusiveLock on the relation, its WAL record takes the same
+		 * lock on a hot standby and cancels conflicting queries there, and
+		 * the next insert would just extend the relation again, over and over
+		 * on a busy table. VACUUM considers truncation once the empty tail is
+		 * at least REL_TRUNCATE_MINIMUM pages, or at least 1/
+		 * REL_TRUNCATE_FRACTION of the relation (see
+		 * should_attempt_truncation() in vacuumlazy.c). An extension of E
+		 * pages onto a relation of N pages stays below both as long as
+		 * E <= N / DBBLUE_BULK_EXTEND_TAIL_FRACTION and
+		 * E <= DBBLUE_BULK_EXTEND_MAX_TAIL.
+		 *
+		 * The proportional cap also keeps a small relation from ballooning:
+		 * a relation only reaches the full bulk extend size once it is about
+		 * 16 times that large, which is where the syscall and extension-lock
+		 * savings actually matter.
 		 * ---
 		 */
-		if (dbblue_heap_bulk_extend_size != 0 &&
-			RelationGetNumberOfBlocks(relation) >= DBBLUE_MIN_BULK_EXTEND_BLOCKS)
+		if (dbblue_heap_bulk_extend_size != 0)
 		{
-			uint32		target;
+			BlockNumber nblocks = RelationGetNumberOfBlocks(relation);
 
-			if (dbblue_heap_bulk_extend_size < 0)
-				target = GetAdditionalPinLimit();
-			else
-				target = (uint32) dbblue_heap_bulk_extend_size;
+			if (nblocks >= DBBLUE_MIN_BULK_EXTEND_BLOCKS)
+			{
+				uint32		target;
 
-			target = Min(target, RelationGetNumberOfBlocks(relation));
-			extend_by_pages = Max(extend_by_pages, target);
+				if (dbblue_heap_bulk_extend_size < 0)
+					target = GetAdditionalPinLimit();
+				else
+					target = (uint32) dbblue_heap_bulk_extend_size;
 
-			/*
-			 * Can't extend by more than MAX_BUFFERS_TO_EXTEND_BY, we need to
-			 * pin them all concurrently. Note that bufmgr's
-			 * LimitAdditionalPins() may reduce this further still.
-			 */
-			extend_by_pages = Min(extend_by_pages, MAX_BUFFERS_TO_EXTEND_BY);
+				target = Min(target, nblocks / DBBLUE_BULK_EXTEND_TAIL_FRACTION);
+				target = Min(target, DBBLUE_BULK_EXTEND_MAX_TAIL);
+				extend_by_pages = Max(extend_by_pages, target);
+			}
 		}
-		else
-			extend_by_pages = Min(extend_by_pages,
-								  STOCK_MAX_BUFFERS_TO_EXTEND_BY);
+
+		/*
+		 * Can't extend by more than MAX_BUFFERS_TO_EXTEND_BY, we need to pin
+		 * them all concurrently. Note that bufmgr's LimitAdditionalPins() may
+		 * reduce this further still.
+		 */
+		extend_by_pages = Min(extend_by_pages, MAX_BUFFERS_TO_EXTEND_BY);
 	}
 
 	/*
@@ -387,11 +411,9 @@ RelationAddBlocks(Relation relation, BulkInsertState bistate,
 	 * so that we are sure that nobody has inserted into the page
 	 * concurrently.
 	 *
-	 * At the default dbblue_heap_bulk_extend_size there's no danger of
-	 * [auto]vacuum trying to truncate later pages, as REL_TRUNCATE_MINIMUM is
-	 * larger. Users who raise dbblue_heap_bulk_extend_size close to its
-	 * max_val (matching REL_TRUNCATE_MINIMUM) should be aware that a mostly
-	 * empty tail of that size can make autovacuum attempt a truncation.
+	 * The tail this leaves is kept below VACUUM's truncation thresholds (see
+	 * above), so [auto]vacuum won't try to truncate the pages we add here
+	 * before they are used.
 	 */
 	first_block = ExtendBufferedRelBy(BMR_REL(relation), MAIN_FORKNUM,
 									  bistate ? bistate->strategy : NULL,
@@ -485,6 +507,8 @@ RelationAddBlocks(Relation relation, BulkInsertState bistate,
 	}
 
 	return buffer;
+#undef DBBLUE_BULK_EXTEND_MAX_TAIL
+#undef DBBLUE_BULK_EXTEND_TAIL_FRACTION
 #undef DBBLUE_MIN_BULK_EXTEND_BLOCKS
 #undef STOCK_MAX_BUFFERS_TO_EXTEND_BY
 #undef MAX_BUFFERS_TO_EXTEND_BY
