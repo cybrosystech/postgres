@@ -1506,9 +1506,18 @@ setup_config(void)
 									  default_timezone, false);
 	}
 
-	if (tde_enabled)
-		conflines = replace_guc_value(conflines, "shared_preload_libraries",
-									  "pg_stat_statements,hypopg,pg_tde", false);
+	/*
+	 * dbblue preloads pg_stat_statements and hypopg (the index advisor needs
+	 * both), and pg_tde as well when TDE is enabled.  This is done here, not
+	 * by uncommenting the line in postgresql.conf.sample: the sample must
+	 * list every parameter commented out at its built-in default, which
+	 * src/test/modules/test_misc/t/003_check_guc.pl enforces.
+	 */
+	conflines = replace_guc_value(conflines, "shared_preload_libraries",
+								  tde_enabled ?
+								  "pg_stat_statements,hypopg,pg_tde" :
+								  "pg_stat_statements,hypopg",
+								  false);
 
 	conflines = replace_guc_value(conflines, "dynamic_shared_memory_type",
 								  dynamic_shared_memory_type, false);

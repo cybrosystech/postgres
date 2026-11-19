@@ -1627,6 +1627,8 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
       For a table whose entries are never updated, complete packing is the
       best choice, but in heavily updated tables smaller fillfactors are
       appropriate.  This parameter cannot be set for TOAST tables.
+      When it is not given, a fillfactor can still be applied by table
+      name; see <xref linkend="guc-dbblue-fillfactor-map"/>.
      </para>
     </listitem>
    </varlistentry>

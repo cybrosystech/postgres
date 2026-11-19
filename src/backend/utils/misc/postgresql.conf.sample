@@ -846,8 +846,10 @@
 
 # - Statement Behavior -
 
-#dbblue_fillfactor_map = ''             # fillfactor per model or table, e.g.
+#dbblue_fillfactor_map = ''             # fillfactor for new tables, by name:
+                                        # 'name:NN, ...', NN 10-100, e.g.
                                         # 'res.partner:70, stock.move:75'
+                                        # ('.' matches '_', case-insensitive)
 #client_min_messages = notice           # values in order of decreasing detail:
                                         #   debug5
                                         #   debug4
@@ -925,7 +927,7 @@
 
 #local_preload_libraries = ''
 #session_preload_libraries = ''
-shared_preload_libraries = 'pg_stat_statements,hypopg'  # (change requires restart)
+#shared_preload_libraries = ''         # (change requires restart)
 #jit_provider = 'llvmjit'               # JIT library to use
 
 # - Other Defaults -

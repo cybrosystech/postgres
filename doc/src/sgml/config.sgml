@@ -10590,6 +10590,66 @@ COPY postgres_log FROM '/full/path/to/logfile.csv' WITH csv;
       </listitem>
      </varlistentry>
 
+     <varlistentry id="guc-dbblue-fillfactor-map" xreflabel="dbblue_fillfactor_map">
+      <term><varname>dbblue_fillfactor_map</varname> (<type>string</type>)
+      <indexterm>
+       <primary><varname>dbblue_fillfactor_map</varname> configuration parameter</primary>
+      </indexterm>
+      <indexterm>
+       <primary>fillfactor</primary>
+       <secondary>default per table name</secondary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Gives tables a <xref linkend="reloption-fillfactor"/> by name when
+        they are created, so that heavily updated tables get free space for
+        <link linkend="storage-hot">heap-only tuple updates</link> without
+        each <command>CREATE TABLE</command> having to say so.  The value is
+        a comma-separated list of
+        <replaceable>name</replaceable><literal>:</literal><replaceable>fillfactor</replaceable>
+        entries, for example:
+<programlisting>
+dbblue_fillfactor_map = 'res.partner:70, stock.move:75, account.move.line:80'
+</programlisting>
+        The default is an empty string, which disables the feature.  Any
+        user can change this setting.
+       </para>
+
+       <para>
+        Each <replaceable>fillfactor</replaceable> must be an integer from
+        10 to 100.  Whitespace around names, numbers and commas is ignored,
+        and if a name appears more than once the last entry wins.  A
+        malformed value (a missing <literal>:</literal>, an empty name, a
+        name longer than 127 characters, or a fillfactor that is not a
+        number or is out of range) is rejected when it is set, and the
+        error says which entry is wrong.
+       </para>
+
+       <para>
+        A <replaceable>name</replaceable> is matched against the unqualified
+        name of the table being created, ignoring case, with every dot
+        treated as an underscore.  So <literal>res.partner</literal> (a model
+        name) matches a table named <literal>res_partner</literal>, in any
+        schema.  Names cannot be schema-qualified: an entry
+        <literal>public.orders</literal> matches a table named
+        <literal>public_orders</literal>, not <literal>orders</literal> in
+        schema <literal>public</literal>.
+       </para>
+
+       <para>
+        The map applies to ordinary tables only, including partitions and
+        tables created by <command>CREATE TABLE AS</command>; it does not
+        apply to partitioned tables or materialized views.  A
+        <literal>fillfactor</literal> given explicitly in
+        <literal>WITH (...)</literal> takes precedence.  The fillfactor is
+        stored with the table when it is created, so changing this setting
+        afterwards does not affect existing tables; use
+        <command>ALTER TABLE ... SET (fillfactor = ...)</command> for those.
+       </para>
+      </listitem>
+     </varlistentry>
+
      <varlistentry id="guc-temp-tablespaces" xreflabel="temp_tablespaces">
       <term><varname>temp_tablespaces</varname> (<type>string</type>)
       <indexterm>
