@@ -44,8 +44,14 @@
 #include "storage/smgr.h"
 #include "utils/rel.h"
 
-/* GUC */
-int			dbblue_bulk_write_maxpages = 128;
+/*
+ * GUC.  The default, 32, is upstream's fixed MAX_PENDING_WRITES, so a bulk
+ * write that doesn't change it -- CREATE INDEX, VACUUM FULL, CLUSTER, REPACK
+ * -- behaves exactly as in upstream.  A larger value saves little: a flush
+ * still WAL-logs at most XLR_MAX_BLOCK_ID (32) pages per record and writes
+ * the pages one at a time, and timings at 128 were within noise of 32.
+ */
+int			dbblue_bulk_write_maxpages = 32;
 
 static const PGIOAlignedBlock zero_buffer = {0};	/* worth BLCKSZ */
 

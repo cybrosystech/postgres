@@ -216,7 +216,7 @@
 #dbblue_index_bulk_extend_size = 0     # measured in pages, 0 disables
                                         # (upstream behaviour), -1 sizes it
                                         # from shared_buffers
-#dbblue_bulk_write_maxpages = 128       # pages buffered before each flush
+#dbblue_bulk_write_maxpages = 32        # pages buffered before each flush
                                         # during bulk writes (1-512)
 #dbblue_enable_tableam_multi_insert = off  # batch the initial insert of
                                         # CREATE TABLE AS and (REFRESH)

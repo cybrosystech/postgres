@@ -923,7 +923,7 @@
   short_desc => 'Sets the maximum number of pages to buffer in backend-local memory before flushing during dbblue bulk relation writes.',
   flags => 'GUC_UNIT_BLOCKS',
   variable => 'dbblue_bulk_write_maxpages',
-  boot_val => '128',
+  boot_val => '32',
   min => '1',
   max => '512',
 },
