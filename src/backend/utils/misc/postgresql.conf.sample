@@ -216,6 +216,11 @@
 #dbblue_index_bulk_extend_size = 0     # measured in pages, 0 disables
                                         # (upstream behaviour), -1 sizes it
                                         # from shared_buffers
+#dbblue_bulk_write_maxpages = 128       # pages buffered before each flush
+                                        # during bulk writes (1-512)
+#dbblue_enable_tableam_multi_insert = off  # batch the initial insert of
+                                        # CREATE TABLE AS and (REFRESH)
+                                        # MATERIALIZED VIEW
 #effective_io_concurrency = 16          # 1-1000; 0 disables issuing multiple simultaneous IO requests
 #maintenance_io_concurrency = 16        # 1-1000; same as effective_io_concurrency
 #io_max_combine_limit = 128kB           # usually 1-128 blocks (depends on OS)
@@ -242,6 +247,10 @@
 #max_parallel_workers = 8               # number of max_worker_processes that
                                         # can be used in parallel operations
 #parallel_leader_participation = on
+#dbblue_create_brin = off               # create BRIN indexes on create_date
+                                        # columns automatically, per database
+#dbblue_brin_database = ''              # obsolete; dbblue_create_brin is
+                                        # set per database instead
 
 
 #------------------------------------------------------------------------------
@@ -386,6 +395,9 @@
                                 # from standby(s); '*' = all
 #synchronized_standby_slots = ''        # streaming replication standby server slot
                                 # names that logical walsender processes will wait for
+#dbblue_standby_max_lag = 64MB          # how far the dbblue_create_standby
+                                        # standby may fall behind and still
+                                        # accept connections; 0 disables
 
 # - Standby Servers -
 
@@ -433,8 +445,16 @@
 
 # - Planner Method Configuration -
 
-#dbblue_enable_groupjoin = off		# dbblue: fuse a hash join with the
-					# GROUP BY above it (opt-in per session)
+#dbblue_enable_groupjoin = off          # dbblue: fuse a hash join with the
+                                        # GROUP BY above it (opt-in per session)
+#dbblue_count_cache = off               # session-local COUNT(*) result cache;
+                                        # needs dbblue_track_relation_writes
+#dbblue_count_cache_ttl = 300s          # lifetime of COUNT cache entries
+#dbblue_offset_flip = off               # OFFSET-flip planner rewrite;
+                                        # needs dbblue_count_cache
+#dbblue_track_relation_writes = off     # per-relation write stamps for the
+                                        # COUNT cache
+                                        # (change requires restart)
 #enable_async_append = on
 #enable_bitmapscan = on
 #enable_gathermerge = on
@@ -692,6 +712,16 @@
                                         # than the specified size in kilobytes;
                                         # -1 disables, 0 logs all temp files
 #log_timezone = 'GMT'
+#dbblue_audit_enabled = on              # dedicated audit log; does nothing
+                                        # until dbblue_audit_tables is set
+#dbblue_audit_tables = ''               # comma-separated tables to audit
+#dbblue_audit_database = ''             # comma-separated databases; '' = all
+#dbblue_audit_operations = 'update,delete'  # which DML operations to record
+#dbblue_audit_exclude_columns = ''      # comma-separated columns to redact
+#dbblue_audit_changed_columns_only = off  # record only the columns an
+                                        # UPDATE changed
+#dbblue_audit_retention = '0'           # how much history to keep; 0 keeps all
+#dbblue_audit_prune_naptime = 1min      # how often expired rows are pruned
 
 # - Process Title -
 
@@ -723,6 +753,21 @@
 #log_parser_stats = off
 #log_planner_stats = off
 #log_executor_stats = off
+#dbblue_wait_sampling_enabled = off     # run the dbblue wait sampling collector
+#dbblue_wait_sampling_database = 'postgres'  # where samples are stored
+                                        # (change requires restart)
+#dbblue_wait_sampling_period = 10ms     # how often wait events are sampled
+#dbblue_wait_sampling_profile_period = 1s  # how often profile snapshots
+                                        # are flushed
+#dbblue_wait_sampling_flush_interval = 2s  # how often buffered history rows
+                                        # are written to disk
+#dbblue_wait_sampling_history_retention = 7d  # how long history and
+                                        # profile rows are kept
+#dbblue_wait_sampling_profile_pid = on  # group profile snapshots per pid
+#dbblue_wait_sampling_profile_queries = top  # none or top: tag rows with
+                                        # the query id
+#dbblue_wait_sampling_sample_cpu = on   # also sample backends that are not
+                                        # waiting on anything
 
 
 #------------------------------------------------------------------------------
@@ -797,6 +842,8 @@
 
 # - Statement Behavior -
 
+#dbblue_fillfactor_map = ''             # fillfactor per model or table, e.g.
+                                        # 'res.partner:70, stock.move:75'
 #client_min_messages = notice           # values in order of decreasing detail:
                                         #   debug5
                                         #   debug4
@@ -874,7 +921,7 @@
 
 #local_preload_libraries = ''
 #session_preload_libraries = ''
-shared_preload_libraries = 'pg_stat_statements,hypopg'	# (change requires restart)
+shared_preload_libraries = 'pg_stat_statements,hypopg'  # (change requires restart)
 #jit_provider = 'llvmjit'               # JIT library to use
 
 # - Other Defaults -
