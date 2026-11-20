@@ -70,7 +70,6 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/timeout.h"
-#include "utils/dbblue_fillfactor.h"
 
 /* has this backend called EmitConnectionWarnings()? */
 static bool ConnectionWarningsEmitted;
@@ -1264,10 +1263,9 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	EmitConnectionWarnings();
 
 	/*
-	 * The dbblue fillfactor map is built lazily on first use
-	 * (dbblue_fillfactor_lookup) and by the GUC assign hook, so there is no
-	 * need to parse it again here -- doing so re-parsed the map on every
-	 * connection.
+	 * The dbblue fillfactor map needs no per-connection setup: its GUC check
+	 * hook parses it whenever the value is set, and the assign hook installs
+	 * the result.
 	 */
 }
 
