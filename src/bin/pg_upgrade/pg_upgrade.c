@@ -638,12 +638,13 @@ create_new_objects(void)
 		 */
 		create_opts = "--clean --create";
 
+		/* --jobs=1: see the comment in the per-database loop below */
 		exec_prog(log_file_name,
 				  NULL,
 				  true,
 				  true,
 				  "\"%s/pg_restore\" %s %s --exit-on-error --verbose "
-				  "--transaction-size=%d "
+				  "--jobs=1 --transaction-size=%d "
 				  "--dbname postgres \"%s/%s\"",
 				  new_cluster.bindir,
 				  cluster_conn_opts(&new_cluster),
@@ -694,10 +695,19 @@ create_new_objects(void)
 			txn_size = Max(txn_size, 10);
 		}
 
+		/*
+		 * Pass --jobs=1 explicitly.  DBblue's pg_restore picks a degree of
+		 * parallelism from the CPU count (up to 8 workers) when --jobs is not
+		 * given, so each restore would open up to 9 connections.  Our own
+		 * --jobs already runs one restore per database concurrently, and that
+		 * multiplication exhausted max_connections ("sorry, too many clients
+		 * already") at modest -j values.  It would also defeat the lock
+		 * budgeting above, which assumes one connection per restore job.
+		 */
 		parallel_exec_prog(log_file_name,
 						   NULL,
 						   "\"%s/pg_restore\" %s %s --exit-on-error --verbose "
-						   "--transaction-size=%d "
+						   "--jobs=1 --transaction-size=%d "
 						   "--dbname template1 \"%s/%s\"",
 						   new_cluster.bindir,
 						   cluster_conn_opts(&new_cluster),
