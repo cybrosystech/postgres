@@ -12,6 +12,7 @@
 EXTRA_INSTALL=contrib/amcheck \
 	contrib/pg_prewarm \
 	contrib/pg_stat_statements \
+	contrib/pg_visibility \
 	contrib/test_decoding \
 	src/test/modules/injection_points \
 	src/test/modules/test_wait_lsn
