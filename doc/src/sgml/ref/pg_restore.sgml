@@ -279,6 +279,73 @@ PostgreSQL documentation
        </para>
 
        <para>
+        If this option is not given, <productname>DBblue</productname>'s
+        <application>pg_restore</application> chooses the number of jobs
+        itself, unlike <productname>PostgreSQL</productname>, which restores
+        with a single job.  It uses the number of CPUs on the machine running
+        <application>pg_restore</application>, but at most 8, and reports the
+        choice on standard error, for example:
+<screen>
+pg_restore: restoring with 8 parallel jobs; use -j/--jobs to choose a different number
+</screen>
+        It uses a single job instead, without that message, whenever parallel
+        restore would fail or be unsafe:
+        <itemizedlist>
+         <listitem>
+          <para>
+           the output is a script rather than a database connection (no
+           <option>-d</option>), or <option>-l</option>/<option>--list</option>
+           is given;
+          </para>
+         </listitem>
+         <listitem>
+          <para>
+           the archive is in tar format;
+          </para>
+         </listitem>
+         <listitem>
+          <para>
+           the input is not a regular file or directory: standard input
+           (<literal>pg_restore -d db &lt; file.dump</literal>), a pipe
+           (<literal>zcat file.dump.gz | pg_restore -d db</literal>), or a
+           named pipe or device;
+          </para>
+         </listitem>
+         <listitem>
+          <para>
+           <option>--single-transaction</option> is given;
+          </para>
+         </listitem>
+         <listitem>
+          <para>
+           the restore loads data into tables it does not create: an archive
+           made with <application>pg_dump</application>
+           <option>-a</option>/<option>--data-only</option>, or
+           <application>pg_restore</application>
+           <option>-a</option>, <option>--section=data</option>, or an
+           <option>-L</option> list that leaves out the table definitions.
+           Those tables' foreign keys already exist, and only restoring in
+           archive order, with referenced tables first, keeps the foreign-key
+           checks from failing;
+          </para>
+         </listitem>
+         <listitem>
+          <para>
+           the number of CPUs cannot be determined, or is 1.
+          </para>
+         </listitem>
+        </itemizedlist>
+        An explicit value is always used as given, including
+        <option>-j 1</option>, which restores
+        <productname>PostgreSQL</productname>'s behavior.  Because each job
+        opens its own connection, the automatic choice can use up to 9
+        connections per <application>pg_restore</application> run (8 jobs
+        plus the leader); specify a smaller value when the server's
+        <xref linkend="guc-max-connections"/> is low or when several
+        restores run at the same time.
+       </para>
+
+       <para>
         Each job is one process or one thread, depending on the
         operating system, and uses a separate connection to the
         server.
@@ -1136,6 +1203,10 @@ CREATE DATABASE foo WITH TEMPLATE template0;
       or <option>--section</option> without <option>pre-data</option> when
       creating an archive you wish to restore in parallel.  Instead, you
       may provide such options to <application>pg_restore</application>.
+      When <option>--jobs</option> is not given,
+      <application>pg_restore</application> restores such data-only
+      archives, and data-only restores into existing tables, with a single
+      job; see <option>--jobs</option>.
      </para>
     </listitem>
 
