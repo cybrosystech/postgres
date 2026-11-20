@@ -41,6 +41,7 @@
 #include "postgres_fe.h"
 
 #include <ctype.h>
+#include <sys/stat.h>
 #ifdef HAVE_TERMIOS_H
 #include <termios.h>
 #endif
@@ -63,6 +64,7 @@
 static void usage(const char *progname);
 static void read_restore_filters(const char *filename, RestoreOptions *opts);
 static int	default_restore_jobs(void);
+static bool input_can_be_reopened(const char *inputFileSpec);
 
 int
 main(int argc, char **argv)
@@ -521,12 +523,16 @@ main(int argc, char **argv)
 	 * worker where parallel restore actually works: it needs an archive
 	 * format whose workers can reopen the input independently (custom and
 	 * directory can; tar and plain text cannot), a connection to a database
-	 * rather than a script on our output, and no --single-transaction.
+	 * rather than a script on our output, and no --single-transaction.  The
+	 * input itself must be reopenable too: each worker reopens the archive
+	 * by name and seeks to its own data, which standard input (a "<"
+	 * redirect, or a pipe such as "zcat x | pg_restore") and FIFOs cannot do.
 	 *
 	 * Getting that wrong is not merely a slow restore: RestoreArchive()
-	 * rejects a parallel request the format cannot serve with a fatal error,
-	 * so defaulting to more than one worker unconditionally would break
-	 * plain "pg_restore -d db backup.tar" on every multi-core host.
+	 * rejects a parallel request the format or input cannot serve with a
+	 * fatal error, so defaulting to more than one worker unconditionally
+	 * would break plain "pg_restore -d db backup.tar" and
+	 * "pg_restore -d db < backup.dump" on every multi-core host.
 	 *
 	 * An explicit -j is always obeyed, including "-j 1".
 	 */
@@ -535,7 +541,8 @@ main(int argc, char **argv)
 		ArchiveHandle *AHX = (ArchiveHandle *) AH;
 
 		if (opts->useDB && !opts->single_txn &&
-			AHX->ClonePtr != NULL && AHX->ReopenPtr != NULL)
+			AHX->ClonePtr != NULL && AHX->ReopenPtr != NULL &&
+			input_can_be_reopened(inputFileSpec))
 			numWorkers = default_restore_jobs();
 		else
 			numWorkers = 1;
@@ -571,6 +578,30 @@ main(int argc, char **argv)
 	CloseArchive(AH);
 
 	return exit_code;
+}
+
+/*
+ * input_can_be_reopened
+ *		Can parallel restore workers reopen this input by name and seek in it?
+ *
+ * Only a named regular file (custom format) or directory (directory format)
+ * qualifies.  No file name means we read standard input, whether that is a
+ * "<" redirect or a pipe; the shell hides which, and neither can be reopened.
+ * A named FIFO or character device (e.g. /dev/stdin) cannot be reread either.
+ * If stat() fails, say no and let opening the archive report the problem.
+ */
+static bool
+input_can_be_reopened(const char *inputFileSpec)
+{
+	struct stat st;
+
+	if (inputFileSpec == NULL || inputFileSpec[0] == '\0')
+		return false;
+
+	if (stat(inputFileSpec, &st) != 0)
+		return false;
+
+	return S_ISREG(st.st_mode) || S_ISDIR(st.st_mode);
 }
 
 /*
