@@ -65,6 +65,7 @@ static void usage(const char *progname);
 static void read_restore_filters(const char *filename, RestoreOptions *opts);
 static int	default_restore_jobs(void);
 static bool input_can_be_reopened(const char *inputFileSpec);
+static bool restore_loads_into_existing_tables(ArchiveHandle *AH);
 
 int
 main(int argc, char **argv)
@@ -519,6 +520,13 @@ main(int argc, char **argv)
 		SortTocFromFile(AH);
 
 	/*
+	 * Decide which TOC entries will be restored.  This must happen before
+	 * choosing a default degree of parallelism below, which looks at them.
+	 */
+	if (!opts->tocSummary)
+		ProcessArchiveRestoreOptions(AH);
+
+	/*
 	 * Choose a degree of parallelism if the user did not.  Only go above one
 	 * worker where parallel restore actually works: it needs an archive
 	 * format whose workers can reopen the input independently (custom and
@@ -534,15 +542,23 @@ main(int argc, char **argv)
 	 * would break plain "pg_restore -d db backup.tar" and
 	 * "pg_restore -d db < backup.dump" on every multi-core host.
 	 *
+	 * Nor may we load data in parallel into tables this restore does not
+	 * create (a "pg_dump -a" archive, or pg_restore -a / --section=data / -L
+	 * keeping only data): those tables' foreign keys already exist, and only
+	 * the archive's order (referenced tables first) keeps the loads valid.
+	 * Parallel workers ignore that order, so a small referencing table can
+	 * finish before its referenced table commits and fail its FK check.
+	 *
 	 * An explicit -j is always obeyed, including "-j 1".
 	 */
 	if (numWorkers == 0)
 	{
 		ArchiveHandle *AHX = (ArchiveHandle *) AH;
 
-		if (opts->useDB && !opts->single_txn &&
+		if (opts->useDB && !opts->single_txn && !opts->tocSummary &&
 			AHX->ClonePtr != NULL && AHX->ReopenPtr != NULL &&
-			input_can_be_reopened(inputFileSpec))
+			input_can_be_reopened(inputFileSpec) &&
+			!restore_loads_into_existing_tables(AHX))
 			numWorkers = default_restore_jobs();
 		else
 			numWorkers = 1;
@@ -563,10 +579,7 @@ main(int argc, char **argv)
 	if (opts->tocSummary)
 		PrintTOCSummary(AH);
 	else
-	{
-		ProcessArchiveRestoreOptions(AH);
 		RestoreArchive(AH);
-	}
 
 	/* done, print a summary of ignored errors */
 	if (AH->n_errors)
@@ -602,6 +615,39 @@ input_can_be_reopened(const char *inputFileSpec)
 		return false;
 
 	return S_ISREG(st.st_mode) || S_ISDIR(st.st_mode);
+}
+
+/*
+ * restore_loads_into_existing_tables
+ *		Will this restore load data into a table it does not also create?
+ *
+ * Must be called after ProcessArchiveRestoreOptions() has set te->reqs.
+ * A TABLE DATA entry's first dependency is its own TABLE entry (pg_dump
+ * records it that way on purpose).  If that entry is absent -- a "pg_dump -a"
+ * archive has none -- or will not have its schema restored (pg_restore -a,
+ * --section=data, an -L list without it), the data goes into a table that
+ * already exists in the target, foreign keys included.
+ */
+static bool
+restore_loads_into_existing_tables(ArchiveHandle *AH)
+{
+	TocEntry   *te;
+
+	for (te = AH->toc->next; te != AH->toc; te = te->next)
+	{
+		TocEntry   *tablete;
+
+		if ((te->reqs & REQ_DATA) == 0 || strcmp(te->desc, "TABLE DATA") != 0)
+			continue;
+
+		tablete = (te->nDeps > 0) ?
+			getTocEntryByDumpId(AH, te->dependencies[0]) : NULL;
+
+		if (tablete == NULL || (tablete->reqs & REQ_SCHEMA) == 0)
+			return true;
+	}
+
+	return false;
 }
 
 /*
