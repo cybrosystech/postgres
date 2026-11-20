@@ -282,9 +282,15 @@ PostgreSQL documentation
         If this option is not given, <productname>DBblue</productname>'s
         <application>pg_restore</application> chooses the number of jobs
         itself, unlike <productname>PostgreSQL</productname>, which restores
-        with a single job.  It uses the number of CPUs on the machine running
-        <application>pg_restore</application>, but at most 8, and reports the
-        choice on standard error, for example:
+        with a single job.  It uses the number of CPUs
+        <application>pg_restore</application> may use, but at most 8: the
+        machine's online CPUs, lowered by a CPU affinity mask
+        (<command>taskset</command>, <literal>docker run --cpuset-cpus</literal>)
+        and by a cgroup CPU quota (<literal>docker run --cpus</literal>,
+        Kubernetes CPU limits).  These are the CPUs of the machine running
+        <application>pg_restore</application>, not of the database server;
+        when restoring to a remote server, choose <option>-j</option> to suit
+        that server.  The choice is reported on standard error, for example:
 <screen>
 pg_restore: restoring with 8 parallel jobs; use -j/--jobs to choose a different number
 </screen>

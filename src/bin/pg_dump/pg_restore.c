@@ -48,6 +48,7 @@
 
 #include "dumputils.h"
 #include "fe_utils/option_utils.h"
+#include "fe_utils/sysinfo.h"
 #include "filter.h"
 #include "getopt_long.h"
 #include "parallel.h"
@@ -654,25 +655,28 @@ restore_loads_into_existing_tables(ArchiveHandle *AH)
  * default_restore_jobs
  *		How many parallel jobs to use when -j was not given.
  *
+ * Counts the CPUs this process may actually use, not the host's: the online
+ * count, lowered by a CPU affinity mask (taskset, "docker run --cpuset-cpus")
+ * and by a cgroup CPU quota ("docker run --cpus", Kubernetes CPU limits).  A
+ * container sees every host CPU as online, so without this a --cpus=1
+ * container would still start 8 jobs and open 9 connections.
+ *
  * Returns 1 when the CPU count cannot be determined, which keeps the
  * upstream default on any platform this does not know how to ask.
  */
 static int
 default_restore_jobs(void)
 {
-	int			ncpus = 0;
+	int			ncpus = get_online_cpus();
+	int			limit;
 
-#ifdef WIN32
-	SYSTEM_INFO si;
+	limit = get_affinity_cpus();
+	if (limit > 0 && (ncpus == 0 || limit < ncpus))
+		ncpus = limit;
 
-	GetSystemInfo(&si);
-	ncpus = (int) si.dwNumberOfProcessors;
-#elif defined(_SC_NPROCESSORS_ONLN)
-	long		n = sysconf(_SC_NPROCESSORS_ONLN);
-
-	if (n > 0)
-		ncpus = (int) n;
-#endif
+	limit = get_cgroup_cpu_limit();
+	if (limit > 0 && (ncpus == 0 || limit < ncpus))
+		ncpus = limit;
 
 	if (ncpus <= 1)
 		return 1;
