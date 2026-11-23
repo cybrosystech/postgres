@@ -10682,6 +10682,172 @@ dbblue_fillfactor_map = 'res.partner:70, stock.move:75, account.move.line:80'
       </listitem>
      </varlistentry>
 
+     <varlistentry id="guc-dbblue-safe-mode" xreflabel="dbblue_safe_mode">
+      <term><varname>dbblue_safe_mode</varname> (<type>boolean</type>)
+      <indexterm>
+       <primary><varname>dbblue_safe_mode</varname> configuration parameter</primary>
+      </indexterm>
+      <indexterm>
+       <primary>safe mode</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Refuses statements that would change every row of a table: an
+        <command>UPDATE</command> or <command>DELETE</command> without a
+        <literal>WHERE</literal> clause that restricts it, a
+        <command>MERGE</command> action that updates or deletes without a
+        restricting condition, and <command>TRUNCATE</command>.  It guards
+        against mistakes such as running a statement whose
+        <literal>WHERE</literal> clause was forgotten or lost; it is not a
+        security boundary, since a determined user can still write a
+        restriction that matches every row (see below).  The default is
+        <literal>off</literal>.
+       </para>
+
+       <para>
+        Only superusers can change this setting, so a session cannot turn it
+        off for itself, not even through a function's <literal>SET</literal>
+        clause.  It is meant to be enabled per role, for the people and tools
+        that run statements by hand:
+<programlisting>
+ALTER ROLE analyst SET dbblue_safe_mode = on;
+</programlisting>
+        A refused statement fails with SQLSTATE <literal>23001</literal>
+        (<literal>restrict_violation</literal>), for example:
+<screen>
+ERROR:  DELETE requires a WHERE clause because dbblue_safe_mode is enabled
+DETAIL:  Safe mode refuses statements that would change every row of a table.
+HINT:  Add a WHERE clause selecting the rows to change, or ask a superuser to turn dbblue_safe_mode off.
+</screen>
+       </para>
+
+       <para>
+        When it is on, the following are refused:
+        <itemizedlist>
+         <listitem>
+          <para>
+           <command>UPDATE</command> and <command>DELETE</command> with no
+           <literal>WHERE</literal> clause.
+          </para>
+         </listitem>
+         <listitem>
+          <para>
+           <command>UPDATE</command> and <command>DELETE</command> whose
+           <literal>WHERE</literal> clause reduces to a constant true, such as
+           <literal>WHERE true</literal>, <literal>WHERE 1 = 1</literal> or
+           <literal>WHERE 1 = 1 OR id = 5</literal>.
+          </para>
+         </listitem>
+         <listitem>
+          <para>
+           <command>UPDATE</command> and <command>DELETE</command> whose
+           <literal>WHERE</literal> clause does not refer to any column of the
+           table being changed, such as <literal>WHERE false</literal>,
+           <literal>WHERE now() &lt; '2000-01-01'</literal>, or an
+           <literal>UPDATE ... FROM</literal> whose <literal>WHERE</literal>
+           clause mentions only the other table.  Such a clause selects either
+           every row of the table or none.
+          </para>
+         </listitem>
+         <listitem>
+          <para>
+           A <command>MERGE</command> action that updates or deletes, in a
+           <literal>WHEN MATCHED</literal> or <literal>WHEN NOT MATCHED BY
+           SOURCE</literal> clause, when its <literal>ON</literal> condition
+           together with its own <literal>WHEN</literal> condition reduces to a
+           constant true, for example <literal>ON true</literal> with
+           <literal>WHEN MATCHED THEN UPDATE</literal>, or <literal>ON
+           false</literal> with <literal>WHEN NOT MATCHED BY SOURCE THEN
+           DELETE</literal>.  Actions that only insert are not affected.
+          </para>
+         </listitem>
+         <listitem>
+          <para>
+           <command>TRUNCATE</command>, always, including on temporary tables.
+           Use <command>DELETE</command> with a <literal>WHERE</literal>
+           clause instead.
+          </para>
+         </listitem>
+        </itemizedlist>
+       </para>
+
+       <para>
+        The check applies wherever such a statement appears: on its own, in a
+        <literal>WITH</literal> query
+        (<literal>WITH d AS (DELETE FROM t RETURNING *) ...</literal>), under
+        <command>EXPLAIN</command> with or without <literal>ANALYZE</literal>,
+        and in <command>PREPARE</command>.  A statement in a
+        <application>PL/pgSQL</application> function is checked when it runs,
+        so the function can be created but fails when called.  The body of a
+        SQL-language function (including a <literal>BEGIN ATOMIC</literal>
+        body, and when <xref linkend="guc-check-function-bodies"/> is on) and
+        of a rule is checked when it is created, so the
+        <command>CREATE FUNCTION</command> or <command>CREATE RULE</command>
+        itself is refused.  A statement that a rule rewrites into another one
+        is checked again after rewriting.
+       </para>
+
+       <para>
+        A <literal>WHERE</literal> clause that refers to the table's columns is
+        accepted, as in <literal>UPDATE t SET ... FROM s WHERE t.id =
+        s.id</literal>, and so is any <literal>WHERE</literal> clause containing
+        a subquery, whose result cannot be judged in advance.  So these are not
+        detected:
+        <itemizedlist>
+         <listitem>
+          <para>
+           a restriction that matches every row without reducing to a
+           constant, such as <literal>WHERE (SELECT 1) = 1</literal> or
+           <literal>WHERE id IS NOT NULL</literal> on a column that is never
+           null;
+          </para>
+         </listitem>
+         <listitem>
+          <para>
+           a statement prepared, or a plan cached (for example in a
+           <application>PL/pgSQL</application> function), in a session before
+           safe mode was turned on there: <command>EXECUTE</command> of such a
+           statement still runs.
+          </para>
+         </listitem>
+        </itemizedlist>
+       </para>
+
+       <para>
+        Do not enable it for the role that <productname>Odoo</productname>
+        connects as, nor for the role used to restore databases:
+        <itemizedlist>
+         <listitem>
+          <para>
+           <productname>Odoo</productname> runs statements that change every
+           row on purpose, for example when it neutralizes a duplicated or
+           restored database and in some scheduled actions, and those then
+           fail.
+          </para>
+         </listitem>
+         <listitem>
+          <para>
+           A parallel <application>pg_restore</application>, which
+           <productname>DBblue</productname>'s
+           <application>pg_restore</application> uses by default, issues
+           <command>TRUNCATE</command> on each table it has just created before
+           loading it, so those loads fail.  Restore with
+           <option>-j 1</option>, or as a role without safe mode.
+          </para>
+         </listitem>
+         <listitem>
+          <para>
+           Restoring a dump fails on any SQL-language function or rule whose
+           body updates or deletes without a restricting
+           <literal>WHERE</literal> clause.
+          </para>
+         </listitem>
+        </itemizedlist>
+       </para>
+      </listitem>
+     </varlistentry>
+
      <varlistentry id="guc-temp-tablespaces" xreflabel="temp_tablespaces">
       <term><varname>temp_tablespaces</varname> (<type>string</type>)
       <indexterm>
