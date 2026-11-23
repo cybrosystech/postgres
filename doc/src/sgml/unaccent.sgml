@@ -246,8 +246,14 @@ unaccent_refresh(<optional><replaceable class="parameter">new_rules</replaceable
   name of a <filename>.rules</filename> file as for
   <command>ALTER TEXT SEARCH DICTIONARY</command>.  It then rebuilds, with
   <command>REINDEX</command>, every index whose definition uses a function named
-  <function>unaccent</function>, whatever its access method.  With
-  <replaceable>dry_run</replaceable> it only reports what it would do.  Everything
+  <function>unaccent</function>, whatever its access method.  The
+  <replaceable>dict</replaceable> argument limits only the dictionary reload;
+  the index rebuild always covers every such index, because
+  <function>unaccent(text)</function> chooses its dictionary implicitly and an
+  index cannot reliably be tied to one dictionary.  With
+  <replaceable>dry_run</replaceable> it only reports what it would do; the
+  dictionary reload is tried and undone, so a missing rules file is reported
+  as <literal>would fail</literal>.  Everything
   runs in one transaction, so a failure changes nothing.
  </para>
 
@@ -286,8 +292,13 @@ unaccent_refresh(<optional><replaceable class="parameter">new_rules</replaceable
   The indexes are rebuilt without <literal>CONCURRENTLY</literal>, so writes to
   the tables are blocked meanwhile; for large busy tables reload the dictionary
   and run <command>REINDEX INDEX CONCURRENTLY</command> by hand.  Data stored
-  from <function>unaccent()</function>, such as generated columns or
-  materialized view contents, is not refreshed.
+  from <function>unaccent()</function> is not refreshed.  Stored generated
+  columns that use <function>unaccent()</function> are listed in the result
+  (step <literal>column</literal>), because rewriting them rewrites the whole
+  table; to refresh one, run <literal>ALTER TABLE ... ALTER COLUMN ... SET
+  EXPRESSION AS (...)</literal> with the same expression.  Materialized view
+  contents are not covered and must be refreshed with
+  <command>REFRESH MATERIALIZED VIEW</command>.
  </para>
 
 <programlisting>

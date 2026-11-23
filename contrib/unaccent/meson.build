@@ -37,6 +37,7 @@ tests += {
   'regress': {
     'sql': [
       'unaccent',
+      'unaccent_refresh',
     ],
   },
 }

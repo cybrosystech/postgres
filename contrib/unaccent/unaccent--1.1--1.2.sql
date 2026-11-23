@@ -19,8 +19,12 @@ ALTER FUNCTION unaccent(text) IMMUTABLE COST 100;
 --      of a .rules file in tsearch_data, as in ALTER TEXT SEARCH DICTIONARY),
 --   2. rebuilds every index whose definition uses a function named unaccent,
 --      whatever its access method (btree, gin, gist, cobalt, ...).
--- With dry_run it only reports what it would do.  dict restricts step 1 to one
--- dictionary.  Everything runs in one transaction: if any step fails, nothing
+-- With dry_run it only reports what it would do (the dictionary reload is
+-- tried and undone, so a missing rules file shows up as 'would fail').  dict
+-- restricts step 1 to one dictionary; step 2 always covers every index that
+-- uses unaccent(), because unaccent(text) picks its dictionary implicitly and
+-- an index cannot reliably be tied to one dictionary.  Everything runs in one
+-- transaction: if any step fails, nothing
 -- is changed.  REINDEX blocks writes to the tables meanwhile; for very large or
 -- busy tables, run the dictionary reload and REINDEX CONCURRENTLY by hand.
 -- Other sessions pick up the new rules the next time they use the dictionary,
@@ -45,8 +49,10 @@ ALTER FUNCTION unaccent(text) IMMUTABLE COST 100;
 -- a non-owner can run this from a fresh connection; an owner or superuser must
 -- reload the dictionary for sessions that are already open.  Switching to
 -- new_rules needs ownership and fails if the caller is not the owner.
--- Not covered: stored data derived from unaccent() (generated columns,
--- materialized view contents), which must be refreshed separately.
+-- Stored generated columns that use unaccent() are listed (step 'column') but
+-- not rewritten, as that rewrites the whole table; the ALTER TABLE command to
+-- do it is in the detail.  Not covered: materialized view contents, which must
+-- be refreshed separately.
 CREATE FUNCTION unaccent_refresh(
 	new_rules text DEFAULT NULL,
 	dry_run boolean DEFAULT false,
@@ -58,6 +64,7 @@ AS $$
 DECLARE
 	d record;
 	i record;
+	g record;
 	rules text;
 BEGIN
 	FOR d IN
@@ -89,7 +96,18 @@ BEGIN
 				detail := 'skipped: not owner; new sessions already read the current rules file';
 			END IF;
 		ELSIF dry_run THEN
-			detail := format('would reload rules ''%s''', rules);
+			-- Really try the reload, then undo it, so that a missing or broken
+			-- rules file is reported now and not by the real run.
+			BEGIN
+				EXECUTE format('ALTER TEXT SEARCH DICTIONARY %I.%I (RULES = %L)',
+							   d.nspname, d.dictname, rules);
+				RAISE EXCEPTION 'dry run' USING ERRCODE = 'U0001';
+			EXCEPTION
+				WHEN SQLSTATE 'U0001' THEN
+					detail := format('would reload rules ''%s''', rules);
+				WHEN OTHERS THEN
+					detail := format('would fail: %s', SQLERRM);
+			END;
 		ELSE
 			EXECUTE format('ALTER TEXT SEARCH DICTIONARY %I.%I (RULES = %L)',
 						   d.nspname, d.dictname, rules);
@@ -129,6 +147,29 @@ BEGIN
 			EXECUTE format('REINDEX INDEX %I.%I', i.nspname, i.relname);
 			detail := format('reindexed (%s)', i.amname);
 		END IF;
+		RETURN NEXT;
+	END LOOP;
+
+	-- Stored generated columns keep the values computed with the old rules.
+	-- Rewriting them rewrites the whole table, so only list them.
+	FOR g IN
+		SELECT DISTINCT n.nspname, c.relname, a.attname
+		FROM pg_depend dep
+		JOIN pg_proc p ON p.oid = dep.refobjid
+		JOIN pg_attrdef ad ON ad.oid = dep.objid
+		JOIN pg_attribute a ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum
+		JOIN pg_class c ON c.oid = a.attrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE dep.refclassid = 'pg_proc'::regclass
+		  AND dep.classid = 'pg_attrdef'::regclass
+		  AND p.proname = 'unaccent'
+		  AND a.attgenerated = 's'
+		  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+		ORDER BY n.nspname, c.relname, a.attname
+	LOOP
+		step := 'column';
+		object := format('%I.%I.%I', g.nspname, g.relname, g.attname);
+		detail := 'stored generated column not refreshed: rewrite it with ALTER TABLE ... ALTER COLUMN ... SET EXPRESSION AS (<same expression>)';
 		RETURN NEXT;
 	END LOOP;
 END

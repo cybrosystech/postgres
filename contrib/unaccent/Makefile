@@ -10,7 +10,7 @@ DATA = unaccent--1.2.sql unaccent--1.1--1.2.sql unaccent--1.1.sql unaccent--1.0-
 DATA_TSEARCH = unaccent.rules
 PGFILEDESC = "unaccent - text search dictionary that removes accents"
 
-REGRESS = unaccent
+REGRESS = unaccent unaccent_refresh
 
 ifdef USE_PGXS
 PG_CONFIG = pg_config
