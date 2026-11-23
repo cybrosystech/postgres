@@ -840,17 +840,9 @@ pg_rewrite_query(Query *query)
 		ShowUsage("REWRITER STATISTICS");
 
 	/*
-	 * dbblue: re-check safe mode against what the rewriter produced.  Rules
-	 * can replace the statement the user wrote with one that touches every
-	 * row, so the parse-time check alone is not enough.
+	 * dbblue: QueryRewrite() re-checks safe mode against the rewritten
+	 * queries; utility statements carry no row restriction to check.
 	 */
-	if (dbblue_safe_mode)
-	{
-		ListCell   *lc;
-
-		foreach(lc, querytree_list)
-			dbblue_safe_mode_check_rewritten(lfirst_node(Query, lc));
-	}
 
 #ifdef DEBUG_NODE_TESTS_ENABLED
 

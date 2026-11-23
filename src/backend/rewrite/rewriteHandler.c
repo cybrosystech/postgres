@@ -39,6 +39,7 @@
 #include "rewrite/rewriteHandler.h"
 #include "rewrite/rewriteManip.h"
 #include "rewrite/rewriteSearchCycle.h"
+#include "parser/analyze.h"
 #include "rewrite/rowsecurity.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
@@ -4767,6 +4768,21 @@ QueryRewrite(Query *parsetree)
 
 	if (!foundOriginalQuery && lastInstead != NULL)
 		lastInstead->canSetTag = true;
+
+	/*
+	 * dbblue: re-check safe mode against what the rewriter produced.  Rules
+	 * can replace the statement the user wrote with one that touches every
+	 * row, so the parse-time check alone is not enough.  Done here rather
+	 * than in a caller so that every route is covered: ordinary statements
+	 * (pg_rewrite_query), AutoPrepare, and the commands that rewrite their
+	 * inner statement themselves -- EXPLAIN (whose ANALYZE runs it), CREATE
+	 * TABLE AS, DECLARE CURSOR, REFRESH MATERIALIZED VIEW.
+	 */
+	if (dbblue_safe_mode)
+	{
+		foreach(l, results)
+			dbblue_safe_mode_check_rewritten(lfirst_node(Query, l));
+	}
 
 	return results;
 }

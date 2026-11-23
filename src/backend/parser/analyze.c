@@ -481,12 +481,29 @@ dbblue_safe_mode_reject_unreached(Query *query, const char *cmd,
 void
 dbblue_safe_mode_check_rewritten(Query *query)
 {
+	ListCell   *lc_cte;
+
 	if (!dbblue_safe_mode)
 		return;
 
 	/* Utility statements carry no row restriction to inspect. */
 	if (query->commandType == CMD_UTILITY || query->utilityStmt != NULL)
 		return;
+
+	/*
+	 * A data-modifying statement in WITH is rewritten in place, inside the
+	 * enclosing query's cteList, so check it too: the enclosing query is
+	 * often a plain SELECT, which the switch below would pass without ever
+	 * looking at what its WITH clause changes.  PostgreSQL allows such
+	 * statements only at the top level of WITH, but recursing costs nothing.
+	 */
+	foreach(lc_cte, query->cteList)
+	{
+		CommonTableExpr *cte = lfirst_node(CommonTableExpr, lc_cte);
+
+		if (IsA(cte->ctequery, Query))
+			dbblue_safe_mode_check_rewritten((Query *) cte->ctequery);
+	}
 
 	switch (query->commandType)
 	{

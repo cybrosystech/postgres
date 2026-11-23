@@ -63,6 +63,27 @@ SELECT count(*) FILTER (WHERE flag) AS changed, count(*) AS total FROM dsu_t;
 
 RESET dbblue_autoprepare_enabled;
 RESET compute_query_id;
+
+-- ---------- Rule rewriting on every route ----------
+-- The same rule-widened statement reached through EXPLAIN ANALYZE (which runs
+-- it), a data-modifying WITH, and CREATE TABLE AS: each command rewrites the
+-- statement itself, and WITH hides it below a SELECT.  All must be refused.
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  UPDATE dsu_vt SET flag = true WHERE id = 3;
+WITH u AS (UPDATE dsu_vt SET flag = true WHERE id = 3) SELECT 1 AS x;
+CREATE TABLE dsu_ctas AS
+  WITH u AS (UPDATE dsu_vt SET flag = true WHERE id = 3) SELECT 1 AS x;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  WITH u AS (UPDATE dsu_vt SET flag = true WHERE id = 3) SELECT 1 AS x;
+
+-- Still no row of dsu_t may have changed.
+SELECT count(*) FILTER (WHERE flag) AS changed, count(*) AS total FROM dsu_t;
+
+-- A restricted statement on the table itself still runs on every route.
+WITH u AS (UPDATE dsu_t SET flag = false WHERE id = 1) SELECT 'ran' AS restricted_with;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  UPDATE dsu_t SET flag = false WHERE id = 1;
+
 RESET dbblue_safe_mode;
 
 -- ---------- The error code ----------
