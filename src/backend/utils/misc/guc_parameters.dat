@@ -649,6 +649,16 @@
   max => 'INT_MAX',
 },
 
+{ name => 'dbblue_autoprepare_memory_limit', type => 'int', context => 'PGC_SUSET', group => 'QUERY_TUNING_OTHER',
+  short_desc => 'Maximum memory for cached query plans per backend.',
+  long_desc => 'When the cached plans of a backend hold more than this, the plans with the least value for their size are dropped. A single plan larger than this is not cached. 0 means no limit.',
+  flags => 'GUC_NOT_IN_SAMPLE | GUC_UNIT_KB | GUC_EXPLAIN',
+  variable => 'autoprepare_memory_limit',
+  boot_val => '65536',
+  min => '0',
+  max => 'INT_MAX',
+},
+
 { name => 'dbblue_autoprepare_threshold', type => 'int', context => 'PGC_SUSET', group => 'QUERY_TUNING_OTHER',
   short_desc => 'Cache a query shape after it is seen this many times.',
   flags => 'GUC_NOT_IN_SAMPLE | GUC_EXPLAIN',

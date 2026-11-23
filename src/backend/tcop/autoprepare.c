@@ -98,6 +98,8 @@
 bool		autoprepare_enabled = false;	/* off by default -- opt in */
 int			autoprepare_threshold = 2;		/* cache once seen this many times */
 int			autoprepare_limit = 256;		/* cap entries per backend */
+int			autoprepare_memory_limit = 65536;	/* kB of cached plans per
+												 * backend; 0 = no limit */
 
 /* ---- the notebook ---- */
 typedef struct AutoprepareEntry
@@ -124,6 +126,9 @@ typedef struct AutoprepareEntry
 	dlist_node	lru_node;
 
 	/* ---- value, for choosing which fixed entry to evict ---- */
+	Size		bytes;			/* memory held by the cached plan source and its
+								 * generic plan, as last measured; 0 if not
+								 * promoted */
 	double		plan_ms;		/* fastest normal planning seen; 0 = unknown */
 	double		build_ms;		/* time of the promotion build attempt */
 
@@ -167,6 +172,14 @@ static uint64 aprep_fixed_evictions = 0;	/* promoted/declined entries
 
 /* Promoted + declined entries currently in the table. */
 static int	aprep_num_fixed = 0;
+
+/*
+ * Memory held by all cached plans of this backend (the sum of the entries'
+ * 'bytes'), and how many entries were dropped to keep it within
+ * dbblue_autoprepare_memory_limit.
+ */
+static Size aprep_total_bytes = 0;
+static uint64 aprep_memory_evictions = 0;
 
 /*
  * Statement clock: +1 per statement consulted.  Reuse counts decay by half
@@ -775,6 +788,7 @@ aprep_remove_entry(AutoprepareEntry *entry)
 		aprep_num_fixed--;
 	else
 		dlist_delete(&entry->lru_node);
+	aprep_total_bytes -= Min(entry->bytes, aprep_total_bytes);
 	if (entry->plansource)
 		DropCachedPlan(entry->plansource);
 	if (entry->param_types)
@@ -921,6 +935,106 @@ aprep_evict_lowest_fixed(void)
 	return true;
 }
 
+/* ----------------------------------------------------------------
+ *		memory budget
+ *
+ * dbblue_autoprepare_memory_limit caps the memory all cached plans of a
+ * backend may hold.  A cached entry owns two memory contexts: the plan
+ * source's (with the stored query trees below it) and, once the plancache has
+ * built one, the generic plan's.  Their sizes are read from the allocation
+ * counters the memory contexts keep anyway -- no walking of blocks, no
+ * planning -- so measuring is nearly free.  It happens when an entry is
+ * built, and again after each reuse (when a generic plan may have appeared or
+ * been dropped).
+ *
+ * Over budget, the entry with the least value for its size is dropped.  The
+ * value is the one aprep_entry_score() gives (reuse rate times what a reuse
+ * saves); dividing by size means a huge, rarely reused plan goes before many
+ * small, frequently reused ones.  Sizes below APREP_DENSITY_UNIT_BYTES count
+ * as that size, so tiny entries are not favoured without bound.
+ * ---------------------------------------------------------------- */
+
+#define APREP_DENSITY_UNIT_BYTES	((double) 16384)
+
+static inline Size
+aprep_budget_bytes(void)
+{
+	return (Size) autoprepare_memory_limit * 1024;	/* 0 = no limit */
+}
+
+/* Memory held by a cached plan source and its generic plan, if any. */
+static Size
+aprep_measure_bytes(CachedPlanSource *ps)
+{
+	Size		bytes = MemoryContextMemAllocated(ps->context, true);
+
+	if (ps->gplan != NULL)
+		bytes += MemoryContextMemAllocated(ps->gplan->context, true);
+	return bytes;
+}
+
+/* Re-measure a promoted entry and keep the backend total in step. */
+static void
+aprep_refresh_bytes(AutoprepareEntry *entry)
+{
+	Size		now;
+
+	if (entry->plansource == NULL)
+		return;
+	now = aprep_measure_bytes(entry->plansource);
+	aprep_total_bytes += now;
+	aprep_total_bytes -= Min(entry->bytes, aprep_total_bytes);
+	entry->bytes = now;
+}
+
+/* Value per size; see the comment above. */
+static double
+aprep_entry_density(AutoprepareEntry *entry)
+{
+	double		units = Max(1.0, (double) entry->bytes / APREP_DENSITY_UNIT_BYTES);
+
+	return aprep_entry_score(entry) / units;
+}
+
+/*
+ * Drop promoted entries, lowest value per size first, until the backend is
+ * within its memory budget.  'keep' (may be NULL) is never dropped: it is the
+ * entry being built or used.  Declined entries hold no plan and are left
+ * alone.  Call only where no entry is in use.
+ */
+static void
+aprep_enforce_memory_limit(AutoprepareEntry *keep)
+{
+	while (autoprepare_memory_limit > 0 &&
+		   aprep_total_bytes > aprep_budget_bytes())
+	{
+		HASH_SEQ_STATUS seq;
+		AutoprepareEntry *entry;
+		AutoprepareEntry *victim = NULL;
+		double		victim_density = 0;
+
+		hash_seq_init(&seq, autoprepare_table);
+		while ((entry = (AutoprepareEntry *) hash_seq_search(&seq)) != NULL)
+		{
+			double		density;
+
+			if (entry == keep || !entry->promoted)
+				continue;
+			density = aprep_entry_density(entry);
+			if (victim == NULL || density < victim_density)
+			{
+				victim = entry;
+				victim_density = density;
+			}
+		}
+		if (victim == NULL)
+			return;				/* nothing left that we may drop */
+
+		aprep_remove_entry(victim);
+		aprep_memory_evictions++;
+	}
+}
+
 /*
  * Sighting counts that outlive tracking entries.
  *
@@ -1031,6 +1145,10 @@ AutoprepareNoteReuseTime(double plan_ms)
 		return;
 	entry->reuse_plan_total_ms += plan_ms;
 	entry->reuse_plans++;
+
+	/* a generic plan may just have been built (or dropped): re-measure */
+	if (autoprepare_memory_limit > 0)
+		aprep_refresh_bytes(entry);
 }
 
 
@@ -1091,6 +1209,15 @@ aprep_promote(AutoprepareEntry *entry, Query *analyzed_query,
 	 * promoted/declined, after anything that can fail, so an error on the
 	 * way leaves it a consistent tracking entry.
 	 */
+	/*
+	 * A plan that alone exceeds the memory budget could only ever be built
+	 * and dropped again; decline it so the build is not repeated.  (Its
+	 * generic plan, built later, is not counted yet.)
+	 */
+	if (ps != NULL && autoprepare_memory_limit > 0 &&
+		aprep_measure_bytes(ps) > aprep_budget_bytes())
+		ps = NULL;
+
 	if (ps != NULL)
 	{
 		SaveCachedPlan(ps); /* reparents the plan to CacheMemoryContext +
@@ -1105,6 +1232,8 @@ aprep_promote(AutoprepareEntry *entry, Query *analyzed_query,
 		dlist_delete(&entry->lru_node);
 		aprep_num_fixed++;
 		aprep_promotions++;
+		aprep_refresh_bytes(entry);
+		aprep_enforce_memory_limit(entry);
 	}
 	else
 	{
@@ -1165,6 +1294,14 @@ AutoprepareConsult(Query *analyzed_query, const char *query_string,
 		autoprepare_init();
 	aprep_clock++;
 
+	/*
+	 * A generic plan built since the last statement may have taken the
+	 * backend over its memory budget (entries are also checked when built).
+	 * Here no entry is in use, so dropping one is safe.
+	 */
+	if (autoprepare_memory_limit > 0 && aprep_total_bytes > aprep_budget_bytes())
+		aprep_enforce_memory_limit(NULL);
+
 	entry = (AutoprepareEntry *) hash_search(autoprepare_table, &fp,
 											 HASH_FIND, &found);
 
@@ -1204,6 +1341,7 @@ AutoprepareConsult(Query *analyzed_query, const char *query_string,
 		entry->plansource = NULL;
 		entry->param_types = NULL;
 		entry->num_params = 0;
+		entry->bytes = 0;
 		entry->plan_ms = 0;
 		entry->normal_plan_total_ms = 0;
 		entry->normal_plans = 0;
@@ -1554,6 +1692,8 @@ typedef struct AprepMsgSummary
 	uint64		rejected_full;
 	uint64		tracking_evictions;
 	uint64		fixed_evictions;
+	uint64		cached_bytes;	/* memory held by all cached plans */
+	uint64		memory_evictions;	/* entries dropped for the memory budget */
 } AprepMsgSummary;
 
 typedef struct AprepMsgShape
@@ -1574,6 +1714,7 @@ typedef struct AprepMsgShape
 								 * other fields above, this one can legitimately
 								 * be negative (a mature entry saving nothing),
 								 * so -1 cannot be used as its sentinel */
+	int64		plan_bytes;		/* memory held by the cached plan; -1: not promoted */
 	int32		query_len;		/* -1: no text; else text follows */
 } AprepMsgShape;
 
@@ -1700,6 +1841,8 @@ aprep_fill_summary(AprepMsgSummary *s)
 	s->rejected_full = aprep_rejected_full;
 	s->tracking_evictions = aprep_tracking_evictions;
 	s->fixed_evictions = aprep_fixed_evictions;
+	s->cached_bytes = aprep_total_bytes;
+	s->memory_evictions = aprep_memory_evictions;
 
 	if (autoprepare_table == NULL)
 		return;
@@ -1784,6 +1927,7 @@ aprep_emit_report(bool want_shapes, AprepEmitFn emit, void *arg)
 			}
 			hdr.score = (entry->promoted || entry->declined) ?
 				aprep_entry_score(entry) : NAN;
+			hdr.plan_bytes = entry->promoted ? (int64) entry->bytes : -1;
 			hdr.query_len = (qs != NULL) ? (int32) strlen(qs) : -1;
 
 			resetStringInfo(&buf);
@@ -1831,8 +1975,8 @@ aprep_consume(void *arg, const void *data, Size len)
 		case APREP_MSG_SUMMARY:
 			{
 				AprepMsgSummary s;
-				Datum		values[15];
-				bool		nulls[15] = {0};
+				Datum		values[17];
+				bool		nulls[17] = {0};
 
 				if (len != sizeof(s))
 					return false;
@@ -1855,6 +1999,8 @@ aprep_consume(void *arg, const void *data, Size len)
 				values[12] = Int64GetDatum((int64) s.rejected_full);
 				values[13] = Int64GetDatum((int64) s.tracking_evictions);
 				values[14] = Int64GetDatum((int64) s.fixed_evictions);
+				values[15] = Int64GetDatum((int64) s.cached_bytes);
+				values[16] = Int64GetDatum((int64) s.memory_evictions);
 				tuplestore_putvalues(c->rsinfo->setResult, c->rsinfo->setDesc,
 									 values, nulls);
 				return true;
@@ -1863,8 +2009,8 @@ aprep_consume(void *arg, const void *data, Size len)
 		case APREP_MSG_SHAPE:
 			{
 				AprepMsgShape h;
-				Datum		values[14];
-				bool		nulls[14] = {0};
+				Datum		values[15];
+				bool		nulls[15] = {0};
 
 				if (len < sizeof(h))
 					return false;
@@ -1917,6 +2063,10 @@ aprep_consume(void *arg, const void *data, Size len)
 																		  h.query_len));
 				else
 					nulls[13] = true;
+				if (h.plan_bytes >= 0)
+					values[14] = Int64GetDatum(h.plan_bytes);
+				else
+					nulls[14] = true;
 				tuplestore_putvalues(c->rsinfo->setResult, c->rsinfo->setDesc,
 									 values, nulls);
 				return true;

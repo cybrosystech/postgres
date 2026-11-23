@@ -197,6 +197,50 @@ SELECT entries, promotions FROM dbblue_autoprepare_stats(pg_backend_pid());
 SELECT dbblue_autoprepare_reset(0);
 SELECT dbblue_autoprepare_reset() >= 1 AS reached_this_backend;
 
+-- memory budget: dbblue_autoprepare_memory_limit (kB per backend)
+DISCARD PLANS;
+SET dbblue_autoprepare_threshold = 2;
+SET dbblue_autoprepare_limit = 4;
+SET dbblue_autoprepare_enabled = on;
+
+-- a plan larger than the whole budget is declined, not cached
+SET dbblue_autoprepare_memory_limit = 1;
+SELECT a FROM aprep_t WHERE a = 11;
+SELECT a FROM aprep_t WHERE a = 12;
+SELECT state, plan_bytes IS NULL AS no_plan_kept
+FROM dbblue_autoprepare_shapes(pg_backend_pid())
+WHERE state IN ('promoted', 'declined') ORDER BY 1;
+SELECT cached_bytes, memory_evicted FROM dbblue_autoprepare_stats(pg_backend_pid());
+
+-- 0 means no limit: promoted, and its size is reported
+DISCARD PLANS;
+SET dbblue_autoprepare_memory_limit = 0;
+SELECT a FROM aprep_t WHERE a = 21;
+SELECT a FROM aprep_t WHERE a = 22;
+SELECT state, plan_bytes > 0 AS has_size
+FROM dbblue_autoprepare_shapes(pg_backend_pid())
+WHERE state = 'promoted';
+SELECT cached_bytes > 0 AS counted, memory_evicted
+FROM dbblue_autoprepare_stats(pg_backend_pid());
+
+-- a budget that fits one shape but not two: caching the second drops one
+DISCARD PLANS;
+SELECT a FROM aprep_t WHERE a = 31;
+SELECT a FROM aprep_t WHERE a = 32;
+SELECT set_config('dbblue_autoprepare_memory_limit',
+                  ((max(plan_bytes) * 3 / 2) / 1024 + 1)::text, false) IS NOT NULL AS limit_set
+FROM dbblue_autoprepare_shapes(pg_backend_pid()) WHERE state = 'promoted';
+SELECT b FROM aprep_t WHERE b = 41;
+SELECT b FROM aprep_t WHERE b = 42;
+SELECT count(*) FILTER (WHERE state = 'promoted') AS promoted
+FROM dbblue_autoprepare_shapes(pg_backend_pid());
+SELECT memory_evicted, cached_bytes <= 1024 * (SELECT setting::int FROM pg_settings
+                          WHERE name = 'dbblue_autoprepare_memory_limit') AS within_budget
+FROM dbblue_autoprepare_stats(pg_backend_pid());
+RESET dbblue_autoprepare_memory_limit;
+SET dbblue_autoprepare_enabled = off;
+DISCARD PLANS;
+
 -- DISCARD ALL must NOT clear it: poolers and psycopg2 send it on every
 -- connection reuse (it resets the GUCs, so set them again)
 SET dbblue_autoprepare_enabled = on;

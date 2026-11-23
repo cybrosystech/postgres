@@ -24,6 +24,7 @@
 extern PGDLLIMPORT bool autoprepare_enabled;
 extern PGDLLIMPORT int	autoprepare_threshold;	/* cache after N sightings */
 extern PGDLLIMPORT int	autoprepare_limit;		/* max cached shapes/backend */
+extern PGDLLIMPORT int	autoprepare_memory_limit;	/* kB of cached plans/backend, 0 = none */
 
 /*
  * Result of consulting the autoprepare cache for an analyzed query.
