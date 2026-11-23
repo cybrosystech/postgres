@@ -457,6 +457,8 @@ PostgreSQL documentation
         This option can be given more than once to set several parameters.
         It is primarily useful when the environment is such that the server
         will not start at all using the default parameters.
+        A value given here takes precedence over the one chosen by
+        <link linkend="app-initdb-auto-tune">automatic tuning</link>.
        </para>
       </listitem>
      </varlistentry>
@@ -482,6 +484,17 @@ PostgreSQL documentation
         Run the bootstrap backend with the
         <literal>debug_discard_caches=1</literal> option.
         This takes a very long time and is only of use for deep debugging.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry id="app-initdb-option-no-auto-tune">
+      <term><option>--no-auto-tune</option></term>
+      <listitem>
+       <para>
+        Do not size the generated <filename>postgresql.conf</filename> for
+        this machine; write <productname>PostgreSQL</productname>'s standard
+        defaults instead.  See <xref linkend="app-initdb-auto-tune"/>.
        </para>
       </listitem>
      </varlistentry>
@@ -695,6 +708,175 @@ PostgreSQL documentation
    <command>initdb</command> can also be invoked via
    <command>pg_ctl initdb</command>.
   </para>
+
+  <refsect2 id="app-initdb-auto-tune" xreflabel="Automatic Tuning">
+   <title>Automatic Tuning</title>
+
+   <para>
+    By default, <productname>DBblue</productname>'s
+    <command>initdb</command> sizes the generated
+    <filename>postgresql.conf</filename> for the machine it runs on, instead
+    of writing <productname>PostgreSQL</productname>'s standard defaults,
+    which are deliberately small.  The formulas are aimed at
+    <productname>Odoo</productname>: many short transactions from the ORM,
+    with the occasional heavy report.  To get the standard defaults, use
+    <option>--no-auto-tune</option>.
+   </para>
+
+   <para>
+    <command>initdb</command> first detects:
+    <itemizedlist>
+     <listitem>
+      <para>
+       <emphasis>Memory</emphasis>: the machine's physical memory or, on
+       Linux, the memory limit of the control group
+       (<literal>cgroup</literal>, version 1 or 2) it runs in, if that is
+       lower.  Inside a container, such as one started with
+       <literal>docker run --memory</literal>, this is the container's limit,
+       not the host's memory.
+      </para>
+     </listitem>
+     <listitem>
+      <para>
+       <emphasis>CPUs</emphasis>: the number of online CPUs or, on Linux, the
+       control group's CPU quota (<literal>docker run --cpus</literal>,
+       Kubernetes CPU limits), rounded up to a whole CPU, if that is lower.
+      </para>
+     </listitem>
+     <listitem>
+      <para>
+       <emphasis>Storage type</emphasis>: on Linux, whether the first of the
+       disks <filename>nvme0n1</filename>, <filename>sda</filename>,
+       <filename>vda</filename> and <filename>xvda</filename> that exists is
+       a rotating disk.  This is not necessarily the disk that will hold the
+       data directory.  Where this cannot be told, an SSD is assumed.
+      </para>
+     </listitem>
+    </itemizedlist>
+    and reports what it found, for example:
+<screen>
+auto-tune: detected 30843 MB RAM, 16 CPU(s), storage=ssd
+auto-tune: probing "shared_buffers" = 8GB ... ok
+</screen>
+    If the memory size or the number of CPUs cannot be determined, it says
+    so and writes the standard defaults.
+   </para>
+
+   <para>
+    It then writes the settings in
+    <xref linkend="app-initdb-auto-tune-table"/>, where
+    <replaceable>RAM</replaceable> and <replaceable>CPUs</replaceable> are the
+    detected values.  Memory sizes below 1 GB are rounded down to a whole
+    megabyte, and larger ones to the nearest gigabyte.
+   </para>
+
+   <table id="app-initdb-auto-tune-table">
+    <title>Settings Chosen by Automatic Tuning</title>
+    <tgroup cols="2">
+     <colspec colname="col1" colwidth="1*"/>
+     <colspec colname="col2" colwidth="2*"/>
+     <thead>
+      <row>
+       <entry>Setting</entry>
+       <entry>Value</entry>
+      </row>
+     </thead>
+     <tbody>
+      <row>
+       <entry><xref linkend="guc-shared-buffers"/></entry>
+       <entry>25% of <replaceable>RAM</replaceable>, at least 128 MB</entry>
+      </row>
+      <row>
+       <entry><xref linkend="guc-effective-cache-size"/></entry>
+       <entry>75% of <replaceable>RAM</replaceable></entry>
+      </row>
+      <row>
+       <entry><xref linkend="guc-work-mem"/></entry>
+       <entry>(<replaceable>RAM</replaceable> &minus;
+        <varname>shared_buffers</varname>) / (<varname>max_connections</varname>
+        &times; 3 &times; <varname>max_parallel_workers_per_gather</varname>),
+        at least 4 MB</entry>
+      </row>
+      <row>
+       <entry><xref linkend="guc-maintenance-work-mem"/></entry>
+       <entry><replaceable>RAM</replaceable> / 16, at most 2 GB</entry>
+      </row>
+      <row>
+       <entry><xref linkend="guc-max-parallel-workers"/></entry>
+       <entry><replaceable>CPUs</replaceable>, at least 8</entry>
+      </row>
+      <row>
+       <entry><xref linkend="guc-max-worker-processes"/></entry>
+       <entry><varname>max_parallel_workers</varname> + 12, leaving room for
+        <productname>DBblue</productname>'s own background workers</entry>
+      </row>
+      <row>
+       <entry><xref linkend="guc-max-parallel-workers-per-gather"/></entry>
+       <entry><replaceable>CPUs</replaceable> / 2, between 2 and 4 (1 on a
+        single-CPU machine)</entry>
+      </row>
+      <row>
+       <entry><xref linkend="guc-max-parallel-maintenance-workers"/></entry>
+       <entry><replaceable>CPUs</replaceable> / 2, between 2 and 4</entry>
+      </row>
+      <row>
+       <entry><xref linkend="guc-random-page-cost"/></entry>
+       <entry>1.1 on an SSD, 4.0 on a rotating disk</entry>
+      </row>
+      <row>
+       <entry><xref linkend="guc-effective-io-concurrency"/></entry>
+       <entry>200 on an SSD, 2 on a rotating disk</entry>
+      </row>
+      <row>
+       <entry><xref linkend="guc-checkpoint-completion-target"/></entry>
+       <entry>0.9</entry>
+      </row>
+      <row>
+       <entry><xref linkend="guc-max-wal-size"/></entry>
+       <entry>25% of <replaceable>RAM</replaceable>, between 1 GB and 8 GB</entry>
+      </row>
+      <row>
+       <entry><xref linkend="guc-min-wal-size"/></entry>
+       <entry><varname>max_wal_size</varname> / 4</entry>
+      </row>
+      <row>
+       <entry><xref linkend="guc-max-slot-wal-keep-size"/></entry>
+       <entry>2 &times; <varname>max_wal_size</varname>, so that a replication
+        slot whose standby never returns cannot fill the disk</entry>
+      </row>
+      <row>
+       <entry><xref linkend="guc-default-statistics-target"/></entry>
+       <entry>200</entry>
+      </row>
+     </tbody>
+    </tgroup>
+   </table>
+
+   <para>
+    <command>initdb</command> starts a test server with the chosen
+    <varname>shared_buffers</varname> before writing it.  If the operating
+    system refuses that much shared memory, it keeps the largest value that
+    worked and says so.
+   </para>
+
+   <para>
+    <varname>work_mem</varname> is computed for the
+    <xref linkend="guc-max-connections"/> that <command>initdb</command>
+    itself selects, normally 100, not for a value given with
+    <option>-c max_connections</option>.  If you allow many more
+    connections, lower <varname>work_mem</varname> to match, since each
+    connection may use it several times at once.
+   </para>
+
+   <para>
+    The values are written to <filename>postgresql.conf</filename> as ordinary
+    settings, and can be changed there, or with <command>ALTER SYSTEM</command>,
+    at any time.  A value given to <command>initdb</command> with
+    <option>-c</option> replaces the tuned one.  Tuning happens only when
+    <command>initdb</command> runs: if the cluster later moves to a machine
+    with different memory or CPUs, adjust the settings by hand.
+   </para>
+  </refsect2>
  </refsect1>
 
  <refsect1>
