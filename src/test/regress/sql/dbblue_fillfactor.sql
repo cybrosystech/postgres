@@ -47,6 +47,15 @@ DO $$ BEGIN EXECUTE format('CREATE TABLE %I (id int)', 'dff_' || repeat('x', 59)
 SELECT length(relname) AS name_bytes, reloptions FROM pg_class WHERE relname = 'dff_' || repeat('x', 59);
 DO $$ BEGIN EXECUTE format('DROP TABLE %I', 'dff_' || repeat('x', 59)); END $$;
 
+-- (6) dbblue_fillfactor_lookup() reports what the map gives a name, matching
+-- the way CREATE TABLE does: model or table name, any case; NULL if none.
+SET dbblue_fillfactor_map = 'dff.hot:70, dff.warm:75';
+SELECT dbblue_fillfactor_lookup('dff.hot') AS model_name,
+       dbblue_fillfactor_lookup('DFF_HOT') AS table_name,
+       dbblue_fillfactor_lookup('dff_cold') AS unmapped;
+SET dbblue_fillfactor_map = '';
+SELECT dbblue_fillfactor_lookup('dff_hot') AS empty_map;
+
 -- cleanup
 RESET dbblue_fillfactor_map;
 DROP TABLE dff_hot, dff_cold, dff_warm;

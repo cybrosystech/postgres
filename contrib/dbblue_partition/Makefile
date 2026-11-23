@@ -11,8 +11,10 @@ MODULES = src/dbblue_partition_bgw
 # were added to the partitioned table after the conversion.
 # 1.2: dbblue_partition_estimate predicts the duration of a conversion.
 # 1.3: the primary key stays on its own columns as a GLOBAL index.
+# 1.4: partitions get the fillfactor dbblue_fillfactor_map gives the model.
 DATA = dbblue_partition--1.0.sql dbblue_partition--1.0--1.1.sql \
-	dbblue_partition--1.1--1.2.sql dbblue_partition--1.2--1.3.sql
+	dbblue_partition--1.1--1.2.sql dbblue_partition--1.2--1.3.sql \
+	dbblue_partition--1.3--1.4.sql
 PGFILEDESC = "dbblue_partition - convert live Odoo tables to native range partitioning"
 
 REGRESS = dbblue_partition

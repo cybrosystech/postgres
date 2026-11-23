@@ -10666,6 +10666,19 @@ dbblue_fillfactor_map = 'res.partner:70, stock.move:75, account.move.line:80'
         <command>ALTER TABLE ... SET (fillfactor = 100)</command> instead of
         resetting it.
        </para>
+
+       <para>
+        A partitioned table stores no rows, so it has no fillfactor; each
+        partition has its own, and a partition's name (such as
+        <literal>account_move_line_p20261101</literal>) does not match the
+        model's map entry.  When <filename>contrib/dbblue_partition</filename>
+        partitions a table that has no fillfactor of its own, it gives every
+        partition, including those created later, the fillfactor the map
+        gives the table's name.  The function
+        <function>dbblue_fillfactor_lookup(<parameter>name</parameter> <type>text</type>)</function>
+        returns that value for a table or model name, matched the same way,
+        or null if the map gives none.
+       </para>
       </listitem>
      </varlistentry>
 

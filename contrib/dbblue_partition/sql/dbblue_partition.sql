@@ -409,4 +409,32 @@ SELECT estimated_seconds FROM dbblue_partition_estimate('est_t');	-- already con
 DROP TABLE est_child, est_t, est_t_old;
 DROP TABLE dbblue_tpl_est_t;
 
+-- 1.4: fillfactor reaches every partition, through the template
+-- (a) the table predates its dbblue_fillfactor_map entry, so it has no
+--     fillfactor of its own: its partitions get the map's
+CREATE TABLE ff_line (id serial PRIMARY KEY, create_date timestamp NOT NULL);
+INSERT INTO ff_line (create_date)
+  SELECT '2026-01-15'::timestamp + g * interval '20 days' FROM generate_series(0, 6) g;
+SELECT reloptions AS table_before FROM pg_class WHERE relname = 'ff_line';
+SET dbblue_fillfactor_map = 'ff.line:70';
+CALL dbblue_partition_model('ff.line', 'create_date', '1 month');
+SELECT count(*) > 5 AS several_partitions,
+       bool_and(coalesce(c.reloptions, '{}') @> '{fillfactor=70}') AS all_have_70
+FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+WHERE i.inhparent = 'ff_line'::regclass;
+SELECT reloptions AS template FROM pg_class WHERE relname = 'dbblue_tpl_ff_line';
+-- (b) an explicit fillfactor on the table wins over the map
+CREATE TABLE ff_move (id serial PRIMARY KEY, create_date timestamp NOT NULL)
+  WITH (fillfactor = 80);
+INSERT INTO ff_move (create_date)
+  SELECT '2026-01-15'::timestamp + g * interval '20 days' FROM generate_series(0, 6) g;
+SET dbblue_fillfactor_map = 'ff.line:70, ff.move:60';
+CALL dbblue_partition_model('ff.move', 'create_date', '1 month');
+SELECT bool_and(coalesce(c.reloptions, '{}') @> '{fillfactor=80}') AS all_keep_80
+FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+WHERE i.inhparent = 'ff_move'::regclass;
+RESET dbblue_fillfactor_map;
+DROP TABLE ff_line, ff_line_old, ff_move, ff_move_old;
+DROP TABLE dbblue_tpl_ff_line, dbblue_tpl_ff_move;
+
 \set SHOW_CONTEXT errors

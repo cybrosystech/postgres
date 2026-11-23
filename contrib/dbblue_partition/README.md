@@ -195,6 +195,24 @@ them here.
    for Odoo's benefit, and no catalog-shadowing layer exists in this
    extension any more.
 
+## Fillfactor
+
+A partitioned parent stores no rows, so it cannot have a fillfactor
+(`ALTER TABLE parent SET (fillfactor = ...)` is refused); each partition has
+its own.  The conversion puts the table's storage options, fillfactor
+included, on the template table `dbblue_tpl_<table>`, and pg_partman copies
+them to every partition it creates, now and later.  So:
+
+- A table that already has a fillfactor keeps it on all its partitions.
+- A table with none, whose model has an entry in `dbblue_fillfactor_map`,
+  gets that entry's fillfactor on all its partitions (since 1.4).  This is
+  the usual case for a model such as `account.move.line` whose table existed
+  before its map entry was added: the map acts only when a table is created,
+  and the partitions' own names (`account_move_line_pNNN`) never match it.
+- To change the fillfactor of a model after conversion, set it on the
+  template for future partitions and on each existing partition, then
+  rewrite those (`VACUUM FULL`, `REPACK`) for existing rows to follow it.
+
 ## Known small print
 
 - Not carried to the new table (everything else is): comments on the PK

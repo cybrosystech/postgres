@@ -26,8 +26,11 @@
 
 #include <ctype.h>
 
+#include "fmgr.h"
 #include "miscadmin.h"
+#include "utils/builtins.h"
 #include "utils/dbblue_fillfactor.h"
+#include "utils/fmgrprotos.h"
 #include "utils/guc.h"
 
 /* ----------------------------------------------------------------
@@ -279,6 +282,25 @@ dbblue_fillfactor_lookup(const char *tablename)
 			return current_map->entries[i].fillfactor;
 	}
 	return -1;
+}
+
+/*
+ * dbblue_fillfactor_lookup(name text) returns int
+ *		SQL-callable form of dbblue_fillfactor_lookup(): the fillfactor the
+ *		current map gives a table or model name, or NULL if it gives none.
+ *		dbblue_partition uses it so that a table partitioned after its map
+ *		entry was added still gets that fillfactor on its partitions.
+ */
+Datum
+dbblue_fillfactor_lookup_sql(PG_FUNCTION_ARGS)
+{
+	char	   *name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	int			ff = dbblue_fillfactor_lookup(name);
+
+	pfree(name);
+	if (ff < 0)
+		PG_RETURN_NULL();
+	PG_RETURN_INT32(ff);
 }
 
 /*
