@@ -1373,6 +1373,16 @@ apply_auto_tune(void)
 		   s.cpu_from_cgroup ? _(" (cgroup limit)") : "",
 		   s.ssd_storage ? "ssd" : "hdd");
 
+	/* /dev/shm only matters when dynamic shared memory lives there. */
+	if (strcmp(dynamic_shared_memory_type, "posix") != 0)
+		s.min_dynamic_shared_memory_mb = 0;
+	if (s.min_dynamic_shared_memory_mb > 0)
+		printf(_("auto-tune: /dev/shm is only %lu MB, too small for parallel queries; "
+				 "reserving \"min_dynamic_shared_memory\" = %dMB "
+				 "(a container's --shm-size raises it)\n"),
+			   (unsigned long) (s.dev_shm_bytes / (1024 * 1024)),
+			   s.min_dynamic_shared_memory_mb);
+
 	/*
 	 * Convert kB → 8 kB pages (BLCKSZ).  Use int64 because shared_buffers
 	 * on a multi-GB host can exceed INT_MAX kilobytes-times-1024.  Cap
@@ -1612,6 +1622,13 @@ setup_config(void)
 									  format_kb(t->work_mem_kb), false);
 		conflines = replace_guc_value(conflines, "maintenance_work_mem",
 									  format_kb(t->maintenance_work_mem_kb), false);
+		if (t->min_dynamic_shared_memory_mb > 0)
+		{
+			snprintf(repltok, sizeof(repltok), "%dMB",
+					 t->min_dynamic_shared_memory_mb);
+			conflines = replace_guc_value(conflines, "min_dynamic_shared_memory",
+										  repltok, false);
+		}
 
 		snprintf(repltok, sizeof(repltok), "%d", t->max_worker_processes);
 		conflines = replace_guc_value(conflines, "max_worker_processes",

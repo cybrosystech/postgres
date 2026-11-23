@@ -806,6 +806,19 @@ auto-tune: probing "shared_buffers" = 8GB ... ok
         32-bit build, whose limit for this setting is just under 2 GB)</entry>
       </row>
       <row>
+       <entry><xref linkend="guc-min-dynamic-shared-memory"/></entry>
+       <entry>Set only when <filename>/dev/shm</filename> is too small for
+        four parallel hash joins at once, as in a container started without
+        <option>--shm-size</option> (64 MB by default):
+        <varname>work_mem</varname> &times; 2 &times;
+        (<varname>max_parallel_workers_per_gather</varname> + 1) &times; 4,
+        at most <replaceable>RAM</replaceable> / 16.  Parallel queries then
+        take their shared memory from this reserve, which is part of the main
+        shared memory and limited by the container's memory limit, before
+        they turn to <filename>/dev/shm</filename>.  Otherwise left at
+        0.</entry>
+      </row>
+      <row>
        <entry><xref linkend="guc-max-parallel-workers"/></entry>
        <entry><replaceable>CPUs</replaceable>, at least 8</entry>
       </row>

@@ -38,6 +38,13 @@ typedef struct AutoTuneSettings
 	int			work_mem_kb;
 	int			maintenance_work_mem_kb;
 
+	/*
+	 * Size of /dev/shm in bytes (0 if unknown), and the min_dynamic_shared_memory
+	 * reserved because it is too small for parallel queries (0 = not needed).
+	 */
+	uint64		dev_shm_bytes;
+	int			min_dynamic_shared_memory_mb;
+
 	/* Parallelism */
 	int			max_worker_processes;
 	int			max_parallel_workers;

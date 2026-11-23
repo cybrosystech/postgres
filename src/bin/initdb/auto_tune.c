@@ -22,6 +22,9 @@
 #include <limits.h>
 #include <string.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/statvfs.h>
+#endif
 
 #ifdef WIN32
 #include <windows.h>
@@ -65,6 +68,14 @@
 #else
 #define MAX_TUNED_MEMORY_KB	KB_PER_GB
 #endif
+
+/*
+ * A parallel hash join keeps its shared hash table in dynamic shared memory,
+ * up to work_mem * hash_mem_multiplier (default 2) for each participant.  When
+ * /dev/shm cannot hold that many at once, see auto_tune_compute().
+ */
+#define HASH_MEM_MULTIPLIER			2
+#define PARALLEL_HASH_CONCURRENCY	4
 
 /*
  * Detect total physical RAM.  Returns 0 on failure.
@@ -321,6 +332,24 @@ detect_ssd(void)
 }
 
 /*
+ * Size of /dev/shm in bytes, or 0 if unknown.  With the posix
+ * dynamic_shared_memory_type, Linux's default, dynamic shared memory
+ * segments are files there.  Docker gives a container a 64 MB /dev/shm
+ * unless --shm-size says otherwise, whatever its --memory limit.
+ */
+static uint64
+detect_dev_shm_size(void)
+{
+#if defined(__linux__)
+	struct statvfs st;
+
+	if (statvfs("/dev/shm", &st) == 0)
+		return (uint64) st.f_frsize * st.f_blocks;
+#endif
+	return 0;
+}
+
+/*
  * Clamp helper.
  */
 static int
@@ -474,6 +503,32 @@ auto_tune_compute(int max_connections)
 			work_mem_kb = 4 * KB_PER_MB;	/* never below upstream default */
 		work_mem_kb = Min(work_mem_kb, MAX_TUNED_MEMORY_KB);
 		s.work_mem_kb = round_memory_kb(work_mem_kb);
+	}
+
+	/*
+	 * min_dynamic_shared_memory: a parallel hash join's shared hash table can
+	 * take work_mem * HASH_MEM_MULTIPLIER per participant from dynamic shared
+	 * memory, which by default is files in /dev/shm.  In a container /dev/shm
+	 * is often 64 MB, too small even for one such join at the work_mem above,
+	 * and the query fails with "No space left on device".  When /dev/shm
+	 * cannot hold PARALLEL_HASH_CONCURRENCY of them, reserve that much at
+	 * startup inside the main shared memory segment instead, which is
+	 * anonymous memory bounded by the container's memory limit, not by
+	 * /dev/shm; segments then come from there first.  Capped at RAM/16.
+	 */
+	s.dev_shm_bytes = detect_dev_shm_size();
+	if (s.dev_shm_bytes > 0)
+	{
+		int64		need_kb = (int64) s.work_mem_kb * HASH_MEM_MULTIPLIER *
+			(parallel_per_gather + 1) * PARALLEL_HASH_CONCURRENCY;
+
+		if (s.dev_shm_bytes / 1024 < (uint64) need_kb)
+		{
+			need_kb = Min(need_kb, ram_kb / 16);
+			need_kb = Min(need_kb, MAX_TUNED_MEMORY_KB / 4);
+			s.min_dynamic_shared_memory_mb =
+				round_memory_kb((int) need_kb) / KB_PER_MB;
+		}
 	}
 
 	/* Storage cost model. */
