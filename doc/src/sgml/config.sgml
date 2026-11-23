@@ -10820,8 +10820,15 @@ HINT:  Add a WHERE clause selecting the rows to change, or ask a superuser to tu
         Do not enable it for the role that <productname>Odoo</productname>
         connects as.  <productname>Odoo</productname> runs statements that
         change every row on purpose, for example when it neutralizes a
-        duplicated or restored database and in some scheduled actions, and
-        those then fail.
+        duplicated or restored database, when it loads demo data, and in some
+        scheduled actions, and those then fail.  A failed neutralization is
+        dangerous: <productname>Odoo</productname> has already created the
+        copy when it neutralizes it, and does not remove it when that fails.
+        The copy is left with its scheduled actions and its outgoing and
+        incoming mail servers active, and with the same
+        <literal>database.uuid</literal> as production, so once an
+        <productname>Odoo</productname> worker serves it, it can send emails
+        to real customers and fetch messages from production's mailbox.
        </para>
       </listitem>
      </varlistentry>
