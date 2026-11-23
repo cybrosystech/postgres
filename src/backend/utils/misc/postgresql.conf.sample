@@ -884,7 +884,10 @@
 #createrole_self_grant = ''             # set and/or inherit
 #event_triggers = on
 #dbblue_safe_mode = off                 # reject UPDATE/DELETE/MERGE that would
-                                        # change every row, and any TRUNCATE
+                                        # change every row
+                                        # (change requires superuser)
+#dbblue_safe_mode_truncate = off        # with dbblue_safe_mode, also reject
+                                        # TRUNCATE of a table with data
                                         # (change requires superuser)
 
 # - Locale and Formatting -

@@ -3805,7 +3805,8 @@ apply_handle_truncate(StringInfo s)
 						relids_logged,
 						DROP_RESTRICT,
 						restart_seqs,
-						!MySubscription->runasowner);
+						!MySubscription->runasowner,
+						false);	/* replicated: safe mode does not apply */
 	foreach(lc, remote_rels)
 	{
 		LogicalRepRelMapEntry *rel = lfirst(lc);

@@ -1143,6 +1143,13 @@
   assign_hook => 'assign_dbblue_safe_mode',
 },
 
+{ name => 'dbblue_safe_mode_truncate', type => 'bool', context => 'PGC_SUSET', group => 'CLIENT_CONN_STATEMENT',
+  short_desc => 'Makes dbblue_safe_mode refuse TRUNCATE of a table that contains data.',
+  long_desc => 'Only takes effect while dbblue_safe_mode is on. Off by default, so safe mode guards UPDATE, DELETE and MERGE only, like MySQL safe updates. A table with no data can always be truncated, since nothing is lost; parallel pg_restore truncates each table it has just created.',
+  variable => 'dbblue_safe_mode_truncate',
+  boot_val => 'false',
+},
+
 { name => 'dbblue_standby_directory', type => 'string', context => 'PGC_SIGHUP', group => 'REPLICATION_PRIMARY',
   short_desc => 'Data directory of the standby managed by dbblue_create_standby.',
   long_desc => 'An empty value (the default) means a sibling of the data directory named "<datadir>_standby", which pg_basebackup creates. A relative path is interpreted against the parent directory of the data directory, so the standby never nests inside the primary; neither may an absolute one. A value set with ALTER SYSTEM must name a directory that already exists, is owned by the operating-system user the server runs as, lies in a directory that user can write to (the build marker goes next to it), and is empty or holds a standby that dbblue_create_standby built, streaming through replication slot "dbblue_standby"; a standby set up otherwise is left alone, never deleted. When the value changes, the standby running in the directory used before is stopped, and its files are left in place. Pointed back at that directory once a standby has been built in another one, the standby there is built anew, as the replication slot it streamed through was dropped for that build.',

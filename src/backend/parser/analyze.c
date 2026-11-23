@@ -73,6 +73,9 @@ post_parse_analyze_hook_type post_parse_analyze_hook = NULL;
 /* GUC: reject UPDATE/DELETE statements that have no WHERE clause */
 bool		dbblue_safe_mode = false;
 
+/* GUC: whether safe mode also refuses TRUNCATE of a table with data */
+bool		dbblue_safe_mode_truncate = false;
+
 /* see analyze.h */
 int			dbblue_safe_mode_storing = 0;
 

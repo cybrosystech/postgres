@@ -64,7 +64,8 @@ extern void ExecuteTruncateGuts(List *explicit_rels,
 								List *relids_logged,
 								DropBehavior behavior,
 								bool restart_seqs,
-								bool run_as_table_owner);
+								bool run_as_table_owner,
+								bool check_safe_mode);
 
 extern void SetRelationHasSubclass(Oid relationId, bool relhassubclass);
 

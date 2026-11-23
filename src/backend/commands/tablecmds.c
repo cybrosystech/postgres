@@ -374,6 +374,7 @@ typedef enum addFkConstraintSides
 	((child_is_partition) ? DEPENDENCY_AUTO : DEPENDENCY_NORMAL)
 
 static void truncate_check_rel(Oid relid, Form_pg_class reltuple);
+static void dbblue_safe_mode_check_truncate(List *rels);
 static void truncate_check_perms(Oid relid, Form_pg_class reltuple);
 static void truncate_check_activity(Relation rel);
 static void RangeVarCallbackForTruncate(const RangeVar *relation,
@@ -2010,6 +2011,53 @@ RangeVarCallbackForDropRelation(const RangeVar *rel, Oid relOid, Oid oldRelOid,
  * internal to the group that's being truncated.  Finally all the relations
  * are truncated and reindexed.
  */
+/*
+ * dbblue_safe_mode_check_truncate
+ *		Refuse a TRUNCATE that would remove rows, when dbblue_safe_mode and
+ *		dbblue_safe_mode_truncate are both on.
+ *
+ * TRUNCATE is outside safe mode unless dbblue_safe_mode_truncate is on, like
+ * MySQL's safe updates: safe mode catches a forgotten WHERE clause, and a
+ * TRUNCATE cannot be typed by accident.  Even then a table that has no data
+ * -- no pages at all -- may be truncated, since nothing is lost: a parallel
+ * pg_restore truncates each table it has just created before loading it, and
+ * refusing that would leave every restored table empty.  A table that once
+ * had rows keeps its pages until VACUUM or TRUNCATE frees them, so it counts
+ * as having data even if every row was deleted.
+ */
+static void
+dbblue_safe_mode_check_truncate(List *rels)
+{
+	ListCell   *cell;
+
+	if (!dbblue_safe_mode || !dbblue_safe_mode_truncate)
+		return;
+
+	foreach(cell, rels)
+	{
+		Relation	rel = (Relation) lfirst(cell);
+
+		/* A partitioned table stores no rows; its partitions are listed too. */
+		if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+			continue;
+
+		/*
+		 * Nothing to lose in a table without pages.  A foreign table's data
+		 * cannot be inspected here, so it counts as having data.
+		 */
+		if (RELKIND_HAS_STORAGE(rel->rd_rel->relkind) &&
+			RelationGetNumberOfBlocks(rel) == 0)
+			continue;
+
+		ereport(ERROR,
+				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				errmsg("TRUNCATE of table \"%s\" is not allowed because dbblue_safe_mode_truncate is enabled",
+					   RelationGetRelationName(rel)),
+				errdetail("The table contains data, and TRUNCATE removes every row."),
+				errhint("Use DELETE with a WHERE clause selecting the rows to remove, or ask a superuser to turn dbblue_safe_mode_truncate off."));
+	}
+}
+
 void
 ExecuteTruncate(TruncateStmt *stmt)
 {
@@ -2017,17 +2065,6 @@ ExecuteTruncate(TruncateStmt *stmt)
 	List	   *relids = NIL;
 	List	   *relids_logged = NIL;
 	ListCell   *cell;
-
-	/*
-	 * dbblue: TRUNCATE has no restricting clause to inspect -- it always
-	 * removes every row -- so safe mode refuses it outright.
-	 */
-	if (dbblue_safe_mode)
-		ereport(ERROR,
-				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				errmsg("TRUNCATE is not allowed because dbblue_safe_mode is enabled"),
-				errdetail("TRUNCATE always removes every row of a table."),
-				errhint("Use DELETE with a WHERE clause selecting the rows to remove, or ask a superuser to turn dbblue_safe_mode off."));
 
 	/*
 	 * Open, exclusive-lock, and check all the explicitly-specified relations
@@ -2121,7 +2158,7 @@ ExecuteTruncate(TruncateStmt *stmt)
 	}
 
 	ExecuteTruncateGuts(rels, relids, relids_logged,
-						stmt->behavior, stmt->restart_seqs, false);
+						stmt->behavior, stmt->restart_seqs, false, true);
 
 	/* And close the rels */
 	foreach(cell, rels)
@@ -2150,7 +2187,7 @@ ExecuteTruncateGuts(List *explicit_rels,
 					List *relids,
 					List *relids_logged,
 					DropBehavior behavior, bool restart_seqs,
-					bool run_as_table_owner)
+					bool run_as_table_owner, bool check_safe_mode)
 {
 	List	   *rels;
 	List	   *seq_relids = NIL;
@@ -2204,6 +2241,15 @@ ExecuteTruncateGuts(List *explicit_rels,
 			}
 		}
 	}
+
+	/*
+	 * dbblue: safe mode's TRUNCATE guard, on every table being truncated --
+	 * partitions and inheritance children, and those CASCADE just pulled in.
+	 * Not for a TRUNCATE replayed by logical replication (check_safe_mode is
+	 * false there): the publisher already ran it.
+	 */
+	if (check_safe_mode)
+		dbblue_safe_mode_check_truncate(rels);
 
 	/*
 	 * Check foreign key references.  In CASCADE mode, this should be

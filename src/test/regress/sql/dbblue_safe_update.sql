@@ -147,6 +147,44 @@ CREATE FUNCTION dsu_broken() RETURNS void LANGUAGE sql
 UPDATE dsu_s SET v = 1;
 RESET dbblue_safe_mode;
 
+-- ---------- TRUNCATE ----------
+-- Outside safe mode unless dbblue_safe_mode_truncate is on, like MySQL's safe
+-- updates.  Even then a table without data may be truncated: nothing is lost,
+-- and a parallel pg_restore truncates each table it has just created.
+CREATE TABLE dsu_tr (id int);
+INSERT INTO dsu_tr VALUES (1), (2);
+CREATE TABLE dsu_tr_empty (id int);
+CREATE TABLE dsu_tr_parent (id int) PARTITION BY RANGE (id);
+CREATE TABLE dsu_tr_p1 PARTITION OF dsu_tr_parent FOR VALUES FROM (0) TO (10);
+CREATE TABLE dsu_tr_p2 PARTITION OF dsu_tr_parent FOR VALUES FROM (10) TO (20);
+INSERT INTO dsu_tr_parent VALUES (15);
+CREATE TABLE dsu_tr_ref (id int PRIMARY KEY);
+CREATE TABLE dsu_tr_fk (ref int REFERENCES dsu_tr_ref);
+INSERT INTO dsu_tr_fk VALUES (NULL);
+
+SET dbblue_safe_mode = on;
+-- by default TRUNCATE is not checked
+TRUNCATE dsu_tr;
+SELECT count(*) AS rows_after_default_truncate FROM dsu_tr;
+INSERT INTO dsu_tr VALUES (1), (2);
+
+SET dbblue_safe_mode_truncate = on;
+TRUNCATE dsu_tr;				-- has data: refused
+TRUNCATE dsu_tr_empty;			-- no data: allowed
+TRUNCATE dsu_tr_parent;			-- partition dsu_tr_p2 has data: refused
+TRUNCATE dsu_tr_ref CASCADE;	-- empty, but cascades to dsu_tr_fk: refused
+SELECT (SELECT count(*) FROM dsu_tr) AS tr,
+       (SELECT count(*) FROM dsu_tr_parent) AS parent,
+       (SELECT count(*) FROM dsu_tr_fk) AS fk;
+
+-- it only acts together with dbblue_safe_mode
+SET dbblue_safe_mode = off;
+TRUNCATE dsu_tr;
+SELECT count(*) AS rows_after_unguarded_truncate FROM dsu_tr;
+RESET dbblue_safe_mode_truncate;
+RESET dbblue_safe_mode;
+DROP TABLE dsu_tr, dsu_tr_empty, dsu_tr_parent, dsu_tr_fk, dsu_tr_ref;
+
 -- ---------- The error code ----------
 -- Every refusal reports SQLSTATE 0A000 (feature_not_supported), never an
 -- integrity-constraint code: psycopg2 turns class 23 into IntegrityError,
@@ -154,12 +192,14 @@ RESET dbblue_safe_mode;
 CREATE FUNCTION dsu_sqlstate(stmt text) RETURNS text LANGUAGE plpgsql AS
   $$ BEGIN EXECUTE stmt; RETURN 'no error'; EXCEPTION WHEN OTHERS THEN RETURN SQLSTATE; END $$;
 SET dbblue_safe_mode = on;
+SET dbblue_safe_mode_truncate = on;
 SELECT dsu_sqlstate('UPDATE dsu_acct SET bal = 0') AS no_where,
        dsu_sqlstate('UPDATE dsu_acct SET bal = 0 WHERE true') AS always_true,
        dsu_sqlstate('DELETE FROM dsu_acct WHERE false') AS not_referring,
        dsu_sqlstate('MERGE INTO dsu_acct USING (VALUES (1)) v(id) ON true WHEN MATCHED THEN DELETE') AS merge,
        dsu_sqlstate('TRUNCATE dsu_acct') AS truncate,
        dsu_sqlstate('UPDATE dsu_acct SET bal = bal WHERE id = 1') AS restricted;
+RESET dbblue_safe_mode_truncate;
 RESET dbblue_safe_mode;
 
 -- cleanup

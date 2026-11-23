@@ -10697,7 +10697,9 @@ dbblue_fillfactor_map = 'res.partner:70, stock.move:75, account.move.line:80'
         <command>UPDATE</command> or <command>DELETE</command> without a
         <literal>WHERE</literal> clause that restricts it, a
         <command>MERGE</command> action that updates or deletes without a
-        restricting condition, and <command>TRUNCATE</command>.  It guards
+        restricting condition, and, if
+        <xref linkend="guc-dbblue-safe-mode-truncate"/> is also on,
+        <command>TRUNCATE</command> of a table that has data.  It guards
         against mistakes such as running a statement whose
         <literal>WHERE</literal> clause was forgotten or lost; it is not a
         security boundary, since a determined user can still write a
@@ -10765,9 +10767,12 @@ HINT:  Add a WHERE clause selecting the rows to change, or ask a superuser to tu
          </listitem>
          <listitem>
           <para>
-           <command>TRUNCATE</command>, always, including on temporary tables.
-           Use <command>DELETE</command> with a <literal>WHERE</literal>
-           clause instead.
+           <command>TRUNCATE</command> of a table that has data, only when
+           <xref linkend="guc-dbblue-safe-mode-truncate"/> is on.  By default
+           safe mode does not check <command>TRUNCATE</command>, like
+           <productname>MySQL</productname>'s safe updates: it is meant to
+           catch a forgotten <literal>WHERE</literal> clause, and a
+           <command>TRUNCATE</command> is not typed by accident.
           </para>
          </listitem>
         </itemizedlist>
@@ -10813,27 +10818,47 @@ HINT:  Add a WHERE clause selecting the rows to change, or ask a superuser to tu
 
        <para>
         Do not enable it for the role that <productname>Odoo</productname>
-        connects as, nor for the role used to restore databases:
-        <itemizedlist>
-         <listitem>
-          <para>
-           <productname>Odoo</productname> runs statements that change every
-           row on purpose, for example when it neutralizes a duplicated or
-           restored database and in some scheduled actions, and those then
-           fail.
-          </para>
-         </listitem>
-         <listitem>
-          <para>
-           A parallel <application>pg_restore</application>, which
-           <productname>DBblue</productname>'s
-           <application>pg_restore</application> uses by default, issues
-           <command>TRUNCATE</command> on each table it has just created before
-           loading it, so those loads fail.  Restore with
-           <option>-j 1</option>, or as a role without safe mode.
-          </para>
-         </listitem>
-        </itemizedlist>
+        connects as.  <productname>Odoo</productname> runs statements that
+        change every row on purpose, for example when it neutralizes a
+        duplicated or restored database and in some scheduled actions, and
+        those then fail.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry id="guc-dbblue-safe-mode-truncate" xreflabel="dbblue_safe_mode_truncate">
+      <term><varname>dbblue_safe_mode_truncate</varname> (<type>boolean</type>)
+      <indexterm>
+       <primary><varname>dbblue_safe_mode_truncate</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Makes <xref linkend="guc-dbblue-safe-mode"/> also refuse
+        <command>TRUNCATE</command> of a table that has data.  It has no effect
+        while <varname>dbblue_safe_mode</varname> is off.  The default is
+        <literal>off</literal>, so safe mode does not check
+        <command>TRUNCATE</command> at all.  Only superusers can change this
+        setting.
+       </para>
+
+       <para>
+        When it is on, every table a <command>TRUNCATE</command> would empty is
+        checked: those named, their partitions and inheritance children, and
+        those added by <literal>CASCADE</literal>.  The first one that has data
+        is named in the error:
+<screen>
+ERROR:  TRUNCATE of table "res_partner" is not allowed because dbblue_safe_mode_truncate is enabled
+DETAIL:  The table contains data, and TRUNCATE removes every row.
+</screen>
+        A table without data, meaning it has no pages on disk, can still be
+        truncated, since nothing is lost.  This is what a parallel
+        <application>pg_restore</application> does to each table it has just
+        created before loading it, so restoring as a role with both settings on
+        works.  A table whose rows were all deleted keeps its pages until
+        <command>VACUUM</command> releases them, and counts as having data.  A
+        foreign table counts as having data.  A <command>TRUNCATE</command>
+        replayed by logical replication is never checked.
        </para>
       </listitem>
      </varlistentry>

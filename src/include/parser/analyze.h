@@ -26,6 +26,7 @@ extern PGDLLIMPORT post_parse_analyze_hook_type post_parse_analyze_hook;
 
 /* GUC: reject UPDATE/DELETE statements that have no WHERE clause */
 extern PGDLLIMPORT bool dbblue_safe_mode;
+extern PGDLLIMPORT bool dbblue_safe_mode_truncate;
 
 /*
  * Above zero while a statement is parsed to be stored rather than run -- a
