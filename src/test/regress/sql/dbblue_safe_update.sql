@@ -86,6 +86,43 @@ EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
 
 RESET dbblue_safe_mode;
 
+-- ---------- Plans cached before safe mode was turned on ----------
+-- Turning safe mode on invalidates the session's cached plans, so a statement
+-- prepared, planned by PL/pgSQL, or cached by AutoPrepare while it was off is
+-- parsed and rewritten -- and so checked -- again on its next use.
+SET dbblue_safe_mode = off;
+PREPARE dsu_wipe AS UPDATE dsu_t SET flag = true;
+CREATE FUNCTION dsu_wipe_fn() RETURNS void LANGUAGE plpgsql AS
+  $$ BEGIN UPDATE dsu_t SET flag = true; END $$;
+SELECT dsu_wipe_fn();	-- plans its UPDATE, and runs it
+UPDATE dsu_t SET flag = false WHERE flag;
+SET compute_query_id = on;
+SET dbblue_autoprepare_enabled = on;
+SET dbblue_autoprepare_threshold = 2;
+UPDATE dsu_vt SET flag = true WHERE id = 4 AND flag IS NOT NULL;
+UPDATE dsu_vt SET flag = true WHERE id = 4 AND flag IS NOT NULL;
+UPDATE dsu_vt SET flag = true WHERE id = 4 AND flag IS NOT NULL;
+UPDATE dsu_vt SET flag = true WHERE id = 4 AND flag IS NOT NULL;
+SELECT state FROM dbblue_autoprepare_shapes(pg_backend_pid())
+  WHERE query LIKE 'UPDATE dsu_vt%IS NOT NULL%';
+UPDATE dsu_t SET flag = false WHERE flag;
+
+SET dbblue_safe_mode = on;
+EXECUTE dsu_wipe;
+SELECT dsu_wipe_fn();
+UPDATE dsu_vt SET flag = true WHERE id = 4 AND flag IS NOT NULL;
+SELECT count(*) FILTER (WHERE flag) AS changed, count(*) AS total FROM dsu_t;
+
+-- Switching it off again needs no re-check: the same statements run.
+SET dbblue_safe_mode = off;
+EXECUTE dsu_wipe;
+SELECT count(*) FILTER (WHERE flag) AS changed FROM dsu_t;
+UPDATE dsu_t SET flag = false WHERE flag;
+DEALLOCATE dsu_wipe;
+RESET dbblue_autoprepare_enabled;
+RESET compute_query_id;
+RESET dbblue_safe_mode;
+
 -- ---------- The error code ----------
 -- Every refusal reports SQLSTATE 0A000 (feature_not_supported), never an
 -- integrity-constraint code: psycopg2 turns class 23 into IntegrityError,
@@ -102,6 +139,7 @@ SELECT dsu_sqlstate('UPDATE dsu_acct SET bal = 0') AS no_where,
 RESET dbblue_safe_mode;
 
 -- cleanup
+DROP FUNCTION dsu_wipe_fn();
 DROP FUNCTION dsu_sqlstate(text);
 DROP VIEW dsu_vt;
 DROP TABLE dsu_t;

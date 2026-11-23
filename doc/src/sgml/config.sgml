@@ -10793,26 +10793,19 @@ HINT:  Add a WHERE clause selecting the rows to change, or ask a superuser to tu
         A <literal>WHERE</literal> clause that refers to the table's columns is
         accepted, as in <literal>UPDATE t SET ... FROM s WHERE t.id =
         s.id</literal>, and so is any <literal>WHERE</literal> clause containing
-        a subquery, whose result cannot be judged in advance.  So these are not
-        detected:
-        <itemizedlist>
-         <listitem>
-          <para>
-           a restriction that matches every row without reducing to a
-           constant, such as <literal>WHERE (SELECT 1) = 1</literal> or
-           <literal>WHERE id IS NOT NULL</literal> on a column that is never
-           null;
-          </para>
-         </listitem>
-         <listitem>
-          <para>
-           a statement prepared, or a plan cached (for example in a
-           <application>PL/pgSQL</application> function), in a session before
-           safe mode was turned on there: <command>EXECUTE</command> of such a
-           statement still runs.
-          </para>
-         </listitem>
-        </itemizedlist>
+        a subquery, whose result cannot be judged in advance.  So a restriction
+        that matches every row without reducing to a constant is not detected,
+        such as <literal>WHERE (SELECT 1) = 1</literal> or
+        <literal>WHERE id IS NOT NULL</literal> on a column that is never null.
+       </para>
+
+       <para>
+        Turning safe mode on, with <command>SET</command> or by changing the
+        configuration file and reloading it, invalidates the session's cached
+        plans: statements prepared with <command>PREPARE</command>, those
+        planned by <application>PL/pgSQL</application> functions, and those
+        cached by AutoPrepare.  They are checked again on their next use, so a
+        plan made while safe mode was off cannot run once it is on.
        </para>
 
        <para>

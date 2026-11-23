@@ -52,7 +52,9 @@
 #include "utils/backend_status.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
+#include "utils/guc_hooks.h"
 #include "utils/lsyscache.h"
+#include "utils/plancache.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
@@ -140,6 +142,32 @@ dbblue_safe_mode_check(const char *cmd, const char *restriction, Node *qual)
 					errhint("Use a %s selecting the rows to change, or ask a superuser to turn dbblue_safe_mode off.",
 							restriction));
 	}
+}
+
+/*
+ * assign_dbblue_safe_mode
+ *		GUC assign hook: when safe mode is switched on, invalidate this
+ *		session's cached plans.
+ *
+ * The guard runs when a statement is parsed and rewritten, which a cached
+ * plan skips on reuse, and nothing else invalidates a plan when this setting
+ * changes.  Without this, a plan cached while safe mode was off -- PREPARE,
+ * a PL/pgSQL statement, an AutoPrepare entry -- would keep running unchecked
+ * once it was on: in a superuser's session that switches it on, or in every
+ * running session (pooled Odoo connections included) when it is enabled in
+ * postgresql.conf and the configuration reloaded.  Invalidated plans are
+ * parsed and rewritten again on their next use, so both checks apply to them.
+ *
+ * ResetPlanCache() only marks plans invalid; it allocates nothing and cannot
+ * fail, as an assign hook must not.  Switching safe mode off needs nothing: a
+ * plan that passed the stricter check is still fine.  The hook runs before
+ * the variable is updated, so dbblue_safe_mode still holds the old value.
+ */
+void
+assign_dbblue_safe_mode(bool newval, void *extra)
+{
+	if (newval && !dbblue_safe_mode)
+		ResetPlanCache();
 }
 
 static Query *transformOptionalSelectInto(ParseState *pstate, Node *parseTree);
