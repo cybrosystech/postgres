@@ -123,6 +123,30 @@ RESET dbblue_autoprepare_enabled;
 RESET compute_query_id;
 RESET dbblue_safe_mode;
 
+-- ---------- Storing a statement is not running it ----------
+-- A rule action or a function body is only stored when it is created, so
+-- safe mode lets it be created (and restored by pg_restore) and checks it
+-- when it runs instead.
+SET dbblue_safe_mode = on;
+CREATE TABLE dsu_s (id int, v int);
+INSERT INTO dsu_s VALUES (1, 0), (2, 0);
+CREATE VIEW dsu_vs AS SELECT * FROM dsu_s;
+CREATE RULE dsu_vs_del AS ON DELETE TO dsu_vs DO INSTEAD DELETE FROM dsu_s;
+CREATE FUNCTION dsu_atomic() RETURNS void LANGUAGE sql
+  BEGIN ATOMIC UPDATE dsu_s SET v = 1; END;
+-- a string body, validated now because check_function_bodies is on
+CREATE FUNCTION dsu_string() RETURNS void LANGUAGE sql AS 'UPDATE dsu_s SET v = 1';
+-- ... but none of them can change every row
+DELETE FROM dsu_vs WHERE id = 1;
+SELECT dsu_atomic();
+SELECT dsu_string();
+SELECT count(*) AS rows_left, count(*) FILTER (WHERE v <> 0) AS changed FROM dsu_s;
+-- a failure while storing a body does not leave safe mode switched off
+CREATE FUNCTION dsu_broken() RETURNS void LANGUAGE sql
+  BEGIN ATOMIC UPDATE dsu_no_such_table SET v = 1; END;
+UPDATE dsu_s SET v = 1;
+RESET dbblue_safe_mode;
+
 -- ---------- The error code ----------
 -- Every refusal reports SQLSTATE 0A000 (feature_not_supported), never an
 -- integrity-constraint code: psycopg2 turns class 23 into IntegrityError,
@@ -139,6 +163,9 @@ SELECT dsu_sqlstate('UPDATE dsu_acct SET bal = 0') AS no_where,
 RESET dbblue_safe_mode;
 
 -- cleanup
+DROP VIEW dsu_vs;
+DROP FUNCTION dsu_atomic(), dsu_string();
+DROP TABLE dsu_s;
 DROP FUNCTION dsu_wipe_fn();
 DROP FUNCTION dsu_sqlstate(text);
 DROP VIEW dsu_vt;

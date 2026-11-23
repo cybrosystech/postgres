@@ -964,7 +964,17 @@ interpret_AS_clause(Oid languageOid, const char *languageName,
 
 				pstate->p_sourcetext = queryString;
 				sql_fn_parser_setup(pstate, pinfo);
-				q = transformStmt(pstate, stmt);
+				/* stored, not run: safe mode checks it when called */
+				dbblue_safe_mode_storing++;
+				PG_TRY();
+				{
+					q = transformStmt(pstate, stmt);
+				}
+				PG_FINALLY();
+				{
+					dbblue_safe_mode_storing--;
+				}
+				PG_END_TRY();
 				if (q->commandType == CMD_UTILITY)
 					ereport(ERROR,
 							errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -983,7 +993,17 @@ interpret_AS_clause(Oid languageOid, const char *languageName,
 
 			pstate->p_sourcetext = queryString;
 			sql_fn_parser_setup(pstate, pinfo);
-			q = transformStmt(pstate, sql_body_in);
+			/* stored, not run: safe mode checks it when called */
+			dbblue_safe_mode_storing++;
+			PG_TRY();
+			{
+				q = transformStmt(pstate, sql_body_in);
+			}
+			PG_FINALLY();
+			{
+				dbblue_safe_mode_storing--;
+			}
+			PG_END_TRY();
 			if (q->commandType == CMD_UTILITY)
 				ereport(ERROR,
 						errcode(ERRCODE_FEATURE_NOT_SUPPORTED),

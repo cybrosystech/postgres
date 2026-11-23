@@ -10778,15 +10778,18 @@ HINT:  Add a WHERE clause selecting the rows to change, or ask a superuser to tu
         <literal>WITH</literal> query
         (<literal>WITH d AS (DELETE FROM t RETURNING *) ...</literal>), under
         <command>EXPLAIN</command> with or without <literal>ANALYZE</literal>,
-        and in <command>PREPARE</command>.  A statement in a
-        <application>PL/pgSQL</application> function is checked when it runs,
-        so the function can be created but fails when called.  The body of a
-        SQL-language function (including a <literal>BEGIN ATOMIC</literal>
-        body, and when <xref linkend="guc-check-function-bodies"/> is on) and
-        of a rule is checked when it is created, so the
-        <command>CREATE FUNCTION</command> or <command>CREATE RULE</command>
-        itself is refused.  A statement that a rule rewrites into another one
-        is checked again after rewriting.
+        and in <command>PREPARE</command>.  A statement that a rule rewrites
+        into another one is checked again after rewriting.
+       </para>
+
+       <para>
+        A statement stored in a function or a rule is checked when it runs,
+        not when it is stored: storing it changes no rows.  So a
+        <application>PL/pgSQL</application> or SQL-language function (with a
+        <literal>BEGIN ATOMIC</literal> body or not) and a rule whose action
+        updates or deletes every row can be created, and restored by
+        <application>pg_restore</application>, while safe mode is on; calling
+        the function, or running a statement the rule rewrites, is refused.
        </para>
 
        <para>
@@ -10828,13 +10831,6 @@ HINT:  Add a WHERE clause selecting the rows to change, or ask a superuser to tu
            <command>TRUNCATE</command> on each table it has just created before
            loading it, so those loads fail.  Restore with
            <option>-j 1</option>, or as a role without safe mode.
-          </para>
-         </listitem>
-         <listitem>
-          <para>
-           Restoring a dump fails on any SQL-language function or rule whose
-           body updates or deletes without a restricting
-           <literal>WHERE</literal> clause.
           </para>
          </listitem>
         </itemizedlist>

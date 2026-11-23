@@ -32,6 +32,7 @@
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
+#include "parser/analyze.h"
 #include "parser/parse_coerce.h"
 #include "pgstat.h"
 #include "rewrite/rewriteHandler.h"
@@ -982,7 +983,17 @@ fmgr_sql_validator(PG_FUNCTION_ARGS)
 				 * that context.
 				 */
 				AcquireRewriteLocks(parsetree, true, false);
-				querytree_sublist = pg_rewrite_query(parsetree);
+				/* only validated here, not run: see dbblue_safe_mode_check() */
+				dbblue_safe_mode_storing++;
+				PG_TRY();
+				{
+					querytree_sublist = pg_rewrite_query(parsetree);
+				}
+				PG_FINALLY();
+				{
+					dbblue_safe_mode_storing--;
+				}
+				PG_END_TRY();
 				querytree_list = lappend(querytree_list, querytree_sublist);
 			}
 		}
@@ -1016,11 +1027,21 @@ fmgr_sql_validator(PG_FUNCTION_ARGS)
 					RawStmt    *parsetree = lfirst_node(RawStmt, lc);
 					List	   *querytree_sublist;
 
-					querytree_sublist = pg_analyze_and_rewrite_withcb(parsetree,
-																	  prosrc,
-																	  (ParserSetupHook) sql_fn_parser_setup,
-																	  pinfo,
-																	  NULL);
+					/* only validated here, not run: see dbblue_safe_mode_check() */
+					dbblue_safe_mode_storing++;
+					PG_TRY();
+					{
+						querytree_sublist = pg_analyze_and_rewrite_withcb(parsetree,
+																		  prosrc,
+																		  (ParserSetupHook) sql_fn_parser_setup,
+																		  pinfo,
+																		  NULL);
+					}
+					PG_FINALLY();
+					{
+						dbblue_safe_mode_storing--;
+					}
+					PG_END_TRY();
 					querytree_list = lappend(querytree_list,
 											 querytree_sublist);
 				}

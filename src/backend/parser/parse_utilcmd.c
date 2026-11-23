@@ -3391,8 +3391,21 @@ transformRuleStmt(RuleStmt *stmt, const char *queryString,
 			addNSItemToQuery(sub_pstate, oldnsitem, false, true, false);
 			addNSItemToQuery(sub_pstate, newnsitem, false, true, false);
 
-			/* Transform the rule action statement */
-			top_subqry = transformStmt(sub_pstate, action);
+			/*
+			 * Transform the rule action statement.  It is stored, not run,
+			 * so safe mode does not check it here; the rewriter's output is
+			 * checked when the rule is applied.
+			 */
+			dbblue_safe_mode_storing++;
+			PG_TRY();
+			{
+				top_subqry = transformStmt(sub_pstate, action);
+			}
+			PG_FINALLY();
+			{
+				dbblue_safe_mode_storing--;
+			}
+			PG_END_TRY();
 
 			/*
 			 * We cannot support utility-statement actions (eg NOTIFY) with

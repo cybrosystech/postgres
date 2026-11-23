@@ -73,6 +73,9 @@ post_parse_analyze_hook_type post_parse_analyze_hook = NULL;
 /* GUC: reject UPDATE/DELETE statements that have no WHERE clause */
 bool		dbblue_safe_mode = false;
 
+/* see analyze.h */
+int			dbblue_safe_mode_storing = 0;
+
 /*
  * dbblue_safe_mode_check
  *		Refuse a statement that would change every row of a table.
@@ -94,6 +97,14 @@ bool		dbblue_safe_mode = false;
  * sandbox against someone determined to do it deliberately; for that, do not
  * grant the privilege in the first place.
  *
+ * Nothing is checked while dbblue_safe_mode_storing is raised, i.e. while a
+ * statement is parsed to be stored -- a CREATE RULE action, a BEGIN ATOMIC
+ * body, a SQL function body being validated -- rather than run.  Storing it
+ * changes no rows, and refusing it would only make such objects impossible
+ * to create or restore (pg_restore would fail on them).  The statement is
+ * checked when it actually runs: a rule's action when the rewriter applies
+ * it, a function's statements when the function is called.
+ *
  * Every safe mode refusal reports ERRCODE_FEATURE_NOT_SUPPORTED, the code
  * PostgreSQL uses for valid statements it declines to run.  Not anything in
  * class 23 (integrity constraint violation): that describes bad data, and
@@ -106,7 +117,7 @@ bool		dbblue_safe_mode = false;
 void
 dbblue_safe_mode_check(const char *cmd, const char *restriction, Node *qual)
 {
-	if (!dbblue_safe_mode)
+	if (!dbblue_safe_mode || dbblue_safe_mode_storing > 0)
 		return;
 
 	if (qual == NULL)
@@ -511,7 +522,7 @@ dbblue_safe_mode_check_rewritten(Query *query)
 {
 	ListCell   *lc_cte;
 
-	if (!dbblue_safe_mode)
+	if (!dbblue_safe_mode || dbblue_safe_mode_storing > 0)
 		return;
 
 	/* Utility statements carry no row restriction to inspect. */

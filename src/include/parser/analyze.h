@@ -27,6 +27,14 @@ extern PGDLLIMPORT post_parse_analyze_hook_type post_parse_analyze_hook;
 /* GUC: reject UPDATE/DELETE statements that have no WHERE clause */
 extern PGDLLIMPORT bool dbblue_safe_mode;
 
+/*
+ * Above zero while a statement is parsed to be stored rather than run -- a
+ * rule action, a function body -- when safe mode's checks are skipped; see
+ * dbblue_safe_mode_check().  Raise and lower it in PG_TRY/PG_FINALLY, so an
+ * error while parsing cannot leave safe mode switched off for the session.
+ */
+extern PGDLLIMPORT int dbblue_safe_mode_storing;
+
 extern void dbblue_safe_mode_check(const char *cmd, const char *restriction,
 								   Node *qual);
 extern void dbblue_safe_mode_check_rewritten(Query *query);
