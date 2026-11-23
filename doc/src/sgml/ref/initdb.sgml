@@ -878,11 +878,12 @@ auto-tune: probing "shared_buffers" = 8GB ... ok
 
    <para>
     <varname>work_mem</varname> is computed for the
-    <xref linkend="guc-max-connections"/> that <command>initdb</command>
-    itself selects, normally 100, not for a value given with
-    <option>-c max_connections</option>.  If you allow many more
-    connections, lower <varname>work_mem</varname> to match, since each
-    connection may use it several times at once.
+    <xref linkend="guc-max-connections"/> the cluster will have: a value
+    given with <option>-c max_connections</option>, or otherwise the one
+    <command>initdb</command> selects, normally 100.  If you raise
+    <varname>max_connections</varname> later, lower
+    <varname>work_mem</varname> to match, since each connection may use it
+    several times at once.
    </para>
 
    <para>

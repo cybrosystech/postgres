@@ -1354,11 +1354,35 @@ apply_auto_tune(void)
 {
 	AutoTuneSettings s;
 	int			desired_buffers;
+	int			tune_connections = n_connections;
+	_stringlist *gnames,
+			   *gvalues;
 
 	if (!auto_tune_enabled)
 		return;
 
-	s = auto_tune_compute(n_connections);
+	/*
+	 * A max_connections given with -c replaces the probed one when
+	 * postgresql.conf is written, so size work_mem for it, not for the probed
+	 * value.  The last -c wins, as it does in the file.
+	 */
+	for (gnames = extra_guc_names, gvalues = extra_guc_values;
+		 gnames != NULL;
+		 gnames = gnames->next, gvalues = gvalues->next)
+	{
+		char	   *end;
+		long		val;
+
+		if (pg_strcasecmp(gnames->str, "max_connections") != 0)
+			continue;
+		errno = 0;
+		val = strtol(gvalues->str, &end, 10);
+		if (errno == 0 && end != gvalues->str && *end == '\0' &&
+			val > 0 && val <= INT_MAX)
+			tune_connections = (int) val;
+	}
+
+	s = auto_tune_compute(tune_connections);
 	if (!s.valid)
 	{
 		printf(_("auto-tune: could not detect host specs, using upstream defaults\n"));
