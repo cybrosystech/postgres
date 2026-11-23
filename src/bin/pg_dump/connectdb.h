@@ -21,6 +21,7 @@ extern PGconn *ConnectDatabase(const char *dbname, const char *connection_string
 							   const char *pgport, const char *pguser,
 							   trivalue prompt_password, bool fail_on_error,
 							   const char *progname, const char **connstr, int *server_version,
-							   char *password, char *override_dbname);
+							   char *password, char *override_dbname,
+							   char **conn_error);
 extern PGresult *executeQuery(PGconn *conn, const char *query);
 #endif							/* CONNECTDB_H */

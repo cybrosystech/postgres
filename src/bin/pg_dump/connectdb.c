@@ -30,7 +30,9 @@ static char *constructConnStr(const char **keywords, const char **values);
  * interactive password prompt is automatically issued if required.
  *
  * If fail_on_error is false, we return NULL without printing any message
- * on failure, but preserve any prompted password for the next try.
+ * on failure, but preserve any prompted password for the next try.  If
+ * conn_error is not NULL, the server's error message is then returned there,
+ * malloc'd, for the caller to report as it sees fit.
  *
  * On success, the 'connstr' is set to a connection string containing
  * the options used and 'server_version' is set to version so that caller
@@ -41,7 +43,7 @@ ConnectDatabase(const char *dbname, const char *connection_string,
 				const char *pghost, const char *pgport, const char *pguser,
 				trivalue prompt_password, bool fail_on_error, const char *progname,
 				const char **connstr, int *server_version, char *password,
-				char *override_dbname)
+				char *override_dbname, char **conn_error)
 {
 	PGconn	   *conn;
 	bool		new_pass;
@@ -174,6 +176,8 @@ ConnectDatabase(const char *dbname, const char *connection_string,
 			pg_fatal("%s", PQerrorMessage(conn));
 		else
 		{
+			if (conn_error)
+				*conn_error = pg_strdup(PQerrorMessage(conn));
 			PQfinish(conn);
 
 			free(keywords);

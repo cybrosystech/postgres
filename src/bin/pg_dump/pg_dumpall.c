@@ -518,7 +518,8 @@ main(int argc, char *argv[])
 	{
 		conn = ConnectDatabase(pgdb, connstr, pghost, pgport, pguser,
 							   prompt_password, false,
-							   progname, &connstr, &server_version, NULL, NULL);
+							   progname, &connstr, &server_version, NULL, NULL,
+							   NULL);
 
 		if (!conn)
 			pg_fatal("could not connect to database \"%s\"", pgdb);
@@ -527,11 +528,13 @@ main(int argc, char *argv[])
 	{
 		conn = ConnectDatabase("postgres", connstr, pghost, pgport, pguser,
 							   prompt_password, false,
-							   progname, &connstr, &server_version, NULL, NULL);
+							   progname, &connstr, &server_version, NULL, NULL,
+							   NULL);
 		if (!conn)
 			conn = ConnectDatabase("template1", connstr, pghost, pgport, pguser,
 								   prompt_password, true,
-								   progname, &connstr, &server_version, NULL, NULL);
+								   progname, &connstr, &server_version, NULL, NULL,
+								   NULL);
 
 		if (!conn)
 		{

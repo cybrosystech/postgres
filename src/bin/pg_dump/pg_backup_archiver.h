@@ -429,7 +429,7 @@ extern void WriteToc(ArchiveHandle *AH);
 extern void ReadToc(ArchiveHandle *AH);
 extern void WriteDataChunks(ArchiveHandle *AH, struct ParallelState *pstate);
 extern void WriteDataChunksForTocEntry(ArchiveHandle *AH, TocEntry *te);
-extern ArchiveHandle *CloneArchive(ArchiveHandle *AH);
+extern ArchiveHandle *CloneArchive(ArchiveHandle *AH, char **conn_error);
 extern void DeCloneArchive(ArchiveHandle *AH);
 
 extern int	TocIDRequired(ArchiveHandle *AH, DumpId id);

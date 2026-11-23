@@ -75,6 +75,7 @@ main(int argc, char **argv)
 	int			c;
 	int			exit_code;
 	int			numWorkers = 0;	/* 0 means "-j not given"; see below */
+	bool		auto_jobs;		/* did we choose numWorkers ourselves? */
 	Archive    *AH;
 	char	   *inputFileSpec;
 	bool		data_only = false;
@@ -552,6 +553,7 @@ main(int argc, char **argv)
 	 *
 	 * An explicit -j is always obeyed, including "-j 1".
 	 */
+	auto_jobs = (numWorkers == 0);
 	if (numWorkers == 0)
 	{
 		ArchiveHandle *AHX = (ArchiveHandle *) AH;
@@ -576,6 +578,7 @@ main(int argc, char **argv)
 	}
 
 	AH->numWorkers = numWorkers;
+	AH->numWorkersAuto = auto_jobs;
 
 	if (opts->tocSummary)
 		PrintTOCSummary(AH);

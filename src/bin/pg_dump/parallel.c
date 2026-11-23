@@ -831,6 +831,8 @@ static void
 RunWorker(ArchiveHandle *AH, ParallelSlot *slot)
 {
 	int			pipefd[2];
+	ArchiveHandle *clone;
+	char	   *conn_error = NULL;
 
 	/* fetch child ends of pipes */
 	pipefd[PIPE_READ] = slot->pipeRevRead;
@@ -844,8 +846,24 @@ RunWorker(ArchiveHandle *AH, ParallelSlot *slot)
 	 * need to because fork() gives us a copy in our own address space
 	 * already.  But CloneArchive resets the state information and also clones
 	 * the database connection which both seem kinda helpful.
+	 *
+	 * In a restore, failing to connect is not fatal: the server may simply be
+	 * short of connection slots (max_connections, a role's or database's
+	 * CONNECTION LIMIT).  Tell the leader why instead, and stop; it carries
+	 * on without us.  See the handshake in ParallelBackupStart().  A parallel
+	 * dump keeps the old behaviour and dies.
 	 */
-	AH = CloneArchive(AH);
+	clone = CloneArchive(AH, AH->mode == archModeRead ? &conn_error : NULL);
+	if (clone == NULL)
+	{
+		char	   *msg = psprintf("NOCONN %s", conn_error ? conn_error : "");
+
+		sendMessageToLeader(pipefd, msg);
+		free(msg);
+		free(conn_error);
+		return;
+	}
+	AH = clone;
 
 	/* Remember cloned archive where signal handler can find it */
 	set_cancel_slot_archive(slot, AH);
@@ -854,6 +872,9 @@ RunWorker(ArchiveHandle *AH, ParallelSlot *slot)
 	 * Call the setup worker function that's defined in the ArchiveHandle.
 	 */
 	(AH->SetupWorkerPtr) ((Archive *) AH);
+
+	/* Tell the leader we are connected and ready for work. */
+	sendMessageToLeader(pipefd, "READY");
 
 	/*
 	 * Execute commands until done.
@@ -891,6 +912,36 @@ init_spawned_worker_win32(WorkerInfo *wi)
 #endif							/* WIN32 */
 
 /*
+ * Retire a worker that reported at startup that it could not connect (or
+ * exited before reporting): close the leader's ends of its pipes, reap it,
+ * and mark it WRKR_TERMINATED so that no work is ever dispatched to it.
+ * The worker has already exited, or is about to, so the wait is short.
+ */
+static void
+RetireUnstartedWorker(ParallelState *pstate, int i)
+{
+	ParallelSlot *slot = &(pstate->parallelSlot[i]);
+
+	closesocket(slot->pipeRead);
+	closesocket(slot->pipeWrite);
+	slot->pipeRead = -1;
+	slot->pipeWrite = -1;
+
+#ifndef WIN32
+	if (slot->pid > 0)
+		(void) waitpid(slot->pid, NULL, 0);
+	slot->pid = 0;
+#else
+	WaitForSingleObject((HANDLE) slot->hThread, INFINITE);
+	CloseHandle((HANDLE) slot->hThread);
+	slot->hThread = (uintptr_t) INVALID_HANDLE_VALUE;
+#endif
+
+	slot->workerStatus = WRKR_TERMINATED;
+	pstate->te[i] = NULL;
+}
+
+/*
  * This function starts a parallel dump or restore by spawning off the worker
  * processes.  For Windows, it creates a number of threads; on Unix the
  * workers are created with fork().
@@ -906,6 +957,7 @@ ParallelBackupStart(ArchiveHandle *AH)
 	pstate = pg_malloc_object(ParallelState);
 
 	pstate->numWorkers = AH->public.numWorkers;
+	pstate->numReady = 0;
 	pstate->te = NULL;
 	pstate->parallelSlot = NULL;
 
@@ -1041,6 +1093,57 @@ ParallelBackupStart(ArchiveHandle *AH)
 #endif
 
 	/*
+	 * Wait for every worker to report that it has connected, before any work
+	 * is handed out.  In a restore, a worker that could not connect is
+	 * retired and the restore goes on with the others; if none connected,
+	 * the caller finishes the restore serially (see RestoreArchive()).
+	 * Because nothing has been dispatched yet, losing a worker here costs
+	 * nothing but parallelism.  Without this, the first worker refused a
+	 * connection would abort the restore after the schema had been created
+	 * and committed, leaving a database of empty tables.
+	 */
+	{
+		int			nfailed = 0;
+		char	   *first_error = NULL;
+
+		for (i = 0; i < pstate->numWorkers; i++)
+		{
+			char	   *msg = readMessageFromPipe(pstate->parallelSlot[i].pipeRead);
+
+			if (msg != NULL && strcmp(msg, "READY") == 0)
+			{
+				pstate->numReady++;
+				free(msg);
+				continue;
+			}
+
+			/* A parallel dump has no fallback: keep the old behaviour. */
+			if (AH->mode != archModeRead)
+				pg_fatal("a worker process died unexpectedly");
+
+			if (first_error == NULL)
+				first_error = pg_strdup(msg != NULL && strncmp(msg, "NOCONN ", 7) == 0 ?
+										msg + 7 : _("worker process exited unexpectedly\n"));
+			free(msg);
+			nfailed++;
+			RetireUnstartedWorker(pstate, i);
+		}
+
+		if (nfailed > 0)
+		{
+			if (pstate->numReady > 0)
+				pg_log_warning(ngettext("could not open a connection for %d of %d parallel jobs; continuing with %d",
+										"could not open connections for %d of %d parallel jobs; continuing with %d",
+										nfailed),
+							   nfailed, pstate->numWorkers, pstate->numReady);
+			else
+				pg_log_warning("could not open a connection for any parallel job; continuing without parallelism");
+			pg_log_warning_detail("%s", first_error);
+			free(first_error);
+		}
+	}
+
+	/*
 	 * Re-establish query cancellation on the leader connection.
 	 */
 	set_archive_cancel_info(AH, AH->connection);
@@ -1074,6 +1177,9 @@ ParallelBackupEnd(ArchiveHandle *AH, ParallelState *pstate)
 	/* Close the sockets so that the workers know they can exit */
 	for (i = 0; i < pstate->numWorkers; i++)
 	{
+		/* a worker retired at startup has had its sockets closed already */
+		if (pstate->parallelSlot[i].workerStatus == WRKR_TERMINATED)
+			continue;
 		closesocket(pstate->parallelSlot[i].pipeRead);
 		closesocket(pstate->parallelSlot[i].pipeWrite);
 	}
@@ -1267,6 +1373,10 @@ HasEveryWorkerTerminated(ParallelState *pstate)
 
 /*
  * Return true iff every worker is in the WRKR_IDLE state.
+ *
+ * Workers retired at startup (WRKR_TERMINATED, see RetireUnstartedWorker())
+ * are not counted.  A worker that dies later is never seen here as
+ * WRKR_TERMINATED: ListenToWorkers() treats that as fatal.
  */
 bool
 IsEveryWorkerIdle(ParallelState *pstate)
@@ -1275,7 +1385,9 @@ IsEveryWorkerIdle(ParallelState *pstate)
 
 	for (i = 0; i < pstate->numWorkers; i++)
 	{
-		if (pstate->parallelSlot[i].workerStatus != WRKR_IDLE)
+		T_WorkerStatus status = pstate->parallelSlot[i].workerStatus;
+
+		if (status != WRKR_IDLE && status != WRKR_TERMINATED)
 			return false;
 	}
 	return true;

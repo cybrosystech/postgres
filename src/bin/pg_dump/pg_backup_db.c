@@ -110,6 +110,22 @@ ConnectDatabaseAhx(Archive *AHX,
 				   const ConnParams *cparams,
 				   bool isReconnect)
 {
+	(void) TryConnectDatabaseAhx(AHX, cparams, isReconnect, NULL);
+}
+
+/*
+ * Like ConnectDatabaseAhx(), but if conn_error is not NULL a failure to
+ * connect is not fatal: return false with the server's message, malloc'd, in
+ * *conn_error.  A parallel restore worker uses this so that a server that is
+ * short of connection slots costs it a worker rather than the whole restore.
+ * Anything that goes wrong after the connection is made is still fatal.
+ */
+bool
+TryConnectDatabaseAhx(Archive *AHX,
+					  const ConnParams *cparams,
+					  bool isReconnect,
+					  char **conn_error)
+{
 	ArchiveHandle *AH = (ArchiveHandle *) AHX;
 	trivalue	prompt_password;
 	char	   *password;
@@ -127,8 +143,15 @@ ConnectDatabaseAhx(Archive *AHX,
 
 	AH->connection = ConnectDatabase(cparams->dbname, NULL, cparams->pghost,
 									 cparams->pgport, cparams->username,
-									 prompt_password, true,
-									 progname, NULL, NULL, password, cparams->override_dbname);
+									 prompt_password, conn_error == NULL,
+									 progname, NULL, NULL, password, cparams->override_dbname,
+									 conn_error);
+	if (AH->connection == NULL)
+	{
+		if (password && password != AH->savedPassword)
+			free(password);
+		return false;
+	}
 
 	/* Start strict; later phases may override this. */
 	PQclear(ExecuteSqlQueryForSingleRow((Archive *) AH,
@@ -154,6 +177,8 @@ ConnectDatabaseAhx(Archive *AHX,
 
 	/* arrange for SIGINT to issue a query cancel on this connection */
 	set_archive_cancel_info(AH, AH->connection);
+
+	return true;
 }
 
 /*

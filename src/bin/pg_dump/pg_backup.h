@@ -238,6 +238,7 @@ typedef struct Archive
 	int			maxRemoteVersion;
 
 	int			numWorkers;		/* number of parallel processes */
+	bool		numWorkersAuto; /* numWorkers chosen by pg_restore, not -j */
 	char	   *sync_snapshot_id;	/* sync snapshot id for parallel operation */
 
 	/* info needed for string escaping */
@@ -298,6 +299,10 @@ typedef void (*SetupWorkerPtrType) (Archive *AH);
 extern void ConnectDatabaseAhx(Archive *AHX,
 							   const ConnParams *cparams,
 							   bool isReconnect);
+extern bool TryConnectDatabaseAhx(Archive *AHX,
+								  const ConnParams *cparams,
+								  bool isReconnect,
+								  char **conn_error);
 extern void DisconnectDatabase(Archive *AHX);
 extern PGconn *GetConnection(Archive *AHX);
 

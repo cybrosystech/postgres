@@ -99,6 +99,9 @@ static void restore_toc_entries_parallel(ArchiveHandle *AH,
 										 TocEntry *pending_list);
 static void restore_toc_entries_postfork(ArchiveHandle *AH,
 										 TocEntry *pending_list);
+static void restore_toc_entries_serial_fallback(ArchiveHandle *AH,
+												TocEntry *pending_list);
+static int	connections_available_to_workers(ArchiveHandle *AH);
 static void pending_list_header_init(TocEntry *l);
 static void pending_list_append(TocEntry *l, TocEntry *te);
 static void pending_list_remove(TocEntry *te);
@@ -424,6 +427,32 @@ RestoreArchive(Archive *AHX)
 		 * obscure SQL when displaying errors
 		 */
 		AH->noTocComments = 1;
+
+		/*
+		 * When pg_restore chose the number of jobs itself (no -j), fit it to
+		 * the connections the server can actually give the workers, keeping
+		 * half of them for everyone else: a restore the user did not ask to
+		 * run in parallel must not be what fills max_connections, or the
+		 * role's or database's CONNECTION LIMIT, on a live server.  Workers
+		 * that still cannot connect are handled in ParallelBackupStart().
+		 */
+		if (parallel_mode && AH->public.numWorkersAuto)
+		{
+			int			avail = connections_available_to_workers(AH);
+			int			jobs = Max(avail / 2, 1);
+
+			if (avail >= 0 && jobs < AH->public.numWorkers)
+			{
+				if (jobs > 1)
+					fprintf(stderr, _("%s: only %d database connections are available; restoring with %d parallel jobs instead\n"),
+							progname, avail, jobs);
+				else
+					fprintf(stderr, _("%s: no spare database connections are available; restoring without parallel jobs instead\n"),
+							progname);
+				AH->public.numWorkers = jobs;
+				parallel_mode = (jobs > 1);
+			}
+		}
 	}
 
 	/*
@@ -738,13 +767,25 @@ RestoreArchive(Archive *AHX)
 		restore_toc_entries_prefork(AH, &pending_list);
 		Assert(AH->connection == NULL);
 
-		/* ParallelBackupStart() will actually fork the processes */
+		/*
+		 * ParallelBackupStart() will actually fork the processes, and waits
+		 * until each has connected or given up.
+		 */
 		pstate = ParallelBackupStart(AH);
-		restore_toc_entries_parallel(AH, pstate, &pending_list);
-		ParallelBackupEnd(AH, pstate);
+		if (pstate->numReady > 0)
+		{
+			restore_toc_entries_parallel(AH, pstate, &pending_list);
+			ParallelBackupEnd(AH, pstate);
 
-		/* reconnect the leader and see if we missed something */
-		restore_toc_entries_postfork(AH, &pending_list);
+			/* reconnect the leader and see if we missed something */
+			restore_toc_entries_postfork(AH, &pending_list);
+		}
+		else
+		{
+			/* No worker could connect: the leader does the rest itself. */
+			ParallelBackupEnd(AH, pstate);
+			restore_toc_entries_serial_fallback(AH, &pending_list);
+		}
 		Assert(AH->connection != NULL);
 	}
 	else
@@ -4648,6 +4689,119 @@ restore_toc_entries_postfork(ArchiveHandle *AH, TocEntry *pending_list)
 }
 
 /*
+ * Finish a parallel restore in which no worker could connect.
+ *
+ * restore_toc_entries_prefork() has restored the pre-data items and dropped
+ * the leader's connection; everything else is on pending_list, in archive
+ * order.  Reconnect and restore it the way a serial restore would: archive
+ * order, which respects dependencies, one restore pass at a time (main, then
+ * ACLs, then post-ACL items such as materialized view refreshes).
+ */
+static void
+restore_toc_entries_serial_fallback(ArchiveHandle *AH, TocEntry *pending_list)
+{
+	RestoreOptions *ropt = AH->public.ropt;
+	TocEntry   *te;
+
+	pg_log_debug("entering restore_toc_entries_serial_fallback");
+
+	ConnectDatabaseAhx((Archive *) AH, &ropt->cparams, true);
+
+	/* re-establish fixed state */
+	_doSetFixedOutputState(AH);
+
+	for (int pass = RESTORE_PASS_MAIN; pass <= RESTORE_PASS_LAST; pass++)
+	{
+		for (te = pending_list->pending_next; te != pending_list; te = te->pending_next)
+		{
+			if ((te->reqs & (REQ_SCHEMA | REQ_DATA | REQ_STATS)) != 0 &&
+				_tocEntryRestorePass(te) == pass)
+				(void) restore_toc_entry(AH, te, false);
+		}
+	}
+}
+
+/*
+ * How many connections parallel workers could open right now, counting the
+ * slot the leader frees when it disconnects before forking them.  This is
+ * the smallest headroom among the server's max_connections (less the slots
+ * reserved for superusers and, from v16, for pg_use_reserved_connections),
+ * the role's CONNECTION LIMIT and the database's, as each is enforced for
+ * this session's role.  Returns -1 if it cannot be determined (an old server,
+ * or the query failed), in which case the caller leaves the job count alone.
+ *
+ * Under --create the leader is connected to a maintenance database, not the
+ * one the workers will use, so that database's limit is not checked.
+ *
+ * Only client backends use these slots, but pg_stat_activity hides
+ * backend_type for other roles' sessions unless we are a superuser or in
+ * pg_read_all_stats, which a typical restoring role is not.  So a row whose
+ * backend_type is hidden counts if it has a user; that may include another
+ * role's background workers, which only errs towards fewer jobs.
+ */
+static int
+connections_available_to_workers(ArchiveHandle *AH)
+{
+	PQExpBuffer q;
+	PGresult   *res;
+	int			avail = -1;
+
+	/* backend_type, used to count only client backends, is new in v10 */
+	if (AH->public.remoteVersion < 100000)
+		return -1;
+
+	q = createPQExpBuffer();
+	appendPQExpBufferStr(q,
+						 "SELECT current_setting('max_connections')::pg_catalog.int4"
+						 " - CASE WHEN r.rolsuper THEN 0 ELSE current_setting('superuser_reserved_connections')::pg_catalog.int4 END");
+	if (AH->public.remoteVersion >= 160000)
+		appendPQExpBufferStr(q,
+							 " - CASE WHEN r.rolsuper OR pg_catalog.pg_has_role('pg_use_reserved_connections', 'USAGE')"
+							 " THEN 0 ELSE current_setting('reserved_connections')::pg_catalog.int4 END");
+#define CLIENT_BACKEND_SQL \
+	"(a.backend_type = 'client backend' OR (a.backend_type IS NULL AND a.usesysid IS NOT NULL))"
+	appendPQExpBufferStr(q,
+						 " - (SELECT pg_catalog.count(*) FROM pg_catalog.pg_stat_activity a"
+						 "    WHERE " CLIENT_BACKEND_SQL "),"
+						 " CASE WHEN r.rolsuper OR r.rolconnlimit < 0 THEN NULL"
+						 "  ELSE r.rolconnlimit - (SELECT pg_catalog.count(*) FROM pg_catalog.pg_stat_activity a"
+						 "   WHERE a.usesysid = r.oid AND " CLIENT_BACKEND_SQL ") END,"
+						 " CASE WHEN r.rolsuper OR d.datconnlimit < 0 THEN NULL"
+						 "  ELSE d.datconnlimit - (SELECT pg_catalog.count(*) FROM pg_catalog.pg_stat_activity a"
+						 "   WHERE a.datid = d.oid AND " CLIENT_BACKEND_SQL ") END"
+						 " FROM pg_catalog.pg_roles r, pg_catalog.pg_database d"
+						 " WHERE r.rolname = session_user AND d.datname = pg_catalog.current_database()");
+#undef CLIENT_BACKEND_SQL
+
+	res = PQexec(AH->connection, q->data);
+	if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1)
+	{
+		int			ncols = AH->public.ropt->createDB ? 2 : 3;
+		bool		found = false;
+
+		for (int i = 0; i < ncols; i++)
+		{
+			int			free_now;
+
+			if (PQgetisnull(res, 0, i))
+				continue;		/* no such limit */
+			/* +1: the leader's own slot is freed before the workers start */
+			free_now = atoi(PQgetvalue(res, 0, i)) + 1;
+			if (!found || free_now < avail)
+				avail = free_now;
+			found = true;
+		}
+		/* over a limit already (it can be lowered under live sessions) */
+		if (found && avail < 0)
+			avail = 0;
+	}
+	PQclear(res);
+	destroyPQExpBuffer(q);
+
+	return avail;
+}
+
+/*
  * Check if te1 has an exclusive lock requirement for an item that te2 also
  * requires, whether or not te2's requirement is for an exclusive lock.
  */
@@ -5201,7 +5355,7 @@ inhibit_data_for_failed_table(ArchiveHandle *AH, TocEntry *te)
  * conflict between different threads each with their own clone.
  */
 ArchiveHandle *
-CloneArchive(ArchiveHandle *AH)
+CloneArchive(ArchiveHandle *AH, char **conn_error)
 {
 	ArchiveHandle *clone;
 
@@ -5243,9 +5397,18 @@ CloneArchive(ArchiveHandle *AH)
 
 	/*
 	 * Connect our new clone object to the database, using the same connection
-	 * parameters used for the original connection.
+	 * parameters used for the original connection.  If conn_error is given, a
+	 * failure to connect returns NULL with the server's message there instead
+	 * of exiting; see RunWorker().
 	 */
-	ConnectDatabaseAhx((Archive *) clone, &clone->public.ropt->cparams, true);
+	if (!TryConnectDatabaseAhx((Archive *) clone, &clone->public.ropt->cparams,
+							   true, conn_error))
+	{
+		free(clone->savedPassword);
+		free(clone->public.ropt);
+		free(clone);
+		return NULL;
+	}
 
 	/* re-establish fixed state */
 	if (AH->mode == archModeRead)

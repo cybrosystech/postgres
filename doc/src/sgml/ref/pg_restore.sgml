@@ -343,12 +343,41 @@ pg_restore: restoring with 8 parallel jobs; use -j/--jobs to choose a different 
         </itemizedlist>
         An explicit value is always used as given, including
         <option>-j 1</option>, which restores
-        <productname>PostgreSQL</productname>'s behavior.  Because each job
-        opens its own connection, the automatic choice can use up to 9
-        connections per <application>pg_restore</application> run (8 jobs
-        plus the leader); specify a smaller value when the server's
-        <xref linkend="guc-max-connections"/> is low or when several
-        restores run at the same time.
+        <productname>PostgreSQL</productname>'s behavior.
+       </para>
+
+       <para>
+        Each job opens its own connection.  When it chooses the number of
+        jobs itself, <application>pg_restore</application> also fits it to
+        the connections the server can give it, using at most half of those
+        free so that other sessions keep the rest.  It counts the free slots
+        of <xref linkend="guc-max-connections"/> (less those reserved by
+        <xref linkend="guc-superuser-reserved-connections"/> and
+        <xref linkend="guc-reserved-connections"/>), and the
+        <literal>CONNECTION LIMIT</literal> of the role and, unless
+        <option>--create</option> is used, of the database.  It reports a
+        reduction, for example:
+<screen>
+pg_restore: only 4 database connections are available; restoring with 2 parallel jobs instead
+</screen>
+        A role that is not a superuser or a member of
+        <literal>pg_read_all_stats</literal> cannot tell other roles' client
+        sessions from their background workers, and counts both, so the
+        estimate may be lower than the true number of free slots.
+       </para>
+
+       <para>
+        Whether chosen automatically or given with <option>-j</option>, a job
+        that cannot connect, for example because the server or the role has
+        run out of connection slots, does not abort the restore.  The jobs
+        connect before any data is restored; a job that fails is dropped
+        with a warning that includes the server's message, and the restore
+        continues with the jobs that did connect, or without parallelism if
+        none did:
+<screen>
+pg_restore: warning: could not open connections for 4 of 8 parallel jobs; continuing with 4
+pg_restore: detail: connection to server on socket "/tmp/.s.PGSQL.5432" failed: FATAL:  too many connections for role "odoo"
+</screen>
        </para>
 
        <para>

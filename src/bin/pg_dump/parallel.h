@@ -55,6 +55,8 @@ typedef struct ParallelSlot ParallelSlot;
 typedef struct ParallelState
 {
 	int			numWorkers;		/* allowed number of workers */
+	int			numReady;		/* workers that connected; the others were
+								 * retired at startup (restore only) */
 	/* these arrays have numWorkers entries, one per worker: */
 	TocEntry  **te;				/* item being worked on, or NULL */
 	ParallelSlot *parallelSlot; /* private info about each worker */
