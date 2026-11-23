@@ -2024,7 +2024,7 @@ ExecuteTruncate(TruncateStmt *stmt)
 	 */
 	if (dbblue_safe_mode)
 		ereport(ERROR,
-				errcode(ERRCODE_RESTRICT_VIOLATION),
+				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				errmsg("TRUNCATE is not allowed because dbblue_safe_mode is enabled"),
 				errdetail("TRUNCATE always removes every row of a table."),
 				errhint("Use DELETE with a WHERE clause selecting the rows to remove, or ask a superuser to turn dbblue_safe_mode off."));

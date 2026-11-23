@@ -10713,8 +10713,9 @@ dbblue_fillfactor_map = 'res.partner:70, stock.move:75, account.move.line:80'
 <programlisting>
 ALTER ROLE analyst SET dbblue_safe_mode = on;
 </programlisting>
-        A refused statement fails with SQLSTATE <literal>23001</literal>
-        (<literal>restrict_violation</literal>), for example:
+        A refused statement fails with SQLSTATE <literal>0A000</literal>
+        (<literal>feature_not_supported</literal>), not an integrity-constraint
+        code, so clients do not report it as invalid data; for example:
 <screen>
 ERROR:  DELETE requires a WHERE clause because dbblue_safe_mode is enabled
 DETAIL:  Safe mode refuses statements that would change every row of a table.

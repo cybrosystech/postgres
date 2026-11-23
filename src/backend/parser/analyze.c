@@ -91,6 +91,15 @@ bool		dbblue_safe_mode = false;
  * gets past.  This is a guard against changing every row by accident, not a
  * sandbox against someone determined to do it deliberately; for that, do not
  * grant the privilege in the first place.
+ *
+ * Every safe mode refusal reports ERRCODE_FEATURE_NOT_SUPPORTED, the code
+ * PostgreSQL uses for valid statements it declines to run.  Not anything in
+ * class 23 (integrity constraint violation): that describes bad data, and
+ * 23001 in particular is what a foreign key's ON DELETE RESTRICT raises.
+ * Clients act on the class -- psycopg2 raises IntegrityError for it, which
+ * Odoo shows as a validation error and logs without a traceback, and which
+ * code catching IntegrityError for its own constraint cases silently
+ * swallows -- so a refused statement must not look like one.
  */
 void
 dbblue_safe_mode_check(const char *cmd, const char *restriction, Node *qual)
@@ -100,7 +109,7 @@ dbblue_safe_mode_check(const char *cmd, const char *restriction, Node *qual)
 
 	if (qual == NULL)
 		ereport(ERROR,
-				errcode(ERRCODE_RESTRICT_VIOLATION),
+				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				errmsg("%s requires a %s because dbblue_safe_mode is enabled",
 					   cmd, restriction),
 				errdetail("Safe mode refuses statements that would change every row of a table."),
@@ -123,7 +132,7 @@ dbblue_safe_mode_check(const char *cmd, const char *restriction, Node *qual)
 		 */
 		if (!con->constisnull && DatumGetBool(con->constvalue))
 			ereport(ERROR,
-					errcode(ERRCODE_RESTRICT_VIOLATION),
+					errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					errmsg("%s with an always-true %s is not allowed because dbblue_safe_mode is enabled",
 						   cmd, restriction),
 					errdetail("The %s reduces to true, so the statement would change every row of a table.",
@@ -460,7 +469,7 @@ dbblue_safe_mode_reject_unreached(Query *query, const char *cmd,
 	const char *relname = get_rel_name(rte->relid);
 
 	ereport(ERROR,
-			errcode(ERRCODE_RESTRICT_VIOLATION),
+			errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 			errmsg("%s would change every row of \"%s\" because dbblue_safe_mode is enabled",
 				   cmd, relname ? relname : "?"),
 			errdetail("The %s does not refer to \"%s\", so it cannot select which of its rows are changed.",

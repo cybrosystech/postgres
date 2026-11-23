@@ -71,7 +71,27 @@ SELECT count(*) FILTER (WHERE flag) AS changed, count(*) AS total FROM dsu_t;
 RESET dbblue_autoprepare_enabled;
 RESET compute_query_id;
 RESET dbblue_safe_mode;
+-- ---------- The error code ----------
+-- Every refusal reports SQLSTATE 0A000 (feature_not_supported), never an
+-- integrity-constraint code: psycopg2 turns class 23 into IntegrityError,
+-- which Odoo shows as a validation error and logs without a traceback.
+CREATE FUNCTION dsu_sqlstate(stmt text) RETURNS text LANGUAGE plpgsql AS
+  $$ BEGIN EXECUTE stmt; RETURN 'no error'; EXCEPTION WHEN OTHERS THEN RETURN SQLSTATE; END $$;
+SET dbblue_safe_mode = on;
+SELECT dsu_sqlstate('UPDATE dsu_acct SET bal = 0') AS no_where,
+       dsu_sqlstate('UPDATE dsu_acct SET bal = 0 WHERE true') AS always_true,
+       dsu_sqlstate('DELETE FROM dsu_acct WHERE false') AS not_referring,
+       dsu_sqlstate('MERGE INTO dsu_acct USING (VALUES (1)) v(id) ON true WHEN MATCHED THEN DELETE') AS merge,
+       dsu_sqlstate('TRUNCATE dsu_acct') AS truncate,
+       dsu_sqlstate('UPDATE dsu_acct SET bal = bal WHERE id = 1') AS restricted;
+ no_where | always_true | not_referring | merge | truncate | restricted 
+----------+-------------+---------------+-------+----------+------------
+ 0A000    | 0A000       | 0A000         | 0A000 | 0A000    | no error
+(1 row)
+
+RESET dbblue_safe_mode;
 -- cleanup
+DROP FUNCTION dsu_sqlstate(text);
 DROP VIEW dsu_vt;
 DROP TABLE dsu_t;
 DROP VIEW dsu_vacct;
