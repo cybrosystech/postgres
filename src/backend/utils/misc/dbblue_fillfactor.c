@@ -38,7 +38,12 @@ char	   *dbblue_fillfactor_map = NULL;
 /* ----------------------------------------------------------------
  *  Parsed map
  * ---------------------------------------------------------------- */
-#define DBBLUE_FF_KEYLEN  128		/* max table-name length */
+/*
+ * A table name is at most NAMEDATALEN - 1 bytes: the parser truncates longer
+ * identifiers before CREATE TABLE sees them, so a longer map entry could never
+ * match a table and is rejected instead.
+ */
+#define DBBLUE_FF_KEYLEN  NAMEDATALEN
 
 typedef struct
 {
@@ -152,13 +157,25 @@ parse_fillfactor_map(const char *mapstr, DbblueFFMap *map, int *nentries,
 		while (namelen > 0 && isspace((unsigned char) token[namelen - 1]))
 			namelen--;
 
-		if (namelen == 0 || namelen >= DBBLUE_FF_KEYLEN)
+		if (namelen == 0)
 		{
 			if (errbuf)
 			{
 				snprintf(errbuf, errbuflen,
-						 "entry has an empty or too-long table name (maximum %d characters).",
-						 DBBLUE_FF_KEYLEN - 1);
+						 "entry \"%s\" has an empty table name.", token);
+				pfree(buf);
+				return false;
+			}
+			continue;
+		}
+
+		if (namelen >= DBBLUE_FF_KEYLEN)
+		{
+			if (errbuf)
+			{
+				snprintf(errbuf, errbuflen,
+						 "table name \"%.*s\" is longer than %d bytes, so it can never match a table.",
+						 namelen, token, DBBLUE_FF_KEYLEN - 1);
 				pfree(buf);
 				return false;
 			}

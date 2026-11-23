@@ -10621,9 +10621,12 @@ dbblue_fillfactor_map = 'res.partner:70, stock.move:75, account.move.line:80'
         10 to 100.  Whitespace around names, numbers and commas is ignored,
         and if a name appears more than once the last entry wins.  A
         malformed value (a missing <literal>:</literal>, an empty name, a
-        name longer than 127 characters, or a fillfactor that is not a
-        number or is out of range) is rejected when it is set, and the
-        error says which entry is wrong.
+        name longer than 63 bytes, or a fillfactor that is not a number or is
+        out of range) is rejected when it is set, and the error says which
+        entry is wrong.  63 bytes is the longest a table name can be:
+        <productname>PostgreSQL</productname> truncates longer identifiers
+        (see <xref linkend="sql-syntax-identifiers"/>), so a longer entry
+        could never match a table.
        </para>
 
        <para>

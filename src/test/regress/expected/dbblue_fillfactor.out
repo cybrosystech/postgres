@@ -20,10 +20,14 @@ ERROR:  invalid value for parameter "dbblue_fillfactor_map": "dff.hot:150"
 DETAIL:  fillfactor 150 for "dff.hot" is out of range [10,100].
 SET dbblue_fillfactor_map = ':70';                  -- empty table name
 ERROR:  invalid value for parameter "dbblue_fillfactor_map": ":70"
-DETAIL:  entry has an empty or too-long table name (maximum 127 characters).
+DETAIL:  entry ":70" has an empty table name.
 SET dbblue_fillfactor_map = 'dff.hot:70, broken';   -- a later entry is malformed
 ERROR:  invalid value for parameter "dbblue_fillfactor_map": "dff.hot:70, broken"
 DETAIL:  malformed entry "broken"; expected "tablename:fillfactor".
+-- a 64-byte name: longer than any table name can be, so it could never match
+SELECT set_config('dbblue_fillfactor_map', 'dff_' || repeat('x', 60) || ':70', false);
+ERROR:  invalid value for parameter "dbblue_fillfactor_map": "dff_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx:70"
+DETAIL:  table name "dff_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" is longer than 63 bytes, so it can never match a table.
 -- A failed SET leaves the previous value in place.
 SHOW dbblue_fillfactor_map;
  dbblue_fillfactor_map 
@@ -71,6 +75,24 @@ SHOW dbblue_fillfactor_map;
  
 (1 row)
 
+-- (5) A name of 63 bytes, the longest a table name can be, is accepted and
+-- matches.  It also matches a longer name in CREATE TABLE, which PostgreSQL
+-- truncates to those same 63 bytes.
+SELECT set_config('dbblue_fillfactor_map', 'dff_' || repeat('x', 59) || ':65', false) IS NOT NULL AS accepted;
+ accepted 
+----------
+ t
+(1 row)
+
+DO $$ BEGIN EXECUTE format('CREATE TABLE %I (id int)', 'dff_' || repeat('x', 59) || '_and_more'); END $$;
+NOTICE:  identifier "dff_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx_and_more" will be truncated to "dff_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+SELECT length(relname) AS name_bytes, reloptions FROM pg_class WHERE relname = 'dff_' || repeat('x', 59);
+ name_bytes |   reloptions    
+------------+-----------------
+         63 | {fillfactor=65}
+(1 row)
+
+DO $$ BEGIN EXECUTE format('DROP TABLE %I', 'dff_' || repeat('x', 59)); END $$;
 -- cleanup
 RESET dbblue_fillfactor_map;
 DROP TABLE dff_hot, dff_cold, dff_warm;

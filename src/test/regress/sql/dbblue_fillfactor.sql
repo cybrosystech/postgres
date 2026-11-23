@@ -13,6 +13,8 @@ SET dbblue_fillfactor_map = 'dff.hot:5';            -- below the [10,100] range
 SET dbblue_fillfactor_map = 'dff.hot:150';          -- above the range
 SET dbblue_fillfactor_map = ':70';                  -- empty table name
 SET dbblue_fillfactor_map = 'dff.hot:70, broken';   -- a later entry is malformed
+-- a 64-byte name: longer than any table name can be, so it could never match
+SELECT set_config('dbblue_fillfactor_map', 'dff_' || repeat('x', 60) || ':70', false);
 
 -- A failed SET leaves the previous value in place.
 SHOW dbblue_fillfactor_map;
@@ -36,6 +38,14 @@ SELECT reloptions FROM pg_class WHERE relname = 'dff_warm';
 -- (4) An empty map is valid (feature off).
 SET dbblue_fillfactor_map = '';
 SHOW dbblue_fillfactor_map;
+
+-- (5) A name of 63 bytes, the longest a table name can be, is accepted and
+-- matches.  It also matches a longer name in CREATE TABLE, which PostgreSQL
+-- truncates to those same 63 bytes.
+SELECT set_config('dbblue_fillfactor_map', 'dff_' || repeat('x', 59) || ':65', false) IS NOT NULL AS accepted;
+DO $$ BEGIN EXECUTE format('CREATE TABLE %I (id int)', 'dff_' || repeat('x', 59) || '_and_more'); END $$;
+SELECT length(relname) AS name_bytes, reloptions FROM pg_class WHERE relname = 'dff_' || repeat('x', 59);
+DO $$ BEGIN EXECUTE format('DROP TABLE %I', 'dff_' || repeat('x', 59)); END $$;
 
 -- cleanup
 RESET dbblue_fillfactor_map;
