@@ -10647,6 +10647,22 @@ dbblue_fillfactor_map = 'res.partner:70, stock.move:75, account.move.line:80'
         afterwards does not affect existing tables; use
         <command>ALTER TABLE ... SET (fillfactor = ...)</command> for those.
        </para>
+
+       <para>
+        Because the map is applied whenever a table is created, it also
+        applies when a table is recreated by a restore
+        (<application>pg_restore</application>, or
+        <application>psql</application> with a plain-format dump) or by
+        <application>pg_upgrade</application>.  A table whose fillfactor was
+        set, by hand or by the map, keeps that value, because the dump
+        records it.  A table with no fillfactor gets the map's value,
+        including one where an administrator ran
+        <command>ALTER TABLE ... RESET (fillfactor)</command> to remove it.
+        To keep the default for a mapped table across a dump and restore, set
+        it explicitly with
+        <command>ALTER TABLE ... SET (fillfactor = 100)</command> instead of
+        resetting it.
+       </para>
       </listitem>
      </varlistentry>
 
