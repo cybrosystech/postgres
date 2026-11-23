@@ -784,7 +784,9 @@ auto-tune: probing "shared_buffers" = 8GB ... ok
      <tbody>
       <row>
        <entry><xref linkend="guc-shared-buffers"/></entry>
-       <entry>25% of <replaceable>RAM</replaceable>, at least 128 MB</entry>
+       <entry>25% of <replaceable>RAM</replaceable>, at least 128 MB (at most
+        1 GB on a 32-bit build, which cannot map much more shared
+        memory)</entry>
       </row>
       <row>
        <entry><xref linkend="guc-effective-cache-size"/></entry>
@@ -795,7 +797,8 @@ auto-tune: probing "shared_buffers" = 8GB ... ok
        <entry>(<replaceable>RAM</replaceable> &minus;
         <varname>shared_buffers</varname>) / (<varname>max_connections</varname>
         &times; 3 &times; <varname>max_parallel_workers_per_gather</varname>),
-        at least 4 MB</entry>
+        at least 4 MB (at most 1 GB on a 32-bit build, whose limit for this
+        setting is just under 2 GB)</entry>
       </row>
       <row>
        <entry><xref linkend="guc-maintenance-work-mem"/></entry>

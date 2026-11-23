@@ -50,16 +50,20 @@
 #define RESERVED_BGWORKER_SLOTS		12
 
 /*
- * Ceiling for the tuned maintenance_work_mem.  On a 32-bit build the server
- * accepts at most MAX_KILOBYTES = INT_MAX / 1024 kB, 1 kB short of 2 GB, so a
- * 2 GB value would make the server reject postgresql.conf and initdb fail.
- * The cap there is 1 GB rather than MAX_KILOBYTES itself, because a value
- * just under 2 GB would be rounded back up to 2GB by round_memory_kb().
+ * Ceiling for the tuned shared_buffers, work_mem and maintenance_work_mem on
+ * a 32-bit build.  There the server accepts at most MAX_KILOBYTES =
+ * INT_MAX / 1024 kB for work_mem and maintenance_work_mem, 1 kB short of
+ * 2 GB, so a 2 GB value would make the server reject postgresql.conf and
+ * initdb fail.  The cap is 1 GB rather than MAX_KILOBYTES itself, because a
+ * value just under 2 GB would be rounded back up to 2GB by round_memory_kb().
+ * shared_buffers gets the same cap: a 32-bit process cannot map much more
+ * than that, and a larger value would be refused by initdb's shared memory
+ * probe and replaced with 128 MB.  A 64-bit build has no such ceiling.
  */
 #if SIZEOF_SIZE_T > 4
-#define MAX_MAINTENANCE_WORK_MEM_KB	(2 * KB_PER_GB)
+#define MAX_TUNED_MEMORY_KB	INT_MAX
 #else
-#define MAX_MAINTENANCE_WORK_MEM_KB	KB_PER_GB
+#define MAX_TUNED_MEMORY_KB	KB_PER_GB
 #endif
 
 /*
@@ -406,6 +410,7 @@ auto_tune_compute(int max_connections)
 	shared_kb = ram_kb / 4;
 	if (shared_kb < 128 * KB_PER_MB)
 		shared_kb = 128 * KB_PER_MB;
+	shared_kb = Min(shared_kb, MAX_TUNED_MEMORY_KB);
 	s.shared_buffers_kb = round_memory_kb(shared_kb);
 
 	/* Planner hint: combined OS + PG cache. */
@@ -415,10 +420,11 @@ auto_tune_compute(int max_connections)
 	 * maintenance_work_mem: governs VACUUM, CREATE INDEX, ALTER TABLE.
 	 * Odoo's module updates create/rebuild many indexes, so be generous.
 	 * RAM/16 capped at 2 GB matches PGTune; 1 GB on 32-bit builds, see
-	 * MAX_MAINTENANCE_WORK_MEM_KB.
+	 * MAX_TUNED_MEMORY_KB.
 	 */
 	s.maintenance_work_mem_kb = round_memory_kb(clamp_int(ram_kb / 16, KB_PER_MB,
-														MAX_MAINTENANCE_WORK_MEM_KB));
+														Min(2 * KB_PER_GB,
+															MAX_TUNED_MEMORY_KB)));
 
 	/*
 	 * Parallelism.  Odoo rarely benefits from very wide parallel workers
@@ -466,6 +472,7 @@ auto_tune_compute(int max_connections)
 		work_mem_kb = (ram_kb - s.shared_buffers_kb) / divisor;
 		if (work_mem_kb < 4 * KB_PER_MB)
 			work_mem_kb = 4 * KB_PER_MB;	/* never below upstream default */
+		work_mem_kb = Min(work_mem_kb, MAX_TUNED_MEMORY_KB);
 		s.work_mem_kb = round_memory_kb(work_mem_kb);
 	}
 
