@@ -668,11 +668,18 @@ sub init
 		or defined $self->{_install_path}
 		or !defined $ENV{INITDB_TEMPLATE})
 	{
+		# Test clusters use the stock settings the expected outputs assume,
+		# not values tuned to the host.  An older installation's initdb does
+		# not know --no-auto-tune and does not auto-tune anyway.
+		my @no_auto_tune =
+		  defined $self->{_install_path} ? () : ('--no-auto-tune');
+
 		note("initializing database system by running initdb");
 		PostgreSQL::Test::Utils::system_or_bail(
 			'initdb', '--no-sync',
 			'--pgdata' => $pgdata,
 			'--auth' => 'trust',
+			@no_auto_tune,
 			@{ $params{extra} });
 	}
 	else
