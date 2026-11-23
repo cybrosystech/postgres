@@ -50,6 +50,19 @@
 #define RESERVED_BGWORKER_SLOTS		12
 
 /*
+ * Ceiling for the tuned maintenance_work_mem.  On a 32-bit build the server
+ * accepts at most MAX_KILOBYTES = INT_MAX / 1024 kB, 1 kB short of 2 GB, so a
+ * 2 GB value would make the server reject postgresql.conf and initdb fail.
+ * The cap there is 1 GB rather than MAX_KILOBYTES itself, because a value
+ * just under 2 GB would be rounded back up to 2GB by round_memory_kb().
+ */
+#if SIZEOF_SIZE_T > 4
+#define MAX_MAINTENANCE_WORK_MEM_KB	(2 * KB_PER_GB)
+#else
+#define MAX_MAINTENANCE_WORK_MEM_KB	KB_PER_GB
+#endif
+
+/*
  * Detect total physical RAM.  Returns 0 on failure.
  */
 static uint64
@@ -401,10 +414,11 @@ auto_tune_compute(int max_connections)
 	/*
 	 * maintenance_work_mem: governs VACUUM, CREATE INDEX, ALTER TABLE.
 	 * Odoo's module updates create/rebuild many indexes, so be generous.
-	 * RAM/16 capped at 2 GB matches PGTune.
+	 * RAM/16 capped at 2 GB matches PGTune; 1 GB on 32-bit builds, see
+	 * MAX_MAINTENANCE_WORK_MEM_KB.
 	 */
 	s.maintenance_work_mem_kb = round_memory_kb(clamp_int(ram_kb / 16, KB_PER_MB,
-														2 * KB_PER_GB));
+														MAX_MAINTENANCE_WORK_MEM_KB));
 
 	/*
 	 * Parallelism.  Odoo rarely benefits from very wide parallel workers

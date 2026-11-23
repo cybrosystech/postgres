@@ -799,7 +799,8 @@ auto-tune: probing "shared_buffers" = 8GB ... ok
       </row>
       <row>
        <entry><xref linkend="guc-maintenance-work-mem"/></entry>
-       <entry><replaceable>RAM</replaceable> / 16, at most 2 GB</entry>
+       <entry><replaceable>RAM</replaceable> / 16, at most 2 GB (1 GB on a
+        32-bit build, whose limit for this setting is just under 2 GB)</entry>
       </row>
       <row>
        <entry><xref linkend="guc-max-parallel-workers"/></entry>
