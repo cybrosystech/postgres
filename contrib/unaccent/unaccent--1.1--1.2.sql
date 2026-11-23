@@ -36,9 +36,13 @@ ALTER FUNCTION unaccent(text) IMMUTABLE COST 100;
 -- caller does not own (extension objects belong to the superuser who ran
 -- the install script) cannot be reloaded, and an index the caller may not
 -- REINDEX cannot be rebuilt.  These are not errors: each is reported as a
--- 'skipped: ...' row (and by dry_run), and the rest still runs.  Sessions
--- started after the rules file changed already read the new rules, so a
--- non-owner can run this from a fresh connection; an owner or superuser must
+-- 'skipped: ...' row (and by dry_run), and the rest still runs.  The same goes
+-- for indexes on temporary tables of other sessions, which cannot be rebuilt
+-- (and need no repair once that session ends); the caller's own temporary
+-- tables are rebuilt as usual.
+--
+-- Sessions started after the rules file changed already read the new rules, so
+-- a non-owner can run this from a fresh connection; an owner or superuser must
 -- reload the dictionary for sessions that are already open.  Switching to
 -- new_rules needs ownership and fails if the caller is not the owner.
 -- Not covered: stored data derived from unaccent() (generated columns,
@@ -97,7 +101,8 @@ BEGIN
 	FOR i IN
 		SELECT DISTINCT n.nspname, c.relname, am.amname,
 			   (has_table_privilege(x.indrelid, 'MAINTAIN')
-				OR pg_has_role(current_user, tbl.relowner, 'USAGE')) AS can_reindex
+				OR pg_has_role(current_user, tbl.relowner, 'USAGE')) AS can_reindex,
+			   pg_is_other_temp_schema(n.oid) AS other_temp
 		FROM pg_depend dep
 		JOIN pg_proc p ON p.oid = dep.refobjid
 		JOIN pg_class c ON c.oid = dep.objid
@@ -114,7 +119,9 @@ BEGIN
 	LOOP
 		step := 'index';
 		object := format('%I.%I', i.nspname, i.relname);
-		IF NOT i.can_reindex THEN
+		IF i.other_temp THEN
+			detail := format('skipped: temporary table of another session (%s)', i.amname);
+		ELSIF NOT i.can_reindex THEN
 			detail := format('skipped: no permission to reindex (%s)', i.amname);
 		ELSIF dry_run THEN
 			detail := format('would reindex (%s)', i.amname);

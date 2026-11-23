@@ -258,7 +258,8 @@ unaccent_refresh(<optional><replaceable class="parameter">new_rules</replaceable
   Such a dictionary, and any index the caller is not allowed to rebuild, is not
   an error: it appears in the result as a <literal>skipped</literal> row and
   <replaceable>dry_run</replaceable> reports the same, while everything else
-  still runs.  Sessions that start after the rules file has changed already
+  still runs.  Indexes on temporary tables of other sessions, which cannot be
+  rebuilt from here, are skipped the same way.  Sessions that start after the rules file has changed already
   read the new rules, so an ordinary user can run the function from a fresh
   connection to rebuild their indexes; a superuser or the dictionary owner must
   run it to make sessions that are already open reload the dictionary.
