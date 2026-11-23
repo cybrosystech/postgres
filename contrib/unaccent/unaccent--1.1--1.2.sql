@@ -23,7 +23,24 @@ ALTER FUNCTION unaccent(text) IMMUTABLE COST 100;
 -- dictionary.  Everything runs in one transaction: if any step fails, nothing
 -- is changed.  REINDEX blocks writes to the tables meanwhile; for very large or
 -- busy tables, run the dictionary reload and REINDEX CONCURRENTLY by hand.
--- Other sessions pick up the new rules the next time they use the dictionary.
+-- Other sessions pick up the new rules the next time they use the dictionary,
+-- except in plans they have already cached: because unaccent() is IMMUTABLE,
+-- a call with constant arguments is folded to a constant when the statement
+-- is planned (PL/pgSQL function bodies, PREPAREd statements, IMMUTABLE SQL
+-- functions), and a rules change does not invalidate such plans.  Long-lived
+-- sessions keep the old result until they reconnect or run DISCARD PLANS.
+-- Calls on column values or parameters are evaluated at run time and are not
+-- affected.
+--
+-- Permissions: the function runs with the caller's rights.  A dictionary the
+-- caller does not own (extension objects belong to the superuser who ran
+-- the install script) cannot be reloaded, and an index the caller may not
+-- REINDEX cannot be rebuilt.  These are not errors: each is reported as a
+-- 'skipped: ...' row (and by dry_run), and the rest still runs.  Sessions
+-- started after the rules file changed already read the new rules, so a
+-- non-owner can run this from a fresh connection; an owner or superuser must
+-- reload the dictionary for sessions that are already open.  Switching to
+-- new_rules needs ownership and fails if the caller is not the owner.
 -- Not covered: stored data derived from unaccent() (generated columns,
 -- materialized view contents), which must be refreshed separately.
 CREATE FUNCTION unaccent_refresh(
@@ -40,7 +57,8 @@ DECLARE
 	rules text;
 BEGIN
 	FOR d IN
-		SELECT t.oid AS dictoid, n.nspname, t.dictname, t.dictinitoption
+		SELECT t.oid AS dictoid, n.nspname, t.dictname, t.dictinitoption,
+			   pg_has_role(current_user, t.dictowner, 'USAGE') AS is_owner
 		FROM pg_ts_dict t
 		JOIN pg_namespace n ON n.oid = t.dictnamespace
 		JOIN pg_ts_template tm ON tm.oid = t.dicttemplate
@@ -54,6 +72,18 @@ BEGIN
 		object := format('%I.%I', d.nspname, d.dictname);
 		IF rules IS NULL THEN
 			detail := 'skipped: no RULES option';
+		ELSIF NOT d.is_owner THEN
+			IF new_rules IS NOT NULL THEN
+				IF dry_run THEN
+					detail := 'would fail: not owner of dictionary, cannot switch rules';
+				ELSE
+					RAISE EXCEPTION 'must be owner of text search dictionary %', object
+						USING ERRCODE = 'insufficient_privilege',
+							  HINT = 'Run unaccent_refresh() without new_rules, or as the dictionary owner.';
+				END IF;
+			ELSE
+				detail := 'skipped: not owner; new sessions already read the current rules file';
+			END IF;
 		ELSIF dry_run THEN
 			detail := format('would reload rules ''%s''', rules);
 		ELSE
@@ -65,11 +95,14 @@ BEGIN
 	END LOOP;
 
 	FOR i IN
-		SELECT DISTINCT n.nspname, c.relname, am.amname
+		SELECT DISTINCT n.nspname, c.relname, am.amname,
+			   (has_table_privilege(x.indrelid, 'MAINTAIN')
+				OR pg_has_role(current_user, tbl.relowner, 'USAGE')) AS can_reindex
 		FROM pg_depend dep
 		JOIN pg_proc p ON p.oid = dep.refobjid
 		JOIN pg_class c ON c.oid = dep.objid
 		JOIN pg_index x ON x.indexrelid = c.oid
+		JOIN pg_class tbl ON tbl.oid = x.indrelid
 		JOIN pg_namespace n ON n.oid = c.relnamespace
 		JOIN pg_am am ON am.oid = c.relam
 		WHERE dep.refclassid = 'pg_proc'::regclass
@@ -81,7 +114,9 @@ BEGIN
 	LOOP
 		step := 'index';
 		object := format('%I.%I', i.nspname, i.relname);
-		IF dry_run THEN
+		IF NOT i.can_reindex THEN
+			detail := format('skipped: no permission to reindex (%s)', i.amname);
+		ELSIF dry_run THEN
 			detail := format('would reindex (%s)', i.amname);
 		ELSE
 			EXECUTE format('REINDEX INDEX %I.%I', i.nspname, i.relname);

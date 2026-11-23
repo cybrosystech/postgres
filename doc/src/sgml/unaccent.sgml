@@ -252,6 +252,36 @@ unaccent_refresh(<optional><replaceable class="parameter">new_rules</replaceable
  </para>
 
  <para>
+  The function runs with the privileges of the caller.  The
+  <literal>unaccent</literal> dictionary created by the extension belongs to the
+  superuser that ran the install script, so an ordinary user cannot reload it.
+  Such a dictionary, and any index the caller is not allowed to rebuild, is not
+  an error: it appears in the result as a <literal>skipped</literal> row and
+  <replaceable>dry_run</replaceable> reports the same, while everything else
+  still runs.  Sessions that start after the rules file has changed already
+  read the new rules, so an ordinary user can run the function from a fresh
+  connection to rebuild their indexes; a superuser or the dictionary owner must
+  run it to make sessions that are already open reload the dictionary.
+  Switching to <replaceable>new_rules</replaceable> requires owning the
+  dictionary and fails otherwise.
+ </para>
+
+ <para>
+  Plans that were cached before the refresh can keep the old rules.  Because
+  <function>unaccent()</function> is <literal>IMMUTABLE</literal>, a call with
+  constant arguments, such as <literal>unaccent('Hôtel')</literal>, is replaced
+  by its result when the statement is planned.  This happens in
+  <application>PL/pgSQL</application> function bodies, prepared statements and
+  <literal>IMMUTABLE</literal> SQL functions, and a rules change does not
+  invalidate those plans.  A session that is already open keeps returning the
+  old result for them until it reconnects or runs
+  <command>DISCARD PLANS</command>.
+  Calls on column values or query parameters are evaluated when the query runs
+  and always use the current rules.  After changing the rules, reconnect
+  long-lived sessions, or restart the application servers that hold them.
+ </para>
+
+ <para>
   The indexes are rebuilt without <literal>CONCURRENTLY</literal>, so writes to
   the tables are blocked meanwhile; for large busy tables reload the dictionary
   and run <command>REINDEX INDEX CONCURRENTLY</command> by hand.  Data stored
