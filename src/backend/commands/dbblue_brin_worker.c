@@ -109,6 +109,12 @@
 #define BRIN_LOCK_TIMEOUT			"60s"
 
 /*
+ * A transaction open longer than this in the database postpones index work
+ * there to a later cycle.  See brin_database_busy().
+ */
+#define BRIN_BUSY_XACT_SECONDS		60
+
+/*
  * One database the launcher will start a worker in this cycle.  The name is
  * carried alongside the OID purely for log messages; the worker is addressed
  * by OID, which stays correct even if the database is renamed mid-cycle.
@@ -594,6 +600,72 @@ brin_drop_own_invalid_index(const char *schemaname, const char *tablename,
 }
 
 /*
+ * brin_database_busy
+ *		Is a transaction open longer than BRIN_BUSY_XACT_SECONDS in this
+ *		database?  If so, log it and return true.
+ *
+ * CREATE and DROP INDEX CONCURRENTLY wait for older transactions while holding
+ * a lock on the table.  If such a transaction then needs a stronger lock on
+ * that table -- odoo -u writes to a model's table and later runs ALTER TABLE
+ * on it, all in one transaction -- the two wait for each other, and the
+ * deadlock detector cancels the transaction, not the build: it runs in
+ * whichever process waits last, which is the upgrade.  Stock PostgreSQL does
+ * the same for a CONCURRENTLY build run by hand.  Rather than change how
+ * deadlocks are resolved, index work is done only while the database is
+ * quiet: an upgrade is one long transaction, while Odoo's requests last well
+ * under a second.  A transaction that starts during a build can still meet
+ * this, but a BRIN build takes seconds.  It also spares the lock_timeout
+ * wait on a session left idle in transaction.
+ *
+ * Autovacuum is ignored, as CONCURRENTLY does not wait for it.
+ */
+static bool
+brin_database_busy(const char *dbname)
+{
+	bool		busy = false;
+
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	if (SPI_connect() == SPI_OK_CONNECT)
+	{
+		char	   *sql = psprintf(
+								   "SELECT pid, extract(epoch FROM now() - xact_start)::int, "
+								   "       coalesce(nullif(application_name, ''), backend_type), "
+								   "       coalesce(state, '') "
+								   "FROM pg_catalog.pg_stat_activity "
+								   "WHERE datid = %u "
+								   "  AND pid <> pg_catalog.pg_backend_pid() "
+								   "  AND backend_type <> 'autovacuum worker' "
+								   "  AND xact_start < now() - interval '%d seconds' "
+								   "ORDER BY xact_start LIMIT 1",
+								   MyDatabaseId, BRIN_BUSY_XACT_SECONDS);
+
+		if (SPI_execute(sql, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+		{
+			HeapTuple	tup = SPI_tuptable->vals[0];
+			TupleDesc	desc = SPI_tuptable->tupdesc;
+
+			busy = true;
+			ereport(LOG,
+					(errmsg("dbblue BRIN: postponing index work in database \"%s\": a transaction has been open for %s seconds",
+							dbname, SPI_getvalue(tup, desc, 2)),
+					 errdetail("Process %s (%s), state \"%s\".",
+							   SPI_getvalue(tup, desc, 1),
+							   SPI_getvalue(tup, desc, 3),
+							   SPI_getvalue(tup, desc, 4)),
+					 errhint("Index work waits until no transaction has been open longer than %d seconds, such as a module upgrade, and is retried next cycle.",
+							 BRIN_BUSY_XACT_SECONDS)));
+		}
+		SPI_finish();
+	}
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+	MemoryContextSwitchTo(brin_worker_cxt);
+
+	return busy;
+}
+
+/*
  * Run one scan cycle: find eligible create_date columns and create BRIN
  * indexes.  Each index creation runs in its own transaction to avoid
  * holding locks across the whole cycle.
@@ -712,6 +784,14 @@ run_brin_scan(const char *dbname)
 			break;
 
 		CHECK_FOR_INTERRUPTS();
+
+		/*
+		 * Checked before every table, just ahead of its concurrent drop and
+		 * build, and the rest of this database is left for the next cycle
+		 * once it is busy.
+		 */
+		if (brin_database_busy(dbname))
+			break;
 
 		/*
 		 * The index name is reused across the check, the concurrent build and
