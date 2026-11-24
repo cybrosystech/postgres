@@ -129,6 +129,15 @@ char	   *dbblue_auto_index_suggestion_database = NULL;
 #define ADVISOR_RESULT_TABLE		"dbblue_index_suggestions"
 
 /*
+ * Appended to a suggestion on a partitioned table, which cannot be indexed
+ * CONCURRENTLY.  An SQL comment, so the DDL still runs as stored.  No single
+ * quotes: it is also used inside an SQL literal.
+ */
+#define ADVISOR_PARTITIONED_NOTE \
+	"/* partitioned table: CONCURRENTLY is not possible here, so this blocks " \
+	"writes to the table until it finishes; run it in a maintenance window */"
+
+/*
  * One query pulled from pg_stat_statements.  Allocated in advisor_cxt so
  * it survives across the per-query transactions of a pass.
  */
@@ -691,6 +700,35 @@ advisor_ensure_environment(void)
 		(void) advisor_exec_in_subxact("ALTER TABLE public." ADVISOR_RESULT_TABLE
 									   " ADD COLUMN IF NOT EXISTS queries_helped bigint NOT NULL DEFAULT 1",
 									   "migrating results table (queries_helped)");
+
+		/*
+		 * Older versions suggested CREATE INDEX CONCURRENTLY on partitioned
+		 * tables too, which can never run.  Rewrite those rows to the form
+		 * suggested now; where that form is already stored, drop the old row
+		 * instead, as suggested_index is unique.
+		 */
+#define ADVISOR_OLD_PARTITIONED_ROWS \
+	" FROM pg_catalog.pg_namespace n, pg_catalog.pg_class c" \
+	" WHERE n.nspname = s.schema_name AND c.relnamespace = n.oid" \
+	"   AND c.relname = s.table_name AND c.relkind = 'p'" \
+	"   AND s.suggested_index LIKE 'CREATE INDEX CONCURRENTLY %'"
+#define ADVISOR_NEW_PARTITIONED_DDL \
+	"'CREATE INDEX ' || substr(s.suggested_index, length('CREATE INDEX CONCURRENTLY ') + 1)" \
+	" || ' ' || '" ADVISOR_PARTITIONED_NOTE "'"
+		(void) advisor_exec_in_subxact("DELETE FROM public." ADVISOR_RESULT_TABLE " s"
+									   " USING pg_catalog.pg_namespace n, pg_catalog.pg_class c"
+									   " WHERE n.nspname = s.schema_name AND c.relnamespace = n.oid"
+									   "   AND c.relname = s.table_name AND c.relkind = 'p'"
+									   "   AND s.suggested_index LIKE 'CREATE INDEX CONCURRENTLY %'"
+									   "   AND EXISTS (SELECT 1 FROM public." ADVISOR_RESULT_TABLE " s2"
+									   "               WHERE s2.suggested_index = " ADVISOR_NEW_PARTITIONED_DDL ")",
+									   "migrating results table (partitioned duplicates)");
+		(void) advisor_exec_in_subxact("UPDATE public." ADVISOR_RESULT_TABLE " s"
+									   " SET suggested_index = " ADVISOR_NEW_PARTITIONED_DDL
+									   ADVISOR_OLD_PARTITIONED_ROWS,
+									   "migrating results table (partitioned tables)");
+#undef ADVISOR_OLD_PARTITIONED_ROWS
+#undef ADVISOR_NEW_PARTITIONED_DDL
 	}
 
 	/*
@@ -1228,6 +1266,7 @@ add_candidate(List **candidates, Oid relid, int nkeys, const AttrNumber *keys)
 	char	   *schema_name;
 	char	   *table_name;
 	char	   *index_name;
+	bool		partitioned;
 	ListCell   *lc;
 	int			i;
 
@@ -1274,13 +1313,21 @@ add_candidate(List **candidates, Oid relid, int nkeys, const AttrNumber *keys)
 
 	index_name = candidate_index_name(table_name, cand->colnames);
 
+	partitioned = (get_rel_relkind(relid) == RELKIND_PARTITIONED_TABLE);
+
 	initStringInfo(&ddl);
 	/*
 	 * Suggest CONCURRENTLY so that applying the recommendation on a live Odoo
 	 * table does not take a lock that blocks writes for the whole build.  The
 	 * DBA must run it outside a transaction block (a CONCURRENTLY restriction).
+	 *
+	 * Not on a partitioned table, which PostgreSQL never allows to be indexed
+	 * concurrently: the DDL would always fail, on exactly the large tables
+	 * dbblue_partition partitions.  There the plain form is suggested, with a
+	 * comment that it blocks writes; see ADVISOR_PARTITIONED_NOTE.
 	 */
-	appendStringInfo(&ddl, "CREATE INDEX CONCURRENTLY IF NOT EXISTS %s ON %s (",
+	appendStringInfo(&ddl, "CREATE INDEX %sIF NOT EXISTS %s ON %s (",
+					 partitioned ? "" : "CONCURRENTLY ",
 					 quote_identifier(index_name),
 					 quote_qualified_identifier(schema_name, table_name));
 	foreach(lc, cand->colnames)
@@ -1290,6 +1337,8 @@ add_candidate(List **candidates, Oid relid, int nkeys, const AttrNumber *keys)
 		appendStringInfoString(&ddl, quote_identifier((char *) lfirst(lc)));
 	}
 	appendStringInfoChar(&ddl, ')');
+	if (partitioned)
+		appendStringInfoString(&ddl, " " ADVISOR_PARTITIONED_NOTE);
 	cand->ddl = ddl.data;
 
 	*candidates = lappend(*candidates, cand);
