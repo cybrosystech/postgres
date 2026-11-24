@@ -65,6 +65,8 @@ CREATE TEXT SEARCH DICTIONARY unaccent (
 -- transaction: if any step fails, nothing
 -- is changed.  REINDEX blocks writes to the tables meanwhile; for very large or
 -- busy tables, run the dictionary reload and REINDEX CONCURRENTLY by hand.
+-- Concurrent calls are serialized (see the advisory lock in the body).
+--
 -- Other sessions pick up the new rules the next time they use the dictionary,
 -- except in plans they have already cached: because unaccent() is IMMUTABLE,
 -- a call with constant arguments is folded to a constant when the statement
@@ -105,6 +107,13 @@ DECLARE
 	g record;
 	rules text;
 BEGIN
+	-- One refresh at a time per database: two concurrent ALTER TEXT SEARCH
+	-- DICTIONARY on the same dictionary fail with "tuple concurrently updated".
+	-- A transaction-level advisory lock only makes other unaccent_refresh()
+	-- calls wait; it does not block queries or writes, and it is released at
+	-- the end of the calling transaction.
+	PERFORM pg_advisory_xact_lock(hashtext('unaccent_refresh'));
+
 	FOR d IN
 		SELECT t.oid AS dictoid, n.nspname, t.dictname, t.dictinitoption,
 			   pg_has_role(current_user, t.dictowner, 'USAGE') AS is_owner
