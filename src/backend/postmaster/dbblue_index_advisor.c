@@ -80,6 +80,7 @@
 #include "access/xact.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_index.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_type.h"
@@ -106,6 +107,7 @@
 #include "utils/memutils.h"
 #include "utils/resowner.h"
 #include "utils/snapmgr.h"
+#include "utils/syscache.h"
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
@@ -182,6 +184,8 @@ typedef struct IndexCandidate
 	AttrNumber *keys;
 	List	   *colnames;		/* of char *, same order as keys */
 	char	   *ddl;			/* CREATE INDEX ON tab (col, ...) */
+	char	   *suggestion;	/* what is stored: ddl, or the REINDEX that
+								 * repairs an INVALID index under its name */
 } IndexCandidate;
 
 /*
@@ -1339,7 +1343,43 @@ add_candidate(List **candidates, Oid relid, int nkeys, const AttrNumber *keys)
 	appendStringInfoChar(&ddl, ')');
 	if (partitioned)
 		appendStringInfoString(&ddl, " " ADVISOR_PARTITIONED_NOTE);
+
+	/*
+	 * A concurrent build of this suggestion that failed -- cancelled,
+	 * deadlocked, out of disk -- leaves an INVALID index under this name.
+	 * IF NOT EXISTS then makes the DDL above a silent no-op, while the
+	 * coverage check, which counts only valid indexes, keeps suggesting it.
+	 * Store the repair instead: REINDEX CONCURRENTLY rebuilds it in place
+	 * without blocking writes, after which the suggestion is covered and
+	 * drops out.  (A partitioned table's plain CREATE INDEX is atomic and
+	 * leaves no such index.)  The CREATE INDEX stays in cand->ddl, as that is
+	 * what HypoPG is given to evaluate the candidate.
+	 */
 	cand->ddl = ddl.data;
+	cand->suggestion = cand->ddl;
+	if (!partitioned)
+	{
+		Oid			indexoid = get_relname_relid(index_name,
+												 get_rel_namespace(relid));
+
+		if (OidIsValid(indexoid))
+		{
+			HeapTuple	tup = SearchSysCache1(INDEXRELID,
+											  ObjectIdGetDatum(indexoid));
+
+			if (HeapTupleIsValid(tup))
+			{
+				Form_pg_index idx = (Form_pg_index) GETSTRUCT(tup);
+
+				if (idx->indrelid == relid && !idx->indisvalid)
+					cand->suggestion =
+						psprintf("REINDEX INDEX CONCURRENTLY %s",
+								 quote_qualified_identifier(schema_name,
+															index_name));
+				ReleaseSysCache(tup);
+			}
+		}
+	}
 
 	*candidates = lappend(*candidates, cand);
 }
@@ -1574,7 +1614,7 @@ advisor_store_suggestion(WorkloadEntry *entry, IndexCandidate *cand,
 	values[2] = PointerGetDatum(construct_array_builtin(colnames,
 														list_length(cand->colnames),
 														TEXTOID));
-	values[3] = CStringGetTextDatum(cand->ddl);
+	values[3] = CStringGetTextDatum(cand->suggestion);
 	values[4] = Int64GetDatum(entry->queryid);
 	values[5] = CStringGetTextDatum(entry->query_text);
 	values[6] = Int64GetDatum(entry->calls);
