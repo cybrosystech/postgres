@@ -214,6 +214,13 @@ static char *advisor_pgss_schema = NULL;
 static char *advisor_hypopg_schema = NULL;
 
 /*
+ * The database's search_path as it was when the worker connected, before the
+ * worker pinned its own to pg_catalog.  Used only while parsing and planning
+ * workload queries, as their user.
+ */
+static char *advisor_query_search_path = NULL;
+
+/*
  * One database the launcher will start a worker in this sweep.  The name is
  * carried alongside the OID only for log messages; the worker is addressed by
  * OID, which stays correct even if the database is renamed mid-sweep.
@@ -656,7 +663,7 @@ advisor_ensure_environment(void)
 	pgstat_report_activity(STATE_RUNNING,
 						   "dbblue index advisor: preparing environment");
 
-	pgss_ok = advisor_exec_in_subxact("CREATE EXTENSION IF NOT EXISTS pg_stat_statements",
+	pgss_ok = advisor_exec_in_subxact("CREATE EXTENSION IF NOT EXISTS pg_stat_statements SCHEMA public",
 									  "installing pg_stat_statements");
 
 	/*
@@ -670,7 +677,7 @@ advisor_ensure_environment(void)
 	if (pgss_ok)
 		(void) advisor_exec_in_subxact("ALTER EXTENSION pg_stat_statements UPDATE",
 									   "upgrading pg_stat_statements");
-	hypopg_ok = advisor_exec_in_subxact("CREATE EXTENSION IF NOT EXISTS hypopg",
+	hypopg_ok = advisor_exec_in_subxact("CREATE EXTENSION IF NOT EXISTS hypopg SCHEMA public",
 										"installing hypopg");
 	table_ok = advisor_exec_in_subxact(
 									   "CREATE TABLE IF NOT EXISTS public." ADVISOR_RESULT_TABLE " ("
@@ -1524,6 +1531,26 @@ existing_index_covers(Oid relid, int nkeys, const AttrNumber *keys)
 }
 
 /*
+ * advisor_use_query_search_path
+ *		Switch search_path to the database's own (advisor_query_search_path)
+ *		for parsing or planning a workload query, whose unqualified names need
+ *		it.  Returns the GUC nest level to pass to AtEOXact_GUC(true, ...) to
+ *		switch back; an error unwinds it with the enclosing subtransaction.
+ *		The caller runs the query as its own user in a restricted context, so
+ *		whatever that path resolves to runs with that user's rights.
+ */
+static int
+advisor_use_query_search_path(void)
+{
+	int			nestlevel = NewGUCNestLevel();
+
+	(void) set_config_option("search_path", advisor_query_search_path,
+							 PGC_USERSET, PGC_S_SESSION,
+							 GUC_ACTION_SAVE, true, 0, false);
+	return nestlevel;
+}
+
+/*
  * advisor_plan_cost
  *		Return the planner's estimated total cost for a query, or -1 if
  *		it cannot be planned.
@@ -1540,6 +1567,7 @@ advisor_plan_cost(const char *query_text, Oid userid)
 	int			ret;
 	Oid			save_userid;
 	int			save_sec_context;
+	int			nestlevel;
 
 	sql = psprintf("EXPLAIN (GENERIC_PLAN, COSTS ON, FORMAT JSON) %s",
 				   query_text);
@@ -1557,6 +1585,7 @@ advisor_plan_cost(const char *query_text, Oid userid)
 	 * the enclosing subtransaction's abort path restores it.  On success it
 	 * is restored explicitly right after the call.
 	 */
+	nestlevel = advisor_use_query_search_path();
 	GetUserIdAndSecContext(&save_userid, &save_sec_context);
 	SetUserIdAndSecContext(userid,
 						   save_sec_context | SECURITY_RESTRICTED_OPERATION);
@@ -1564,6 +1593,7 @@ advisor_plan_cost(const char *query_text, Oid userid)
 	ret = SPI_execute(sql, false, 0);
 
 	SetUserIdAndSecContext(save_userid, save_sec_context);
+	AtEOXact_GUC(true, nestlevel);
 
 	if ((ret == SPI_OK_UTILITY || ret == SPI_OK_SELECT) &&
 		SPI_processed > 0 && SPI_tuptable != NULL)
@@ -1822,10 +1852,23 @@ advisor_process_entry(WorkloadEntry *entry)
 				Oid		   *paramtypes = NULL;
 				int			numparams = 0;
 				Query	   *query;
+				Oid			save_userid;
+				int			save_sec_context;
+				int			nestlevel;
 
+				/*
+				 * Resolve the query's names as its own user would, with the
+				 * database's search_path, like advisor_plan_cost() plans it.
+				 */
+				nestlevel = advisor_use_query_search_path();
+				GetUserIdAndSecContext(&save_userid, &save_sec_context);
+				SetUserIdAndSecContext(entry->userid,
+									   save_sec_context | SECURITY_RESTRICTED_OPERATION);
 				query = parse_analyze_varparams(raw, entry->query_text,
 												&paramtypes, &numparams,
 												NULL);
+				SetUserIdAndSecContext(save_userid, save_sec_context);
+				AtEOXact_GUC(true, nestlevel);
 
 				collect_query_columns(query, &tables);
 				candidates = build_candidates(tables);
@@ -2259,6 +2302,22 @@ DbblueIndexAdvisorMain(Datum main_arg)
 	 * loop this worker does not use.
 	 */
 	SetConfigOption("lock_timeout", "5s", PGC_SUSET, PGC_S_SESSION);
+
+	/*
+	 * Pin search_path for the advisor's own statements, which run as the
+	 * bootstrap superuser.  Otherwise the database owner decides how their
+	 * unqualified names resolve -- with ALTER DATABASE ... SET search_path, or
+	 * by planting public.quote_ident(name), an exact match that wins over
+	 * pg_catalog.quote_ident(text) -- and the next pass runs that code as
+	 * superuser.  The value in force at connect time is kept for parsing and
+	 * planning the workload queries, whose unqualified table names need it;
+	 * those run as their own user, see advisor_use_query_search_path().
+	 */
+	advisor_query_search_path = MemoryContextStrdup(TopMemoryContext,
+													GetConfigOption("search_path",
+																	false, false));
+	SetConfigOption("search_path", "pg_catalog, pg_temp",
+					PGC_SUSET, PGC_S_SESSION);
 
 	advisor_ensure_environment();
 
