@@ -122,6 +122,7 @@
 typedef struct BrinDatabase
 {
 	Oid			dboid;
+	Oid			dbowner;		/* the worker connects as this role */
 	char	   *dbname;
 } BrinDatabase;
 
@@ -237,6 +238,7 @@ brin_get_database_list(void)
 		oldcxt = MemoryContextSwitchTo(resultcxt);
 		db = palloc_object(BrinDatabase);
 		db->dboid = pgdatabase->oid;
+		db->dbowner = pgdatabase->datdba;
 		db->dbname = pstrdup(NameStr(pgdatabase->datname));
 		result = lappend(result, db);
 		MemoryContextSwitchTo(oldcxt);
@@ -357,7 +359,11 @@ brin_scan_one_database(const BrinDatabase *db)
 	 * per-database.  The worker cannot look the name up for itself between
 	 * transactions, since resolving an OID needs a syscache lookup.
 	 */
-	strlcpy(worker.bgw_extra, db->dbname, BGW_EXTRALEN);
+	/* bgw_extra: the database name, then the owner's OID after NAMEDATALEN. */
+	StaticAssertStmt(NAMEDATALEN + sizeof(Oid) <= BGW_EXTRALEN,
+					 "bgw_extra too small for the database name and owner");
+	strlcpy(worker.bgw_extra, db->dbname, NAMEDATALEN);
+	memcpy(worker.bgw_extra + NAMEDATALEN, &db->dbowner, sizeof(Oid));
 
 	/* So our latch is set when it starts and stops. */
 	worker.bgw_notify_pid = MyProcPid;
@@ -622,47 +628,70 @@ brin_drop_own_invalid_index(const char *schemaname, const char *tablename,
 static bool
 brin_database_busy(const char *dbname)
 {
-	bool		busy = false;
+	TimestampTz now = GetCurrentTimestamp();
+	PgBackendStatus *oldest = NULL;
+	int			nbackends;
 
+	/*
+	 * Read the backend status array rather than pg_stat_activity: the worker
+	 * runs as the database owner, and pg_stat_activity would hide the
+	 * xact_start of other roles' sessions from it.  The local copy is taken
+	 * and freed with this transaction.
+	 */
 	StartTransactionCommand();
-	PushActiveSnapshot(GetTransactionSnapshot());
-	if (SPI_connect() == SPI_OK_CONNECT)
+	nbackends = pgstat_fetch_stat_numbackends();
+	for (int i = 1; i <= nbackends; i++)
 	{
-		char	   *sql = psprintf(
-								   "SELECT pid, extract(epoch FROM now() - xact_start)::int, "
-								   "       coalesce(nullif(application_name, ''), backend_type), "
-								   "       coalesce(state, '') "
-								   "FROM pg_catalog.pg_stat_activity "
-								   "WHERE datid = %u "
-								   "  AND pid <> pg_catalog.pg_backend_pid() "
-								   "  AND backend_type <> 'autovacuum worker' "
-								   "  AND xact_start < now() - interval '%d seconds' "
-								   "ORDER BY xact_start LIMIT 1",
-								   MyDatabaseId, BRIN_BUSY_XACT_SECONDS);
+		PgBackendStatus *be = &pgstat_get_local_beentry_by_index(i)->backendStatus;
 
-		if (SPI_execute(sql, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
-		{
-			HeapTuple	tup = SPI_tuptable->vals[0];
-			TupleDesc	desc = SPI_tuptable->tupdesc;
-
-			busy = true;
-			ereport(LOG,
-					(errmsg("dbblue BRIN: postponing index work in database \"%s\": a transaction has been open for %s seconds",
-							dbname, SPI_getvalue(tup, desc, 2)),
-					 errdetail("Process %s (%s), state \"%s\".",
-							   SPI_getvalue(tup, desc, 1),
-							   SPI_getvalue(tup, desc, 3),
-							   SPI_getvalue(tup, desc, 4)),
-					 errhint("Index work waits until no transaction has been open longer than %d seconds, such as a module upgrade, and is retried next cycle.",
-							 BRIN_BUSY_XACT_SECONDS)));
-		}
-		SPI_finish();
+		if (be->st_databaseid != MyDatabaseId ||
+			be->st_procpid == MyProcPid ||
+			be->st_backendType == B_AUTOVAC_WORKER ||
+			be->st_xact_start_timestamp == 0 ||
+			!TimestampDifferenceExceeds(be->st_xact_start_timestamp, now,
+										BRIN_BUSY_XACT_SECONDS * 1000))
+			continue;
+		if (oldest == NULL ||
+			be->st_xact_start_timestamp < oldest->st_xact_start_timestamp)
+			oldest = be;
 	}
-	PopActiveSnapshot();
+
+	if (oldest != NULL)
+	{
+		const char *state;
+
+		switch (oldest->st_state)
+		{
+			case STATE_RUNNING:
+				state = "active";
+				break;
+			case STATE_IDLEINTRANSACTION:
+				state = "idle in transaction";
+				break;
+			case STATE_IDLEINTRANSACTION_ABORTED:
+				state = "idle in transaction (aborted)";
+				break;
+			default:
+				state = "other";
+				break;
+		}
+		ereport(LOG,
+				(errmsg("dbblue BRIN: postponing index work in database \"%s\": a transaction has been open for %ld seconds",
+						dbname,
+						(long) ((now - oldest->st_xact_start_timestamp) / USECS_PER_SEC)),
+				 errdetail("Process %d (%s), state \"%s\".",
+						   oldest->st_procpid,
+						   oldest->st_appname && oldest->st_appname[0] ?
+						   oldest->st_appname :
+						   GetBackendTypeDesc(oldest->st_backendType),
+						   state),
+				 errhint("Index work waits until no transaction has been open longer than %d seconds, such as a module upgrade, and is retried next cycle.",
+						 BRIN_BUSY_XACT_SECONDS)));
+	}
 	CommitTransactionCommand();
 	MemoryContextSwitchTo(brin_worker_cxt);
 
-	return busy;
+	return oldest != NULL;
 }
 
 /*
@@ -705,7 +734,8 @@ run_brin_scan(const char *dbname)
 	 * Only ordinary tables and materialized views, and no temporary tables:
 	 * pg_stats also lists foreign tables, partitioned parents and other
 	 * sessions' temporary tables, on which the build can only fail, and would
-	 * log a WARNING every cycle for as long as they exist.
+	 * log a WARNING every cycle for as long as they exist.  Likewise only
+	 * tables the database owner, whom the worker runs as, may index.
 	 */
 	{
 		Oid			argtypes[1] = {INT4OID};
@@ -722,6 +752,7 @@ run_brin_scan(const char *dbname)
 			"  AND s.schemaname NOT IN ('pg_catalog', 'information_schema') "
 			"  AND c.relkind IN ('r', 'm') "
 			"  AND c.relpersistence <> 't' "
+			"  AND pg_catalog.pg_has_role(c.relowner, 'USAGE') "
 			"  AND c.relpages >= $1",
 			1, argtypes, args, NULL, true, 0);
 	}
@@ -1037,10 +1068,20 @@ DBBlueBrinWorkerMain(Datum main_arg)
 {
 	Oid			dboid = DatumGetObjectId(main_arg);
 	const char *dbname = MyBgworkerEntry->bgw_extra;
+	Oid			dbowner;
 	sigjmp_buf	local_sigjmp_buf;
 
+	memcpy(&dbowner, MyBgworkerEntry->bgw_extra + NAMEDATALEN, sizeof(Oid));
+
+	/*
+	 * SIGTERM ends the worker at once, as it does a backend, even in the
+	 * middle of a concurrent build: a fast shutdown must not wait for a build
+	 * over a large table, nor DROP DATABASE give up while one runs.  The
+	 * INVALID index such a build leaves is dropped the next time the table is
+	 * visited; see brin_drop_own_invalid_index().
+	 */
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
-	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
+	pqsignal(SIGTERM, die);
 	BackgroundWorkerUnblockSignals();
 
 	/*
@@ -1048,12 +1089,22 @@ DBBlueBrinWorkerMain(Datum main_arg)
 	 * rename in between must not redirect this worker somewhere else.
 	 * InitPostgres applies the database's own ALTER DATABASE settings, so
 	 * dbblue_create_brin below is this database's value.
+	 *
+	 * As the database's owner, not a superuser.  Odoo's role owns its
+	 * databases and their tables, and before Drop, Duplicate and Rename it
+	 * terminates every session in the database with pg_terminate_backend(),
+	 * which a non-superuser may not do to a superuser's process: the call
+	 * errors, which stops it signalling the sessions after this one too, and
+	 * the database stays in use.  As the owner, the worker can be terminated
+	 * by Odoo, and also can only index tables that role may.  The owner need
+	 * not be allowed to log in.
 	 */
-	BackgroundWorkerInitializeConnectionByOid(dboid, InvalidOid, 0);
+	BackgroundWorkerInitializeConnectionByOid(dboid, dbowner,
+											  BGWORKER_BYPASS_ROLELOGINCHECK);
 
 	/*
-	 * This worker connects as a superuser and runs DDL, so pin its search_path
-	 * to the system catalogs before it does anything.  Every object it names
+	 * This worker runs DDL, so pin its search_path to the system catalogs
+	 * before it does anything.  Every object it names
 	 * is schema-qualified, but a pinned path is defence in depth: no relation
 	 * or function an unprivileged user could create in a searched schema can
 	 * then shadow an unqualified name resolved here.  PGC_S_SESSION outlives
