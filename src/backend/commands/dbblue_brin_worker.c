@@ -701,6 +701,11 @@ run_brin_scan(const char *dbname)
 	 * there is pure cost: with the default 128 pages per range it has a
 	 * single range and can skip nothing, while each CREATE INDEX CONCURRENTLY
 	 * waits for every older transaction.
+	 *
+	 * Only ordinary tables and materialized views, and no temporary tables:
+	 * pg_stats also lists foreign tables, partitioned parents and other
+	 * sessions' temporary tables, on which the build can only fail, and would
+	 * log a WARNING every cycle for as long as they exist.
 	 */
 	{
 		Oid			argtypes[1] = {INT4OID};
@@ -715,6 +720,8 @@ run_brin_scan(const char *dbname)
 			"WHERE s.attname = 'create_date' "
 			"  AND s.correlation > 0.9 "
 			"  AND s.schemaname NOT IN ('pg_catalog', 'information_schema') "
+			"  AND c.relkind IN ('r', 'm') "
+			"  AND c.relpersistence <> 't' "
 			"  AND c.relpages >= $1",
 			1, argtypes, args, NULL, true, 0);
 	}
