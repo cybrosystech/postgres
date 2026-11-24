@@ -142,14 +142,25 @@ static void brin_create_index_concurrently(const char *create_sql);
  * Warn instead, so a stale value is visible at the moment it is set rather
  * than never.  Not rejected: erroring out would turn an obsolete line in a
  * config file into a failure to start.
+ *
+ * On a reload every process re-reads the configuration file and runs this
+ * hook, so warning in each would log one line per backend.  As guc.c does for
+ * problems in the file, only the postmaster warns then; other processes log
+ * it at DEBUG3.  ALTER SYSTEM also validates with PGC_S_FILE, but inside a
+ * transaction, so its user is still warned.
  */
 bool
 dbblue_check_brin_database(char **newval, void **extra, GucSource source)
 {
+	int			elevel = WARNING;
+
 	if (*newval == NULL || **newval == '\0')
 		return true;
 
-	ereport(WARNING,
+	if (source == PGC_S_FILE && IsUnderPostmaster && !IsTransactionState())
+		elevel = DEBUG3;
+
+	ereport(elevel,
 			(errmsg("dbblue_brin_database is obsolete and is ignored"),
 			 errdetail("Automatic BRIN index creation is now enabled per database."),
 			 errhint("Use ALTER DATABASE %s SET dbblue_create_brin = on instead, and remove dbblue_brin_database.",
