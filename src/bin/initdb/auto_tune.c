@@ -33,6 +33,7 @@
 #include <windows.h>
 #endif
 
+#include "access/xlog_internal.h"
 #include "auto_tune.h"
 #include "fe_utils/sysinfo.h"
 
@@ -493,7 +494,8 @@ round_memory_kb(int kb)
 }
 
 AutoTuneSettings
-auto_tune_compute(int max_connections, const char *data_dir)
+auto_tune_compute(int max_connections, const char *data_dir,
+				  int wal_segment_size_mb)
 {
 	AutoTuneSettings s;
 	uint64		ram_bytes;
@@ -657,6 +659,18 @@ auto_tune_compute(int max_connections, const char *data_dir)
 	s.max_wal_size_mb = clamp_int((int) ((int64) ram_kb / 4 / KB_PER_MB),
 								  1024, 8192);
 	s.min_wal_size_mb = s.max_wal_size_mb / 4;
+
+	/*
+	 * Never below what initdb writes untuned, DEFAULT_MIN_WAL_SEGS and
+	 * DEFAULT_MAX_WAL_SEGS segments.  The server requires at least two
+	 * segments of each, which with --wal-segsize of 256 MB or more the RAM
+	 * based values above can miss, and initdb would fail.  With the default
+	 * 16 MB segments those floors are 80 MB and 1 GB, below the values above.
+	 */
+	s.min_wal_size_mb = Max(s.min_wal_size_mb,
+							DEFAULT_MIN_WAL_SEGS * wal_segment_size_mb);
+	s.max_wal_size_mb = Max(s.max_wal_size_mb,
+							DEFAULT_MAX_WAL_SEGS * wal_segment_size_mb);
 
 	/*
 	 * Cap the WAL a replication slot may hold back.  The default of -1 lets a

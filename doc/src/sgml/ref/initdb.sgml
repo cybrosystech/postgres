@@ -855,11 +855,16 @@ auto-tune: probing "shared_buffers" = 8GB ... ok
       </row>
       <row>
        <entry><xref linkend="guc-max-wal-size"/></entry>
-       <entry>25% of <replaceable>RAM</replaceable>, between 1 GB and 8 GB</entry>
+       <entry>25% of <replaceable>RAM</replaceable>, between 1 GB and 8 GB,
+        but at least 64 WAL segments, the value written without automatic
+        tuning (only larger with <option>--wal-segsize</option> above
+        16 MB)</entry>
       </row>
       <row>
        <entry><xref linkend="guc-min-wal-size"/></entry>
-       <entry><varname>max_wal_size</varname> / 4</entry>
+       <entry>25% of the <varname>max_wal_size</varname> above (before
+        the 64-segment minimum), but at least 5 WAL segments, the value written
+        without automatic tuning; the server requires at least 2</entry>
       </row>
       <row>
        <entry><xref linkend="guc-max-slot-wal-keep-size"/></entry>

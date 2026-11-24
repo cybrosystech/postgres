@@ -73,6 +73,7 @@ typedef struct AutoTuneSettings
  * with valid = false and the caller should fall back to upstream defaults.
  */
 extern AutoTuneSettings auto_tune_compute(int max_connections,
-										   const char *data_dir);
+										   const char *data_dir,
+										   int wal_segment_size_mb);
 
 #endif							/* AUTO_TUNE_H */

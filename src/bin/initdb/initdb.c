@@ -1382,7 +1382,7 @@ apply_auto_tune(void)
 			tune_connections = (int) val;
 	}
 
-	s = auto_tune_compute(tune_connections, pg_data);
+	s = auto_tune_compute(tune_connections, pg_data, wal_segment_size_mb);
 	if (!s.valid)
 	{
 		printf(_("auto-tune: could not detect host specs, using upstream defaults\n"));
