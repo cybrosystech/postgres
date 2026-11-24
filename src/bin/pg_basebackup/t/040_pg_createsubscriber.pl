@@ -256,7 +256,7 @@ $node_p->append_conf(
 	'postgresql.conf', q{
 max_replication_slots = 10
 max_wal_senders = 10
-max_worker_processes = 8
+max_worker_processes = 20
 });
 
 # Check some unmet conditions on node S
@@ -283,7 +283,7 @@ $node_s->append_conf(
 	'postgresql.conf', q{
 max_active_replication_origins = 10
 max_logical_replication_workers = 4
-max_worker_processes = 8
+max_worker_processes = 20
 });
 # Restore default settings on both servers
 $node_p->restart;

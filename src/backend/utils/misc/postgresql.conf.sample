@@ -245,7 +245,7 @@
 
 # - Worker Processes -
 
-#max_worker_processes = 8               # (change requires restart)
+#max_worker_processes = 20              # (change requires restart)
 #max_parallel_workers_per_gather = 2    # limited by max_parallel_workers
 #max_parallel_maintenance_workers = 2   # limited by max_parallel_workers
 #max_parallel_workers = 8               # number of max_worker_processes that

@@ -2829,7 +2829,7 @@
 { name => 'max_worker_processes', type => 'int', context => 'PGC_POSTMASTER', group => 'RESOURCES_WORKER_PROCESSES',
   short_desc => 'Maximum number of concurrent worker processes.',
   variable => 'max_worker_processes',
-  boot_val => '8',
+  boot_val => '20',
   min => '0',
   max => 'MAX_BACKENDS',
 },

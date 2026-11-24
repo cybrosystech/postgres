@@ -1005,6 +1005,30 @@ PostmasterMain(int argc, char *argv[])
 	process_shared_preload_libraries();
 
 	/*
+	 * dbblue: the always-on background workers are all registered now,
+	 * DBblue's own and those of preloaded libraries.  Warn if they leave too
+	 * few max_worker_processes slots for the per-database workers that the
+	 * BRIN, repack, index advisor and audit prune launchers start, one each,
+	 * and for parallel query.  A configuration that sets the upstream
+	 * default of 8 explicitly leaves none, as DBblue itself keeps 8 busy.
+	 */
+	{
+		dlist_iter	iter;
+		int			registered = 0;
+
+		dlist_foreach(iter, &BackgroundWorkerList)
+			registered++;
+		if (max_worker_processes - registered < 4)
+			ereport(WARNING,
+					(errmsg("only %d of %d background worker slots are free after the %d always-on background workers",
+							max_worker_processes - registered,
+							max_worker_processes, registered),
+					 errdetail("Parallel queries and the per-database workers of DBblue's BRIN, repack, index advisor and audit prune features cannot start without free slots."),
+					 errhint("Set \"max_worker_processes\" to at least %d.",
+							 registered + 4 + max_parallel_workers)));
+	}
+
+	/*
 	 * Initialize SSL library, if specified.
 	 */
 #ifdef USE_SSL

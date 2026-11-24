@@ -762,7 +762,7 @@ GuessControlValues(void)
 	ControlFile.track_commit_timestamp = false;
 	ControlFile.MaxConnections = 100;
 	ControlFile.max_wal_senders = 10;
-	ControlFile.max_worker_processes = 8;
+	ControlFile.max_worker_processes = 20;
 	ControlFile.max_prepared_xacts = 0;
 	ControlFile.max_locks_per_xact = 128;
 
@@ -971,7 +971,7 @@ RewriteControlFile(void)
 	ControlFile.track_commit_timestamp = false;
 	ControlFile.MaxConnections = 100;
 	ControlFile.max_wal_senders = 10;
-	ControlFile.max_worker_processes = 8;
+	ControlFile.max_worker_processes = 20;
 	ControlFile.max_prepared_xacts = 0;
 	ControlFile.max_locks_per_xact = 128;
 
