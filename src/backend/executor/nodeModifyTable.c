@@ -3609,7 +3609,7 @@ ExecMergeMatched(ModifyTableContext *context, ResultRelInfo *resultRelInfo,
 	List	   *actionStates;
 	TupleTableSlot *newslot = NULL;
 	TupleTableSlot *rslot = NULL;
-	TupleTableSlot *planSlot = context->planSlot;
+	TupleTableSlot *origPlanSlot = context->planSlot;
 	EState	   *estate = context->estate;
 	ExprContext *econtext = mtstate->ps.ps_ExprContext;
 	bool		isNull;
@@ -3634,7 +3634,7 @@ ExecMergeMatched(ModifyTableContext *context, ResultRelInfo *resultRelInfo,
 	 * or NOT MATCHED BY SOURCE tuple and UPDATE/DELETE actions.
 	 */
 	econtext->ecxt_scantuple = resultRelInfo->ri_oldTupleSlot;
-	econtext->ecxt_innertuple = planSlot;
+	econtext->ecxt_innertuple = origPlanSlot;
 	econtext->ecxt_outertuple = NULL;
 
 	/*
@@ -4029,18 +4029,16 @@ lmerge_matched:
 									 * contain the NOT MATCHED BY TARGET
 									 * tuple, with non-NULL source values.
 									 * Instead, build a new all-NULL plan slot
-									 * for use locally, leaving
-									 * context->planSlot unchanged for any
-									 * subsequent NOT MATCHED BY TARGET
-									 * actions.  We don't bother setting
-									 * "junk" attributes, since they are no
-									 * longer needed.
+									 * to replace context->planSlot while we
+									 * execute the NOT MATCHED BY SOURCE
+									 * action.  We don't bother setting "junk"
+									 * attributes, since they aren't needed.
 									 */
-									planSlot =
+									context->planSlot =
 										MakeSingleTupleTableSlot(context->planSlot->tts_tupleDescriptor,
 																 &TTSOpsVirtual);
-									ExecStoreAllNullTuple(planSlot);
-									econtext->ecxt_innertuple = planSlot;
+									ExecStoreAllNullTuple(context->planSlot);
+									econtext->ecxt_innertuple = context->planSlot;
 
 									/*
 									 * If we have both NOT MATCHED BY SOURCE
@@ -4141,7 +4139,7 @@ lmerge_matched:
 												 false,
 												 resultRelInfo->ri_oldTupleSlot,
 												 newslot,
-												 planSlot);
+												 context->planSlot);
 					break;
 
 				case CMD_DELETE:
@@ -4150,7 +4148,7 @@ lmerge_matched:
 												 true,
 												 resultRelInfo->ri_oldTupleSlot,
 												 NULL,
-												 planSlot);
+												 context->planSlot);
 					break;
 
 				case CMD_NOTHING:
@@ -4173,12 +4171,13 @@ lmerge_matched:
 	 * Successfully executed an action or no qualifying action was found.
 	 */
 out:
-	if (planSlot != context->planSlot)
+	if (context->planSlot != origPlanSlot)
 	{
 		econtext->ecxt_innertuple = NULL;
 		if (resultRelInfo->ri_projectReturning != NULL)
 			resultRelInfo->ri_projectReturning->pi_exprContext->ecxt_outertuple = NULL;
-		ExecDropSingleTupleTableSlot(planSlot);
+		ExecDropSingleTupleTableSlot(context->planSlot);
+		context->planSlot = origPlanSlot;
 	}
 
 	if (ItemPointerIsValid(&lockedtid))
