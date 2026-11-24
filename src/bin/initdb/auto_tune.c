@@ -23,7 +23,10 @@
 #include <string.h>
 #include <unistd.h>
 #if defined(__linux__)
+#include <dirent.h>
+#include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <sys/sysmacros.h>
 #endif
 
 #ifdef WIN32
@@ -293,39 +296,139 @@ detect_cpu_count(bool *from_cgroup)
 	return cpus;
 }
 
+#if defined(__linux__)
 /*
- * Best-effort SSD detection.  On Linux, /sys/block/<dev>/queue/rotational
- * exposes 0 for SSD/NVMe and 1 for spinning disks.  Anywhere we cannot
- * determine the answer, we assume SSD: that is the right default for the
- * hardware most clusters now run on, and the cost of being wrong is just
- * a slightly aggressive random_page_cost.
+ * Is the disk whose sysfs directory is dir a virtual one?  A virtual disk's
+ * rotational flag describes the emulated controller, not the storage behind
+ * it: virtio (vd*) and Xen (xvd*) disks, and the SCSI disks of QEMU, VMware,
+ * Hyper-V/Azure and Google Cloud, report "rotational" even on SSD storage.
  */
 static bool
-detect_ssd(void)
+is_virtual_disk(const char *dir)
 {
-#if defined(__linux__)
-	const char *candidates[] = {
-		"/sys/block/nvme0n1/queue/rotational",
-		"/sys/block/sda/queue/rotational",
-		"/sys/block/vda/queue/rotational",
-		"/sys/block/xvda/queue/rotational",
-		NULL
-	};
+	static const char *const vendors[] = {"QEMU", "VMware", "Msft", "Google", NULL};
+	const char *name = last_dir_separator(dir);
+	char		path[MAXPGPATH];
+	char		vendor[64];
+	FILE	   *fp;
 	int			i;
 
-	for (i = 0; candidates[i] != NULL; i++)
-	{
-		FILE	   *fp = fopen(candidates[i], "r");
-		int			val;
+	name = name ? name + 1 : dir;
+	if (strncmp(name, "vd", 2) == 0 || strncmp(name, "xvd", 3) == 0)
+		return true;
 
-		if (fp == NULL)
-			continue;
-		if (fscanf(fp, "%d", &val) == 1)
+	snprintf(path, sizeof(path), "%s/device/vendor", dir);
+	if ((fp = fopen(path, "r")) == NULL)
+		return false;
+	if (fgets(vendor, sizeof(vendor), fp) == NULL)
+		vendor[0] = '\0';
+	fclose(fp);
+	for (i = 0; vendors[i] != NULL; i++)
+		if (strncmp(vendor, vendors[i], strlen(vendors[i])) == 0)
+			return true;
+	return false;
+}
+
+/*
+ * Is the block device whose sysfs directory is dir rotational?  Returns 1 if
+ * so, 0 if not, -1 if unknown.  A partition is judged by its disk, and a
+ * device-mapper (LVM) or md (RAID) device by the devices under it: rotational
+ * if any of them is, since the slowest one sets the pace.
+ */
+static int
+block_device_rotational(const char *dir, int depth)
+{
+	char		path[MAXPGPATH];
+	char		real[PATH_MAX];	/* realpath() needs PATH_MAX */
+	DIR		   *d;
+	struct dirent *de;
+	FILE	   *fp;
+	int			result = -1;
+	int			val;
+
+	if (depth > 8)
+		return -1;
+
+	/* A partition: use the disk it belongs to, its parent directory. */
+	snprintf(path, sizeof(path), "%s/partition", dir);
+	if (access(path, F_OK) == 0)
+	{
+		snprintf(path, sizeof(path), "%s/..", dir);
+		if (realpath(path, real) == NULL)
+			return -1;
+		return block_device_rotational(real, depth + 1);
+	}
+
+	/* LVM, RAID and the like: look at the devices underneath. */
+	snprintf(path, sizeof(path), "%s/slaves", dir);
+	if ((d = opendir(path)) != NULL)
+	{
+		while ((de = readdir(d)) != NULL)
 		{
-			fclose(fp);
-			return val == 0;
+			int			r;
+
+			if (de->d_name[0] == '.')
+				continue;
+			snprintf(path, sizeof(path), "%s/slaves/%s", dir, de->d_name);
+			if (realpath(path, real) == NULL)
+				continue;
+			r = block_device_rotational(real, depth + 1);
+			if (r == 1)
+			{
+				result = 1;
+				break;
+			}
+			if (r == 0)
+				result = 0;
 		}
-		fclose(fp);
+		closedir(d);
+		if (result != -1)
+			return result;
+	}
+
+	if (is_virtual_disk(dir))
+		return 0;
+
+	snprintf(path, sizeof(path), "%s/queue/rotational", dir);
+	if ((fp = fopen(path, "r")) == NULL)
+		return -1;
+	if (fscanf(fp, "%d", &val) != 1)
+		val = -1;
+	fclose(fp);
+	return val < 0 ? -1 : (val != 0);
+}
+#endif
+
+/*
+ * Best-effort SSD detection for the disk holding the data directory.  On
+ * Linux, find the block device of data_dir and read its rotational flag,
+ * through partitions, LVM and RAID (block_device_rotational()), and store the
+ * device's name in device.  A rotating disk is reported only for a physical
+ * disk that says so; a virtual disk, a filesystem without a single block
+ * device (overlayfs, btrfs, NFS, ...), or anything else we cannot determine
+ * is assumed to be an SSD, which is what most clusters now run on.
+ */
+static bool
+detect_ssd(const char *data_dir, char *device, size_t devlen)
+{
+	device[0] = '\0';
+#if defined(__linux__)
+	{
+		struct stat st;
+		char		path[MAXPGPATH];
+		char		real[PATH_MAX];	/* realpath() needs PATH_MAX */
+		int			r;
+
+		if (data_dir == NULL || stat(data_dir, &st) != 0)
+			return true;
+		snprintf(path, sizeof(path), "/sys/dev/block/%u:%u",
+				 major(st.st_dev), minor(st.st_dev));
+		if (realpath(path, real) == NULL)
+			return true;
+		strlcpy(device, last_dir_separator(real) + 1, devlen);
+		r = block_device_rotational(real, 0);
+		if (r >= 0)
+			return r == 0;
 	}
 #endif
 	return true;
@@ -390,7 +493,7 @@ round_memory_kb(int kb)
 }
 
 AutoTuneSettings
-auto_tune_compute(int max_connections)
+auto_tune_compute(int max_connections, const char *data_dir)
 {
 	AutoTuneSettings s;
 	uint64		ram_bytes;
@@ -406,7 +509,7 @@ auto_tune_compute(int max_connections)
 
 	ram_bytes = detect_total_ram(&ram_from_cgroup);
 	cpus = detect_cpu_count(&cpu_from_cgroup);
-	ssd = detect_ssd();
+	ssd = detect_ssd(data_dir, s.storage_device, sizeof(s.storage_device));
 
 	if (ram_bytes == 0 || cpus <= 0 || max_connections <= 0)
 	{
@@ -531,9 +634,14 @@ auto_tune_compute(int max_connections)
 		}
 	}
 
-	/* Storage cost model. */
+	/*
+	 * Storage cost model.  A rotating disk keeps the upstream default
+	 * effective_io_concurrency (16, DEFAULT_EFFECTIVE_IO_CONCURRENCY) rather
+	 * than going below it, so a wrong guess never reads ahead less than an
+	 * untuned server.
+	 */
 	s.random_page_cost = ssd ? 1.1 : 4.0;
-	s.effective_io_concurrency = ssd ? 200 : 2;
+	s.effective_io_concurrency = ssd ? 200 : 16;
 
 	/* Smooth checkpoints over the full interval. */
 	s.checkpoint_completion_target = 0.9;

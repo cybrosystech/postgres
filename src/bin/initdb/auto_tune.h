@@ -31,6 +31,8 @@ typedef struct AutoTuneSettings
 	/* True if cpu_count came from a cgroup CPU quota, not the online count. */
 	bool		cpu_from_cgroup;
 	bool		ssd_storage;
+	/* Block device holding the data directory, or "" if not found. */
+	char		storage_device[32];
 
 	/* Memory settings, in kilobytes */
 	int			shared_buffers_kb;
@@ -70,6 +72,7 @@ typedef struct AutoTuneSettings
  * value already chosen by initdb.  On detection failure, returns a struct
  * with valid = false and the caller should fall back to upstream defaults.
  */
-extern AutoTuneSettings auto_tune_compute(int max_connections);
+extern AutoTuneSettings auto_tune_compute(int max_connections,
+										   const char *data_dir);
 
 #endif							/* AUTO_TUNE_H */

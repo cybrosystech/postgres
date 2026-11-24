@@ -1382,7 +1382,7 @@ apply_auto_tune(void)
 			tune_connections = (int) val;
 	}
 
-	s = auto_tune_compute(tune_connections);
+	s = auto_tune_compute(tune_connections, pg_data);
 	if (!s.valid)
 	{
 		printf(_("auto-tune: could not detect host specs, using upstream defaults\n"));
@@ -1390,12 +1390,15 @@ apply_auto_tune(void)
 		return;
 	}
 
-	printf(_("auto-tune: detected %lu MB RAM%s, %d CPU(s)%s, storage=%s\n"),
+	printf(_("auto-tune: detected %lu MB RAM%s, %d CPU(s)%s, storage=%s%s%s%s\n"),
 		   (unsigned long) (s.total_ram_bytes / (1024 * 1024)),
 		   s.ram_from_cgroup ? _(" (cgroup limit)") : "",
 		   s.cpu_count,
 		   s.cpu_from_cgroup ? _(" (cgroup limit)") : "",
-		   s.ssd_storage ? "ssd" : "hdd");
+		   s.ssd_storage ? "ssd" : "hdd",
+		   s.storage_device[0] ? " (" : "",
+		   s.storage_device,
+		   s.storage_device[0] ? ")" : "");
 
 	/* /dev/shm only matters when dynamic shared memory lives there. */
 	if (strcmp(dynamic_shared_memory_type, "posix") != 0)

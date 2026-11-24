@@ -745,17 +745,21 @@ PostgreSQL documentation
      </listitem>
      <listitem>
       <para>
-       <emphasis>Storage type</emphasis>: on Linux, whether the first of the
-       disks <filename>nvme0n1</filename>, <filename>sda</filename>,
-       <filename>vda</filename> and <filename>xvda</filename> that exists is
-       a rotating disk.  This is not necessarily the disk that will hold the
-       data directory.  Where this cannot be told, an SSD is assumed.
+       <emphasis>Storage type</emphasis>: on Linux, whether the disk holding
+       the data directory is a rotating disk.  A partition is judged by its
+       disk, and an LVM or software RAID volume by the disks under it (rotating
+       if any of them is).  Only a physical disk that reports itself as
+       rotating counts: virtual disks (virtio, Xen, and the virtual disks of
+       QEMU, VMware, Hyper-V/Azure and Google Cloud) report this regardless of
+       the storage behind them, so they, and anything that cannot be told
+       (such as overlay, btrfs or network file systems), are assumed to be
+       SSDs.
       </para>
      </listitem>
     </itemizedlist>
     and reports what it found, for example:
 <screen>
-auto-tune: detected 30843 MB RAM, 16 CPU(s), storage=ssd
+auto-tune: detected 30843 MB RAM, 16 CPU(s), storage=ssd (nvme0n1p3)
 auto-tune: probing "shared_buffers" = 8GB ... ok
 </screen>
     If the memory size or the number of CPUs cannot be determined, it says
@@ -842,7 +846,8 @@ auto-tune: probing "shared_buffers" = 8GB ... ok
       </row>
       <row>
        <entry><xref linkend="guc-effective-io-concurrency"/></entry>
-       <entry>200 on an SSD, 2 on a rotating disk</entry>
+       <entry>200 on an SSD, 16 (the standard default) on a rotating
+        disk</entry>
       </row>
       <row>
        <entry><xref linkend="guc-checkpoint-completion-target"/></entry>
