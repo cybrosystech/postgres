@@ -486,8 +486,8 @@ brin_create_index_concurrently(const char *create_sql)
 
 /*
  * brin_try_concurrent_ddl
- *		Run a CREATE or DROP INDEX CONCURRENTLY, and log a WARNING rather than
- *		end the worker if it fails.
+ *		Run a CREATE or DROP INDEX CONCURRENTLY, or an ALTER INDEX, and log a
+ *		WARNING rather than end the worker if it fails.
  *
  * The concurrent paths wait for other sessions: for writers of the table, and
  * for every transaction in the database with an older snapshot -- under
@@ -700,6 +700,7 @@ run_brin_scan(const char *dbname)
 		bool		need_create = false;
 		bool		name_taken = false;
 		bool		created = false;
+		bool		need_autosummarize = false;
 
 		/*
 		 * Stop between tables on shutdown, so a long cycle does not delay
@@ -767,10 +768,35 @@ run_brin_scan(const char *dbname)
 		}
 		else if (SPI_processed > 0)
 		{
-			/* Index exists — skip */
+			/*
+			 * Index exists -- skip, but give this worker's own index
+			 * autosummarize if it was built before the worker set it.  An
+			 * index someone else made, or one where autosummarize was set
+			 * either way by hand, is left alone.
+			 */
+			char	   *opt_sql;
+
 			ereport(DEBUG1,
 					(errmsg("dbblue BRIN: index already exists for %s.%s in database \"%s\", skipping",
 							schemaname, tablename, dbname)));
+
+			opt_sql = psprintf(
+				"SELECT 1 FROM pg_index i "
+				"JOIN pg_class ic ON ic.oid = i.indexrelid "
+				"JOIN pg_namespace n ON n.oid = ic.relnamespace "
+				"JOIN pg_class t ON t.oid = i.indrelid "
+				"JOIN pg_am am ON am.oid = ic.relam "
+				"WHERE n.nspname = %s AND ic.relname = %s "
+				"  AND t.relname = %s AND am.amname = 'brin' "
+				"  AND i.indisvalid "
+				"  AND NOT EXISTS (SELECT 1 FROM unnest(ic.reloptions) o "
+				"                  WHERE o LIKE 'autosummarize=%%')",
+				quote_literal_cstr(schemaname),
+				quote_literal_cstr(indexname),
+				quote_literal_cstr(tablename));
+			if (SPI_execute(opt_sql, true, 1) == SPI_OK_SELECT &&
+				SPI_processed > 0)
+				need_autosummarize = true;
 		}
 		else
 		{
@@ -812,6 +838,25 @@ run_brin_scan(const char *dbname)
 			continue;
 		}
 
+		if (need_autosummarize)
+		{
+			char	   *alter_sql;
+
+			oldctx = MemoryContextSwitchTo(brin_worker_cxt);
+			alter_sql = psprintf("ALTER INDEX %s.%s SET (autosummarize = on)",
+								 quote_identifier(schemaname),
+								 quote_identifier(indexname));
+			MemoryContextSwitchTo(oldctx);
+
+			if (brin_try_concurrent_ddl(alter_sql,
+										"enable autosummarize on the",
+										schemaname, tablename, dbname))
+				ereport(LOG,
+						(errmsg("dbblue BRIN: enabled autosummarize on index %s on %s.%s in database \"%s\"",
+								indexname, schemaname, tablename, dbname)));
+			continue;
+		}
+
 		if (!need_create)
 			continue;
 
@@ -822,10 +867,16 @@ run_brin_scan(const char *dbname)
 		 * build, in case the name was taken in between; the verification that
 		 * follows is what actually confirms the index now exists, so a silent
 		 * IF NOT EXISTS skip is reported honestly rather than as a success.
+		 *
+		 * autosummarize: without it, block ranges filled after the build stay
+		 * unsummarized, and so are read by every scan, until the next VACUUM
+		 * -- on an insert-mostly Odoo table up to about a fifth of it, and
+		 * the newest part, which Odoo's date filters ask for most.  With it,
+		 * autovacuum summarizes each range as soon as the next one starts.
 		 */
 		oldctx = MemoryContextSwitchTo(brin_worker_cxt);
 		create_sql = psprintf(
-			"CREATE INDEX CONCURRENTLY IF NOT EXISTS %s ON %s.%s USING brin (create_date)",
+			"CREATE INDEX CONCURRENTLY IF NOT EXISTS %s ON %s.%s USING brin (create_date) WITH (autosummarize = on)",
 			quote_identifier(indexname),
 			quote_identifier(schemaname),
 			quote_identifier(tablename));
