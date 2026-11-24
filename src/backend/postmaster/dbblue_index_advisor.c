@@ -2288,6 +2288,7 @@ DbblueIndexAdvisorLauncherMain(Datum main_arg)
 
 	/* volatile: assigned in the error handler below and read after it. */
 	volatile TimestampTz next_run = 0;
+	TimestampTz last_sweep = 0;		/* start of the latest sweep, 0 = none */
 
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
@@ -2354,16 +2355,28 @@ DbblueIndexAdvisorLauncherMain(Datum main_arg)
 
 		if (ConfigReloadPending)
 		{
+			bool		old_enabled = dbblue_auto_index_suggestion_enabled;
+			int			old_interval = dbblue_auto_index_suggestion_interval;
+
 			ConfigReloadPending = false;
 			ProcessConfigFile(PGC_SIGHUP);
 
 			/*
-			 * The cluster-wide dbblue_auto_index_suggestion_enabled is the
-			 * default for every database without a setting of its own, and
-			 * the interval itself may have changed, so re-evaluate at once
-			 * rather than at the end of the current interval.
+			 * Move the schedule only for what concerns the advisor: a sweep
+			 * runs hundreds of EXPLAINs per database, and tooling may reload
+			 * every few minutes for unrelated reasons.  The cluster-wide
+			 * dbblue_auto_index_suggestion_enabled is the default for every
+			 * database without a setting of its own, so a change to it sweeps
+			 * at once.  A new interval counts from the last sweep -- at once
+			 * if that is already overdue.  A per-database ALTER DATABASE ...
+			 * SET needs no reload: the worker reads it at the next sweep.
 			 */
-			next_run = 0;
+			if (dbblue_auto_index_suggestion_enabled != old_enabled)
+				next_run = 0;
+			else if (dbblue_auto_index_suggestion_interval != old_interval &&
+					 last_sweep != 0)
+				next_run = TimestampTzPlusMilliseconds(last_sweep,
+													   (int64) dbblue_auto_index_suggestion_interval * 1000);
 		}
 
 		interval_ms = (int64) dbblue_auto_index_suggestion_interval * 1000;
@@ -2399,6 +2412,7 @@ DbblueIndexAdvisorLauncherMain(Datum main_arg)
 				 * than this either: the value is read by the worker, at
 				 * connect time, on every sweep.
 				 */
+				last_sweep = GetCurrentTimestamp();
 				databases = advisor_get_database_list();
 
 				foreach(lc, databases)
