@@ -29,6 +29,7 @@ $node->init;
 # make the worker's own log lines visible for the collision assertions.
 $node->append_conf('postgresql.conf', <<'EOF');
 dbblue_create_brin = on
+dbblue_brin_min_pages = 0
 log_min_messages = info
 EOF
 $node->start;

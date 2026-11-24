@@ -617,6 +617,7 @@ bool		check_function_bodies = true;
 
 char	   *dbblue_brin_database = NULL;
 bool		dbblue_create_brin = false;
+int			dbblue_brin_min_pages = 1000;
 
 /*
  * These GUCs exist solely for backward compatibility.

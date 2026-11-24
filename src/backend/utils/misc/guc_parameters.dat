@@ -788,7 +788,6 @@
   max => '1.0',
 },
 
-
 { name => 'dbblue_auto_index_suggestion_top_n_queries', type => 'int', context => 'PGC_SIGHUP', group => 'STATS_MONITORING',
   short_desc => 'How many top queries from pg_stat_statements to analyse per run.',
   long_desc => 'Queries are ranked by total execution time across all calls; only this many of the top entries are processed each tick.',
@@ -917,6 +916,15 @@
   variable => 'dbblue_brin_database',
   boot_val => '""',
   check_hook => 'dbblue_check_brin_database',
+},
+
+{ name => 'dbblue_brin_min_pages', type => 'int', context => 'PGC_SUSET', group => 'RESOURCES_WORKER_PROCESSES',
+  short_desc => 'Minimum table size, in pages, for automatic BRIN index creation.',
+  long_desc => 'dbblue_create_brin skips tables smaller than this, as of their last VACUUM or ANALYZE. A BRIN index summarizes 128 pages per range by default, so on a smaller table it cannot skip anything, and every CREATE INDEX CONCURRENTLY waits for older transactions. 0 means no minimum. Settable per database with ALTER DATABASE, like dbblue_create_brin.',
+  variable => 'dbblue_brin_min_pages',
+  boot_val => '1000',
+  min => '0',
+  max => 'INT_MAX',
 },
 
 { name => 'dbblue_bulk_write_maxpages', type => 'int', context => 'PGC_USERSET', group => 'RESOURCES_IO',

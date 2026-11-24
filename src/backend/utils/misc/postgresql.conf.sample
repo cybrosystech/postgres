@@ -253,6 +253,8 @@
 #parallel_leader_participation = on
 #dbblue_create_brin = off               # create BRIN indexes on create_date
                                         # columns automatically, per database
+#dbblue_brin_min_pages = 1000           # only on tables of at least this many
+                                        # pages (8kB each); 0 = no minimum
 #dbblue_brin_database = ''              # obsolete; dbblue_create_brin is
                                         # set per database instead
 

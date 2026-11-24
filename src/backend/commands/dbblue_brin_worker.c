@@ -65,6 +65,7 @@
 #include "access/tableam.h"
 #include "access/xact.h"
 #include "catalog/pg_database.h"
+#include "catalog/pg_type.h"
 #include "commands/dbblue_brin_worker.h"
 #include "executor/spi.h"
 #include "libpq/pqsignal.h"
@@ -489,13 +490,30 @@ run_brin_scan(const char *dbname)
 		return;
 	}
 
-	ret = SPI_execute(
-		"SELECT DISTINCT schemaname, tablename "
-		"FROM pg_stats "
-		"WHERE attname = 'create_date' "
-		"  AND correlation > 0.9 "
-		"  AND schemaname NOT IN ('pg_catalog', 'information_schema')",
-		true, 0);
+	/*
+	 * Skip tables smaller than dbblue_brin_min_pages, by relpages as of their
+	 * last VACUUM or ANALYZE.  Every Odoo model has a create_date, and on a
+	 * small table it is almost always in insertion order, but a BRIN index
+	 * there is pure cost: with the default 128 pages per range it has a
+	 * single range and can skip nothing, while each CREATE INDEX CONCURRENTLY
+	 * waits for every older transaction.
+	 */
+	{
+		Oid			argtypes[1] = {INT4OID};
+		Datum		args[1] = {Int32GetDatum(dbblue_brin_min_pages)};
+
+		ret = SPI_execute_with_args(
+			"SELECT DISTINCT s.schemaname, s.tablename "
+			"FROM pg_stats s "
+			"JOIN pg_namespace n ON n.nspname = s.schemaname "
+			"JOIN pg_class c ON c.relnamespace = n.oid "
+			"                AND c.relname = s.tablename "
+			"WHERE s.attname = 'create_date' "
+			"  AND s.correlation > 0.9 "
+			"  AND s.schemaname NOT IN ('pg_catalog', 'information_schema') "
+			"  AND c.relpages >= $1",
+			1, argtypes, args, NULL, true, 0);
+	}
 
 	if (ret != SPI_OK_SELECT)
 	{

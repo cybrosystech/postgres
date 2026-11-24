@@ -292,6 +292,7 @@ extern PGDLLIMPORT bool current_role_is_superuser;
 
 extern PGDLLIMPORT char *dbblue_brin_database;
 extern PGDLLIMPORT bool dbblue_create_brin;
+extern PGDLLIMPORT int dbblue_brin_min_pages;
 
 extern PGDLLIMPORT bool AllowAlterSystem;
 extern PGDLLIMPORT bool log_duration;
