@@ -101,6 +101,14 @@
 #define BRIN_WORKER_POLL_INTERVAL	1000	/* 1 second in ms */
 
 /*
+ * lock_timeout for the worker's session.  CREATE and DROP INDEX CONCURRENTLY
+ * wait for other sessions, and one left idle in transaction would otherwise
+ * hold the worker -- and, as the launcher runs workers one at a time, every
+ * other database -- indefinitely.  See brin_try_concurrent_ddl().
+ */
+#define BRIN_LOCK_TIMEOUT			"60s"
+
+/*
  * One database the launcher will start a worker in this cycle.  The name is
  * carried alongside the OID purely for log messages; the worker is addressed
  * by OID, which stays correct even if the database is renamed mid-cycle.
@@ -379,7 +387,9 @@ brin_scan_one_database(const BrinDatabase *db)
  *
  * The index relation's own attribute carries the indexed column's name, so
  * joining it against pg_am asks exactly the intended question: is there a BRIN
- * index on this table, over create_date?
+ * index on this table, over create_date?  Only a valid one counts: a
+ * concurrent build that failed leaves an INVALID index behind, which is
+ * maintained on every write but never used, and must not stop a rebuild.
  */
 static char *
 brin_build_check_sql(const char *schemaname, const char *tablename)
@@ -396,6 +406,7 @@ brin_build_check_sql(const char *schemaname, const char *tablename)
 		"WHERE n.nspname = %s AND t.relname = %s "
 		"  AND am.amname = 'brin' "
 		"  AND ia.attname = 'create_date' "
+		"  AND i.indisvalid "
 		"LIMIT 1",
 		quote_literal_cstr(schemaname),
 		quote_literal_cstr(tablename));
@@ -471,6 +482,115 @@ brin_create_index_concurrently(const char *create_sql)
 	 * expects before returning.
 	 */
 	MemoryContextSwitchTo(brin_worker_cxt);
+}
+
+/*
+ * brin_try_concurrent_ddl
+ *		Run a CREATE or DROP INDEX CONCURRENTLY, and log a WARNING rather than
+ *		end the worker if it fails.
+ *
+ * The concurrent paths wait for other sessions: for writers of the table, and
+ * for every transaction in the database with an older snapshot -- under
+ * Odoo's REPEATABLE READ, any transaction still open.  lock_timeout, set when
+ * the worker starts, bounds each of those waits, and a session left idle in
+ * transaction is the usual reason to hit it.  Catching the error here, the
+ * way autovacuum treats a failure on one table, lets the worker go on to its
+ * other tables and the launcher to the other databases; the table is retried
+ * next cycle.  FATAL, such as a shutdown, is not caught.  Returns true on
+ * success.
+ */
+static bool
+brin_try_concurrent_ddl(const char *sql, const char *action,
+						const char *schemaname, const char *tablename,
+						const char *dbname)
+{
+	volatile bool ok = true;
+
+	PG_TRY();
+	{
+		brin_create_index_concurrently(sql);
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		HOLD_INTERRUPTS();
+		MemoryContextSwitchTo(brin_worker_cxt);
+		edata = CopyErrorData();
+		FlushErrorState();
+		AbortOutOfAnyTransaction();
+		MemoryContextSwitchTo(brin_worker_cxt);
+		pgstat_report_activity(STATE_IDLE, NULL);
+		RESUME_INTERRUPTS();
+
+		ereport(WARNING,
+				(errmsg("dbblue BRIN: could not %s index on %s.%s in database \"%s\": %s",
+						action, schemaname, tablename, dbname, edata->message),
+				 errhint("A long-running or idle-in-transaction session in this database can block it; idle_in_transaction_session_timeout limits those. It will be retried next cycle.")));
+		FreeErrorData(edata);
+		ok = false;
+	}
+	PG_END_TRY();
+
+	return ok;
+}
+
+/*
+ * brin_drop_own_invalid_index
+ *		Drop the INVALID index a failed concurrent build left on this table
+ *		under this worker's name, if there is one.
+ *
+ * Only an index that is BRIN, on this table, under the name this worker
+ * gives, and INVALID is touched: a valid index, or anyone else's, never is.
+ * Returns false if such an index still exists afterwards, because the drop
+ * failed too; the caller then leaves the table for the next cycle.
+ */
+static bool
+brin_drop_own_invalid_index(const char *schemaname, const char *tablename,
+							const char *indexname, const char *dbname)
+{
+	bool		found = false;
+	char	   *drop_sql;
+
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	if (SPI_connect() == SPI_OK_CONNECT)
+	{
+		char	   *sql = psprintf(
+								   "SELECT 1 FROM pg_index i "
+								   "JOIN pg_class ic ON ic.oid = i.indexrelid "
+								   "JOIN pg_namespace n ON n.oid = ic.relnamespace "
+								   "JOIN pg_class t ON t.oid = i.indrelid "
+								   "JOIN pg_am am ON am.oid = ic.relam "
+								   "WHERE n.nspname = %s AND ic.relname = %s "
+								   "  AND t.relname = %s AND am.amname = 'brin' "
+								   "  AND NOT i.indisvalid",
+								   quote_literal_cstr(schemaname),
+								   quote_literal_cstr(indexname),
+								   quote_literal_cstr(tablename));
+
+		if (SPI_execute(sql, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+			found = true;
+		SPI_finish();
+	}
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+	MemoryContextSwitchTo(brin_worker_cxt);
+
+	if (!found)
+		return true;
+
+	drop_sql = psprintf("DROP INDEX CONCURRENTLY IF EXISTS %s.%s",
+						quote_identifier(schemaname),
+						quote_identifier(indexname));
+	if (!brin_try_concurrent_ddl(drop_sql, "drop the invalid",
+								 schemaname, tablename, dbname))
+		return false;
+
+	ereport(LOG,
+			(errmsg("dbblue BRIN: dropped invalid index %s on %s.%s in database \"%s\"",
+					indexname, schemaname, tablename, dbname)));
+	return true;
 }
 
 /*
@@ -609,6 +729,15 @@ run_brin_scan(const char *dbname)
 		truncate_identifier(indexname, strlen(indexname), false);
 
 		/*
+		 * Clear an INVALID index an earlier failed build left under this
+		 * name, from this worker or an older version of it, so the checks
+		 * below neither take it for the real one nor for a name conflict.
+		 */
+		if (!brin_drop_own_invalid_index(schemaname, tablename, indexname,
+										 dbname))
+			continue;
+
+		/*
 		 * ---- Check transaction ----
 		 *
 		 * Decide, inside one short read transaction, whether this table still
@@ -706,7 +835,14 @@ run_brin_scan(const char *dbname)
 				(errmsg("dbblue BRIN: creating index on %s.%s in database \"%s\"",
 						schemaname, tablename, dbname)));
 
-		brin_create_index_concurrently(create_sql);
+		if (!brin_try_concurrent_ddl(create_sql, "create",
+									 schemaname, tablename, dbname))
+		{
+			/* Don't leave the half-built index for Odoo's writes to maintain. */
+			(void) brin_drop_own_invalid_index(schemaname, tablename,
+											   indexname, dbname);
+			continue;
+		}
 
 		/*
 		 * ---- Verify transaction ----
@@ -787,6 +923,10 @@ DBBlueBrinWorkerMain(Datum main_arg)
 	 * this database's own settings, so this is the value that stands.
 	 */
 	SetConfigOption("search_path", "pg_catalog, pg_temp",
+					PGC_SUSET, PGC_S_SESSION);
+
+	/* Bound every wait of the concurrent builds; see BRIN_LOCK_TIMEOUT. */
+	SetConfigOption("lock_timeout", BRIN_LOCK_TIMEOUT,
 					PGC_SUSET, PGC_S_SESSION);
 
 	brin_worker_cxt = AllocSetContextCreate(TopMemoryContext,
