@@ -72,6 +72,7 @@
 #include "miscadmin.h"
 #include "nodes/parsenodes.h"
 #include "nodes/plannodes.h"
+#include "parser/scansup.h"
 #include "pgstat.h"
 #include "postmaster/bgworker.h"
 #include "postmaster/interrupt.h"
@@ -599,6 +600,13 @@ run_brin_scan(const char *dbname)
 		oldctx = MemoryContextSwitchTo(brin_worker_cxt);
 		indexname = psprintf("%s_create_date_brin_idx", tablename);
 		MemoryContextSwitchTo(oldctx);
+
+		/*
+		 * Cut the name to NAMEDATALEN - 1 bytes now, as CREATE INDEX would, so
+		 * the log messages show the name the index really gets.  With a table
+		 * name over 42 bytes the suffix would otherwise make it too long.
+		 */
+		truncate_identifier(indexname, strlen(indexname), false);
 
 		/*
 		 * ---- Check transaction ----
