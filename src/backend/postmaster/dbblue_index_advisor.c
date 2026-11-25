@@ -2358,7 +2358,13 @@ DbblueIndexAdvisorMain(Datum main_arg)
 	sigjmp_buf	local_sigjmp_buf;
 
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
-	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
+	/*
+	 * SIGTERM ends the worker at once, as it does a backend, even in the
+	 * middle of a pass: a fast shutdown, DROP DATABASE and Odoo's Drop,
+	 * Duplicate and Rename must not wait for hundreds of EXPLAINs.  The
+	 * database owner may send it too; see pg_signal_backend().
+	 */
+	pqsignal(SIGTERM, die);
 	BackgroundWorkerUnblockSignals();
 
 	advisor_dbname = MyBgworkerEntry->bgw_extra;

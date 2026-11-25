@@ -17,8 +17,10 @@
 #include <signal.h>
 
 #include "catalog/pg_authid.h"
+#include "catalog/pg_database.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "postmaster/bgworker.h"
 #include "postmaster/syslogger.h"
 #include "storage/pmsignal.h"
 #include "storage/proc.h"
@@ -48,6 +50,30 @@
 #define SIGNAL_BACKEND_NOPERMISSION 2
 #define SIGNAL_BACKEND_NOSUPERUSER 3
 #define SIGNAL_BACKEND_NOAUTOVAC 4
+
+/*
+ * DBblue: is proc one of DBblue's background workers, connected to a
+ * database the current user owns?  Such workers -- the index advisor, auto
+ * repack, the audit pruner -- connect to a database on their own, as a
+ * superuser, to do maintenance there.  Before Drop, Duplicate and Rename,
+ * Odoo terminates every session in the database as its owner, and the error
+ * on a superuser's process ended that call, leaving the database in use.  So
+ * the owner may signal them, as pg_signal_autovacuum_worker may autovacuum,
+ * which DROP DATABASE also terminates itself; their work is redone later.
+ */
+static bool
+dbblue_worker_of_own_database(PGPROC *proc, int pid)
+{
+	const char *type;
+
+	if (proc->backendType != B_BG_WORKER || !OidIsValid(proc->databaseId))
+		return false;
+	type = GetBackgroundWorkerTypeByPid(pid);
+	if (type == NULL || strncmp(type, "dbblue ", 7) != 0)
+		return false;
+	return object_ownercheck(DatabaseRelationId, proc->databaseId, GetUserId());
+}
+
 static int
 pg_signal_backend(int pid, int sig)
 {
@@ -93,7 +119,7 @@ pg_signal_backend(int pid, int sig)
 			if (!has_privs_of_role(GetUserId(), ROLE_PG_SIGNAL_AUTOVACUUM_WORKER))
 				return SIGNAL_BACKEND_NOAUTOVAC;
 		}
-		else if (!superuser())
+		else if (!superuser() && !dbblue_worker_of_own_database(proc, pid))
 			return SIGNAL_BACKEND_NOSUPERUSER;
 	}
 	else if (!has_privs_of_role(GetUserId(), proc->roleId) &&
