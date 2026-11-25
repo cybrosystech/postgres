@@ -1667,14 +1667,17 @@ CREATE DATABASE foo WITH TEMPLATE template0;
 
   <para>
    When dumping a <productname>DBblue</productname> server,
-   <application>pg_dump</application> leaves out the table
-   <literal>public.dbblue_index_suggestions</literal>, which the automatic
-   index suggestion feature writes as a superuser, and the extensions
+   <application>pg_dump</application> leaves out the tables
+   <literal>public.dbblue_index_suggestions</literal> and
+   <literal>public.dbblue_repack_history</literal>, which the automatic index
+   suggestion and automatic repack features write as a superuser, and the
+   extensions
    <literal>pg_stat_statements</literal> and <literal>hypopg</literal>, which
    only a superuser may create.  Dumped as the database owner, as
    <productname>Odoo</productname>'s database manager does, they would make
-   the dump, or its restore, fail.  The feature rebuilds its suggestions and
-   recreates the extensions in the restored database, and
+   the dump, or its restore, fail.  The features rebuild their suggestions
+   and repack history, and recreate the extensions, in the restored database,
+   and
    <productname>DBblue</productname> preloads both extensions on every
    cluster.  To include them, name them with <option>--table</option> or
    <option>--extension</option>.  This does not apply with

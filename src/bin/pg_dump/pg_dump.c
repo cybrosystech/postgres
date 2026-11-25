@@ -2116,12 +2116,15 @@ selectDumpableTable(TableInfo *tbinfo, Archive *fout)
 		tbinfo->dobj.dump = tbinfo->dobj.namespace->dobj.dump_contains;
 
 	/*
-	 * DBblue: the index advisor's results table, unless named with --table.
-	 * Its identity sequence follows it; see getOwnedSeqs().
+	 * DBblue: the index advisor's results table and auto repack's history,
+	 * unless named with --table.  Their identity sequences follow them; see
+	 * getOwnedSeqs().  The repack history only holds a per-table cooldown,
+	 * keyed by OIDs a restore changes anyway.
 	 */
 	if (dbblue_skip_objects && table_include_oids.head == NULL &&
 		strcmp(tbinfo->dobj.namespace->dobj.name, "public") == 0 &&
-		strcmp(tbinfo->dobj.name, DBBLUE_ADVISOR_TABLE) == 0)
+		(strcmp(tbinfo->dobj.name, DBBLUE_ADVISOR_TABLE) == 0 ||
+		 strcmp(tbinfo->dobj.name, "dbblue_repack_history") == 0))
 		tbinfo->dobj.dump = DUMP_COMPONENT_NONE;
 
 	/*
