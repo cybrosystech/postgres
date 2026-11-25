@@ -2280,6 +2280,28 @@ advisor_prune_stale(TimestampTz pass_start)
 				(errmsg("dbblue index advisor: removed " UINT64_FORMAT " stale suggestion(s) from database \"%s\"",
 						(uint64) SPI_processed, advisor_dbname)));
 
+	/*
+	 * Drop a suggestion whose columns are the leading columns of another
+	 * suggestion on the same table: a B-tree on (company_id, state) also
+	 * serves a query on company_id alone, so (company_id) beside it would
+	 * cost every write a second index for little gain.  Only a leading prefix
+	 * counts -- (state) is not served by it and stays -- and a REINDEX that
+	 * repairs an INVALID index is kept.  Every row left is from this pass.
+	 */
+	ret = SPI_execute("DELETE FROM public." ADVISOR_RESULT_TABLE " s"
+					  " WHERE s.suggested_index NOT LIKE 'REINDEX%'"
+					  "   AND EXISTS (SELECT 1 FROM public." ADVISOR_RESULT_TABLE " l"
+					  "               WHERE l.schema_name = s.schema_name"
+					  "                 AND l.table_name = s.table_name"
+					  "                 AND cardinality(l.index_columns) > cardinality(s.index_columns)"
+					  "                 AND l.index_columns[1:cardinality(s.index_columns)] = s.index_columns)",
+					  false, 0);
+
+	if (ret == SPI_OK_DELETE && SPI_processed > 0)
+		ereport(LOG,
+				(errmsg("dbblue index advisor: removed " UINT64_FORMAT " suggestion(s) covered by a longer one on the same table from database \"%s\"",
+						(uint64) SPI_processed, advisor_dbname)));
+
 	SPI_finish();
 	PopActiveSnapshot();
 	CommitTransactionCommand();
