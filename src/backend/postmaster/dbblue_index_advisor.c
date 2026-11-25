@@ -1219,15 +1219,59 @@ collect_query_columns(Query *query, List **tables)
 /*
  * candidate_index_name
  *		Build a deterministic name for a suggested index:
- *		dbblue_<table>_<col1>_..._idx, hashed down when it would exceed
- *		NAMEDATALEN.
+ *		dbblue_<table>_<col1>_..._<hash>_idx.
  *
  * A stable name plus IF NOT EXISTS in the generated DDL makes running
  * a suggestion twice a no-op, instead of silently creating a duplicate
  * index the way an unnamed CREATE INDEX does.
+ *
+ * Joined with underscores alone, names are ambiguous, because Odoo's table
+ * and column names contain underscores too: sale_order_line (state) and
+ * sale_order (line_state) both came out as dbblue_sale_order_line_state_idx.
+ * Index names are unique per schema, so IF NOT EXISTS then skipped the second
+ * suggestion while reporting CREATE INDEX.  The hash covers the table and the
+ * column list, quoted so that their boundaries are unambiguous, which tells
+ * any two candidates apart; the readable prefix is cut to make room for it.
  */
 static char *
 candidate_index_name(const char *table_name, List *colnames)
+{
+	StringInfoData key;
+	StringInfoData buf;
+	ListCell   *lc;
+	uint32		hash;
+
+	initStringInfo(&key);
+	appendStringInfo(&key, "%s(", quote_identifier(table_name));
+	foreach(lc, colnames)
+		appendStringInfo(&key, "%s%s", lc == list_head(colnames) ? "" : ",",
+						 quote_identifier((char *) lfirst(lc)));
+	appendStringInfoChar(&key, ')');
+	hash = hash_bytes((const unsigned char *) key.data, key.len);
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf, "dbblue_%s", table_name);
+	foreach(lc, colnames)
+		appendStringInfo(&buf, "_%s", (char *) lfirst(lc));
+
+	/*
+	 * Leave room for "_<8 hex digits>_idx" (13 bytes) within NAMEDATALEN - 1,
+	 * cutting on a character boundary so a multibyte name is never split.
+	 */
+	buf.len = pg_mbcliplen(buf.data, buf.len, NAMEDATALEN - 1 - 13);
+	buf.data[buf.len] = '\0';
+	appendStringInfo(&buf, "_%08x_idx", hash);
+
+	return buf.data;
+}
+
+/*
+ * candidate_index_name_v1
+ *		The name earlier versions gave a suggestion, without the hash.  Used
+ *		only to find an INVALID index such a version's suggestion left behind.
+ */
+static char *
+candidate_index_name_v1(const char *table_name, List *colnames)
 {
 	StringInfoData buf;
 	ListCell   *lc;
@@ -1366,25 +1410,29 @@ add_candidate(List **candidates, Oid relid, int nkeys, const AttrNumber *keys)
 	cand->suggestion = cand->ddl;
 	if (!partitioned)
 	{
-		Oid			indexoid = get_relname_relid(index_name,
-												 get_rel_namespace(relid));
+		/* Under this name, or the one earlier versions gave. */
+		char	   *names[2];
 
-		if (OidIsValid(indexoid))
+		names[0] = index_name;
+		names[1] = candidate_index_name_v1(table_name, cand->colnames);
+
+		for (i = 0; i < 2 && cand->suggestion == cand->ddl; i++)
 		{
-			HeapTuple	tup = SearchSysCache1(INDEXRELID,
-											  ObjectIdGetDatum(indexoid));
+			Oid			indexoid = get_relname_relid(names[i],
+													 get_rel_namespace(relid));
+			HeapTuple	tup;
 
-			if (HeapTupleIsValid(tup))
-			{
-				Form_pg_index idx = (Form_pg_index) GETSTRUCT(tup);
-
-				if (idx->indrelid == relid && !idx->indisvalid)
-					cand->suggestion =
-						psprintf("REINDEX INDEX CONCURRENTLY %s",
-								 quote_qualified_identifier(schema_name,
-															index_name));
-				ReleaseSysCache(tup);
-			}
+			if (!OidIsValid(indexoid))
+				continue;
+			tup = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(indexoid));
+			if (!HeapTupleIsValid(tup))
+				continue;
+			if (((Form_pg_index) GETSTRUCT(tup))->indrelid == relid &&
+				!((Form_pg_index) GETSTRUCT(tup))->indisvalid)
+				cand->suggestion =
+					psprintf("REINDEX INDEX CONCURRENTLY %s",
+							 quote_qualified_identifier(schema_name, names[i]));
+			ReleaseSysCache(tup);
 		}
 	}
 
