@@ -34,6 +34,20 @@
  *	  not crowded out by old ones' long histories.  See aprep_entry_score().
  *	All eviction happens inside AutoprepareConsult(), when no entry is in use.
  *
+ * Planner settings
+ * -----------------
+ *	A cached plan keeps the planner settings (enable_*, work_mem, the cost
+ *	settings, jit, parallel query, ...) it was planned under.  Changing one
+ *	later does not re-plan a shape that is already cached.  This is the same
+ *	as an ordinary PREPAREd statement: the plan cache re-plans only for
+ *	changes to the objects a plan depends on, search_path and role, not for
+ *	planner settings.  Its first few executions of a shape are planned afresh
+ *	each time, so they do see the current settings; later ones reuse the
+ *	generic plan.  To test or force a plan after changing such a setting, run
+ *	DISCARD PLANS (or dbblue_autoprepare_reset()) first.  We deliberately do
+ *	not check the settings on every statement, to keep the lookup cheap;
+ *	normal workloads do not change them.
+ *
  * Correctness stance
  * ------------------
  *	The 64-bit queryId only selects a candidate entry; it is not trusted for

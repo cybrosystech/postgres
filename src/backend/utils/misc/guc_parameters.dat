@@ -632,6 +632,7 @@
 
 { name => 'dbblue_autoprepare_enabled', type => 'bool', context => 'PGC_SUSET', group => 'QUERY_TUNING_OTHER',
   short_desc => 'Cache and reuse plans for repeated query shapes.',
+  long_desc => 'A cached plan keeps the planner settings it was built with (enable_*, work_mem, cost settings and so on), as a PREPAREd statement does. After changing one, run DISCARD PLANS to re-plan.',
   flags => 'GUC_NOT_IN_SAMPLE | GUC_EXPLAIN',
   variable => 'autoprepare_enabled',
   boot_val => 'false',
