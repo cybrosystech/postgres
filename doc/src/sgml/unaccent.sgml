@@ -246,14 +246,20 @@ unaccent_refresh(<optional><replaceable class="parameter">new_rules</replaceable
   name of a <filename>.rules</filename> file as for
   <command>ALTER TEXT SEARCH DICTIONARY</command>.  It then rebuilds, with
   <command>REINDEX</command>, every index whose definition uses a function named
-  <function>unaccent</function>, whatever its access method.  The
+  <function>unaccent</function>, whatever its access method.  Only indexes
+  that call <function>unaccent</function> directly are found: an index built
+  through a user-defined wrapper, for example an SQL function that calls
+  <function>unaccent()</function>, depends on the wrapper and is not detected,
+  so it must be rebuilt by hand with <command>REINDEX</command>.  The
   <replaceable>dict</replaceable> argument limits only the dictionary reload;
   the index rebuild always covers every such index, because
   <function>unaccent(text)</function> chooses its dictionary implicitly and an
   index cannot reliably be tied to one dictionary.  With
   <replaceable>dry_run</replaceable> it only reports what it would do; the
   dictionary reload is tried and undone, so a missing rules file is reported
-  as <literal>would fail</literal>.  Everything
+  as <literal>would fail</literal>.  Because that really executes
+  <command>ALTER TEXT SEARCH DICTIONARY</command> before undoing it, any DDL
+  event trigger fires for it, even though nothing is changed.  Everything
   runs in one transaction, so a failure changes nothing.  Concurrent calls
   are serialized with a transaction-level advisory lock, so a second call
   waits until the first one's transaction ends; the lock does not block

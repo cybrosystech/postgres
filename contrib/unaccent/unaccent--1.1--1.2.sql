@@ -17,10 +17,14 @@ ALTER FUNCTION unaccent(text) IMMUTABLE COST 100;
 --   1. re-reads the rules of every text search dictionary built from the
 --      unaccent template, optionally switching them to new_rules (the base name
 --      of a .rules file in tsearch_data, as in ALTER TEXT SEARCH DICTIONARY),
---   2. rebuilds every index whose definition uses a function named unaccent,
+--   2. rebuilds every index whose definition uses a function named unaccent
+--      directly (an index through a user-defined wrapper function depends on
+--      the wrapper and is NOT found; rebuild such indexes by hand),
 --      whatever its access method (btree, gin, gist, cobalt, ...).
 -- With dry_run it only reports what it would do (the dictionary reload is
--- tried and undone, so a missing rules file shows up as 'would fail').  dict
+-- tried and undone, so a missing rules file shows up as 'would fail'; as that
+-- really runs ALTER TEXT SEARCH DICTIONARY, DDL event triggers fire for it).
+-- dict
 -- restricts step 1 to one dictionary; step 2 always covers every index that
 -- uses unaccent(), because unaccent(text) picks its dictionary implicitly and
 -- an index cannot reliably be tied to one dictionary.  Everything runs in one
