@@ -85,6 +85,7 @@
 #include "access/table.h"
 #include "access/tableam.h"
 #include "access/xact.h"
+#include "catalog/namespace.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_type.h"
@@ -103,6 +104,7 @@
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
@@ -190,6 +192,7 @@ static void repack_wait_for_worker(BackgroundWorkerHandle *handle,
 									const RepackDatabase *db);
 static void repack_scan_one_database(const RepackDatabase *db);
 static bool ensure_schema(void);
+static bool history_table_exists(void);
 static List *parse_configured_tables(void);
 static List *load_bloat_candidates(List *specs);
 static void run_repack_cycle(void);
@@ -794,7 +797,7 @@ DbblueRepackWorkerMain(Datum main_arg)
 	if (RecoveryInProgress())
 		proc_exit(0);
 
-	if (!ShutdownRequestPending && ensure_schema())
+	if (!ShutdownRequestPending)
 		run_repack_cycle();
 
 	proc_exit(0);
@@ -803,15 +806,18 @@ DbblueRepackWorkerMain(Datum main_arg)
 /*
  * ensure_schema
  *		Create dbblue_repack_history if it doesn't already exist in the
- *		current database.  Run fresh on every worker invocation -- there
- *		is nothing to cache across processes, since each worker is a
- *		fresh one-shot process with no state surviving between cycles --
- *		but cheap, being just a CREATE TABLE IF NOT EXISTS and a GRANT.
+ *		current database.  Called only before the first repack of a cycle,
+ *		not on every visit: creating it in every database, every cycle, put
+ *		it into a database Odoo had just created to restore a backup into,
+ *		and a backup that contained it then failed with "relation already
+ *		exists".  The GRANT runs only when the table is created, since a
+ *		GRANT rewrites the table's pg_class row even when nothing changes.
  */
 static bool
 ensure_schema(void)
 {
 	bool		table_ok;
+	bool		created;
 
 	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
@@ -820,6 +826,7 @@ ensure_schema(void)
 	pgstat_report_activity(STATE_RUNNING,
 						   "dbblue repack launcher: ensuring schema");
 
+	created = !history_table_exists();
 	table_ok = (SPI_execute(
 							"CREATE TABLE IF NOT EXISTS public.dbblue_repack_history ("
 							"  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"
@@ -833,7 +840,7 @@ ensure_schema(void)
 							")",
 							false, 0) == SPI_OK_UTILITY);
 
-	if (table_ok)
+	if (table_ok && created)
 	{
 		if (SPI_execute("GRANT SELECT ON public.dbblue_repack_history TO PUBLIC",
 						false, 0) != SPI_OK_UTILITY)
@@ -850,6 +857,19 @@ ensure_schema(void)
 	pgstat_report_activity(STATE_IDLE, NULL);
 
 	return table_ok;
+}
+
+/*
+ * history_table_exists
+ *		Does public.dbblue_repack_history exist?  Needs a transaction.
+ */
+static bool
+history_table_exists(void)
+{
+	Oid			nspid = get_namespace_oid("public", true);
+
+	return OidIsValid(nspid) &&
+		OidIsValid(get_relname_relid("dbblue_repack_history", nspid));
 }
 
 /*
@@ -943,6 +963,7 @@ load_bloat_candidates(List *specs)
 	int			ret;
 	uint64		row;
 	ListCell   *lc;
+	bool		have_history;
 
 	if (n == 0)
 		return NIL;
@@ -966,7 +987,12 @@ load_bloat_candidates(List *specs)
 	pgstat_report_activity(STATE_RUNNING,
 						   "dbblue repack launcher: checking table bloat");
 
-	ret = SPI_execute_with_args(
+	/*
+	 * Without the history table nothing has been repacked here yet, so there
+	 * is no cooldown to read; see ensure_schema().
+	 */
+	have_history = history_table_exists();
+	ret = SPI_execute_with_args(have_history ?
 							   "WITH wanted AS ("
 							   "  SELECT s AS qualname, split_part(s, '.', 1) AS nspname,"
 							   "         split_part(s, '.', 2) AS relname"
@@ -995,7 +1021,35 @@ load_bloat_candidates(List *specs)
 							   " FROM resolved r"
 							   " LEFT JOIN pg_stat_user_tables t ON t.relid = r.relid"
 							   " LEFT JOIN public.dbblue_repack_history h"
-							   "   ON h.schema_name = r.nspname AND h.table_name = r.relname",
+							   "   ON h.schema_name = r.nspname AND h.table_name = r.relname"
+							   :
+							   "WITH wanted AS ("
+							   "  SELECT s AS qualname, split_part(s, '.', 1) AS nspname,"
+							   "         split_part(s, '.', 2) AS relname"
+							   "  FROM unnest($1::text[]) AS s"
+							   "), resolved AS ("
+							   "  SELECT w.qualname, w.nspname, w.relname,"
+							   "         to_regclass(w.qualname)::oid AS relid"
+							   "  FROM wanted w"
+							   ")"
+							   "SELECT r.qualname, r.relid, r.nspname, r.relname,"
+							   /*
+							    * pg_class.relpages is a cached statistic that
+							    * only VACUUM/ANALYZE/REPACK refresh; it can
+							    * lag far behind reality between those runs.
+							    * pg_relation_size() reads the file's actual
+							    * current block count directly, so freshly
+							    * created bloat is visible immediately.
+							    */
+							   "       (pg_relation_size(r.relid) /"
+							   "        current_setting('block_size')::bigint)::int AS relpages,"
+							   "       COALESCE(t.n_live_tup, 0) AS n_live_tup,"
+							   "       COALESCE((SELECT SUM(s.avg_width) FROM pg_stats s"
+							   "                 WHERE s.schemaname = r.nspname"
+							   "                   AND s.tablename = r.relname), 0) AS sum_width,"
+							   "       NULL::timestamptz AS last_repack_at"
+							   " FROM resolved r"
+							   " LEFT JOIN pg_stat_user_tables t ON t.relid = r.relid",
 							   1, argtypes, values, NULL, false, 0);
 
 	if (ret != SPI_OK_SELECT)
@@ -1091,6 +1145,7 @@ run_repack_cycle(void)
 	List	   *specs = parse_configured_tables();
 	List	   *candidates;
 	ListCell   *lc;
+	bool		history_ready = false;
 
 	if (specs == NIL)
 		return;
@@ -1139,6 +1194,10 @@ run_repack_cycle(void)
 			now < cand->last_repack_at +
 			(int64) dbblue_repack_min_interval * USECS_PER_SEC)
 			continue;
+
+		/* The history table is needed from the first repack on. */
+		if (!history_ready && !(history_ready = ensure_schema()))
+			break;
 
 		(void) repack_one_table(cand->schema, cand->table, cand->relid,
 								cand->bloat_ratio);
