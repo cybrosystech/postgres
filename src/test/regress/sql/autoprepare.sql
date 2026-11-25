@@ -116,14 +116,16 @@ SELECT c, d FROM aprep_t WHERE c = 1;					-- F
 SELECT c, d FROM aprep_t WHERE c = 2;					-- F qualifies
 SET dbblue_autoprepare_enabled = off;
 
-SELECT state, query FROM dbblue_autoprepare_shapes(pg_backend_pid())
-ORDER BY query COLLATE "C";
+-- Which shapes survive the eviction depends on measured planning times, so
+-- only the states and counts are shown, not the shape texts.
+SELECT state, count(*) FROM dbblue_autoprepare_shapes(pg_backend_pid())
+GROUP BY state ORDER BY state;
 SELECT promoted, tracking, declined, not_tracked, tracking_evicted, cached_evicted
 FROM dbblue_autoprepare_stats(pg_backend_pid());
 
-SELECT pid = pg_backend_pid() AS own, state, seen_count, num_params, query
+SELECT pid = pg_backend_pid() AS own, state, count(*) AS shapes
 FROM dbblue_autoprepare_shapes(pg_backend_pid())
-ORDER BY state, query COLLATE "C";
+GROUP BY pid, state ORDER BY state;
 
 -- queryid is the core query jumble, so it is never 0 here
 SELECT count(*) FROM dbblue_autoprepare_shapes(pg_backend_pid())
@@ -252,6 +254,41 @@ SELECT 1.2345::numeric(10,2) AS n, 'abcdefgh'::varchar(3) AS v;
 SELECT 1.2345::numeric(10,3) AS n, 'abcdefgh'::varchar(5) AS v;
 SELECT 1.2345::numeric(10,3) AS n, 'abcdefgh'::varchar(5) AS v;
 SELECT 1.2345::numeric(10,2) AS n, 'abcdefgh'::varchar(3) AS v;
+SET dbblue_autoprepare_enabled = off;
+DISCARD PLANS;
+
+-- a table dropped and recreated: the cached entry points at the old table and
+-- can never match again, so it is dropped and the shape is cached afresh,
+-- instead of failing the check (and costing a lookup) on every statement
+SET dbblue_autoprepare_enabled = on;
+SET dbblue_autoprepare_threshold = 2;
+CREATE TABLE aprep_stale (id int, v int);
+INSERT INTO aprep_stale SELECT i, i * 10 FROM generate_series(1, 20) i;
+SELECT v FROM aprep_stale WHERE id = 1;
+SELECT v FROM aprep_stale WHERE id = 2;
+SELECT v FROM aprep_stale WHERE id = 3;
+SELECT hits AS hits_before, stale_dropped AS stale_before
+FROM dbblue_autoprepare_stats(pg_backend_pid()) \gset
+DROP TABLE aprep_stale;
+CREATE TABLE aprep_stale (id int, v int);
+INSERT INTO aprep_stale SELECT i, i * 100 FROM generate_series(1, 20) i;
+SELECT v FROM aprep_stale WHERE id = 4;
+SELECT v FROM aprep_stale WHERE id = 5;
+SELECT v FROM aprep_stale WHERE id = 6;
+SELECT v FROM aprep_stale WHERE id = 7;
+SELECT stale_dropped - :stale_before AS stale_dropped,
+       hits - :hits_before AS hits_after_recreate,
+       promoted
+FROM dbblue_autoprepare_stats(pg_backend_pid());
+-- a changed table that still matches (index added, statistics refreshed)
+-- keeps its entry: nothing is dropped
+CREATE INDEX aprep_stale_id ON aprep_stale (id);
+ANALYZE aprep_stale;
+SELECT v FROM aprep_stale WHERE id = 8;
+SELECT v FROM aprep_stale WHERE id = 9;
+SELECT stale_dropped - :stale_before AS stale_dropped_total
+FROM dbblue_autoprepare_stats(pg_backend_pid());
+DROP TABLE aprep_stale;
 SET dbblue_autoprepare_enabled = off;
 DISCARD PLANS;
 

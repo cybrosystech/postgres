@@ -159,6 +159,7 @@ static dlist_head aprep_tracking_lru = DLIST_STATIC_INIT(aprep_tracking_lru);
  * dbblue_log_autoprepare_shapes().
  */
 static uint64 aprep_hits = 0;			/* cached plan reused */
+static uint64 aprep_stale_dropped = 0;	/* entries dropped: their table changed */
 static uint64 aprep_fallbacks = 0;		/* promoted shape, reuse checks failed */
 static uint64 aprep_promotions = 0;		/* plan built and cached */
 static uint64 aprep_declines = 0;		/* shape found uncacheable at promotion */
@@ -1423,6 +1424,26 @@ AutoprepareConsult(Query *analyzed_query, const char *query_string,
 		if (ipquery == NULL ||
 			!equal(ipquery, entry->plansource->analyzed_parse_tree))
 		{
+			/*
+			 * Mismatch.  Normally that means two different queries share one
+			 * queryId, and the entry stays for the one it was built from.
+			 * But if the plan cache has marked the entry invalid, a table it
+			 * depends on was dropped, recreated or altered (a temp table
+			 * recreated per transaction, DROP/CREATE TABLE, ...), so the
+			 * cached tree points at objects that no longer exist and will
+			 * never match again.  Left alone it would fail this check, and
+			 * cost a full re-parameterization, on every statement for the
+			 * rest of the session.  Drop it and look the statement up again:
+			 * its earlier sightings are still in the sketch, so it is
+			 * promoted again at once from this query.
+			 */
+			if (!entry->plansource->is_valid)
+			{
+				aprep_stale_dropped++;
+				aprep_remove_entry(entry);
+				return AutoprepareConsult(analyzed_query, query_string,
+										  plansource_out, boundParams_out);
+			}
 			aprep_fallbacks++;
 			aprep_note_fp = fp;		/* planned normally: time it */
 			return APREP_MISS;	/* queryId collision -> plan normally */
@@ -1726,6 +1747,7 @@ typedef struct AprepMsgSummary
 	uint64		fixed_evictions;
 	uint64		cached_bytes;	/* memory held by all cached plans */
 	uint64		memory_evictions;	/* entries dropped for the memory budget */
+	uint64		stale_dropped;	/* entries dropped: their table changed */
 } AprepMsgSummary;
 
 typedef struct AprepMsgShape
@@ -1875,6 +1897,7 @@ aprep_fill_summary(AprepMsgSummary *s)
 	s->fixed_evictions = aprep_fixed_evictions;
 	s->cached_bytes = aprep_total_bytes;
 	s->memory_evictions = aprep_memory_evictions;
+	s->stale_dropped = aprep_stale_dropped;
 
 	if (autoprepare_table == NULL)
 		return;
@@ -2007,8 +2030,8 @@ aprep_consume(void *arg, const void *data, Size len)
 		case APREP_MSG_SUMMARY:
 			{
 				AprepMsgSummary s;
-				Datum		values[17];
-				bool		nulls[17] = {0};
+				Datum		values[18];
+				bool		nulls[18] = {0};
 
 				if (len != sizeof(s))
 					return false;
@@ -2033,6 +2056,7 @@ aprep_consume(void *arg, const void *data, Size len)
 				values[14] = Int64GetDatum((int64) s.fixed_evictions);
 				values[15] = Int64GetDatum((int64) s.cached_bytes);
 				values[16] = Int64GetDatum((int64) s.memory_evictions);
+				values[17] = Int64GetDatum((int64) s.stale_dropped);
 				tuplestore_putvalues(c->rsinfo->setResult, c->rsinfo->setDesc,
 									 values, nulls);
 				return true;

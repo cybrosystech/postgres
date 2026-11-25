@@ -335,14 +335,14 @@ SELECT c, d FROM aprep_t WHERE c = 2;					-- F qualifies
 (0 rows)
 
 SET dbblue_autoprepare_enabled = off;
-SELECT state, query FROM dbblue_autoprepare_shapes(pg_backend_pid())
-ORDER BY query COLLATE "C";
-  state   |                      query                      
-----------+-------------------------------------------------
- promoted | SELECT a FROM aprep_t WHERE a = 2;
- promoted | SELECT a, b FROM aprep_t WHERE a = 1 AND b = 2;
- promoted | SELECT c, d FROM aprep_t WHERE c = 2;
-(3 rows)
+-- Which shapes survive the eviction depends on measured planning times, so
+-- only the states and counts are shown, not the shape texts.
+SELECT state, count(*) FROM dbblue_autoprepare_shapes(pg_backend_pid())
+GROUP BY state ORDER BY state;
+  state   | count 
+----------+-------
+ promoted |     3
+(1 row)
 
 SELECT promoted, tracking, declined, not_tracked, tracking_evicted, cached_evicted
 FROM dbblue_autoprepare_stats(pg_backend_pid());
@@ -351,15 +351,13 @@ FROM dbblue_autoprepare_stats(pg_backend_pid());
         3 |        0 |        0 |           0 |                1 |              2
 (1 row)
 
-SELECT pid = pg_backend_pid() AS own, state, seen_count, num_params, query
+SELECT pid = pg_backend_pid() AS own, state, count(*) AS shapes
 FROM dbblue_autoprepare_shapes(pg_backend_pid())
-ORDER BY state, query COLLATE "C";
- own |  state   | seen_count | num_params |                      query                      
------+----------+------------+------------+-------------------------------------------------
- t   | promoted |         23 |          1 | SELECT a FROM aprep_t WHERE a = 2;
- t   | promoted |         23 |          2 | SELECT a, b FROM aprep_t WHERE a = 1 AND b = 2;
- t   | promoted |          2 |          1 | SELECT c, d FROM aprep_t WHERE c = 2;
-(3 rows)
+GROUP BY pid, state ORDER BY state;
+ own |  state   | shapes 
+-----+----------+--------
+ t   | promoted |      3
+(1 row)
 
 -- queryid is the core query jumble, so it is never 0 here
 SELECT count(*) FROM dbblue_autoprepare_shapes(pg_backend_pid())
@@ -707,6 +705,95 @@ SELECT 1.2345::numeric(10,2) AS n, 'abcdefgh'::varchar(3) AS v;
  1.23 | abc
 (1 row)
 
+SET dbblue_autoprepare_enabled = off;
+DISCARD PLANS;
+-- a table dropped and recreated: the cached entry points at the old table and
+-- can never match again, so it is dropped and the shape is cached afresh,
+-- instead of failing the check (and costing a lookup) on every statement
+SET dbblue_autoprepare_enabled = on;
+SET dbblue_autoprepare_threshold = 2;
+CREATE TABLE aprep_stale (id int, v int);
+INSERT INTO aprep_stale SELECT i, i * 10 FROM generate_series(1, 20) i;
+SELECT v FROM aprep_stale WHERE id = 1;
+ v  
+----
+ 10
+(1 row)
+
+SELECT v FROM aprep_stale WHERE id = 2;
+ v  
+----
+ 20
+(1 row)
+
+SELECT v FROM aprep_stale WHERE id = 3;
+ v  
+----
+ 30
+(1 row)
+
+SELECT hits AS hits_before, stale_dropped AS stale_before
+FROM dbblue_autoprepare_stats(pg_backend_pid()) \gset
+DROP TABLE aprep_stale;
+CREATE TABLE aprep_stale (id int, v int);
+INSERT INTO aprep_stale SELECT i, i * 100 FROM generate_series(1, 20) i;
+SELECT v FROM aprep_stale WHERE id = 4;
+  v  
+-----
+ 400
+(1 row)
+
+SELECT v FROM aprep_stale WHERE id = 5;
+  v  
+-----
+ 500
+(1 row)
+
+SELECT v FROM aprep_stale WHERE id = 6;
+  v  
+-----
+ 600
+(1 row)
+
+SELECT v FROM aprep_stale WHERE id = 7;
+  v  
+-----
+ 700
+(1 row)
+
+SELECT stale_dropped - :stale_before AS stale_dropped,
+       hits - :hits_before AS hits_after_recreate,
+       promoted
+FROM dbblue_autoprepare_stats(pg_backend_pid());
+ stale_dropped | hits_after_recreate | promoted 
+---------------+---------------------+----------
+             1 |                   3 |        2
+(1 row)
+
+-- a changed table that still matches (index added, statistics refreshed)
+-- keeps its entry: nothing is dropped
+CREATE INDEX aprep_stale_id ON aprep_stale (id);
+ANALYZE aprep_stale;
+SELECT v FROM aprep_stale WHERE id = 8;
+  v  
+-----
+ 800
+(1 row)
+
+SELECT v FROM aprep_stale WHERE id = 9;
+  v  
+-----
+ 900
+(1 row)
+
+SELECT stale_dropped - :stale_before AS stale_dropped_total
+FROM dbblue_autoprepare_stats(pg_backend_pid());
+ stale_dropped_total 
+---------------------
+                   1
+(1 row)
+
+DROP TABLE aprep_stale;
 SET dbblue_autoprepare_enabled = off;
 DISCARD PLANS;
 -- DISCARD ALL must NOT clear it: poolers and psycopg2 send it on every
