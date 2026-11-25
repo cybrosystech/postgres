@@ -1292,8 +1292,14 @@ repack_one_table(const char *schema, const char *table, Oid relid,
 	}
 	PG_CATCH();
 	{
-		ErrorData  *edata = CopyErrorData();
+		ErrorData  *edata;
 
+		/*
+		 * The error machinery jumps here in ErrorContext, which
+		 * FlushErrorState() resets: copy the error out of it first.
+		 */
+		MemoryContextSwitchTo(launcher_cxt);
+		edata = CopyErrorData();
 		FlushErrorState();
 		AbortOutOfAnyTransaction();
 		MemoryContextSwitchTo(launcher_cxt);
