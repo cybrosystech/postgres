@@ -191,6 +191,13 @@ static SimpleOidList extension_exclude_oids = {NULL, NULL};
 
 static const CatalogId nilCatalogId = {0, 0};
 
+/*
+ * DBblue: left out of a dump of a DBblue server unless asked for, as they
+ * break the database owner's backup or restore; see dbblue_skip_objects.
+ */
+#define DBBLUE_ADVISOR_TABLE	"dbblue_index_suggestions"
+static bool dbblue_skip_objects = false;
+
 /* override for standard extra_float_digits setting */
 static bool have_extra_float_digits = false;
 static int	extra_float_digits;
@@ -1013,6 +1020,27 @@ main(int argc, char **argv)
 	g_last_builtin_oid = FirstNormalObjectId - 1;
 
 	pg_log_info("last built-in OID is %u", g_last_builtin_oid);
+
+	/*
+	 * DBblue: by default, leave out of the dump what the index advisor adds
+	 * to a database, which would otherwise break the Odoo database owner's
+	 * own backup and restore: its superuser-owned results table, which that
+	 * role cannot read, so pg_dump fails, and the pg_stat_statements and
+	 * hypopg extensions, which only a superuser may create, so pg_restore
+	 * fails.  The suggestions are rebuilt and the extensions recreated by the
+	 * advisor, and DBblue preloads both extensions on every cluster.  Only for
+	 * a DBblue server, so other servers dump as with stock pg_dump, and never
+	 * for pg_upgrade.  --table or --extension still includes them.
+	 */
+	if (!dopt.binary_upgrade && fout->remoteVersion >= 190000)
+	{
+		PGresult   *res = ExecuteSqlQueryForSingleRow(fout,
+													  "SELECT count(*) FROM pg_catalog.pg_settings "
+													  "WHERE name = 'dbblue_auto_index_suggestion_enabled'");
+
+		dbblue_skip_objects = (atoi(PQgetvalue(res, 0, 0)) > 0);
+		PQclear(res);
+	}
 
 	/* Expand schema selection patterns into OID lists */
 	if (schema_include_patterns.head != NULL)
@@ -2088,6 +2116,15 @@ selectDumpableTable(TableInfo *tbinfo, Archive *fout)
 		tbinfo->dobj.dump = tbinfo->dobj.namespace->dobj.dump_contains;
 
 	/*
+	 * DBblue: the index advisor's results table, unless named with --table.
+	 * Its identity sequence follows it; see getOwnedSeqs().
+	 */
+	if (dbblue_skip_objects && table_include_oids.head == NULL &&
+		strcmp(tbinfo->dobj.namespace->dobj.name, "public") == 0 &&
+		strcmp(tbinfo->dobj.name, DBBLUE_ADVISOR_TABLE) == 0)
+		tbinfo->dobj.dump = DUMP_COMPONENT_NONE;
+
+	/*
 	 * In any case, a table can be excluded by an exclusion switch
 	 */
 	if (tbinfo->dobj.dump &&
@@ -2291,6 +2328,15 @@ selectDumpableExtension(ExtensionInfo *extinfo, DumpOptions *dopt)
 			extinfo->dobj.dump = extinfo->dobj.dump_contains =
 				dopt->include_everything ?
 				DUMP_COMPONENT_ALL : DUMP_COMPONENT_NONE;
+
+		/*
+		 * DBblue: pg_stat_statements and hypopg, unless named with
+		 * --extension; see dbblue_skip_objects.
+		 */
+		if (dbblue_skip_objects && extension_include_oids.head == NULL &&
+			(strcmp(extinfo->dobj.name, "pg_stat_statements") == 0 ||
+			 strcmp(extinfo->dobj.name, "hypopg") == 0))
+			extinfo->dobj.dump = extinfo->dobj.dump_contains = DUMP_COMPONENT_NONE;
 
 		/* check that the extension is not explicitly excluded */
 		if (extinfo->dobj.dump &&
