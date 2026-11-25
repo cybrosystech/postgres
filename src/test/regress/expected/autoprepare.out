@@ -664,6 +664,72 @@ FROM dbblue_autoprepare_stats(pg_backend_pid());
 RESET dbblue_autoprepare_memory_limit;
 SET dbblue_autoprepare_enabled = off;
 DISCARD PLANS;
+-- an entry that is over the whole budget by itself (as happens when its
+-- generic plan is built after it was cached) becomes a declined marker: it is
+-- freed, and not cached again on its next sighting
+SET dbblue_autoprepare_enabled = on;
+SET dbblue_autoprepare_threshold = 2;
+SET dbblue_autoprepare_memory_limit = 0;
+SELECT a FROM aprep_t WHERE a = 51;
+ a 
+---
+(0 rows)
+
+SELECT a FROM aprep_t WHERE a = 52;
+ a 
+---
+(0 rows)
+
+SELECT state, count(*) AS shapes FROM dbblue_autoprepare_shapes(pg_backend_pid())
+WHERE state <> 'tracking' GROUP BY state ORDER BY state;
+  state   | shapes 
+----------+--------
+ promoted |      1
+(1 row)
+
+SELECT promotions AS promotions_before, memory_evicted AS evicted_before
+FROM dbblue_autoprepare_stats(pg_backend_pid()) \gset
+SET dbblue_autoprepare_memory_limit = 1;
+SELECT a FROM aprep_t WHERE a = 53;
+ a 
+---
+(0 rows)
+
+SELECT a FROM aprep_t WHERE a = 54;
+ a 
+---
+(0 rows)
+
+SELECT a FROM aprep_t WHERE a = 55;
+ a 
+---
+(0 rows)
+
+SELECT a FROM aprep_t WHERE a = 56;
+ a 
+---
+(0 rows)
+
+SELECT state, count(*) AS shapes, bool_and(plan_bytes IS NULL) AS no_plan
+FROM dbblue_autoprepare_shapes(pg_backend_pid())
+WHERE state <> 'tracking' GROUP BY state ORDER BY state;
+  state   | shapes | no_plan 
+----------+--------+---------
+ declined |      1 | t
+(1 row)
+
+SELECT memory_evicted - :evicted_before AS evicted,
+       promotions - :promotions_before AS promoted_again,
+       cached_bytes
+FROM dbblue_autoprepare_stats(pg_backend_pid());
+ evicted | promoted_again | cached_bytes 
+---------+----------------+--------------
+       1 |              0 |            0
+(1 row)
+
+RESET dbblue_autoprepare_memory_limit;
+SET dbblue_autoprepare_enabled = off;
+DISCARD PLANS;
 -- length-coercion casts: the size in x::numeric(p,s) / x::varchar(n) is part of
 -- the shape, not a parameter.  Casts that differ only in that size must never
 -- share one cached plan (and a cached plan must keep reporting the real size).

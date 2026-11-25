@@ -1044,10 +1044,41 @@ aprep_entry_density(AutoprepareEntry *entry)
 }
 
 /*
- * Drop promoted entries, lowest value per size first, until the backend is
- * within its memory budget.  'keep' (may be NULL) is never dropped: it is the
- * entry being built or used.  Declined entries hold no plan and are left
- * alone.  Call only where no entry is in use.
+ * Turn a promoted entry into a declined one: free its plan, keep the entry as
+ * a marker so the shape is not built and cached again.  It stays in the fixed
+ * share, so aprep_num_fixed does not change.
+ */
+static void
+aprep_demote_to_declined(AutoprepareEntry *entry)
+{
+	Assert(entry->promoted);
+
+	aprep_total_bytes -= Min(entry->bytes, aprep_total_bytes);
+	entry->bytes = 0;
+	if (entry->plansource)
+		DropCachedPlan(entry->plansource);
+	entry->plansource = NULL;
+	if (entry->param_types)
+		pfree(entry->param_types);
+	entry->param_types = NULL;
+	entry->num_params = 0;
+	entry->promoted = false;
+	entry->declined = true;
+}
+
+/*
+ * Drop promoted entries until the backend is within its memory budget.
+ * 'keep' (may be NULL) is never dropped: it is the entry being built or used.
+ * Declined entries hold no plan and are left alone.  Call only where no entry
+ * is in use.
+ *
+ * An entry that is bigger than the whole budget by itself (its stored query
+ * plus the generic plan the plancache built later) can never fit, so it
+ * becomes a declined marker: simply removing it would let its next sighting
+ * promote it again, grow it again and evict it again.  Those go first, so
+ * smaller entries are not dropped for nothing.  Otherwise the entry with the
+ * least value per size is removed: it fits alone and only lost out to the
+ * others, so it may return later.
  */
 static void
 aprep_enforce_memory_limit(AutoprepareEntry *keep)
@@ -1058,6 +1089,7 @@ aprep_enforce_memory_limit(AutoprepareEntry *keep)
 		HASH_SEQ_STATUS seq;
 		AutoprepareEntry *entry;
 		AutoprepareEntry *victim = NULL;
+		AutoprepareEntry *too_big = NULL;
 		double		victim_density = 0;
 
 		hash_seq_init(&seq, autoprepare_table);
@@ -1067,12 +1099,24 @@ aprep_enforce_memory_limit(AutoprepareEntry *keep)
 
 			if (entry == keep || !entry->promoted)
 				continue;
+			if (entry->bytes > aprep_budget_bytes())
+			{
+				too_big = entry;
+				hash_seq_term(&seq);
+				break;
+			}
 			density = aprep_entry_density(entry);
 			if (victim == NULL || density < victim_density)
 			{
 				victim = entry;
 				victim_density = density;
 			}
+		}
+		if (too_big != NULL)
+		{
+			aprep_demote_to_declined(too_big);
+			aprep_memory_evictions++;
+			continue;
 		}
 		if (victim == NULL)
 			return;				/* nothing left that we may drop */
