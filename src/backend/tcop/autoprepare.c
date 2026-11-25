@@ -236,6 +236,7 @@ static uint32 aprep_sketch_adds = 0;
  * Shape of the statement being planned normally right now, so that
  * AutoprepareNotePlanTime() can credit the planning time to it; 0 if none.
  */
+static bool aprep_warned_no_queryid = false;	/* logged compute_query_id=off */
 static uint64 aprep_note_fp = 0;
 
 /* guards against recursion via CHECK_FOR_INTERRUPTS() inside ereport() */
@@ -1379,7 +1380,23 @@ AutoprepareConsult(Query *analyzed_query, const char *query_string,
 	/* The fingerprint is the queryId the core jumbler already computed. */
 	fp = (uint64) analyzed_query->queryId;
 	if (fp == UINT64CONST(0))
+	{
+		/*
+		 * Without a query id nothing can be cached.  compute_query_id = auto
+		 * is switched on for us (EnableQueryId), but an explicit "off" is not
+		 * overridden, and then autoprepare would silently do nothing.  Say so
+		 * once per backend, in the server log only: a message to the client
+		 * would reach every Odoo session.
+		 */
+		if (!aprep_warned_no_queryid && compute_query_id == COMPUTE_QUERY_ID_OFF)
+		{
+			aprep_warned_no_queryid = true;
+			ereport(LOG,
+					(errmsg("dbblue_autoprepare_enabled is on but compute_query_id is off, so no query is cached"),
+					 errhint("Set compute_query_id to auto or on.")));
+		}
 		return APREP_UNCACHEABLE;	/* query-id computation disabled */
+	}
 
 	if (autoprepare_table == NULL)
 		autoprepare_init();

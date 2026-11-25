@@ -271,6 +271,22 @@ RESET dbblue_autoprepare_memory_limit;
 SET dbblue_autoprepare_enabled = off;
 DISCARD PLANS;
 
+-- compute_query_id = off leaves autoprepare without a fingerprint: nothing is
+-- cached, and the server log (shown here as LOG) says so, once per backend
+SET dbblue_autoprepare_enabled = on;
+SET dbblue_autoprepare_threshold = 2;
+SET compute_query_id = off;
+SET client_min_messages = log;
+SELECT a FROM aprep_t WHERE a = 61;
+SELECT a FROM aprep_t WHERE a = 62;
+SELECT a FROM aprep_t WHERE a = 63;
+RESET client_min_messages;
+SELECT count(*) AS cached FROM dbblue_autoprepare_shapes(pg_backend_pid())
+WHERE state <> 'tracking';
+RESET compute_query_id;
+SET dbblue_autoprepare_enabled = off;
+DISCARD PLANS;
+
 -- length-coercion casts: the size in x::numeric(p,s) / x::varchar(n) is part of
 -- the shape, not a parameter.  Casts that differ only in that size must never
 -- share one cached plan (and a cached plan must keep reporting the real size).
