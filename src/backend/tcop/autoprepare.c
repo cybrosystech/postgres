@@ -342,6 +342,38 @@ aprep_literal_only_argno(Oid funcid)
 	}
 }
 
+/*
+ * Bitmask of the argument positions of this call that must stay literal.
+ *
+ * Besides the functions in aprep_literal_only_argno(), this covers length
+ * coercions such as x::numeric(10,2) or x::varchar(5).  Those are function
+ * calls whose second argument is the typmod, and exprTypmod() /
+ * exprIsLengthCoercion() only recognise them while that argument is a Const.
+ * If we turned it into a $n Param, the result column's typmod would silently
+ * become -1 whenever the statement is served from the cache, while the same
+ * statement planned normally reports the real typmod.  The third argument
+ * (the "is explicit" flag) is kept literal too so explicit and implicit casts
+ * can never share one cached plan.
+ *
+ * The typmod stays part of the shape: the equal() guard in AutoprepareConsult
+ * compares non-parameterized literals, so numeric(10,2) and numeric(8,3) do
+ * not match each other.
+ */
+static uint32
+aprep_literal_only_mask(FuncExpr *f)
+{
+	int			argno = aprep_literal_only_argno(f->funcid);
+	int32		typmod;
+
+	if (argno >= 0)
+		return ((uint32) 1) << argno;
+
+	if (exprIsLengthCoercion((Node *) f, &typmod))
+		return (((uint32) 1) << 1) | (((uint32) 1) << 2);
+
+	return 0;
+}
+
 
 /* ----------------------------------------------------------------
  *		shape transform: BUILD (Const -> Param, collect types)
@@ -418,9 +450,9 @@ aprep_build_mutator(Node *node, void *context)
 	if (IsA(node, FuncExpr))
 	{
 		FuncExpr   *f = (FuncExpr *) node;
-		int			litarg = aprep_literal_only_argno(f->funcid);
+		uint32		litmask = aprep_literal_only_mask(f);
 
-		if (litarg >= 0)
+		if (litmask != 0)
 		{
 			FuncExpr   *nf = copyObject(f);
 			ListCell   *lc;
@@ -433,7 +465,7 @@ aprep_build_mutator(Node *node, void *context)
 			 */
 			foreach(lc, nf->args)
 			{
-				if (i != litarg)
+				if (!(litmask & (((uint32) 1) << i)))
 				{
 					lfirst(lc) = aprep_build_mutator((Node *) lfirst(lc), ctx);
 					if (ctx->too_many)
@@ -616,17 +648,17 @@ aprep_extract_walker(Node *node, void *context)
 	if (IsA(node, FuncExpr))
 	{
 		FuncExpr   *f = (FuncExpr *) node;
-		int			litarg = aprep_literal_only_argno(f->funcid);
+		uint32		litmask = aprep_literal_only_mask(f);
 
-		if (litarg >= 0)
+		if (litmask != 0)
 		{
 			ListCell   *lc;
 			int			i = 0;
 
-			/* Mirror aprep_build_mutator: skip the literal-only argument. */
+			/* Mirror aprep_build_mutator: skip the literal-only arguments. */
 			foreach(lc, f->args)
 			{
-				if (i != litarg &&
+				if (!(litmask & (((uint32) 1) << i)) &&
 					aprep_extract_walker((Node *) lfirst(lc), ctx))
 					return true;
 				i++;

@@ -241,6 +241,20 @@ RESET dbblue_autoprepare_memory_limit;
 SET dbblue_autoprepare_enabled = off;
 DISCARD PLANS;
 
+-- length-coercion casts: the size in x::numeric(p,s) / x::varchar(n) is part of
+-- the shape, not a parameter.  Casts that differ only in that size must never
+-- share one cached plan (and a cached plan must keep reporting the real size).
+SET dbblue_autoprepare_enabled = on;
+SET dbblue_autoprepare_threshold = 2;
+SELECT 1.2345::numeric(10,2) AS n, 'abcdefgh'::varchar(3) AS v;
+SELECT 1.2345::numeric(10,2) AS n, 'abcdefgh'::varchar(3) AS v;
+SELECT 1.2345::numeric(10,2) AS n, 'abcdefgh'::varchar(3) AS v;
+SELECT 1.2345::numeric(10,3) AS n, 'abcdefgh'::varchar(5) AS v;
+SELECT 1.2345::numeric(10,3) AS n, 'abcdefgh'::varchar(5) AS v;
+SELECT 1.2345::numeric(10,2) AS n, 'abcdefgh'::varchar(3) AS v;
+SET dbblue_autoprepare_enabled = off;
+DISCARD PLANS;
+
 -- DISCARD ALL must NOT clear it: poolers and psycopg2 send it on every
 -- connection reuse (it resets the GUCs, so set them again)
 SET dbblue_autoprepare_enabled = on;
