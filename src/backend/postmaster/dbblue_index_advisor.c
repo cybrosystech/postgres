@@ -79,6 +79,7 @@
 #include "access/transam.h"
 #include "access/xact.h"
 #include "catalog/pg_am.h"
+#include "catalog/namespace.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_index.h"
 #include "catalog/pg_database.h"
@@ -642,6 +643,88 @@ advisor_extension_schema(const char *extname)
 }
 
 /*
+ * advisor_results_table_trusted
+ *		Is public.dbblue_index_suggestions safe for the advisor to write to as
+ *		superuser?  Warns and returns false if not.
+ *
+ * CREATE TABLE IF NOT EXISTS keeps whatever already has that name, and the
+ * advisor then inserts, updates and deletes there as superuser -- so triggers,
+ * rules, column defaults or index expressions on it run with superuser rights.
+ * The database owner can put such a table there before the advisor does, or
+ * own the advisor's after a pg_restore --no-owner, and then add them; the
+ * table would also show them the query text of every role.  So accept only an
+ * ordinary table owned by a superuser, as the advisor creates it, with no
+ * triggers or rules.  Checked before anything else touches it.
+ */
+static bool
+advisor_results_table_trusted(void)
+{
+	Oid			nspid = get_namespace_oid("public", true);
+	Oid			relid;
+	HeapTuple	tup;
+	Form_pg_class rel;
+	const char *problem = NULL;
+	char	   *owner = NULL;
+
+	CommandCounterIncrement();	/* see a table created just above */
+	relid = OidIsValid(nspid) ? get_relname_relid(ADVISOR_RESULT_TABLE, nspid)
+		: InvalidOid;
+	if (!OidIsValid(relid))
+		return false;			/* creating it failed, and was reported */
+
+	tup = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	if (!HeapTupleIsValid(tup))
+		return false;
+	rel = (Form_pg_class) GETSTRUCT(tup);
+
+	if (rel->relkind != RELKIND_RELATION)
+		problem = "is not an ordinary table";
+	else if (!superuser_arg(rel->relowner))
+	{
+		owner = GetUserNameFromId(rel->relowner, true);
+		problem = "is not owned by a superuser";
+	}
+	ReleaseSysCache(tup);
+
+	/*
+	 * Look for triggers and rules themselves: pg_class.relhastriggers and
+	 * relhasrules mean "has or once had", and stay set until a VACUUM after
+	 * the last one is dropped.  read_only = false, for a fresh snapshot.
+	 */
+	if (problem == NULL)
+	{
+		char	   *sql = psprintf("SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger WHERE tgrelid = %u),"
+								   "       EXISTS (SELECT 1 FROM pg_catalog.pg_rewrite WHERE ev_class = %u)",
+								   relid, relid);
+
+		if (SPI_execute(sql, false, 1) != SPI_OK_SELECT || SPI_processed != 1)
+			problem = "could not be checked";
+		else
+		{
+			bool		isnull;
+
+			if (DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
+										   SPI_tuptable->tupdesc, 1, &isnull)))
+				problem = "has triggers";
+			else if (DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
+												SPI_tuptable->tupdesc, 2, &isnull)))
+				problem = "has rules";
+		}
+		pfree(sql);
+	}
+
+	if (problem == NULL)
+		return true;
+
+	ereport(WARNING,
+			(errmsg("dbblue index advisor: public.%s in database \"%s\" %s; not writing suggestions",
+					ADVISOR_RESULT_TABLE, advisor_dbname, problem),
+			 owner ? errdetail("It is owned by \"%s\".", owner) : 0,
+			 errhint("The advisor writes to it as superuser.  Drop it so the advisor recreates it, or make it an ordinary table owned by a superuser, with no triggers or rules.")));
+	return false;
+}
+
+/*
  * advisor_ensure_environment
  *		Make sure pg_stat_statements, hypopg and the results table exist
  *		in the connected database.  Sets advisor_env_ready when all three
@@ -701,6 +784,10 @@ advisor_ensure_environment(void)
 									   "  CONSTRAINT dbblue_index_suggestions_ddl_unique UNIQUE (suggested_index)"
 									   ")",
 									   "creating results table");
+
+	/* Before the migrations below, which write to it as superuser too. */
+	if (table_ok)
+		table_ok = advisor_results_table_trusted();
 
 	/* Schema migration for tables created by older advisor versions. */
 	if (table_ok)
