@@ -78,6 +78,10 @@
 #include "postgres.h"
 
 #include <math.h>
+#include <sys/stat.h>
+#ifndef WIN32
+#include <sys/statvfs.h>
+#endif
 
 #include "access/heapam.h"
 #include "access/htup_details.h"
@@ -89,6 +93,7 @@
 #include "nodes/makefuncs.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_database.h"
+#include "catalog/pg_tablespace_d.h"
 #include "catalog/pg_type.h"
 #include "commands/repack.h"
 #include "commands/vacuum.h"
@@ -215,6 +220,8 @@ static bool repack_one_table(const char *schema, const char *table,
 static void record_repack_failure(const char *schema, const char *table,
 								  Oid relid, double bloat_ratio);
 static bool table_busy(Oid relid, const char *schema, const char *table);
+static bool repack_has_disk_room(Oid relid, double bloat_ratio,
+								 const char *schema, const char *table);
 static void record_repack_history(const char *schema, const char *table,
 								  Oid relid, double bloat_ratio);
 
@@ -1405,6 +1412,11 @@ run_repack_cycle(void)
 		if (table_busy(cand->relid, cand->schema, cand->table))
 			continue;
 
+		/* Running out of disk, above all in pg_wal, would stop the server. */
+		if (!repack_has_disk_room(cand->relid, cand->bloat_ratio,
+								  cand->schema, cand->table))
+			continue;
+
 		/* The history table is needed from the first repack on. */
 		if (!history_ready && !(history_ready = ensure_schema()))
 			break;
@@ -1652,6 +1664,106 @@ table_busy(Oid relid, const char *schema, const char *table)
 	CommitTransactionCommand();
 	MemoryContextSwitchTo(launcher_cxt);
 	return busy;
+}
+
+/*
+ * repack_has_disk_room
+ *		Is there disk space to repack the table?  If not, warn and return
+ *		false; the table is checked again next cycle.
+ *
+ * REPACK writes a whole new copy of the table and its indexes beside the
+ * old ones, freed only after the swap, and the WAL for all of it: the
+ * logical replication slot REPACK (CONCURRENTLY) holds keeps every WAL
+ * segment written meanwhile.  If pg_wal fills up the server PANICs.  So ask
+ * for room for the new table (its size divided by the bloat ratio, the live
+ * part) plus its indexes as they are now, once in the table's tablespace and
+ * once in pg_wal -- twice where they share a file system -- with a fifth on
+ * top, and leave a tenth of each file system free besides.  Deliberately
+ * generous: a skipped repack costs little.  Not checked on Windows, which
+ * has no statvfs().
+ */
+static bool
+repack_has_disk_room(Oid relid, double bloat_ratio,
+					 const char *schema, const char *table)
+{
+#ifndef WIN32
+	int64		table_bytes = 0;
+	int64		index_bytes = 0;
+	Oid			tsoid;
+	char	   *data_path;
+	char	   *wal_path;
+	struct statvfs data_fs;
+	struct statvfs wal_fs;
+	struct stat data_st;
+	struct stat wal_st;
+	double		need;
+	double		data_free;
+	double		wal_free;
+	bool		ok;
+
+	SetCurrentStatementStartTimestamp();
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	SPI_connect();
+	{
+		Oid			argtypes[1] = {OIDOID};
+		Datum		values[1] = {ObjectIdGetDatum(relid)};
+
+		if (SPI_execute_with_args("SELECT pg_catalog.pg_table_size($1::regclass),"
+								  "       pg_catalog.pg_indexes_size($1::regclass)",
+								  1, argtypes, values, NULL, true, 1) == SPI_OK_SELECT &&
+			SPI_processed == 1)
+		{
+			bool		isnull;
+			Datum		d;
+
+			d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
+			table_bytes = isnull ? 0 : DatumGetInt64(d);
+			d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &isnull);
+			index_bytes = isnull ? 0 : DatumGetInt64(d);
+		}
+	}
+	tsoid = get_rel_tablespace(relid);
+	SPI_finish();
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+	MemoryContextSwitchTo(launcher_cxt);
+
+	if (!OidIsValid(tsoid))
+		tsoid = MyDatabaseTableSpace;
+	data_path = (tsoid == DEFAULTTABLESPACE_OID) ? pstrdup(DataDir) :
+		psprintf("%s/pg_tblspc/%u", DataDir, tsoid);
+	wal_path = psprintf("%s/pg_wal", DataDir);
+
+	if (statvfs(data_path, &data_fs) != 0 || statvfs(wal_path, &wal_fs) != 0 ||
+		stat(data_path, &data_st) != 0 || stat(wal_path, &wal_st) != 0)
+		return true;			/* cannot tell: do not block repacking */
+
+	need = 1.2 * ((double) table_bytes / Max(bloat_ratio, 1.0) + (double) index_bytes);
+	data_free = (double) data_fs.f_bavail * data_fs.f_frsize -
+		0.1 * (double) data_fs.f_blocks * data_fs.f_frsize;
+	wal_free = (double) wal_fs.f_bavail * wal_fs.f_frsize -
+		0.1 * (double) wal_fs.f_blocks * wal_fs.f_frsize;
+
+	if (data_st.st_dev == wal_st.st_dev)
+		ok = data_free >= 2 * need;
+	else
+		ok = data_free >= need && wal_free >= need;
+
+	if (!ok)
+		ereport(WARNING,
+				(errmsg("dbblue repack launcher: skipping \"%s.%s\": not enough free disk space to repack it",
+						schema, table),
+				 data_st.st_dev == wal_st.st_dev ?
+				 errdetail("It needs about %.0f MB free for the new table, its indexes and their WAL, beyond a tenth of the disk kept free; %.0f MB is available.",
+						   2 * need / 1048576.0, Max(data_free, 0) / 1048576.0) :
+				 errdetail("It needs about %.0f MB free beyond a tenth of each disk, both for the data (%.0f MB available) and for pg_wal (%.0f MB available).",
+						   need / 1048576.0, Max(data_free, 0) / 1048576.0,
+						   Max(wal_free, 0) / 1048576.0)));
+	return ok;
+#else
+	return true;
+#endif
 }
 
 /*
