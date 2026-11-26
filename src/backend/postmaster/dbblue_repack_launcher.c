@@ -163,6 +163,14 @@ typedef struct RepackTableSpec
 } RepackTableSpec;
 
 /* One configured table plus what the bloat scan learned about it. */
+/*
+ * A table whose repack failed is not tried again for this long; see
+ * record_repack_failure().  And one that a transaction open this long holds a
+ * lock on is not started; see table_busy().
+ */
+#define DBBLUE_REPACK_RETRY_DELAY_S		3600
+#define DBBLUE_REPACK_BUSY_XACT_S		30
+
 typedef struct RepackCandidate
 {
 	char	   *schema;
@@ -170,6 +178,7 @@ typedef struct RepackCandidate
 	Oid			relid;			/* InvalidOid if the table does not exist */
 	double		bloat_ratio;	/* 0.0 if too small to estimate meaningfully */
 	TimestampTz last_repack_at; /* 0 if never repacked by this worker */
+	TimestampTz last_failed_at; /* 0 if the last attempt did not fail */
 } RepackCandidate;
 
 /*
@@ -202,6 +211,9 @@ static List *load_bloat_candidates(List *specs);
 static void run_repack_cycle(void);
 static bool repack_one_table(const char *schema, const char *table,
 							 Oid relid, double bloat_ratio);
+static void record_repack_failure(const char *schema, const char *table,
+								  Oid relid, double bloat_ratio);
+static bool table_busy(Oid relid, const char *schema, const char *table);
 static void record_repack_history(const char *schema, const char *table,
 								  Oid relid, double bloat_ratio);
 
@@ -820,10 +832,15 @@ DbblueRepackWorkerMain(Datum main_arg)
 	 * table.  Without this, a table stuck behind a long-running
 	 * conflicting lock would stall every later table in this cycle
 	 * indefinitely; on timeout the attempt errors, is caught per-table,
-	 * and is simply retried next cycle.  Unrelated to, and unaffected by,
-	 * the per-database GUCs InitPostgres just merged above.
+	 * and is retried after DBBLUE_REPACK_RETRY_DELAY_S.  Unrelated to, and
+	 * unaffected by, the per-database GUCs InitPostgres just merged above.
+	 *
+	 * Short, because the wait that matters is REPACK (CONCURRENTLY)'s final
+	 * upgrade to AccessExclusiveLock to swap the files: while it waits, every
+	 * new query on the table queues behind it, so this is how long a blocked
+	 * swap freezes the table for Odoo.
 	 */
-	SetConfigOption("lock_timeout", "5s", PGC_SUSET, PGC_S_SESSION);
+	SetConfigOption("lock_timeout", "2s", PGC_SUSET, PGC_S_SESSION);
 
 	/*
 	 * This is where the feature is actually switched on or off.
@@ -876,9 +893,10 @@ ensure_schema(void)
 							"  schema_name text NOT NULL,"
 							"  table_name text NOT NULL,"
 							"  relid oid,"
-							"  last_repack_at timestamptz NOT NULL,"
+							"  last_repack_at timestamptz,"
 							"  last_bloat_ratio double precision,"
 							"  repack_count bigint NOT NULL DEFAULT 1,"
+							"  last_failed_at timestamptz,"
 							"  CONSTRAINT dbblue_repack_history_table_key UNIQUE (schema_name, table_name)"
 							")",
 							false, 0) == SPI_OK_UTILITY);
@@ -1104,6 +1122,19 @@ load_bloat_candidates(List *specs)
 			break;
 		case 1:
 			have_history = true;
+
+			/*
+			 * Bring a table created before last_failed_at existed up to
+			 * date, before anything below reads or writes that column.
+			 * It is locked and checked by now.
+			 */
+			if (get_attnum(get_relname_relid("dbblue_repack_history",
+											 get_namespace_oid("public", false)),
+						   "last_failed_at") == InvalidAttrNumber)
+				(void) SPI_execute("ALTER TABLE public.dbblue_repack_history"
+								   " ADD COLUMN last_failed_at timestamptz,"
+								   " ALTER COLUMN last_repack_at DROP NOT NULL",
+								   false, 0);
 			break;
 		default:
 			/* Someone else's table, warned: no cycle in this database. */
@@ -1145,7 +1176,7 @@ load_bloat_candidates(List *specs)
 							   "       COALESCE((SELECT SUM(s.avg_width) FROM pg_stats s"
 							   "                 WHERE s.schemaname = r.nspname"
 							   "                   AND s.tablename = r.relname), 0) AS sum_width,"
-							   "       h.last_repack_at"
+							   "       h.last_repack_at, h.last_failed_at"
 							   " FROM resolved r"
 							   " LEFT JOIN pg_stat_user_tables t ON t.relid = r.relid"
 							   " LEFT JOIN public.dbblue_repack_history h"
@@ -1182,7 +1213,8 @@ load_bloat_candidates(List *specs)
 							   "       COALESCE((SELECT SUM(s.avg_width) FROM pg_stats s"
 							   "                 WHERE s.schemaname = r.nspname"
 							   "                   AND s.tablename = r.relname), 0) AS sum_width,"
-							   "       NULL::timestamptz AS last_repack_at"
+							   "       NULL::timestamptz AS last_repack_at,"
+							   "       NULL::timestamptz AS last_failed_at"
 							   " FROM resolved r"
 							   " LEFT JOIN pg_stat_user_tables t ON t.relid = r.relid",
 							   2, argtypes, values, NULL, false, 0);
@@ -1236,6 +1268,8 @@ load_bloat_candidates(List *specs)
 				sum_width = isnull ? 0 : DatumGetInt64(d);
 				d = SPI_getbinval(tuple, tupdesc, 7, &isnull);
 				cand->last_repack_at = isnull ? 0 : DatumGetTimestampTz(d);
+				d = SPI_getbinval(tuple, tupdesc, 8, &isnull);
+				cand->last_failed_at = isnull ? 0 : DatumGetTimestampTz(d);
 
 				if (relpages >= DBBLUE_REPACK_MIN_RELPAGES && n_live_tup > 0)
 				{
@@ -1328,6 +1362,16 @@ run_repack_cycle(void)
 		if (cand->last_repack_at != 0 &&
 			now < cand->last_repack_at +
 			(int64) dbblue_repack_min_interval * USECS_PER_SEC)
+			continue;
+
+		/* Its last attempt failed: wait before throwing away another copy. */
+		if (cand->last_failed_at != 0 &&
+			now < cand->last_failed_at +
+			(int64) DBBLUE_REPACK_RETRY_DELAY_S * USECS_PER_SEC)
+			continue;
+
+		/* A long transaction on it would make the final swap time out. */
+		if (table_busy(cand->relid, cand->schema, cand->table))
 			continue;
 
 		/* The history table is needed from the first repack on. */
@@ -1504,9 +1548,14 @@ repack_one_table(const char *schema, const char *table, Oid relid,
 							schema, table, edata->message),
 					 errdetail("The repack itself committed; statistics will be refreshed by the next autovacuum analyze.")));
 		else
+		{
 			ereport(WARNING,
 					(errmsg("dbblue repack launcher: repacking \"%s.%s\" failed: %s",
-							schema, table, edata->message)));
+							schema, table, edata->message),
+					 errdetail("It will be tried again in %d minutes at the earliest.",
+							   DBBLUE_REPACK_RETRY_DELAY_S / 60)));
+			record_repack_failure(schema, table, relid, bloat_ratio);
+		}
 		FreeErrorData(edata);
 		success = repacked;
 	}
@@ -1514,6 +1563,108 @@ repack_one_table(const char *schema, const char *table, Oid relid,
 
 	pgstat_report_activity(STATE_IDLE, NULL);
 	return success;
+}
+
+/*
+ * table_busy
+ *		Is a transaction open for DBBLUE_REPACK_BUSY_XACT_S or more holding a
+ *		lock on the table?  If so, log it and return true.
+ *
+ * REPACK (CONCURRENTLY) copies the whole table under a light lock, then
+ * upgrades to AccessExclusiveLock to swap the files, which waits for every
+ * transaction that has touched the table.  A long Odoo report reading it
+ * makes that upgrade time out after the copy is done: the copy is thrown
+ * away, and while the upgrade waits every new query on the table queues
+ * behind it.  Starting only when no long transaction is on the table avoids
+ * most of those attempts; one that starts during the copy can still cause
+ * one, and record_repack_failure() spaces out the retries.  Autovacuum is
+ * left out: it is cancelled for REPACK.
+ */
+static bool
+table_busy(Oid relid, const char *schema, const char *table)
+{
+	bool		busy = false;
+	Oid			argtypes[1] = {OIDOID};
+	Datum		values[1];
+
+	values[0] = ObjectIdGetDatum(relid);
+	SetCurrentStatementStartTimestamp();
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	SPI_connect();
+	if (SPI_execute_with_args(psprintf("SELECT a.pid, extract(epoch FROM now() - a.xact_start)::int,"
+									   "       coalesce(nullif(a.application_name, ''), a.backend_type)"
+									   "  FROM pg_catalog.pg_locks l"
+									   "  JOIN pg_catalog.pg_stat_activity a ON a.pid = l.pid"
+									   " WHERE l.locktype = 'relation' AND l.relation = $1"
+									   "   AND l.database = %u AND l.granted"
+									   "   AND a.pid <> pg_catalog.pg_backend_pid()"
+									   "   AND a.backend_type <> 'autovacuum worker'"
+									   "   AND a.xact_start < now() - interval '%d seconds'"
+									   " ORDER BY a.xact_start LIMIT 1",
+									   MyDatabaseId, DBBLUE_REPACK_BUSY_XACT_S),
+							  1, argtypes, values, NULL, true, 1) == SPI_OK_SELECT &&
+		SPI_processed > 0)
+	{
+		HeapTuple	tup = SPI_tuptable->vals[0];
+		TupleDesc	desc = SPI_tuptable->tupdesc;
+
+		busy = true;
+		ereport(LOG,
+				(errmsg("dbblue repack launcher: postponing \"%s.%s\": a transaction holding a lock on it has been open for %s seconds",
+						schema, table, SPI_getvalue(tup, desc, 2)),
+				 errdetail("Process %s (%s).", SPI_getvalue(tup, desc, 1),
+						   SPI_getvalue(tup, desc, 3))));
+	}
+	SPI_finish();
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+	MemoryContextSwitchTo(launcher_cxt);
+	return busy;
+}
+
+/*
+ * record_repack_failure
+ *		Note in dbblue_repack_history that repacking the table just failed,
+ *		in a transaction of its own after the failed one was aborted.
+ *
+ * The cycle then leaves the table alone for DBBLUE_REPACK_RETRY_DELAY_S
+ * instead of copying it again next cycle: a failure at the final swap throws
+ * the finished copy away, and a cause such as a long report, a missing
+ * primary key or wal_level below logical usually outlasts one cycle.  A
+ * successful repack clears it.
+ */
+static void
+record_repack_failure(const char *schema, const char *table, Oid relid,
+					  double bloat_ratio)
+{
+	static const Oid argtypes[4] = {TEXTOID, TEXTOID, OIDOID, FLOAT8OID};
+	Datum		values[4];
+
+	values[0] = CStringGetTextDatum(schema);
+	values[1] = CStringGetTextDatum(table);
+	values[2] = ObjectIdGetDatum(relid);
+	values[3] = Float8GetDatum(bloat_ratio);
+
+	SetCurrentStatementStartTimestamp();
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	SPI_connect();
+	if (history_table_check(RowExclusiveLock) == 1 &&
+		SPI_execute_with_args("INSERT INTO public.dbblue_repack_history"
+							  " (schema_name, table_name, relid, last_bloat_ratio,"
+							  "  repack_count, last_failed_at)"
+							  " VALUES ($1, $2, $3, $4, 0, now())"
+							  " ON CONFLICT ON CONSTRAINT dbblue_repack_history_table_key"
+							  " DO UPDATE SET last_failed_at = EXCLUDED.last_failed_at",
+							  4, (Oid *) argtypes, values, NULL, false, 0) < 0)
+		ereport(WARNING,
+				(errmsg("dbblue repack launcher: failed to record the failed repack of \"%s.%s\"",
+						schema, table)));
+	SPI_finish();
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+	MemoryContextSwitchTo(launcher_cxt);
 }
 
 /*
@@ -1536,6 +1687,7 @@ record_repack_history(const char *schema, const char *table, Oid relid,
 		"relid = EXCLUDED.relid, "
 		"last_repack_at = EXCLUDED.last_repack_at, "
 		"last_bloat_ratio = EXCLUDED.last_bloat_ratio, "
+		"last_failed_at = NULL, "
 		"repack_count = dbblue_repack_history.repack_count + 1";
 	static const Oid argtypes[4] = {TEXTOID, TEXTOID, OIDOID, FLOAT8OID};
 	Datum		values[4];
