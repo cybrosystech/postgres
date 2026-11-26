@@ -70,6 +70,9 @@ struct XidCache
 #define		PROC_AFFECTS_ALL_HORIZONS	0x20	/* this proc's xmin must be
 												 * included in vacuum horizons
 												 * in all databases */
+#define		PROC_IS_DBBLUE_REPACK	0x40	/* is it a dbblue repack worker?
+											 * Cancelled like autovacuum when
+											 * it blocks someone */
 
 /* flags reset at EOXact */
 #define		PROC_VACUUM_STATE_MASK \

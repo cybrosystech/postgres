@@ -1535,10 +1535,12 @@ ProcSleep(LOCALLOCK *locallock)
 
 			/*
 			 * Only do it if the worker is not working to protect against Xid
-			 * wraparound.
+			 * wraparound.  A dbblue repack worker always yields: its REPACK
+			 * is optional and is retried later.
 			 */
-			if ((statusFlags & PROC_IS_AUTOVACUUM) &&
-				!(statusFlags & PROC_VACUUM_FOR_WRAPAROUND))
+			if (((statusFlags & PROC_IS_AUTOVACUUM) &&
+				 !(statusFlags & PROC_VACUUM_FOR_WRAPAROUND)) ||
+				(statusFlags & PROC_IS_DBBLUE_REPACK))
 			{
 				int			pid = autovac->pid;
 

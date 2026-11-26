@@ -108,6 +108,8 @@
 #include "storage/bufpage.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
+#include "storage/lwlock.h"
+#include "storage/proc.h"
 #include "tcop/tcopprot.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
@@ -799,6 +801,19 @@ DbblueRepackWorkerMain(Datum main_arg)
 	BackgroundWorkerInitializeConnectionByOid(dboid, InvalidOid, 0);
 
 	/*
+	 * Yield to anyone we block, as autovacuum does: a session that waits
+	 * deadlock_timeout for a lock this worker holds sends it SIGINT (see
+	 * ProcSleep()), cancelling the REPACK.  Otherwise odoo -u's ALTER TABLE
+	 * would wait for the whole REPACK, and every query on the table would
+	 * queue behind the ALTER.  Set once and never cleared, so deadlock.c may
+	 * read it without a lock.
+	 */
+	LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
+	MyProc->statusFlags |= PROC_IS_DBBLUE_REPACK;
+	ProcGlobal->statusFlags[MyProc->pgxactoff] = MyProc->statusFlags;
+	LWLockRelease(ProcArrayLock);
+
+	/*
 	 * This worker runs as superuser in a database its owner controls, so pin
 	 * search_path to the system catalogs: otherwise the owner decides how its
 	 * unqualified names resolve -- with ALTER DATABASE ... SET search_path, or
@@ -854,9 +869,11 @@ DbblueRepackWorkerMain(Datum main_arg)
 	 * Short, because the wait that matters is REPACK (CONCURRENTLY)'s final
 	 * upgrade to AccessExclusiveLock to swap the files: while it waits, every
 	 * new query on the table queues behind it, so this is how long a blocked
-	 * swap freezes the table for Odoo.
+	 * swap freezes the table for Odoo.  And below deadlock_timeout (1s by
+	 * default), so that in a deadlock with, say, odoo -u, the REPACK gives up
+	 * before the other session's deadlock check can pick it as the victim.
 	 */
-	SetConfigOption("lock_timeout", "2s", PGC_SUSET, PGC_S_SESSION);
+	SetConfigOption("lock_timeout", "500ms", PGC_SUSET, PGC_S_SESSION);
 
 	/*
 	 * This is where the feature is actually switched on or off.
@@ -1592,11 +1609,18 @@ repack_one_table(const char *schema, const char *table, Oid relid,
 					 errdetail("The repack itself committed; statistics will be refreshed by the next autovacuum analyze.")));
 		else
 		{
-			ereport(WARNING,
-					(errmsg("dbblue repack launcher: repacking \"%s.%s\" failed: %s",
-							schema, table, edata->message),
-					 errdetail("It will be tried again in %d minutes at the earliest.",
-							   DBBLUE_REPACK_RETRY_DELAY_S / 60)));
+			if (edata->sqlerrcode == ERRCODE_QUERY_CANCELED)
+				ereport(LOG,
+						(errmsg("dbblue repack launcher: repacking \"%s.%s\" cancelled: another session was waiting for a lock on it",
+								schema, table),
+						 errdetail("It will be tried again in %d minutes at the earliest.",
+								   DBBLUE_REPACK_RETRY_DELAY_S / 60)));
+			else
+				ereport(WARNING,
+						(errmsg("dbblue repack launcher: repacking \"%s.%s\" failed: %s",
+								schema, table, edata->message),
+						 errdetail("It will be tried again in %d minutes at the earliest.",
+								   DBBLUE_REPACK_RETRY_DELAY_S / 60)));
 			record_repack_failure(schema, table, relid, bloat_ratio);
 		}
 		FreeErrorData(edata);
