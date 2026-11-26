@@ -86,6 +86,7 @@
 #include "access/tableam.h"
 #include "access/xact.h"
 #include "catalog/namespace.h"
+#include "nodes/makefuncs.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_type.h"
@@ -195,6 +196,7 @@ static void repack_wait_for_worker(BackgroundWorkerHandle *handle,
 static void repack_scan_one_database(const RepackDatabase *db);
 static bool ensure_schema(void);
 static bool history_table_exists(void);
+static int	history_table_check(LOCKMODE lockmode);
 static List *parse_configured_tables(void);
 static List *load_bloat_candidates(List *specs);
 static void run_repack_cycle(void);
@@ -768,6 +770,18 @@ DbblueRepackWorkerMain(Datum main_arg)
 	 */
 	BackgroundWorkerInitializeConnectionByOid(dboid, InvalidOid, 0);
 
+	/*
+	 * This worker runs as superuser in a database its owner controls, so pin
+	 * search_path to the system catalogs: otherwise the owner decides how its
+	 * unqualified names resolve -- with ALTER DATABASE ... SET search_path, or
+	 * by planting public.pg_relation_size(oid), an exact match that wins over
+	 * pg_catalog.pg_relation_size(regclass) -- and the next cycle runs that
+	 * code as superuser.  REPACK and ANALYZE run index expressions as the
+	 * table's owner anyway.
+	 */
+	SetConfigOption("search_path", "pg_catalog, pg_temp",
+					PGC_SUSET, PGC_S_SESSION);
+
 	launcher_cxt = AllocSetContextCreate(TopMemoryContext,
 										 "dbblue repack worker",
 										 ALLOCSET_DEFAULT_SIZES);
@@ -869,16 +883,16 @@ ensure_schema(void)
 							")",
 							false, 0) == SPI_OK_UTILITY);
 
-	if (table_ok && created)
-	{
-		if (SPI_execute("GRANT SELECT ON public.dbblue_repack_history TO PUBLIC",
-						false, 0) != SPI_OK_UTILITY)
-			ereport(WARNING,
-					(errmsg("dbblue repack launcher: failed to grant select on dbblue_repack_history")));
-	}
-	else
+	if (!table_ok)
 		ereport(WARNING,
 				(errmsg("dbblue repack launcher: failed to create table dbblue_repack_history")));
+	else if (history_table_check(AccessShareLock) != 1)
+		table_ok = false;		/* someone else's table; warned */
+	else if (created &&
+			 SPI_execute("GRANT SELECT ON public.dbblue_repack_history TO PUBLIC",
+						 false, 0) != SPI_OK_UTILITY)
+		ereport(WARNING,
+				(errmsg("dbblue repack launcher: failed to grant select on dbblue_repack_history")));
 
 	SPI_finish();
 	PopActiveSnapshot();
@@ -899,6 +913,79 @@ history_table_exists(void)
 
 	return OidIsValid(nspid) &&
 		OidIsValid(get_relname_relid("dbblue_repack_history", nspid));
+}
+
+/*
+ * history_table_check
+ *		Lock public.dbblue_repack_history in lockmode, until the transaction
+ *		ends, and check that it is safe for this superuser worker to read and
+ *		write.  Returns 0 if it does not exist, 1 if it is an ordinary table
+ *		owned by a superuser with no triggers or rules, and -1, after a
+ *		WARNING, otherwise.  Needs a transaction and an SPI connection.
+ *
+ * The database owner owns schema public, so they can create this table
+ * before the worker does, drop the worker's and put their own in its place,
+ * or own it after a pg_restore --no-owner; their triggers or rules then run
+ * on the worker's writes as superuser, and a view in its place runs its
+ * functions on the worker's reads.  Locking first keeps the table that was
+ * checked from being dropped or replaced before it is used: any lock blocks
+ * DROP and ALTER ... RENAME.  pg_trigger and pg_rewrite are read directly, as
+ * pg_class.relhastriggers and relhasrules mean "has or once had".
+ */
+static int
+history_table_check(LOCKMODE lockmode)
+{
+	Oid			relid;
+	HeapTuple	tup;
+	Form_pg_class rel;
+	const char *problem = NULL;
+	char	   *owner = NULL;
+
+	relid = RangeVarGetRelidExtended(makeRangeVar("public", "dbblue_repack_history", -1),
+									 lockmode, RVR_MISSING_OK, NULL, NULL);
+	if (!OidIsValid(relid))
+		return 0;
+
+	tup = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	if (!HeapTupleIsValid(tup))
+		return 0;
+	rel = (Form_pg_class) GETSTRUCT(tup);
+	if (rel->relkind != RELKIND_RELATION)
+		problem = "is not an ordinary table";
+	else if (!superuser_arg(rel->relowner))
+	{
+		owner = GetUserNameFromId(rel->relowner, true);
+		problem = "is not owned by a superuser";
+	}
+	ReleaseSysCache(tup);
+
+	if (problem == NULL)
+	{
+		char	   *sql = psprintf("SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger WHERE tgrelid = %u),"
+								   "       EXISTS (SELECT 1 FROM pg_catalog.pg_rewrite WHERE ev_class = %u)",
+								   relid, relid);
+		bool		isnull;
+
+		if (SPI_execute(sql, false, 1) != SPI_OK_SELECT || SPI_processed != 1)
+			problem = "could not be checked";
+		else if (DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
+											SPI_tuptable->tupdesc, 1, &isnull)))
+			problem = "has triggers";
+		else if (DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
+											SPI_tuptable->tupdesc, 2, &isnull)))
+			problem = "has rules";
+		pfree(sql);
+	}
+
+	if (problem == NULL)
+		return 1;
+
+	ereport(WARNING,
+			(errmsg("dbblue repack launcher: public.dbblue_repack_history in database \"%s\" %s; not repacking there",
+					get_database_name(MyDatabaseId), problem),
+			 owner ? errdetail("It is owned by \"%s\".", owner) : 0,
+			 errhint("The repack worker reads and writes it as superuser.  Drop it so the worker recreates it, or make it an ordinary table owned by a superuser, with no triggers or rules.")));
+	return -1;
 }
 
 /*
@@ -1010,7 +1097,22 @@ load_bloat_candidates(List *specs)
 	 * Without the history table nothing has been repacked here yet, so there
 	 * is no cooldown to read; see ensure_schema().
 	 */
-	have_history = history_table_exists();
+	switch (history_table_check(AccessShareLock))
+	{
+		case 0:
+			have_history = false;
+			break;
+		case 1:
+			have_history = true;
+			break;
+		default:
+			/* Someone else's table, warned: no cycle in this database. */
+			SPI_finish();
+			PopActiveSnapshot();
+			CommitTransactionCommand();
+			pgstat_report_activity(STATE_IDLE, NULL);
+			return NIL;
+	}
 	ret = SPI_execute_with_args(have_history ?
 							   "WITH named AS ("
 							   "  SELECT w.nspname, w.relname, c.oid AS relid, c.relkind"
@@ -1446,7 +1548,13 @@ record_repack_history(const char *schema, const char *table, Oid relid,
 	SPI_connect();
 	PushActiveSnapshot(GetTransactionSnapshot());
 
-	if (SPI_execute_with_args(sql, 4, (Oid *) argtypes, values, NULL, false, 0) < 0)
+	/*
+	 * Checked again right before writing; see history_table_check().  If the
+	 * table is missing or someone else's (already warned about), nothing is
+	 * written.
+	 */
+	if (history_table_check(RowExclusiveLock) == 1 &&
+		SPI_execute_with_args(sql, 4, (Oid *) argtypes, values, NULL, false, 0) < 0)
 		ereport(WARNING,
 				(errmsg("dbblue repack launcher: failed to record history for \"%s.%s\"",
 						schema, table)));
