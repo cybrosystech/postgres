@@ -1155,6 +1155,19 @@ BackupLauncherMain(Datum main_arg)
 				SetConfigOption("default_transaction_read_only", "off",
 								PGC_SUSET, PGC_S_SESSION);
 
+				/*
+				 * Never wait for a synchronous standby.  With one down, a
+				 * commit to the history table would wait in
+				 * SyncRepWaitForLSN(), which ends only on die() or a query
+				 * cancel, not on this launcher's SIGTERM: no backup would be
+				 * taken while the standby is down -- when one matters most --
+				 * and pg_ctl stop -m fast would hang.  The history rows are
+				 * this launcher's own bookkeeping; the backup file does not
+				 * depend on them reaching the standby.
+				 */
+				SetConfigOption("synchronous_commit", "local",
+								PGC_SUSET, PGC_S_SESSION);
+
 				launcher_connected = true;
 			}
 
