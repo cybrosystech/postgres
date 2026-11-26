@@ -94,6 +94,7 @@
 #include "executor/spi.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
+#include "nodes/miscnodes.h"
 #include "pgstat.h"
 #include "postmaster/bgworker.h"
 #include "postmaster/dbblue_repack_launcher.h"
@@ -106,6 +107,7 @@
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/regproc.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
@@ -253,53 +255,80 @@ dbblue_check_repack_database(char **newval, void **extra, GucSource source)
 }
 
 /*
+ * split_repack_tables
+ *		Parse a dbblue_repack_tables value into RepackTableSpecs.  Returns
+ *		false and sets *bad to the offending entry on a syntax error.
+ *
+ * Each entry is a qualified name written as in SQL: unquoted parts are
+ * folded to lower case, quoted ones kept as written, and each part limited
+ * to NAMEDATALEN - 1 bytes on its own, so "public"."Foo" names public.Foo
+ * and a long schema plus a long table both survive.  The list is split at
+ * commas outside double quotes.  Splitting it with SplitIdentifierString()
+ * instead treated each entry as one identifier: "public"."Foo" was a syntax
+ * error, "public.Foo" became public.Foo here but public.foo when resolved,
+ * and a qualified name over 63 bytes was cut short as a whole.
+ */
+static bool
+split_repack_tables(const char *value, List **specs, char **bad)
+{
+	const char *p = value;
+
+	*specs = NIL;
+	*bad = NULL;
+	while (*p != '\0')
+	{
+		const char *start = p;
+		bool		inquote = false;
+		char	   *item;
+		List	   *names;
+		RepackTableSpec *spec;
+		ErrorSaveContext escontext = {T_ErrorSaveContext};
+
+		for (; *p != '\0' && (inquote || *p != ','); p++)
+			if (*p == '"')
+				inquote = !inquote;		/* "" inside quotes toggles twice */
+		item = pnstrdup(start, p - start);
+		if (*p == ',')
+			p++;
+
+		names = stringToQualifiedNameList(item, (Node *) &escontext);
+		if (escontext.error_occurred || list_length(names) != 2)
+		{
+			*bad = item;
+			return false;
+		}
+		spec = palloc_object(RepackTableSpec);
+		spec->schema = strVal(linitial(names));
+		spec->table = strVal(lsecond(names));
+		*specs = lappend(*specs, spec);
+	}
+	return true;
+}
+
+/*
  * dbblue_check_repack_tables
  *		GUC check hook for dbblue_repack_tables.
  *
- * Syntax only: each comma-separated item must be a single unquoted
- * "schema.table" pair.  Resolution to an OID is deliberately deferred to
+ * Syntax only: each comma-separated item must be a schema.table name; see
+ * split_repack_tables().  Resolution to an OID is deliberately deferred to
  * each cycle (parse_configured_tables/load_bloat_candidates), since a
  * table can be dropped or renamed between GUC-set-time and repack-time.
  */
 bool
 dbblue_check_repack_tables(char **newval, void **extra, GucSource source)
 {
-	char	   *rawstring;
-	List	   *elemlist;
-	ListCell   *lc;
-	bool		ok = true;
+	List	   *specs;
+	char	   *bad;
 
 	if (*newval == NULL || **newval == '\0')
 		return true;
 
-	rawstring = pstrdup(*newval);
-
-	if (!SplitIdentifierString(rawstring, ',', &elemlist))
+	if (!split_repack_tables(*newval, &specs, &bad))
 	{
-		GUC_check_errdetail("List syntax is invalid.");
-		pfree(rawstring);
-		list_free(elemlist);
+		GUC_check_errdetail("\"%s\" is not a valid schema.table name.", bad);
 		return false;
 	}
-
-	foreach(lc, elemlist)
-	{
-		char	   *item = (char *) lfirst(lc);
-		char	   *dot = strchr(item, '.');
-
-		if (dot == NULL || dot == item || dot[1] == '\0' ||
-			strchr(dot + 1, '.') != NULL)
-		{
-			GUC_check_errdetail("\"%s\" is not a valid schema.table name.",
-								item);
-			ok = false;
-			break;
-		}
-	}
-
-	pfree(rawstring);
-	list_free(elemlist);
-	return ok;
+	return true;
 }
 
 /*
@@ -880,38 +909,23 @@ history_table_exists(void)
 static List *
 parse_configured_tables(void)
 {
-	char	   *rawstring;
-	List	   *elemlist;
+	List	   *specs;
 	List	   *result = NIL;
+	char	   *bad;
 	ListCell   *lc;
 
 	if (dbblue_repack_tables == NULL || dbblue_repack_tables[0] == '\0')
 		return NIL;
 
-	rawstring = pstrdup(dbblue_repack_tables);
-	if (!SplitIdentifierString(rawstring, ',', &elemlist))
-	{
-		pfree(rawstring);
-		list_free(elemlist);
+	/* Malformed entries should have been rejected by the check hook. */
+	if (!split_repack_tables(dbblue_repack_tables, &specs, &bad))
 		return NIL;
-	}
 
-	foreach(lc, elemlist)
+	foreach(lc, specs)
 	{
-		char	   *item = (char *) lfirst(lc);
-		char	   *dot = strchr(item, '.');
-		char	   *schema;
-		char	   *table;
-		RepackTableSpec *spec;
+		RepackTableSpec *spec = (RepackTableSpec *) lfirst(lc);
 		ListCell   *lc2;
 		bool		duplicate = false;
-
-		/* Malformed entries should have been rejected by the check hook. */
-		if (dot == NULL || dot == item || dot[1] == '\0')
-			continue;
-
-		schema = pnstrdup(item, dot - item);
-		table = pstrdup(dot + 1);
 
 		/*
 		 * A repeated entry (e.g. a copy-paste mistake in the GUC) would
@@ -923,24 +937,16 @@ parse_configured_tables(void)
 		{
 			RepackTableSpec *seen = (RepackTableSpec *) lfirst(lc2);
 
-			if (strcmp(seen->schema, schema) == 0 &&
-				strcmp(seen->table, table) == 0)
+			if (strcmp(seen->schema, spec->schema) == 0 &&
+				strcmp(seen->table, spec->table) == 0)
 			{
 				duplicate = true;
 				break;
 			}
 		}
-		if (duplicate)
-			continue;
-
-		spec = (RepackTableSpec *) palloc(sizeof(RepackTableSpec));
-		spec->schema = schema;
-		spec->table = table;
-		result = lappend(result, spec);
+		if (!duplicate)
+			result = lappend(result, spec);
 	}
-
-	pfree(rawstring);
-	list_free(elemlist);
 	return result;
 }
 
@@ -955,10 +961,10 @@ load_bloat_candidates(List *specs)
 {
 	List	   *candidates = NIL;
 	int			n = list_length(specs);
-	Datum	   *qualnames;
-	ArrayType  *arr;
-	Oid			argtypes[1] = {TEXTARRAYOID};
-	Datum		values[1];
+	Datum	   *schemas;
+	Datum	   *tables;
+	Oid			argtypes[2] = {TEXTARRAYOID, TEXTARRAYOID};
+	Datum		values[2];
 	int			i;
 	int			ret;
 	uint64		row;
@@ -968,17 +974,23 @@ load_bloat_candidates(List *specs)
 	if (n == 0)
 		return NIL;
 
-	qualnames = (Datum *) palloc(n * sizeof(Datum));
+	/*
+	 * Schema and table names exactly as parsed, resolved below by name rather
+	 * than joined back into text for to_regclass(), which would parse them a
+	 * second time under different rules.
+	 */
+	schemas = (Datum *) palloc(n * sizeof(Datum));
+	tables = (Datum *) palloc(n * sizeof(Datum));
 	i = 0;
 	foreach(lc, specs)
 	{
 		RepackTableSpec *spec = (RepackTableSpec *) lfirst(lc);
 
-		qualnames[i++] = CStringGetTextDatum(psprintf("%s.%s", spec->schema,
-													  spec->table));
+		schemas[i] = CStringGetTextDatum(spec->schema);
+		tables[i++] = CStringGetTextDatum(spec->table);
 	}
-	arr = construct_array_builtin(qualnames, n, TEXTOID);
-	values[0] = PointerGetDatum(arr);
+	values[0] = PointerGetDatum(construct_array_builtin(schemas, n, TEXTOID));
+	values[1] = PointerGetDatum(construct_array_builtin(tables, n, TEXTOID));
 
 	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
@@ -993,16 +1005,14 @@ load_bloat_candidates(List *specs)
 	 */
 	have_history = history_table_exists();
 	ret = SPI_execute_with_args(have_history ?
-							   "WITH wanted AS ("
-							   "  SELECT s AS qualname, split_part(s, '.', 1) AS nspname,"
-							   "         split_part(s, '.', 2) AS relname"
-							   "  FROM unnest($1::text[]) AS s"
-							   "), resolved AS ("
-							   "  SELECT w.qualname, w.nspname, w.relname,"
-							   "         to_regclass(w.qualname)::oid AS relid"
-							   "  FROM wanted w"
+							   "WITH resolved AS ("
+							   "  SELECT w.nspname, w.relname, c.oid AS relid"
+							   "  FROM unnest($1::text[], $2::text[]) AS w(nspname, relname)"
+							   "  LEFT JOIN pg_catalog.pg_namespace n ON n.nspname = w.nspname"
+							   "  LEFT JOIN pg_catalog.pg_class c"
+							   "    ON c.relnamespace = n.oid AND c.relname = w.relname"
 							   ")"
-							   "SELECT r.qualname, r.relid, r.nspname, r.relname,"
+							   "SELECT r.relid, r.nspname, r.relname,"
 							   /*
 							    * pg_class.relpages is a cached statistic that
 							    * only VACUUM/ANALYZE/REPACK refresh; it can
@@ -1023,16 +1033,14 @@ load_bloat_candidates(List *specs)
 							   " LEFT JOIN public.dbblue_repack_history h"
 							   "   ON h.schema_name = r.nspname AND h.table_name = r.relname"
 							   :
-							   "WITH wanted AS ("
-							   "  SELECT s AS qualname, split_part(s, '.', 1) AS nspname,"
-							   "         split_part(s, '.', 2) AS relname"
-							   "  FROM unnest($1::text[]) AS s"
-							   "), resolved AS ("
-							   "  SELECT w.qualname, w.nspname, w.relname,"
-							   "         to_regclass(w.qualname)::oid AS relid"
-							   "  FROM wanted w"
+							   "WITH resolved AS ("
+							   "  SELECT w.nspname, w.relname, c.oid AS relid"
+							   "  FROM unnest($1::text[], $2::text[]) AS w(nspname, relname)"
+							   "  LEFT JOIN pg_catalog.pg_namespace n ON n.nspname = w.nspname"
+							   "  LEFT JOIN pg_catalog.pg_class c"
+							   "    ON c.relnamespace = n.oid AND c.relname = w.relname"
 							   ")"
-							   "SELECT r.qualname, r.relid, r.nspname, r.relname,"
+							   "SELECT r.relid, r.nspname, r.relname,"
 							   /*
 							    * pg_class.relpages is a cached statistic that
 							    * only VACUUM/ANALYZE/REPACK refresh; it can
@@ -1050,7 +1058,7 @@ load_bloat_candidates(List *specs)
 							   "       NULL::timestamptz AS last_repack_at"
 							   " FROM resolved r"
 							   " LEFT JOIN pg_stat_user_tables t ON t.relid = r.relid",
-							   1, argtypes, values, NULL, false, 0);
+							   2, argtypes, values, NULL, false, 0);
 
 	if (ret != SPI_OK_SELECT)
 		ereport(WARNING,
@@ -1068,7 +1076,7 @@ load_bloat_candidates(List *specs)
 			RepackCandidate *cand;
 			MemoryContext oldcxt;
 
-			d = SPI_getbinval(tuple, tupdesc, 2, &isnull);
+			d = SPI_getbinval(tuple, tupdesc, 1, &isnull);
 			relid = isnull ? InvalidOid : DatumGetObjectId(d);
 
 			oldcxt = MemoryContextSwitchTo(launcher_cxt);
@@ -1076,9 +1084,9 @@ load_bloat_candidates(List *specs)
 			cand = (RepackCandidate *) palloc0(sizeof(RepackCandidate));
 			cand->relid = relid;
 
-			d = SPI_getbinval(tuple, tupdesc, 3, &isnull);
+			d = SPI_getbinval(tuple, tupdesc, 2, &isnull);
 			cand->schema = isnull ? NULL : TextDatumGetCString(d);
-			d = SPI_getbinval(tuple, tupdesc, 4, &isnull);
+			d = SPI_getbinval(tuple, tupdesc, 3, &isnull);
 			cand->table = isnull ? NULL : TextDatumGetCString(d);
 
 			if (cand->schema == NULL || cand->table == NULL)
@@ -1093,13 +1101,13 @@ load_bloat_candidates(List *specs)
 				int64		n_live_tup;
 				int64		sum_width;
 
-				d = SPI_getbinval(tuple, tupdesc, 5, &isnull);
+				d = SPI_getbinval(tuple, tupdesc, 4, &isnull);
 				relpages = isnull ? 0 : DatumGetInt32(d);
-				d = SPI_getbinval(tuple, tupdesc, 6, &isnull);
+				d = SPI_getbinval(tuple, tupdesc, 5, &isnull);
 				n_live_tup = isnull ? 0 : DatumGetInt64(d);
-				d = SPI_getbinval(tuple, tupdesc, 7, &isnull);
+				d = SPI_getbinval(tuple, tupdesc, 6, &isnull);
 				sum_width = isnull ? 0 : DatumGetInt64(d);
-				d = SPI_getbinval(tuple, tupdesc, 8, &isnull);
+				d = SPI_getbinval(tuple, tupdesc, 7, &isnull);
 				cand->last_repack_at = isnull ? 0 : DatumGetTimestampTz(d);
 
 				if (relpages >= DBBLUE_REPACK_MIN_RELPAGES && n_live_tup > 0)
