@@ -978,6 +978,13 @@ load_bloat_candidates(List *specs)
 	 * Schema and table names exactly as parsed, resolved below by name rather
 	 * than joined back into text for to_regclass(), which would parse them a
 	 * second time under different rules.
+	 *
+	 * A partitioned table holds no rows itself -- its size is 0, so its bloat
+	 * ratio was 0 and it was skipped without a word -- and REPACK
+	 * (CONCURRENTLY) refuses it anyway.  So it stands for its leaf partitions,
+	 * found afresh every cycle so that partitions pg_partman adds later are
+	 * included, each measured, cooled down and repacked on its own.  UNION
+	 * drops a partition that is also listed by name.
 	 */
 	schemas = (Datum *) palloc(n * sizeof(Datum));
 	tables = (Datum *) palloc(n * sizeof(Datum));
@@ -1005,12 +1012,21 @@ load_bloat_candidates(List *specs)
 	 */
 	have_history = history_table_exists();
 	ret = SPI_execute_with_args(have_history ?
-							   "WITH resolved AS ("
-							   "  SELECT w.nspname, w.relname, c.oid AS relid"
+							   "WITH named AS ("
+							   "  SELECT w.nspname, w.relname, c.oid AS relid, c.relkind"
 							   "  FROM unnest($1::text[], $2::text[]) AS w(nspname, relname)"
 							   "  LEFT JOIN pg_catalog.pg_namespace n ON n.nspname = w.nspname"
 							   "  LEFT JOIN pg_catalog.pg_class c"
 							   "    ON c.relnamespace = n.oid AND c.relname = w.relname"
+							   "), resolved AS ("
+							   "  SELECT nspname, relname, relid FROM named"
+							   "  WHERE relkind IS DISTINCT FROM 'p'"
+							   "  UNION"
+							   "  SELECT pn.nspname, pc.relname, pc.oid"
+							   "  FROM named, pg_catalog.pg_partition_tree(named.relid) t"
+							   "  JOIN pg_catalog.pg_class pc ON pc.oid = t.relid"
+							   "  JOIN pg_catalog.pg_namespace pn ON pn.oid = pc.relnamespace"
+							   "  WHERE named.relkind = 'p' AND t.isleaf AND pc.relkind = 'r'"
 							   ")"
 							   "SELECT r.relid, r.nspname, r.relname,"
 							   /*
@@ -1033,12 +1049,21 @@ load_bloat_candidates(List *specs)
 							   " LEFT JOIN public.dbblue_repack_history h"
 							   "   ON h.schema_name = r.nspname AND h.table_name = r.relname"
 							   :
-							   "WITH resolved AS ("
-							   "  SELECT w.nspname, w.relname, c.oid AS relid"
+							   "WITH named AS ("
+							   "  SELECT w.nspname, w.relname, c.oid AS relid, c.relkind"
 							   "  FROM unnest($1::text[], $2::text[]) AS w(nspname, relname)"
 							   "  LEFT JOIN pg_catalog.pg_namespace n ON n.nspname = w.nspname"
 							   "  LEFT JOIN pg_catalog.pg_class c"
 							   "    ON c.relnamespace = n.oid AND c.relname = w.relname"
+							   "), resolved AS ("
+							   "  SELECT nspname, relname, relid FROM named"
+							   "  WHERE relkind IS DISTINCT FROM 'p'"
+							   "  UNION"
+							   "  SELECT pn.nspname, pc.relname, pc.oid"
+							   "  FROM named, pg_catalog.pg_partition_tree(named.relid) t"
+							   "  JOIN pg_catalog.pg_class pc ON pc.oid = t.relid"
+							   "  JOIN pg_catalog.pg_namespace pn ON pn.oid = pc.relnamespace"
+							   "  WHERE named.relkind = 'p' AND t.isleaf AND pc.relkind = 'r'"
 							   ")"
 							   "SELECT r.relid, r.nspname, r.relname,"
 							   /*
