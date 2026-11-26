@@ -40,8 +40,8 @@ $node->start;
 sub run_cycle
 {
 	my ($tables) = @_;
-	# Let the previous cycle's worker finish first: the launcher acts on a
-	# reload that arrives while it waits for a worker only after its naptime.
+	# Let the previous cycle's worker finish first, so each cycle's log lines
+	# come after the offset its caller took.
 	$node->poll_query_until('postgres',
 		"SELECT count(*) = 0 FROM pg_stat_activity WHERE backend_type = 'dbblue repack worker'"
 	) or die "timed out waiting for the previous repack worker to finish";

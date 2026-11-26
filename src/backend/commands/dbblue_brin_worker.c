@@ -1327,6 +1327,14 @@ DBBlueBrinLauncherMain(Datum main_arg)
 		if (ShutdownRequestPending)
 			break;
 
+		/*
+		 * A reload that arrived during the pass: act on it now.  Its latch
+		 * wake-up was used up while waiting for the worker, so sleeping here
+		 * would leave it pending until the naptime ran out.
+		 */
+		if (ConfigReloadPending)
+			continue;
+
 		(void) WaitLatch(MyLatch,
 						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
 						 sleep_ms,
