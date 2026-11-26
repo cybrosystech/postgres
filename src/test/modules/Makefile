@@ -10,6 +10,7 @@ SUBDIRS = \
 		  dbblue_audit \
 		  dbblue_backup \
 		  dbblue_brin \
+		  dbblue_repack \
 		  dbblue_standby \
 		  dbblue_wait_sampling \
 		  delay_execution \
