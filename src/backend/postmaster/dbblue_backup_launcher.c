@@ -1185,6 +1185,23 @@ BackupLauncherMain(Datum main_arg)
 			{
 				TimestampTz now = GetCurrentTimestamp();
 
+				/*
+				 * next_run is never set more than a naptime ahead, so if it is
+				 * further away now, the system clock has been set back -- e.g.
+				 * by NTP correcting a hardware clock kept in local time.
+				 * Waiting for it would pause every backup for the size of the
+				 * step, so run a cycle now; that also corrects history rows
+				 * dated in the future (fix_future_dated_rows()).  A minute of
+				 * slack keeps a small step from being reported.
+				 */
+				if (next_run != 0 &&
+					next_run - now > ((int64) dbblue_backup_naptime + 60) * USECS_PER_SEC)
+				{
+					ereport(LOG,
+							(errmsg("dbblue backup launcher: the system clock was set back, so running a backup cycle now")));
+					next_run = 0;
+				}
+
 				if (next_run == 0 || now >= next_run)
 				{
 					TimestampTz next_due;
@@ -1951,6 +1968,13 @@ run_backup_cycle(void)
 		{
 			BackupRetryState *rs = hash_search(retry_state, cand->dbname,
 											   HASH_FIND, NULL);
+
+			/*
+			 * A failure time in the future was recorded while the clock was
+			 * ahead: count the wait from now, not from that time.
+			 */
+			if (rs != NULL && rs->last_failure_at > now)
+				rs->last_failure_at = now;
 
 			if (rs != NULL &&
 				now < rs->last_failure_at +
