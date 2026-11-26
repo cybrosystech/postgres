@@ -287,6 +287,30 @@ typedef struct BackupRetryState
 static HTAB *retry_state = NULL;	/* in TopMemoryContext */
 
 /*
+ * Listed databases skipped because they do not exist, or do not accept
+ * connections or are templates: what was last warned about each, and when.
+ * Each is warned about once, then once a day while it lasts, rather than
+ * every cycle -- an Odoo Rename or Drop of a listed database used to log a
+ * WARNING every naptime, 288 a day -- and again after a reload, which is what
+ * an administrator does after editing dbblue_backup_databases.
+ */
+typedef enum SkipReason
+{
+	SKIP_NONE,					/* backed up normally: forget it */
+	SKIP_MISSING,				/* does not exist */
+	SKIP_NO_CONNECT,			/* does not accept connections, or a template */
+} SkipReason;
+
+typedef struct SkipWarning
+{
+	char		dbname[NAMEDATALEN];	/* hash key */
+	SkipReason	reason;			/* what was warned about */
+	TimestampTz warned_at;		/* and when */
+} SkipWarning;
+
+static HTAB *skip_warnings = NULL;	/* in TopMemoryContext */
+
+/*
  * What report_unmanaged_backups() last logged (-1 = nothing yet), and when:
  * it logs only when that changes, or once a day as a reminder.
  */
@@ -301,6 +325,7 @@ static List *load_backup_candidates(List *specs);
 static TimestampTz run_backup_cycle(void);
 static void backup_launcher_quickdie(SIGNAL_ARGS);
 static void reload_configuration(void);
+static bool should_warn_skipped(const char *dbname, SkipReason reason);
 static void warn_if_backup_database_listed(void);
 static int64 retry_delay_secs(int failures);
 static void note_backup_result(const char *dbname, bool ok,
@@ -1925,9 +1950,12 @@ run_backup_cycle(void)
 
 		if (!OidIsValid(cand->dboid))
 		{
-			ereport(WARNING,
-					(errmsg("dbblue backup launcher: configured database \"%s\" does not exist, skipping",
-							cand->dbname)));
+			if (should_warn_skipped(cand->dbname, SKIP_MISSING))
+				ereport(WARNING,
+						(errmsg("dbblue backup launcher: configured database \"%s\" does not exist, skipping",
+								cand->dbname),
+						 errdetail("It is not being backed up. This is logged again once a day while it lasts, or after a configuration reload."),
+						 errhint("If it was renamed, put its new name in dbblue_backup_databases.")));
 			continue;
 		}
 
@@ -1944,11 +1972,16 @@ run_backup_cycle(void)
 
 		if (!cand->allowconn || cand->istemplate)
 		{
-			ereport(WARNING,
-					(errmsg("dbblue backup launcher: configured database \"%s\" does not accept connections or is a template, skipping",
-							cand->dbname)));
+			if (should_warn_skipped(cand->dbname, SKIP_NO_CONNECT))
+				ereport(WARNING,
+						(errmsg("dbblue backup launcher: configured database \"%s\" does not accept connections or is a template, skipping",
+								cand->dbname),
+						 errdetail("It is not being backed up. This is logged again once a day while it lasts, or after a configuration reload.")));
 			continue;
 		}
+
+		/* Usable again: should it be skipped later, warn at once. */
+		(void) should_warn_skipped(cand->dbname, SKIP_NONE);
 
 		now = GetCurrentTimestamp();
 		if (cand->last_backup_at != 0 &&
@@ -2069,6 +2102,13 @@ reload_configuration(void)
 	if (dbblue_backup_enabled && launcher_connected)
 		warn_if_backup_database_listed();
 
+	/* Warn again about every skipped database at the next cycle. */
+	if (skip_warnings != NULL)
+	{
+		hash_destroy(skip_warnings);
+		skip_warnings = NULL;
+	}
+
 	if (retry_state != NULL)
 	{
 		HASH_SEQ_STATUS status;
@@ -2088,6 +2128,50 @@ reload_configuration(void)
 								   "dbblue backup launcher: configuration reloaded, retrying %ld failing databases at the next cycle",
 								   n, n)));
 	}
+}
+
+/*
+ * should_warn_skipped
+ *		Whether to warn now that listed database dbname is skipped for
+ *		reason: the first time, when the reason changes, and once a day
+ *		while it lasts (see SkipWarning).  SKIP_NONE, for a database that is
+ *		usable, forgets it and returns false.
+ */
+static bool
+should_warn_skipped(const char *dbname, SkipReason reason)
+{
+	SkipWarning *sw;
+	bool		found;
+	TimestampTz now = GetCurrentTimestamp();
+
+	if (reason == SKIP_NONE)
+	{
+		if (skip_warnings != NULL)
+			(void) hash_search(skip_warnings, dbname, HASH_REMOVE, NULL);
+		return false;
+	}
+
+	if (skip_warnings == NULL)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = NAMEDATALEN;
+		ctl.entrysize = sizeof(SkipWarning);
+		ctl.hcxt = TopMemoryContext;
+		skip_warnings = hash_create("dbblue backup skip warnings", 16, &ctl,
+									HASH_ELEM | HASH_STRINGS | HASH_CONTEXT);
+	}
+
+	sw = hash_search(skip_warnings, dbname, HASH_ENTER, &found);
+
+	/* A warned_at in the future means the clock was set back: warn now. */
+	if (found && sw->reason == reason && now >= sw->warned_at &&
+		now < sw->warned_at + (int64) SECS_PER_DAY * USECS_PER_SEC)
+		return false;
+
+	sw->reason = reason;
+	sw->warned_at = now;
+	return true;
 }
 
 /*
