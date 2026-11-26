@@ -287,6 +287,43 @@ RESET compute_query_id;
 SET dbblue_autoprepare_enabled = off;
 DISCARD PLANS;
 
+-- pattern matching against a constant is not cached: once the pattern is a
+-- parameter the planner cannot estimate how many rows it matches, and a
+-- reused plan can be far slower for a rare pattern.  Shapes that only use a
+-- column as the pattern, or that do no pattern matching, are cached as usual.
+SET dbblue_autoprepare_enabled = on;
+SET dbblue_autoprepare_threshold = 2;
+CREATE TEMP TABLE aprep_p (n text, b int);
+INSERT INTO aprep_p VALUES ('alpha', 1), ('Beta', 2), ('gamma', 3);
+SELECT declines AS declines_before, promotions AS promotions_before
+FROM dbblue_autoprepare_stats(pg_backend_pid()) \gset
+SELECT b FROM aprep_p WHERE n ILIKE '%a%' ORDER BY b LIMIT 5;
+SELECT b FROM aprep_p WHERE n ILIKE '%b%' ORDER BY b LIMIT 6;
+SELECT b FROM aprep_p WHERE n LIKE 'a%' ORDER BY b LIMIT 5;
+SELECT b FROM aprep_p WHERE n LIKE 'g%' ORDER BY b LIMIT 6;
+SELECT b FROM aprep_p WHERE n NOT ILIKE '%a%' ORDER BY b LIMIT 5;
+SELECT b FROM aprep_p WHERE n NOT ILIKE '%b%' ORDER BY b LIMIT 6;
+SELECT b FROM aprep_p WHERE n ~ '^a' ORDER BY b LIMIT 5;
+SELECT b FROM aprep_p WHERE n ~ '^g' ORDER BY b LIMIT 6;
+SELECT b FROM aprep_p WHERE n SIMILAR TO 'a%' ORDER BY b LIMIT 5;
+SELECT b FROM aprep_p WHERE n SIMILAR TO 'g%' ORDER BY b LIMIT 6;
+SELECT b FROM aprep_p WHERE n ILIKE lower('%A%') ORDER BY b LIMIT 5;
+SELECT b FROM aprep_p WHERE n ILIKE lower('%B%') ORDER BY b LIMIT 6;
+SELECT b FROM aprep_p WHERE n ILIKE ANY (ARRAY['%a%', '%b%']) ORDER BY b LIMIT 5;
+SELECT b FROM aprep_p WHERE n ILIKE ANY (ARRAY['%g%', '%b%']) ORDER BY b LIMIT 6;
+SELECT b FROM aprep_p WHERE n ILIKE n AND b = 1;
+SELECT b FROM aprep_p WHERE n ILIKE n AND b = 2;
+SELECT b FROM aprep_p WHERE b = 1;
+SELECT b FROM aprep_p WHERE b = 2;
+-- counted from the cumulative counters: the table itself may already have
+-- dropped some entries to stay within the limit set earlier in this file
+SELECT declines - :declines_before AS pattern_shapes_declined,
+       promotions - :promotions_before AS other_shapes_cached
+FROM dbblue_autoprepare_stats(pg_backend_pid());
+DROP TABLE aprep_p;
+SET dbblue_autoprepare_enabled = off;
+DISCARD PLANS;
+
 -- length-coercion casts: the size in x::numeric(p,s) / x::varchar(n) is part of
 -- the shape, not a parameter.  Casts that differ only in that size must never
 -- share one cached plan (and a cached plan must keep reporting the real size).

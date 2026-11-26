@@ -48,6 +48,16 @@
  *	not check the settings on every statement, to keep the lookup cheap;
  *	normal workloads do not change them.
  *
+ * Shapes that are not cached
+ * --------------------------
+ *	A shape is declined, once, when it is first promoted, if it has no
+ *	constants, more than APREP_MAX_PARAMS of them, does not rewrite to a single
+ *	query, is larger than the memory budget, or matches a pattern (LIKE, ILIKE,
+ *	regular expression, SIMILAR TO) against a constant.  The last one is there
+ *	because the planner cannot estimate a pattern's selectivity once it is a
+ *	parameter, so a reused plan can be much slower for a rare pattern; see
+ *	aprep_is_pattern_operator().
+ *
  * Correctness stance
  * ------------------
  *	The 64-bit queryId only selects a candidate entry; it is not trusted for
@@ -395,11 +405,60 @@ aprep_literal_only_mask(FuncExpr *f)
  *		shape transform: BUILD (Const -> Param, collect types)
  * ---------------------------------------------------------------- */
 
+/*
+ * Pattern matching (LIKE, ILIKE, regular expressions, SIMILAR TO) with a
+ * constant pattern is not cached.
+ *
+ * The planner estimates how many rows a pattern matches from the pattern
+ * itself and the column's statistics.  Once the pattern is a $n parameter it
+ * cannot: it falls back to a fixed guess (a few hundred rows).  For a query
+ * with ORDER BY ... LIMIT that guess favours walking an index in sort order
+ * until enough rows are found, which is quick for a common pattern and reads
+ * the whole table for a rare one.  Measured on an Odoo database, such a
+ * statement ran 41% to 45% slower with the cached plan, and a pattern that
+ * matches nothing ran 7 times slower.  These statements are cheap to plan, so
+ * not caching them costs little.
+ *
+ * A pattern operator is recognised by its selectivity estimator, which covers
+ * every type (text, name, bpchar, bytea) and ~~, ~~*, !~~, !~~*, ~, ~*, !~ and
+ * !~*.  SIMILAR TO is a regular expression operator over similar_to_escape().
+ */
+static bool
+aprep_is_pattern_operator(Oid opno)
+{
+	switch (get_oprrest(opno))
+	{
+		case F_LIKESEL:
+		case F_NLIKESEL:
+		case F_ICLIKESEL:
+		case F_ICNLIKESEL:
+		case F_REGEXEQSEL:
+		case F_REGEXNESEL:
+		case F_ICREGEXEQSEL:
+		case F_ICREGEXNESEL:
+			return true;
+		default:
+			return false;
+	}
+}
+
+/* Does this expression contain a constant we would turn into a parameter? */
+static bool
+aprep_contains_const(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Const))
+		return const_is_parameterizable((Const *) node);
+	return expression_tree_walker(node, aprep_contains_const, context);
+}
+
 typedef struct AprepBuildCtx
 {
 	int			next_paramid;	/* 0-based running counter */
 	Oid			types[APREP_MAX_PARAMS];
 	bool		too_many;
+	bool		pattern_match;	/* LIKE/regex with a constant pattern: decline */
 }			AprepBuildCtx;
 
 static Node *
@@ -407,13 +466,37 @@ aprep_build_mutator(Node *node, void *context)
 {
 	AprepBuildCtx *ctx = (AprepBuildCtx *) context;
 
-	if (node == NULL || ctx->too_many)
+	if (node == NULL || ctx->too_many || ctx->pattern_match)
 		return node;
 
 	/* Descend into sub-queries explicitly. */
 	if (IsA(node, Query))
 		return (Node *) query_tree_mutator((Query *) node,
 										   aprep_build_mutator, ctx, 0);
+
+	/* LIKE, ILIKE, regex ... with a constant pattern: see above */
+	if (IsA(node, OpExpr))
+	{
+		OpExpr	   *o = (OpExpr *) node;
+
+		if (list_length(o->args) == 2 && aprep_is_pattern_operator(o->opno) &&
+			aprep_contains_const((Node *) lsecond(o->args), NULL))
+		{
+			ctx->pattern_match = true;
+			return node;
+		}
+	}
+	if (IsA(node, ScalarArrayOpExpr))
+	{
+		ScalarArrayOpExpr *so = (ScalarArrayOpExpr *) node;
+
+		if (list_length(so->args) == 2 && aprep_is_pattern_operator(so->opno) &&
+			aprep_contains_const((Node *) lsecond(so->args), NULL))
+		{
+			ctx->pattern_match = true;
+			return node;
+		}
+	}
 
 	if (IsA(node, Const))
 	{
@@ -452,7 +535,7 @@ aprep_build_mutator(Node *node, void *context)
 			}
 			/* Walk the left arg FIRST so its param ids precede the array's. */
 			newleft = aprep_build_mutator((Node *) linitial(s->args), ctx);
-			if (ctx->too_many)
+			if (ctx->too_many || ctx->pattern_match)
 				return node;
 			id = ++ctx->next_paramid;
 			ctx->types[id - 1] = arr->array_typeid;
@@ -484,7 +567,7 @@ aprep_build_mutator(Node *node, void *context)
 				if (!(litmask & (((uint32) 1) << i)))
 				{
 					lfirst(lc) = aprep_build_mutator((Node *) lfirst(lc), ctx);
-					if (ctx->too_many)
+					if (ctx->too_many || ctx->pattern_match)
 						return node;
 				}
 				i++;
@@ -509,6 +592,7 @@ aprep_parameterize_build(Query *analyzed, Oid **types_out, int *nparams_out)
 
 	ctx.next_paramid = 0;
 	ctx.too_many = false;
+	ctx.pattern_match = false;
 
 	/*
 	 * Parameterize the ENTIRE query, including LIMIT/OFFSET.  We must
@@ -521,7 +605,7 @@ aprep_parameterize_build(Query *analyzed, Oid **types_out, int *nparams_out)
 	 */
 	mutated = query_tree_mutator(analyzed, aprep_build_mutator, &ctx, 0);
 
-	if (ctx.too_many || ctx.next_paramid == 0)
+	if (ctx.too_many || ctx.pattern_match || ctx.next_paramid == 0)
 		return NULL;
 
 	/*
