@@ -103,6 +103,7 @@
 #include "storage/bufpage.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
+#include "tcop/tcopprot.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
@@ -770,7 +771,15 @@ DbblueRepackWorkerMain(Datum main_arg)
 	sigjmp_buf	local_sigjmp_buf;
 
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
-	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
+	/*
+	 * SIGTERM ends the worker at once, as it does a backend, even in the
+	 * middle of a REPACK that can run for hours: a fast shutdown, DROP
+	 * DATABASE and Odoo's Drop, Duplicate and Rename must not wait for it.
+	 * The REPACK rolls back and the table stays as it was; a later cycle
+	 * repacks it.  The database owner may send it too; see
+	 * pg_signal_backend().
+	 */
+	pqsignal(SIGTERM, die);
 	BackgroundWorkerUnblockSignals();
 
 	/*
