@@ -1185,7 +1185,11 @@ load_bloat_candidates(List *specs)
 							   "       COALESCE((SELECT SUM(s.avg_width) FROM pg_stats s"
 							   "                 WHERE s.schemaname = r.nspname"
 							   "                   AND s.tablename = r.relname), 0) AS sum_width,"
-							   "       h.last_repack_at, h.last_failed_at"
+							   "       h.last_repack_at, h.last_failed_at,"
+							   "       COALESCE((SELECT o.option_value::int"
+							   "                 FROM pg_catalog.pg_class c2,"
+							   "                      pg_catalog.pg_options_to_table(c2.reloptions) o"
+							   "                 WHERE c2.oid = r.relid AND o.option_name = 'fillfactor'), 100)"
 							   " FROM resolved r"
 							   " LEFT JOIN pg_stat_user_tables t ON t.relid = r.relid"
 							   " LEFT JOIN public.dbblue_repack_history h"
@@ -1223,7 +1227,11 @@ load_bloat_candidates(List *specs)
 							   "                 WHERE s.schemaname = r.nspname"
 							   "                   AND s.tablename = r.relname), 0) AS sum_width,"
 							   "       NULL::timestamptz AS last_repack_at,"
-							   "       NULL::timestamptz AS last_failed_at"
+							   "       NULL::timestamptz AS last_failed_at,"
+							   "       COALESCE((SELECT o.option_value::int"
+							   "                 FROM pg_catalog.pg_class c2,"
+							   "                      pg_catalog.pg_options_to_table(c2.reloptions) o"
+							   "                 WHERE c2.oid = r.relid AND o.option_name = 'fillfactor'), 100)"
 							   " FROM resolved r"
 							   " LEFT JOIN pg_stat_user_tables t ON t.relid = r.relid",
 							   2, argtypes, values, NULL, false, 0);
@@ -1268,6 +1276,7 @@ load_bloat_candidates(List *specs)
 				int32		relpages;
 				int64		n_live_tup;
 				int64		sum_width;
+				int32		fillfactor;
 
 				d = SPI_getbinval(tuple, tupdesc, 4, &isnull);
 				relpages = isnull ? 0 : DatumGetInt32(d);
@@ -1279,12 +1288,25 @@ load_bloat_candidates(List *specs)
 				cand->last_repack_at = isnull ? 0 : DatumGetTimestampTz(d);
 				d = SPI_getbinval(tuple, tupdesc, 8, &isnull);
 				cand->last_failed_at = isnull ? 0 : DatumGetTimestampTz(d);
+				d = SPI_getbinval(tuple, tupdesc, 9, &isnull);
+				fillfactor = isnull ? 100 : DatumGetInt32(d);
 
 				if (relpages >= DBBLUE_REPACK_MIN_RELPAGES && n_live_tup > 0)
 				{
 					double		avg_row_width = (sum_width > 0) ?
 						(double) sum_width : DBBLUE_REPACK_FALLBACK_AVG_ROW_WIDTH;
-					double		usable_bytes = BLCKSZ - SizeOfPageHeaderData;
+					/*
+					 * A fillfactor below 100 leaves part of every page
+					 * empty on purpose, for HOT updates, and REPACK
+					 * writes the new table that way too.  Counting that
+					 * space as bloat measured a fresh fillfactor-70 table
+					 * at about 1.6, over the threshold, so it was
+					 * rewritten every dbblue_repack_min_interval for
+					 * nothing -- and DBblue's fillfactor map gives exactly
+					 * the hot Odoo tables such a fillfactor.
+					 */
+					double		usable_bytes = (BLCKSZ - SizeOfPageHeaderData) *
+						Min(Max(fillfactor, 10), 100) / 100.0;
 					double		rows_per_page = usable_bytes /
 						(avg_row_width + DBBLUE_REPACK_TUPLE_OVERHEAD);
 					int64		ideal_pages;
