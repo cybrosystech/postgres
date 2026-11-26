@@ -64,6 +64,7 @@
 #include "portability/instr_time.h"
 #include "postmaster/bgworker.h"
 #include "postmaster/dbblue_backup_launcher.h"
+#include "postmaster/dbblue_create_standby.h"
 #include "postmaster/interrupt.h"
 #include "postmaster/postmaster.h"
 #include "storage/fd.h"
@@ -1261,6 +1262,33 @@ BackupLauncherMain(Datum main_arg)
 		}
 		else
 		{
+			/*
+			 * A standby built by DBblue has backups off: it shares our
+			 * dbblue_backup_directory and a copy of our backup history, so
+			 * once promoted it would write into, and prune, the old
+			 * primary's backups (see dbblue_create_standby.c).  But promoted,
+			 * it is the primary, and nothing backs it up.  Say so, once and
+			 * then daily, so that a failover does not go on without backups
+			 * unnoticed.  A promoted standby keeps its cluster_name.
+			 */
+			if (!dbblue_backup_enabled && !RecoveryInProgress() &&
+				cluster_name != NULL &&
+				strcmp(cluster_name, DBBLUE_STANDBY_NAME) == 0)
+			{
+				static TimestampTz promoted_warned_at = 0;
+				TimestampTz now = GetCurrentTimestamp();
+
+				if (promoted_warned_at == 0 || now < promoted_warned_at ||
+					now >= promoted_warned_at + (int64) SECS_PER_DAY * USECS_PER_SEC)
+				{
+					promoted_warned_at = now;
+					ereport(WARNING,
+							(errmsg("dbblue backup launcher: this server was promoted from a DBblue standby, but dbblue_backup_enabled is off, so no backups are being taken"),
+							 errdetail("DBblue turns backups off on the standby it builds, as it shares the primary's backup folder. This is logged again once a day."),
+							 errhint("To back it up, set dbblue_backup_directory to a folder of its own and dbblue_backup_enabled = on with ALTER SYSTEM, then restart the server.")));
+				}
+			}
+
 			/* Disabled (or a standby): re-verify everything once re-enabled. */
 			schema_ready = false;
 			environment_ready = false;

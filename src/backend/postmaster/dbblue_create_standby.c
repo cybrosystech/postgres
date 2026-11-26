@@ -229,13 +229,6 @@ int			dbblue_standby_max_lag = 64;
 #define DBBLUE_STANDBY_SLOT			"dbblue_standby"
 
 /*
- * The name the standby streams as, its cluster_name, which its walreceiver
- * sends as application_name: what pg_stat_replication shows for it, and
- * what synchronous_standby_names would have to name.
- */
-#define DBBLUE_STANDBY_NAME			"dbblue_standby"
-
-/*
  * File in DataDir naming the standby directory last managed, so that a change
  * of dbblue_standby_directory, across a restart too, still finds the standby
  * left in the old one; see retire_previous_standby().
