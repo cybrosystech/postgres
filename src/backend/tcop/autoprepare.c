@@ -110,6 +110,7 @@
 #include "utils/guc_hooks.h"
 #include "utils/hsearch.h"
 #include "utils/lsyscache.h"
+#include "utils/ruleutils.h"
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
 #include "utils/tuplestore.h"
@@ -868,6 +869,17 @@ build_parameterized_plansource(Query *analyzed, const char *query_string,
 	rewritten = QueryRewrite(copyObject(pquery));
 	if (list_length(rewritten) != 1)
 		return NULL;			/* rule-rewritten / multi -> skip (see caveat) */
+
+	/*
+	 * Keep the statement text of the parameterized tree, not the promoting
+	 * statement's own text.  The cached plan stores one text for its whole
+	 * life and for every statement of this shape; the original would carry
+	 * that one statement's literal values (an e-mail address, a password in an
+	 * UPDATE) into memory, the shapes view and the server log long after the
+	 * statement is gone.  The deparsed tree reads "... WHERE c = $1".  Running
+	 * statements are unaffected: they execute and log with their own text.
+	 */
+	query_string = pg_get_querydef(pquery, false);
 
 	plansource = CreateCachedPlanForQuery(pquery, query_string,
 										  aprep_cmdtag(analyzed->commandType));

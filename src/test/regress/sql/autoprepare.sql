@@ -324,6 +324,31 @@ DROP TABLE aprep_p;
 SET dbblue_autoprepare_enabled = off;
 DISCARD PLANS;
 
+-- the text kept with a cached shape is the parameterized statement, never the
+-- literal values of the statement that happened to promote it
+SELECT current_setting('dbblue_autoprepare_limit') AS saved_limit \gset
+SET dbblue_autoprepare_limit = 100;
+SET dbblue_autoprepare_enabled = on;
+SET dbblue_autoprepare_threshold = 2;
+SELECT a FROM aprep_t WHERE c = 424242 AND d = 313131;
+SELECT a FROM aprep_t WHERE c = 424243 AND d = 313132;
+UPDATE aprep_t SET d = 777001 WHERE c = 777002;
+UPDATE aprep_t SET d = 777003 WHERE c = 777004;
+INSERT INTO aprep_t VALUES (888001, 888002, 888003, 888004);
+INSERT INTO aprep_t VALUES (888011, 888012, 888013, 888014);
+SELECT a FROM aprep_t WHERE a IN (SELECT b FROM aprep_t WHERE c = 999001) AND d = 999002;
+SELECT a FROM aprep_t WHERE a IN (SELECT b FROM aprep_t WHERE c = 999011) AND d = 999012;
+SELECT count(*) FILTER (WHERE query ~ '[0-9]{6}') AS with_literal,
+       count(*) FILTER (WHERE query LIKE '%$1%') AS with_parameter,
+       count(*) AS cached
+FROM dbblue_autoprepare_shapes(pg_backend_pid()) WHERE state = 'promoted';
+SELECT query FROM dbblue_autoprepare_shapes(pg_backend_pid())
+WHERE state = 'promoted' ORDER BY query COLLATE "C";
+DELETE FROM aprep_t;
+SET dbblue_autoprepare_enabled = off;
+DISCARD PLANS;
+SET dbblue_autoprepare_limit = :saved_limit;
+
 -- length-coercion casts: the size in x::numeric(p,s) / x::varchar(n) is part of
 -- the shape, not a parameter.  Casts that differ only in that size must never
 -- share one cached plan (and a cached plan must keep reporting the real size).

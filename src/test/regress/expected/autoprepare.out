@@ -134,11 +134,18 @@ SELECT state, plan_ms > 0 AS timed, score > 0 AS scored,
        query
 FROM dbblue_autoprepare_shapes(pg_backend_pid())
 ORDER BY query COLLATE "C";
-  state   | timed | scored | before_timed | after_timed | num_custom_plans | num_generic_plans | costed |                      query                      
-----------+-------+--------+--------------+-------------+------------------+-------------------+--------+-------------------------------------------------
- promoted | t     | t      | t            | t           |                1 |                 0 | t      | SELECT a FROM aprep_t WHERE a = 2;
- promoted | t     | t      | t            | t           |                1 |                 0 | t      | SELECT a, b FROM aprep_t WHERE a = 1 AND b = 2;
- promoted | t     | t      | t            | t           |                1 |                 0 | t      | SELECT b FROM aprep_t WHERE b IN (3, 4, 5);
+  state   | timed | scored | before_timed | after_timed | num_custom_plans | num_generic_plans | costed |              query              
+----------+-------+--------+--------------+-------------+------------------+-------------------+--------+---------------------------------
+ promoted | t     | t      | t            | t           |                1 |                 0 | t      |  SELECT a                      +
+          |       |        |              |             |                  |                   |        |    FROM aprep_t                +
+          |       |        |              |             |                  |                   |        |   WHERE (a = $1)
+ promoted | t     | t      | t            | t           |                1 |                 0 | t      |  SELECT a,                     +
+          |       |        |              |             |                  |                   |        |     b                          +
+          |       |        |              |             |                  |                   |        |    FROM aprep_t                +
+          |       |        |              |             |                  |                   |        |   WHERE ((a = $1) AND (b = $2))
+ promoted | t     | t      | t            | t           |                1 |                 0 | t      |  SELECT b                      +
+          |       |        |              |             |                  |                   |        |    FROM aprep_t                +
+          |       |        |              |             |                  |                   |        |   WHERE (b = ANY ($1))
 (3 rows)
 
 -- A and E are reused heavily, B is not.  A new shape F that qualifies then
@@ -490,9 +497,11 @@ SELECT b FROM aprep_t WHERE d = 2;			-- K1 again: promoted
 SET dbblue_autoprepare_enabled = off;
 SELECT state, seen_count, query FROM dbblue_autoprepare_shapes(pg_backend_pid())
 WHERE query LIKE '%d = %' OR state = 'tracking';
-  state   | seen_count |               query                
-----------+------------+------------------------------------
- promoted |          2 | SELECT b FROM aprep_t WHERE d = 2;
+  state   | seen_count |      query       
+----------+------------+------------------
+ promoted |          2 |  SELECT b       +
+          |            |    FROM aprep_t +
+          |            |   WHERE (d = $1)
 (1 row)
 
 SELECT tracking_evicted, cached_evicted FROM dbblue_autoprepare_stats(pg_backend_pid());
@@ -902,6 +911,67 @@ FROM dbblue_autoprepare_stats(pg_backend_pid());
 DROP TABLE aprep_p;
 SET dbblue_autoprepare_enabled = off;
 DISCARD PLANS;
+-- the text kept with a cached shape is the parameterized statement, never the
+-- literal values of the statement that happened to promote it
+SELECT current_setting('dbblue_autoprepare_limit') AS saved_limit \gset
+SET dbblue_autoprepare_limit = 100;
+SET dbblue_autoprepare_enabled = on;
+SET dbblue_autoprepare_threshold = 2;
+SELECT a FROM aprep_t WHERE c = 424242 AND d = 313131;
+ a 
+---
+(0 rows)
+
+SELECT a FROM aprep_t WHERE c = 424243 AND d = 313132;
+ a 
+---
+(0 rows)
+
+UPDATE aprep_t SET d = 777001 WHERE c = 777002;
+UPDATE aprep_t SET d = 777003 WHERE c = 777004;
+INSERT INTO aprep_t VALUES (888001, 888002, 888003, 888004);
+INSERT INTO aprep_t VALUES (888011, 888012, 888013, 888014);
+SELECT a FROM aprep_t WHERE a IN (SELECT b FROM aprep_t WHERE c = 999001) AND d = 999002;
+ a 
+---
+(0 rows)
+
+SELECT a FROM aprep_t WHERE a IN (SELECT b FROM aprep_t WHERE c = 999011) AND d = 999012;
+ a 
+---
+(0 rows)
+
+SELECT count(*) FILTER (WHERE query ~ '[0-9]{6}') AS with_literal,
+       count(*) FILTER (WHERE query LIKE '%$1%') AS with_parameter,
+       count(*) AS cached
+FROM dbblue_autoprepare_shapes(pg_backend_pid()) WHERE state = 'promoted';
+ with_literal | with_parameter | cached 
+--------------+----------------+--------
+            0 |              4 |      4
+(1 row)
+
+SELECT query FROM dbblue_autoprepare_shapes(pg_backend_pid())
+WHERE state = 'promoted' ORDER BY query COLLATE "C";
+                       query                        
+----------------------------------------------------
+  INSERT INTO aprep_t (a, b, c, d)                 +
+   VALUES ($1, $2, $3, $4)
+  SELECT a                                         +
+    FROM aprep_t                                   +
+   WHERE ((a IN ( SELECT aprep_t_1.b               +
+            FROM aprep_t aprep_t_1                 +
+           WHERE (aprep_t_1.c = $1))) AND (d = $2))
+  SELECT a                                         +
+    FROM aprep_t                                   +
+   WHERE ((c = $1) AND (d = $2))
+  UPDATE aprep_t SET d = $1                        +
+   WHERE (c = $2)
+(4 rows)
+
+DELETE FROM aprep_t;
+SET dbblue_autoprepare_enabled = off;
+DISCARD PLANS;
+SET dbblue_autoprepare_limit = :saved_limit;
 -- length-coercion casts: the size in x::numeric(p,s) / x::varchar(n) is part of
 -- the shape, not a parameter.  Casts that differ only in that size must never
 -- share one cached plan (and a cached plan must keep reporting the real size).
@@ -1051,9 +1121,11 @@ DISCARD ALL;
 SET dbblue_autoprepare_enabled = off;
 SELECT state, num_params, query FROM dbblue_autoprepare_shapes(pg_backend_pid())
 WHERE state = 'promoted';
-  state   | num_params |               query                
-----------+------------+------------------------------------
- promoted |          1 | SELECT a FROM aprep_t WHERE a = 2;
+  state   | num_params |      query       
+----------+------------+------------------
+ promoted |          1 |  SELECT a       +
+          |            |    FROM aprep_t +
+          |            |   WHERE (a = $1)
 (1 row)
 
 SET dbblue_autoprepare_threshold = 2;
