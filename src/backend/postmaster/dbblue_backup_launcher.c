@@ -1153,6 +1153,15 @@ BackupLauncherMain(Datum main_arg)
 				 * managing its own history table.  This never blocks on
 				 * the pg_dump subprocess itself (dbblue_backup_timeout
 				 * does that); it only protects the SPI bookkeeping.
+				 *
+				 * So a lock on the history table held open for longer --
+				 * which superusers and members of pg_write_all_data or
+				 * pg_maintain can take (LockTableAclCheck()) -- stops every
+				 * cycle at lock_timeout, and a dump that finishes meanwhile
+				 * is removed, as its row cannot be recorded.  This is
+				 * documented for administrators, with how to find the
+				 * session, rather than worked around: those roles can
+				 * change or delete the history rows anyway.
 				 */
 				SetConfigOption("lock_timeout", "5s", PGC_SUSET, PGC_S_SESSION);
 
