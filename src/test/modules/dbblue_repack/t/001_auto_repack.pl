@@ -40,6 +40,11 @@ $node->start;
 sub run_cycle
 {
 	my ($tables) = @_;
+	# Let the previous cycle's worker finish first: the launcher acts on a
+	# reload that arrives while it waits for a worker only after its naptime.
+	$node->poll_query_until('postgres',
+		"SELECT count(*) = 0 FROM pg_stat_activity WHERE backend_type = 'dbblue repack worker'"
+	) or die "timed out waiting for the previous repack worker to finish";
 	$node->safe_psql('postgres',
 		"ALTER DATABASE postgres SET dbblue_repack_tables = '$tables'");
 	$node->reload;
@@ -226,6 +231,43 @@ SET enable_bitmapscan = off;
 SELECT count(*) FROM crm_lead WHERE slow_id(id) > 0;
 EOF
 	'5000', 'and in its expression index');
+
+# ---------------------------------------------------------------------------
+# A long write transaction elsewhere in the cluster does not make the repack
+# fail.  Before it can decode, REPACK's decoding worker waits for every
+# running transaction to finish; the worker's short lock_timeout, meant for
+# the locks on the table, must not cut that wait short.
+# ---------------------------------------------------------------------------
+$node->safe_psql('postgres', <<'EOF');
+CREATE TABLE hr_employee (id int PRIMARY KEY, pad text);
+CREATE TABLE unrelated (x int);
+EOF
+make_bloated('hr_employee');
+
+my $long_xact = $node->background_psql('postgres');
+$long_xact->query_safe('BEGIN');
+$long_xact->query_safe('INSERT INTO unrelated VALUES (1)');
+
+$offset = -s $node->logfile;
+run_cycle('public.hr_employee');
+$node->poll_query_until('postgres',
+	"SELECT count(*) > 0 FROM pg_stat_activity WHERE backend_type = 'REPACK decoding worker' AND wait_event = 'transactionid'"
+) or die "timed out waiting for the decoding worker to wait for the open transaction";
+# Well past the repack worker's 500ms lock_timeout.
+sleep(2);
+$long_xact->query_safe('COMMIT');
+$long_xact->quit;
+
+$node->wait_for_log(
+	qr/dbblue repack launcher: (repacked|repacking) "public\.hr_employee"/,
+	$offset);
+$log = slurp_file($node->logfile, $offset);
+like(
+	$log,
+	qr/dbblue repack launcher: repacked "public\.hr_employee"/,
+	'a repack waits for a long write transaction elsewhere instead of failing');
+unlike($log, qr/lock timeout/,
+	'the decoding worker does not time out while it waits');
 
 # ---------------------------------------------------------------------------
 # A repack yields to a session waiting for its lock.  REPACK (CONCURRENTLY)

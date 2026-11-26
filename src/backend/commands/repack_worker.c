@@ -33,7 +33,8 @@
 #define PGREPACK_PLUGIN   "pgrepack"
 
 static void RepackWorkerShutdown(int code, Datum arg);
-static LogicalDecodingContext *repack_setup_logical_decoding(Oid relid);
+static LogicalDecodingContext *repack_setup_logical_decoding(Oid relid,
+															 ProcNumber leader);
 static void repack_cleanup_logical_decoding(LogicalDecodingContext *ctx);
 static void export_initial_snapshot(Snapshot snapshot,
 									DecodingWorkerShared *shared);
@@ -141,7 +142,8 @@ RepackWorkerMain(Datum main_arg)
 	/*
 	 * Prepare to capture the concurrent data changes ourselves.
 	 */
-	decoding_ctx = repack_setup_logical_decoding(shared->relid);
+	decoding_ctx = repack_setup_logical_decoding(shared->relid,
+												  shared->backend_proc_number);
 
 	/* Announce that we're ready. */
 	SpinLockAcquire(&shared->mutex);
@@ -222,7 +224,7 @@ AmRepackWorker(void)
  * crash by restarting all the work from scratch).
  */
 static LogicalDecodingContext *
-repack_setup_logical_decoding(Oid relid)
+repack_setup_logical_decoding(Oid relid, ProcNumber leader)
 {
 	Relation	rel;
 	Oid			toastrelid;
@@ -298,8 +300,31 @@ repack_setup_logical_decoding(Oid relid)
 	/* We don't have control on fast_forward, but verify it's sane */
 	Assert(!ctx->fast_forward);
 
-	/* Find our decoding starting point. */
-	DecodingContextFindStartpoint(ctx);
+	/*
+	 * Find our decoding starting point.  This waits for every transaction
+	 * running anywhere in the cluster to finish (SnapBuildWaitSnapshot()),
+	 * as a lock wait on their XIDs, so the lock_timeout adopted from the
+	 * steering backend bounds it.
+	 *
+	 * Except under the dbblue repack worker: its short lock_timeout is meant
+	 * for the locks on the table, and here it would fail the repack whenever
+	 * any write transaction runs longer.  The table stays usable meanwhile,
+	 * since the steering backend holds only ShareUpdateExclusiveLock on it.
+	 * PROC_IS_DBBLUE_REPACK is set at that worker's start and never cleared,
+	 * so it may be read without a lock.
+	 */
+	if (GetPGProcByNumber(leader)->statusFlags &
+		PROC_IS_DBBLUE_REPACK)
+	{
+		char		buf[32];
+
+		snprintf(buf, sizeof(buf), "%d", LockTimeout);
+		SetConfigOption("lock_timeout", "0", PGC_SUSET, PGC_S_OVERRIDE);
+		DecodingContextFindStartpoint(ctx);
+		SetConfigOption("lock_timeout", buf, PGC_SUSET, PGC_S_OVERRIDE);
+	}
+	else
+		DecodingContextFindStartpoint(ctx);
 
 	/* From this point on, we need non-blocking WAL reads */
 	ctx->reader->routine.page_read = read_local_xlog_page_no_wait;
