@@ -1536,11 +1536,14 @@ ProcSleep(LOCALLOCK *locallock)
 			/*
 			 * Only do it if the worker is not working to protect against Xid
 			 * wraparound.  A dbblue repack worker always yields: its REPACK
-			 * is optional and is retried later.
+			 * is optional and is retried later.  So does a dbblue automatic
+			 * backup's pg_dump session, which holds AccessShareLock on every
+			 * table until the dump ends: an ALTER TABLE of odoo -u would wait
+			 * for the whole dump, and every query on the table behind it.
 			 */
 			if (((statusFlags & PROC_IS_AUTOVACUUM) &&
 				 !(statusFlags & PROC_VACUUM_FOR_WRAPAROUND)) ||
-				(statusFlags & PROC_IS_DBBLUE_REPACK))
+				(statusFlags & (PROC_IS_DBBLUE_REPACK | PROC_IS_DBBLUE_BACKUP)))
 			{
 				int			pid = autovac->pid;
 
@@ -1568,8 +1571,13 @@ ProcSleep(LOCALLOCK *locallock)
 					pfree(logbuf.data);
 				}
 
-				/* send the autovacuum worker Back to Old Kent Road */
-				if (kill(pid, SIGINT) < 0)
+				/*
+				 * send the autovacuum worker Back to Old Kent Road.  A backup
+				 * session is terminated, not cancelled: pg_dump runs one short
+				 * statement after another, and a cancel arriving between two
+				 * is lost, its locks kept.  The backup is retried later.
+				 */
+				if (kill(pid, (statusFlags & PROC_IS_DBBLUE_BACKUP) ? SIGTERM : SIGINT) < 0)
 				{
 					/*
 					 * There's a race condition here: once we release the

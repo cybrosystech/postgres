@@ -3171,7 +3171,9 @@ backup_one_database(const char *dbname, int64 last_backup_size)
 		/*
 		 * Ended by another session, not by this worker or a shutdown: the
 		 * database's owner ending every session in it, as Odoo does before
-		 * Drop, Duplicate and Rename (see dbblue_backup_session).  After a
+		 * Drop, Duplicate and Rename (see dbblue_backup_session), or a
+		 * session that waited deadlock_timeout for a lock this dump holds,
+		 * such as odoo -u altering a table (see ProcSleep()).  After a
 		 * Drop or Rename the name is gone, which is certain; otherwise go by
 		 * pg_dump's error -- the server's message if it got it, libpq's when
 		 * the connection was cut mid-COPY.  A crash would also cut it, but
@@ -3193,7 +3195,7 @@ backup_one_database(const char *dbname, int64 last_backup_size)
 									dbname)));
 				else
 					ereport(LOG,
-							(errmsg("dbblue backup launcher: the backup of database \"%s\" was stopped by another session, such as one dropping, copying or renaming the database; it is not counted as a failure",
+							(errmsg("dbblue backup launcher: the backup of database \"%s\" was stopped by another session, such as one dropping, copying or renaming the database or altering one of its tables; it is not counted as a failure",
 									dbname)));
 				dump_terminated_by_other = true;
 				unlink(partfile);

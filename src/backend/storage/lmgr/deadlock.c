@@ -618,7 +618,8 @@ FindLockCycleRecurseMember(PGPROC *checkProc,
 					 */
 					if (checkProc == MyProc &&
 						proc->statusFlags & (PROC_IS_AUTOVACUUM |
-											 PROC_IS_DBBLUE_REPACK))
+											 PROC_IS_DBBLUE_REPACK |
+											 PROC_IS_DBBLUE_BACKUP))
 						blocking_autovacuum_proc = proc;
 
 					/* We're done looking at this proclock */
