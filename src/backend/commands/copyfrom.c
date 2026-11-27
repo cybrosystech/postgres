@@ -521,9 +521,6 @@ CopyMultiInsertBufferFlush(CopyMultiInsertInfo *miinfo,
 					ExecARInsertTriggers(estate, resultRelInfo,
 										 slot, NIL,
 										 cstate->transition_capture);
-
-					/* dbblue dedicated audit log: see CopyMultiInsertBufferFlush */
-					dbblue_audit_capture_insert(resultRelInfo, slot);
 				}
 			}
 

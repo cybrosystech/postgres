@@ -1431,6 +1431,21 @@ dbblue_audit_table_is_tracked(Relation rel, const char **schema_out,
       return false;
 
    /*
+    * Nor a foreign or temporary table, even when listed.  A foreign table's
+    * rows live on another server: changes made there directly never pass
+    * through here, and the remote commit is not atomic with the audit row,
+    * so the trail could only ever be partial -- and it was already, since
+    * rows a foreign data wrapper inserts in batches were never captured.
+    * Audit the table where it is stored instead.  A temporary table's rows
+    * are private to one session and gone when it ends; a bare entry such as
+    * "res_partner" would otherwise also match a script's
+    * CREATE TEMP TABLE res_partner and fill the permanent log with it.
+    */
+   if (rel->rd_rel->relkind == RELKIND_FOREIGN_TABLE ||
+       rel->rd_rel->relpersistence == RELPERSISTENCE_TEMP)
+      return false;
+
+   /*
     * An entry may be written either qualified ("public.orders") or bare
     * ("orders").  A qualified entry matches only that schema; a bare one
     * matches the table in any schema, which is what entries written before
