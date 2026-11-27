@@ -19,6 +19,7 @@
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/table.h"
+#include "access/xact.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_class.h"
 #include "executor/spi.h"
@@ -37,6 +38,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/resowner.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/varlena.h"
@@ -748,43 +750,78 @@ SortEntriesByAccessCount(PinEntry *entries, int nentries)
 static void
 PrewarmRelationIntoBuffers(PinEntry *entry)
 {
-    int     ret;
+    MemoryContext   oldcontext = CurrentMemoryContext;
+    ResourceOwner   oldowner = CurrentResourceOwner;
 
-    /* Prewarm main relation */
+    /*
+     * Run each table in its own subtransaction, so an error while warming one
+     * table is logged and skipped instead of aborting the whole cycle (which
+     * would leave the tables already warmed unstamped).
+     */
+    BeginInternalSubTransaction(NULL);
+    PG_TRY();
     {
-        static const char *query =
-            "SELECT pg_prewarm($1, 'buffer', 'main')";
-        Datum   args[1];
-        Oid     argtypes[1] = { TEXTOID };
+        int     ret;
 
-        args[0] = CStringGetTextDatum(entry->table_name);
-        ret = SPI_execute_with_args(query, 1, argtypes, args,
-                                    NULL, false, 1);
+        /*
+         * Prewarm the main relation. The OID is passed (not the name) so
+         * pg_prewarm opens exactly the relation the pinner resolved: names
+         * are lowercased when parsed as text, which broke quoted/mixed-case
+         * names and could pick a different schema's table.
+         */
+        {
+            static const char *query =
+                "SELECT pg_prewarm($1::oid::regclass, 'buffer', 'main')";
+            Datum   args[1];
+            Oid     argtypes[1] = { OIDOID };
 
-        if (ret != SPI_OK_SELECT)
-            elog(WARNING, "db_blue pinner: pg_prewarm failed for \"%s\"",
-                 entry->table_name);
+            args[0] = ObjectIdGetDatum(entry->relid);
+            ret = SPI_execute_with_args(query, 1, argtypes, args,
+                                        NULL, false, 1);
+
+            if (ret != SPI_OK_SELECT)
+                elog(WARNING, "db_blue pinner: pg_prewarm failed for \"%s\"",
+                     entry->table_name);
+        }
+
+        /* For Tier 1: also prewarm all indexes */
+        if (entry->tier == SOFT_PIN_TIER_1)
+        {
+            static const char *idx_query =
+                "SELECT pg_prewarm(indexrelid::oid::regclass, 'buffer', 'main') "
+                "FROM pg_index "
+                "WHERE indrelid = $1";
+            Datum   args[1];
+            Oid     argtypes[1] = { OIDOID };
+
+            args[0] = ObjectIdGetDatum(entry->relid);
+            ret = SPI_execute_with_args(idx_query, 1, argtypes, args,
+                                        NULL, false, 0);
+
+            if (ret != SPI_OK_SELECT)
+                elog(WARNING,
+                     "db_blue pinner: index prewarm failed for \"%s\"",
+                     entry->table_name);
+        }
+
+        ReleaseCurrentSubTransaction();
+        MemoryContextSwitchTo(oldcontext);
+        CurrentResourceOwner = oldowner;
     }
-
-    /* For Tier 1: also prewarm all indexes */
-    if (entry->tier == SOFT_PIN_TIER_1)
+    PG_CATCH();
     {
-        static const char *idx_query =
-            "SELECT pg_prewarm(indexrelid::regclass::text, 'buffer', 'main') "
-            "FROM pg_index "
-            "WHERE indrelid = $1";
-        Datum   args[1];
-        Oid     argtypes[1] = { OIDOID };
-
-        args[0] = ObjectIdGetDatum(entry->relid);
-        ret = SPI_execute_with_args(idx_query, 1, argtypes, args,
-                                    NULL, false, 0);
-
-        if (ret != SPI_OK_SELECT)
-            elog(WARNING,
-                 "db_blue pinner: index prewarm failed for \"%s\"",
-                 entry->table_name);
+        MemoryContextSwitchTo(oldcontext);
+        EmitErrorReport();
+        FlushErrorState();
+        RollbackAndReleaseCurrentSubTransaction();
+        MemoryContextSwitchTo(oldcontext);
+        CurrentResourceOwner = oldowner;
+        elog(LOG,
+             "db_blue pinner: prewarm of \"%s\" failed; skipping this table "
+             "and continuing",
+             entry->table_name);
     }
+    PG_END_TRY();
 }
 
 /* =========================================================================
