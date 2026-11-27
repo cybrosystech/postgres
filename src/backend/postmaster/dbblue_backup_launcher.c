@@ -313,6 +313,14 @@ typedef struct SkipWarning
 static HTAB *skip_warnings = NULL;	/* in TopMemoryContext */
 
 /*
+ * Set once a pg_dump was refused because the server is shutting down: a
+ * smart shutdown, which waits for client sessions -- pg_dump's included --
+ * to end and only then stops this worker.  No more backups are tried until
+ * then, and none of this is recorded as a failure.
+ */
+static bool server_shutting_down = false;
+
+/*
  * What report_unmanaged_backups() last logged (-1 = nothing yet), and when:
  * it logs only when that changes, or once a day as a reminder.
  */
@@ -1968,7 +1976,7 @@ run_backup_cycle(void)
 
 		CHECK_FOR_INTERRUPTS();
 
-		if (ShutdownRequestPending)
+		if (ShutdownRequestPending || server_shutting_down)
 			break;
 
 		if (ConfigReloadPending)
@@ -2081,10 +2089,14 @@ run_backup_cycle(void)
 						 errhint("If the backup disk is not mounted, this backup is being written to another disk.")));
 		}
 
-		note_backup_result(cand->dbname,
-						   backup_one_database(cand->dbname,
-											   cand->last_backup_size),
-						   cand->last_backup_at);
+		{
+			bool		ok = backup_one_database(cand->dbname,
+												 cand->last_backup_size);
+
+			/* Refused for the shutdown: not a failure of this database. */
+			if (!server_shutting_down)
+				note_backup_result(cand->dbname, ok, cand->last_backup_at);
+		}
 	}
 
 	return next_due;
@@ -3085,6 +3097,23 @@ backup_one_database(const char *dbname, int64 last_backup_size)
 		const char *reason = stop_reason != NULL ? stop_reason :
 			dump_errors != NULL ? dump_errors :
 			wait_result_to_str(rc);
+
+		/*
+		 * Refused because a smart shutdown is waiting for the client
+		 * sessions to end (see server_shutting_down).  The text is the
+		 * server's, in its lc_messages; in another language this is
+		 * recorded as an ordinary failure, as it was before.
+		 */
+		if (stop_reason == NULL && dump_errors != NULL &&
+			strstr(dump_errors, "the database system is shutting down") != NULL)
+		{
+			ereport(LOG,
+					(errmsg("dbblue backup launcher: the server is shutting down, so not backing up database \"%s\" or any other until it has restarted",
+							dbname)));
+			server_shutting_down = true;
+			unlink(partfile);
+			return false;
+		}
 
 		ereport(WARNING,
 				(errmsg("dbblue backup launcher: backing up database \"%s\" failed: %s",
