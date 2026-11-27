@@ -689,9 +689,10 @@
 
 { name => 'dbblue_pin_check_interval', type => 'int', context => 'PGC_SIGHUP', group => 'RESOURCES_MEM',
   short_desc => 'Seconds between pinner maintenance cycles (0 = startup prewarm only).',
+  long_desc => 'Each cycle re-resolves the pinned tables, so a table rewritten by VACUUM FULL, CLUSTER or TRUNCATE is prewarmed and pinned again, and pages added since the last cycle are pinned.',
   flags => 'GUC_UNIT_S | GUC_NOT_IN_SAMPLE',
   variable => 'DBBluePinner_check_interval',
-  boot_val => '0',
+  boot_val => '30',
   min => '0',
   max => '3600',
 },
