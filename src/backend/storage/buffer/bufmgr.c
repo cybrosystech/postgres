@@ -94,70 +94,6 @@
  */
 #define BUF_DROP_FULL_SCAN_THRESHOLD		(uint64) (NBuffers / 32)
 
-/* ---------------------------------------------------------------------
- * Odoo pinner: ring-buffer forced-relations table.
- *
- * A small fixed-size shared-memory registry of relfilenodes whose
- * sequential reads must be funnelled through a 256KB ring buffer (the
- * existing BAS_BULKREAD strategy). Lets the operator name large
- * report tables that should never pollute shared_buffers.
- * ---------------------------------------------------------------------
- */
-#define MAX_RING_BUFFER_RELATIONS	64
-
-typedef struct RingBufferEntry
-{
-	Oid			relfileOid;
-	bool		active;
-} RingBufferEntry;
-
-typedef struct RingBufferTable
-{
-	LWLock		lock;
-	int			num_entries;
-	RingBufferEntry entries[MAX_RING_BUFFER_RELATIONS];
-} RingBufferTable;
-
-static RingBufferTable *RingBufferRelations = NULL;
-
-Size
-RingBufferShmemSize(void)
-{
-	return sizeof(RingBufferTable);
-}
-
-/*
- * Reserve shared memory for the ring-buffer forced-relations table and assign
- * the RingBufferRelations pointer.
- *
- * Called from BufferManagerShmemRequest() (the buffer manager's shmem
- * request_fn) so this struct's size is properly accounted in the total
- * shared-memory request, exactly like the other buffer-manager structures.
- * Previously the table was self-allocated in InitRingBufferTable() via
- * ShmemInitStruct() without its size ever being requested, so it only fit by
- * consuming PostgreSQL's fixed shared-memory slack.
- */
-void
-RingBufferShmemRequest(void)
-{
-	ShmemRequestStruct(.name = "RingBufferRelations",
-					   .size = RingBufferShmemSize(),
-					   .ptr = (void **) &RingBufferRelations);
-}
-
-void
-InitRingBufferTable(void)
-{
-	/*
-	 * The shared memory is reserved and RingBufferRelations is assigned by
-	 * RingBufferShmemRequest(); here we only initialize its contents. This
-	 * runs once, on the shared-memory create path.
-	 */
-	MemSet(RingBufferRelations, 0, sizeof(RingBufferTable));
-	LWLockInitialize(&RingBufferRelations->lock,
-					 LWTRANCHE_RING_BUFFER_TABLE);
-}
-
 /*
  * DBBlueRegisterPinnerWorker — register the dbblue soft-pin background worker
  * as a static bgworker, gated by the dbblue_pinner_enabled GUC.
@@ -189,99 +125,6 @@ DBBlueRegisterPinnerWorker(void)
 	strlcpy(worker.bgw_type, "db_blue pinner", sizeof(worker.bgw_type));
 
 	RegisterBackgroundWorker(&worker);
-}
-
-void
-RegisterRingBufferRelation(Oid relfileOid)
-{
-	int			i;
-
-	LWLockAcquire(&RingBufferRelations->lock, LW_EXCLUSIVE);
-
-	for (i = 0; i < MAX_RING_BUFFER_RELATIONS; i++)
-	{
-		if (RingBufferRelations->entries[i].active &&
-			RingBufferRelations->entries[i].relfileOid == relfileOid)
-		{
-			LWLockRelease(&RingBufferRelations->lock);
-			return;
-		}
-	}
-
-	for (i = 0; i < MAX_RING_BUFFER_RELATIONS; i++)
-	{
-		if (!RingBufferRelations->entries[i].active)
-		{
-			RingBufferRelations->entries[i].relfileOid = relfileOid;
-			RingBufferRelations->entries[i].active = true;
-			RingBufferRelations->num_entries++;
-
-			elog(DEBUG1,
-				 "bufmgr: registered relfileOid %u for ring buffer forcing",
-				 relfileOid);
-
-			LWLockRelease(&RingBufferRelations->lock);
-			return;
-		}
-	}
-
-	LWLockRelease(&RingBufferRelations->lock);
-
-	elog(WARNING,
-		 "RegisterRingBufferRelation: table full (%d entries), "
-		 "cannot add relfileOid %u. Increase MAX_RING_BUFFER_RELATIONS.",
-		 MAX_RING_BUFFER_RELATIONS, relfileOid);
-}
-
-void
-UnregisterRingBufferRelation(Oid relfileOid)
-{
-	int			i;
-
-	LWLockAcquire(&RingBufferRelations->lock, LW_EXCLUSIVE);
-
-	for (i = 0; i < MAX_RING_BUFFER_RELATIONS; i++)
-	{
-		if (RingBufferRelations->entries[i].active &&
-			RingBufferRelations->entries[i].relfileOid == relfileOid)
-		{
-			RingBufferRelations->entries[i].active = false;
-			RingBufferRelations->entries[i].relfileOid = InvalidOid;
-			RingBufferRelations->num_entries--;
-			break;
-		}
-	}
-
-	LWLockRelease(&RingBufferRelations->lock);
-}
-
-/*
- * IsRingBufferForced — fast check on every read of a relation. Uses a
- * shared lock so concurrent readers don't serialize.
- */
-static bool
-IsRingBufferForced(Oid relfileOid)
-{
-	int			i;
-	bool		result = false;
-
-	if (RingBufferRelations->num_entries == 0)
-		return false;
-
-	LWLockAcquire(&RingBufferRelations->lock, LW_SHARED);
-
-	for (i = 0; i < MAX_RING_BUFFER_RELATIONS; i++)
-	{
-		if (RingBufferRelations->entries[i].active &&
-			RingBufferRelations->entries[i].relfileOid == relfileOid)
-		{
-			result = true;
-			break;
-		}
-	}
-
-	LWLockRelease(&RingBufferRelations->lock);
-	return result;
 }
 
 /*
@@ -415,7 +258,7 @@ int			bgwriter_flush_after = DEFAULT_BGWRITER_FLUSH_AFTER;
 int			backend_flush_after = DEFAULT_BACKEND_FLUSH_AFTER;
 
 /*
- * dbblue soft-pin / ring-buffer GUC variables.
+ * dbblue soft-pin GUC variables.
  *
  * These back the core dbblue_* GUCs defined in guc_parameters.dat. They live
  * in core (rather than the pg_prewarm contrib module) because flat, dotless
@@ -425,7 +268,6 @@ int			backend_flush_after = DEFAULT_BACKEND_FLUSH_AFTER;
  */
 bool		DBBluePinner_enabled = false;	/* master switch: register the pinner worker? */
 char	   *DBBluePinner_pinned_tables = NULL;
-char	   *DBBluePinner_ring_buffer_tables = NULL;
 char	   *DBBluePinner_database = NULL;
 int			DBBluePinner_check_interval = 0;
 int			DBBluePinner_max_pin_percent = 35;
@@ -1566,25 +1408,6 @@ ReadBuffer_common(Relation rel, SMgrRelation smgr, char smgr_persistence,
 	operation.rel = rel;
 	operation.persistence = persistence;
 	operation.forknum = forkNum;
-
-	/*
-	 * Odoo pinner: substitute a BAS_BULKREAD ring-buffer strategy if this
-	 * relation is registered for forced ring-buffering and the caller
-	 * didn't already pick a strategy. Skipped for temp relations (which
-	 * use local buffers, not shared_buffers).
-	 */
-	if (strategy == NULL && persistence != RELPERSISTENCE_TEMP)
-	{
-		Oid			relfileOid = InvalidOid;
-
-		if (rel != NULL)
-			relfileOid = rel->rd_locator.relNumber;
-		else if (smgr != NULL)
-			relfileOid = smgr->smgr_rlocator.locator.relNumber;
-
-		if (OidIsValid(relfileOid) && IsRingBufferForced(relfileOid))
-			strategy = GetAccessStrategy(BAS_BULKREAD);
-	}
 
 	operation.strategy = strategy;
 	if (StartReadBuffer(&operation,

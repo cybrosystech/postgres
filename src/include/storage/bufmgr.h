@@ -182,10 +182,9 @@ extern PGDLLIMPORT int checkpoint_flush_after;
 extern PGDLLIMPORT int backend_flush_after;
 extern PGDLLIMPORT int bgwriter_flush_after;
 
-/* dbblue soft-pin / ring-buffer GUCs (backed in bufmgr.c, read by the pinner) */
+/* dbblue soft-pin GUCs (backed in bufmgr.c, read by the pinner) */
 extern PGDLLIMPORT bool DBBluePinner_enabled;
 extern PGDLLIMPORT char *DBBluePinner_pinned_tables;
-extern PGDLLIMPORT char *DBBluePinner_ring_buffer_tables;
 extern PGDLLIMPORT char *DBBluePinner_database;
 extern PGDLLIMPORT int DBBluePinner_check_interval;
 extern PGDLLIMPORT int DBBluePinner_max_pin_percent;
@@ -392,13 +391,6 @@ extern int	GetAccessStrategyBufferCount(BufferAccessStrategy strategy);
 extern int	GetAccessStrategyPinLimit(BufferAccessStrategy strategy);
 
 extern void FreeAccessStrategy(BufferAccessStrategy strategy);
-
-/* Odoo pinner: ring-buffer forced-relations table (shared memory) */
-extern Size RingBufferShmemSize(void);
-extern void RingBufferShmemRequest(void);
-extern void InitRingBufferTable(void);
-extern void RegisterRingBufferRelation(Oid relfileOid);
-extern void UnregisterRingBufferRelation(Oid relfileOid);
 
 /* Odoo pinner: register the soft-pin background worker from the postmaster */
 extern void DBBlueRegisterPinnerWorker(void);

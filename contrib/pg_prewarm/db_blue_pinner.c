@@ -1,10 +1,8 @@
 /*-------------------------------------------------------------------------
  * db_blue_pinner.c
  *
- * Background worker: reads db_blue.pinned_tables and
- * db_blue.ring_buffer_tables from GUCs, preloads those relations
- * into shared_buffers, applies soft-pin flags, and enforces ring-buffer
- * strategy for tables that must never pollute the cache.
+ * Background worker: reads db_blue.pinned_tables from the GUC, preloads
+ * those relations into shared_buffers and applies soft-pin flags.
  *
  * DROP THIS FILE into: contrib/pg_prewarm/db_blue_pinner.c
  * Add it to contrib/pg_prewarm/Makefile OBJS list.
@@ -68,22 +66,6 @@
  *   db_blue.pinned_tables = '
  *       res_users:tier1, res_company:tier1,
  *       res_partner, account_move, product_product
- *   '
- */
-
-/*
- * db_blue.ring_buffer_tables
- *
- * Comma-separated list of tables whose sequential scans must NEVER
- * pollute shared_buffers. All I/O for these tables is routed through
- * a private 256KB ring buffer.
- *
- * Best candidates: large append-mostly tables used in reports.
- *
- * Example:
- *   db_blue.ring_buffer_tables = '
- *       account_move_line, stock_move, mail_message, mail_mail,
- *       account_analytic_line, mrp_production
  *   '
  */
 
@@ -152,30 +134,6 @@ typedef struct PinEntry
 /* Max tables we will process in one cycle */
 #define MAX_PIN_ENTRIES     256
 
-/*
- * Max ring-buffer-routed tables we will track between cycles. Matches the
- * shmem registry size in bufmgr.c (MAX_RING_BUFFER_RELATIONS).
- */
-#define MAX_RING_BUFFER_TRACKED  64
-
-/*
- * Previous cycle's registered ring-buffer relfilenodes. Used to compute
- * the set we need to unregister at the start of the next cycle.
- *
- * Without this tracking, RegisterRingBufferRelation accumulates entries
- * across DDL events (TRUNCATE, VACUUM FULL, CLUSTER, DROP+recreate)
- * because the relfilenode changes but the old entry is never removed.
- * Over time the 64-entry shmem registry fills with dead entries and new
- * tables fail to register.
- *
- * Lives in the bgworker's process memory; lost on worker restart, in
- * which case we just over-write the shmem registry with the fresh set
- * on the next cycle (any pre-restart dead entries are functionally
- * harmless until they get unregistered or the postmaster restarts).
- */
-static Oid  prev_ring_buffer_oids[MAX_RING_BUFFER_TRACKED];
-static int  prev_ring_buffer_count = 0;
-
 /* =========================================================================
  * FORWARD DECLARATIONS
  * =========================================================================
@@ -188,7 +146,6 @@ DBBluePinnerMain(Datum main_arg);
 static void  PinnerRunCycle(void);
 static void  PinnerRunCycleSafe(void);
 static void  DBBluePinnerEnsureExtensions(void);
-static void  PinnerSetupRingBuffers(void);
 static int   ResolvePinEntries(PinEntry *entries, int max_entries);
 static void  SortEntriesByAccessCount(PinEntry *entries, int nentries);
 static float4 GetRelCacheRatio(Oid relid);
@@ -394,7 +351,6 @@ DBBluePinnerMain(Datum main_arg)
  *   4. Sort by access count descending
  *   5. For each table (in order): check cache ratio,
  *      prewarm if needed, apply soft pin
- *   6. Update ring_buffer_tables registration
  */
 static void
 PinnerRunCycle(void)
@@ -504,9 +460,6 @@ PinnerRunCycle(void)
         used_bytes += e->table_size;
     }
 
-    /* ---- Update ring buffer registration ---- */
-    PinnerSetupRingBuffers();
-
 cycle_end:
     SPI_finish();
     PopActiveSnapshot();
@@ -515,126 +468,6 @@ cycle_end:
     elog(DEBUG1,
          "db_blue pinner: cycle complete, %ldMB pinned",
          (long) (used_bytes / (1024 * 1024)));
-}
-
-/* =========================================================================
- * RING BUFFER SETUP
- * =========================================================================
- */
-
-/*
- * PinnerSetupRingBuffers — parse ring_buffer_tables GUC and register
- * each table's relfilenode in the shared RingBufferRelations array.
- *
- * Also soft-pins each table's *indexes* at Tier 2. Ring-buffer routing
- * keeps the heap out of shared_buffers (route reads through a 256 KB
- * private ring), but index pages are small and benefit from staying
- * resident — without protection, concurrent pool pressure (e.g. archive
- * scans) can evict report PK indexes and turn index-only scans into
- * disk-bound queries. Pinning the indexes here gives ring_buffer_tables
- * the contract users want: "don't pollute cache with this table's heap,
- * but keep its indexes warm."
- *
- * Index pin sizes are not charged against max_pin_size_percent — they
- * are typically small (a few MB per table) and disabling protection
- * because the budget is consumed by heaps would defeat the purpose.
- *
- * This runs inside a transaction so we can resolve table names to OIDs.
- */
-static void
-PinnerSetupRingBuffers(void)
-{
-    List       *namelist;
-    ListCell   *lc;
-    char       *rawstring;
-    Oid         new_oids[MAX_RING_BUFFER_TRACKED];
-    int         new_count = 0;
-    int         i;
-
-    /*
-     * Step 1: unregister everything we registered last cycle. This is the
-     * fix for the leak — DDL operations (TRUNCATE, VACUUM FULL, CLUSTER,
-     * DROP+recreate) change a table's relfilenode, leaving the old one as
-     * a dead entry in the shmem registry. Without this cleanup, the
-     * 64-slot registry fills with stale entries over time and new tables
-     * fail to register.
-     *
-     * Tables that survived will get re-registered in step 2 (with their
-     * current relfilenode, which may have changed since last cycle).
-     */
-    for (i = 0; i < prev_ring_buffer_count; i++)
-        UnregisterRingBufferRelation(prev_ring_buffer_oids[i]);
-    prev_ring_buffer_count = 0;
-
-    if (DBBluePinner_ring_buffer_tables == NULL ||
-        strlen(DBBluePinner_ring_buffer_tables) == 0)
-        return;
-
-    rawstring = pstrdup(DBBluePinner_ring_buffer_tables);
-
-    if (!SplitIdentifierString(rawstring, ',', &namelist))
-    {
-        elog(WARNING,
-             "db_blue pinner: invalid db_blue.ring_buffer_tables syntax");
-        return;
-    }
-
-    /*
-     * Step 2: walk the desired set, register each, remember relfileOids
-     * for next cycle's cleanup pass.
-     */
-    foreach(lc, namelist)
-    {
-        char       *table_name = (char *) lfirst(lc);
-        Oid         relid;
-        Oid         relfileOid;
-        PinEntry    ring_entry;
-
-        /* Trim whitespace */
-        while (*table_name == ' ') table_name++;
-
-        relid = RelnameGetRelid(table_name);
-        if (!OidIsValid(relid))
-        {
-            elog(WARNING,
-                 "db_blue pinner: ring_buffer_table \"%s\" not found",
-                 table_name);
-            continue;
-        }
-
-        relfileOid = GetRelFileNumber(relid);
-        if (!OidIsValid(relfileOid))
-            continue;
-
-        RegisterRingBufferRelation(relfileOid);
-
-        /* Remember for next cycle's cleanup pass */
-        if (new_count < MAX_RING_BUFFER_TRACKED)
-            new_oids[new_count++] = relfileOid;
-
-        elog(DEBUG1,
-             "db_blue pinner: ring buffer forced for \"%s\" "
-             "(relfileOid=%u)",
-             table_name, relfileOid);
-
-        /*
-         * Soft-pin the indexes of this ring-buffered table. Builds a
-         * minimal PinEntry with just the fields SoftPinRelationIndexes
-         * needs: relid (for the SPI lookup), table_name (for log
-         * messages), and tier.
-         */
-        memset(&ring_entry, 0, sizeof(ring_entry));
-        ring_entry.relid = relid;
-        ring_entry.tier  = SOFT_PIN_TIER_2;
-        strlcpy(ring_entry.table_name, table_name, NAMEDATALEN);
-        SoftPinRelationIndexes(&ring_entry);
-    }
-
-    /* Remember the new set for next cycle's cleanup pass */
-    memcpy(prev_ring_buffer_oids, new_oids, new_count * sizeof(Oid));
-    prev_ring_buffer_count = new_count;
-
-    list_free(namelist);
 }
 
 /* =========================================================================

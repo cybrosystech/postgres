@@ -105,9 +105,6 @@ BufferManagerShmemRequest(void *arg)
 					   .size = NBuffers * sizeof(CkptSortItem),
 					   .ptr = (void **) &CkptBufferIds,
 		);
-
-	/* Odoo pinner: reserve the ring-buffer forced-relations table. */
-	RingBufferShmemRequest();
 }
 
 /*
@@ -141,7 +138,4 @@ BufferManagerShmemInit(void *arg)
 		/* Odoo pinner: start out unpinned. */
 		buf->soft_pin_tier = SOFT_PIN_TIER_NONE;
 	}
-
-	/* Odoo pinner: shared-memory ring-buffer forced-relations table. */
-	InitRingBufferTable();
 }
