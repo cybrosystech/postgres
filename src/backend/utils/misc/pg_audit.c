@@ -1952,6 +1952,20 @@ dbblue_audit_tuple_to_json(HeapTuple tuple, HeapTuple other,
        if (att->attisdropped)
            continue;
 
+       /*
+        * Skip virtual generated columns.  They are not stored, so the tuple
+        * holds no value for them and they were logged as null -- and, in
+        * changed-columns-only mode, always dropped as unchanged.  Computing
+        * them here could fail on a row PostgreSQL accepts (a division by
+        * zero is only raised when the column is read) and so reject the
+        * change being audited, and could write an excluded column's value
+        * under another name.  Nothing is lost: the expression may only use
+        * built-in, immutable functions of the stored columns, which are all
+        * logged.  Triggers and logical replication do not see them either.
+        */
+       if (att->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL)
+           continue;
+
 
        val = heap_getattr(tuple, i + 1, tupdesc, &isnull);
 
