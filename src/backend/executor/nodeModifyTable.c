@@ -2389,6 +2389,9 @@ ExecCrossPartitionUpdate(ModifyTableContext *context,
 
 	if (cpAuditOld != NULL && cpAuditNew != NULL)
 		dbblue_audit_capture_crosspart_update(mtstate->rootResultRelInfo,
+											  resultRelInfo->ri_RelationDesc,
+											  (insert_destrel && *insert_destrel) ?
+											  (*insert_destrel)->ri_RelationDesc : NULL,
 											  cpAuditOld, cpAuditNew);
 	if (cpAuditOld != NULL)
 		heap_freetuple(cpAuditOld);

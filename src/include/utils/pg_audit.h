@@ -58,7 +58,9 @@ extern void  dbblue_audit_write(Relation rel,
                               const char *operation,
                               HeapTuple   old_tuple,
                               HeapTuple   new_tuple,
-                              TupleDesc   tupdesc);
+                              TupleDesc   tupdesc,
+                              Oid         moved_from,
+                              Oid         moved_to);
 
 
 /* Check if a table is in the dbblue_audit_tables list */
@@ -87,6 +89,8 @@ extern void  dbblue_audit_capture_insert(ResultRelInfo   *rri,
 extern bool  dbblue_audit_crosspart_update_wanted(Relation rootrel,
                                                   Relation srcrel);
 extern void  dbblue_audit_capture_crosspart_update(ResultRelInfo *rootRelInfo,
+                                                   Relation srcrel,
+                                                   Relation dstrel,
                                                    HeapTuple oldtup,
                                                    HeapTuple newtup);
 

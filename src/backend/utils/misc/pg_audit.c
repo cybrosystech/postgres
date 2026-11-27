@@ -385,7 +385,8 @@ static char *dbblue_audit_tuple_to_json(HeapTuple tuple, HeapTuple other,
                                         Bitmapset *keepcols,
                                         TupleDesc tupdesc,
                                         const char *schema_name,
-                                        const char *table_name);
+                                        const char *table_name,
+                                        List *redact_names);
 
 
 
@@ -1731,6 +1732,85 @@ dbblue_audit_column_is_excluded(const char *schema_name,
    return false;
 }
 
+/*
+ * A table, besides the one a row is logged under, whose
+ * dbblue_audit_exclude_columns rules apply to that row.
+ */
+typedef struct AuditRedactName
+{
+   char       *schema;
+   char       *table;
+} AuditRedactName;
+
+/* ----------------------------------------------------------------
+ * audit_redact_names
+ *
+ * Exclude rules are matched against the name a row is logged under, which
+ * for a partition is the listed ancestor and for a row moved between
+ * partitions is the root.  A rule naming the partition itself was skipped
+ * there, and the column it hides was written in plain text.  So the rules
+ * of every table the row passed through apply too: relid1 and relid2 (the
+ * partition the change was made in, or the source and destination of a
+ * move) and all of their ancestors.
+ *
+ * Returns NIL, at no cost, when every rule is for "*" or for the name the
+ * row is logged under (schema_name.table_name), which already applies, or
+ * when neither relation is a partition.
+ * ---------------------------------------------------------------- */
+static List *
+audit_redact_names(const char *schema_name, const char *table_name,
+                   Oid relid1, Oid relid2)
+{
+   Oid         relids[2] = {relid1, relid2};
+   List       *result = NIL;
+   bool        other = false;
+
+   audit_exclude_refresh();
+   for (int i = 0; i < exclude_nentries; i++)
+   {
+       AuditExcludeEntry *e = &exclude_entries[i];
+
+       if (strcmp(e->table, "*") == 0)
+           continue;
+       if (strcmp(e->table, table_name) != 0 ||
+           (e->schema != NULL &&
+            (schema_name == NULL || strcmp(e->schema, schema_name) != 0)))
+       {
+           other = true;
+           break;
+       }
+   }
+   if (!other)
+       return NIL;
+
+   for (int i = 0; i < lengthof(relids); i++)
+   {
+       List       *chain;
+       ListCell   *lc;
+
+       if (!OidIsValid(relids[i]) || !get_rel_relispartition(relids[i]))
+           continue;
+
+       chain = lcons_oid(relids[i], get_partition_ancestors(relids[i]));
+       foreach(lc, chain)
+       {
+           Oid         oid = lfirst_oid(lc);
+           char       *table = get_rel_name(oid);
+           AuditRedactName *n;
+
+           if (table == NULL)
+               continue;       /* dropped concurrently */
+           n = palloc_object(AuditRedactName);
+           n->schema = get_namespace_name(get_rel_namespace(oid));
+           n->table = table;
+           result = lappend(result, n);
+       }
+       list_free(chain);
+   }
+
+   return result;
+}
+
 /* ----------------------------------------------------------------
  * audit_exclude_check_table
  *
@@ -1832,7 +1912,8 @@ static char *
 dbblue_audit_tuple_to_json(HeapTuple tuple, HeapTuple other,
                            Bitmapset *keepcols, TupleDesc tupdesc,
                            const char *schema_name,
-                           const char *table_name)
+                           const char *table_name,
+                           List *redact_names)
 {
    StringInfoData buf;
    int            i;
@@ -1863,6 +1944,8 @@ dbblue_audit_tuple_to_json(HeapTuple tuple, HeapTuple other,
        Oid    typoutput;
        bool   typisvarlena;
        char  *valstr;
+       bool   excluded;
+       ListCell *lc;
 
 
        /* skip dropped columns */
@@ -1902,9 +1985,22 @@ dbblue_audit_tuple_to_json(HeapTuple tuple, HeapTuple other,
         * Note the mask is a constant, so an excluded column reads the same
         * before and after a change: you cannot tell from the audit row
         * whether it was modified.  That is the point of excluding it.
+        *
+        * A rule for any table the row passed through counts, not only one
+        * for the name it is logged under; see audit_redact_names().
         */
-       if (dbblue_audit_column_is_excluded(schema_name, table_name,
-                                           NameStr(att->attname)))
+       excluded = dbblue_audit_column_is_excluded(schema_name, table_name,
+                                                  NameStr(att->attname));
+       foreach(lc, redact_names)
+       {
+           AuditRedactName *n = (AuditRedactName *) lfirst(lc);
+
+           if (excluded)
+               break;
+           excluded = dbblue_audit_column_is_excluded(n->schema, n->table,
+                                                      NameStr(att->attname));
+       }
+       if (excluded)
        {
            escape_json(&buf, NameStr(att->attname));
            appendStringInfoChar(&buf, ':');
@@ -2143,6 +2239,10 @@ odoo_actor_name(int32 uid)
 *
 * Inserts one row into dbblue_audit_log using SPI.
 * Called once per audited row.
+*
+* For a row moved between partitions, rel is the root and moved_from and
+* moved_to are the source and destination partitions (moved_to invalid if
+* unknown); otherwise both are InvalidOid.
 * ---------------------------------------------------------------- */
 void
 dbblue_audit_write(Relation rel,
@@ -2151,7 +2251,9 @@ dbblue_audit_write(Relation rel,
                 const char *operation,
                 HeapTuple   old_tuple,
                 HeapTuple   new_tuple,
-                TupleDesc   tupdesc)
+                TupleDesc   tupdesc,
+                Oid         moved_from,
+                Oid         moved_to)
 {
    char       *old_json  = NULL;
    char       *new_json  = NULL;
@@ -2171,6 +2273,8 @@ dbblue_audit_write(Relation rel,
    Bitmapset  *keepcols = NULL;
    HeapTuple   counterpart_old = NULL;
    HeapTuple   counterpart_new = NULL;
+   List       *redact_names;
+   ListCell   *lc;
 
 
    /* Auto-create the audit log table if it doesn't exist yet */
@@ -2206,10 +2310,24 @@ dbblue_audit_write(Relation rel,
            counterpart_old = new_tuple, counterpart_new = old_tuple;
    }
 
+   redact_names = audit_redact_names(schema_name, table_name,
+                                     OidIsValid(moved_from) ? moved_from :
+                                     RelationGetRelid(rel), moved_to);
    old_json = dbblue_audit_tuple_to_json(old_tuple, counterpart_old, keepcols,
-                                         tupdesc, schema_name, table_name);
+                                         tupdesc, schema_name, table_name,
+                                         redact_names);
    new_json = dbblue_audit_tuple_to_json(new_tuple, counterpart_new, keepcols,
-                                         tupdesc, schema_name, table_name);
+                                         tupdesc, schema_name, table_name,
+                                         redact_names);
+   foreach(lc, redact_names)
+   {
+       AuditRedactName *n = (AuditRedactName *) lfirst(lc);
+
+       if (n->schema)
+           pfree(n->schema);
+       pfree(n->table);
+   }
+   list_free_deep(redact_names);
 
 
    username  = GetUserNameFromId(GetUserId(), false);
@@ -2416,7 +2534,7 @@ dbblue_audit_capture_update(ResultRelInfo *rri,
    PG_TRY();
    {
        dbblue_audit_write(rel, nspname, relname, "UPDATE", oldtup, newtup,
-                          tupdesc);
+                          tupdesc, InvalidOid, InvalidOid);
    }
    PG_FINALLY();
    {
@@ -2484,7 +2602,7 @@ dbblue_audit_capture_delete(ResultRelInfo *rri,
    PG_TRY();
    {
        dbblue_audit_write(rel, nspname, relname, "DELETE", oldtup, NULL,
-                          tupdesc);
+                          tupdesc, InvalidOid, InvalidOid);
    }
    PG_FINALLY();
    {
@@ -2535,7 +2653,7 @@ dbblue_audit_capture_insert(ResultRelInfo *rri, TupleTableSlot *newslot)
    PG_TRY();
    {
        dbblue_audit_write(rel, nspname, relname, "INSERT", NULL, newtup,
-                          tupdesc);
+                          tupdesc, InvalidOid, InvalidOid);
    }
    PG_FINALLY();
    {
@@ -2590,9 +2708,13 @@ dbblue_audit_crosspart_update_wanted(Relation rootrel, Relation srcrel)
  * half's own audit row and calls this once, with both images already converted
  * to the root (queried) table's format, so the trail carries a proper UPDATE
  * with old_data and new_data.
+ *
+ * srcrel and dstrel are the partitions the row moved from and to (dstrel
+ * NULL if unknown), whose exclude rules apply as well as the root's.
  * ---------------------------------------------------------------- */
 void
 dbblue_audit_capture_crosspart_update(ResultRelInfo *rootRelInfo,
+                                      Relation srcrel, Relation dstrel,
                                       HeapTuple oldtup, HeapTuple newtup)
 {
    Relation    rel;
@@ -2619,7 +2741,8 @@ dbblue_audit_capture_crosspart_update(ResultRelInfo *rootRelInfo,
    PG_TRY();
    {
        dbblue_audit_write(rel, nspname, relname, "UPDATE", oldtup, newtup,
-                          RelationGetDescr(rel));
+                          RelationGetDescr(rel), RelationGetRelid(srcrel),
+                          dstrel ? RelationGetRelid(dstrel) : InvalidOid);
    }
    PG_FINALLY();
    {
