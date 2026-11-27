@@ -174,6 +174,7 @@ static void dbblue_audit_maybe_prune(void);
 static bool audit_retention_is_set(void);
 static SPIPlanPtr audit_insert_plan(void);
 static const char *odoo_actor_name(int32 uid);
+static void odoo_actor_cache_reset(bool committed);
 
 /*
  * The audit INSERT, prepared once per backend and kept.
@@ -437,6 +438,11 @@ dbblue_audit_xact_callback(XactEvent event, void *arg)
        /* A failed setup is retried in the next transaction. */
        audit_table_available = true;
    }
+
+   /* Odoo actor names are looked up afresh in each transaction. */
+   if (event == XACT_EVENT_COMMIT || event == XACT_EVENT_ABORT ||
+       event == XACT_EVENT_PREPARE)
+       odoo_actor_cache_reset(event != XACT_EVENT_ABORT);
 }
 
 
@@ -2089,7 +2095,7 @@ dbblue_audit_tuple_to_json(HeapTuple tuple, HeapTuple other,
 /* -1 = not probed yet, 0 = this database is not an Odoo database, 1 = it is */
 static int odoo_schema_present = -1;
 
-/* uid -> partner name, for this backend.  See the note on staleness below. */
+/* uid -> partner name, for the current transaction; see odoo_actor_name(). */
 typedef struct OdooActorEntry
 {
    int32   uid;                /* hash key */
@@ -2097,6 +2103,7 @@ typedef struct OdooActorEntry
 } OdooActorEntry;
 
 static HTAB *odoo_actor_cache = NULL;
+static SPIPlanPtr odoo_actor_plan = NULL;
 
 /* ----------------------------------------------------------------
  * audit_get_int_attr
@@ -2141,7 +2148,8 @@ audit_get_int_attr(HeapTuple tup, TupleDesc tupdesc, const char *attname,
 /* ----------------------------------------------------------------
  * odoo_schema_is_present
  *
- * One probe per backend for the tables and columns the join needs.  Doing
+ * One probe for the tables and columns the join needs (see
+ * odoo_actor_cache_reset for when it is repeated).  Doing
  * this up front means the lookup below can never fail on a missing
  * relation or column, which matters because an error raised here would
  * propagate out of the audit path and abort the user's transaction.
@@ -2193,14 +2201,18 @@ odoo_schema_is_present(void)
  * odoo_actor_name
  *
  * Resolve a res_users id to its partner name, or NULL when it cannot be
- * resolved.  The result is cached for the life of the backend: the audit
+ * resolved.  The result is cached until the transaction ends: the audit
  * path already pays for one SPI INSERT per row, and re-running this join
  * per row would roughly double that on a bulk update.
  *
- * The cache means a partner renamed during a long-lived session keeps its
- * old name in audit rows written by that session.  For an audit trail
- * that is the lesser evil -- and arguably the right answer, since the row
- * records who acted at the time.
+ * It used to be cached for the life of the backend, failures included.
+ * Odoo reuses each pooled connection for days, so a uid looked up before
+ * its user existed or was visible -- or a first probe made before the
+ * Odoo tables could be read -- left odoo_changed_by NULL on that
+ * connection for good, and a renamed partner kept the old name there
+ * while new connections logged the new one.  Per transaction, which is
+ * per Odoo request, a failure is retried on the next request and the
+ * name is the one current when the change was made.
  *
  * Caller must hold an SPI connection.
  * ---------------------------------------------------------------- */
@@ -2210,7 +2222,7 @@ odoo_actor_name(int32 uid)
    OdooActorEntry *entry;
    bool        found;
    int         spi_ret;
-   char        sql[256];
+   Datum       arg;
    char       *name = NULL;
 
    if (!odoo_schema_is_present())
@@ -2233,15 +2245,29 @@ odoo_actor_name(int32 uid)
    if (found)
        return entry->name;
 
-   entry->name = NULL;         /* so a failure below is remembered too */
+   entry->name = NULL;         /* a failure is remembered until xact end */
 
-   snprintf(sql, sizeof(sql),
-            "SELECT p.name FROM res_users u"
-            "  JOIN res_partner p ON p.id = u.partner_id"
-            " WHERE u.id = %d",
-            uid);
+   /*
+    * Prepared once per backend: only the answers are forgotten at each
+    * transaction end, so parsing and planning this for every transaction
+    * would make each small one noticeably slower.
+    */
+   if (odoo_actor_plan == NULL)
+   {
+       Oid         argtype = INT4OID;
+       SPIPlanPtr  plan;
 
-   spi_ret = SPI_execute(sql, true, 1);
+       plan = SPI_prepare("SELECT p.name FROM res_users u"
+                          "  JOIN res_partner p ON p.id = u.partner_id"
+                          " WHERE u.id = $1",
+                          1, &argtype);
+       if (plan == NULL || SPI_keepplan(plan) != 0)
+           return NULL;
+       odoo_actor_plan = plan;
+   }
+
+   arg = Int32GetDatum(uid);
+   spi_ret = SPI_execute_plan(odoo_actor_plan, &arg, NULL, true, 1);
    if (spi_ret == SPI_OK_SELECT && SPI_processed == 1)
    {
        bool        isnull;
@@ -2261,6 +2287,34 @@ odoo_actor_name(int32 uid)
 
    entry->name = name;
    return entry->name;
+}
+
+/*
+ * Forget every cached actor name; called at the end of each transaction
+ * (see dbblue_audit_xact_callback).  The Odoo schema probe is forgotten
+ * too, except when it found the tables and the transaction committed: a
+ * database does not stop being an Odoo database, and re-probing the
+ * catalogs in every transaction would slow each small one down.
+ */
+static void
+odoo_actor_cache_reset(bool committed)
+{
+   HASH_SEQ_STATUS status;
+   OdooActorEntry *entry;
+
+   if (!committed || odoo_schema_present != 1)
+       odoo_schema_present = -1;
+
+   if (odoo_actor_cache == NULL || hash_get_num_entries(odoo_actor_cache) == 0)
+       return;
+
+   hash_seq_init(&status, odoo_actor_cache);
+   while ((entry = (OdooActorEntry *) hash_seq_search(&status)) != NULL)
+   {
+       if (entry->name != NULL)
+           pfree(entry->name);
+       hash_search(odoo_actor_cache, &entry->uid, HASH_REMOVE, NULL);
+   }
 }
 
 /* ----------------------------------------------------------------
