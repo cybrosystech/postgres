@@ -116,8 +116,14 @@
 #include "utils/tuplestore.h"
 #include "utils/wait_event.h"
 
-/* Decline shapes with more parameters than this (e.g. huge multi-row INSERTs). */
-#define APREP_MAX_PARAMS 100
+/*
+ * Decline shapes with more parameters than this (e.g. huge multi-row INSERTs).
+ * Large generated reports (many UNION ALL branches) can legitimately carry
+ * over a thousand constants and are exactly the statements that are costly
+ * to plan, so the ceiling is generous; the per-statement cost is one Oid per
+ * parameter.
+ */
+#define APREP_MAX_PARAMS 2000
 
 /* ---- GUCs ---- */
 bool		autoprepare_enabled = false;	/* off by default -- opt in */
