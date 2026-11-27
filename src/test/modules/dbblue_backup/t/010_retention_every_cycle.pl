@@ -69,18 +69,22 @@ foreach my $day (1 .. 3)
 	push @old_files, $file;
 	$node->safe_psql('postgres', qq{
 		INSERT INTO dbblue.dbblue_backup_history
-		  (database_name, backup_started_at, backup_finished_at, status,
-		   file_path, file_size_bytes)
-		VALUES ('db_a', '2000-01-0$day', '2000-01-0$day', 'success',
-		        '$file', 8)});
+		  (database_name, database_oid, backup_started_at, backup_finished_at,
+		   status, file_path, file_size_bytes)
+		SELECT 'db_a', oid, '2000-01-0$day', '2000-01-0$day', 'success',
+		       '$file', 8
+		  FROM pg_database WHERE datname = 'db_a'});
 }
 $node->safe_psql('postgres', q{
 	INSERT INTO dbblue.dbblue_backup_history
-	  (database_name, backup_started_at, backup_finished_at, status, error_message)
-	VALUES ('db_a', '2000-01-04', '2000-01-04', 'failed', 'resolved 1'),
-	       ('db_a', '2000-01-05', '2000-01-05', 'failed', 'resolved 2'),
-	       ('db_a', now() + interval '1 minute', now() + interval '1 minute',
-	        'failed', 'current')});
+	  (database_name, database_oid, backup_started_at, backup_finished_at,
+	   status, error_message)
+	SELECT 'db_a', d.oid, v.t, v.t, 'failed', v.msg
+	  FROM pg_database d,
+	       (VALUES ('2000-01-04'::timestamptz, 'resolved 1'),
+	               ('2000-01-05'::timestamptz, 'resolved 2'),
+	               (now() + interval '1 minute', 'current')) v(t, msg)
+	 WHERE d.datname = 'db_a'});
 
 # ---------------------------------------------------------------------------
 # Failed attempts older than the last success are cleared at the next cycle,

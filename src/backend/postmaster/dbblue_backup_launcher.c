@@ -1586,6 +1586,7 @@ create_history_objects(void)
 	if (SPI_execute("CREATE TABLE IF NOT EXISTS dbblue.dbblue_backup_history ("
 					"  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"
 					"  database_name text NOT NULL,"
+					"  database_oid oid,"
 					"  backup_started_at timestamptz NOT NULL,"
 					"  backup_finished_at timestamptz,"
 					"  status text NOT NULL,"
@@ -1615,6 +1616,37 @@ create_history_objects(void)
 						dbblue_backup_database),
 				 errhint("Drop the conflicting object so the launcher can create its own table.")));
 		return false;
+	}
+
+	/*
+	 * database_oid tells which database a row is about, not just its name: a
+	 * database dropped and created again under the same name -- as Odoo does
+	 * for its db_name when it is missing -- is another database, and must not
+	 * take over the history of the first.  Retention would otherwise prune
+	 * the dropped database's dumps, maybe the only copy of its data left, to
+	 * make room for backups of the new one.  Added once to a table from
+	 * before it existed: rows of a database that exists now are taken to be
+	 * of that database, those of one that does not stay NULL, for good.
+	 */
+	if (SPI_execute("SELECT 1 FROM pg_catalog.pg_attribute "
+					"WHERE attrelid = 'dbblue.dbblue_backup_history'::pg_catalog.regclass "
+					"  AND attname = 'database_oid' AND NOT attisdropped",
+					false, 1) != SPI_OK_SELECT)	/* not read-only: must see the CREATE above */
+		return false;
+	if (SPI_processed == 0)
+	{
+		if (SPI_execute("ALTER TABLE dbblue.dbblue_backup_history ADD COLUMN database_oid oid",
+						false, 0) != SPI_OK_UTILITY ||
+			SPI_execute("UPDATE dbblue.dbblue_backup_history h SET database_oid = d.oid "
+						"FROM pg_catalog.pg_database d WHERE d.datname = h.database_name",
+						false, 0) != SPI_OK_UPDATE)
+		{
+			ereport(WARNING,
+					(errmsg("dbblue backup launcher: failed to add column database_oid to dbblue.dbblue_backup_history")));
+			return false;
+		}
+		ereport(LOG,
+				(errmsg("dbblue backup launcher: added column database_oid to dbblue.dbblue_backup_history")));
 	}
 
 	if (SPI_execute("CREATE INDEX IF NOT EXISTS dbblue_backup_history_db_status_idx "
@@ -1868,16 +1900,16 @@ load_backup_candidates(List *specs)
 							   "SELECT w.dbname, d.oid, d.datallowconn, d.datistemplate,"
 							   "       (SELECT max(h.backup_started_at)"
 							   "        FROM dbblue.dbblue_backup_history h"
-							   "        WHERE h.database_name = w.dbname"
+							   "        WHERE h.database_name = w.dbname AND h.database_oid = d.oid"
 							   "          AND h.status = 'success') AS last_backup_at,"
 							   "       (SELECT h.file_size_bytes"
 							   "        FROM dbblue.dbblue_backup_history h"
-							   "        WHERE h.database_name = w.dbname"
+							   "        WHERE h.database_name = w.dbname AND h.database_oid = d.oid"
 							   "          AND h.status = 'success'"
 							   "        ORDER BY h.backup_started_at DESC LIMIT 1) AS last_backup_size,"
 							   "       (SELECT h.file_path"
 							   "        FROM dbblue.dbblue_backup_history h"
-							   "        WHERE h.database_name = w.dbname"
+							   "        WHERE h.database_name = w.dbname AND h.database_oid = d.oid"
 							   "          AND h.status = 'success'"
 							   "        ORDER BY h.backup_started_at DESC LIMIT 1) AS last_backup_path"
 							   " FROM wanted w"
@@ -3276,9 +3308,11 @@ prune_resolved_failures(const char *dbname)
 	static const char *sql =
 		"DELETE FROM dbblue.dbblue_backup_history "
 		"WHERE database_name = $1 AND status = 'failed' "
+		"  AND database_oid = (SELECT oid FROM pg_catalog.pg_database WHERE datname = $1) "
 		"  AND backup_started_at < "
 		"      (SELECT max(backup_started_at) FROM dbblue.dbblue_backup_history "
-		"       WHERE database_name = $1 AND status = 'success')";
+		"       WHERE database_name = $1 AND status = 'success' "
+		"         AND database_oid = (SELECT oid FROM pg_catalog.pg_database WHERE datname = $1))";
 	Oid			argtypes[1] = {TEXTOID};
 	Datum		values[1];
 
@@ -3329,11 +3363,12 @@ record_backup_history(const char *dbname, TimestampTz started_at,
 	 */
 	static const char *sql =
 		"INSERT INTO dbblue.dbblue_backup_history "
-		"(id, database_name, backup_started_at, backup_finished_at, status, "
-		" file_path, file_size_bytes, error_message) "
+		"(id, database_name, database_oid, backup_started_at, backup_finished_at, "
+		" status, file_path, file_size_bytes, error_message) "
 		"OVERRIDING SYSTEM VALUE "
 		"VALUES ((SELECT coalesce(max(id), 0) + 1 FROM dbblue.dbblue_backup_history), "
-		"        $1, $2, now(), $3, $4, $5, $6)";
+		"        $1, (SELECT oid FROM pg_catalog.pg_database WHERE datname = $1), "
+		"        $2, now(), $3, $4, $5, $6)";
 	static const Oid argtypes[6] = {TEXTOID, TIMESTAMPTZOID, TEXTOID, TEXTOID, INT8OID, TEXTOID};
 	Datum		values[6];
 	char		nulls[7] = "      ";	/* SPI convention: ' ' = not null, 'n' = null */
@@ -3559,6 +3594,7 @@ enforce_retention(const char *dbname, const char *status)
 	static const char *select_sql =
 		"SELECT id, file_path FROM dbblue.dbblue_backup_history "
 		"WHERE database_name = $1 AND status = $2 "
+		"  AND database_oid = (SELECT oid FROM pg_catalog.pg_database WHERE datname = $1) "
 		"ORDER BY backup_finished_at DESC "
 		"OFFSET $3";
 	static const Oid select_argtypes[3] = {TEXTOID, TEXTOID, INT8OID};
@@ -3724,7 +3760,7 @@ report_unmanaged_backups(void)
 	 */
 	static const char *sql =
 		"SELECT h.database_name, h.file_path,"
-		"       (d.oid IS NOT NULL AND h.database_name = ANY ($1)) AS managed"
+		"       (d.oid IS NOT NULL AND h.database_oid = d.oid AND h.database_name = ANY ($1)) AS managed"
 		" FROM dbblue.dbblue_backup_history h"
 		"      LEFT JOIN pg_catalog.pg_database d ON d.datname = h.database_name"
 		" WHERE h.status = 'success' AND h.file_path IS NOT NULL"

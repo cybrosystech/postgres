@@ -69,11 +69,13 @@ $node->safe_psql(
 	       backup_finished_at = now() - interval '3 days'
 	 WHERE database_name = 'appdb' AND status = 'success';
 	INSERT INTO dbblue.dbblue_backup_history
-	       (database_name, backup_started_at, backup_finished_at, status, file_path)
-	VALUES ('appdb', now() - interval '3 days', now() - interval '3 days',
-	        'success', '$backupdir/appdb/../../victim_dotdot'),
-	       ('appdb', now() - interval '3 days', now() - interval '3 days',
-	        'success', '$stray');
+	       (database_name, database_oid, backup_started_at, backup_finished_at,
+	        status, file_path)
+	SELECT 'appdb', d.oid, now() - interval '3 days', now() - interval '3 days',
+	       'success', v.path
+	  FROM pg_database d,
+	       (VALUES ('$backupdir/appdb/../../victim_dotdot'), ('$stray')) v(path)
+	 WHERE d.datname = 'appdb';
 	},
 	extra_params => [ '-U', 'writer' ]);
 pass('pg_write_all_data member rewrote file_path in the history table');
