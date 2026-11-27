@@ -83,7 +83,7 @@ $node->safe_psql('postgres',
 # ---------------------------------------------------------------------------
 # A dump in progress is named .partial.
 # ---------------------------------------------------------------------------
-my $first = wait_for_backup_file(qr/^bktest_\d{8}_\d{6}\.dump\.partial$/);
+my $first = wait_for_backup_file(qr/^bktest_\d{8}T\d{6}Z\.dump\.partial$/);
 ok(!grep({ /\.dump$/ } dir_files()),
 	'while pg_dump runs, its output is .partial and no .dump exists');
 
@@ -106,7 +106,7 @@ $node->safe_psql('postgres',
 	'ALTER SYSTEM SET dbblue_backup_timeout = 0; SELECT pg_reload_conf()');
 
 # The next cycle retries (a failure sets no cooldown) and blocks on the lock.
-my $crashed = wait_for_backup_file(qr/^bktest_\d{8}_\d{6}\.dump\.partial$/);
+my $crashed = wait_for_backup_file(qr/^bktest_\d{8}T\d{6}Z\.dump\.partial$/);
 
 # Files that must survive the cleanup, and an older leftover that must not.
 my @keep = (
@@ -151,7 +151,7 @@ foreach my $f (@keep)
 	ok(-e "$dbdir/$f", "unrelated file $f is left alone");
 }
 
-my @dumps = grep { /^bktest_\d{8}_\d{6}\.dump$/ } dir_files();
+my @dumps = grep { /^bktest_\d{8}T\d{6}Z\.dump$/ } dir_files();
 is(scalar(@dumps), 1, 'exactly one completed .dump exists');
 ok(!grep({ /^bktest_.*\.dump\.partial$/ } dir_files()),
 	'no .partial file of this database remains');

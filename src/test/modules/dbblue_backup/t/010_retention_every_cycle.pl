@@ -149,7 +149,7 @@ is( $node->safe_psql('postgres',
 	'could not record the backup in dbblue_backup_history',
 	'a backup whose row cannot be recorded counts as failed');
 ok( $node->log_contains(
-		qr/removing backup ".*db_c_\d{8}_\d{6}\.dump" of database "db_c", which could not be recorded/,
+		qr/removing backup ".*db_c_\d{8}T\d{6}Z\.dump" of database "db_c", which could not be recorded/,
 		$offset),
 	'its removal is logged');
 ok(!glob("'$backupdir/db_c/*.dump*'"), 'and no file of it is left');

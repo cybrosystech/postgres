@@ -164,8 +164,9 @@ monotonic_seconds(void)
 }
 
 /*
- * pg_dump writes to <dbname>_<time>.dump.partial, which is renamed to
- * <dbname>_<time>.dump only once the dump is complete and on disk.  So a file
+ * pg_dump writes to <dbname>_<time>.dump.partial, <time> being its start in
+ * UTC (20261025T003000Z), which is renamed to <dbname>_<time>.dump only once
+ * the dump is complete and on disk.  So a file
  * ending in .dump is always a whole backup, and one ending in .dump.partial
  * is a dump that never finished (the worker was killed mid-dump, e.g. by a
  * crash-restart, before it could clean up); remove_partial_dumps() deletes
@@ -2749,9 +2750,15 @@ backup_one_database(const char *dbname, int64 last_backup_size)
 		return false;
 	}
 
+	/*
+	 * Name the dump by its start in UTC, marked with a Z.  Local time
+	 * repeats an hour at the daylight-saving fall-back, so with hourly
+	 * backups the second dump in that hour got the first one's name and
+	 * replaced it; UTC never repeats.
+	 */
 	now_t = time(NULL);
-	(void) localtime_r(&now_t, &lt);
-	strftime(timebuf, sizeof(timebuf), "%Y%m%d_%H%M%S", &lt);
+	(void) gmtime_r(&now_t, &lt);
+	strftime(timebuf, sizeof(timebuf), "%Y%m%dT%H%M%SZ", &lt);
 
 	/*
 	 * Every path this backup uses, checked for length before anything is
@@ -2983,6 +2990,26 @@ backup_one_database(const char *dbname, int64 last_backup_size)
 			unlink(partfile);
 			record_backup_history(dbname, started_at, "failed", NULL, 0,
 								  "pg_dump exited successfully but produced no output file");
+			apply_retention(dbname);
+			return false;
+		}
+
+		/*
+		 * Never replace an existing dump.  rename() would do so silently, and
+		 * the history row of the dump it replaced would then name this one,
+		 * for retention to delete when that row ages out.  With UTC names
+		 * this launcher cannot reuse a name, so a file already there was put
+		 * there by something else.
+		 */
+		if (lstat(outfile, &statbuf) == 0)
+		{
+			ereport(WARNING,
+					(errmsg("dbblue backup launcher: not saving the backup of database \"%s\": \"%s\" already exists",
+							dbname, outfile),
+					 errdetail("A backup never replaces an existing file; it will be tried again under a new name.")));
+			unlink(partfile);
+			record_backup_history(dbname, started_at, "failed", NULL, 0,
+								  "a file with the backup's name already exists");
 			apply_retention(dbname);
 			return false;
 		}
