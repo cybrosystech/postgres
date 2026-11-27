@@ -123,9 +123,10 @@ audit_prune_wanted(const char *dbname)
 	if (dbblue_audit_database == NULL || dbblue_audit_database[0] == '\0')
 		return true;
 
+	/* Split exactly as audit_database_matches() does: case kept as written. */
 	rawstring = pstrdup(dbblue_audit_database);
 
-	if (!SplitIdentifierString(rawstring, ',', &elemlist))
+	if (!SplitGUCList(rawstring, ',', &elemlist))
 	{
 		/*
 		 * Malformed list: sweep nothing rather than everything.  The audit

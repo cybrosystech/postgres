@@ -1156,8 +1156,14 @@ audit_database_matches(void)
 
    audit_db_match = 0;
 
+   /*
+    * SplitGUCList(), not SplitIdentifierString(): the latter downcases
+    * unquoted names, so a database created as "ACME" (as Odoo does) was
+    * looked up as "acme" and never audited.  Names match exactly, as with
+    * dbblue_backup_databases; a quoted name still works.
+    */
    rawstring = pstrdup(dbblue_audit_database);
-   if (SplitIdentifierString(rawstring, ',', &elemlist))
+   if (SplitGUCList(rawstring, ',', &elemlist))
    {
        foreach(lc, elemlist)
        {
