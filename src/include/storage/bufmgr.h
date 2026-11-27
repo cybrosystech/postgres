@@ -400,6 +400,7 @@ extern void SoftPinRelationBuffers(Oid relspcOid, Oid reldbOid,
 								   Oid relfileOid, uint8 tier);
 extern void ClearSoftPinForRelation(Oid relspcOid, Oid reldbOid,
 									Oid relfileOid);
+extern void ClearAllSoftPins(void);
 
 /* Odoo pinner: pool-pressure helpers consulted by clock-sweep */
 extern void ComputePoolPressure(bool *under_pressure, bool *critical_pressure);

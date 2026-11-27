@@ -9216,8 +9216,9 @@ SoftPinRelationBuffers(Oid relspcOid, Oid reldbOid,
 
 /*
  * ClearSoftPinForRelation — drop soft_pin_tier from every buffer of a
- * relation. Called when the operator removes a table from
- * odoo_pinner.pinned_tables.
+ * relation. Called by the pinner when a relation leaves the pinned set
+ * (removed from dbblue_pinned_tables, below the access threshold, or over
+ * budget).
  */
 void
 ClearSoftPinForRelation(Oid relspcOid, Oid reldbOid, Oid relfileOid)
@@ -9239,6 +9240,29 @@ ClearSoftPinForRelation(Oid relspcOid, Oid reldbOid, Oid relfileOid)
 			buf->soft_pin_tier = SOFT_PIN_TIER_NONE;
 		}
 
+		UnlockBufHdr(buf);
+	}
+}
+
+/*
+ * ClearAllSoftPins — drop soft_pin_tier from every buffer.  The pinner calls
+ * this once at start-up: it keeps no record of pins left by an earlier worker,
+ * so they would otherwise never be released.
+ */
+void
+ClearAllSoftPins(void)
+{
+	int			i;
+
+	for (i = 0; i < NBuffers; i++)
+	{
+		BufferDesc *buf = GetBufferDescriptor(i);
+
+		if (buf->soft_pin_tier == SOFT_PIN_TIER_NONE)
+			continue;
+
+		(void) LockBufHdr(buf);
+		buf->soft_pin_tier = SOFT_PIN_TIER_NONE;
 		UnlockBufHdr(buf);
 	}
 }

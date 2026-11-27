@@ -157,8 +157,32 @@ static void  PrewarmRelationIntoBuffers(PinEntry *entry);
 static void  SoftPinRelationIndexes(PinEntry *entry);
 static uint8 ParseTierSuffix(char *table_name);
 static void  PinnerHandleSignals(void);
+static void  PinAndRemember(Oid spcOid, Oid relfileOid, uint8 tier);
+static void  PinnerReleaseDropped(void);
 
 static bool pinner_shutdown_requested = false;
+
+/*
+ * Relations whose buffers this worker has soft-pinned.  "pinned_last" is what
+ * the previous successful cycle left pinned; "pinned_building" is collected
+ * during the running cycle.  At the end of a cycle, anything in pinned_last
+ * but not in pinned_building -- a table removed from dbblue_pinned_tables, one
+ * below dbblue_min_access_count, or one that no longer fits the budget -- is
+ * unpinned, then the two arrays are swapped.  Both live in TopMemoryContext
+ * so they survive across cycles.
+ */
+typedef struct PinnedRel
+{
+    Oid     spcOid;
+    Oid     relfileOid;
+} PinnedRel;
+
+static PinnedRel *pinned_last = NULL;
+static int  pinned_last_n = 0;
+static int  pinned_last_cap = 0;
+static PinnedRel *pinned_building = NULL;
+static int  pinned_building_n = 0;
+static int  pinned_building_cap = 0;
 
 /* =========================================================================
  * INTERNAL HELPERS
@@ -290,6 +314,12 @@ DBBluePinnerMain(Datum main_arg)
          DBBluePinner_check_interval,
          DBBluePinner_max_pin_percent);
 
+    /*
+     * Drop any pins left by an earlier incarnation of this worker; it keeps
+     * no record of them, so they would otherwise never be released.
+     */
+    ClearAllSoftPins();
+
     /* Ensure the extensions we depend on exist in this database. */
     DBBluePinnerEnsureExtensions();
 
@@ -338,6 +368,77 @@ DBBluePinnerMain(Datum main_arg)
     proc_exit(0);
 }
 
+/*
+ * PinAndRemember — soft-pin one relation's resident buffers and record it, so
+ * a later cycle can unpin it if it leaves the pinned set.
+ */
+static void
+PinAndRemember(Oid spcOid, Oid relfileOid, uint8 tier)
+{
+    SoftPinRelationBuffers(spcOid, MyDatabaseId, relfileOid, tier);
+
+    if (pinned_building_n >= pinned_building_cap)
+    {
+        int     newcap = Max(64, pinned_building_cap * 2);
+
+        if (pinned_building == NULL)
+            pinned_building = MemoryContextAlloc(TopMemoryContext,
+                                                 newcap * sizeof(PinnedRel));
+        else
+            pinned_building = repalloc(pinned_building,
+                                       newcap * sizeof(PinnedRel));
+        pinned_building_cap = newcap;
+    }
+    pinned_building[pinned_building_n].spcOid = spcOid;
+    pinned_building[pinned_building_n].relfileOid = relfileOid;
+    pinned_building_n++;
+}
+
+/*
+ * PinnerReleaseDropped — unpin every relation pinned last cycle that was not
+ * pinned this cycle, then make this cycle's set the "last" set.
+ */
+static void
+PinnerReleaseDropped(void)
+{
+    PinnedRel  *tmp;
+    int         tmp_cap;
+
+    for (int i = 0; i < pinned_last_n; i++)
+    {
+        PinnedRel  *old = &pinned_last[i];
+        bool        still = false;
+
+        for (int j = 0; j < pinned_building_n; j++)
+        {
+            if (pinned_building[j].relfileOid == old->relfileOid &&
+                pinned_building[j].spcOid == old->spcOid)
+            {
+                still = true;
+                break;
+            }
+        }
+        if (!still)
+        {
+            elog(LOG,
+                 "db_blue pinner: unpinning relfilenode %u (no longer in "
+                 "dbblue_pinned_tables, below the access threshold, or over "
+                 "budget)", old->relfileOid);
+            ClearSoftPinForRelation(old->spcOid, MyDatabaseId, old->relfileOid);
+        }
+    }
+
+    /* this cycle's set becomes the previous set; reuse the old array */
+    tmp = pinned_last;
+    tmp_cap = pinned_last_cap;
+    pinned_last = pinned_building;
+    pinned_last_n = pinned_building_n;
+    pinned_last_cap = pinned_building_cap;
+    pinned_building = tmp;
+    pinned_building_n = 0;
+    pinned_building_cap = tmp_cap;
+}
+
 /* =========================================================================
  * PINNER CYCLE — the core logic
  * =========================================================================
@@ -364,6 +465,7 @@ PinnerRunCycle(void)
     int         i;
 
     elog(DEBUG1, "db_blue pinner: starting cycle");
+    pinned_building_n = 0;
 
     /* ---- Calculate byte budget ---- */
     budget_bytes = (int64) NBuffers * BLCKSZ *
@@ -444,10 +546,7 @@ PinnerRunCycle(void)
         }
 
         /* Apply soft-pin flag to all cached heap buffers */
-        SoftPinRelationBuffers(e->relspcOid,
-                               MyDatabaseId,
-                               e->relfileOid,
-                               e->tier);
+        PinAndRemember(e->relspcOid, e->relfileOid, e->tier);
 
         /*
          * Also pin each index's buffers. SoftPinRelationBuffers stamps
@@ -463,6 +562,9 @@ PinnerRunCycle(void)
     }
 
 cycle_end:
+    /* unpin whatever was pinned last cycle but is not pinned now */
+    PinnerReleaseDropped();
+
     SPI_finish();
     PopActiveSnapshot();
     CommitTransactionCommand();
@@ -890,10 +992,7 @@ SoftPinRelationIndexes(PinEntry *entry)
         if (isnull || !OidIsValid(idx_relspcOid))
             idx_relspcOid = MyDatabaseTableSpace;
 
-        SoftPinRelationBuffers(idx_relspcOid,
-                               MyDatabaseId,
-                               idx_relfileOid,
-                               entry->tier);
+        PinAndRemember(idx_relspcOid, idx_relfileOid, entry->tier);
         pinned_indexes++;
     }
 
