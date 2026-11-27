@@ -3809,6 +3809,13 @@ enforce_retention(const char *dbname, const char *status)
  *	- dumps in an earlier dbblue_backup_directory (retention only removes
  *	  files in the current one).
  *
+ * Only dumps the history lists, so not those it no longer does: after
+ * dbblue_backup_database changes (the history lives there), or the server is
+ * restored from a base backup or to a point in time (the history goes back
+ * with it), or a .dump.partial of a database since removed from the list.
+ * Those are documented for administrators to delete by hand rather than
+ * found by scanning the backup directory.
+ *
  * Checked every cycle, but logged only when the list has changed since it was
  * last logged (so also right after every start), or a day after that, as a
  * reminder -- not the same message every naptime.
