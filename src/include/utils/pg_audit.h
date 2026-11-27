@@ -39,6 +39,9 @@ extern void  dbblue_assign_audit_database(const char *newval, void *extra);
 extern bool  dbblue_check_audit_retention(char **newval, void **extra,
                                           GucSource source);
 extern void  dbblue_assign_audit_retention(const char *newval, void *extra);
+extern bool  dbblue_check_audit_tables(char **newval, void **extra,
+                                       GucSource source);
+extern void  dbblue_assign_audit_tables(const char *newval, void *extra);
 
 /* True when the named operation ("INSERT"/"UPDATE"/"DELETE") is selected. */
 extern bool  dbblue_audit_operation_is_tracked(int op);

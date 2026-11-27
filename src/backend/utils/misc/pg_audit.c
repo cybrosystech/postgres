@@ -16,7 +16,9 @@
 #include "libpq/libpq-be.h"    /* MyProcPort, for client addr */
 #include "miscadmin.h"
 #include "nodes/execnodes.h"
+#include "nodes/miscnodes.h"
 #include "nodes/plannodes.h"
+#include "parser/scansup.h"
 #include "tcop/utility.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
@@ -27,6 +29,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/pg_audit.h"
+#include "utils/regproc.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
@@ -1222,37 +1225,159 @@ dbblue_audit_active(int op)
 * recursive audit logging.
 * ---------------------------------------------------------------- */
 /*
+* dbblue_audit_tables, parsed once by its check hook and kept as the GUC's
+* extra, so a bad entry is rejected when the setting is changed and the
+* per-row path only compares names.
+*
+* The list used to be split with SplitIdentifierString() for every audited
+* row, and a parse failure returned "not tracked" for every table: one
+* entry such as "Sales".orders silently turned off all auditing.  That
+* also treated "schema.table" as one identifier, cut to 63 bytes as a
+* whole, so a qualified name with a table name over 56 characters never
+* matched.  Each entry is now parsed as a SQL name, like
+* dbblue_repack_tables: unquoted parts are folded to lower case, quoted
+* ones kept as written, and schema and table are each limited to
+* NAMEDATALEN - 1 bytes on their own.  Wildcards are not supported, and
+* are rejected rather than matching nothing.
+*/
+typedef struct AuditTableEntry
+{
+   bool        qualified;      /* false: matches the table in any schema */
+   char        schema[NAMEDATALEN];
+   char        table[NAMEDATALEN];
+} AuditTableEntry;
+
+typedef struct AuditTableList
+{
+   int         nentries;
+   AuditTableEntry entries[FLEXIBLE_ARRAY_MEMBER];
+} AuditTableList;
+
+static AuditTableList *audit_tables = NULL;
+
+/* GUC check hook for dbblue_audit_tables. */
+bool
+dbblue_check_audit_tables(char **newval, void **extra, GucSource source)
+{
+   const char *p = (*newval != NULL) ? *newval : "";
+   int         capacity = 1;
+   AuditTableList *list;
+
+   /* One entry per comma at most, plus one. */
+   for (const char *c = p; *c; c++)
+      if (*c == ',')
+         capacity++;
+
+   list = (AuditTableList *)
+      guc_malloc(LOG, offsetof(AuditTableList, entries) +
+                 capacity * sizeof(AuditTableEntry));
+   if (list == NULL)
+      return false;
+   list->nentries = 0;
+
+   while (*p != '\0')
+   {
+      const char *start;
+      const char *end;
+      bool        inquote = false;
+      char        badch = '\0';
+      char       *item;
+      List       *names;
+      AuditTableEntry *e;
+      ErrorSaveContext escontext = {T_ErrorSaveContext};
+
+      while (scanner_isspace(*p))
+         p++;
+      start = p;
+
+      /* Find the end of this entry: the next comma outside double quotes. */
+      for (; *p != '\0' && (inquote || *p != ','); p++)
+      {
+         if (*p == '"')
+            inquote = !inquote;     /* "" inside quotes toggles twice */
+         else if (!inquote && badch == '\0' &&
+                  !IS_HIGHBIT_SET(*p) && !isalnum((unsigned char) *p) &&
+                  *p != '_' && *p != '$' && *p != '.' &&
+                  !scanner_isspace(*p))
+            badch = *p;
+      }
+      end = p;
+      while (end > start && scanner_isspace(end[-1]))
+         end--;
+      if (*p == ',')
+         p++;
+
+      /* Ignore empty entries, such as after a trailing comma. */
+      if (end == start)
+         continue;
+      item = pnstrdup(start, end - start);
+
+      if (badch == '*' || badch == '%' || badch == '?')
+      {
+         GUC_check_errdetail("Entry \"%s\" contains a wildcard, which is not supported.",
+                             item);
+         GUC_check_errhint("List each table by name, as table or schema.table.");
+         guc_free(list);
+         return false;
+      }
+
+      names = NIL;
+      if (badch == '\0')
+         names = stringToQualifiedNameList(item, (Node *) &escontext);
+      if (badch != '\0' || escontext.error_occurred ||
+          list_length(names) > 2)
+      {
+         GUC_check_errdetail("Entry \"%s\" is not a valid table or schema.table name.",
+                             item);
+         guc_free(list);
+         return false;
+      }
+
+      e = &list->entries[list->nentries++];
+      e->qualified = (list_length(names) == 2);
+      strlcpy(e->schema, e->qualified ? strVal(linitial(names)) : "",
+              NAMEDATALEN);
+      strlcpy(e->table, strVal(llast(names)), NAMEDATALEN);
+      pfree(item);
+   }
+
+   *extra = list;
+   return true;
+}
+
+/* GUC assign hook for dbblue_audit_tables. */
+void
+dbblue_assign_audit_tables(const char *newval, void *extra)
+{
+   audit_tables = (AuditTableList *) extra;
+}
+
+/*
 * Match one relation name against the parsed dbblue_audit_tables list.
 *
 * schema_inout caches the namespace name so a configuration written with
 * bare names never pays for the lookup: only a schema-qualified entry
-* needs it.
+* whose table name matches needs it.
 */
 static bool
-audit_match_name(List *elemlist, Oid nspoid, const char *table_name,
+audit_match_name(Oid nspoid, const char *table_name,
                  const char **schema_inout)
 {
-   ListCell   *lc;
+   if (audit_tables == NULL)
+      return false;
 
-   foreach(lc, elemlist)
+   for (int i = 0; i < audit_tables->nentries; i++)
    {
-      const char *item = (const char *) lfirst(lc);
-      const char *dot = strchr(item, '.');
+      const AuditTableEntry *e = &audit_tables->entries[i];
 
-      if (dot != NULL)
-      {
-         size_t      slen = (size_t) (dot - item);
+      if (strcmp(e->table, table_name) != 0)
+         continue;
+      if (!e->qualified)
+         return true;
 
-         if (*schema_inout == NULL)
-            *schema_inout = get_namespace_name(nspoid);
-
-         if (*schema_inout != NULL &&
-             strlen(*schema_inout) == slen &&
-             strncmp(item, *schema_inout, slen) == 0 &&
-             strcmp(dot + 1, table_name) == 0)
-            return true;
-      }
-      else if (strcmp(item, table_name) == 0)
+      if (*schema_inout == NULL)
+         *schema_inout = get_namespace_name(nspoid);
+      if (*schema_inout != NULL && strcmp(e->schema, *schema_inout) == 0)
          return true;
    }
 
@@ -1268,8 +1393,6 @@ dbblue_audit_table_is_tracked(Relation rel, const char **schema_out,
    const char *schema_name = NULL;     /* resolved only if actually needed */
    const char *matched_name = NULL;
    Oid         matched_nsp = InvalidOid;
-   char       *rawstring;
-   List       *elemlist;
    bool        tracked = false;
 
    if (!dbblue_audit_enabled)
@@ -1281,21 +1404,13 @@ dbblue_audit_table_is_tracked(Relation rel, const char **schema_out,
    if (strcmp(table_name, "dbblue_audit_log") == 0)
       return false;
 
-   rawstring = pstrdup(dbblue_audit_tables);
-   if (!SplitIdentifierString(rawstring, ',', &elemlist))
-   {
-      pfree(rawstring);
-      list_free(elemlist);
-      return false;
-   }
-
    /*
     * An entry may be written either qualified ("public.orders") or bare
     * ("orders").  A qualified entry matches only that schema; a bare one
     * matches the table in any schema, which is what entries written before
     * schema support meant, so existing configurations keep working.
     */
-   if (audit_match_name(elemlist, RelationGetNamespace(rel), table_name,
+   if (audit_match_name(RelationGetNamespace(rel), table_name,
                         &schema_name))
    {
       tracked = true;
@@ -1330,7 +1445,7 @@ dbblue_audit_table_is_tracked(Relation rel, const char **schema_out,
          if (aname == NULL)
             continue;         /* ancestor dropped concurrently */
 
-         if (audit_match_name(elemlist, get_rel_namespace(aoid), aname,
+         if (audit_match_name(get_rel_namespace(aoid), aname,
                               &aschema))
          {
             tracked = true;
@@ -1345,9 +1460,6 @@ dbblue_audit_table_is_tracked(Relation rel, const char **schema_out,
 
       list_free(ancestors);
    }
-
-   pfree(rawstring);
-   list_free(elemlist);
 
    if (tracked)
    {
