@@ -60,17 +60,31 @@
  * on a superuser's process ended that call, leaving the database in use.  So
  * the owner may signal them, as pg_signal_autovacuum_worker may autovacuum,
  * which DROP DATABASE also terminates itself; their work is redone later.
+ *
+ * The same goes for the pg_dump of an automatic backup, an ordinary client
+ * session the backup launcher marks with dbblue_backup_session -- a setting
+ * only a superuser can set, so no one else can make a session look like one.
  */
 static bool
 dbblue_worker_of_own_database(PGPROC *proc, int pid)
 {
-	const char *type;
+	if (!OidIsValid(proc->databaseId))
+		return false;
+	if (proc->backendType == B_BACKEND)
+	{
+		if (!(proc->statusFlags & PROC_IS_DBBLUE_BACKUP))
+			return false;
+	}
+	else
+	{
+		const char *type;
 
-	if (proc->backendType != B_BG_WORKER || !OidIsValid(proc->databaseId))
-		return false;
-	type = GetBackgroundWorkerTypeByPid(pid);
-	if (type == NULL || strncmp(type, "dbblue ", 7) != 0)
-		return false;
+		if (proc->backendType != B_BG_WORKER)
+			return false;
+		type = GetBackgroundWorkerTypeByPid(pid);
+		if (type == NULL || strncmp(type, "dbblue ", 7) != 0)
+			return false;
+	}
 	return object_ownercheck(DatabaseRelationId, proc->databaseId, GetUserId());
 }
 

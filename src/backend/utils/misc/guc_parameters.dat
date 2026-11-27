@@ -900,6 +900,15 @@
   max => '1000',
 },
 
+{ name => 'dbblue_backup_session', type => 'bool', context => 'PGC_SUSET', group => 'WAL_ARCHIVING',
+  short_desc => 'Marks the session as a DBblue automatic backup.',
+  long_desc => 'Set by the backup launcher on the connection of the pg_dump it runs; not meant to be set by hand. The owner of the database such a session is connected to may terminate it, so that Odoo can drop, duplicate or rename the database while it is being backed up.',
+  flags => 'GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE | GUC_DISALLOW_IN_FILE',
+  variable => 'dbblue_backup_session',
+  boot_val => 'false',
+  assign_hook => 'assign_dbblue_backup_session',
+},
+
 { name => 'dbblue_backup_timeout', type => 'int', context => 'PGC_SIGHUP', group => 'WAL_ARCHIVING',
   short_desc => 'Maximum time to let one pg_dump run before it is killed.',
   long_desc => 'Bounds how long the launcher will wait for a single database backup, so a hung pg_dump cannot wedge the launcher indefinitely. A value of 0 disables the timeout.',

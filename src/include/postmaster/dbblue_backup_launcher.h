@@ -23,6 +23,9 @@ extern PGDLLIMPORT int dbblue_backup_interval;
 extern PGDLLIMPORT int dbblue_backup_naptime;
 extern PGDLLIMPORT int dbblue_backup_retention_count;
 extern PGDLLIMPORT int dbblue_backup_timeout;
+extern PGDLLIMPORT bool dbblue_backup_session;
+
+extern void assign_dbblue_backup_session(bool newval, void *extra);
 extern PGDLLIMPORT int dbblue_backup_min_free_space;
 
 extern void BackupLauncherRegister(void);

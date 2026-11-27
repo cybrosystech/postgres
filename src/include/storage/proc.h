@@ -70,6 +70,9 @@ struct XidCache
 #define		PROC_AFFECTS_ALL_HORIZONS	0x20	/* this proc's xmin must be
 												 * included in vacuum horizons
 												 * in all databases */
+#define		PROC_IS_DBBLUE_BACKUP	0x80	/* a DBblue backup's pg_dump session
+											 * (dbblue_backup_session); its
+											 * database's owner may end it */
 #define		PROC_IS_DBBLUE_REPACK	0x40	/* is it a dbblue repack worker?
 											 * Cancelled like autovacuum when
 											 * it blocks someone */

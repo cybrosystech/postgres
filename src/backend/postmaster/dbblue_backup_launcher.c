@@ -54,6 +54,7 @@
 #include "catalog/pg_class.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_type.h"
+#include "commands/dbcommands.h"
 #include "common/string.h"
 #include "executor/spi.h"
 #include "lib/stringinfo.h"
@@ -70,6 +71,8 @@
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
+#include "storage/lwlock.h"
+#include "storage/proc.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
@@ -89,6 +92,7 @@ int			dbblue_backup_interval = 86400;
 int			dbblue_backup_naptime = 300;
 int			dbblue_backup_retention_count = 7;
 int			dbblue_backup_timeout = 3600;
+bool		dbblue_backup_session = false;
 int			dbblue_backup_min_free_space = 2048;	/* MB; 0 disables */
 
 /* Permissions for per-database backup subdirectories; not a GUC. */
@@ -321,6 +325,14 @@ static HTAB *skip_warnings = NULL;	/* in TopMemoryContext */
 static bool server_shutting_down = false;
 
 /*
+ * Set when the last pg_dump was terminated by another session -- typically
+ * Odoo, as the database's owner, ending every session in the database before
+ * dropping, duplicating or renaming it (see dbblue_backup_session).  That
+ * attempt is not a failure of the database's backups, so it is not counted.
+ */
+static bool dump_terminated_by_other = false;
+
+/*
  * What report_unmanaged_backups() last logged (-1 = nothing yet), and when:
  * it logs only when that changes, or once a day as a reminder.
  */
@@ -336,6 +348,7 @@ static TimestampTz run_backup_cycle(void);
 static void backup_launcher_quickdie(SIGNAL_ARGS);
 static void reload_configuration(void);
 static bool should_warn_skipped(const char *dbname, SkipReason reason);
+static bool database_exists(const char *dbname);
 static void warn_if_backup_database_listed(void);
 static int64 retry_delay_secs(int failures);
 static void note_backup_result(const char *dbname, bool ok,
@@ -2125,9 +2138,13 @@ run_backup_cycle(void)
 			bool		ok = backup_one_database(cand->dbname,
 												 cand->last_backup_size);
 
-			/* Refused for the shutdown: not a failure of this database. */
-			if (!server_shutting_down)
+			/*
+			 * Refused for the shutdown, or ended by another session: not a
+			 * failure of this database's backups.
+			 */
+			if (!server_shutting_down && !dump_terminated_by_other)
 				note_backup_result(cand->dbname, ok, cand->last_backup_at);
+			dump_terminated_by_other = false;
 		}
 	}
 
@@ -2994,6 +3011,13 @@ backup_one_database(const char *dbname, int64 last_backup_size)
 
 		initStringInfo(&conninfo);
 		append_conninfo_dbname(&conninfo, dbname);
+
+		/*
+		 * Mark the session as this backup's, so that the database's owner
+		 * may end it -- Odoo does, before Drop, Duplicate and Rename -- as it
+		 * could not end a superuser's session otherwise.
+		 */
+		appendStringInfoString(&conninfo, " options='-c dbblue_backup_session=on'");
 		appendStringInfoString(&cmd, " -- ");
 		ok &= append_shell_quoted(&cmd, conninfo.data);
 		pfree(conninfo.data);
@@ -3144,6 +3168,39 @@ backup_one_database(const char *dbname, int64 last_backup_size)
 		 * server's, in its lc_messages; in another language this is
 		 * recorded as an ordinary failure, as it was before.
 		 */
+		/*
+		 * Ended by another session, not by this worker or a shutdown: the
+		 * database's owner ending every session in it, as Odoo does before
+		 * Drop, Duplicate and Rename (see dbblue_backup_session).  After a
+		 * Drop or Rename the name is gone, which is certain; otherwise go by
+		 * pg_dump's error -- the server's message if it got it, libpq's when
+		 * the connection was cut mid-COPY.  A crash would also cut it, but
+		 * restarts this worker too, so never gets here.  The messages are in
+		 * English only; in another language a Duplicate counts as a failure.
+		 */
+		if (stop_reason == NULL && !ShutdownRequestPending)
+		{
+			bool		gone = !database_exists(dbname);
+
+			if (gone ||
+				(dump_errors != NULL &&
+				 (strstr(dump_errors, "terminating connection due to administrator command") != NULL ||
+				  strstr(dump_errors, "server closed the connection unexpectedly") != NULL)))
+			{
+				if (gone)
+					ereport(LOG,
+							(errmsg("dbblue backup launcher: database \"%s\" was dropped or renamed while it was being backed up; this is not counted as a failed backup",
+									dbname)));
+				else
+					ereport(LOG,
+							(errmsg("dbblue backup launcher: the backup of database \"%s\" was stopped by another session, such as one dropping, copying or renaming the database; it is not counted as a failure",
+									dbname)));
+				dump_terminated_by_other = true;
+				unlink(partfile);
+				return false;
+			}
+		}
+
 		if (stop_reason == NULL && dump_errors != NULL &&
 			strstr(dump_errors, "the database system is shutting down") != NULL)
 		{
@@ -3876,6 +3933,48 @@ report_unmanaged_backups(void)
 	PG_END_TRY();
 
 	MemoryContextSwitchTo(oldcxt);
+}
+
+/*
+ * database_exists
+ *		Is there (still) a database named dbname?  Run between transactions.
+ */
+static bool
+database_exists(const char *dbname)
+{
+	MemoryContext oldcxt = CurrentMemoryContext;
+	bool		exists;
+
+	SetCurrentStatementStartTimestamp();
+	StartTransactionCommand();
+	exists = OidIsValid(get_database_oid(dbname, true));
+	CommitTransactionCommand();
+	MemoryContextSwitchTo(oldcxt);
+	return exists;
+}
+
+/*
+ * assign_dbblue_backup_session
+ *		Mark this backend's PGPROC as a DBblue backup session, or unmark it,
+ *		for pg_signal_backend() to see (PROC_IS_DBBLUE_BACKUP).  The setting
+ *		is superuser-only, so only the backup launcher's pg_dump sets it.
+ */
+void
+assign_dbblue_backup_session(bool newval, void *extra)
+{
+	/* The postmaster, and a process not yet in the proc array, have none. */
+	if (!IsUnderPostmaster || MyProc == NULL)
+		return;
+	if (newval == ((MyProc->statusFlags & PROC_IS_DBBLUE_BACKUP) != 0))
+		return;
+
+	LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
+	if (newval)
+		MyProc->statusFlags |= PROC_IS_DBBLUE_BACKUP;
+	else
+		MyProc->statusFlags &= ~PROC_IS_DBBLUE_BACKUP;
+	ProcGlobal->statusFlags[MyProc->pgxactoff] = MyProc->statusFlags;
+	LWLockRelease(ProcArrayLock);
 }
 
 /*
