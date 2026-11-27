@@ -681,7 +681,7 @@
 
 { name => 'dbblue_audit_prune_naptime', type => 'int', context => 'PGC_SIGHUP', group => 'LOGGING_WHAT',
   short_desc => 'How often the dbblue audit pruner sweeps expired rows.',
-  long_desc => 'The retention worker wakes this often, deletes whatever dbblue_audit_retention has aged out, and sleeps again. A worker runs for each database named in dbblue_audit_database; with that setting empty no worker runs and pruning happens only when something writes to an audited table.',
+  long_desc => 'The retention worker wakes this often, deletes whatever dbblue_audit_retention has aged out, and sleeps again. It sweeps each database named in dbblue_audit_database or, when that setting is empty, every database that is not a template and accepts connections.',
   flags => 'GUC_UNIT_S',
   variable => 'dbblue_audit_prune_naptime',
   boot_val => '60',
@@ -699,7 +699,7 @@
 
 { name => 'dbblue_audit_retention', type => 'string', context => 'PGC_SUSET', group => 'LOGGING_WHAT',
   short_desc => 'How much history the dedicated audit log keeps; 0 keeps everything.',
-  long_desc => 'An SQL interval: "2 min", "12 hours", "90 days", "6 months" and "7 years" are all valid. Months and years carry calendar meaning, so "1 year" is a real year rather than 365 days. Rows older than this are deleted by the dbblue audit pruner, which wakes every dbblue_audit_prune_naptime, and opportunistically by backends writing to the log; a row can therefore outlive its retention by up to one naptime before it is removed. The pruner only runs for databases named in dbblue_audit_database. Zero (the default) disables pruning and lets the log grow without limit, which is only appropriate where an external process archives or trims it.',
+  long_desc => 'An SQL interval: "2 min", "12 hours", "90 days", "6 months" and "7 years" are all valid. Months and years carry calendar meaning, so "1 year" is a real year rather than 365 days. Rows older than this are deleted by the dbblue audit pruner, which wakes every dbblue_audit_prune_naptime, and opportunistically by backends writing to the log; a row can therefore outlive its retention by up to one naptime before it is removed. The pruner sweeps the databases named in dbblue_audit_database, or every database when that setting is empty. Zero (the default) disables pruning and lets the log grow without limit, which is only appropriate where an external process archives or trims it.',
   variable => 'dbblue_audit_retention',
   boot_val => '"0"',
   check_hook => 'dbblue_check_audit_retention',
