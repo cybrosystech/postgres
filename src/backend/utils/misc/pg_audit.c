@@ -411,7 +411,8 @@ static bool xact_callback_registered = false;
 * Transaction end callback registered once per backend session.  Resets
 * the audit_table_checked flag when a transaction aborts, so that if the
 * CREATE TABLE IF NOT EXISTS was rolled back, the next transaction will
-* recreate it.
+* recreate it.  At any transaction end, a failed setup is forgotten, so
+* the next transaction tries again.
 * ---------------------------------------------------------------- */
 static void
 dbblue_audit_xact_callback(XactEvent event, void *arg)
@@ -429,6 +430,11 @@ dbblue_audit_xact_callback(XactEvent event, void *arg)
         * write re-prepares.
         */
        audit_forget_plan();
+   }
+   else if (event == XACT_EVENT_COMMIT || event == XACT_EVENT_PREPARE)
+   {
+       /* A failed setup is retried in the next transaction. */
+       audit_table_available = true;
    }
 }
 
@@ -729,6 +735,19 @@ dbblue_audit_ensure_log_table(void)
    ResourceOwner oldowner;
 
    if (audit_table_checked)
+       return;
+
+   /*
+    * Setup already failed in this transaction and, with
+    * dbblue_audit_require_write off, the change went on unaudited.  Don't
+    * try again until the transaction ends (the xact callback resets the
+    * flag): retrying for every row cost a subtransaction, the DDL and a
+    * WARNING each time, so a 100k-row UPDATE on a restored database whose
+    * dbblue schema the Odoo role owns took 67 s instead of 0.3 s and sent
+    * 100k warnings.  With require_write on, retry, so that the change is
+    * refused rather than skipped.
+    */
+   if (!audit_table_available && !dbblue_audit_require_write)
        return;
 
    /*
