@@ -2709,6 +2709,14 @@ read_dump_errors(void)
  * Called just before dbname is dumped again.  Only this worker writes these
  * files, and it dumps one database at a time, so none of them can belong to
  * a dump still in progress.
+ *
+ * That holds only while no other running server uses the same
+ * dbblue_backup_directory -- e.g. a promoted standby with backups turned on
+ * while the old primary still runs, or two servers on one network folder.
+ * Such sharing is documented as unsupported rather than locked out: this
+ * would then delete the other server's dump in progress, two dumps started
+ * in the same second would share a file, and a promoted standby's copy of
+ * the history would let its retention delete the primary's dumps.
  */
 static void
 remove_partial_dumps(const char *dbdir, const char *dbname)
